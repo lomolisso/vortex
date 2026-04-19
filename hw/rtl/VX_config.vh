@@ -255,23 +255,27 @@
 `ifndef FPU_FPNEW
 `ifndef FPU_DSP
 `ifndef FPU_DPI
-`ifndef SYNTHESIS
+`ifdef ASIC_SYNTHESIS
+`define FPU_FPNEW
+`elsif SYNTHESIS
+`define FPU_DSP
+`else
 `ifndef DPI_DISABLE
 `define FPU_DPI
 `else
 `define FPU_DSP
 `endif
-`else
-`define FPU_DSP
 `endif
 `endif
 `endif
 `endif
 
 `ifndef SYNTHESIS
+`ifndef ASIC_SYNTHESIS
 `ifndef DPI_DISABLE
 `define IMUL_DPI
 `define IDIV_DPI
+`endif
 `endif
 `endif
 
@@ -800,17 +804,17 @@
 `ifndef TCU_BHF
 `ifndef TCU_DSP
 `ifndef TCU_DPI
-
-`ifndef SYNTHESIS
+`ifdef ASIC_SYNTHESIS
+`define TCU_BHF
+`elsif SYNTHESIS
+`define TCU_DSP
+`else
 `ifndef DPI_DISABLE
 `define TCU_DPI
 `else
 `define TCU_BHF
 `endif
-`else
-`define TCU_DSP
 `endif
-
 `endif
 `endif
 `endif

@@ -103,6 +103,89 @@ module VX_dp_ram #(
     localparam FORCE_BRAM = !LUTRAM && `FORCE_BRAM(SIZE, DATAW);
     if (OUT_REG) begin : g_sync
         if (FORCE_BRAM) begin : g_bram
+        `ifdef ASIC_SYNTHESIS
+            //------------------------------------------------------------------
+            // ASIC: instantiate bsg_fakeram 1R1W macro
+            // Port names (from generate_verilog.py):
+            //   clk, r_ce_in, r_addr_in, rd_out,
+            //   w_ce_in, w_addr_in, wd_in, w_mask_in
+            // Single shared clock; independent read and write addresses.
+            // w_mask_in assembled by replicating each wren[i] across WSELW bits.
+            //------------------------------------------------------------------
+            logic [DATAW-1:0] w_mask;
+            for (genvar i = 0; i < WRENW; ++i) begin : g_mask
+                assign w_mask[i*WSELW +: WSELW] = {WSELW{wren[i]}};
+            end
+            if (SIZE == 64 && DATAW <= 24) begin : g_macro
+                logic [23:0] rdata_padded;
+                logic [23:0] wdata_padded;
+                logic [23:0] wmask_padded;
+                assign wdata_padded = {{(24-DATAW){1'b0}}, wdata};
+                assign wmask_padded = {{(24-DATAW){1'b0}}, w_mask};
+                sram_64x24_1r1w macro_inst (
+                    .clk      (clk),
+                    .r_ce_in  (read),
+                    .r_addr_in(raddr[5:0]),
+                    .rd_out   (rdata_padded),
+                    .w_ce_in  (write),
+                    .w_addr_in(waddr[5:0]),
+                    .wd_in    (wdata_padded),
+                    .w_mask_in(wmask_padded)
+                );
+                assign rdata = rdata_padded[DATAW-1:0];
+            end else if (SIZE == 256 && DATAW <= 24) begin : g_macro
+                logic [23:0] rdata_padded;
+                logic [23:0] wdata_padded;
+                logic [23:0] wmask_padded;
+                assign wdata_padded = {{(24-DATAW){1'b0}}, wdata};
+                assign wmask_padded = {{(24-DATAW){1'b0}}, w_mask};
+                sram_256x24_1r1w macro_inst (
+                    .clk      (clk),
+                    .r_ce_in  (read),
+                    .r_addr_in(raddr[7:0]),
+                    .rd_out   (rdata_padded),
+                    .w_ce_in  (write),
+                    .w_addr_in(waddr[7:0]),
+                    .wd_in    (wdata_padded),
+                    .w_mask_in(wmask_padded)
+                );
+                assign rdata = rdata_padded[DATAW-1:0];
+            end else if (SIZE == 64 && DATAW == 128) begin : g_macro
+                sram_64x128_1r1w macro_inst (
+                    .clk      (clk),
+                    .r_ce_in  (read),
+                    .r_addr_in(raddr[5:0]),
+                    .rd_out   (rdata),
+                    .w_ce_in  (write),
+                    .w_addr_in(waddr[5:0]),
+                    .wd_in    (wdata),
+                    .w_mask_in(w_mask)
+                );
+            end else if (SIZE == 128 && DATAW == 128) begin : g_macro
+                sram_128x128_1r1w macro_inst (
+                    .clk      (clk),
+                    .r_ce_in  (read),
+                    .r_addr_in(raddr[6:0]),
+                    .rd_out   (rdata),
+                    .w_ce_in  (write),
+                    .w_addr_in(waddr[6:0]),
+                    .wd_in    (wdata),
+                    .w_mask_in(w_mask)
+                );
+            end else begin : g_macro_fallback
+                // No macro available — infer as stdcell
+                reg [DATAW-1:0] ram [0:SIZE-1];
+                reg [DATAW-1:0] rdata_r;
+                always @(posedge clk) begin
+                    if (write) begin
+                        for (integer i = 0; i < WRENW; ++i)
+                            if (wren[i]) ram[waddr][i*WSELW +: WSELW] <= wdata[i*WSELW +: WSELW];
+                    end
+                    if (read) rdata_r <= ram[raddr];
+                end
+                assign rdata = rdata_r;
+            end
+        `else
             if (RDW_MODE == "W") begin : g_write_first
                 if (WRENW != 1) begin : g_wren
                     `RW_RAM_CHECK `USE_BLOCK_BRAM `RAM_ARRAY_WREN
@@ -152,6 +235,7 @@ module VX_dp_ram #(
                     assign rdata = rdata_r;
                 end
             end
+        `endif
         end else begin : g_auto
             if (RDW_MODE == "W") begin : g_write_first
                 if (WRENW != 1) begin : g_wren

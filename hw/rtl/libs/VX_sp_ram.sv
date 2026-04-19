@@ -102,6 +102,65 @@ module VX_sp_ram #(
     localparam FORCE_BRAM = !LUTRAM && `FORCE_BRAM(SIZE, DATAW);
     if (OUT_REG) begin : g_sync
         if (FORCE_BRAM) begin : g_bram
+        `ifdef ASIC_SYNTHESIS
+            //------------------------------------------------------------------
+            // ASIC: instantiate bsg_fakeram 1RW macro
+            // Port names (from generate_verilog.py):
+            //   clk, ce_in, we_in, addr_in, wd_in, w_mask_in, rd_out
+            // ce_in  = write | read (assert whenever port is used)
+            // we_in  = write        (1 = write this cycle)
+            // w_mask_in assembled by replicating each wren[i] across WSELW bits
+            //------------------------------------------------------------------
+            logic [DATAW-1:0] rdata_macro;
+            logic [DATAW-1:0] w_mask;
+            for (genvar i = 0; i < WRENW; ++i) begin : g_mask
+                assign w_mask[i*WSELW +: WSELW] = {WSELW{wren[i]}};
+            end
+            if (SIZE == 64 && DATAW == 512) begin : g_macro
+                sram_64x512_1rw macro_inst (
+                    .clk      (clk),
+                    .ce_in    (write | read),
+                    .we_in    (write),
+                    .addr_in  (addr[5:0]),
+                    .wd_in    (wdata),
+                    .w_mask_in(w_mask),
+                    .rd_out   (rdata_macro)
+                );
+            end else if (SIZE == 256 && DATAW == 512) begin : g_macro
+                sram_256x512_1rw macro_inst (
+                    .clk      (clk),
+                    .ce_in    (write | read),
+                    .we_in    (write),
+                    .addr_in  (addr[7:0]),
+                    .wd_in    (wdata),
+                    .w_mask_in(w_mask),
+                    .rd_out   (rdata_macro)
+                );
+            end else if (SIZE == 1024 && DATAW == 32) begin : g_macro
+                sram_1024x32_1rw macro_inst (
+                    .clk      (clk),
+                    .ce_in    (write | read),
+                    .we_in    (write),
+                    .addr_in  (addr[9:0]),
+                    .wd_in    (wdata),
+                    .w_mask_in(w_mask),
+                    .rd_out   (rdata_macro)
+                );
+            end else begin : g_macro_fallback
+                // Size not in macro table — infer stdcell array
+                reg [DATAW-1:0] ram [0:SIZE-1];
+                reg [DATAW-1:0] rdata_r;
+                always @(posedge clk) begin
+                    if (write) begin
+                        for (integer i = 0; i < WRENW; ++i)
+                            if (wren[i]) ram[addr][i*WSELW +: WSELW] <= wdata[i*WSELW +: WSELW];
+                    end
+                    if (read) rdata_r <= ram[addr];
+                end
+                assign rdata_macro = rdata_r;
+            end
+            assign rdata = rdata_macro;
+        `else
             if (RDW_MODE == "W") begin : g_write_first
                 if (WRENW != 1) begin : g_wren
                     `RW_RAM_CHECK `USE_BLOCK_BRAM `RAM_ARRAY_WREN
@@ -179,6 +238,7 @@ module VX_sp_ram #(
                     assign rdata = rdata_r;
                 end
             end
+        `endif
         end else begin : g_auto
             if (RDW_MODE == "W") begin : g_write_first
                 if (WRENW != 1) begin : g_wren
