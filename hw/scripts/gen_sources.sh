@@ -127,7 +127,7 @@ if [ "$output_file" != "" ]; then
             find "$(realpath $dir)" -maxdepth 1 -type f -name "*_pkg.sv" -print
         done
         for dir in ${externs[@]}; do
-            find "$(realpath $dir)" -maxdepth 1 -type f \( -name "*.v" -o -name "*.sv" \) ! -name "*_pkg.sv" -print
+            find "$(realpath $dir)" -maxdepth 1 -type f \( -name "*.v" -o -name "*.sv" \) ! -name "*_pkg.sv" ! -name "*.bb.v" -print
         done
 
         if [ "$copy_folder" != "" ]; then
