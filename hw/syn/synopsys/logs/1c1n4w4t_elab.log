@@ -1,0 +1,1614 @@
+Info: [VCS_SAVE_RESTORE_INFO] ASLR (Address Space Layout Randomization) is detected on the machinInfo: [VCS_SAVE_RESTORE_INFO] ASLR (Address Space Layout Randomization) is detected on the machine. To enable $save functionality, 
+                           Design Compiler Graphical 
+                                 DC Ultra 
+                           Design Compiler Graphical 
+                                 DC Ultra (TM)
+                                  DFTMAX (TM)
+                              Power Compiler (TM)
+                                 DesignWare (R)
+                                 DC Expert (TM)
+                               Design Vision (TM)
+                               HDL Compiler (TM)
+                               VHDL Compiler (TM)
+                                  DFT Compiler
+                               Design Compiler(R)
+
+                 Version W-2024.09 for linux64 - Aug 27, 2024 
+
+                    Copyright (c) 1988 - 2024 Synopsys, Inc.
+   This software and the associated documentation are proprietary to Synopsys,
+ Inc. This software may only be used in accordance with the terms and conditions
+ of a written license agreement with Synopsys, Inc. All other use, reproduction,
+   or distribution of this software is strictly prohibited.  Licensed Products
+     communicate with Synopsys servers for the purpose of providing software
+    updates, detecting software piracy and verifying that customers are using
+    Licensed Products in conformity with the applicable License Key for such
+  Licensed Products. Synopsys will use information gathered in connection with
+    this process to deliver software updates and pursue software pirates and
+                                   infringers.
+
+ Inclusivity & Diversity - Visit SolvNetPlus to read the "Synopsys Statement on
+            Inclusivity and Diversity" (Refer tCurrent time:       Sun Apr 19 11:05:19 2026
+Hostname:           fastx3-34.ews.illinois.edu
+CPU Model:          Intel(R) Xeon(R) Silver 4216 CPU @ 2.10GHz
+CPU Details:        Cores = 10 : SCPU Model:          Intel(R) Xeon(R) Silver 4216 CPU @ 2.10GHz
+CPU Details:        Cores = 10 : Sockets = 19 : Cache Size = 22528 KB : Freq = 2.10 GH
+Swap:                 3 GB (Free   3 GB)
+Work Filesystem:    /home/rid2 mounted to ews-homes-inst-prod.engrit.illinois.edu:/ewshomes/fspooWork Filesystem:    /home/rid2 mounted to ews-homes-inst-prod.engrit.illinois.edu:/ewshomes/fspool-r/rid2/linux
+Tmp Filesystem:     /tmp mounted to /dev/mapper/fastx3_34_sys-tmp
+Work Disk:           25 GB (Free  10 GB)
+Tmp Disk:            31 GB (Free  30# Copyright © 2019-2023
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file e#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#=======================================================================
+# Vortex GPGPU — Synopsys DC Elaboration-Only Check
+#
+# Analyzes and elaborates without running compile_ultra.
+# Use this to catch unresolved modules, DPI imports, string-type
+# errors, and other DC parse issues before committing to a full run.
+#
+# Usage:
+#   dc_shell -x "set CONFIG 1c1n4w4t" -f dc_elab.tcl 2>&1 | tee logs/1c1n4w4t_elab.log
+#   grep -E "Error|Warning|unresolved" logs/1c1n4w4t_elab.log
+#=======================================================================
+if {![info exists CONFIG]} {
+    error "CONFIG is not set. Invoke as: dc_shell -x {set CONFIG <config_name>} -f dc_elab.tcl"
+}
+set SCRIPT_DIR [file normalize [file dirname [info script]]]
+/home/rid2/cs533.work/vortex/hw/syn/synopsys
+#-----------------------------------------------------------------------
+# Library setup (same as dc_syn.tcl — needed for link)
+#-----------------------------------------------------------------------
+set LIBS_DIR "$SCRIPT_DIR/libs"
+/home/rid2/cs533.work/vortex/hw/syn/synopsys/libs
+set target_library "$LIBS_DIR/stdc
+    * \
+/home/rid2/cs533.work/vortex/hw/syn/synopsys/libs/stdcells.db
+set link_library [concat \
+    * \
+    $LIBS_DIR/stdcells.db \
+    $LIBS_DIR/sram_64x512_1rw.db \
+    $LIBS_DIR/sram_256x512_1rw.db \
+    $LIBS_DIR/sram_1024x32_1rw.db \
+    $LIBS_DIR/sram_64x24_1r1w.db \
+    $LIBS_DIR/* /home/rid2/cs533.work/vortex/hw/syn/synopsys/libs/stdcells.db /home/rid2/cs533.work/vortex/hw/s* /home/rid2/cs533.work/vortex/hw/syn/synopsys/libs/stdcells.db /home/rid2/cs533.work/vortex/hw/syn/synopsys/libs/sram_64x512_1rw.db /home/rid2/cs533.work/vortex/hw/syn/synopsys/libs/sram_256x512_1rw.db /home/rid2/cs533.work/vortex/hw/syn/synopsys/libs/sram_1024x32_1rw.db /home/rid2/cs533.work/vortex/hw/syn/synopsys/libs/sram_64x24_1r1w.db /home/rid2/cs533.work/vortex/hw/syn/synopsys/libs/sram_256x24_1r1w.db /home/rid2/cs533.work/vortex/hw/syn/synopsy
+set symbol_library {}
+#-----------------------------------------------------------------------
+# Parse filelist
+#-----------------------------------------------------------------------
+source "$SCRIPT_DIR/../../scripts/parse_vcs_list.tcl"
+set flist_path "$SCRIPT_DIR/dc_flist_${CONFIG}.f"
+/home/rid2/cs533.work/vortex/hw/syn/synopsys/dcset flist_path "$SCRIPT_DIR/dc_flist_${CONFIG}.f"
+/home/rid2/cs533.work/vortex/hw/syn/synopsys/dc_flist_1c1n4w4t.f
+if {![file exists $flist_path]} {
+    error "Filelist not found: $flist_path\nRset search_path [concat $search_path $inc_dirs]
+. /software/Synopsys-2024_x86_64/syn/W-2024.09/libraries/syn /software/Synopsys-2024_x86_64/syn/W-2024.09/dw/syn_ver /software/Synopsys-2024_x86_64/syn/W-2024.09/dw/sim_ver /ho-2024_x86_64/syn/W-2024.09/dw/syn_ver /software/Synopsys-2024_x86_64/syn/W-2024.09/dw/sim_ver /home/rid2/cs533.work/vortex/third_party/cvfpu/src /home/rid2/cs533.work/vortex/third_party/hardfloat/source /home/rid2/cs533.work/vortex/third_party/hardfloat/source/RISCV /home/rid2/cs533.work/vortex/hw/syn/synopsys/libs /home/rid2/cs533.work/vortex/hw/rtl /home/rid2/cs533.work/vortex/hw/rtl/interfaces /home/rid2/cs533.work/vortex/hw/rtl/core /home/rid2/cs533.work/vortex/hw/rtl/libs /home/rid2/cs533.work/vortex/hw/rtl/fpu /home/rid2/cs533.work/vortex/hw/rtl/mem /home/rid2/cs533.work/vortex/hw/rtl/cache /home/rid2/cs533.work/vortex/hw/rtl/tcu /home/rid2/cs533.work/vortex/h#-----------------------------------------------------------------------
+foreach f $src_files {
+    analyze -format sverilog -define $defines $f
+}
+Running PRESTO HDLC
+Compiling source file /home/rid2/cs533.work/vortex/third_party/cvfpu/src/fpnew_pkg.sv
+Warning:  /home/rid2/cs533.work/vortex/third_party/cvfpu/src/fpnew_pkg.sv:369: signed to unsignedWarning:  /home/rid2/cs533.worWarning:  /home/rid2/cs533.work/vortex/third_party/cvfpu/src/fpnew_pkg.sv:368: signed to unsignedWarning:  /home/rid2/cs533.worWarning:  /home/rid2/cs533.work/vortex/third_party/cvfpu/src/fpnew_pkg.sv:507: signed to unsignedWarning:  /home/rid2/cs533.worPresto compilation completed successfully.
+Loading db file '/home/rid2/cs533.work/vortex/hw/syn/synopsys/libs/stdcells.db'
+Loading db file '/home/rid2/cs533.work/vortex/hw/syn/synopsys/libs/sram_64x512_1rw.db'
+Loading db file '/home/rid2/cs533.work/vortex/hw/syn/synopsys/libs/sram_256x512_1rw.db'
+Loading db file '/home/rid2/cs533.work/vortex/hw/syn/synopsys/libs/sram_1024x32_1rw.db'
+Loading db file '/home/rid2/cs533.work/vortex/hw/syn/synopsys/libs/sram_64x24_1r1w.db'
+Loading db file '/home/rid2/cs533.work/vortex/hw/syn/synopsys/libs/sram_256x24_1r1w.db'
+Loading db file '/home/rid2/cs533.work/vortex/hw/syn/synopsys/libs/sram_64x128_1r1w.db'
+Loading db file '/home/rid2/cs533.work/vortex/hw/syn/synopsys/libs/sram_128x128_1r1w.db'
+Running PRESTO HDLC
+Compiling source file /home/rid2/cs533.work/vortex/third_party/hardfloat/source/bsg_hardfloat_pkgCompWarning:  /home/rid2/cs533.work/vortex/third_party/hardfloat/source/bsg_hardfloat_pkg.sv:18: ParaWarning:  /home/rid2/cs533.work/vortex/third_party/hardfloat/Presto compilation completed successfully.
+Running PRESTO HDLC
+Compiling source file /home/rid2/cs533.work/vortex/third_party/cvfpu/src/fpnew_divsqrt_th_32.sv
+Opening include file common_cells/registers.svh
+Error:  /home/rid2/cs533.work/vortex/third_party/Opening include file common_cells/registers.svh
+Error:  /home/rid2/cs533.work/vortex/third_party/cvfpu/src/fpnew_divsqrt_th_32.sv:19: Unable to open file `common_cells/registerRunning PRESTO HDLC
+Compiling source file /home/rid2/cs533.work/vortex/third_party/cvfpu/src/fpnew_divsqrt_th_64_mul
+CompiOpening include file common_cells/registers.svh
+Error:  /home/rid2/cs533.work/vortex/third_party/cvfpu/src/fpnew_divsqrt_th_64_multi.sv:18: Unab
+Error:  /home/rid2/cs533.work/vortex/third_party/cvfpu/src/fpnew_divsqrt_th_64_mu*** Presto compilation terminated with 1 errors. ***
+Running PRESTO HDLC
+Compiling source file /home/rid2/cs533.work/vortex/third_party/cvfpu/src/fpnew_opgroup_fmt_slice.ComPresto compilation completed successfully.
+Running PRESTO HDLC
+Compiling source file /home/rid2/cs533.work/vortex/third_party/cvfpu/src/fpnew_opgroup_multifmt_sCompilinOpening include file common_cells/registers.svh
+Error:  /home/rid2/cs533.work/vortex/third_party/Opening include file common_cells/registers.svh
+Error:  /home/rid2/cs533.work/vortex/third_party/cvfpu/src/fpnew_opgroup_multifmt_slice.sv:16: Unable to open file `common_cells/registers.svh': No such fileCompiling source file /home/rid2/cs533.work/vortex/third_party/cvfpu/src/fpnew_rounding.sv
+Presto compilation completed successfully.
+Running PRESTO HDLC
+Compiling source file /home/rid2/cs533.work/vortex/third_party/cvfpu/src/fpnew_top.sv
+Presto compilation completed successfully.
+Running PRESTO HDLC
+Compiling source file /home/rid2/cs533.work/vortex/third_party/cvfpu/src/fpnew_fma.sv
+Opening include file common_cells/registers.svh
+Error:  /home/rid2/cs533.work/vortex/third_party/Opening include file common_cells/registers.svh
+Error:  /home/rid2/cs533.work/vortex/third_party/cvfpu/src/fpnew_fma.sv:16: Unable to open file `common_cells/registers.svh': No such fileCompiling source file /home/rid2/cs533.work/vortex/third_party/cvfpu/src/fpnew_noncomp.sv
+Opening include file common_cells/registers.svh
+Error:  /home/rid2/cs533.work/vortex/third_party/Opening include file common_cells/registers.svh
+Error:  /home/rid2/cs533.work/vortex/third_party/cvfpu/src/fpnew_noncomp.sv:16: Unable to open file `common_cells/registerRunning PRESTO HDLC
+Compiling source file /home/rid2/cs533.work/vortex/third_party/cvfpu/src/fpnew_cast_multi.sv
+OpenCompiling source file /home/rid2/cs533.work/vortex/third_party/cvfpu/src/fpnew_cast_multi.sv
+Opening include file common_cells/registers.svh
+Error:  /home/rid2/cs533.work/vortex/third_party/cvfpu/src/fpnew_cast_multi.sv:16: Unable to open file `common_cells/registerRunning PRESTO HDLC
+Compiling source file /home/rid2/cs533.work/vortex/third_party/cvfpu/src/fpnew_opgroup_block.sv
+Presto compilation completed successfully.
+Running PRESTO HDLC
+Compiling source file /home/rid2/cs533.work/vortex/third_party/cvfpu/src/fpnew_divsqrt_multi.sv
+Opening include file common_cells/registers.svh
+Error:  /home/rid2/cs533.work/vortex/third_party/cvfpu/src/fpnew_divsqrt_multi.sv:16: Unable to oError:  /home/rid2/cs533.work/vortex/third_party/cvfpu/src/fpnew_divsqrt_mu*** Presto compilation terminated with 1 errors. ***
+Running PRESTO HDLC
+Compiling source file /home/rid2/cs533.work/vortex/third_party/cvfpu/src/fpnew_classifier.sv
+Presto compilation completed successfully.
+Running PRESTO HDLC
+Compiling source file /home/rid2/cs533.work/vortex/third_party/cvfpu/src/fpnew_fma_multi.sv
+OpeniCompiling source file /home/rid2/cs533.work/vortex/third_party/cvfpu/src/fpnew_fma_multi.sv
+Opening include file common_cells/registers.svh
+Error:  /home/rid2/cs533.work/vortex/third_party/cvfpu/src/fpnew_fma_multi.sv:16: Unable to open file `common_cells/registers.svh': No such fileCompiling source file /home/rid2/cs533.work/vortex/third_party/hardfloat/source/mulRecFN.v
+Opening include file /home/rid2/cs533.work/vortex/third_party/hardfloat/source/HardFloat_consts.vOpOpening include file /home/rid2/cs533.work/vortex/third_party/hardfloat/source/RISCV/HardFloat_specialize.vi
+Presto compilation completed successfully.
+Running PRESTO HDLC
+Compiling source file /home/rid2/cs533.work/vortex/third_party/hardfloat/source/HardFloat_rawFN.v
+Opening include file /home/rid2/cs533.work/vortex/third_party/hardfloat/source/HardFloat_consts.vi
+Opening include file /home/rid2/cs533.work/vortex/third_party/hardfloat/source/RISCV/HardFloat_specialize.vi
+Presto compilation completed successfully.
+Running PRESTO HDLC
+Compiling source file /home/rid2/cs533.work/vortex/third_party/hardfloat/source/divSqrtRecFN_smalCompOpening include file /home/rid2/cs533.work/vortex/third_party/hardfloat/source/HardFloat_consts.vi
+Opening include file /home/rid2/cs533.work/vortex/third_party/hardfloat/source/RISCV/HardFloat_spOpening inclOpening include file /home/rid2/cs533.work/vortex/third_party/hardfloat/source/HardFloat_localFunOpeninWarning:  /home/rid2/cs533.work/vortex/third_party/hardfloat/source/HardFloat_localFuncs.vi:46: PWarning:  /home/rid2/cs533.work/vortex/third_party/hardfloat/source/HardFloat_localFuncs.vi:46: Port fa of type input is being assigned.  (VER-1005)
+Warning:  /home/rid2/cs533.work/vortex/third_party/hPresto compilation completed successfully.
+Running PRESTO HDLC
+Compiling source file /home/rid2/cs533.work/vortex/third_party/hardfloat/source/HardFloat_primitives.v
+Presto compilation completed successfully.
+Running PRESTO HDLC
+Compiling source file /home/rid2/cs533.work/vortex/third_party/hardfloat/source/compareRecFN.v
+Presto compilation completed successfully.
+Running PRESTO HDLC
+Compiling source file /home/rid2/cs533.work/vortex/third_party/hardfloat/source/mulAddRecFN.v
+Opening include file /home/rid2/cs533.work/vortex/third_party/hardfloat/source/HardFloat_consts.vOpOpening include file /home/rid2/cs533.work/vortex/third_party/hardfloat/source/RISCV/HardFloat_spOpening inclOpening include file /home/rid2/cs533.work/vortex/third_party/hardfloat/source/HardFloat_localFunOpeninWarning:  /home/rid2/cs533.work/vortex/third_party/hardfloat/source/HardFloat_localFuncs.vi:46: PWarning:  /home/rid2/cs533.work/vortex/third_party/hardfloat/source/HardFloat_localFuncs.vi:46: Port fa of type input is being assigned.  (VER-1005)
+Warning:  /home/rid2/cs533.work/vortex/third_party/hOpening include file /home/rid2/cs533.work/vortex/third_party/hardfloat/source/HardFloat_localFunOpeninWarning:  /home/rid2/cs533.work/vortex/third_party/hardfloat/source/HardFloat_localFuncs.vi:46: PWarning:  /home/rid2/cs533.work/vortex/third_party/hardfloat/source/HardFloat_localFuncs.vi:46: Port fa of type input is being assigned.  (VER-1005)
+Warning:  /home/rid2/cs533.work/vortex/third_party/hOpening include file /home/rid2/cs533.work/vortex/third_party/hardfloat/source/HardFloat_localFunOpeninWarning:  /home/rid2/cs533.work/vortex/third_party/hardfloat/source/HardFloat_localFuncs.vi:46: PWarning:  /home/rid2/cs533.work/vortex/third_party/hWarning:  /home/rid2/cs533.work/vortex/third_party/hardfloat/source/HardFloat_localFuncs.vi:47: PWarning:  /home/rid2/cs533.work/vortex/third_party/hPresto compilation completed successfully.
+Running PRESTO HDLC
+Compiling source file /home/rid2/cs533.work/vortex/third_party/hardfloat/source/isSigNaNRecFN.v
+Presto compilation completed successfully.
+Running PRESTO HDLC
+Compiling source file /home/rid2/cs533.work/vortex/third_party/hardfloat/source/recFNToFN.v
+Opening include file /home/rid2/cs533.work/vortex/third_party/hardfloat/source/HardFloat_localFunOpeninWarning:  /home/rid2/cs533.work/vortex/third_party/hardfloat/source/HardFloat_localFuncs.vi:46: PWarning:  /home/rid2/cs533.work/vortex/third_party/hardfloat/source/HardFloat_localFuncs.vi:46: Port fa of type input is being assigned.  (VER-1005)
+Warning:  /home/rid2/cs533.work/vortex/third_party/hPresto compilation completed successfully.
+Running PRESTO HDLC
+Compiling source file /home/rid2/cs533.work/vortex/third_party/hardfloat/source/divSqrtFN.v
+Opening include file /home/rid2/cs533.work/vortex/third_party/hardfloat/source/HardFloat_consts.vOpOpening include file /home/rid2/cs533.work/vortex/third_party/hardfloat/source/RISCV/HardFloat_spOpening inclPresto compilation completed successfully.
+Running PRESTO HDLC
+Compiling source file /home/rid2/cs533.work/vortex/third_party/hardfloat/source/divSqrtRecFN_mediCompiOpening include file /home/rid2/cs533.work/vortex/third_party/hardfloat/source/HardFloat_consts.vOpOpening include file /home/rid2/cs533.work/vortex/third_party/hardfloat/source/RISCV/HardFloat_spOpening inclOpening include file /home/rid2/cs533.work/vortex/third_party/hardfloat/source/HardFloat_localFunOpeninWarning:  /home/rid2/cs533.work/vortex/third_party/hardfloat/source/HardFloat_localFuncs.vi:46: PWarning:  /home/rid2/cs533.work/vortex/third_party/hardfloat/source/HardFloat_localFuncs.vi:46: Port fa of type input is being assigned.  (VER-1005)
+Warning:  /home/rid2/cs533.work/vortex/third_party/hPresto compilation completed successfully.
+Running PRESTO HDLC
+Compiling source file /home/rid2/cs533.work/vortex/third_party/hardfloat/source/divSqrtRecFN.v
+Opening include file /home/rid2/cs533.work/vortex/third_party/hardfloat/source/HardFloat_consts.vOpOpening include file /home/rid2/cs533.work/vortex/third_party/hardfloat/source/RISCV/HardFloat_spOpening inclPresto compilation completed successfully.
+Running PRESTO HDLC
+Compiling source file /home/rid2/cs533.work/vortex/third_party/hardfloat/source/recFNToIN.v
+Opening include file /home/rid2/cs533.work/vortex/third_party/hardfloat/source/HardFloat_consts.vi
+Opening include file /home/rid2/cs533.work/vortex/third_party/hardfloat/source/RISCV/HardFloat_specialize.vi
+Opening include file /home/rid2/cs533.work/vortex/third_party/hardfloat/source/HardFloat_localFunOpeninWarning:  /home/rid2/cs533.work/vortex/third_party/hardfloat/source/HardFloat_localFuncs.vi:46: PWarning:  /home/rid2/cs533.work/vortex/third_party/hWarning:  /home/rid2/cs533.work/vortex/third_party/hardfloat/source/HardFloat_localFuncs.vi:47: PWarning:  /home/rid2/cs533.work/vortex/third_party/hPresto compilation completed successfully.
+Running PRESTO HDLC
+Compiling source file /home/rid2/cs533.work/vortex/third_party/hardfloat/source/fNToRecFN.v
+Opening include file /home/rid2/cs533.work/vortex/third_party/hardfloat/source/HardFloat_localFuncs.vi
+Warning:  /home/rid2/cs533.work/vortex/third_party/hardfloat/source/HardFloat_localFuncs.vi:46: PWarning:  /home/rid2/cs533.work/vortex/third_party/hWarning:  /home/rid2/cs533.work/vortex/third_party/hardfloat/source/HardFloat_localFuncs.vi:47: PWarning:  /home/rid2/cs533.work/vortex/third_party/hPresto compilation completed successfully.
+Running PRESTO HDLC
+Compiling source file /home/rid2/cs533.work/vortex/third_party/hardfloat/source/recFNToRecFN.v
+Opening include file /home/rid2/cs533.work/vortex/third_party/hardfloat/source/HardFloat_consts.vi
+Opening include file /home/rid2/cs533.work/vortex/third_party/hardfloat/source/RISCV/HardFloat_specialize.vi
+Presto compilation completed successfully.
+Running PRESTO HDLC
+Compiling source file /home/rid2/cs533.work/vortex/third_party/hardfloat/source/addRecFN.v
+Opening include file /home/rid2/cs533.work/vortex/third_party/hardfloat/source/HardFloat_consts.vOpOpening include file /home/rid2/cs533.work/vortex/third_party/hardfloat/source/RISCV/HardFloat_spOpening inclOpening include file /home/rid2/cs533.work/vortex/third_party/hardfloat/source/HardFloat_localFunOpeninWarning:  /home/rid2/cs533.work/vortex/third_party/hardfloat/source/HardFloat_localFuncs.vi:46: PWarning:  /home/rid2/cs533.work/vortex/third_party/hardfloat/source/HardFloat_localFuncs.vi:46: Port fa of type input is being assigned.  (VER-1005)
+Warning:  /home/rid2/cs533.work/vortex/third_party/hPresto compilation completed successfully.
+Running PRESTO HDLC
+Compiling source file /home/rid2/cs533.work/vortex/third_party/hardfloat/source/iNToRecFN.v
+Opening include file /home/rid2/cs533.work/vortex/third_party/hardfloat/source/HardFloat_consts.vOpOpening include file /home/rid2/cs533.work/vortex/third_party/hardfloat/source/RISCV/HardFloat_spOpening inclOpening include file /home/rid2/cs533.work/vortex/third_party/hardfloat/source/HardFloat_localFunOpeninWarning:  /home/rid2/cs533.work/vortex/third_party/hardfloat/source/HardFloat_localFuncs.vi:46: PWarning:  /home/rid2/cs533.work/vortex/third_party/hWarning:  /home/rid2/cs533.work/vortex/third_party/hardfloat/source/HardFloat_localFuncs.vi:47: PWarning:  /home/rid2/cs533.work/vortex/third_party/hOpening include file /home/rid2/cs533.work/vortex/third_party/hardfloat/source/HardFloat_localFunOpeninWarning:  /home/rid2/cs533.work/vortex/third_party/hardfloat/source/HardFloat_localFuncs.vi:46: PWarning:  /home/rid2/cs533.work/vortex/third_party/hWarning:  /home/rid2/cs533.work/vortex/third_party/hardfloat/source/HardFloat_localFuncs.vi:47: PWarning:  /home/rid2/cs533.work/vortex/third_party/hPresto compilation completed successfully.
+Running PRESTO HDLC
+Compiling source file /home/rid2/cs533.work/vortex/third_party/hardfloat/source/RISCV/HardFloat_sCompiling soPresto compilation completed successfully.
+Running PRESTO HDLC
+Compiling source file /home/rid2/cs533.work/vortex/hw/syn/synopsys/libs/sram_64x128_1r1w.v
+Warning:  /home/rid2/cs533.work/vortex/hw/syn/synopsys/libs/sram_64x128_1r1w.v:72: The construct Warning:  /home/rid2/cs533.work/vortex/hw/syn/synopsys/libs/sram_6Presto compilation completed successfully.
+Running PRESTO HDLC
+Compiling source file /home/rid2/cs533.work/vortex/hw/syn/synopsys/libs/sram_64x512_1rw.v
+Warning:  /home/rid2/cs533.work/vortex/hw/syn/synopsys/libs/sram_64x512_1rw.v:56: The construct 'Warning:  /home/rid2/cs533.work/vortex/hw/syn/synopsys/libs/sram_64x512_1rw.v:56: The construct 'specify' is not supported in synthesis; it is ignored. (VER-708)
+Warning:  /home/rid2/cs533.work/vortex/hw/syn/sPresto compilation completed successfully.
+Running PRESTO HDLC
+Compiling source file /home/rid2/cs533.work/vortex/hw/syn/synopsys/libs/sram_256x24_1r1w.v
+Warning:  /home/rid2/cs533.work/vortex/hw/syn/synopsys/libs/sram_256x24_1r1w.v:72: The construct Warning:  /home/rid2/cs533.work/vortex/hw/syn/synopsys/libs/sram_2Presto compilation completed successfully.
+Running PRESTO HDLC
+Compiling source file /home/rid2/cs533.work/vortex/hw/syn/synopsys/libs/sram_64x24_1r1w.v
+Warning:  /home/rid2/cs533.work/vortex/hw/syn/synopsys/libs/sram_64x24_1r1w.v:72: The construct 'Warning:  /home/rid2/cs533.work/vortex/hw/syn/synopsys/libs/sram_Presto compilation completed successfully.
+Running PRESTO HDLC
+Compiling source file /home/rid2/cs533.work/vortex/hw/syn/synopsys/libs/sram_256x512_1rw.v
+Warning:  /home/rid2/cs533.work/vortex/hw/syn/synopsys/libs/sram_256x512_1rw.v:56: The construct Warning:  /home/rid2/cs533.work/vortex/hw/syn/synopsys/libs/sram_256x512_1rw.v:56: The construct 'specify' is not supported in synthesis; it is ignored. (VER-708)
+Warning:  /home/rid2/cs533.work/vortex/hw/syn/syPresto compilation completed successfully.
+Running PRESTO HDLC
+Compiling source file /home/rid2/cs533.work/vortex/hw/syn/synopsys/libs/sram_1024x32_1rw.v
+Warning:  /home/rid2/cs533.work/vortex/hw/syn/synopsys/libs/sram_1024x32_1rw.v:56: The construct Warning:  /home/rid2/cs533.work/vortex/hw/syn/synopsys/libs/sram_1024x32_1rw.v:56: The construct 'specify' is not supported in synthesis; it is ignored. (VER-708)
+Warning:  /home/rid2/cs533.work/vortex/hw/syn/syPresto compilation completed successfully.
+Running PRESTO HDLC
+Compiling source file /home/rid2/cs533.work/vortex/hw/syn/synopsys/libs/sram_128x128_1r1w.v
+Warning:  /home/rid2/cs533.work/vortex/hw/syn/synopsys/libs/sram_128x128_1r1w.v:72: The constructWarning:  /home/rid2/cs533.work/vortex/hw/syn/synopsys/libs/sram_12Presto compilation completed successfully.
+Running PRESTO HDLC
+Compiling source file /home/rid2/cs533.work/vortex/hw/rtl/VX_gpu_pkg.sv
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_define.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_platform.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_scope.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_config.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_types.vh
+Presto compilation completed successfully.
+Running PRESTO HDLC
+Compiling source file /home/rid2/cs533.work/vortex/hw/rtl/VX_trace_pkg.sv
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_define.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_platform.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_scope.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_config.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_types.vh
+Presto compilation completed successfully.
+Running PRESTO HDLC
+Compiling source file /home/rid2/cs533.work/vortex/hw/rtl/fpu/VX_fpu_pkg.sv
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_define.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_platform.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_scope.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_config.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_types.vh
+Presto compilation completed successfully.
+Running PRESTO HDLC
+Compiling source file /home/rid2/cs533.work/vortex/hw/rtl/tcu/VX_tcu_pkg.sv
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_define.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_platform.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_scope.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_config.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_types.vh
+Presto compilation completed successfully.
+Running PRESTO HDLC
+Compiling source file /home/rid2/cs533.work/vortex/hw/rtl/Vortex.sv
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_define.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_platform.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_scope.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_config.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_types.vh
+Error:  /home/rid2/cs533.work/vortex/hw/rtl/Vortex.sv:161: Syntax error at or near token '161'
+	iError:  /home/rid2/cs533.work/vortex/hw/rtl/Vortex.sv:161: Syntax error at or near token '161'
+	in macro "__LINE__"
+	called from macro "BUFFER_EX" (l*** Presto compilation terminated with 1 errors. ***
+Running PRESTO HDLC
+Compiling source file /home/rid2/cs533.work/vortex/hw/rtl/VX_socket.sv
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_define.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_platform.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_scope.vh
+Opening include file /home/rOpening include file /home/rid2/cs533.workOpening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_types.vh
+Error:  /home/rid2/cs533.work/vortex/hw/rtl/VX_socket.sv:253: Syntax error at or near token '253'Error:  /home/rid2/cs533.work/vortex/hw/rtl/VX_socket.sv:253: Syntax error at or near token '253'
+	in macro "__LINE__"
+	called from macro "BUFFER_EX" (line*** Presto compilation terminated with 1 errors. ***
+Running PRESTO HDLC
+Compiling source file /home/rid2/cs533.work/vortex/hw/rtl/VX_cluster.sv
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_define.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_platform.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_scope.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_config.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_types.vh
+Error:  /home/rid2/cs533.work/vortex/hw/rtl/VX_cluster.sv:156: Syntax error at or near token '156Error:  /home/rid2/cs533.work/vortex/hw/rtl/VX_cluster.sv:156: Syntax error at or near token '156'
+	in macro "__LINE__"
+	called from macro "BUFFER_EX" (line 156)
+	called from file "/home/rid2/cs533.work/vortex/hw/rtl/VX_cluster.svCompiling source file /home/rid2/cs533.work/vortex/hw/rtl/Vortex_axi.sv
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_define.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_platform.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_scope.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_config.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_types.vh
+Presto compilation completed successfully.
+Running PRESTO HDLC
+Compiling source file /home/rid2/cs533.work/vortex/hw/rtl/interfaces/VX_warp_ctl_if.sv
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_define.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_platform.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_scope.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_config.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_types.vh
+Information:  /home/rid2/cs533.work/vortex/hw/rtl/interfaces/VX_warp_ctl_if.sv:16: List () of oneInformation:  /home/rid2/cs533.work/voPresto compilation completed successfully.
+Running PRESTO HDLC
+Compiling source file /home/rid2/cs533.work/vortex/hw/rtl/interfaces/VX_result_if.sv
+Opening inclCompiling source file /home/rid2/cs533.work/vortex/hw/rtl/Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_platform.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_scope.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_config.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_types.vh
+Information:  /home/rid2/cs533.work/vortex/hw/rtl/interfaces/VX_result_if.sv:18: List () of one, Information:  /home/rid2/cs533.work/Presto compilation completed successfully.
+Running PRESTO HDLC
+Compiling source file /home/rid2/cs533.work/vortex/hw/rtl/interfaces/VX_decode_sched_if.sv
+OpeninCompiling source file /home/rid2/cs533.work/vortex/hw/rtl/interfaces/VX_decode_sched_if.sv
+Opening include file /home/rid2/cs533.work/voOpening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_scope.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_config.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_types.vh
+Information:  /home/rid2/cs533.work/vortex/hw/rtl/interfaces/VX_decode_sched_if.sv:16: List () ofInformation:  /home/rid2/cs533.work/vortexPresto compilation completed successfully.
+Running PRESTO HDLC
+Compiling source file /home/rid2/cs533.work/vortex/hw/rtl/interfaces/VX_writeback_if.sv
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_define.vh
+Opening include file /home/Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_define.vh
+Opening include file /home/rid2/cs533.work/vOpening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_config.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_types.vh
+Information:  /home/rid2/cs533.work/vortex/hw/rtl/interfaces/VX_writeback_if.sv:16: List () of onInformation:  /home/rid2/cs533.work/vorPresto compilation completed successfully.
+Running PRESTO HDLC
+Compiling source file /home/rid2/cs533.work/vortex/hw/rtl/interfaces/VX_dispatch_if.sv
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_define.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_platform.vh
+Opening include file /homOpening include file /home/rid2/cs533.work/vOpening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_config.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_types.vh
+Information:  /home/rid2/cs533.work/vortex/hw/rtl/interfaces/VX_dispatch_if.sv:16: List () of oneInformation:  /home/rid2/cs533.work/voPresto compilation completed successfully.
+Running PRESTO HDLC
+Compiling source file /home/rid2/cs533.work/vortex/hw/rtl/interfaces/VX_ibuffer_if.sv
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_define.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_platform.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_scope.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_config.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_types.vh
+Information:  /home/rid2/cs533.work/vortex/hw/rtl/interfaces/VX_ibuffer_if.sv:16: List () of one,Information:  /home/rid2/cs533.work/vPresto compilation completed successfully.
+Running PRESTO HDLC
+Compiling source file /home/rid2/cs533.work/vortex/hw/rtl/interfaces/VX_dcr_bus_if.sv
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_define.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_platform.vh
+Opening include file /homOpening include file /home/rid2/cs533.work/vOpening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_config.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_types.vh
+Information:  /home/rid2/cs533.work/vortex/hw/rtl/interfaces/VX_dcr_bus_if.sv:16: List () of one,Information:  /home/rid2/cs533.work/vPresto compilation completed successfully.
+Running PRESTO HDLC
+Compiling source file /home/rid2/cs533.work/vortex/hw/rtl/interfaces/VX_sched_csr_if.sv
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_define.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_platform.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_scope.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_config.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_types.vh
+Information:  /home/rid2/cs533.work/vortex/hw/rtl/interfaces/VX_sched_csr_if.sv:16: List () of onInformation:  /home/rid2/cs533.work/vorPresto compilation completed successfully.
+Running PRESTO HDLC
+Compiling source file /home/rid2/cs533.work/vortex/hw/rtl/interfaces/VX_decode_if.sv
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_define.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_platform.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_scope.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_config.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_types.vh
+Information:  /home/rid2/cs533.work/vortex/hw/rtl/interfaces/VX_decode_if.sv:16: List () of one, Information:  /home/rid2/cs533.work/Presto compilation completed successfully.
+Running PRESTO HDLC
+Compiling source file /home/rid2/cs533.work/vortex/hw/rtl/interfaces/VX_commit_if.sv
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_define.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_platform.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_scope.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_config.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_types.vh
+Information:  /home/rid2/cs533.work/vortex/hw/rtl/interfaces/VX_commit_if.sv:16: List () of one, Information:  /home/rid2/cs533.work/Presto compilation completed successfully.
+Running PRESTO HDLC
+Compiling source file /home/rid2/cs533.work/vortex/hw/rtl/interfaces/VX_schedule_if.sv
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_define.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_platform.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_scope.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_config.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_types.vh
+Information:  /home/rid2/cs533.work/vortex/hw/rtl/interfaces/VX_schedule_if.sv:16: List () of oneInformation:  /home/rid2/cs533.work/voPresto compilation completed successfully.
+Running PRESTO HDLC
+Compiling source file /home/rid2/cs533.work/vortex/hw/rtl/interfaces/VX_execute_if.sv
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_define.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_platform.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_scope.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_config.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_types.vh
+Presto compilation completed successfully.
+Running PRESTO HDLC
+Compiling source file /home/rid2/cs533.work/vortex/hw/rtl/interfaces/VX_issue_sched_if.sv
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_define.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_platform.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_scope.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_config.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_types.vh
+Information:  /home/rid2/cs533.work/vortex/hw/rtl/interfaces/VX_issue_sched_if.sv:16: List () of Information:  /home/rid2/cs533.work/vortePresto compilation completed successfully.
+Running PRESTO HDLC
+Compiling source file /home/rid2/cs533.work/vortex/hw/rtl/interfaces/VX_branch_ctl_if.sv
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_define.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_platform.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_scope.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_config.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_types.vh
+Information:  /home/rid2/cs533.work/vortex/hw/rtl/interfaces/VX_branch_ctl_if.sv:16: List () of oInformation:  /home/rid2/cs533.work/vortPresto compilation completed successfully.
+Running PRESTO HDLC
+Compiling source file /home/rid2/cs533.work/vortex/hw/rtl/interfaces/VX_fetch_if.sv
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_define.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_platform.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_scope.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_config.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_types.vh
+Information:  /home/rid2/cs533.work/vortex/hw/rtl/interfaces/VX_fetch_if.sv:16: List () of one, uInformation:  /home/rid2/cs533.workPresto compilation completed successfully.
+Running PRESTO HDLC
+Compiling source file /home/rid2/cs533.work/vortex/hw/rtl/interfaces/VX_commit_csr_if.sv
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_define.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_platform.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_scope.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_config.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_types.vh
+Information:  /home/rid2/cs533.work/vortex/hw/rtl/interfaces/VX_commit_csr_if.sv:16: List () of oInformation:  /home/rid2/cs533.work/vortPresto compilation completed successfully.
+Running PRESTO HDLC
+Compiling source file /home/rid2/cs533.work/vortex/hw/rtl/interfaces/VX_scoreboard_if.sv
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_define.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_platform.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_scope.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_config.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_types.vh
+Information:  /home/rid2/cs533.work/vortex/hw/rtl/interfaces/VX_scoreboard_if.sv:16: List () of oInformation:  /home/rid2/cs533.work/vortPresto compilation completed successfully.
+Running PRESTO HDLC
+Compiling source file /home/rid2/cs533.work/vortex/hw/rtl/interfaces/VX_operands_if.sv
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_define.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_platform.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_scope.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_config.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_types.vh
+Information:  /home/rid2/cs533.work/vortex/hw/rtl/interfaces/VX_operands_if.sv:16: List () of oneInformation:  /home/rid2/cs533.work/voPresto compilation completed successfully.
+Running PRESTO HDLC
+Compiling source file /home/rid2/cs533.work/vortex/hw/rtl/interfaces/VX_commit_sched_if.sv
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_define.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_platform.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_scope.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_config.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_types.vh
+Information:  /home/rid2/cs533.work/vortex/hw/rtl/interfaces/VX_commit_sched_if.sv:16: List () ofInformation:  /home/rid2/cs533.work/vortexPresto compilation completed successfully.
+Running PRESTO HDLC
+Compiling source file /home/rid2/cs533.work/vortex/hw/rtl/core/VX_issue_slice.sv
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_define.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_platform.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_scope.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_config.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_types.vh
+Presto compilation completed successfully.
+Running PRESTO HDLC
+Compiling source file /home/rid2/cs533.work/vortex/hw/rtl/core/VX_sfu_unit.sv
+Opening include filCompiling source file /home/rid2/cs533.work/vortex/hw/rtl/core/VX_sfu_unit.sv
+Opening include file /home/rid2/cs533.work/voOpening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_scope.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_config.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_types.vh
+Presto compilation completed successfully.
+Running PRESTO HDLC
+Compiling source file /home/rid2/cs533.work/vortex/hw/rtl/core/VX_scoreboard.sv
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_define.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_platform.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_scope.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_config.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_types.vh
+Presto compilation completed successfully.
+Running PRESTO HDLC
+Compiling source file /home/rid2/cs533.work/vortex/hw/rtl/core/VX_opc_unit.sv
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_define.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_platform.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_scope.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_config.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_types.vh
+Presto compilation completed successfully.
+Running PRESTO HDLC
+Compiling source file /home/rid2/cPresto compilation completed successfully.
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_define.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_platform.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_scope.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_config.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_types.vh
+Presto compilation completed successfully.
+Running PRESTO HDLC
+Compiling source file /home/rid2/cs533.work/vortex/hw/rtl/core/VX_core.sv
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_define.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_platform.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_scope.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_config.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_types.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/fpu/VX_fpu_define.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_define.vh
+Presto compilation completed successfully.
+Running PRESTO HDLC
+Compiling source file /home/rid2/cs533.work/vortex/hw/rtl/core/VX_issue_top.sv
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_define.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_platform.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_scope.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_config.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_types.vh
+Presto compilation completed successfully.
+Running PRESTO HDLC
+Compiling source file /home/rid2/cs533.work/vortex/hw/rtl/core/VX_schedule.sv
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_define.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_platform.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_scope.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_config.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_types.vh
+Error:  /home/rid2/cs533.work/vortex/hw/rtl/core/VX_schedule.sv:104: Syntax error at or near tokeError:  /home/rid2/cs533.work/vortex/hw/rtl/core/VX_schedule.sv:104: Syntax error at or near token '104'
+	in macro "__LINE__"
+	called from macro "POP_COUNT_EX" (line 104)
+	called from macro "POP_COUNT" (line 104)
+	Error:  /home/rid2/cs533.work/vortex/hw/rtl/core/VX_schedule.sv:390: Syntax error at or near tokeError:  /home/rid2/cs533.work/vortex/hw/rtl/core/VX_schedule.sv:390: Syntax error at or near token '390'
+	in macro "__LINE__"
+	called from macro "BUFFER_EX" (line 390)
+	*** Presto compilation terminated with 2 errors. ***
+Running PRESTO HDLC
+Compiling source file /home/rid2/cs533.work/vortex/hw/rtl/core/VX_uuid_gen.sv
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_define.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_platform.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_scope.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_config.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_types.vh
+Presto compilation completed successfully.
+Running PRESTO HDLC
+Compiling source file /home/rid2/cs533.work/vortex/hw/rtl/core/VX_ibuffer.sv
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_define.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_platform.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_scope.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_config.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_types.vh
+Presto compilation completed successfully.
+Running PRESTO HDLC
+Compiling source file /home/rid2/cs533.work/vortex/hw/rtl/core/VX_dispatch_unit.sv
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_define.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_platform.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_scope.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_config.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_types.vh
+Presto compilation completed successfully.
+Running PRESTO HDLC
+Compiling source file /home/rid2/cs533.work/vortex/hw/rtl/core/VX_wctl_unit.sv
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_define.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_platform.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_scope.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_config.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_types.vh
+Error:  /home/rid2/cs533.work/vortex/hw/rtl/core/VX_wctl_unit.sv:114: Syntax error at or near tokError:  /home/rid2/cs533.work/vortex/hw/rtl/core/VX_wctl_unit.sv:114: Syntax error at or near token '114'
+	in macro "__LINE__"
+	called from macro "POP_COUNT_EX" (line 114)
+	called from macro "POP_COUNT" (line 114)
+	cError:  /home/rid2/cs533.work/vortex/hw/rtl/core/VX_wctl_unit.sv:115: Syntax error at or near tokError:  /home/rid2/cs533.work/vortex/hw/rtl/core/VX_wctl_unit.sv:115: Syntax error at or near token '115'
+	in macro "__LINE__"
+	called from macro "POP_COUNT_EX" (line 115)
+	called from macro "POP_COUNT" (line 115)
+	c*** Presto compilation terminated with 2 errors. ***
+Running PRESTO HDLC
+Compiling source file /home/rid2/cs533.work/vortex/hw/rtl/core/VX_dcr_data.sv
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_define.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_platform.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_scope.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_config.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_types.vh
+Presto compilation completed successfully.
+Running PRESTO HDLC
+Compiling source file /home/rid2/cs533.work/vortex/hw/rtl/core/VX_csr_data.sv
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_define.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_platform.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_scope.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_config.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_types.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/fpu/VX_fpu_define.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_define.vh
+Presto compilation completed successfully.
+Running PRESTO HDLC
+Compiling source file /home/rid2/cs533.work/vortex/hw/rtl/core/VX_issue.sv
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_define.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_platform.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_scope.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_config.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_types.vh
+Presto compilation completed successfully.
+Running PRESTO HDLC
+Compiling source file /home/rid2/cs533.work/vortex/hw/rtl/core/VX_lsu_unit.sv
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_define.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_platform.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_scope.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_config.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_types.vh
+Presto compilation completed successfully.
+Running PRESTO HDLC
+Compiling source file /home/rid2/cs533.work/vortex/hw/rtl/core/VX_mem_unit.sv
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_define.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_platform.vh
+Opening include file /homOpening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_platform.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_scope.vh
+Opening include file /home/rid2/cs533.workPresto compilation completed successfully.
+Running PRESTO HDLC
+Compiling source file /home/rid2/cs533.work/vortex/hw/rtl/core/VX_split_join.sv
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_define.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_platform.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_scope.vh
+Opening include file /home/rOpening include file /home/rid2/cs533.workOpening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_types.vh
+Presto compilation completed successfully.
+Running PRESTO HDLC
+Compiling source file /home/rid2/cs533.work/vortex/hw/rtl/core/VX_alu_unit.sv
+Opening include filCompiling source file /home/rid2/cs533.work/vortex/hw/rtl/core/VX_alu_unit.sv
+Opening include file /home/rid2/cs533.work/voOpening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_scope.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_config.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_types.vh
+Presto compilation completed successfully.
+Running PRESTO HDLC
+Compiling source file /home/rid2/cs533.work/vortex/hw/rtl/core/VX_fetch.sv
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_define.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_platform.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_scope.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_config.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_types.vh
+Presto compilation completed successfully.
+Running PRESTO HDLC
+Compiling source file /home/rid2/cs533.work/vortex/hw/rtl/core/VX_mem_unit_top.sv
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_define.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_platform.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_scope.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_config.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_types.vh
+Presto compilation completed successfully.
+Running PRESTO HDLC
+Compiling source file /home/rid2/cs533.work/vortex/hw/rtl/core/VX_gather_unit.sv
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_define.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_platform.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_scope.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_config.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_types.vh
+Presto compilation completed successfully.
+Running PRESTO HDLC
+Compiling source file /home/rid2/cs533.work/vortex/hw/rtl/core/VX_pe_switch.sv
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_define.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_platform.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_scope.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_config.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_types.vh
+Presto compilation completed successfully.
+Running PRESTO HDLC
+Compiling source file /home/rid2/cPresto compilation completed successfully.
+ROpening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_define.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_platform.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_scope.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_config.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_types.vh
+Presto compilation completed successfully.
+Running PRESTO HDLC
+Compiling source file /home/rid2/cs533.work/vortex/hw/rtl/core/VX_ipdom_stack.sv
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_define.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_platform.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_scope.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_config.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_types.vh
+Presto compilation completed successfully.
+Running PRESTO HDLC
+Compiling source file /home/rid2/cs533.work/vortex/hw/rtl/core/VX_commit.sv
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_define.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_platform.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_scope.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_config.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_types.vh
+Error:  /home/rid2/cs533.work/vortex/hw/rtl/core/VX_commit.sv:89: Syntax error at or near token 'Error:  /home/rid2/cs533.work/vortex/hw/rtl/core/VX_commit.sv:89: Syntax error at or near token '89'
+	in macro "__LINE__"
+	called from macro "POP_COUNT_EX" (line 89)
+	called from macro "POP_COUNT" (line 89*** Presto compilation terminated with 1 errors. ***
+Running PRESTO HDLC
+Compiling source file /home/rid2/cs533.work/vortex/hw/rtl/core/VX_uop_sequencer.sv
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_define.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_platform.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_scope.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_config.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_types.vh
+Presto compilation completed successfully.
+Running PRESTO HDLC
+Compiling source file /home/rid2/cs533.work/vortex/hw/rtl/core/VX_core_top.sv
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_define.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_platform.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_scope.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_config.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_types.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/fpu/VX_fpu_define.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_define.vh
+Presto compilation completed successfully.
+Running PRESTO HDLC
+Compiling source file /home/rid2/cs533.work/vortex/hw/rtl/core/VX_execute.sv
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_define.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_platform.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_scope.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_config.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_types.vh
+Presto compilation completed successfully.
+Running PRESTO HDLC
+Compiling source file /home/rid2/cs533.work/vortex/hw/rtl/core/VX_lsu_slice.sv
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_define.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_platform.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_scope.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_config.vh
+Opening include file /home/Opening include file /home/rid2/cs533.workPresto compilation completed successfully.
+Running PRESTO HDLC
+Compiling source file /home/rid2/cs533.work/vortex/hw/rtl/core/VX_csr_unit.sv
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_define.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_platform.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_scope.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_config.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_types.vh
+Presto compilation completed successfully.
+Running PRESTO HDLC
+Compiling source file /home/rid2/cs533.work/vortex/hw/rtl/core/VX_decode.sv
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_define.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_platform.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_scope.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_config.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_types.vh
+Presto compilation completed successfully.
+Running PRESTO HDLC
+Compiling source file /home/rid2/cs533.work/vortex/hw/rtl/core/VX_dispatch.sv
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_define.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_platform.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_scope.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_config.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_types.vh
+Presto compilation completed successfully.
+Running PRESTO HDLC
+Compiling source file /home/rid2/cs533.work/vortex/hw/rtl/core/VX_alu_muldiv.sv
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_define.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_platform.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_scope.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_config.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_types.vh
+Presto compilation completed successfully.
+Running PRESTO HDLC
+Compiling source file /home/rid2/cs533.work/vortex/hw/rtl/libs/VX_stream_pack.sv
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_platform.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_scope.vh
+Presto compilation completed successfully.
+Running PRESTO HDLC
+Compiling source file /home/rid2/cs533.work/vortex/hw/rtl/libs/VX_stream_buffer.sv
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_platform.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_scope.vh
+Presto compilation completed successfully.
+Running PRESTO HDLC
+Compiling source file /home/rid2/cs533.work/vortex/hw/rtl/libs/VX_demux.sv
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_platform.vh
+Opening include file /homOpening include file /home/rid2/cs533.work/vPresto compilation completed successfully.
+Running PRESTO HDLC
+Compiling source file /home/rid2/cs533.work/vortex/hw/rtl/libs/VX_mux.sv
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_platform.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_scope.vh
+Presto compilation completed successfully.
+Running PRESTO HDLC
+Compiling source file /home/rid2/cs533.work/vortex/hw/rtl/libs/VX_stream_unpack.sv
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_platform.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_scope.vh
+Presto compilation completed successfully.
+Running PRESTO HDLC
+Compiling source file /home/rid2/cPresto compilation completed successfully.
+RuOpening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_platform.vh
+Opening include file /homOpening include file /home/rid2/cs533.work/vPresto compilation completed successfully.
+Running PRESTO HDLC
+Compiling source file /home/rid2/cs533.work/vortex/hw/rtl/libs/VX_bits_insert.sv
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_platform.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_scope.vh
+Presto compilation completed successfully.
+Running PRESTO HDLC
+Compiling source file /home/rid2/cs533.work/vortex/hw/rtl/libs/VX_allocator.sv
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_platform.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_scope.vh
+Presto compilation completed successfully.
+Running PRESTO HDLC
+Compiling source file /home/rid2/cs533.work/vortex/hw/rtl/libs/VX_pending_size.sv
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_platform.vh
+Opening include file /homOpening include file /home/rid2/cs533.work/vPresto compilation completed successfully.
+Running PRESTO HDLC
+Compiling source file /home/rid2/cs533.work/vortex/hw/rtl/libs/VX_pipe_buffer.sv
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_platform.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_scope.vh
+Presto compilation completed successfully.
+Running PRESTO HDLC
+Compiling source file /home/rid2/cs533.work/vortex/hw/rtl/libs/VX_mem_coalescer.sv
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_platform.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_scope.vh
+Presto compilation completed successfully.
+Running PRESTO HDLC
+Compiling source file /home/rid2/cs533.work/vortex/hw/rtl/libs/VX_skid_buffer.sv
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_platform.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_scope.vh
+Presto compilation completed successfully.
+Running PRESTO HDLC
+Compiling source file /home/rid2/cs533.work/vortex/hw/rtl/libs/VX_bypass_buffer.sv
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_platform.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_scope.vh
+Presto compilation completed successfully.
+Running PRESTO HDLC
+Compiling source file /home/rid2/cs533.work/vortex/hw/rtl/libs/VX_cyclic_arbiter.sv
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_platform.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_scope.vh
+Presto compilation completed successfully.
+Running PRESTO HDLC
+Compiling source file /home/rid2/cs533.work/vortex/hw/rtl/libs/VX_elastic_buffer.sv
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_platform.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_scope.vh
+Presto compilation completed successfully.
+Running PRESTO HDLC
+Compiling source file /home/rid2/cs533.work/vortex/hw/rtl/libs/VX_mem_data_adapter.sv
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_platform.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_scope.vh
+Presto compilation completed successfully.
+Running PRESTO HDLC
+Compiling source file /home/rid2/cs533.work/vortex/hw/rtl/libs/VX_placeholder.sv
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_platform.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_scope.vh
+Presto compilation completed successfully.
+Running PRESTO HDLC
+Compiling source file /home/rid2/cs533.work/vortex/hw/rtl/libs/VX_lzc.sv
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_platform.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_scope.vh
+Presto compilation completed successfully.
+Running PRESTO HDLC
+Compiling source file /home/rid2/cs533.work/vortex/hw/rtl/libs/VX_axi_adapter.sv
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_platform.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_scope.vh
+Presto compilation completed successfully.
+Running PRESTO HDLC
+Compiling source file /home/rid2/cs533.work/vortex/hw/rtl/libs/VX_priority_arbiter.sv
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_platform.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_scope.vh
+Presto compilation completed successfully.
+Running PRESTO HDLC
+Compiling source file /home/rid2/cs533.work/vortex/hw/rtl/libs/VX_avs_adapter.sv
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_define.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_platform.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_scope.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_config.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_types.vh
+Presto compilation completed successfully.
+Running PRESTO HDLC
+Compiling source file /home/rid2/cs533.work/vortex/hw/rtl/libs/VX_serial_div.sv
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_platform.vh
+Opening include file /homOpening include file /home/rid2/cs533.work/vPresto compilation completed successfully.
+Running PRESTO HDLC
+Compiling source file /home/rid2/cs533.work/vortex/hw/rtl/libs/VX_priority_encoder.sv
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_platform.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_scope.vh
+Presto compilation completed successfully.
+Running PRESTO HDLC
+Compiling source file /home/rid2/cs533.work/vortex/hw/rtl/libs/VX_ticket_lock.sv
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_platform.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_scope.vh
+Presto compilation completed successfully.
+Running PRESTO HDLC
+Compiling source file /home/rid2/cs533.work/vortex/hw/rtl/libs/VX_find_first.sv
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_platform.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_scope.vh
+Presto compilation completed successfully.
+Running PRESTO HDLC
+Compiling source file /home/rid2/cs533.work/vortex/hw/rtl/libs/VX_mem_bank_adapter.sv
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_platform.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_scope.vh
+Presto compilation completed successfully.
+Running PRESTO HDLC
+Compiling source file /home/rid2/cs533.work/vortex/hw/rtl/libs/VX_scope_switch.sv
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_platform.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_scope.vh
+Presto compilation completed successfully.
+Running PRESTO HDLC
+Compiling source file /home/rid2/cs533.work/vortex/hw/rtl/libs/VX_async_ram_patch.sv
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_platform.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_scope.vh
+Warning:  Little argument or return value checking implemented for system task or function '$readWarning:  Little Warning:  /home/rid2/cs533.work/vortex/hw/rtl/libs/VX_async_ram_patch.sv:174: Unsupported system Warning:  /home/rid2/cs533.work/vortex/hw/rtl/libs/VX_async_ram_patch.sv:174: Unsupported system task '$readmemh' will be ignored for synthesis. (VER-274)
+Warning:  /home/rid2/cs533.work/vortex/hw/rtl/libs/VX_async_ram_patch.sv:178: Unsupported system task '$readmemh' will be ignored for synthesis. (VER-274)
+Warning:  /home/rid2/cs533.work/vortex/hw/rtl/libs/VX_async_ram_patch.sv:184: Unsupported system task '$readmemh' will be ignored for synthesis. (VER-274)
+Warning:  /home/rid2/cs533.work/vortex/hw/rtl/libs/VX_async_ram_patch.sv:188: Unsupported system task '$readmemh' will be ignored for synthesis. (VER-274)
+Warning:  /home/rid2/cs533.work/vortex/hw/rtl/libs/VX_async_ram_patch.sv:196: Unsupported system task '$readmemh' will be ignored for synthesis. (VER-274)
+Warning:  /home/rid2/cs533.work/vortex/hw/rtl/libs/VX_async_ram_patch.sv:200: Unsupported system task '$readmemh' will be ignored for synthesis. (VER-274)
+Warning:  /home/rid2/cs533.work/vortex/hw/rtl/libs/VX_async_ram_patch.sv:206: Unsupported system task '$readmemh' will be ignored for synthesis. (VER-274)
+Warning:  /home/rid2/cs533.work/vortex/hw/rtl/libs/VX_async_ram_patch.sv:210: Unsupported system task '$readmemh' will be ignored for synthesis. (VER-274)
+Warning:  /home/rid2/cs533.work/vortex/hw/rtl/libs/VX_async_ram_patch.sv:232: Unsupported system task '$readmemh' will be ignored for synthesis. (VER-274)
+Warning:  /home/rid2/cs533.work/vortex/hw/rtl/libs/VX_async_ram_patch.sv:236: Unsupported system task '$readmemh' will be ignored for synthesis. (VER-274)
+Warning:  /home/rid2/cs533.work/vortex/hw/rtl/libs/VX_async_ram_patch.sv:242: Unsupported system task '$readmemh' will be ignored for synthesis. (VER-274)
+Warning:  /home/rid2/cs533.work/vortex/hw/rtl/libs/VX_async_ram_patch.sv:246: Unsupported system task '$readmemh' will be ignored for synthesis. (VER-274)
+Warning:  /home/rid2/cs533.work/vortex/hw/rtl/libs/VX_async_ram_patch.sv:254: Unsupported system task '$readmemh' will be ignored for synthesis. (VER-274)
+Warning:  /home/rid2/cs533.work/vortex/hw/rtl/libs/VX_async_ram_patch.sv:258: Unsupported system task '$readmemh' will be ignored for synthesis. (VER-274)
+Warning:  /home/rid2/cs533.work/vortex/hw/rtl/libs/VX_async_ram_patch.sv:264: Unsupported system task '$readmemh' will be ignored for synthesis. (VER-274)
+Warning:  /home/rid2/cs533.work/vortex/hw/rtl/libs/VX_asynPresto compilation completed successfully.
+Running PRESTO HDLC
+Compiling source file /home/rid2/cs533.work/vortex/hw/rtl/libs/VX_stream_xbar.sv
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_define.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_platform.vh
+Opening include file /homOpening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_platform.vh
+Opening include file /home/rid2/cs533.workOpening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_types.vh
+Error:  /home/rid2/cs533.work/vortex/hw/rtl/libs/VX_stream_xbar.sv:220: Syntax error at or near tError:  /home/rid2/cs533.work/vortex/hw/rtl/libs/VX_stream_xbar.sv:220: Syntax error at or near token '220'
+	in macro "__LINE__"
+	called from macro "BUFFER_EX" (line 220)
+	called from macro "BUFFER" (line 220)
+	called from file "/home/rid2/cs533.work/vortex/hw/rtl/libs/VX_stream_xbar.sv" (line 220). (VER-294)
+Error:  /home/rid2/cs533.work/vortex/hw/rtl/libs/VX_stream_xbar.sv:221: Syntax error at or near token '221'
+	in macro "__LINE__"
+	called from macro "POP_COUNT_EX" (line 221)
+	called from macro "POP_COUNT" (line 221)
+	called from file "/home/rid2/cs533.work/vortex/hw/rtl/liRunning PRESTO HDLC
+Compiling source file /home/rid2/cs533.work/vortex/hw/rtl/libs/VX_divider.sv
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_platform.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_scope.vh
+Presto compilation completed successfully.
+Running PRESTO HDLC
+Compiling source file /home/rid2/cs533.work/vortex/hw/rtl/libs/VX_generic_arbiter.sv
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_platform.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_scope.vh
+Presto compilation completed successfully.
+Running PRESTO HDLC
+Compiling source file /home/rid2/cs533.work/vortex/hw/rtl/libs/VX_serial_mul.sv
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_platform.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_scope.vh
+Presto compilation completed successfully.
+Running PRESTO HDLC
+Compiling source file /home/rid2/cs533.work/vortex/hw/rtl/libs/VX_sp_ram.sv
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_platform.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_scope.vh
+Warning:  Little argument or return value checking implemented for system task or function '$readWarning:  Little Warning:  /home/rid2/cs533.work/vortex/hw/rtl/libs/VX_sp_ram.sv:246: Unsupported system task '$reWarning:  /home/rid2/cs533.work/vortex/hw/rtl/libWarning:  /home/rid2/cs533.work/vortex/hw/rtl/libs/VX_sp_ram.sv:257: Unsupported system task '$reWarning:  /home/rid2/cs533.work/vortex/hw/rtl/libs/VX_sp_ram.sv:257: Unsupported system task '$readmemh' will be ignored for synthesis. (VER-274)
+Warning:  /home/rid2/cs533.work/vortex/hw/rtl/libs/VX_sp_ram.sv:274: Unsupported system task '$readmemh' will be ignored for synthesis. (VER-274)
+Warning:  /home/rid2/cs533.work/vortex/hw/rtl/libs/VX_sp_ram.sv:285: Unsupported system task '$readmemh' will be ignored for synthesis. (VER-274)
+Warning:  /home/rid2/cs533.work/vortex/hw/rtl/libs/VX_sp_ram.sv:298: Unsupported system task '$readmemh' will be ignored for synthesis. (VER-274)
+Warning:  /home/rid2/cs533.work/vortex/hw/rtl/libs/VX_sp_ram.sv:309: Unsupported system task '$readmemh' will be ignored for synthesis. (VER-274)
+Warning:  /home/rid2/cs533.work/vortex/hw/rtl/libs/VX_sp_ram.sv:352: Unsupported system task '$readmemh' will be ignored for synthesis. (VER-274)
+Warning:  /home/rid2/cs533.work/vortex/hw/rtl/libs/VX_sp_ram.sv:359: Unsupported system task '$readmemh' will be ignored for synthesis. (VER-274)
+Warning:  /home/rid2/cs533.work/vortex/hw/rtl/libs/VX_sp_ram.sv:368: Unsupported system task '$readmemh' will be ignored for synthesis. (VER-274)
+Warning:  /home/rid2/cs533.work/vortex/hw/rtl/libs/VX_sp_ram.sv:375: Unsupported system task '$readmemh' will be ignored for synthesis. (VER-274)
+Warning:  /home/rid2/cs533.work/vortex/hw/rtl/libWarning:  /home/rid2/cs533.work/vortex/hw/rtl/libs/VX_sp_ram.sv:394: Unsupported system task '$reWarning:  /home/rid2/cs533.work/vortex/hw/rtl/libWarning:  /home/rid2/cs533.work/vortex/hw/rtl/libs/VX_sp_ram.sv:403: Unsupported system task '$reWarning:  /home/rid2/cs533.work/vortex/hw/rtl/libs/VX_sp_ram.sv:403: Unsupported system task '$readmemh' will be ignored for synthesis. (VER-274)
+Warning:  /home/rid2/cs533.work/vortex/hw/rtl/libPresto compilation completed successfully.
+Running PRESTO HDLC
+Compiling source file /home/rid2/cs533.work/vortex/hw/rtl/libs/VX_shift_register.sv
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_platform.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_scope.vh
+Presto compilation completed successfully.
+Running PRESTO HDLC
+Compiling source file /home/rid2/cs533.work/vortex/hw/rtl/libs/VX_matrix_arbiter.sv
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_platform.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_scope.vh
+Presto compilation completed successfully.
+Running PRESTO HDLC
+Compiling source file /home/rid2/cs533.work/vortex/hw/rtl/libs/VX_pe_serializer.sv
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_platform.vh
+Opening include file /homOpening include file /home/rid2/cs533.work/vPresto compilation completed successfully.
+Running PRESTO HDLC
+Compiling source file /home/rid2/cs533.work/vortex/hw/rtl/libs/VX_pipe_register.sv
+Opening includCompiling source file /home/rid2/cs533.work/vortex/hw/rtl/Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_scope.vh
+Presto compilation completed successfully.
+Running PRESTO HDLC
+Compiling source file /home/rid2/cs533.work/vortex/hw/rtl/libs/VX_edge_trigger.sv
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_platform.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_scope.vh
+Presto compilation completed successfully.
+Running PRESTO HDLC
+Compiling source file /home/rid2/cs533.work/vortex/hw/rtl/libs/VX_dp_ram.sv
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_platform.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_scope.vh
+Warning:  Little argument or return value checking implemented for system task or function '$readWarning:  Little Warning:  /home/rid2/cs533.work/vortex/hw/rtl/libs/VX_dp_ram.sv:243: Unsupported system task '$reWarning:  /home/rid2/cs533.work/vortex/hw/rtl/libWarning:  /home/rid2/cs533.work/vortex/hw/rtl/libs/VX_dp_ram.sv:254: Unsupported system task '$reWarning:  /home/rid2/cs533.work/vortex/hw/rtl/libs/VX_dp_ram.sv:254: Unsupported system task '$readmemh' will be ignored for synthesis. (VER-274)
+Warning:  /home/rid2/cs533.work/vortex/hw/rtl/libs/VX_dp_ram.sv:267: Unsupported system task '$readmemh' will be ignored for synthesis. (VER-274)
+Warning:  /home/rid2/cs533.work/vortex/hw/rtl/libs/VX_dp_ram.sv:278: Unsupported system task '$readmemh' will be ignored for synthesis. (VER-274)
+Warning:  /home/rid2/cs533.work/vortex/hw/rtl/libs/VX_dp_ram.sv:321: Unsupported system task '$readmemh' will be ignored for synthesis. (VER-274)
+Warning:  /home/rid2/cs533.work/vortex/hw/rtl/libs/VX_dp_ram.sv:328: Unsupported system task '$readmemh' will be ignored for synthesis. (VER-274)
+Warning:  /home/rid2/cs533.work/vortex/hw/rtl/libs/VX_dp_ram.sv:337: Unsupported system task '$readmemh' will be ignored for synthesis. (VER-274)
+Warning:  /home/rid2/cs533.work/vortex/hw/rtl/libs/VX_dp_ram.sv:344: Unsupported system task '$readmemh' will be ignored for synthesis. (VER-274)
+Warning:  /home/rid2/cs533.work/vortex/hw/rtl/libs/VX_dp_ram.sv:356: Unsupported system task '$readmemh' will be ignored for synthesis. (VER-274)
+Warning:  /home/rid2/cs533.work/vortex/hw/rtl/libs/VX_dp_ram.sv:363: Unsupported system task '$readmemh' will be ignored for synthesis. (VER-274)
+Warning:  /home/rid2/cs533.work/vortex/hw/rtl/libs/VX_dp_ram.sv:372: Unsupported system task '$readmemh' will be ignored for synthesis. (VER-274)
+Warning:  /home/rid2/cs533.work/vortex/hw/rtl/libPresto compilation completed successfully.
+Running PRESTO HDLC
+Compiling source file /home/rid2/cs533.work/vortex/hw/rtl/libs/VX_popcount.sv
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_platform.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_scope.vh
+Presto compilation completed successfully.
+Running PRESTO HDLC
+Compiling source file /home/rid2/cs533.work/vortex/hw/rtl/libs/VX_multiplier.sv
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_platform.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_scope.vh
+Presto compilation completed successfully.
+Running PRESTO HDLC
+Compiling source file /home/rid2/cs533.work/vortex/hw/rtl/libs/VX_bits_remove.sv
+Opening include Compiling source file /home/rid2/cs533.work/vortex/hw/rtl/libs/VX_bits_remove.sv
+Opening include file /home/rid2/cs533.work/vPresto compilation completed successfully.
+Running PRESTO HDLC
+Compiling source file /home/rid2/cs533.work/vortex/hw/rtl/libs/VX_transpose.sv
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_platform.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_scope.vh
+Presto compilation completed successfully.
+Running PRESTO HDLC
+Compiling source file /home/rid2/cs533.work/vortex/hw/rtl/libs/VX_bits_concat.sv
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_platform.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_scope.vh
+Presto compilation completed successfully.
+Running PRESTO HDLC
+Compiling source file /home/rid2/cs533.work/vortex/hw/rtl/libs/VX_onehot_encoder.sv
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_platform.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_scope.vh
+Presto compilation completed successfully.
+Running PRESTO HDLC
+Compiling source file /home/rid2/cs533.work/vortex/hw/rtl/libs/VX_reset_relay.sv
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_platform.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_scope.vh
+Presto compilation completed successfully.
+Running PRESTO HDLC
+Compiling source file /home/rid2/cs533.work/vortex/hw/rtl/libs/VX_stream_switch.sv
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_platform.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_scope.vh
+Presto compilation completed successfully.
+Running PRESTO HDLC
+Compiling source file /home/rid2/cs533.work/vortex/hw/rtl/libs/VX_reduce_tree.sv
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_platform.vh
+Opening include file /homOpening include file /home/rid2/cs533.work/vPresto compilation completed successfully.
+Running PRESTO HDLC
+Compiling source file /home/rid2/cs533.work/vortex/hw/rtl/libs/VX_scan.sv
+Opening include file /hCompiling source file /home/rid2/cs533.work/vort
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_scope.vh
+Presto compilation completed successfully.
+Running PRESTO HDLC
+Compiling source file /home/rid2/cs533.work/vortex/hw/rtl/libs/VX_nz_iterator.sv
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_platform.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_scope.vh
+Presto compilation completed successfully.
+Running PRESTO HDLC
+Compiling source file /home/rid2/cs533.work/vortex/hw/rtl/libs/VX_axi_write_ack.sv
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_platform.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_scope.vh
+Presto compilation completed successfully.
+Running PRESTO HDLC
+Compiling source file /home/rid2/cs533.work/vortex/hw/rtl/libs/VX_rr_arbiter.sv
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_platform.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_scope.vh
+Presto compilation completed successfully.
+Running PRESTO HDLC
+Compiling source file /home/rid2/cs533.work/vortex/hw/rtl/libs/VX_onehot_mux.sv
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_platform.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_scope.vh
+Presto compilation completed successfully.
+Running PRESTO HDLC
+Compiling source file /home/rid2/cs533.work/vortex/hw/rtl/libs/VX_mem_scheduler.sv
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_platform.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_scope.vh
+Presto compilation completed successfully.
+Running PRESTO HDLC
+Compiling source file /home/rid2/cs533.work/vortex/hw/rtl/libs/VX_index_queue.sv
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_platform.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_scope.vh
+Presto compilation completed successfully.
+Running PRESTO HDLC
+Compiling source file /home/rid2/cs533.work/vortex/hw/rtl/libs/VX_index_buffer.sv
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_platform.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_scope.vh
+Presto compilation completed successfully.
+Running PRESTO HDLC
+Compiling source file /home/rid2/cs533.work/vortex/hw/rtl/libs/VX_toggle_buffer.sv
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_platform.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_scope.vh
+Presto compilation completed successfully.
+Running PRESTO HDLC
+Compiling source file /home/rid2/cs533.work/vortex/hw/rtl/libs/VX_stream_omega.sv
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_define.vh
+Opening include file /home/Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_define.vh
+Opening include file /home/rid2/cs533.work/vOpening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_config.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_types.vh
+Error:  /home/rid2/cs533.work/vortex/hw/rtl/libs/VX_stream_omega.sv:200: Syntax error at or near Error:  /home/rid2/cs533.work/vortex/hw/rtl/libs/VX_stream_omega.sv:200: Syntax error at or near token '200'
+	in macro "__LINE__"
+	called from macro "BUFFER_EX" (line 200)
+	called from macro "BUFFER" (line 200)
+	callError:  /home/rid2/cs533.work/vortex/hw/rtl/libs/VX_stream_omega.sv:201: Syntax error at or near Error:  /home/rid2/cs533.work/vortex/hw/rtl/libs/VX_stream_omega.sv:201: Syntax error at or near token '201'
+	in macro "__LINE__"
+	called from macro "POP_COUNT_EX" (line 201)
+	called from macro "POP_COUNT" (line 201)
+	call*** Presto compilation terminated with 2 errors. ***
+Running PRESTO HDLC
+Compiling source file /home/rid2/cs533.work/vortex/hw/rtl/libs/VX_onehot_shift.sv
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_platform.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_scope.vh
+Presto compilation completed successfully.
+Running PRESTO HDLC
+Compiling source file /home/rid2/cs533.work/vortex/hw/rtl/libs/VX_stream_xpoint.sv
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_platform.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_scope.vh
+Presto compilation completed successfully.
+Running PRESTO HDLC
+Compiling source file /home/rid2/cs533.work/vortex/hw/rtl/libs/VX_stream_arb.sv
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_platform.vh
+Opening include file /homOpening include file /home/rid2/cs533.work/vPresto compilation completed successfully.
+Running PRESTO HDLC
+Compiling source file /home/rid2/cs533.work/vortex/hw/rtl/libs/VX_fifo_queue.sv
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_platform.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_scope.vh
+Presto compilation completed successfully.
+Running PRESTO HDLC
+Compiling source file /home/rid2/cs533.work/vortex/hw/rtl/libs/VX_elastic_adapter.sv
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_platform.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_scope.vh
+Presto compilation completed successfully.
+Running PRESTO HDLC
+Compiling source file /home/rid2/cs533.work/vortex/hw/rtl/fpu/VX_fpu_csr_if.sv
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/fpu/VX_fpu_define.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_define.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_platform.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_scope.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_config.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_types.vh
+Information:  /home/rid2/cs533.work/vortex/hw/rtl/fpu/VX_fpu_csr_if.sv:16: List () of one, unnameInformation:  /home/rid2/cs533Presto compilation completed successfully.
+Running PRESTO HDLC
+Compiling source file /home/rid2/cs533.work/vortex/hw/rtl/fpu/VX_fpu_unit.sv
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/fpu/VX_fpu_define.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_define.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_platform.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_scope.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_config.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_types.vh
+Presto compilation completed successfully.
+Running PRESTO HDLC
+Compiling source file /home/rid2/cs533.work/vortex/hw/rtl/fpu/VX_fpu_ncp.sv
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/fpu/VX_fpu_define.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_define.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_platform.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_scope.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_config.vh
+Opening include file /home/Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_config.vh
+Opening include file /home/rid2/cs5Compiling source file /home/rid2/cs533.work/vortex/hw/rtl/fpu/VX_fcvt_unit.sv
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/fpu/VX_fpu_define.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_define.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_platform.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_scope.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_config.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_types.vh
+Presto compilation completed successfully.
+Running PRESTO HDLC
+Compiling source file /home/rid2/cs533.work/vortex/hw/rtl/fpu/VX_fp_rounding.sv
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/fpu/VX_fpu_define.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_define.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_platform.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_scope.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_config.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_types.vh
+Presto compilation completed successfully.
+Running PRESTO HDLC
+Compiling source file /home/rid2/cs533.work/vortex/hw/rtl/fpu/VX_fp_classifier.sv
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/fpu/VX_fpu_define.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_define.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_platform.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_scope.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_config.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_types.vh
+Presto compilation completed successfully.
+Running PRESTO HDLC
+Compiling source file /home/rid2/cs533.work/vortex/hw/rtl/fpu/VX_fpu_cvt.sv
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/fpu/VX_fpu_define.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_define.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_platform.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_scope.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_config.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_types.vh
+Presto compilation completed successfully.
+Running PRESTO HDLC
+Compiling source file /home/rid2/cs533.work/vortex/hw/rtl/fpu/VX_fpu_dpi.sv
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/fpu/VX_fpu_define.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_define.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_platform.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_scope.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_config.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_types.vh
+Presto compilation completed successfully.
+Running PRESTO HDLC
+Compiling source file /home/rid2/cs533.work/vortex/hw/rtl/fpu/VX_fpu_dsp.sv
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/fpu/VX_fpu_define.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_define.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_platform.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_scope.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_config.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_types.vh
+Presto compilation completed successfully.
+Running PRESTO HDLC
+Compiling source file /home/rid2/cs533.work/vortex/hw/rtl/fpu/VX_fncp_unit.sv
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/fpu/VX_fpu_define.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_define.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_platform.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_scope.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_config.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_types.vh
+Presto compilation completed successfully.
+Running PRESTO HDLC
+Compiling source file /home/rid2/cs533.work/vortex/hw/rtl/fpu/VX_fpu_sqrt.sv
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/fpu/VX_fpu_define.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_define.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_platform.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_scope.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_config.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_types.vh
+Presto compilation completed successfully.
+Running PRESTO HDLC
+Compiling source file /home/rid2/cs533.work/vortex/hw/rtl/fpu/VX_fpu_fma.sv
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/fpu/VX_fpu_define.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_define.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_platform.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_scope.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_config.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_types.vh
+Presto compilation completed successfully.
+Running PRESTO HDLC
+Compiling source file /home/rid2/cs533.work/vortex/hw/rtl/fpu/VX_fpu_div.sv
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/fpu/VX_fpu_define.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_define.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_platform.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_scope.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_config.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_types.vh
+Presto compilation completed successfully.
+Running PRESTO HDLC
+Compiling source file /home/rid2/cs533.work/vortex/hw/rtl/fpu/VX_fpu_fpnew.sv
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/fpu/VX_fpu_define.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_define.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_platform.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_scope.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_config.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_types.vh
+Error:  /home/rid2/cs533.work/vortex/hw/rtl/fpu/VX_fpu_fpnew.sv:22: Unable to open file `cf_math_Error:  /home/rid2/cs533.work/vortex/hw/rtl/fpu/VX_fpu_fpnew.sv:22: Unable to open file `cf_math_pkg.pvk': in search_path {/home/rid2/cs533.work/vortex/hw/syn/synopsys /home/rid2/cs533.work/vortex/hw/syn/synopsys . /software/Synopsys-2024_x86_64/syn/W-2024.09/libraries/syn /software/Synopsys-2024_x86_64/syn/W-2024.09/dw/syn_ver /software/Synopsys-2024_x86_64/syn/W-2024.09/dw/sim_ver /home/rid2/cs533.work/vortex/third_party/cvfpu/src /home/rid2/cs533.work/vortex/third_party/hardfloat/source /home/rid2/cs533.work/vortex/third_party/hardfloat/source/RISCV /home/rid2/cs533.work/vortex/hw/syn/synopsys/libs /home/rid2/cs533.work/vortex/hw/rtl /home/rid2/cs533.work/vortex/hw/rtl/interfaces /home/rid2/cs533.work/vortex/hw/rtl/core /home/rid2/cs533.work/vortex/hw/rtl/libs /home/rid2/cs533.work/vortex/hw/rtl/fpu /home/rid2/cs533.work/vortex/hw/rtl/mem /home/rid2/cs533.work/vortex/hw/rtl/cache /home/rid2/cs533.work/vortex/hw/rtl/tcu /home/rid2/cs533.work/vortex/hw/rtl/tcu/bhf}. (VER-292)
+Error:  /home/rid2/cs533.work/vortex/hw/rtl/fpu/VX_fpu_fpneError:  /home/rid2/cs533.work/vortex/hw/rtl/fpu/VX_fpu_fpnew.sv:23: Unable to open file `defs_divError:  /home/rid2/cs533.work/vortex/hw/rtl/fpu/VX_fpu_fpnew.sv:23: Unable to open file `defs_div_sqrt_mvp.pvk': in search_path {/home/rid2/cs533.work/vortex/hw/syn/synopsys /home/rid2/cs533.work/vortex/hw/syn/synopsys . /software/Synopsys-2024_x86_64/syn/W-2024.09/libraries/syn /software/Synopsys-2024_x86_64/syn/W-2024.09/dw/syn_ver /software/Synopsys-2024_x86_64/syn/W-2024.09/dw/sim_ver /home/rid2/cs533.work/vortex/third_party/cvfpu/src /home/rid2/cs533.work/vortex/third_party/hardfloat/source /home/rid2/cs533.work/vortex/third_party/hardfloat/source/RISCV /home/rid2/cs533.work/vortex/hw/syn/synopsys/libs /home/rid2/cs533.work/vortex/hw/rtl /home/rid2/cs533.work/vortex/hw/rtl/interfaces /home/rid2/cs533.work/vortex/hw/rtl/core /home/rid2/cs533.work/vortex/hw/rtl/libs /home/rid2/cs533.work/vortex/hw/rtl/fpu /home/rid2/cs533.work/vortex/hw/rtl/mem /home/rid2/cs533.work/vortex/hw/rtl/cacheError:  /home/rid2/cs533.work/vortex/hw/rtl/fpu/VX_fpu_fpnew.sv:23: Package 'defs_div_sqrt_mvp' hError:  /home/rid2/cs533.work/vortex/hw/rtl/fpu/VX_fpu_fpnew.sv:2*** Presto compilation terminated with 4 errors. ***
+Running PRESTO HDLC
+Compiling source file /home/rid2/cs533.work/vortex/hw/rtl/mem/VX_mem_arb.sv
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_define.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_platform.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_scope.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_config.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_types.vh
+Presto compilation completed successfully.
+Running PRESTO HDLC
+Compiling source file /home/rid2/cs533.work/vortex/hw/rtl/mem/VX_mem_switch.sv
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_define.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_platform.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_scope.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_config.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_types.vh
+Presto compilation completed successfully.
+Running PRESTO HDLC
+Compiling source file /home/rid2/cs533.work/vortex/hw/rtl/mem/VX_lsu_adapter.sv
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_define.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_platform.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_scope.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_config.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_types.vh
+Presto compilation completed successfully.
+Running PRESTO HDLC
+Compiling source file /home/rid2/cs533.work/vortex/hw/rtl/mem/VX_gbar_unit.sv
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_define.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_platform.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_scope.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_config.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_types.vh
+Error:  /home/rid2/cs533.work/vortex/hw/rtl/mem/VX_gbar_unit.sv:30: Syntax error at or near tokenError:  /home/rid2/cs533.work/vortex/hw/rtl/mem/VX_gbar_unit.sv:30: Syntax error at or near token '30'
+	in macro "__LINE__"
+	called from macro "POP_COUNT_EX" (line 30)
+	called from macro "POP_COUNT" (line 30)
+*** Presto compilation terminated with 1 errors. ***
+Running PRESTO HDLC
+Compiling source file /home/rid2/cs533.work/vortex/hw/rtl/mem/VX_lsu_mem_if.sv
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_define.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_platform.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_scope.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_config.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_types.vh
+Information:  /home/rid2/cs533.work/vortex/hw/rtl/mem/VX_lsu_mem_if.sv:23: List () of one, unnameInformation:  /home/rid2/cs533Presto compilation completed successfully.
+Running PRESTO HDLC
+Compiling source file /home/rid2/cs533.work/vortex/hw/rtl/mem/VX_lsu_mem_arb.sv
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_define.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_platform.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_scope.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_config.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_types.vh
+Presto compilation completed successfully.
+Running PRESTO HDLC
+Compiling source file /home/rid2/cs533.work/vortex/hw/rtl/mem/VX_gbar_bus_if.sv
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_define.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_platform.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_scope.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_config.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_types.vh
+Information:  /home/rid2/cs533.work/vortex/hw/rtl/mem/VX_gbar_bus_if.sv:16: List () of one, unnamInformation:  /home/rid2/cs533.Presto compilation completed successfully.
+Running PRESTO HDLC
+Compiling source file /home/rid2/cs533.work/vortex/hw/rtl/mem/VX_local_mem.sv
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_define.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_platform.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_scope.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_config.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_types.vh
+Presto compilation completed successfully.
+Running PRESTO HDLC
+Compiling source file /home/rid2/cs533.work/vortex/hw/rtl/mem/VX_local_mem_top.sv
+Opening includeCompiling source file /home/rid2/cs533.work/vortex/hw/rOpening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_platform.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_scope.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_config.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_types.vh
+Presto compilation completed successfully.
+Running PRESTO HDLC
+Compiling source file /home/rid2/cs533.work/vortex/hw/rtl/mem/VX_lmem_switch.sv
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_define.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_platform.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_scope.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_config.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_types.vh
+Presto compilation completed successfully.
+Running PRESTO HDLC
+Compiling source file /home/rid2/cs533.work/vortex/hw/rtl/mem/VX_gbar_arb.sv
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_define.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_platform.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_scope.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_config.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_types.vh
+Presto compilation completed successfully.
+Running PRESTO HDLC
+Compiling source file /home/rid2/cs533.work/vortex/hw/rtl/mem/VX_mem_bus_if.sv
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_define.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_platform.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_scope.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_config.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_types.vh
+Information:  /home/rid2/cs533.work/vortex/hw/rtl/mem/VX_mem_bus_if.sv:22: List () of one, unnameInformation:  /home/rid2/cs533Presto compilation completed successfully.
+Running PRESTO HDLC
+Compiling source file /home/rid2/cs533.work/vortex/hw/rtl/cache/VX_cache_tags.sv
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/cache/VX_cache_define.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_define.vh
+Opening include file /home/Opening include file /home/rid2/cs533.work/voOpening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_scope.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_config.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_types.vh
+Error:  /home/rid2/cs533.work/vortex/hw/rtl/cache/VX_cache_tags.sv:84: Syntax error at or near toError:  /home/rid2/cs533.work/vortex/hw/rtl/cache/VX_cache_tags.sv:84: Syntax error at or near token '84'
+	in macro "__LINE__"
+	called from macro "BUFFER_EX" (line 84)
+	called from macro "BUFFER" (line 84)
+	caError:  /home/rid2/cs533.work/vortex/hw/rtl/cache/VX_cache_tags.sv:85: Syntax error at or near toError:  /home/rid2/cs533.work/vortex/hw/rtl/cache/VX_cache_tags.sv:85: Syntax error at or near token '85'
+	in macro "__LINE__"
+	called from macro "BUFFER_EX" (line 85)
+	called from macro "BUFFER" (line 85)
+	ca*** Presto compilation terminated with 2 errors. ***
+Running PRESTO HDLC
+Compiling source file /home/rid2/cs533.work/vortex/hw/rtl/cache/VX_cache_bypass.sv
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/cache/VX_cache_define.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_define.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_platform.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_scope.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_config.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_types.vh
+Presto compilation completed successfully.
+Running PRESTO HDLC
+Compiling source file /home/rid2/cs533.work/vortex/hw/rtl/cache/VX_cache_init.sv
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/cache/VX_cache_define.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_define.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_platform.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_scope.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_config.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_types.vh
+Error:  /home/rid2/cs533.work/vortex/hw/rtl/cache/VX_cache_init.sv:62: Syntax error at or near toError:  /home/rid2/cs533.work/vortex/hw/rtl/cache/VX_cache_init.sv:62: Syntax error at or near token '62'
+	in macro "__LINE__"
+	called from macro "POP_COUNT_EX" (line 62)
+	called from macro "POP_COUNT" (line 62)
+	caError:  /home/rid2/cs533.work/vortex/hw/rtl/cache/VX_cache_init.sv:63: Syntax error at or near toError:  /home/rid2/cs533.work/vortex/hw/rtl/cache/VX_cache_init.sv:63: Syntax error at or near token '63'
+	in macro "__LINE__"
+	called from macro "POP_COUNT_EX" (line 63)
+	called from macro "POP_COUNT" (line 63)
+	ca*** Presto compilation terminated with 2 errors. ***
+Running PRESTO HDLC
+Compiling source file /home/rid2/cs533.work/vortex/hw/rtl/cache/VX_cache_data.sv
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/cache/VX_cache_define.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_define.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_platform.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_scope.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_config.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_types.vh
+Presto compilation completed successfully.
+Running PRESTO HDLC
+Compiling source file /home/rid2/cs533.work/vortex/hw/rtl/cache/VX_cache_mshr.sv
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/cache/VX_cache_define.vh
+Opening includeOpening include file /home/rid2/cs533.work/vortex/hw/rtOpening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_platform.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_scope.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_config.vh
+Opening include file /home/Opening include file /home/rid2/cs533.workPresto compilation completed successfully.
+Running PRESTO HDLC
+Compiling source file /home/rid2/cs533.work/vortex/hw/rtl/cache/VX_cache_bank.sv
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/cache/VX_cache_define.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_define.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_platform.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_scope.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_config.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_types.vh
+Error:  /home/rid2/cs533.work/vortex/hw/rtl/cache/VX_cache_bank.sv:482: Syntax error at or near tError:  /home/rid2/cs533.work/vortex/hw/rtl/cache/VX_cache_bank.sv:482: Syntax error at or near token '482'
+	in macro "__LINE__"
+	called from macro "POP_COUNT_EX" (line 482)
+	called from macro "POP_COUNT" (line 482)
+	cal*** Presto compilation terminated with 1 errors. ***
+Running PRESTO HDLC
+Compiling source file /home/rid2/cs533.work/vortex/hw/rtl/cache/VX_cache_wrap.sv
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/cache/VX_cache_define.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_define.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_platform.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_scope.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_config.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_types.vh
+Presto compilation completed successfully.
+Running PRESTO HDLC
+Compiling source file /home/rid2/cs533.work/vortex/hw/rtl/cache/VX_cache_cluster.sv
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/cache/VX_cache_define.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_define.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_platform.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_scope.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_config.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_types.vh
+Presto compilation completed successfully.
+Running PRESTO HDLC
+Compiling source file /home/rid2/cs533.work/vortex/hw/rtl/cache/VX_cache_repl.sv
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/cache/VX_cache_define.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_define.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_platform.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_scope.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_config.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_types.vh
+Presto compilation completed successfully.
+Running PRESTO HDLC
+Compiling source file /home/rid2/cs533.work/vortex/hw/rtl/cache/VX_cache_flush.sv
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/cache/VX_cache_define.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_define.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_platform.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_scope.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_config.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_types.vh
+Presto compilation completed successfully.
+Running PRESTO HDLC
+Compiling source file /home/rid2/cs533.work/vortex/hw/rtl/cache/VX_cache.sv
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/cache/VX_cache_define.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_define.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_platform.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_scope.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_config.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_types.vh
+Presto compilation completed successfully.
+Running PRESTO HDLC
+Compiling source file /home/rid2/cs533.work/vortex/hw/rtl/cache/VX_cache_top.sv
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/cache/VX_cache_define.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_define.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_platform.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_scope.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_config.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_types.vh
+Presto compilation completed successfully.
+Running PRESTO HDLC
+Compiling source file /home/rid2/cs533.work/vortex/hw/rtl/tcu/VX_tcu_fedp_dpi.sv
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_define.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_platform.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_scope.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_config.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_types.vh
+Error:  /home/rid2/cs533.work/vortex/hw/rtl/tcu/VX_tcu_fedp_dpi.sv:54: Called function (or task) Error:  /home/rid2/cs533.work/vortex/hw/rtl/tcu/VX_tcu_feError:  /home/rid2/cs533.work/vortex/hw/rtl/tcu/VX_tcu_fedp_dpi.sv:55: Called function (or task) Error:  /home/rid2/cs533.work/vortex/hw/rtl/tcu/VX_tcu_fedp_dpi.sv:55: Called function (or task) 'dpi_f2f' not defined as a function (or task). (VER-125)
+Error:  /home/rid2/cs533.work/vortex/hw/rtl/tcu/VX_tcu_fedp_dpi.sv:56: Called function (or task) 'dpi_fmadd' not defined as a function (or task). (VER-125)
+Error:  /home/rid2/cs533.work/vortex/hw/rtl/tcu/VX_tcu_fedp_dpi.sv:62: Called function (or task) 'dpi_f2f' not defined as a function (or task). (VER-125)
+Error:  /home/rid2/cs533.work/vortex/hw/rtl/tcu/VX_tcu_feError:  /home/rid2/cs533.work/vortex/hw/rtl/tcu/VX_tcu_fedp_dpi.sv:64: Called function (or task) Error:  /home/rid2/cs533.work/vortex/hw/rtl/tcu/VX_tcu_fedp_dpi.sv:64: Called function (or task) 'dpi_fmadd' not defined as a function (or task). (VER-125)
+Error:  /home/rid2/cs533.work/vortex/hw/rtl/tcu/VX_tcu_fedp_dpi.sv:105: Called function (or task) 'dpi_fadd' not defined as a function (or task). (VER-125)
+Error:  /home/rid2/cs533.work/vortex/hw/rtl/tcu/VX_tcu_fedp_dpi.sv:107: Called function (or task) 'dpi_fadd' not defined as a functiCompiling source file /home/rid2/cs533.work/vortex/hw/rtl/tcu/VX_tcu_fedp_int.sv
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_define.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_platform.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_scope.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_config.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_types.vh
+Presto compilation completed successfully.
+Running PRESTO HDLC
+Compiling source file /home/rid2/cs533.work/vortex/hw/rtl/tcu/VX_tcu_top.sv
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_define.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_platform.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_scope.vh
+Opening include file /home/rOpening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_scope.vh
+Opening include file /home/rid2/cs533.workWarning:  /home/rid2/cs533.work/vortex/hw/rtl/tcu/VX_tcu_top.sv:52: the undeclared symbol 'executWarning:  /home/rid2/cs533.work/vortex/hw/rtl/tcu/VX_tcu_top.sv:52: theError:  /home/rid2/cs533.work/vortex/hw/rtl/tcu/VX_tcu_top.sv:42: bad hierarchical name (execute_Error:  /home/rid2/cs533.work/vortex/hw/rtl/tcu/VX_tcu_top.sv:42: bad hierarchical name Compiling source file /home/rid2/cs533.work/vortex/hw/rtl/tcu/VX_tcu_fedp_bhf.sv
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_define.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_platform.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_scope.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_config.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_types.vh
+Presto compilation completed successfully.
+Running PRESTO HDLC
+Compiling source file /home/rid2/cs533.work/vortex/hw/rtl/tcu/VX_tcu_fp.sv
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_define.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_platform.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_scope.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_config.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_types.vh
+Error:  /home/rid2/cs533.work/vortex/hw/rtl/tcu/VX_tcu_fp.sv:141: Syntax error at or near token 'Error:  /home/rid2/cs533.work/vortex/hw/rtl/tcu/VX_tcu_fp.sv:141: Syntax error at or near token '141'
+	in macro "__LINE__"
+	called from macro "BUFFER_EX" (line 141*** Presto compilation terminated with 1 errors. ***
+Running PRESTO HDLC
+Compiling source file /home/rid2/cs533.work/vortex/hw/rtl/tcu/VX_tcu_unit.sv
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_define.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_platform.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_scope.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_config.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_types.vh
+Presto compilation completed successfully.
+Running PRESTO HDLC
+Compiling source file /home/rid2/cs533.work/vortex/hw/rtl/tcu/VX_tcu_uops.sv
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_define.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_platform.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_scope.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_config.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_types.vh
+Error:  /home/rid2/cs533.work/vortex/hw/rtl/tcu/VX_tcu_uops.sv:30: symbol TCU_UOPS must be a consError:  /home/rid2/cs533.work/vortex/hw/rtl/tcu/VX_tcu_uops.sv:30: symbol TCU_UOPS must be a constant or parameter. (VER-260)
+Error:  /home/rid2/cs533.work/voError:  /home/rid2/cs533.work/vortex/hw/rtl/tcu/VX_tcu_uops.sv:33: symbol TCU_M_STEPS must be a cError:  /home/rid2/cs533.work/vortex/hw/rtl/tcu/VX_tcu_uops.sv:33: symbol TCU_M_STEPS must be a constant or parameter. (VER-260)
+Error:  /home/rid2/cs533.work/vortex/hw/rtl/tcu/VX_tcu_uops.sv:34: symbol TCU_K_STEPS must be a constant or parameter. (VER-260)
+Error:  /home/rid2/cs533.work/vortex/hw/rtl/tcu/VX_tcu_uops.sv:36: symbol TCU_A_SUB_BLOCKS must be a constant or parameter. (VER-260)
+Error:  /home/rid2/cs533.work/vortex/Error:  /home/rid2/cs533.work/vortex/hw/rtl/tcu/VX_tcu_uops.sv:70: The symbol 'TCU_RA' is not defError:  /home/rid2/cs533.work/vortex/hw/rtl/tcu/VX_tcu_uops.sv:70: The symbol 'TCU_RA' is not defined. (VER-956)
+Error:  /home/rid2/cs533.work/vortex/hw/rtl/tcu/VX_tcu_uops.sv:71: The symbol 'TCU_RB' is not defined. (VER-956)
+Error:  /home/rid2/cs533.work/vortex/hw/rtl/tcu/VX_tcu_uops.sv:72: The symbol 'TCU_RC' is not defined. (VER-956)
+Error:  /home/rid2/cs533.work/vortex/hw/rtl/tcu/VX_tcu_uops.sv:113: The symbol 'TCU_UOPS' is not defined. (VER-956)
+Error:  /home/rid2/cs533.work/vortex/hw/rtl/tcu/VX_tcu_uops.sv:32: invalid symbol TCU_N_STEPS found in expression. (VER-255)
+Error:  /home/rid2/cs533.work/vortex/hw/rtl/tcu/VX_tcu_uops.sv:33: invalid symbol TCU_M_STEPS found in expression. (VER-255)
+Error:  /home/rid2/cs533.work/vortex/hw/rtl/tcu/VX_tcu_uops.sv:34: invalid symbol TCU_K_STEPS found in expression. (VER-255)
+Error:  /home/rid2/cs533.work/vortex/hw/rtl/tcu/VX_tcu_uops.sv:36: invalid symbol TCU_A_SUB_BLOCKS found in expression. (VER-255)
+Error:  /home/rid2/cs533.work/vortex/hw/rtl/tcu/VX_tcu_uops.sv:37: invalid symbol TCU_BRunning PRESTO HDLC
+Compiling source file /home/rid2/cs533.work/vortex/hw/rtl/tcu/VX_tcu_fedp_dsp.sv
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_define.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_platform.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_scope.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_config.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_types.vh
+Presto compilation completed successfully.
+Running PRESTO HDLC
+Compiling source file /home/rid2/cs533.work/vortex/hw/rtl/tcu/VX_tcu_int.sv
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_define.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_platform.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_scope.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_config.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_types.vh
+Error:  /home/rid2/cs533.work/vortex/hw/rtl/tcu/VX_tcu_int.sv:126: Syntax error at or near token Error:  /home/rid2/cs533.work/vortex/hw/rtl/tcu/VX_tcu_int.sv:126: Syntax error at or near token '126'
+	in macro "__LINE__"
+	called from macro "BUFFER_EX" (line 126)
+	called from file "/home/rid2/cs533.work/vortex/hw/rtl/tcu/VX_tcu_int.svCompiling source file /home/rid2/cs533.work/vortex/hw/rtl/tcu/bhf/VX_tcu_bhf_bf16mul.sv
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_define.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_platform.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_scope.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_config.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_types.vh
+Presto compilation completed successfully.
+Running PRESTO HDLC
+Compiling source file /home/rid2/cs533.work/vortex/hw/rtl/tcu/bhf/bsg_counting_leading_zeros.sv
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_define.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_platform.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_scope.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_config.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_types.vh
+Presto compilation completed successfully.
+Running PRESTO HDLC
+Compiling source file /home/rid2/cs533.work/vortex/hw/rtl/tcu/bhf/VX_tcu_bhf_fmul.sv
+Opening inclCompiling source file /home/rid2/cs533.work/vortex/hw/rtl/Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_platform.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_scope.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_config.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_types.vh
+Opening include file /home/rid2/cs533.work/vortex/third_party/hardfloat/source/HardFloat_consts.vi
+Presto compilation completed successfully.
+Running PRESTO HDLC
+Compiling source file /home/rid2/cs533.work/vortex/hw/rtl/tcu/bhf/VX_tcu_bhf_fadd.sv
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_define.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_platform.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_scope.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_config.vh
+Opening include file /home/rid2/cs533.work/vortex/hw/rtl/VX_types.vh
+Opening include file /home/rid2/cs533.work/vortex/third_party/hardfloat/source/HardFloat_consts.vOpPresto compilation completed successfully.
+#-----------------------------------------------------------------------
+# Elaborate, link, and c#-----------------------------------------------------------------------
+# Elaborate, link, and check — stop here (no coLoading db file '/software/Synopsys-2024_x86_64/syn/W-2024.09/libraries/syn/gtech.db'
+Loading db file '/software/Synopsys-2024_x86_64/syn/W-2024.09/libraries/syn/standard.sldb'
+  Loading link library 'NangateOpenCellLibrary'
+  Loading link library 'sram_64x512_1rw'
+  Loading link library 'sram_256x512_1rw'
+  Loading link library 'sram_1024x32_1rw'
+  Loading link library 'sram_64x24_1r1w'
+  Loading link library 'sram_256x24_1r1w'
+  Loading link library 'sram_64x128_1r1w'
+  Loading link library 'sram_128x128_1r1w'
+  Loading link library 'gtech'
+Error: Cannot find the design 'Vortex' in the library 'WORK'. (LBR-0)
+0
+current_design Vortex
+ErrError: Cannot find the design 'Vortex' in the library 'WORK'. (LBR-0)
+0
+current_design Vortex
+Error: Can't find design 'Vortex'. (UID-109)
+Error: Current design is not defined. (UID-4)
+link
+Error: Current design is not defined. (UID-4)
+0
+check_design
+Error: Current design
+Memory usage for this session 132 Mbytes.
+Memory usage for this session including child processe
+Memory usage for this session 132 Mbytes.
+Memory usage for this session including child processes 132 Mbytes.
+CPU usage for this session 7 seconds ( 0.00 hours ).
+Elapsed time for this session 15 seconds ( 0.00 hours ).
+
+Thank you...
