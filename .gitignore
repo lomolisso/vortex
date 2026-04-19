@@ -3,3 +3,24 @@
 *.cache
 *.code-workspace
 miscs/apptainer/vortex.sif
+
+# Synopsys DC ASIC synthesis run artifacts (heavy / machine-specific)
+/hw/syn/synopsys/runs/
+/hw/syn/synopsys/flists/
+/hw/syn/synopsys/work/
+/hw/syn/synopsys/logs/
+/hw/syn/synopsys/reports/
+/hw/syn/synopsys/results/
+/syn/synopsys/work/
+
+# DC scratch files sometimes created in CWD
+/hw/syn/synopsys/*.pvl
+/hw/syn/synopsys/*.syn
+/hw/syn/synopsys/*.mr
+/hw/syn/synopsys/*.pvk
+/hw/syn/synopsys/cksum_dir/
+/hw/syn/synopsys/moduleparamid
+/hw/syn/synopsys/command.log
+/hw/syn/synopsys/filenames*.log
+/hw/syn/synopsys/default.svf
+/hw/syn/synopsys/alib-*/

@@ -132,6 +132,16 @@ module VX_tcu_fp import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
             wire [TCU_TC_K-1:0][`XLEN-1:0] a_row_r, b_col_r;
             wire [`XLEN-1:0] c_val_r;
 
+`ifdef ASIC_SYNTHESIS
+            // BUFFER_EX does not support concatenation destinations under
+            // ASIC_SYNTHESIS (token-paste on '{' produces an invalid identifier).
+            // Pack/unpack through a single intermediate wire instead.
+            localparam FEDP_BUF_W = $bits({a_row_r, b_col_r, c_val_r, fmt_s_r, fmt_d_r});
+            wire [FEDP_BUF_W-1:0] fedp_buf_in, fedp_buf_out;
+            assign fedp_buf_in = {a_row, b_col, c_val, fmt_s[2:0], fmt_d[2:0]};
+            assign {a_row_r, b_col_r, c_val_r, fmt_s_r, fmt_d_r} = fedp_buf_out;
+            `BUFFER_EX(fedp_buf_out, fedp_buf_in, fedp_enable, 0, 1);
+`else
             `BUFFER_EX (
                 {a_row_r, b_col_r, c_val_r, fmt_s_r,    fmt_d_r},
                 {a_row,   b_col,   c_val,   fmt_s[2:0], fmt_d[2:0]},
@@ -139,6 +149,7 @@ module VX_tcu_fp import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
                 0, // resetw
                 1  // depth
             );
+`endif
 
         `ifdef TCU_DPI
             VX_tcu_fedp_dpi #(

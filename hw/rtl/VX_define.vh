@@ -184,6 +184,30 @@
     end \
     /* verilator lint_off GENUNNAMED */
 
+`ifdef ASIC_SYNTHESIS
+
+`define REDUCE_TREE(__op, __out, __in, __n, __outw, __inw) \
+    VX_reduce_tree #( \
+        .IN_W  (__inw), \
+        .OUT_W (__outw), \
+        .N     (__n), \
+        .OP    ("__op") \
+    ) reduce``__out ( \
+        .data_in(__in), \
+        .data_out(__out) \
+    )
+
+`define POP_COUNT_EX(out, in, model) \
+    VX_popcount #( \
+        .N     ($bits(in)), \
+        .MODEL (model) \
+    ) __pop_count``out ( \
+        .data_in  (in), \
+        .data_out (out) \
+    )
+
+`else
+
 `define REDUCE_TREE(__op, __out, __in, __n, __outw, __inw) \
     VX_reduce_tree #( \
         .IN_W  (__inw), \
@@ -204,6 +228,8 @@
         .data_out (out) \
     )
 
+`endif
+
 `define POP_COUNT(out, in) `POP_COUNT_EX(out, in, 1)
 
 `define CONCAT(out, left_in, right_in, L, R) \
@@ -216,6 +242,42 @@
         assign out = {left_in, right_in}; \
     end \
     /* verilator lint_off GENUNNAMED */
+
+`ifdef ASIC_SYNTHESIS
+
+// DC Presto does not expand `__LINE__` as a token-paste operand, so instance
+// names like __buffer_ex`__LINE__ would be split into two tokens causing a
+// syntax error.  Instead we paste the destination signal name onto the prefix,
+// which is always unique within a module because no two wires may share a name.
+// Concatenation destinations (e.g. {a, b, c}) must NOT be passed to these
+// macros; use an explicit intermediate wire and a named instantiation instead.
+`define BUFFER_EX(dst, src, ena, resetw, latency) \
+    VX_pipe_register #( \
+        .DATAW  ($bits(dst)), \
+        .RESETW (resetw), \
+        .DEPTH  (latency) \
+    ) __buffer_ex``dst ( \
+        .clk      (clk), \
+        .reset    (reset), \
+        .enable   (ena), \
+        .data_in  (src), \
+        .data_out (dst) \
+    )
+
+`define BUFFER(dst, src) `BUFFER_EX(dst, src, 1'b1, $bits(dst), 1)
+
+`define NEG_EDGE(dst, src) \
+    VX_edge_trigger #( \
+        .POS  (0), \
+        .INIT (0) \
+    ) __neg_edge``dst ( \
+        .clk      (clk), \
+        .reset    (1'b0), \
+        .data_in  (src), \
+        .data_out (dst) \
+    )
+
+`else
 
 `define BUFFER_EX(dst, src, ena, resetw, latency) \
     VX_pipe_register #( \
@@ -242,6 +304,8 @@
         .data_in  (src), \
         .data_out (dst) \
     )
+
+`endif
 
 ///////////////////////////////////////////////////////////////////////////////
 

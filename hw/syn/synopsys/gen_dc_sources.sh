@@ -31,7 +31,7 @@ HARDFLOAT_DIR="$VORTEX_ROOT/third_party/hardfloat/source"
 LIBS_DIR="$SCRIPT_DIR/libs"
 
 extra_defines=()
-output_file="$SCRIPT_DIR/dc_flist.f"
+output_file="$SCRIPT_DIR/flists/dc_flist.f"
 
 while getopts "D:O:" flag; do
     case "${flag}" in
@@ -40,6 +40,8 @@ while getopts "D:O:" flag; do
         \?) echo "Usage: $0 [-D<define>]... -O <output_flist>" 1>&2; exit 1 ;;
     esac
 done
+
+mkdir -p "$(dirname "$output_file")"
 
 "$SCRIPT_DIR/../../scripts/gen_sources.sh" \
     -DASIC_SYNTHESIS \
@@ -51,9 +53,13 @@ done
     -DICACHE_ENABLE \
     -DDCACHE_ENABLE \
     -DLMEM_ENABLE \
+    -DEXT_TCU_ENABLE \
     "${extra_defines[@]}" \
     -T Vortex \
+    -J "$CVFPU_DIR/common_cells/src" \
+    -J "$CVFPU_DIR/fpu_div_sqrt_mvp/hdl" \
     -J "$CVFPU_DIR" \
+    -J "$CVFPU_DIR/common_cells/include" \
     -J "$HARDFLOAT_DIR" \
     -J "$HARDFLOAT_DIR/RISCV" \
     -J "$LIBS_DIR" \

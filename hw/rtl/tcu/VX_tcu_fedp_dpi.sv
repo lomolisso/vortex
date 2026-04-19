@@ -29,6 +29,9 @@ module VX_tcu_fedp_dpi #(
     input  wire [`XLEN-1:0] c_val,
     output wire [`XLEN-1:0] d_val
 );
+
+`ifndef ASIC_SYNTHESIS
+
     localparam FMUL_LATENCY = 2;
     localparam FACC_LATENCY = 2;
     localparam TOTAL_LATENCY= FMUL_LATENCY + FACC_LATENCY;
@@ -120,5 +123,14 @@ module VX_tcu_fedp_dpi #(
     );
 
     assign d_val = `XLEN'(result);
+
+`else
+
+    // Under ASIC_SYNTHESIS this module is never instantiated (all call-sites
+    // are inside `ifdef TCU_DPI blocks), but DC Presto still parses it.
+    // Provide a zero stub so the DPI function references do not cause errors.
+    assign d_val = '0;
+
+`endif
 
 endmodule

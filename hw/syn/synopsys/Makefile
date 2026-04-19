@@ -26,7 +26,10 @@
 
 SCRIPT_DIR  := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))
 GPGPU_ROOT  := $(abspath $(SCRIPT_DIR)../../../..)
-SRAM_DIR    := $(GPGPU_ROOT)/sram_output
+# SRAM_DIR and STDCELLS source paths on this machine installation.
+# libs/ ships pre-populated with the repo; these are only used by 'make libs'
+# to refresh the copies from source.
+SRAM_DIR    := $(GPGPU_ROOT)/../project/synth/synth_vortex/sram_output
 LIBS_DIR    := $(SCRIPT_DIR)libs
 
 CONFIGS := 1c1n4w4t 1c2n4w4t 2c2n4w4t_l2 4c2n4w4t_l2l3 4c4n8w4t_l2l3
@@ -74,7 +77,7 @@ STDCELLS_DB := $(LIBS_DIR)/stdcells.db
         $(addprefix elab_,$(CONFIGS)) \
         $(addprefix flist_,$(CONFIGS))
 
-all: libs $(CONFIGS)
+all: $(CONFIGS)
 
 #-----------------------------------------------------------------------
 # libs — copy .db and .v files into libs/ (idempotent; files ship with
@@ -82,7 +85,7 @@ all: libs $(CONFIGS)
 #-----------------------------------------------------------------------
 libs: $(STDCELLS_DB) $(SRAM_DBS) $(SRAM_VS)
 
-$(STDCELLS_DB): $(GPGPU_ROOT)/stdcells.db
+$(STDCELLS_DB): $(GPGPU_ROOT)/../project/stdcells.db
 	mkdir -p $(LIBS_DIR)
 	cp $< $@
 
@@ -105,19 +108,21 @@ define CONFIG_RULES
 
 .PHONY: $(1) elab_$(1) flist_$(1)
 
-dc_flist_$(1).f:
+FLIST_$(1) := flists/dc_flist_$(1).f
+
+$(FLIST_$(1)):
 	mkdir -p logs
-	./gen_dc_sources.sh $(DEFINES_$(1)) -O dc_flist_$(1).f
+	./gen_dc_sources.sh $(DEFINES_$(1)) -O $(FLIST_$(1))
 
-flist_$(1): dc_flist_$(1).f
+flist_$(1): $(FLIST_$(1))
 
-$(1): libs dc_flist_$(1).f
-	mkdir -p logs results/$(1) reports/$(1)
-	dc_shell -x "set CONFIG $(1)" -f dc_syn.tcl 2>&1 | tee logs/$(1)_syn.log
+$(1): $(FLIST_$(1))
+	mkdir -p runs/$(1)/logs
+	cd runs/$(1) && dc_shell -x "set CONFIG $(1)" -f ../../dc_syn.tcl 2>&1 | tee logs/$(1)_syn.log
 
-elab_$(1): dc_flist_$(1).f
-	mkdir -p logs
-	dc_shell -x "set CONFIG $(1)" -f dc_elab.tcl 2>&1 | tee logs/$(1)_elab.log
+elab_$(1): $(FLIST_$(1))
+	mkdir -p runs/$(1)/logs
+	cd runs/$(1) && dc_shell -x "set CONFIG $(1)" -f ../../dc_elab.tcl 2>&1 | tee logs/$(1)_elab.log
 
 endef
 
@@ -127,9 +132,15 @@ $(foreach cfg,$(CONFIGS),$(eval $(call CONFIG_RULES,$(cfg))))
 # clean — remove all generated artifacts (libs/ kept intentionally)
 #-----------------------------------------------------------------------
 clean:
-	rm -f dc_flist_*.f
+	rm -f  dc_flist_*.f
 	rm -rf logs/
 	rm -rf results/
 	rm -rf reports/
+	rm -rf work/
+	rm -rf runs/
+	rm -rf flists/
 	rm -rf alib-52/
 	rm -f  *.svf *.key *.log *.ddc
+	rm -f  *.pvl *.syn *.mr *.pvk
+	rm -rf cksum_dir/
+	rm -f  moduleparamid

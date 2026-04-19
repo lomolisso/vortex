@@ -28,6 +28,14 @@ if {![info exists CONFIG]} {
 }
 
 set SCRIPT_DIR [file normalize [file dirname [info script]]]
+set RUN_DIR    [pwd]
+
+#-----------------------------------------------------------------------
+# Work library — redirect DC's intermediate .pvl/.syn/.mr files into
+# work/ under the per-config run directory.
+#-----------------------------------------------------------------------
+file mkdir "$RUN_DIR/work"
+define_design_lib WORK -path "$RUN_DIR/work"
 
 #-----------------------------------------------------------------------
 # Library setup (same as dc_syn.tcl — needed for link)
@@ -55,14 +63,25 @@ set symbol_library {}
 #-----------------------------------------------------------------------
 source "$SCRIPT_DIR/../../scripts/parse_vcs_list.tcl"
 
-set flist_path "$SCRIPT_DIR/dc_flist_${CONFIG}.f"
+set flist_path "$SCRIPT_DIR/flists/dc_flist_${CONFIG}.f"
 if {![file exists $flist_path]} {
-    error "Filelist not found: $flist_path\nRun: make dc_flist_${CONFIG}.f"
+    error "Filelist not found: $flist_path\nRun: make flist_${CONFIG}"
 }
 
 lassign [parse_vcs_list $flist_path] src_files inc_dirs defines
 
 set search_path [concat $search_path $inc_dirs]
+
+# defs_div_sqrt_mvp.sv defines a package but does not follow the *_pkg.sv
+# naming convention, so gen_sources.sh cannot hoist it automatically.
+# Move it to the front of the file list so it is analyzed before any file
+# that imports the defs_div_sqrt_mvp package.
+set _defs_idx [lsearch -glob $src_files "*defs_div_sqrt_mvp.sv"]
+if {$_defs_idx >= 0} {
+    set _defs_file [lindex $src_files $_defs_idx]
+    set src_files [linsert [lreplace $src_files $_defs_idx $_defs_idx] 0 $_defs_file]
+    unset _defs_idx _defs_file
+}
 
 #-----------------------------------------------------------------------
 # Analyze
