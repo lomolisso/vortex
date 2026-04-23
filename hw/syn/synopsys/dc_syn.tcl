@@ -16,11 +16,31 @@
 # Target: NanGate45 stdcells + bsg_fakeram SRAM macros
 #
 # Usage:
-#   dc_shell -x "set CONFIG 1c1n4w4t" -f dc_syn.tcl 2>&1 | tee logs/1c1n4w4t_syn.log
+#   dc_shell -x "set CONFIG single-core; set TOP VX_socket_top" -f dc_syn.tcl
+#   dc_shell -x "set CONFIG full-vortex; set TOP Vortex"        -f dc_syn.tcl
+#
+# CONFIG selects the filelist (flists/dc_flist_<CONFIG>.f); TOP is the
+# module name passed to elaborate/current_design/write_file. Output
+# filenames follow the TOP name: <TOP>_netlist.v, <TOP>.ddc, <TOP>.sdc.
 #=======================================================================
 
 if {![info exists CONFIG]} {
-    error "CONFIG is not set. Invoke as: dc_shell -x {set CONFIG <config_name>} -f dc_syn.tcl"
+    error "CONFIG is not set. Invoke as: dc_shell -x {set CONFIG <config_name>; set TOP <top_module>} -f dc_syn.tcl"
+}
+if {![info exists TOP]} {
+    # Backward compatibility: pre-existing invocations assumed Vortex.
+    set TOP Vortex
+}
+
+# BLACKBOX_SOCKET selects bottom-up vs. flat synthesis for VX_socket_top.
+#   0 → analyze + elaborate VX_socket_top.sv from RTL (flat / deep synth).
+#   1 → skip its RTL, link against VX_socket_top.db, and freeze every
+#       VX_socket_top instance with set_dont_touch so compile_ultra
+#       respects the macro boundary.
+# The Makefile sets this explicitly per config; we default it here for
+# direct dc_shell invocations that forget to pass the flag.
+if {![info exists BLACKBOX_SOCKET]} {
+    set BLACKBOX_SOCKET [expr {$CONFIG eq "full-vortex"}]
 }
 
 set SCRIPT_DIR [file normalize [file dirname [info script]]]
@@ -52,6 +72,37 @@ set link_library [concat \
     $LIBS_DIR/sram_128x128_1r1w.db \
 ]
 
+# ----------------------------------------------------------------------
+# Bottom-up hard macro: add VX_socket_top.db to link_library only.
+#
+# NOT target_library — target_library is the cell pool DC is allowed
+# to use when it maps combinational/sequential logic. VX_socket_top is
+# a design-specific blackbox, not a library cell, so it must appear in
+# link_library (for resolving the module instance) and stay out of
+# target_library (so compile_ultra never tries to map random gates
+# onto VX_socket_top).
+#
+# Path lookup: the canonical location is the PnR export directory,
+# in case a future workflow ever drops the .db directly there. The
+# Makefile's socket-db rule produces the .db in LIBS_DIR, so that's
+# the branch that will normally fire.
+# ----------------------------------------------------------------------
+if {$BLACKBOX_SOCKET} {
+    set _socket_db_pref [file normalize "$SCRIPT_DIR/../../pnr/cadence/export/single-core/VX_socket_top.db"]
+    set _socket_db_fall "$LIBS_DIR/VX_socket_top.db"
+    if {[file exists $_socket_db_pref]} {
+        set _socket_db $_socket_db_pref
+    } elseif {[file exists $_socket_db_fall]} {
+        set _socket_db $_socket_db_fall
+    } else {
+        error "BLACKBOX_SOCKET=1 but VX_socket_top.db was not found in either:\n  $_socket_db_pref\n  $_socket_db_fall\nRun 'make socket-db' (or 'make full-vortex' via the Makefile) to build it from the .lib, and if the .lib itself is missing, run 'make extract-macro' under hw/pnr/cadence first."
+    }
+    lappend link_library $_socket_db
+    puts "INFO: BLACKBOX_SOCKET=1 — VX_socket_top linked from: $_socket_db"
+} else {
+    puts "INFO: BLACKBOX_SOCKET=0 — VX_socket_top will be synthesized from RTL (flat)."
+}
+
 set symbol_library {}
 
 #-----------------------------------------------------------------------
@@ -81,6 +132,32 @@ if {$_defs_idx >= 0} {
 }
 
 #-----------------------------------------------------------------------
+# Bottom-up: drop VX_socket_top.sv from the analyze list when we're
+# blackboxing the socket. With the RTL body gone, `elaborate Vortex`
+# will see VX_socket_top as an unresolved reference and `link` will
+# resolve it against VX_socket_top.db in link_library — exactly the
+# behavior we want.
+#
+# We only filter VX_socket_top.sv itself; the descendants
+# (VX_socket.sv, VX_core.sv, caches, fpu, ...) stay in the list.
+# Removing them too would need a dependency-graph pass, and there's
+# no correctness benefit: `elaborate` never descends past the linked
+# blackbox, so descendants sit harmlessly in the WORK library. The
+# price is a modest analyze-time overhead; fixing that is future work.
+#-----------------------------------------------------------------------
+if {$BLACKBOX_SOCKET} {
+    set _pre [llength $src_files]
+    set src_files [lsearch -inline -all -not -glob $src_files "*/VX_socket_top.sv"]
+    set _post [llength $src_files]
+    if {$_pre == $_post} {
+        puts "WARNING: BLACKBOX_SOCKET=1 but VX_socket_top.sv was not in the filelist; nothing to skip."
+    } else {
+        puts "INFO: BLACKBOX_SOCKET=1 — skipped VX_socket_top.sv from analyze ([expr {$_pre - $_post}] file(s))."
+    }
+    unset _pre _post
+}
+
+#-----------------------------------------------------------------------
 # Analyze (parse) all source files in filelist order
 # gen_sources.sh already places packages first, so ordering is correct:
 #   fpnew_pkg.sv → HardFloat sources → Vortex RTL → Vortex top
@@ -92,10 +169,39 @@ foreach f $src_files {
 #-----------------------------------------------------------------------
 # Elaborate, link, and check
 #-----------------------------------------------------------------------
-elaborate Vortex
-current_design Vortex
+elaborate $TOP
+current_design $TOP
 link
 check_design
+
+#-----------------------------------------------------------------------
+# Bottom-up: assert the socket is really a linked blackbox, then pin
+# every VX_socket_top instance with set_dont_touch.
+#
+#   - The sanity check catches silent misconfigurations: e.g. a stale
+#     filelist that still carries VX_socket_top.sv despite our filter,
+#     or a .db that was read in but didn't cover the expected cell.
+#     In either case `get_cells -filter "ref_name == VX_socket_top"`
+#     would return zero matches and we'd silently produce a flat
+#     netlist; failing loudly here is much easier to debug than
+#     discovering it in the middle of PnR.
+#
+#   - set_dont_touch stops compile_ultra from: removing unused socket
+#     pins, re-timing paths through the socket (the .lib already has
+#     those characterized), or cloning/merging socket instances. Four
+#     identical VX_socket_top cells must stay as four identical cells
+#     so the PnR placer can hard-macro-instantiate each one.
+#-----------------------------------------------------------------------
+if {$BLACKBOX_SOCKET} {
+    set _sockets [get_cells -hier -filter "ref_name == VX_socket_top"]
+    set _n_sockets [sizeof_collection $_sockets]
+    if {$_n_sockets == 0} {
+        error "BLACKBOX_SOCKET=1 but no VX_socket_top cells appear in the linked design.\nCheck that link_library contains VX_socket_top.db and that VX_cluster.sv is under `ifdef ASIC_SYNTHESIS (which it should be — gen_dc_sources.sh forces -DASIC_SYNTHESIS)."
+    }
+    set_dont_touch $_sockets
+    puts "INFO: set_dont_touch on $_n_sockets VX_socket_top cell(s) — compile_ultra will respect the blackbox boundary."
+    unset _sockets _n_sockets
+}
 
 #-----------------------------------------------------------------------
 # Timing constraints — 100 MHz (10 ns)
@@ -141,8 +247,24 @@ report_constraint -all_violators     > "$REPORT_DIR/constraints.rpt"
 set RESULTS_DIR "$RUN_DIR/results"
 file mkdir $RESULTS_DIR
 
-write_file -hierarchy -format verilog -output "$RESULTS_DIR/Vortex_netlist.v"
-write_file -format ddc                -output "$RESULTS_DIR/Vortex.ddc"
-write_sdc                                     "$RESULTS_DIR/Vortex.sdc"
+write_file -hierarchy -format verilog -output "$RESULTS_DIR/${TOP}_netlist.v"
+write_file -format ddc                -output "$RESULTS_DIR/${TOP}.ddc"
+write_sdc                                     "$RESULTS_DIR/${TOP}.sdc"
+
+# DC's write_sdc emits 2-D SV port names (e.g., mem_req_data[0][511]) because
+# it tracks packed multidimensional arrays internally, but write_file -format
+# verilog flattens them to 1-D port declarations (mem_req_data[511]).  Innovus
+# reads the Verilog netlist and therefore cannot resolve the 2-D get_ports
+# references, producing TCLNL-312 errors for every bit of every wide bus.
+# Strip the outer [0] subscript so the SDC matches the netlist port names.
+set _sdc "$RESULTS_DIR/${TOP}.sdc"
+set _fh  [open $_sdc r]
+set _txt [read $_fh]
+close $_fh
+regsub -all {\{([a-zA-Z_][a-zA-Z0-9_]*)\[0\]\[([0-9]+)\]\}} $_txt {{\1[\2]}} _txt
+set _fh  [open $_sdc w]
+puts -nonewline $_fh $_txt
+close $_fh
+unset _sdc _fh _txt
 
 exit

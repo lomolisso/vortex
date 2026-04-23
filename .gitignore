@@ -1,9 +1,10 @@
 /build*
 /.vscode
 *.cache
+*.pyc
 *.code-workspace
 miscs/apptainer/vortex.sif
-
+.cursor
 # Synopsys DC ASIC synthesis run artifacts (heavy / machine-specific)
 /hw/syn/synopsys/runs/
 /hw/syn/synopsys/flists/
@@ -12,6 +13,13 @@ miscs/apptainer/vortex.sif
 /hw/syn/synopsys/reports/
 /hw/syn/synopsys/results/
 /syn/synopsys/work/
+
+# Cadence Innovus PnR run artifacts (heavy / machine-specific)
+/hw/pnr/cadence/runs/
+/hw/pnr/cadence/export/
+/hw/pnr/cadence/*.cmd*
+/hw/pnr/cadence/*.log*
+/hw/pnr/cadence/innovus.lck
 
 # DC scratch files sometimes created in CWD
 /hw/syn/synopsys/*.pvl
