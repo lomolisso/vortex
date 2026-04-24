@@ -39,7 +39,7 @@ The relevant knobs (all from `hw/rtl/VX_config.vh`):
 | `ICACHE_NUM_WAYS`, `DCACHE_NUM_WAYS` | 4 | ways |
 | `DCACHE_NUM_BANKS` | `MIN(DCACHE_NUM_REQS, 16)` | banks |
 | `NUM_ICACHES`, `NUM_DCACHES` | `UP(SOCKET_SIZE/4)` | physical cache slices per socket |
-| `L2_CACHE_SIZE` | 1048576 | bytes (overridden to 131072 in full-vortex) |
+| `L2_CACHE_SIZE` | 1048576 | bytes (set to 1048576 in 1c8n4w4t) |
 | `L2_NUM_BANKS`  | `MIN(L2_NUM_REQS, 16)` (=`NUM_SOCKETS*L1_MEM_PORTS`) | banks |
 | `L2_NUM_WAYS`   | 8 | ways |
 | `L1_LINE_SIZE`, `L2_LINE_SIZE` | 64 | bytes |
@@ -272,8 +272,8 @@ Defines (from `hw/syn/synopsys/Makefile:93–104`):
 ```
 single-core : NUM_CLUSTERS=1 NUM_CORES=1 NUM_WARPS=4 NUM_THREADS=4 SOCKET_SIZE=1
               (no L2)                TOP = VX_socket_top
-full-vortex : NUM_CLUSTERS=1 NUM_CORES=4 NUM_WARPS=4 NUM_THREADS=4 SOCKET_SIZE=1
-              L2_ENABLE  L2_CACHE_SIZE=131072   TOP = Vortex
+1c8n4w4t    : NUM_CLUSTERS=1 NUM_CORES=8 NUM_WARPS=4 NUM_THREADS=4 SOCKET_SIZE=1
+              L2_ENABLE  L2_CACHE_SIZE=1048576  TOP = Vortex
 ```
 
 Derived constants common to both configs:
@@ -286,7 +286,7 @@ Derived constants common to both configs:
 - `LMEM_NUM_BANKS = 4`, `LMEM` size = `2^14 = 16 KiB`
 - `NUM_ICACHES = NUM_DCACHES = UP(SOCKET_SIZE/4) = 1`
 - `NUM_SOCKETS = NUM_CORES / SOCKET_SIZE`
-- For full-vortex: `L2_NUM_REQS = NUM_SOCKETS · L1_MEM_PORTS = 4·1 = 4`, so `L2_NUM_BANKS = 4`; `L2_NUM_WAYS = 8`; `CS_LINES_PER_BANK = 131072 / (4·64·8) = 64`.
+- For 1c8n4w4t: `L2_NUM_REQS = NUM_SOCKETS · L1_MEM_PORTS = 8·1 = 8`, so `L2_NUM_BANKS = 8`; `L2_NUM_WAYS = 8`; `CS_LINES_PER_BANK = 1048576 / (8·64·8) = 256`.
 
 ### 2.1 Macro instance count — closed-form formulas
 
@@ -299,7 +299,7 @@ N_LMEM_per_core = LMEM_NUM_BANKS
 N_L2_way       = L2_NUM_BANKS · L2_NUM_WAYS        (only if L2_ENABLE)
 ```
 
-For every L1/L2 cache, the **tag** and **data** arrays each instantiate `N_*_way` SRAMs (one of each per way-per-bank), mapped as `sram_64x24_1r1w` and `sram_64x512_1rw` for all the sizes in these configs.
+For every L1/L2 cache, the **tag** and **data** arrays each instantiate `N_*_way` SRAMs (one of each per way-per-bank). L1 caches map to `sram_64x24_1r1w` (tag) and `sram_64x512_1rw` (data); the 1c8n4w4t L2 maps to `sram_256x24_1r1w` (tag) and `sram_256x512_1rw` (data) because `CS_LINES_PER_BANK=256`.
 
 ---
 
@@ -326,47 +326,47 @@ This is exactly what the synthesized netlist contains (confirmed by grepping `ru
      8 sram_64x512_1rw
 ```
 
-### 2.3 `full-vortex` — adding the L2, blackboxing sockets
+### 2.3 `1c8n4w4t` — adding the L2, blackboxing sockets
 
-In this run DC runs **bottom-up**: `VX_socket_top` is linked as a pre-characterized blackbox (`.lib/.db` from PnR). So the Vortex-level netlist only exposes the SRAMs that live **outside** the socket — i.e. the L2 — plus 4 opaque socket instances.
+In this run DC runs **bottom-up**: `VX_socket_top` is linked as a pre-characterized blackbox (`.lib/.db` from PnR). So the Vortex-level netlist only exposes the SRAMs that live **outside** the socket — i.e. the L2 — plus 8 opaque socket instances.
 
-L2 derived quantities (with `L2_CACHE_SIZE=131072`, `L2_NUM_BANKS=4`, `L2_NUM_WAYS=8`, `L2_LINE_SIZE=L2_WORD_SIZE=64`):
-- `CS_LINES_PER_BANK = L2_CACHE_SIZE / (L2_LINE_SIZE · L2_NUM_WAYS · L2_NUM_BANKS) = 131072/(64·8·4) = 64`
+L2 derived quantities (with `L2_CACHE_SIZE=1048576`, `L2_NUM_BANKS=8`, `L2_NUM_WAYS=8`, `L2_LINE_SIZE=L2_WORD_SIZE=64`):
+- `CS_LINES_PER_BANK = L2_CACHE_SIZE / (L2_LINE_SIZE · L2_NUM_WAYS · L2_NUM_BANKS) = 1048576/(64·8·8) = 256`
 - `CS_LINE_WIDTH = 8·L2_LINE_SIZE = 512`
 - `CS_TAG_SEL_BITS = (MEM_ADDR_WIDTH − log2 L2_WORD_SIZE) − log2(CS_LINES_PER_BANK) − log2(L2_NUM_BANKS) − log2(L2_LINE_SIZE/L2_WORD_SIZE)`
-  `= 32 − 6 − 6 − 2 − 0 = 18` → `TAG_WIDTH = 1 + 0 + 18 = 19` bits (fits in the 24-bit 1R1W macro).
+  `= 32 − 6 − 8 − 3 − 0 = 15` → `TAG_WIDTH = 1 + 0 + 15 = 16` bits (fits in the 24-bit 1R1W macro).
 
 | Structure | Macro file (`libs/`) | Instances |
 |---|---|---|
-| L2 data store (per way-bank) | **`sram_64x512_1rw.v`** | `L2_NUM_BANKS · L2_NUM_WAYS = 4·8 = 32` |
-| L2 tag store  (per way-bank) | **`sram_64x24_1r1w.v`** | `L2_NUM_BANKS · L2_NUM_WAYS = 4·8 = 32` |
-| (4 × `VX_socket_top` blackbox — internal SRAMs not visible here) | — | — |
+| L2 data store (per way-bank) | **`sram_256x512_1rw.v`** | `L2_NUM_BANKS · L2_NUM_WAYS = 8·8 = 64` |
+| L2 tag store  (per way-bank) | **`sram_256x24_1r1w.v`** | `L2_NUM_BANKS · L2_NUM_WAYS = 8·8 = 64` |
+| (8 × `VX_socket_top` blackbox — internal SRAMs not visible here) | — | — |
 
-**L2-only total = 64 macros**, matching exactly what `runs/full-vortex/results/Vortex_netlist.v` holds:
+**L2-only total = 128 macros**, matching exactly what `runs/1c8n4w4t/results/Vortex_netlist.v` holds:
 ```
-    32 sram_64x24_1r1w
-    32 sram_64x512_1rw
+    64 sram_256x24_1r1w
+    64 sram_256x512_1rw
 ```
 
-If you flatten the blackbox (or PnR the full-vortex flat), the fully-expanded macro count is:
+If you flatten the blackbox (or PnR the 1c8n4w4t flat), the fully-expanded macro count is:
 ```
-  N_total = 4 · 24  (four sockets, each 24 macros)  +  64 (L2)
-          = 96 + 64 = 160 macros
+  N_total = 8 · 24  (eight sockets, each 24 macros)  +  128 (L2)
+          = 192 + 128 = 320 macros
 ```
 
 ---
 
-### 2.4 Where the "crazy amount of small macros" comes from
+### 2.4 Where the large macro count comes from
 
-The L2 is only 128 KiB, but it is carved as **4 banks × 8 ways = 32 parallel cache-line arrays**, plus an **equal number of tag arrays**. Each way-bank combination becomes:
+The L2 is 1 MiB, carved as **8 banks × 8 ways = 64 parallel cache-line arrays**, plus an **equal number of tag arrays**. Each way-bank combination becomes:
 
-- one `sram_64x512_1rw` (64 lines × 512-bit line) → 4 KiB of data
-- one `sram_64x24_1r1w`  (64 lines × ≤24-bit tag)  → 168 B of tag (most bits unused; the macro is 24 bits wide)
+- one `sram_256x512_1rw` (256 lines × 512-bit line) → 16 KiB of data
+- one `sram_256x24_1r1w` (256 lines × ≤24-bit tag)  → 672 B of tag (most bits unused; the macro is 24 bits wide)
 
-That is **64 physically small macros** (each data macro is 4 KiB, 32 of them = 128 KiB, which is the full L2) because:
+That is **128 macros** (each data macro is 16 KiB, 64 of them = 1 MiB, which is the full L2) because:
 1. `L2_NUM_WAYS=8` is baked into `VX_config.vh` — every set is materially 8 parallel SRAMs, one per way.
-2. `L2_NUM_BANKS` is pinned by `MIN(L2_NUM_REQS, 16)` with `L2_NUM_REQS = NUM_SOCKETS · L1_MEM_PORTS = 4`, giving 4 banks.
-3. The wrapper only has two L2-eligible macro sizes (`64x512_1rw` and `256x512_1rw`); the chosen `CS_LINES_PER_BANK=64` snaps to the 64-deep flavor. If you increased `L2_CACHE_SIZE` per bank-per-way to yield 256 lines (e.g. 4× the size, or fewer banks/ways), the wrapper would pick `sram_256x512_1rw` and you would get 4× fewer, larger macros for the same capacity.
+2. `L2_NUM_BANKS` is pinned by `MIN(L2_NUM_REQS, 16)` with `L2_NUM_REQS = NUM_SOCKETS · L1_MEM_PORTS = 8`, giving 8 banks.
+3. The wrapper has two L2-eligible macro sizes (`64x512_1rw` and `256x512_1rw`); the chosen `CS_LINES_PER_BANK=256` snaps to the 256-deep flavor, giving good area density (16 KiB per data macro vs. 4 KiB for the 64-deep flavor).
 
 ### 2.5 Knobs that directly change the L2 macro count
 
@@ -374,10 +374,10 @@ Using the formula `N_L2 = 2 · L2_NUM_BANKS · L2_NUM_WAYS`:
 
 | change | effect |
 |---|---|
-| `L2_NUM_WAYS=4` instead of 8 | halves the number of macros (2 · 4 · 4 = 32) — but you lose associativity |
-| `L2_NUM_BANKS` forced to 2 (via `-DL2_NUM_BANKS=2`) | halves the bank count → 2 · 2 · 8 = 32 macros, but serializes L2 accesses |
-| larger `L2_CACHE_SIZE` to hit `CS_LINES_PER_BANK=256` | each way-bank maps to `sram_256x512_1rw` instead of `sram_64x512_1rw` — same count, 4× bigger macros, much better area density |
+| `L2_NUM_WAYS=4` instead of 8 | halves the macro count (2 · 8 · 4 = 64) — but you lose associativity |
+| `L2_NUM_BANKS` forced to 4 (via `-DL2_NUM_BANKS=4`) | halves the bank count → 2 · 4 · 8 = 64 macros, but serializes L2 accesses |
+| smaller `L2_CACHE_SIZE` that causes `CS_LINES_PER_BANK=64` | each way-bank maps to `sram_64x512_1rw` instead of `sram_256x512_1rw` — same count but 4× smaller macros, worse area density |
 | `L2_DISABLE` / no `L2_ENABLE` | zero L2 macros — L1 misses go straight to DRAM bypass tags |
 
-The bottom line: the small-macro explosion in PnR is _not_ an SRAM-mapper artifact. It is a direct, unavoidable consequence of the way `VX_cache` instantiates one `sp_ram`+`dp_ram` **per way per bank**, combined with the fact that the only macros available at 512-bit data width are 64-deep and 256-deep, and the L2 geometry lands on the 64-deep flavor.
+The bottom line: the macro count in PnR is _not_ an SRAM-mapper artifact. It is a direct, unavoidable consequence of the way `VX_cache` instantiates one `sp_ram`+`dp_ram` **per way per bank**. In the 1c8n4w4t config the L2 geometry (`CS_LINES_PER_BANK=256`) lands on the 256-deep macro flavor, giving good capacity density (16 KiB each) at the cost of a large physical macro count.
 
