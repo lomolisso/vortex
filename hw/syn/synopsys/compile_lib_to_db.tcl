@@ -7,7 +7,7 @@
 #   Liberty representation). Our bottom-up flow ships VX_socket_top as
 #   a plain .lib (emitted by Innovus's do_extract_model) and we need a
 #   .db for DC to treat the socket as a hard-macro blackbox during the
-#   full-vortex synthesis run.
+#   1c8n4w4t synthesis run.
 #
 # Why dc_shell (and not lc_shell)
 #   dc_shell is the tool everyone on this course machine already has

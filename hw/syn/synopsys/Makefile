@@ -22,12 +22,12 @@
 #                  and register file. Defines force SOCKET_SIZE=1 so the
 #                  socket holds exactly one core. The netlist produced
 #                  here is what is handed to PnR and, later, turned into
-#                  a .lef/.lib macro for reuse in the full-vortex run.
+#                  a .lef/.lib macro for reuse in the 1c8n4w4t run.
 #
-#   full-vortex    Synthesizes the complete Vortex GPGPU: 1 cluster,
-#                  4 cores (NUM_CORES=4, SOCKET_SIZE=1, so each core has
+#   1c8n4w4t       Synthesizes the complete Vortex GPGPU: 1 cluster,
+#                  8 cores (NUM_CORES=8, SOCKET_SIZE=1, so each core has
 #                  its own private L1s, lmem and regfile), with a shared
-#                  L2 across all four cores. Each core block is still a
+#                  1 MiB L2 across all eight cores. Each core block is still a
 #                  VX_socket_top instance — the same module synthesized
 #                  in single-core — which is exactly the boundary used
 #                  later for blackboxing.
@@ -42,7 +42,7 @@
 #   make clean                — remove generated filelists, logs, results, reports
 #
 # Bottom-up hierarchical synthesis
-#   `make full-vortex` runs DC in bottom-up mode: VX_socket_top is
+#   `make 1c8n4w4t` runs DC in bottom-up mode: VX_socket_top is
 #   treated as a pre-characterized hard-macro blackbox linked from
 #   libs/VX_socket_top.db, NOT re-synthesized from RTL. The .db is
 #   auto-built from the socket's Liberty (.lib) as a prerequisite.
@@ -51,14 +51,14 @@
 #       cd ../../pnr/cadence && make single-core STAGE=12
 #       cd ../../pnr/cadence && make extract-macro
 #
-#   After that, this directory's `make full-vortex` is self-contained:
+#   After that, this directory's `make 1c8n4w4t` is self-contained:
 #   it finds the exported .lib, compiles it to .db on demand, and
 #   synthesizes the top-level wrapper around the blackboxed sockets.
 #
 #   Override: to force a flat re-synth of the whole GPGPU (e.g. to
-#   compare QoR), set `BLACKBOX_SOCKET_full-vortex=0` on the command
+#   compare QoR), set `BLACKBOX_SOCKET_1c8n4w4t=0` on the command
 #   line:
-#       make full-vortex BLACKBOX_SOCKET_full-vortex=0
+#       make 1c8n4w4t BLACKBOX_SOCKET_1c8n4w4t=0
 #=======================================================================
 
 SHELL       := /bin/bash
@@ -73,7 +73,7 @@ GPGPU_ROOT  := $(abspath $(SCRIPT_DIR)../../../..)
 SRAM_DIR    := $(GPGPU_ROOT)/../project/synth/synth_vortex/sram_output
 LIBS_DIR    := $(SCRIPT_DIR)libs
 
-CONFIGS := single-core full-vortex
+CONFIGS := single-core 1c8n4w4t
 
 #-----------------------------------------------------------------------
 # Per-configuration preprocessor defines and synthesis top module.
@@ -83,7 +83,7 @@ CONFIGS := single-core full-vortex
 # SOCKET_SIZE=1 is forced in both cases so that a "socket" is always
 # exactly one VX_core with its own private I$/D$. Without this override
 # VX_config.vh would pick SOCKET_SIZE=MIN(4, NUM_CORES), which in the
-# full-vortex case would collapse all four cores into a single socket
+# 1c8n4w4t case would collapse cores into shared sockets,
 # sharing one I$ and one D$ — breaking the blackbox boundary.
 #-----------------------------------------------------------------------
 
@@ -94,14 +94,16 @@ DEFINES_single-core := -DNUM_CLUSTERS=1 -DNUM_CORES=1 -DNUM_WARPS=4 -DNUM_THREAD
                        -DSOCKET_SIZE=1
 TOP_single-core     := VX_socket_top
 
-# full-vortex: full Vortex GPGPU with 4 cores (4 VX_socket_top instances
-# inside one VX_cluster) sharing an L2 cache. VX_cluster instantiates
+# 1c8n4w4t: full Vortex GPGPU with 8 cores (8 VX_socket_top instances
+# inside one VX_cluster) sharing a 1 MiB L2 cache. VX_cluster instantiates
 # VX_socket_top directly under ASIC_SYNTHESIS, which is the boundary
 # that will later be replaced by the single-core .lib/.lef macro.
-DEFINES_full-vortex := -DNUM_CLUSTERS=1 -DNUM_CORES=4 -DNUM_WARPS=4 -DNUM_THREADS=4 \
-                       -DSOCKET_SIZE=1 \
-                       -DL2_ENABLE -DL2_CACHE_SIZE=131072
-TOP_full-vortex     := Vortex
+# Name encodes: 1 Cluster, 8 cores (N), 4 Warps, 4 Threads.
+# L2: 8 banks × 8 ways × 256 lines/bank = 1 MiB → sram_256x512_1rw / sram_256x24_1r1w.
+DEFINES_1c8n4w4t := -DNUM_CLUSTERS=1 -DNUM_CORES=8 -DNUM_WARPS=4 -DNUM_THREADS=4 \
+                    -DSOCKET_SIZE=1 \
+                    -DL2_ENABLE -DL2_CACHE_SIZE=1048576
+TOP_1c8n4w4t     := Vortex
 
 #-----------------------------------------------------------------------
 # SRAM macros — names only (files already pre-copied into libs/)
@@ -129,7 +131,7 @@ STDCELLS_DB := $(LIBS_DIR)/stdcells.db
 #
 # BLACKBOX_SOCKET_<config> controls whether dc_syn.tcl / dc_elab.tcl
 # should blackbox VX_socket_top for that config. Default: only the
-# full-vortex config does so; single-core must synthesize the socket
+# 1c8n4w4t config does so; single-core must synthesize the socket
 # from RTL (it's the block the .lib is *built from*).
 #-----------------------------------------------------------------------
 PNR_EXPORT_DIR            := $(abspath $(SCRIPT_DIR)../../pnr/cadence/export/single-core)
@@ -138,7 +140,7 @@ VX_SOCKET_LIB             := $(firstword $(wildcard $(VX_SOCKET_LIB_CANDIDATES))
 VX_SOCKET_DB              := $(LIBS_DIR)/VX_socket_top.db
 
 BLACKBOX_SOCKET_single-core ?= 0
-BLACKBOX_SOCKET_full-vortex ?= 1
+BLACKBOX_SOCKET_1c8n4w4t    ?= 1
 
 #-----------------------------------------------------------------------
 # Top-level targets
@@ -215,7 +217,7 @@ $(VX_SOCKET_DB): $(VX_SOCKET_LIB) compile_lib_to_db.tcl
 #-----------------------------------------------------------------------
 #
 # BLACKBOX_DEPS_<cfg> expands to the list of prerequisites that a
-# full-vortex-style (blackbox=1) run needs before dc_shell starts —
+# blackbox=1 run (like 1c8n4w4t) needs before dc_shell starts —
 # i.e. the compiled VX_socket_top.db. For configs that don't blackbox,
 # the list is empty.
 define CONFIG_RULES
@@ -245,7 +247,7 @@ $(foreach cfg,$(CONFIGS),$(eval $(call CONFIG_RULES,$(cfg))))
 #-----------------------------------------------------------------------
 # clean — remove all generated artifacts (libs/ kept intentionally,
 # EXCEPT the auto-built VX_socket_top.db, which is derived and should
-# be regenerated from the current .lib on the next full-vortex run.
+# be regenerated from the current .lib on the next 1c8n4w4t run.
 # Override with KEEP_SOCKET_DB=1 if you want to preserve the binary.
 #-----------------------------------------------------------------------
 KEEP_SOCKET_DB ?= 0

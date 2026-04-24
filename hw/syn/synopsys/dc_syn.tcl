@@ -17,7 +17,7 @@
 #
 # Usage:
 #   dc_shell -x "set CONFIG single-core; set TOP VX_socket_top" -f dc_syn.tcl
-#   dc_shell -x "set CONFIG full-vortex; set TOP Vortex"        -f dc_syn.tcl
+#   dc_shell -x "set CONFIG 1c8n4w4t; set TOP Vortex"          -f dc_syn.tcl
 #
 # CONFIG selects the filelist (flists/dc_flist_<CONFIG>.f); TOP is the
 # module name passed to elaborate/current_design/write_file. Output
@@ -40,7 +40,7 @@ if {![info exists TOP]} {
 # The Makefile sets this explicitly per config; we default it here for
 # direct dc_shell invocations that forget to pass the flag.
 if {![info exists BLACKBOX_SOCKET]} {
-    set BLACKBOX_SOCKET [expr {$CONFIG eq "full-vortex"}]
+    set BLACKBOX_SOCKET [expr {$CONFIG eq "1c8n4w4t"}]
 }
 
 set SCRIPT_DIR [file normalize [file dirname [info script]]]
@@ -95,7 +95,7 @@ if {$BLACKBOX_SOCKET} {
     } elseif {[file exists $_socket_db_fall]} {
         set _socket_db $_socket_db_fall
     } else {
-        error "BLACKBOX_SOCKET=1 but VX_socket_top.db was not found in either:\n  $_socket_db_pref\n  $_socket_db_fall\nRun 'make socket-db' (or 'make full-vortex' via the Makefile) to build it from the .lib, and if the .lib itself is missing, run 'make extract-macro' under hw/pnr/cadence first."
+        error "BLACKBOX_SOCKET=1 but VX_socket_top.db was not found in either:\n  $_socket_db_pref\n  $_socket_db_fall\nRun 'make socket-db' (or 'make 1c8n4w4t' via the Makefile) to build it from the .lib, and if the .lib itself is missing, run 'make extract-macro' under hw/pnr/cadence first."
     }
     lappend link_library $_socket_db
     puts "INFO: BLACKBOX_SOCKET=1 — VX_socket_top linked from: $_socket_db"

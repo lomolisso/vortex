@@ -3,15 +3,15 @@
 This flow uses **Synopsys Design Compiler** with **NanGate45** standard cells
 and **bsg_fakeram** SRAM macros to synthesize two complementary designs:
 
-| Config         | DC top           | What it contains                                                                                   |
-| -------------- | ---------------- | -------------------------------------------------------------------------------------------------- |
-| `single-core`  | `VX_socket_top`  | One `VX_core` + its **private** I$, D$, local memory and register file. `SOCKET_SIZE=1`, no L2.    |
-| `full-vortex`  | `Vortex`         | Full GPGPU: 4 cores (4 `VX_socket_top` instances) inside one cluster, sharing an **L2** cache.     |
+| Config         | DC top           | What it contains                                                                                        |
+| -------------- | ---------------- | ------------------------------------------------------------------------------------------------------- |
+| `single-core`  | `VX_socket_top`  | One `VX_core` + its **private** I$, D$, local memory and register file. `SOCKET_SIZE=1`, no L2.         |
+| `1c8n4w4t`     | `Vortex`         | Full GPGPU: 8 cores (8 `VX_socket_top` instances) inside one cluster, sharing a 1 MiB **L2** cache.    |
 
 `VX_socket_top` is a flat-port wrapper around `VX_socket` added in
 [`hw/rtl/VX_socket_top.sv`](../../rtl/VX_socket_top.sv). It exists so the
 PnR’d single-core block has explicit flat pins that can later be packaged
-as a `.lef`/`.lib` macro and substituted back into the `full-vortex` run as a
+as a `.lef`/`.lib` macro and substituted back into the `1c8n4w4t` run as a
 blackbox. `VX_cluster` is gated on `ASIC_SYNTHESIS` to instantiate
 `VX_socket_top` directly (see [`hw/rtl/VX_cluster.sv`](../../rtl/VX_cluster.sv)),
 so both scenarios share the exact same socket boundary.
@@ -45,17 +45,17 @@ cd hw/syn/synopsys
 
 # (Optional) quick elaboration-only check
 make elab_single-core
-make elab_full-vortex
+make elab_1c8n4w4t
 
 # Synthesize one configuration
 make single-core
-make full-vortex
+make 1c8n4w4t
 
 # Synthesize both
 make all
 ```
 
-> `make full-vortex` runs in **bottom-up mode by default**: the socket
+> `make 1c8n4w4t` runs in **bottom-up mode by default**: the socket
 > is linked as a blackbox from `libs/VX_socket_top.db`, which is
 > auto-built from the routed single-core's `.lib`. See the
 > [Bottom-up hierarchical synthesis](#bottom-up-hierarchical-synthesis)
@@ -66,7 +66,7 @@ make all
 
 Results are written per-config under `runs/<config>/`:
 
-| Path (under `runs/<config>/`)        | `single-core`              | `full-vortex`       |
+| Path (under `runs/<config>/`)        | `single-core`              | `1c8n4w4t`          |
 | ------------------------------------ | -------------------------- | ------------------- |
 | `results/<TOP>_netlist.v`            | `VX_socket_top_netlist.v`  | `Vortex_netlist.v`  |
 | `results/<TOP>.ddc`                  | `VX_socket_top.ddc`        | `Vortex.ddc`        |
@@ -86,14 +86,14 @@ The two configs slot into this end-to-end flow:
 3. `make extract-macro` in `hw/pnr/cadence/` — emits
    `VX_socket_top.lef` and `VX_socket_top.lib` into
    `hw/pnr/cadence/export/single-core/`.
-4. `make full-vortex` — synthesize the full GPGPU with the socket
+4. `make 1c8n4w4t` — synthesize the full GPGPU with the socket
    **blackboxed** from the exported `.lib` (see below).
 5. Run PnR on the GPGPU netlist; Innovus reads the same `.lef`/`.lib`
    from `export/single-core/` to place the socket as a hard macro.
 
 ## Bottom-up hierarchical synthesis
 
-`make full-vortex` runs DC in bottom-up mode by default. Instead of
+`make 1c8n4w4t` runs DC in bottom-up mode by default. Instead of
 re-synthesizing `VX_socket_top` from RTL every run (which is wasteful
 — the routed single-core already has characterized timing/area), DC:
 
@@ -105,7 +105,7 @@ re-synthesizing `VX_socket_top` from RTL every run (which is wasteful
 3. Applies `set_dont_touch` to every `VX_socket_top` instance so
    `compile_ultra` never optimizes across the blackbox boundary.
 
-The resulting `Vortex_netlist.v` has four `VX_socket_top` instance
+The resulting `Vortex_netlist.v` has eight `VX_socket_top` instance
 lines and zero gate-level expansion of the socket internals.
 
 ### Artifact chain
@@ -117,13 +117,13 @@ hw/pnr/cadence/export/single-core/VX_socket_top.lib   ← make extract-macro
                      ▼ compile_lib_to_db.tcl (dc_shell)
 hw/syn/synopsys/libs/VX_socket_top.db                 ← make socket-db
                      │                                   (auto-built as a prereq
-                     │                                    of make full-vortex)
+                     │                                    of make 1c8n4w4t)
                      ▼
-hw/syn/synopsys/runs/full-vortex/results/Vortex_netlist.v
+hw/syn/synopsys/runs/1c8n4w4t/results/Vortex_netlist.v
 ```
 
 The `.db` is treated as a **derived** artifact: `make clean` deletes
-it and the next `make full-vortex` rebuilds it from whichever `.lib`
+it and the next `make 1c8n4w4t` rebuilds it from whichever `.lib`
 exists. Set `KEEP_SOCKET_DB=1` on the `make clean` command line to
 preserve it across cleans.
 
@@ -149,17 +149,17 @@ must all come from the **same single-core PnR run**. Re-run
 `make extract-macro` every time the single-core RTL, constraints, or
 floorplan change — otherwise DC will characterize `VX_socket_top`
 pins that don't match the PnR netlist, and Innovus will fail with
-connectivity errors on the full-vortex run.
+connectivity errors on the 1c8n4w4t run.
 
 ### Forcing a flat re-synth
 
 To bypass the bottom-up flow — for example, to compare QoR against a
 flat reference or to debug a netlist discrepancy — override
-`BLACKBOX_SOCKET_full-vortex` on the command line:
+`BLACKBOX_SOCKET_1c8n4w4t` on the command line:
 
 ```bash
-# Flat full-vortex (re-synthesizes VX_socket_top from RTL):
-make full-vortex BLACKBOX_SOCKET_full-vortex=0
+# Flat 1c8n4w4t (re-synthesizes VX_socket_top from RTL):
+make 1c8n4w4t BLACKBOX_SOCKET_1c8n4w4t=0
 
 # Forcing blackbox on single-core is nonsensical (single-core IS the
 # synthesis of VX_socket_top), and is not supported.

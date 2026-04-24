@@ -2,23 +2,23 @@
 """
 compute_full_vortex_area_budget.py
 ──────────────────────────────────
-Floorplan area budget for the `full-vortex` PnR run.
+Floorplan area budget for the `1c8n4w4t` PnR run.
 
-At the full-GPGPU level the four VX_core blocks are already laid out and
+At the full-GPGPU level the eight VX_core blocks are already laid out and
 packaged as a .lef/.lib pair (`VX_socket_top.lef`, `VX_socket_top.lib`),
 produced by the earlier single-core PnR step. So the area we need to
 allocate at the top is:
 
-    4 × core_area  +  L2 SRAM macro area  +  top-level stdcells
+    8 × core_area  +  L2 SRAM macro area  +  top-level stdcells
 
 Where:
   · core_area    — Liberty 'area' of cell VX_socket_top (read from
                    <libs_dir>/VX_socket_top.lib).
-  · L2 macros    — 4 banks × 4 ways = 16 tag + 16 data bsg_fakeram macros:
+  · L2 macros    — 8 banks × 8 ways = 64 tag + 64 data bsg_fakeram macros:
                      sram_256x24_1r1w   (tag arrays)
                      sram_256x512_1rw   (data arrays)
                    Dimensions read from each LEF's SIZE statement.
-  · stdcells     — 'Total cell area' from the full-vortex DC area report.
+  · stdcells     — 'Total cell area' from the 1c8n4w4t DC area report.
                    After core blackboxing this covers only the L2 cache
                    controller + Vortex top-level glue; pre-blackbox it
                    is larger, which simply yields a conservative budget.
@@ -26,17 +26,17 @@ Where:
 The script emits the same `floorplan_budget.tcl` variables
 (FLOORPLAN_W / FLOORPLAN_H / FLOORPLAN_MARGIN) that the per-config stage-3
 floorplan scripts already consume — so it is a drop-in replacement for
-the single-core variant at the `full-vortex` target.
+the single-core variant at the `1c8n4w4t` target.
 
 Default paths (relative to this script's directory)
 ────────────────────────────────────────────────────
-  --runs_dir  ../syn/synopsys/runs   (area.rpt at <runs_dir>/full-vortex/reports/area.rpt)
+  --runs_dir  ../syn/synopsys/runs   (area.rpt at <runs_dir>/1c8n4w4t/reports/area.rpt)
   --libs_dir  ../syn/synopsys/libs   (VX_socket_top.lib + SRAM .lef files)
 
 Usage
 ─────
   python3 compute_full_vortex_area_budget.py \\
-      --emit_tcl runs/full-vortex/floorplan_budget.tcl
+      --emit_tcl runs/1c8n4w4t/floorplan_budget.tcl
 """
 
 from __future__ import annotations
@@ -60,19 +60,20 @@ from compute_area_budget import (  # noqa: E402
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Fixed full-vortex parameters — matches hw/syn/synopsys/Makefile's
-# DEFINES_full-vortex (NUM_CLUSTERS=1, NUM_CORES=4, NUM_WARPS=4, NUM_THREADS=4,
-# SOCKET_SIZE=1, L2_ENABLE, L2_CACHE_SIZE=131072).
+# Fixed 1c8n4w4t parameters — matches hw/syn/synopsys/Makefile's
+# DEFINES_1c8n4w4t (NUM_CLUSTERS=1, NUM_CORES=8, NUM_WARPS=4, NUM_THREADS=4,
+# SOCKET_SIZE=1, L2_ENABLE, L2_CACHE_SIZE=1048576).
 #
-# With the default L2_NUM_BANKS=4 and L2_NUM_WAYS=4 in VX_config.vh, the L2
-# cache contains 16 tag arrays and 16 data arrays.  Both variants live in
-# libs/ as bsg_fakeram macros.
+# L2_NUM_BANKS = MIN(NUM_SOCKETS * L1_MEM_PORTS, 16) = MIN(8*1, 16) = 8.
+# L2_NUM_WAYS  = 8 (VX_config.vh default).
+# CS_LINES_PER_BANK = 1048576 / (64 * 8 * 8) = 256 → sram_256x* macros.
+# Total: 8 banks × 8 ways = 64 tag arrays + 64 data arrays.
 # ──────────────────────────────────────────────────────────────────────────────
 
-CONFIG          = "full-vortex"
-NUM_CORES       = 4
-L2_NUM_BANKS    = 4
-L2_NUM_WAYS     = 4
+CONFIG          = "1c8n4w4t"
+NUM_CORES       = 8
+L2_NUM_BANKS    = 8
+L2_NUM_WAYS     = 8
 L2_TAG_LIB      = "sram_256x24_1r1w"
 L2_DATA_LIB     = "sram_256x512_1rw"
 CORE_LIB_NAME   = "VX_socket_top"
@@ -139,15 +140,15 @@ def main():
 
     ap = argparse.ArgumentParser(
         description=(
-            "Compute the Innovus floorplan area budget for the `full-vortex` "
-            "PnR run (Vortex GPGPU = 4 × VX_socket_top blackboxes + shared L2)."
+            "Compute the Innovus floorplan area budget for the `1c8n4w4t` "
+            "PnR run (Vortex GPGPU = 8 × VX_socket_top blackboxes + shared 1 MiB L2)."
         )
     )
     ap.add_argument(
         '--runs_dir', default=default_runs,
         help=(
             'Root of synthesis run directories. area.rpt is expected at '
-            '<runs_dir>/full-vortex/reports/area.rpt  '
+            '<runs_dir>/1c8n4w4t/reports/area.rpt  '
             f'(default: {default_runs})'
         ),
     )
@@ -202,14 +203,14 @@ def main():
 
     core_area_um2 = parse_lib_cell_area(core_lib, CORE_CELL_NAME)
 
-    # ── 2. Locate the full-vortex DC area report for the stdcell total ───
+    # ── 2. Locate the 1c8n4w4t DC area report for the stdcell total ─────
     area_rpt = os.path.normpath(
         os.path.join(args.runs_dir, CONFIG, 'reports', 'area.rpt')
     )
     if not os.path.isfile(area_rpt):
         sys.exit(
             f"ERROR: area report not found: {area_rpt}\n"
-            "Run 'make full-vortex' in hw/syn/synopsys first."
+            "Run 'make 1c8n4w4t' in hw/syn/synopsys first."
         )
 
     stdcell_area_um2  = parse_dc_area_report(area_rpt)
@@ -242,7 +243,7 @@ def main():
     # ── 5. Print report ──────────────────────────────────────────────────
     print()
     hr()
-    print("  AREA BUDGET REPORT — full-vortex (Vortex GPGPU)")
+    print("  AREA BUDGET REPORT — 1c8n4w4t (Vortex GPGPU)")
     hr()
     print(f"  Config            : {CONFIG}  "
           f"(cores={NUM_CORES}  shared-L2 banks={L2_NUM_BANKS}  ways={L2_NUM_WAYS})")
@@ -274,14 +275,14 @@ def main():
     hr()
     row("L2 total macro area", f"{l2_total_area:,.2f}", "µm²")
 
-    print("\n  STDCELLS (from full-vortex Design Compiler area.rpt)")
+    print("\n  STDCELLS (from 1c8n4w4t Design Compiler area.rpt)")
     hr()
     row("Total stdcell area",   f"{stdcell_area_um2:,.2f}",  "µm²")
     row("Area @ target util",   f"{stdcell_with_util:,.2f}", "µm²")
 
     print("\n  FLOORPLAN SIZING")
     hr()
-    row("4 × core area",        f"{core_total_area:,.2f}", "µm²")
+    row("8 × core area",        f"{core_total_area:,.2f}", "µm²")
     row("L2 macro area",        f"{l2_total_area:,.2f}",   "µm²")
     row("Stdcells @ util",      f"{stdcell_with_util:,.2f}", "µm²")
     row("Raw total area",       f"{raw_area:,.2f}",        "µm²")

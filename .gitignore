@@ -1,10 +1,14 @@
 /build*
 /.vscode
 *.cache
-*.pyc
 *.code-workspace
 miscs/apptainer/vortex.sif
 .cursor
+
+# Python
+__pycache__/
+*.pyc
+
 # Synopsys DC ASIC synthesis run artifacts (heavy / machine-specific)
 /hw/syn/synopsys/runs/
 /hw/syn/synopsys/flists/
