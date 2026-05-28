@@ -4,6 +4,8 @@
 *.code-workspace
 miscs/apptainer/vortex.sif
 .cursor
+.venv
+.summaries
 
 # Python
 __pycache__/
@@ -16,10 +18,13 @@ __pycache__/
 /hw/syn/synopsys/logs/
 /hw/syn/synopsys/reports/
 /hw/syn/synopsys/results/
-/syn/synopsys/work/
+/hw/syn/synopsys/libs
+/hw/syn/synopsys/lc_*
 
 # Cadence Innovus PnR run artifacts (heavy / machine-specific)
 /hw/pnr/cadence/runs/
+/hw/pnr/cadence/reports/
+/hw/pnr/cadence/results/
 /hw/pnr/cadence/export/
 /hw/pnr/cadence/*.cmd*
 /hw/pnr/cadence/*.log*
