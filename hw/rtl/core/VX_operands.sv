@@ -66,6 +66,24 @@ module VX_operands import VX_gpu_pkg::*; #(
         assign opc_writeback_if.valid = writeback_if.valid && (wb_opc == i);
         assign opc_writeback_if.data  = writeback_if.data;
 
+`ifdef ASIC_SYNTHESIS
+        VX_gpr_top #(
+            .INSTANCE_ID(`SFORMATF(("%s-collector%0d", INSTANCE_ID, i))),
+            .NUM_BANKS  (`NUM_GPR_BANKS),
+            .OUT_BUF    (3)
+        ) opc_unit (
+            .clk              (clk),
+            .reset            (reset),
+            .writeback_valid  (opc_writeback_if.valid),
+            .writeback_data   (opc_writeback_if.data),
+            .scoreboard_valid (opc_scoreboard_if.valid),
+            .scoreboard_data  (opc_scoreboard_if.data),
+            .scoreboard_ready (opc_scoreboard_if.ready),
+            .operands_valid   (per_opc_operands_if[i].valid),
+            .operands_data    (per_opc_operands_if[i].data),
+            .operands_ready   (per_opc_operands_if[i].ready)
+        );
+`else
         VX_opc_unit #(
             .INSTANCE_ID  (`SFORMATF(("%s-collector%0d", INSTANCE_ID, i))),
             .NUM_BANKS    (`NUM_GPR_BANKS),
@@ -80,6 +98,7 @@ module VX_operands import VX_gpu_pkg::*; #(
             .scoreboard_if(opc_scoreboard_if),
             .operands_if  (per_opc_operands_if[i])
         );
+`endif
     end
 
     `ITF_TO_AOS (per_opc_operands, per_opc_operands_if, `NUM_OPCS, OUT_DATAW)
@@ -104,6 +123,10 @@ module VX_operands import VX_gpu_pkg::*; #(
     );
 
 `ifdef PERF_ENABLE
+`ifdef ASIC_SYNTHESIS
+    // VX_gpr_top does not expose per-OPC stall counters.
+    assign perf_stalls = '0;
+`else
     wire [PERF_CTR_BITS-1:0] perf_stalls_w;
     VX_reduce_tree #(
         .IN_W (PERF_CTR_BITS),
@@ -114,6 +137,7 @@ module VX_operands import VX_gpu_pkg::*; #(
         .data_out (perf_stalls_w)
     );
     `BUFFER(perf_stalls, perf_stalls_w);
+`endif
 `endif
 
 endmodule

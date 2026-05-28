@@ -15,6 +15,8 @@
 
 module VX_cache_cluster import VX_gpu_pkg::*; #(
     parameter `STRING INSTANCE_ID    = "",
+    // Forwarded to VX_cache_wrap → VX_cache for bank-macro dispatch.
+    parameter `STRING CACHE_KIND     = "",
 
     parameter NUM_UNITS             = 1,
     parameter NUM_INPUTS            = 1,
@@ -146,6 +148,7 @@ module VX_cache_cluster import VX_gpu_pkg::*; #(
      for (genvar i = 0; i < NUM_CACHES; ++i) begin : g_cache_wrap
         VX_cache_wrap #(
             .INSTANCE_ID  (`SFORMATF(("%s%0d", INSTANCE_ID, i))),
+            .CACHE_KIND   (CACHE_KIND),
             .CACHE_SIZE   (CACHE_SIZE),
             .LINE_SIZE    (LINE_SIZE),
             .NUM_BANKS    (NUM_BANKS),

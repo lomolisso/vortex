@@ -13,48 +13,45 @@
 
 `include "VX_define.vh"
 
-module VX_tcu_top import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
-    parameter `STRING INSTANCE_ID = ""
-) (
-    `SCOPE_IO_DECL
+// Flat-port wrapper around VX_tcu_unit for the ASIC macro boundary.
 
-    input wire clk,
-    input wire reset,
+`ifdef ASIC_SYNTHESIS
+module VX_tcu_top import VX_gpu_pkg::*, VX_tcu_pkg::*; (
+    input  wire                                         clk,
+    input  wire                                         reset,
 
-    // Dispatch Interface
-    input wire execute_valid,
-    input tcu_exe_t execute_data,
-    output wire execute_ready,
+    // Dispatch (per issue slot)
+    input  wire [`ISSUE_WIDTH-1:0]                      dispatch_valid,
+    input  dispatch_t [`ISSUE_WIDTH-1:0]                dispatch_data,
+    output wire [`ISSUE_WIDTH-1:0]                      dispatch_ready,
 
-    // Commit Interface
-    output wire result_valid,
-    output tcu_res_t result_data,
-    input wire result_ready
+    // Commit (per issue slot)
+    output wire [`ISSUE_WIDTH-1:0]                      commit_valid,
+    output commit_t [`ISSUE_WIDTH-1:0]                  commit_data,
+    input  wire [`ISSUE_WIDTH-1:0]                      commit_ready
 );
-    VX_execute_if #(
-        .data_t (tcu_exe_t)
-    ) execute_if();
 
-    VX_result_if #(
-        .data_t (tcu_res_t)
-    ) result_if();
+    VX_dispatch_if dispatch_if [`ISSUE_WIDTH]();
+    VX_commit_if   commit_if   [`ISSUE_WIDTH]();
 
-    assign execute_if.valid = execute_valid;
-    assign execute_if.data = execute_data;
-    assign execute_ready = execute_if.ready;
+    for (genvar i = 0; i < `ISSUE_WIDTH; ++i) begin : g_disp_commit
+        assign dispatch_if[i].valid = dispatch_valid[i];
+        assign dispatch_if[i].data  = dispatch_data[i];
+        assign dispatch_ready[i]    = dispatch_if[i].ready;
 
-    VX_tcu_fp #(
-        .INSTANCE_ID (INSTANCE_ID)
+        assign commit_valid[i]      = commit_if[i].valid;
+        assign commit_data[i]       = commit_if[i].data;
+        assign commit_if[i].ready   = commit_ready[i];
+    end
+
+    VX_tcu_unit #(
+        .INSTANCE_ID (`SFORMATF(("tcu_top")))
     ) tcu_unit (
-        `SCOPE_IO_BIND (0)
-        .clk        (clk),
-        .reset      (reset),
-        .execute_if (execute_if),
-        .result_if  (result_if)
+        .clk         (clk),
+        .reset       (reset),
+        .dispatch_if (dispatch_if),
+        .commit_if   (commit_if)
     );
 
-    assign result_valid = result_if.valid;
-    assign result_data = result_if.data;
-    assign result_if.ready = result_ready;
-
 endmodule
+`endif

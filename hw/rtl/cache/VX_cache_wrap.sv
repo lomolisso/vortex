@@ -15,6 +15,8 @@
 
 module VX_cache_wrap import VX_gpu_pkg::*; #(
     parameter `STRING INSTANCE_ID    = "",
+    // Forwarded to VX_cache for hierarchical-PnR bank-macro dispatch.
+    parameter `STRING CACHE_KIND     = "",
 
     parameter TAG_SEL_IDX           = 0,
 
@@ -161,6 +163,7 @@ module VX_cache_wrap import VX_gpu_pkg::*; #(
 
         VX_cache #(
             .INSTANCE_ID  (INSTANCE_ID),
+            .CACHE_KIND   (CACHE_KIND),
             .CACHE_SIZE   (CACHE_SIZE),
             .LINE_SIZE    (LINE_SIZE),
             .NUM_BANKS    (NUM_BANKS),

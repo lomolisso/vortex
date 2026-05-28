@@ -88,6 +88,7 @@ module VX_socket import VX_gpu_pkg::*; #(
 
     VX_cache_cluster #(
         .INSTANCE_ID    (`SFORMATF(("%s-icache", INSTANCE_ID))),
+        .CACHE_KIND     ("l1_icache"),
         .NUM_UNITS      (`NUM_ICACHES),
         .NUM_INPUTS     (`SOCKET_SIZE),
         .TAG_SEL_IDX    (0),
@@ -134,6 +135,7 @@ module VX_socket import VX_gpu_pkg::*; #(
 
     VX_cache_cluster #(
         .INSTANCE_ID    (`SFORMATF(("%s-dcache", INSTANCE_ID))),
+        .CACHE_KIND     ("l1_dcache"),
         .NUM_UNITS      (`NUM_DCACHES),
         .NUM_INPUTS     (`SOCKET_SIZE),
         .TAG_SEL_IDX    (0),

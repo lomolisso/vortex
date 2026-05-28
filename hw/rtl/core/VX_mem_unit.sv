@@ -104,6 +104,68 @@ module VX_mem_unit import VX_gpu_pkg::*; #(
         .mem_bus_if (lmem_adapt_if)
     );
 
+`ifdef ASIC_SYNTHESIS
+    // Flatten lmem_adapt_if[] to flat ports for the VX_local_mem_top macro boundary.
+    localparam LMEM_NUM_REQS = `NUM_LSU_LANES;
+    wire [LMEM_NUM_REQS-1:0]                       lmem_req_valid;
+    wire [LMEM_NUM_REQS-1:0]                       lmem_req_rw;
+    wire [LMEM_NUM_REQS-1:0][LSU_WORD_SIZE-1:0]    lmem_req_byteen;
+    wire [LMEM_NUM_REQS-1:0][LMEM_ADDR_WIDTH-1:0]  lmem_req_addr;
+    wire [LMEM_NUM_REQS-1:0][MEM_FLAGS_WIDTH-1:0]  lmem_req_flags;
+    wire [LMEM_NUM_REQS-1:0][LSU_WORD_SIZE*8-1:0]  lmem_req_data;
+    wire [LMEM_NUM_REQS-1:0][LMEM_TAG_WIDTH-1:0]   lmem_req_tag;
+    wire [LMEM_NUM_REQS-1:0]                       lmem_req_ready;
+    wire [LMEM_NUM_REQS-1:0]                       lmem_rsp_valid;
+    wire [LMEM_NUM_REQS-1:0][LSU_WORD_SIZE*8-1:0]  lmem_rsp_data;
+    wire [LMEM_NUM_REQS-1:0][LMEM_TAG_WIDTH-1:0]   lmem_rsp_tag;
+    wire [LMEM_NUM_REQS-1:0]                       lmem_rsp_ready;
+
+    for (genvar i = 0; i < LMEM_NUM_REQS; ++i) begin : g_lmem_flat
+        assign lmem_req_valid[i]            = lmem_adapt_if[i].req_valid;
+        assign lmem_req_rw[i]               = lmem_adapt_if[i].req_data.rw;
+        assign lmem_req_byteen[i]           = lmem_adapt_if[i].req_data.byteen;
+        assign lmem_req_addr[i]             = lmem_adapt_if[i].req_data.addr;
+        assign lmem_req_flags[i]            = lmem_adapt_if[i].req_data.flags;
+        assign lmem_req_data[i]             = lmem_adapt_if[i].req_data.data;
+        assign lmem_req_tag[i]              = lmem_adapt_if[i].req_data.tag;
+        assign lmem_adapt_if[i].req_ready   = lmem_req_ready[i];
+        assign lmem_adapt_if[i].rsp_valid   = lmem_rsp_valid[i];
+        assign lmem_adapt_if[i].rsp_data.data = lmem_rsp_data[i];
+        assign lmem_adapt_if[i].rsp_data.tag  = lmem_rsp_tag[i];
+        assign lmem_rsp_ready[i]            = lmem_adapt_if[i].rsp_ready;
+    end
+
+    VX_local_mem_top #(
+        .INSTANCE_ID(`SFORMATF(("%s-lmem", INSTANCE_ID))),
+        .SIZE       (1 << `LMEM_LOG_SIZE),
+        .NUM_REQS   (LMEM_NUM_REQS),
+        .NUM_BANKS  (`LMEM_NUM_BANKS),
+        .WORD_SIZE  (LSU_WORD_SIZE),
+        .ADDR_WIDTH (LMEM_ADDR_WIDTH),
+        .TAG_WIDTH  (LMEM_TAG_WIDTH)
+    ) local_mem (
+        .clk           (clk),
+        .reset         (reset),
+        .mem_req_valid (lmem_req_valid),
+        .mem_req_rw    (lmem_req_rw),
+        .mem_req_byteen(lmem_req_byteen),
+        .mem_req_addr  (lmem_req_addr),
+        .mem_req_flags (lmem_req_flags),
+        .mem_req_data  (lmem_req_data),
+        .mem_req_tag   (lmem_req_tag),
+        .mem_req_ready (lmem_req_ready),
+        .mem_rsp_valid (lmem_rsp_valid),
+        .mem_rsp_data  (lmem_rsp_data),
+        .mem_rsp_tag   (lmem_rsp_tag),
+        .mem_rsp_ready (lmem_rsp_ready)
+    );
+
+`ifdef PERF_ENABLE
+    assign lmem_perf = '0;
+`endif
+
+`else
+
     VX_local_mem #(
         .INSTANCE_ID(`SFORMATF(("%s-lmem", INSTANCE_ID))),
         .SIZE       (1 << `LMEM_LOG_SIZE),
@@ -121,6 +183,8 @@ module VX_mem_unit import VX_gpu_pkg::*; #(
     `endif
         .mem_bus_if (lmem_adapt_if)
     );
+
+`endif
 
 `else
 

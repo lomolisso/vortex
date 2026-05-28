@@ -1,270 +1,118 @@
-# Copyright © 2019-2023
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-# http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+# Vortex DC synthesis. Driver vars from Makefile via dc_shell -x:
+#   CONFIG, TOP, TARGET_FREQ_MHZ, MAX_FANOUT
+#   SRAM_DBS      space-separated .db paths
+#   BLACKBOX_DBS  space-separated <module>:<db> pairs
 
-#=======================================================================
-# Vortex GPGPU — Synopsys DC Synthesis Script
-# Target: NanGate45 stdcells + bsg_fakeram SRAM macros
-#
-# Usage:
-#   dc_shell -x "set CONFIG single-core; set TOP VX_socket_top" -f dc_syn.tcl
-#   dc_shell -x "set CONFIG 1c8n4w4t; set TOP Vortex"          -f dc_syn.tcl
-#
-# CONFIG selects the filelist (flists/dc_flist_<CONFIG>.f); TOP is the
-# module name passed to elaborate/current_design/write_file. Output
-# filenames follow the TOP name: <TOP>_netlist.v, <TOP>.ddc, <TOP>.sdc.
-#=======================================================================
-
-if {![info exists CONFIG]} {
-    error "CONFIG is not set. Invoke as: dc_shell -x {set CONFIG <config_name>; set TOP <top_module>} -f dc_syn.tcl"
+foreach _v {CONFIG TOP TARGET_FREQ_MHZ MAX_FANOUT} {
+    if {![info exists $_v]} { error "$_v not set." }
 }
-if {![info exists TOP]} {
-    # Backward compatibility: pre-existing invocations assumed Vortex.
-    set TOP Vortex
-}
-
-# BLACKBOX_SOCKET selects bottom-up vs. flat synthesis for VX_socket_top.
-#   0 → analyze + elaborate VX_socket_top.sv from RTL (flat / deep synth).
-#   1 → skip its RTL, link against VX_socket_top.db, and freeze every
-#       VX_socket_top instance with set_dont_touch so compile_ultra
-#       respects the macro boundary.
-# The Makefile sets this explicitly per config; we default it here for
-# direct dc_shell invocations that forget to pass the flag.
-if {![info exists BLACKBOX_SOCKET]} {
-    set BLACKBOX_SOCKET [expr {$CONFIG eq "1c8n4w4t"}]
+foreach _v {SRAM_DBS BLACKBOX_DBS} {
+    if {![info exists $_v]} { set $_v "" }
 }
 
 set SCRIPT_DIR [file normalize [file dirname [info script]]]
 set RUN_DIR    [pwd]
+set LIBS_DIR   "$SCRIPT_DIR/libs"
 
-#-----------------------------------------------------------------------
-# Work library — redirect DC's intermediate .pvl/.syn/.mr files out of
-# the synopsys/ root and into a per-config run directory.
-#-----------------------------------------------------------------------
 file mkdir "$RUN_DIR/work"
 define_design_lib WORK -path "$RUN_DIR/work"
 
-#-----------------------------------------------------------------------
-# Library setup
-#-----------------------------------------------------------------------
-set LIBS_DIR "$SCRIPT_DIR/libs"
-
 set target_library "$LIBS_DIR/stdcells.db"
-
-set link_library [concat \
-    * \
-    $LIBS_DIR/stdcells.db \
-    $LIBS_DIR/sram_64x512_1rw.db \
-    $LIBS_DIR/sram_256x512_1rw.db \
-    $LIBS_DIR/sram_1024x32_1rw.db \
-    $LIBS_DIR/sram_64x24_1r1w.db \
-    $LIBS_DIR/sram_256x24_1r1w.db \
-    $LIBS_DIR/sram_64x128_1r1w.db \
-    $LIBS_DIR/sram_128x128_1r1w.db \
-]
-
-# ----------------------------------------------------------------------
-# Bottom-up hard macro: add VX_socket_top.db to link_library only.
-#
-# NOT target_library — target_library is the cell pool DC is allowed
-# to use when it maps combinational/sequential logic. VX_socket_top is
-# a design-specific blackbox, not a library cell, so it must appear in
-# link_library (for resolving the module instance) and stay out of
-# target_library (so compile_ultra never tries to map random gates
-# onto VX_socket_top).
-#
-# Path lookup: the canonical location is the PnR export directory,
-# in case a future workflow ever drops the .db directly there. The
-# Makefile's socket-db rule produces the .db in LIBS_DIR, so that's
-# the branch that will normally fire.
-# ----------------------------------------------------------------------
-if {$BLACKBOX_SOCKET} {
-    set _socket_db_pref [file normalize "$SCRIPT_DIR/../../pnr/cadence/export/single-core/VX_socket_top.db"]
-    set _socket_db_fall "$LIBS_DIR/VX_socket_top.db"
-    if {[file exists $_socket_db_pref]} {
-        set _socket_db $_socket_db_pref
-    } elseif {[file exists $_socket_db_fall]} {
-        set _socket_db $_socket_db_fall
-    } else {
-        error "BLACKBOX_SOCKET=1 but VX_socket_top.db was not found in either:\n  $_socket_db_pref\n  $_socket_db_fall\nRun 'make socket-db' (or 'make 1c8n4w4t' via the Makefile) to build it from the .lib, and if the .lib itself is missing, run 'make extract-macro' under hw/pnr/cadence first."
-    }
-    lappend link_library $_socket_db
-    puts "INFO: BLACKBOX_SOCKET=1 — VX_socket_top linked from: $_socket_db"
-} else {
-    puts "INFO: BLACKBOX_SOCKET=0 — VX_socket_top will be synthesized from RTL (flat)."
-}
-
+set link_library   [list * "$LIBS_DIR/stdcells.db"]
 set symbol_library {}
 
-#-----------------------------------------------------------------------
-# Parse the filelist generated by gen_dc_sources.sh
-#-----------------------------------------------------------------------
-source "$SCRIPT_DIR/../../scripts/parse_vcs_list.tcl"
+foreach _db $SRAM_DBS {
+    if {![file exists $_db]} { error "SRAM .db not found: $_db (run 'make libs')." }
+    lappend link_library $_db
+}
+puts "INFO: linked [llength $SRAM_DBS] SRAM .db file(s)."
 
-set flist_path "$SCRIPT_DIR/flists/dc_flist_${CONFIG}.f"
-if {![file exists $flist_path]} {
-    error "Filelist not found: $flist_path\nRun: make flist_${CONFIG}"
+set blackbox_cells [list]
+foreach pair $BLACKBOX_DBS {
+    if {$pair eq ""} continue
+    set _i [string first ":" $pair]
+    if {$_i < 0} { error "BLACKBOX_DBS entry '$pair' missing ':' (need <module>:<db>)." }
+    set _cell [string range $pair 0 [expr {$_i - 1}]]
+    set _db   [string range $pair [expr {$_i + 1}] end]
+    if {![file exists $_db]} { error "Blackbox .db not found for $_cell: $_db" }
+    lappend link_library  $_db
+    lappend blackbox_cells $_cell
+    puts "INFO: $_cell linked from $_db"
 }
 
+source "$SCRIPT_DIR/../../scripts/parse_vcs_list.tcl"
+set flist_path "$SCRIPT_DIR/flists/dc_flist_${CONFIG}.f"
+if {![file exists $flist_path]} { error "Filelist not found: $flist_path (run 'make flist_${CONFIG}')." }
 lassign [parse_vcs_list $flist_path] src_files inc_dirs defines
-
-# Extend search_path with all +incdir+ entries from the filelist
 set search_path [concat $search_path $inc_dirs]
 
-# defs_div_sqrt_mvp.sv defines a package but does not follow the *_pkg.sv
-# naming convention, so gen_sources.sh cannot hoist it automatically.
-# Move it to the front of the file list so it is analyzed before any file
-# that imports the defs_div_sqrt_mvp package.
-set _defs_idx [lsearch -glob $src_files "*defs_div_sqrt_mvp.sv"]
-if {$_defs_idx >= 0} {
-    set _defs_file [lindex $src_files $_defs_idx]
-    set src_files [linsert [lreplace $src_files $_defs_idx $_defs_idx] 0 $_defs_file]
-    unset _defs_idx _defs_file
+# defs_div_sqrt_mvp.sv is a package; *_pkg.sv glob misses it.
+set _i [lsearch -glob $src_files "*defs_div_sqrt_mvp.sv"]
+if {$_i >= 0} {
+    set _f [lindex $src_files $_i]
+    set src_files [linsert [lreplace $src_files $_i $_i] 0 $_f]
 }
 
-#-----------------------------------------------------------------------
-# Bottom-up: drop VX_socket_top.sv from the analyze list when we're
-# blackboxing the socket. With the RTL body gone, `elaborate Vortex`
-# will see VX_socket_top as an unresolved reference and `link` will
-# resolve it against VX_socket_top.db in link_library — exactly the
-# behavior we want.
-#
-# We only filter VX_socket_top.sv itself; the descendants
-# (VX_socket.sv, VX_core.sv, caches, fpu, ...) stay in the list.
-# Removing them too would need a dependency-graph pass, and there's
-# no correctness benefit: `elaborate` never descends past the linked
-# blackbox, so descendants sit harmlessly in the WORK library. The
-# price is a modest analyze-time overhead; fixing that is future work.
-#-----------------------------------------------------------------------
-if {$BLACKBOX_SOCKET} {
-    set _pre [llength $src_files]
-    set src_files [lsearch -inline -all -not -glob $src_files "*/VX_socket_top.sv"]
-    set _post [llength $src_files]
-    if {$_pre == $_post} {
-        puts "WARNING: BLACKBOX_SOCKET=1 but VX_socket_top.sv was not in the filelist; nothing to skip."
-    } else {
-        puts "INFO: BLACKBOX_SOCKET=1 — skipped VX_socket_top.sv from analyze ([expr {$_pre - $_post}] file(s))."
-    }
-    unset _pre _post
+foreach _cell $blackbox_cells {
+    set src_files [lsearch -inline -all -not -glob $src_files "*/${_cell}.sv"]
 }
 
-#-----------------------------------------------------------------------
-# Analyze (parse) all source files in filelist order
-# gen_sources.sh already places packages first, so ordering is correct:
-#   fpnew_pkg.sv → HardFloat sources → Vortex RTL → Vortex top
-#-----------------------------------------------------------------------
 foreach f $src_files {
     analyze -format sverilog -define $defines $f
 }
-
-#-----------------------------------------------------------------------
-# Elaborate, link, and check
-#-----------------------------------------------------------------------
 elaborate $TOP
 current_design $TOP
 link
 check_design
 
-#-----------------------------------------------------------------------
-# Bottom-up: assert the socket is really a linked blackbox, then pin
-# every VX_socket_top instance with set_dont_touch.
-#
-#   - The sanity check catches silent misconfigurations: e.g. a stale
-#     filelist that still carries VX_socket_top.sv despite our filter,
-#     or a .db that was read in but didn't cover the expected cell.
-#     In either case `get_cells -filter "ref_name == VX_socket_top"`
-#     would return zero matches and we'd silently produce a flat
-#     netlist; failing loudly here is much easier to debug than
-#     discovering it in the middle of PnR.
-#
-#   - set_dont_touch stops compile_ultra from: removing unused socket
-#     pins, re-timing paths through the socket (the .lib already has
-#     those characterized), or cloning/merging socket instances. Four
-#     identical VX_socket_top cells must stay as four identical cells
-#     so the PnR placer can hard-macro-instantiate each one.
-#-----------------------------------------------------------------------
-if {$BLACKBOX_SOCKET} {
-    set _sockets [get_cells -hier -filter "ref_name == VX_socket_top"]
-    set _n_sockets [sizeof_collection $_sockets]
-    if {$_n_sockets == 0} {
-        error "BLACKBOX_SOCKET=1 but no VX_socket_top cells appear in the linked design.\nCheck that link_library contains VX_socket_top.db and that VX_cluster.sv is under `ifdef ASIC_SYNTHESIS (which it should be — gen_dc_sources.sh forces -DASIC_SYNTHESIS)."
-    }
-    set_dont_touch $_sockets
-    puts "INFO: set_dont_touch on $_n_sockets VX_socket_top cell(s) — compile_ultra will respect the blackbox boundary."
-    unset _sockets _n_sockets
+# PnR placeInstance paths bake in the wrapper's `macro_inst` hierarchy.
+foreach _w {sram_32x512_1rw sram_64x512_1rw sram_256x512_1rw sram_1024x32_1rw sram_64x128_1r1w} {
+    if {[get_designs -quiet $_w] ne ""} { set_dont_touch [get_designs $_w] }
 }
 
-#-----------------------------------------------------------------------
-# Timing constraints — 100 MHz (10 ns)
-#-----------------------------------------------------------------------
-set CLK_PERIOD 10.0
+foreach _cell $blackbox_cells {
+    set _insts [get_cells -hier -filter "ref_name == $_cell"]
+    set _n [sizeof_collection $_insts]
+    if {$_n == 0} { error "BLACKBOX_DBS listed $_cell but no $_cell instances in linked design." }
+    set_dont_touch $_insts
+    puts "INFO: dont_touch on $_n $_cell instance(s)."
+}
+
+set CLK_PERIOD [expr {1000.0 / double($TARGET_FREQ_MHZ)}]
+puts "INFO: $CONFIG SDC — ${TARGET_FREQ_MHZ} MHz (period ${CLK_PERIOD} ns), max_fanout ${MAX_FANOUT}."
 
 create_clock -name clk -period $CLK_PERIOD [get_ports clk]
-set_ideal_network   [get_ports clk]
-set_max_fanout 20   [get_ports clk]
-
-set_false_path -from [get_ports reset]
-set_max_fanout 20   [get_ports reset]
-
-# Relaxed I/O delays (20% of period) — tighten after first-pass QoR
+set_ideal_network                          [get_ports clk]
+set_max_fanout $MAX_FANOUT                 [get_ports clk]
+set_false_path -from                       [get_ports reset]
+set_max_fanout $MAX_FANOUT                 [get_ports reset]
+set_clock_uncertainty [expr {$CLK_PERIOD * 0.05}] [get_clocks clk]
 set_input_delay  -clock clk -max [expr {$CLK_PERIOD * 0.2}] [all_inputs]
 set_output_delay -clock clk -max [expr {$CLK_PERIOD * 0.2}] [all_outputs]
+set_max_fanout     $MAX_FANOUT [current_design]
+set_max_transition 0.5         [current_design]
 
-# Global design-rule constraints
-set_max_fanout   20  [current_design]
-set_max_transition 0.5 [current_design]
-
-#-----------------------------------------------------------------------
-# Compile
-#-----------------------------------------------------------------------
 compile_ultra -no_autoungroup
 
-#-----------------------------------------------------------------------
-# Reports
-#-----------------------------------------------------------------------
 set REPORT_DIR "$RUN_DIR/reports"
 file mkdir $REPORT_DIR
+report_area                      > "$REPORT_DIR/area.rpt"
+report_timing -nworst 10         > "$REPORT_DIR/timing.rpt"
+report_power                     > "$REPORT_DIR/power.rpt"
+report_qor                       > "$REPORT_DIR/qor.rpt"
+report_hierarchy                 > "$REPORT_DIR/hierarchy.rpt"
+report_constraint -all_violators > "$REPORT_DIR/constraints.rpt"
 
-report_area                          > "$REPORT_DIR/area.rpt"
-report_timing -nworst 10             > "$REPORT_DIR/timing.rpt"
-report_power                         > "$REPORT_DIR/power.rpt"
-report_qor                           > "$REPORT_DIR/qor.rpt"
-report_hierarchy                     > "$REPORT_DIR/hierarchy.rpt"
-report_constraint -all_violators     > "$REPORT_DIR/constraints.rpt"
-
-#-----------------------------------------------------------------------
-# Write outputs
-#-----------------------------------------------------------------------
 set RESULTS_DIR "$RUN_DIR/results"
 file mkdir $RESULTS_DIR
-
 write_file -hierarchy -format verilog -output "$RESULTS_DIR/${TOP}_netlist.v"
 write_file -format ddc                -output "$RESULTS_DIR/${TOP}.ddc"
 write_sdc                                     "$RESULTS_DIR/${TOP}.sdc"
 
-# DC's write_sdc emits 2-D SV port names (e.g., mem_req_data[0][511]) because
-# it tracks packed multidimensional arrays internally, but write_file -format
-# verilog flattens them to 1-D port declarations (mem_req_data[511]).  Innovus
-# reads the Verilog netlist and therefore cannot resolve the 2-D get_ports
-# references, producing TCLNL-312 errors for every bit of every wide bus.
-# Strip the outer [0] subscript so the SDC matches the netlist port names.
+# TCLNL-312: strip 2-D SV port index from SDC to match flattened netlist.
 set _sdc "$RESULTS_DIR/${TOP}.sdc"
-set _fh  [open $_sdc r]
-set _txt [read $_fh]
-close $_fh
-regsub -all {\{([a-zA-Z_][a-zA-Z0-9_]*)\[0\]\[([0-9]+)\]\}} $_txt {{\1[\2]}} _txt
-set _fh  [open $_sdc w]
-puts -nonewline $_fh $_txt
-close $_fh
-unset _sdc _fh _txt
+set _fh [open $_sdc r] ; set _txt [read $_fh] ; close $_fh
+regsub -all {\{([a-zA-Z_][a-zA-Z0-9_]*)\[[0-9]+\]\[([0-9]+)\]\}} $_txt {{\1[\2]}} _txt
+set _fh [open $_sdc w] ; puts -nonewline $_fh $_txt ; close $_fh
 
 exit

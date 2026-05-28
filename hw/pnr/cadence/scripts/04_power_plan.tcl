@@ -1,100 +1,65 @@
-#=======================================================================
-# Stage 4 — Power Planning
-#
-# PURPOSE
-#   Build the physical power distribution network (PDN) — the metal
-#   structures that carry VDD and VSS from the chip boundary to every
-#   standard cell and macro.  A well-designed PDN minimises IR-drop
-#   (voltage sag due to wire resistance) and electromigration risk.
-#
-# THREE-TIER PDN STRATEGY
-# ─────────────────────────────────────────────────────────────────────
-#   Tier 1 — Standard-cell rails (M1, horizontal)
-#     Every standard-cell row has a VDD rail along its top edge and a
-#     VSS rail along its bottom edge, both on metal 1.  These are the
-#     finest-grained wires, running the full width of the row.
-#     Command: sroute -connect corePin
-#
-#   Tier 2 — Power ring (M7 top/bottom, M8 left/right)
-#     A closed rectangular ring encircles the entire core.  It acts as a
-#     low-resistance "bus" connecting the I/O pads (outside) to the
-#     internal stripe grid (inside).  Using M7/M8 (thick global metals)
-#     minimises resistance and allows the ring to carry the full chip
-#     current.  VSS and VDD each get their own ring wire side by side.
-#     Command: addRing
-#
-#   Tier 3 — Vertical power stripes (M7)
-#     Vertical wires spaced every 40 µm across the core connect the ring
-#     (tier 2) down to the M1 rails (tier 1) via vias.  Without stripes,
-#     cells far from the ring would see high IR-drop because current would
-#     have to travel horizontally along the thin M1 rails.
-#     Command: addStripe
-#
-# LAYER USAGE NOTE (FreePDK45)
-#   M1  — used by stdcell internal routing and power rails (horizontal)
-#   M2  — signal routing (vertical, preferred)
-#   M3  — signal routing (horizontal, preferred)
-#   ...
-#   M7  — power ring top/bottom + power stripes (vertical)
-#   M8  — power ring left/right (horizontal)
-#   M9, M10 — left for clock and long-distance signal nets if needed
-#
-# KNOWN WARNINGS FROM THIS STAGE
-#   IMPPP-532  (×20) — ViaGen warning: metal4 and metal7 run in the same
-#                      preferred direction, but the via between them must be
-#                      orthogonal.  Innovus handles this automatically by
-#                      inserting a jog; no manual intervention needed.
-#   IMPEXT-2882 (×9) — Via resistance for specific via types not found in
-#                      the cap table; defaulted to 4 Ω.  Affects IR-drop
-#                      accuracy but acceptable for a course project.
-#=======================================================================
+# PG above signal per kind:
+#   leaf    → ring M3/M4, M4 V straps              (4-metal stack)
+#   socket  → ring M5/M6, M4 V + M5 H straps       (6-metal stack)
+#   cluster → ring M9/M10, M7 V + M8 H straps      (10-metal stack)
+# addRing/addStripe must run BEFORE sroute -connect corePin, else M1 rails
+# are left open (IMPVFC-200 in verifyConnectivity).
 
-# -----------------------------------------------------------------------
-# Tier 1: Connect M1 power rails to the core power pins.
-# sroute routes the power/ground wires to the pins of the standard-cell
-# rows ("corePin").  After this command, every row has a VDD rail on top
-# and VSS rail on bottom, both touching the cell power pins.
-# -----------------------------------------------------------------------
-sroute -connect { corePin } -nets { VDD VSS }
+switch -- $DESIGN_KIND {
+    cluster {
+        addRing -follow core \
+            -offset  {top 2 bottom 2 left 2 right 2} \
+            -spacing {top 2 bottom 2 left 2 right 2} \
+            -width   {top 2 bottom 2 left 2 right 2} \
+            -layer   {top metal9 bottom metal9 left metal10 right metal10} \
+            -nets    { VSS VDD }
+        addStripe -nets { VSS VDD } -layer metal7 -direction vertical \
+                  -width 1.6 -spacing 1.6 -set_to_set_distance 50
+        addStripe -nets { VSS VDD } -layer metal8 -direction horizontal \
+                  -width 1.6 -spacing 1.6 -set_to_set_distance 50
+        puts "INFO: cluster PDN — ring M9/M10, V-stripes M7 + H-stripes M8 @ 50 µm."
+    }
+    socket {
+        addRing -follow core \
+            -offset  {top 2 bottom 2 left 2 right 2} \
+            -spacing {top 2 bottom 2 left 2 right 2} \
+            -width   {top 2 bottom 2 left 2 right 2} \
+            -layer   {top metal5 bottom metal5 left metal6 right metal6} \
+            -nets    { VSS VDD }
+        addStripe -nets { VSS VDD } -layer metal4 -direction vertical \
+                  -width 1.6 -spacing 1.6 -set_to_set_distance 30
+        addStripe -nets { VSS VDD } -layer metal5 -direction horizontal \
+                  -width 1.6 -spacing 1.6 -set_to_set_distance 30
+        puts "INFO: socket PDN — ring M5/M6, V-stripes M4 + H-stripes M5 @ 30 µm."
+    }
+    leaf {
+        # Ring on M3/M4 keeps PG off M1/M2 (signal pin layers).
+        addRing -follow core \
+            -offset  {top 1 bottom 1 left 1 right 1} \
+            -spacing {top 1 bottom 1 left 1 right 1} \
+            -width   {top 1 bottom 1 left 1 right 1} \
+            -layer   {top metal3 bottom metal3 left metal4 right metal4} \
+            -nets    { VSS VDD }
+        if {[llength [get_db insts -if {.base_cell.class == block}]] == 0} {
+            addStripe -nets { VSS VDD } -layer metal4 -direction vertical \
+                      -width 1 -spacing 1 -set_to_set_distance 30
+            puts "INFO: leaf PDN — ring M3/M4 + M4 V-straps @ 30 µm."
+        } else {
+            puts "INFO: leaf PDN — ring M3/M4 only (sroute handles PG to macro pins)."
+        }
+    }
+}
 
-# -----------------------------------------------------------------------
-# Tier 2: Power ring around the core.
-#
-#   -follow  core        → ring hugs the core boundary rectangle
-#   -offset  {... 2 ...} → ring starts 2 µm outside each core edge
-#   -spacing {... 2 ...} → 2 µm gap between the VDD and VSS ring wires
-#   -width   {... 2 ...} → each ring wire is 2 µm wide
-#   -layer   {top metal7 bottom metal7 left metal8 right metal8}
-#             Horizontal segments use M7 (which runs horizontal here);
-#             vertical segments use M8.
-#   -nets    { VSS VDD } → create one ring wire for VSS, then one for VDD.
-#                          Innovus places them in the order listed.
-# -----------------------------------------------------------------------
-addRing \
-    -follow  core \
-    -offset  {top 2 bottom 2 left 2 right 2} \
-    -spacing {top 2 bottom 2 left 2 right 2} \
-    -width   {top 2 bottom 2 left 2 right 2} \
-    -layer   {top metal7 bottom metal7 left metal8 right metal8} \
-    -nets    { VSS VDD }
-
-# -----------------------------------------------------------------------
-# Tier 3: Vertical power stripes across the core.
-#
-#   -nets              { VSS VDD }   → alternating VSS / VDD stripes
-#   -layer             metal7        → thick global metal for low resistance
-#   -direction         vertical      → stripes run from ring-bottom to ring-top
-#   -width             1.6           → each stripe is 1.6 µm wide
-#   -spacing           1.6           → gap between VSS and VDD pair members
-#   -set_to_set_distance 40          → centre-to-centre distance between
-#                                      adjacent VSS–VDD stripe pairs (µm).
-#                                      Decrease to reduce IR-drop at the
-#                                      cost of routing congestion.
-# -----------------------------------------------------------------------
-addStripe \
-    -nets              { VSS VDD } \
-    -layer             metal7 \
-    -direction         vertical \
-    -width             1.6 \
-    -spacing           1.6 \
-    -set_to_set_distance 40
+# IMPSR-1254: append blockPin only if macros exist.
+setSrouteMode -extendNearestTarget true
+set _sr_connect { corePin }
+set _sr_targets { ring stripe }
+if {[llength [get_db insts -if {.base_cell.class == block}]] > 0} {
+    lappend _sr_connect blockPin
+    lappend _sr_targets blockpin
+}
+sroute -connect $_sr_connect \
+       -nets { VDD VSS } \
+       -allowJogging 1 \
+       -allowLayerChange 1 \
+       -corePinTarget $_sr_targets

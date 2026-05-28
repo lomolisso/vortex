@@ -1,66 +1,72 @@
-#=======================================================================
-# Stage 10 — Post-Route Optimization (Setup and Hold)
-#
-# PURPOSE
-#   This is the final timing-closure pass.  Unlike the pre- and post-CTS
-#   optimization stages, wire delays here are computed from ACTUAL routed
-#   wire geometries extracted by Innovus's parasitic extractor.
-#   Slack values reported after this stage are the authoritative PPA
-#   numbers for the design.
-#
-# WHY ANOTHER OPTIMIZATION PASS?
-#   The pre-route wire model (used in stages 6 and 8) estimates parasitics
-#   from cell proximity.  Once real wires exist, actual delays can differ
-#   significantly from the estimates — particularly for:
-#     - Long wires on global metals (M7–M10) that cross the die.
-#     - Dense areas where routing detours add extra wire length.
-#     - High-fanout nets whose wires fan out to many distant sinks.
-#   Some paths that passed pre-route timing may violate post-route, and
-#   vice versa.  This pass reconciles those discrepancies.
-#
-# -postRoute vs -postRoute -hold
-#   Same setup/hold split as stage 8, for the same reasons:
-#     -postRoute        → fix setup violations (speed up slow paths)
-#     -postRoute -hold  → fix hold violations (slow down fast paths)
-#   At this stage, hold buffer insertion uses real wire delays, so the
-#   hold fixes are more accurate (and typically fewer are needed if the
-#   post-CTS hold pass was effective).
-#
-# KNOWN WARNINGS FROM THIS STAGE
-#   IMPOPT-6080       — RESOLVED by switching to OCV analysis mode below.
-#                        This was the fatal error that caused the previous
-#                        run to abort.
-#   IMPESI-3014 (×20) — Incomplete RC networks on SRAM-connected nets.
-#                        Same root cause as stage 9; acceptable for this
-#                        project.
-#   IMPOPT-665  (×100)— Nets with unplaced terms (SRAM macro ports).
-#                        Same as stage 8; intrinsic to fixed-macro placement.
-#=======================================================================
+# `standard` flowEffort forced; `express` skips optDesign -postRoute entirely.
+setDesignMode    -flowEffort             standard
+setNanoRouteMode -routeWithTimingDriven  true
+setNanoRouteMode -routeWithSiDriven      false
+setNanoRouteMode -drouteFixAntenna       true
+setNanoRouteMode -routeInsertAntennaDiode true
+setNanoRouteMode -routeAntennaCellName    ANTENNA_X1
 
-# Switch timing analysis to On-Chip Variation (OCV) mode.
-#
-# By default, Innovus enables AAE-SI (Advanced Analysis Engine with Signal
-# Integrity) optimization during postRoute optDesign.  AAE-SI models crosstalk-
-# induced delay variations and REQUIRES the timing analysis mode to be OCV.
-# With the default single-mode analysis, optDesign aborts with:
-#   ERROR IMPOPT-6080: AAE-SI Optimization can only be turned on when the
-#   timing analysis mode is set to OCV.
-#
-# (Note: there is no `setOptMode -enableAAE` flag in Innovus 21 — AAE-SI is
-# controlled implicitly by the analysis mode.)
-#
-# For this project, which uses a single "typical" corner and a relaxed 100 MHz
-# target clock, OCV adds no meaningful pessimism: with no derating tables
-# defined in the delay corner, Innovus applies unity (1.0) deratings, so early
-# and late path delays remain equal.  This switch simply satisfies the AAE-SI
-# prerequisite and lets postRoute optimization run without aborting.
-setAnalysisMode -analysisType onChipVariation
-
-# Set optimization effort (Innovus 21: mode command, not an inline flag).
-setOptMode -effort $OPT_EFFORT
-
-# Fix post-route setup violations using real extracted wire delays.
 optDesign -postRoute
-
-# Fix post-route hold violations.
 optDesign -postRoute -hold
+optDesign -postRoute -drv
+
+addFiller -cell {FILLCELL_X32 FILLCELL_X16 FILLCELL_X8 FILLCELL_X4 FILLCELL_X2 FILLCELL_X1} \
+          -prefix FILLER
+connectGlobalNets
+
+# NRIF-78: TD off during filler-DRC patch to avoid spurious markers.
+setNanoRouteMode -routeWithTimingDriven false
+ecoRoute -fix_filler_drc_with_patch_only
+setNanoRouteMode -routeWithTimingDriven true
+
+setNanoRouteMode -droutePostRouteSpreadWire true
+ecoRoute -fix_drc
+
+file mkdir "$REPORT_DIR/verify"
+verify_drc -limit 100000 -report "$REPORT_DIR/verify/drc.rpt"
+verifyConnectivity   -type all -report "$REPORT_DIR/verify/connectivity.rpt"
+verifyProcessAntenna -reportFile "$REPORT_DIR/verify/antenna.rpt"
+checkPlace                       "$REPORT_DIR/verify/checkPlace.rpt"
+redirect "$REPORT_DIR/verify/checkRoute.rpt" { checkRoute }
+redirect "$REPORT_DIR/verify/drv.rpt" { report_constraint -all_violators }
+
+# DRC residual classifier: M3 SHORTs/SPACINGs against bsg_fakeram macro pin
+# or OBS shapes are intrinsic to the pin-escape geometry at FreePDK45 (single
+# M3 track per pin, via M3 enclosure overlaps adjacent pin tracks). They sit
+# inside the macro's LEF abstract and don't propagate to the bank interface
+# — logged separately, NOT counted as fatal. Anything else is fatal.
+set _drc_residual "$REPORT_DIR/verify/sram_residual.rpt"
+set _fatal 0
+set _residual 0
+if {[file exists "$REPORT_DIR/verify/drc.rpt"]} {
+    set _fp  [open "$REPORT_DIR/verify/drc.rpt" r]
+    set _out [open $_drc_residual w]
+    set _cur ""
+    while {[gets $_fp _line] >= 0} {
+        if {[regexp {^(SHORT|SPACING|CUTSPACING|CSHORT|MetSpc)} $_line]} { set _cur $_line ; continue }
+        if {[regexp {^Bounds} $_line] && $_cur ne ""} {
+            if {[regexp {(Pin|Blockage) of Cell.*macro_inst.*\( metal3 \)} $_cur]} {
+                incr _residual
+                puts $_out "$_cur\n$_line\n"
+            } else {
+                incr _fatal
+            }
+            set _cur ""
+        }
+    }
+    close $_fp ; close $_out
+}
+set _drv 0
+if {[file exists "$REPORT_DIR/verify/drv.rpt"]} {
+    set _fp [open "$REPORT_DIR/verify/drv.rpt" r]
+    set _drv [regexp -all -line {^Pin:} [read $_fp]]
+    close $_fp
+}
+puts "INFO: post-route — fatal DRC: $_fatal   M3 macro-pin residual: $_residual   DRV: $_drv"
+# DRC/DRV are reported but NOT gated — this is an estimation flow, not signoff.
+# The verify_drc / verifyConnectivity / report_constraint outputs above still
+# land in $REPORT_DIR/verify/ for inspection; we just don't stop the run on
+# them so stages 11 (signoff reports) and 12 (macro extraction) always emit.
+if {$_fatal > 0 || $_drv > 0} {
+    puts "WARN: post-route verification has $_fatal fatal DRC + $_drv DRV — continuing anyway (estimation flow). Reports in $REPORT_DIR/verify/."
+}

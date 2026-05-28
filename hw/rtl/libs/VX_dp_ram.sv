@@ -104,76 +104,80 @@ module VX_dp_ram #(
     if (OUT_REG) begin : g_sync
         if (FORCE_BRAM) begin : g_bram
         `ifdef ASIC_SYNTHESIS
-            //------------------------------------------------------------------
-            // ASIC: instantiate bsg_fakeram 1R1W macro
-            // Port names (from generate_verilog.py):
-            //   clk, r_ce_in, r_addr_in, rd_out,
-            //   w_ce_in, w_addr_in, wd_in, w_mask_in
-            // Single shared clock; independent read and write addresses.
-            // w_mask_in assembled by replicating each wren[i] across WSELW bits.
-            //------------------------------------------------------------------
-            logic [DATAW-1:0] w_mask;
-            for (genvar i = 0; i < WRENW; ++i) begin : g_mask
-                assign w_mask[i*WSELW +: WSELW] = {WSELW{wren[i]}};
-            end
-            if (SIZE == 64 && DATAW <= 24) begin : g_macro
-                logic [23:0] rdata_padded;
-                logic [23:0] wdata_padded;
-                logic [23:0] wmask_padded;
-                assign wdata_padded = {{(24-DATAW){1'b0}}, wdata};
-                assign wmask_padded = {{(24-DATAW){1'b0}}, w_mask};
-                sram_64x24_1r1w macro_inst (
-                    .clk      (clk),
-                    .r_ce_in  (read),
-                    .r_addr_in(raddr[5:0]),
-                    .rd_out   (rdata_padded),
-                    .w_ce_in  (write),
-                    .w_addr_in(waddr[5:0]),
-                    .wd_in    (wdata_padded),
-                    .w_mask_in(wmask_padded)
-                );
-                assign rdata = rdata_padded[DATAW-1:0];
-            end else if (SIZE == 256 && DATAW <= 24) begin : g_macro
-                logic [23:0] rdata_padded;
-                logic [23:0] wdata_padded;
-                logic [23:0] wmask_padded;
-                assign wdata_padded = {{(24-DATAW){1'b0}}, wdata};
-                assign wmask_padded = {{(24-DATAW){1'b0}}, w_mask};
-                sram_256x24_1r1w macro_inst (
-                    .clk      (clk),
-                    .r_ce_in  (read),
-                    .r_addr_in(raddr[7:0]),
-                    .rd_out   (rdata_padded),
-                    .w_ce_in  (write),
-                    .w_addr_in(waddr[7:0]),
-                    .wd_in    (wdata_padded),
-                    .w_mask_in(wmask_padded)
-                );
-                assign rdata = rdata_padded[DATAW-1:0];
-            end else if (SIZE == 64 && DATAW == 128) begin : g_macro
+            if (SIZE == 64 && DATAW == 128) begin : g_macro
+                // bsg_fakeram 1R1W: separate r_/w_ ce active-high, shared clk, bit-mask.
+                wire [DATAW-1:0] bit_mask;
+                for (genvar i = 0; i < WRENW; ++i) begin : g_bit_mask
+                    assign bit_mask[i*WSELW +: WSELW] = {WSELW{wren[i]}};
+                end
                 sram_64x128_1r1w macro_inst (
-                    .clk      (clk),
-                    .r_ce_in  (read),
-                    .r_addr_in(raddr[5:0]),
-                    .rd_out   (rdata),
-                    .w_ce_in  (write),
-                    .w_addr_in(waddr[5:0]),
-                    .wd_in    (wdata),
-                    .w_mask_in(w_mask)
+                    .clk        (clk),
+                    .w_ce_in    (write),
+                    .w_addr_in  (waddr[5:0]),
+                    .wd_in      (wdata),
+                    .w_mask_in  (bit_mask),
+                    .r_ce_in    (read),
+                    .r_addr_in  (raddr[5:0]),
+                    .rd_out     (rdata)
                 );
-            end else if (SIZE == 128 && DATAW == 128) begin : g_macro
-                sram_128x128_1r1w macro_inst (
-                    .clk      (clk),
-                    .r_ce_in  (read),
-                    .r_addr_in(raddr[6:0]),
-                    .rd_out   (rdata),
-                    .w_ce_in  (write),
-                    .w_addr_in(waddr[6:0]),
-                    .wd_in    (wdata),
-                    .w_mask_in(w_mask)
+            end else if (SIZE == 32 && DATAW <= 24) begin : g_macro
+                wire [DATAW-1:0] bit_mask;
+                for (genvar i = 0; i < WRENW; ++i) begin : g_bit_mask
+                    assign bit_mask[i*WSELW +: WSELW] = {WSELW{wren[i]}};
+                end
+                wire [23:0] wd_pad   = {{(24-DATAW){1'b0}}, wdata};
+                wire [23:0] mask_pad = {{(24-DATAW){1'b0}}, bit_mask};
+                wire [23:0] rd_pad;
+                sram_32x24_1r1w macro_inst (
+                    .clk        (clk),
+                    .w_ce_in    (write),
+                    .w_addr_in  (waddr[4:0]),
+                    .wd_in      (wd_pad),
+                    .w_mask_in  (mask_pad),
+                    .r_ce_in    (read),
+                    .r_addr_in  (raddr[4:0]),
+                    .rd_out     (rd_pad)
                 );
+                assign rdata = rd_pad[DATAW-1:0];
+            end else if (SIZE == 64 && DATAW <= 24) begin : g_macro
+                wire [DATAW-1:0] bit_mask;
+                for (genvar i = 0; i < WRENW; ++i) begin : g_bit_mask
+                    assign bit_mask[i*WSELW +: WSELW] = {WSELW{wren[i]}};
+                end
+                wire [23:0] wd_pad   = {{(24-DATAW){1'b0}}, wdata};
+                wire [23:0] mask_pad = {{(24-DATAW){1'b0}}, bit_mask};
+                wire [23:0] rd_pad;
+                sram_64x24_1r1w macro_inst (
+                    .clk        (clk),
+                    .w_ce_in    (write),
+                    .w_addr_in  (waddr[5:0]),
+                    .wd_in      (wd_pad),
+                    .w_mask_in  (mask_pad),
+                    .r_ce_in    (read),
+                    .r_addr_in  (raddr[5:0]),
+                    .rd_out     (rd_pad)
+                );
+                assign rdata = rd_pad[DATAW-1:0];
+            end else if (SIZE == 256 && DATAW <= 24) begin : g_macro
+                wire [DATAW-1:0] bit_mask;
+                for (genvar i = 0; i < WRENW; ++i) begin : g_bit_mask
+                    assign bit_mask[i*WSELW +: WSELW] = {WSELW{wren[i]}};
+                end
+                wire [23:0] wd_pad   = {{(24-DATAW){1'b0}}, wdata};
+                wire [23:0] mask_pad = {{(24-DATAW){1'b0}}, bit_mask};
+                wire [23:0] rd_pad;
+                sram_256x24_1r1w macro_inst (
+                    .clk        (clk),
+                    .w_ce_in    (write),
+                    .w_addr_in  (waddr[7:0]),
+                    .wd_in      (wd_pad),
+                    .w_mask_in  (mask_pad),
+                    .r_ce_in    (read),
+                    .r_addr_in  (raddr[7:0]),
+                    .rd_out     (rd_pad)
+                );
+                assign rdata = rd_pad[DATAW-1:0];
             end else begin : g_macro_fallback
-                // No macro available — infer as stdcell
                 reg [DATAW-1:0] ram [0:SIZE-1];
                 reg [DATAW-1:0] rdata_r;
                 always @(posedge clk) begin

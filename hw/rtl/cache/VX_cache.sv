@@ -15,6 +15,10 @@
 
 module VX_cache import VX_gpu_pkg::*; #(
     parameter `STRING INSTANCE_ID   = "",
+    // Hierarchical-PnR bank-macro dispatch key (under ASIC_SYNTHESIS).
+    // "l1_icache" | "l1_dcache" | "l2" | "" (= bare VX_cache_bank, used by
+    // sim / FPGA flows and any future cache instance with no macro view).
+    parameter `STRING CACHE_KIND    = "",
 
     // Number of Word requests per cycle
     parameter NUM_REQS              = 4,
@@ -359,76 +363,176 @@ module VX_cache import VX_gpu_pkg::*; #(
 
     // Banks access ///////////////////////////////////////////////////////////
 
+    // Under ASIC_SYNTHESIS each bank maps to a fixed-parameter macro wrapper
+    // selected by CACHE_KIND; CACHE_KIND="" falls back to the bare bank (the
+    // sim/FPGA path). All ASIC branches share the label g_bank, fixing the
+    // macro instance at g_banks[$b].g_bank.bank for the PnR floorplan scripts.
     for (genvar bank_id = 0; bank_id < NUM_BANKS; ++bank_id) begin : g_banks
-        VX_cache_bank #(
-            .BANK_ID      (bank_id),
-            .INSTANCE_ID  (`SFORMATF(("%s-bank%0d", INSTANCE_ID, bank_id))),
-            .CACHE_SIZE   (CACHE_SIZE),
-            .LINE_SIZE    (LINE_SIZE),
-            .NUM_BANKS    (NUM_BANKS),
-            .NUM_WAYS     (NUM_WAYS),
-            .WORD_SIZE    (WORD_SIZE),
-            .NUM_REQS     (NUM_REQS),
-            .WRITE_ENABLE (WRITE_ENABLE),
-            .WRITEBACK    (WRITEBACK),
-            .DIRTY_BYTES  (DIRTY_BYTES),
-            .REPL_POLICY  (REPL_POLICY),
-            .CRSQ_SIZE    (CRSQ_SIZE),
-            .MSHR_SIZE    (MSHR_SIZE),
-            .MREQ_SIZE    (MREQ_SIZE),
-            .TAG_WIDTH    (TAG_WIDTH),
-            .CORE_OUT_REG (CORE_RSP_BUF_ENABLE ? 0 : `TO_OUT_BUF_REG(CORE_OUT_BUF)),
-            .MEM_OUT_REG  (MEM_REQ_BUF_ENABLE ? 0 : `TO_OUT_BUF_REG(MEM_OUT_BUF))
-        ) bank (
-            .clk                (clk),
-            .reset              (reset),
-
-        `ifdef PERF_ENABLE
-            .perf_read_miss    (perf_read_miss_per_bank[bank_id]),
-            .perf_write_miss   (perf_write_miss_per_bank[bank_id]),
-            .perf_mshr_stall   (perf_mshr_stall_per_bank[bank_id]),
-        `endif
-
-            // Core request
-            .core_req_valid     (per_bank_core_req_valid[bank_id]),
-            .core_req_addr      (per_bank_core_req_addr[bank_id]),
-            .core_req_rw        (per_bank_core_req_rw[bank_id]),
-            .core_req_wsel      (per_bank_core_req_wsel[bank_id]),
-            .core_req_byteen    (per_bank_core_req_byteen[bank_id]),
-            .core_req_data      (per_bank_core_req_data[bank_id]),
-            .core_req_tag       (per_bank_core_req_tag[bank_id]),
-            .core_req_idx       (per_bank_core_req_idx[bank_id]),
-            .core_req_flags     (per_bank_core_req_flags[bank_id]),
-            .core_req_ready     (per_bank_core_req_ready[bank_id]),
-
-            // Core response
-            .core_rsp_valid     (per_bank_core_rsp_valid[bank_id]),
-            .core_rsp_data      (per_bank_core_rsp_data[bank_id]),
-            .core_rsp_tag       (per_bank_core_rsp_tag[bank_id]),
-            .core_rsp_idx       (per_bank_core_rsp_idx[bank_id]),
-            .core_rsp_ready     (per_bank_core_rsp_ready[bank_id]),
-
-            // Memory request
-            .mem_req_valid      (per_bank_mem_req_valid[bank_id]),
-            .mem_req_addr       (per_bank_mem_req_addr[bank_id]),
-            .mem_req_rw         (per_bank_mem_req_rw[bank_id]),
-            .mem_req_byteen     (per_bank_mem_req_byteen[bank_id]),
-            .mem_req_data       (per_bank_mem_req_data[bank_id]),
-            .mem_req_tag        (per_bank_mem_req_tag[bank_id]),
-            .mem_req_flags      (per_bank_mem_req_flags[bank_id]),
-            .mem_req_ready      (per_bank_mem_req_ready[bank_id]),
-
-            // Memory response
-            .mem_rsp_valid      (per_bank_mem_rsp_valid[bank_id]),
-            .mem_rsp_data       (per_bank_mem_rsp_data[bank_id]),
-            .mem_rsp_tag        (per_bank_mem_rsp_tag[bank_id]),
-            .mem_rsp_ready      (per_bank_mem_rsp_ready[bank_id]),
-
-            // Flush request
-            .flush_begin        (per_bank_flush_begin[bank_id]),
-            .flush_uuid         (flush_uuid),
-            .flush_end          (per_bank_flush_end[bank_id])
-        );
+`ifdef ASIC_SYNTHESIS
+        if (CACHE_KIND == "l1_icache") begin : g_bank
+            VX_l1_icache_bank_top bank (
+                .clk(clk), .reset(reset),
+                .core_req_valid (per_bank_core_req_valid[bank_id]),
+                .core_req_addr  (per_bank_core_req_addr[bank_id]),
+                .core_req_rw    (per_bank_core_req_rw[bank_id]),
+                .core_req_wsel  (per_bank_core_req_wsel[bank_id]),
+                .core_req_byteen(per_bank_core_req_byteen[bank_id]),
+                .core_req_data  (per_bank_core_req_data[bank_id]),
+                .core_req_tag   (per_bank_core_req_tag[bank_id]),
+                .core_req_idx   (per_bank_core_req_idx[bank_id]),
+                .core_req_flags (per_bank_core_req_flags[bank_id]),
+                .core_req_ready (per_bank_core_req_ready[bank_id]),
+                .core_rsp_valid (per_bank_core_rsp_valid[bank_id]),
+                .core_rsp_data  (per_bank_core_rsp_data[bank_id]),
+                .core_rsp_tag   (per_bank_core_rsp_tag[bank_id]),
+                .core_rsp_idx   (per_bank_core_rsp_idx[bank_id]),
+                .core_rsp_ready (per_bank_core_rsp_ready[bank_id]),
+                .mem_req_valid  (per_bank_mem_req_valid[bank_id]),
+                .mem_req_addr   (per_bank_mem_req_addr[bank_id]),
+                .mem_req_rw     (per_bank_mem_req_rw[bank_id]),
+                .mem_req_byteen (per_bank_mem_req_byteen[bank_id]),
+                .mem_req_data   (per_bank_mem_req_data[bank_id]),
+                .mem_req_tag    (per_bank_mem_req_tag[bank_id]),
+                .mem_req_flags  (per_bank_mem_req_flags[bank_id]),
+                .mem_req_ready  (per_bank_mem_req_ready[bank_id]),
+                .mem_rsp_valid  (per_bank_mem_rsp_valid[bank_id]),
+                .mem_rsp_data   (per_bank_mem_rsp_data[bank_id]),
+                .mem_rsp_tag    (per_bank_mem_rsp_tag[bank_id]),
+                .mem_rsp_ready  (per_bank_mem_rsp_ready[bank_id]),
+                .flush_begin    (per_bank_flush_begin[bank_id]),
+                .flush_uuid     (flush_uuid),
+                .flush_end      (per_bank_flush_end[bank_id])
+            );
+        end else if (CACHE_KIND == "l1_dcache") begin : g_bank
+            VX_l1_dcache_bank_top bank (
+                .clk(clk), .reset(reset),
+                .core_req_valid (per_bank_core_req_valid[bank_id]),
+                .core_req_addr  (per_bank_core_req_addr[bank_id]),
+                .core_req_rw    (per_bank_core_req_rw[bank_id]),
+                .core_req_wsel  (per_bank_core_req_wsel[bank_id]),
+                .core_req_byteen(per_bank_core_req_byteen[bank_id]),
+                .core_req_data  (per_bank_core_req_data[bank_id]),
+                .core_req_tag   (per_bank_core_req_tag[bank_id]),
+                .core_req_idx   (per_bank_core_req_idx[bank_id]),
+                .core_req_flags (per_bank_core_req_flags[bank_id]),
+                .core_req_ready (per_bank_core_req_ready[bank_id]),
+                .core_rsp_valid (per_bank_core_rsp_valid[bank_id]),
+                .core_rsp_data  (per_bank_core_rsp_data[bank_id]),
+                .core_rsp_tag   (per_bank_core_rsp_tag[bank_id]),
+                .core_rsp_idx   (per_bank_core_rsp_idx[bank_id]),
+                .core_rsp_ready (per_bank_core_rsp_ready[bank_id]),
+                .mem_req_valid  (per_bank_mem_req_valid[bank_id]),
+                .mem_req_addr   (per_bank_mem_req_addr[bank_id]),
+                .mem_req_rw     (per_bank_mem_req_rw[bank_id]),
+                .mem_req_byteen (per_bank_mem_req_byteen[bank_id]),
+                .mem_req_data   (per_bank_mem_req_data[bank_id]),
+                .mem_req_tag    (per_bank_mem_req_tag[bank_id]),
+                .mem_req_flags  (per_bank_mem_req_flags[bank_id]),
+                .mem_req_ready  (per_bank_mem_req_ready[bank_id]),
+                .mem_rsp_valid  (per_bank_mem_rsp_valid[bank_id]),
+                .mem_rsp_data   (per_bank_mem_rsp_data[bank_id]),
+                .mem_rsp_tag    (per_bank_mem_rsp_tag[bank_id]),
+                .mem_rsp_ready  (per_bank_mem_rsp_ready[bank_id]),
+                .flush_begin    (per_bank_flush_begin[bank_id]),
+                .flush_uuid     (flush_uuid),
+                .flush_end      (per_bank_flush_end[bank_id])
+            );
+        end else if (CACHE_KIND == "l2") begin : g_bank
+            VX_l2_bank_top bank (
+                .clk(clk), .reset(reset),
+                .core_req_valid (per_bank_core_req_valid[bank_id]),
+                .core_req_addr  (per_bank_core_req_addr[bank_id]),
+                .core_req_rw    (per_bank_core_req_rw[bank_id]),
+                .core_req_wsel  (per_bank_core_req_wsel[bank_id]),
+                .core_req_byteen(per_bank_core_req_byteen[bank_id]),
+                .core_req_data  (per_bank_core_req_data[bank_id]),
+                .core_req_tag   (per_bank_core_req_tag[bank_id]),
+                .core_req_idx   (per_bank_core_req_idx[bank_id]),
+                .core_req_flags (per_bank_core_req_flags[bank_id]),
+                .core_req_ready (per_bank_core_req_ready[bank_id]),
+                .core_rsp_valid (per_bank_core_rsp_valid[bank_id]),
+                .core_rsp_data  (per_bank_core_rsp_data[bank_id]),
+                .core_rsp_tag   (per_bank_core_rsp_tag[bank_id]),
+                .core_rsp_idx   (per_bank_core_rsp_idx[bank_id]),
+                .core_rsp_ready (per_bank_core_rsp_ready[bank_id]),
+                .mem_req_valid  (per_bank_mem_req_valid[bank_id]),
+                .mem_req_addr   (per_bank_mem_req_addr[bank_id]),
+                .mem_req_rw     (per_bank_mem_req_rw[bank_id]),
+                .mem_req_byteen (per_bank_mem_req_byteen[bank_id]),
+                .mem_req_data   (per_bank_mem_req_data[bank_id]),
+                .mem_req_tag    (per_bank_mem_req_tag[bank_id]),
+                .mem_req_flags  (per_bank_mem_req_flags[bank_id]),
+                .mem_req_ready  (per_bank_mem_req_ready[bank_id]),
+                .mem_rsp_valid  (per_bank_mem_rsp_valid[bank_id]),
+                .mem_rsp_data   (per_bank_mem_rsp_data[bank_id]),
+                .mem_rsp_tag    (per_bank_mem_rsp_tag[bank_id]),
+                .mem_rsp_ready  (per_bank_mem_rsp_ready[bank_id]),
+                .flush_begin    (per_bank_flush_begin[bank_id]),
+                .flush_uuid     (flush_uuid),
+                .flush_end      (per_bank_flush_end[bank_id])
+            );
+        end else begin : g_bank
+`endif
+            VX_cache_bank #(
+                .BANK_ID      (bank_id),
+                .INSTANCE_ID  (`SFORMATF(("%s-bank%0d", INSTANCE_ID, bank_id))),
+                .CACHE_SIZE   (CACHE_SIZE),
+                .LINE_SIZE    (LINE_SIZE),
+                .NUM_BANKS    (NUM_BANKS),
+                .NUM_WAYS     (NUM_WAYS),
+                .WORD_SIZE    (WORD_SIZE),
+                .NUM_REQS     (NUM_REQS),
+                .WRITE_ENABLE (WRITE_ENABLE),
+                .WRITEBACK    (WRITEBACK),
+                .DIRTY_BYTES  (DIRTY_BYTES),
+                .REPL_POLICY  (REPL_POLICY),
+                .CRSQ_SIZE    (CRSQ_SIZE),
+                .MSHR_SIZE    (MSHR_SIZE),
+                .MREQ_SIZE    (MREQ_SIZE),
+                .TAG_WIDTH    (TAG_WIDTH),
+                .CORE_OUT_REG (CORE_RSP_BUF_ENABLE ? 0 : `TO_OUT_BUF_REG(CORE_OUT_BUF)),
+                .MEM_OUT_REG  (MEM_REQ_BUF_ENABLE ? 0 : `TO_OUT_BUF_REG(MEM_OUT_BUF))
+            ) bank (
+                .clk(clk), .reset(reset),
+            `ifdef PERF_ENABLE
+                .perf_read_miss    (perf_read_miss_per_bank[bank_id]),
+                .perf_write_miss   (perf_write_miss_per_bank[bank_id]),
+                .perf_mshr_stall   (perf_mshr_stall_per_bank[bank_id]),
+            `endif
+                .core_req_valid (per_bank_core_req_valid[bank_id]),
+                .core_req_addr  (per_bank_core_req_addr[bank_id]),
+                .core_req_rw    (per_bank_core_req_rw[bank_id]),
+                .core_req_wsel  (per_bank_core_req_wsel[bank_id]),
+                .core_req_byteen(per_bank_core_req_byteen[bank_id]),
+                .core_req_data  (per_bank_core_req_data[bank_id]),
+                .core_req_tag   (per_bank_core_req_tag[bank_id]),
+                .core_req_idx   (per_bank_core_req_idx[bank_id]),
+                .core_req_flags (per_bank_core_req_flags[bank_id]),
+                .core_req_ready (per_bank_core_req_ready[bank_id]),
+                .core_rsp_valid (per_bank_core_rsp_valid[bank_id]),
+                .core_rsp_data  (per_bank_core_rsp_data[bank_id]),
+                .core_rsp_tag   (per_bank_core_rsp_tag[bank_id]),
+                .core_rsp_idx   (per_bank_core_rsp_idx[bank_id]),
+                .core_rsp_ready (per_bank_core_rsp_ready[bank_id]),
+                .mem_req_valid  (per_bank_mem_req_valid[bank_id]),
+                .mem_req_addr   (per_bank_mem_req_addr[bank_id]),
+                .mem_req_rw     (per_bank_mem_req_rw[bank_id]),
+                .mem_req_byteen (per_bank_mem_req_byteen[bank_id]),
+                .mem_req_data   (per_bank_mem_req_data[bank_id]),
+                .mem_req_tag    (per_bank_mem_req_tag[bank_id]),
+                .mem_req_flags  (per_bank_mem_req_flags[bank_id]),
+                .mem_req_ready  (per_bank_mem_req_ready[bank_id]),
+                .mem_rsp_valid  (per_bank_mem_rsp_valid[bank_id]),
+                .mem_rsp_data   (per_bank_mem_rsp_data[bank_id]),
+                .mem_rsp_tag    (per_bank_mem_rsp_tag[bank_id]),
+                .mem_rsp_ready  (per_bank_mem_rsp_ready[bank_id]),
+                .flush_begin    (per_bank_flush_begin[bank_id]),
+                .flush_uuid     (flush_uuid),
+                .flush_end      (per_bank_flush_end[bank_id])
+            );
+`ifdef ASIC_SYNTHESIS
+        end
+`endif
     end
 
     // Core responses gather //////////////////////////////////////////////////

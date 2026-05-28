@@ -13,16 +13,17 @@
 
 `include "VX_define.vh"
 
+`ifdef ASIC_SYNTHESIS
 module VX_local_mem_top import VX_gpu_pkg::*; #(
     parameter `STRING  INSTANCE_ID = "",
 
-    // Size of cache in bytes
-    parameter SIZE              = (1024*16*8),
+    // Size in bytes; default (1 << LMEM_LOG_SIZE) matches the VX_mem_unit override.
+    parameter SIZE              = (1 << `LMEM_LOG_SIZE),
 
     // Number of Word requests per cycle
-    parameter NUM_REQS          = 4,
+    parameter NUM_REQS          = `NUM_LSU_LANES,
     // Number of banks
-    parameter NUM_BANKS         = 4,
+    parameter NUM_BANKS         = `LMEM_NUM_BANKS,
 
     // Size of a word in bytes
     parameter WORD_SIZE         = `XLEN/8,
@@ -97,3 +98,4 @@ module VX_local_mem_top import VX_gpu_pkg::*; #(
     );
 
 endmodule
+`endif
