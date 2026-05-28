@@ -8,17 +8,18 @@
 `include "VX_cache_define.vh"
 
 `ifdef ASIC_SYNTHESIS
+// Hard-macro boundary: localparams (not parameters) so DC can't uniquify on parent overrides.
 module VX_l1_icache_bank_top import VX_gpu_pkg::*; #(
-    parameter NUM_REQS       = 1,
-    parameter NUM_BANKS      = 1,
-    parameter WORD_SIZE      = ICACHE_WORD_SIZE,
-    parameter LINE_SIZE      = ICACHE_LINE_SIZE,
-    parameter TAG_WIDTH      = ICACHE_TAG_WIDTH,
-    parameter MSHR_SIZE      = `ICACHE_MSHR_SIZE,
-    parameter MSHR_ADDR_WIDTH= `LOG2UP(MSHR_SIZE),
-    parameter MEM_TAG_WIDTH  = UUID_WIDTH + MSHR_ADDR_WIDTH,
-    parameter REQ_SEL_WIDTH  = `UP(`CS_REQ_SEL_BITS),
-    parameter WORD_SEL_WIDTH = `UP(`CS_WORD_SEL_BITS)
+    localparam NUM_REQS       = 1,
+    localparam NUM_BANKS      = 1,
+    localparam WORD_SIZE      = ICACHE_WORD_SIZE,
+    localparam LINE_SIZE      = ICACHE_LINE_SIZE,
+    localparam TAG_WIDTH      = ICACHE_TAG_WIDTH,
+    localparam MSHR_SIZE      = `ICACHE_MSHR_SIZE,
+    localparam MSHR_ADDR_WIDTH= `LOG2UP(MSHR_SIZE),
+    localparam MEM_TAG_WIDTH  = UUID_WIDTH + MSHR_ADDR_WIDTH,
+    localparam REQ_SEL_WIDTH  = `UP(`CS_REQ_SEL_BITS),
+    localparam WORD_SEL_WIDTH = `UP(`CS_WORD_SEL_BITS)
 ) (
     input  wire                          clk,
     input  wire                          reset,

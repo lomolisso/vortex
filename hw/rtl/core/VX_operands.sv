@@ -67,11 +67,7 @@ module VX_operands import VX_gpu_pkg::*; #(
         assign opc_writeback_if.data  = writeback_if.data;
 
 `ifdef ASIC_SYNTHESIS
-        VX_gpr_top #(
-            .INSTANCE_ID(`SFORMATF(("%s-collector%0d", INSTANCE_ID, i))),
-            .NUM_BANKS  (`NUM_GPR_BANKS),
-            .OUT_BUF    (3)
-        ) opc_unit (
+        VX_gpr_top opc_unit (
             .clk              (clk),
             .reset            (reset),
             .writeback_valid  (opc_writeback_if.valid),

@@ -14,29 +14,15 @@
 `include "VX_define.vh"
 
 `ifdef ASIC_SYNTHESIS
+// Hard-macro boundary: localparams (not parameters) so DC can't uniquify on parent overrides.
 module VX_local_mem_top import VX_gpu_pkg::*; #(
-    parameter `STRING  INSTANCE_ID = "",
-
-    // Size in bytes; default (1 << LMEM_LOG_SIZE) matches the VX_mem_unit override.
-    parameter SIZE              = (1 << `LMEM_LOG_SIZE),
-
-    // Number of Word requests per cycle
-    parameter NUM_REQS          = `NUM_LSU_LANES,
-    // Number of banks
-    parameter NUM_BANKS         = `LMEM_NUM_BANKS,
-
-    // Size of a word in bytes
-    parameter WORD_SIZE         = `XLEN/8,
-
-    // Request tag size
-    parameter TAG_WIDTH         = 16,
-
-    // Address width
-    parameter NUM_WORDS         = SIZE / WORD_SIZE,
-    parameter WORDS_PER_BANK    = NUM_WORDS / NUM_BANKS,
-    parameter BANK_ADDR_WIDTH   = `CLOG2(WORDS_PER_BANK),
-    parameter ADDR_WIDTH        = BANK_ADDR_WIDTH + `CLOG2(NUM_BANKS)
- ) (
+    localparam SIZE       = (1 << `LMEM_LOG_SIZE),
+    localparam NUM_REQS   = `NUM_LSU_LANES,
+    localparam NUM_BANKS  = `LMEM_NUM_BANKS,
+    localparam WORD_SIZE  = LSU_WORD_SIZE,
+    localparam TAG_WIDTH  = LMEM_TAG_WIDTH,
+    localparam ADDR_WIDTH = `LMEM_LOG_SIZE - `CLOG2(WORD_SIZE)
+) (
     input wire clk,
     input wire reset,
 
@@ -83,7 +69,6 @@ module VX_local_mem_top import VX_gpu_pkg::*; #(
     end
 
     VX_local_mem #(
-        .INSTANCE_ID(INSTANCE_ID),
         .SIZE       (SIZE),
         .NUM_REQS   (NUM_REQS),
         .NUM_BANKS  (NUM_BANKS),

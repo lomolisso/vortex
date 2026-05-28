@@ -4,10 +4,10 @@
 `include "VX_define.vh"
 
 `ifdef ASIC_SYNTHESIS
+// Hard-macro boundary: localparams (not parameters) so DC can't uniquify on parent overrides.
 module VX_gpr_top import VX_gpu_pkg::*; #(
-    parameter `STRING INSTANCE_ID = "",
-    parameter NUM_BANKS = 4,
-    parameter OUT_BUF   = 3
+    localparam NUM_BANKS = `NUM_GPR_BANKS,
+    localparam OUT_BUF   = 3
 ) (
     input  wire                            clk,
     input  wire                            reset,
@@ -39,9 +39,8 @@ module VX_gpr_top import VX_gpu_pkg::*; #(
     assign operands_if.ready   = operands_ready;
 
     VX_opc_unit #(
-        .INSTANCE_ID (INSTANCE_ID),
-        .NUM_BANKS   (NUM_BANKS),
-        .OUT_BUF     (OUT_BUF)
+        .NUM_BANKS (NUM_BANKS),
+        .OUT_BUF   (OUT_BUF)
     ) opc (
         .clk           (clk),
         .reset         (reset),

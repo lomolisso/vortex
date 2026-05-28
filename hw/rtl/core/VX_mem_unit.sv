@@ -135,15 +135,7 @@ module VX_mem_unit import VX_gpu_pkg::*; #(
         assign lmem_rsp_ready[i]            = lmem_adapt_if[i].rsp_ready;
     end
 
-    VX_local_mem_top #(
-        .INSTANCE_ID(`SFORMATF(("%s-lmem", INSTANCE_ID))),
-        .SIZE       (1 << `LMEM_LOG_SIZE),
-        .NUM_REQS   (LMEM_NUM_REQS),
-        .NUM_BANKS  (`LMEM_NUM_BANKS),
-        .WORD_SIZE  (LSU_WORD_SIZE),
-        .ADDR_WIDTH (LMEM_ADDR_WIDTH),
-        .TAG_WIDTH  (LMEM_TAG_WIDTH)
-    ) local_mem (
+    VX_local_mem_top local_mem (
         .clk           (clk),
         .reset         (reset),
         .mem_req_valid (lmem_req_valid),

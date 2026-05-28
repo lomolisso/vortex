@@ -23,6 +23,7 @@ recipe             = "cache_bank"
 
 [floorplan.params]
 num_ways   = 4
+grid_rows  = 2
 leaf_macro = "sram_1024x32_1rw"
 store_path = "local_mem"
 store_iter = "g_data_store"
@@ -44,16 +45,16 @@ lef_path = "sram/sram_1024x32_1rw/sram_1024x32_1rw.lef"
 # re-written on every `make <cfg>` invocation. Hand edits below this
 # line are discarded.
 [budget]
-generated_at        = "2026-05-27T15:04:19"
-stdcell_area_um2    = 8818.166
+generated_at        = "2026-05-28T14:28:22"
+stdcell_area_um2    = 6542.536
 macro_area_raw_um2  = 132840.400
 macro_area_eff_um2  = 150132.400
-core_area_um2       = 161096.516
-floorplan_w_um         = 646.000
-floorplan_h_um         = 264.600
+core_area_um2       = 157983.252
+floorplan_w_um         = 640.680
+floorplan_h_um         = 261.800
 floorplan_margin_lr_um = 5.130
 floorplan_margin_tb_um = 5.600
-utilization_overall    = 0.8793
+utilization_overall    = 0.8823
 warnings = [
-    "u_overall=0.879 exceeds 0.85 — consider lowering target_utilization or growing halos before committing the floorplan.",
+    "u_overall=0.882 exceeds 0.85 — consider lowering target_utilization or growing halos before committing the floorplan.",
 ]
