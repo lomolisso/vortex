@@ -94,7 +94,7 @@ TOP_l1_dcache_bank         := VX_l1_dcache_bank_top
 SRAM_MACROS_l1_dcache_bank := sram_64x512_1rw sram_64x24_1r1w
 BLACKBOX_CORES_l1_dcache_bank :=
 
-DEFINES_l2_bank := $(DEFINES_2d-1c4s4w4t)
+DEFINES_l2_bank := $(DEFINES_2d-1c8s4w4t)
 TOP_l2_bank         := VX_l2_bank_top
 SRAM_MACROS_l2_bank := sram_256x512_1rw sram_256x24_1r1w
 BLACKBOX_CORES_l2_bank :=

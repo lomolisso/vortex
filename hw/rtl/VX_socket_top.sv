@@ -29,8 +29,9 @@
 // up the hierarchy (socket = 1 VX_core + its private I$/D$/lmem/regfile
 // when SOCKET_SIZE=1).
 
+// Hard-macro boundary: localparams (not parameters) so DC can't uniquify on parent overrides.
 module VX_socket_top import VX_gpu_pkg::*; #(
-    parameter SOCKET_ID = 0
+    localparam SOCKET_ID = 0
 ) (
     // Clock
     input  wire                             clk,

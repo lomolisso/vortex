@@ -193,9 +193,7 @@ module VX_cluster import VX_gpu_pkg::*; #(
         assign sock_gbar_rsp_id                                  = per_socket_gbar_bus_if[socket_id].rsp_data.id;
     `endif
 
-        VX_socket_top #(
-            .SOCKET_ID ((CLUSTER_ID * NUM_SOCKETS) + socket_id)
-        ) socket (
+        VX_socket_top socket (
             .clk             (clk),
             .reset           (socket_reset),
 

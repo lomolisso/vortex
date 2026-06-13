@@ -52,7 +52,7 @@ lef_path = "sram/sram_256x24_1r1w/sram_256x24_1r1w.lef"
 # re-written on every `make <cfg>` invocation. Hand edits below this
 # line are discarded.
 [budget]
-generated_at        = "2026-05-27T21:16:28"
+generated_at        = "2026-05-29T09:57:53"
 stdcell_area_um2    = 126179.226
 macro_area_raw_um2  = 2007582.864
 macro_area_eff_um2  = 2149214.864
