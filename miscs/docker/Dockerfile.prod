@@ -11,8 +11,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Use Ubuntu 20.04 as the base image
-FROM ubuntu:20.04
+# Use Ubuntu 22.04 as the base image. ci/install_dependencies.sh pulls
+# jammy-native packages (libffi8, libpython3.10, the jammy Vulkan SDK repo),
+# so the base must match the 22.04 CI image.
+FROM ubuntu:22.04
 
 # Set non-interactive installation to avoid user input during build
 ARG DEBIAN_FRONTEND=noninteractive
@@ -26,7 +28,8 @@ RUN apt-get update && apt-get install -y \
     git \
     wget \
     curl \
-    ca-certificates && \
+    ca-certificates \
+    sudo && \
     rm -rf /var/lib/apt/lists/*
 
 # upgrade installed components
@@ -41,21 +44,40 @@ RUN git clone --depth=1 --recursive https://github.com/vortexgpgpu/vortex.git /v
 # Set the initial working directory
 WORKDIR /vortex
 
-# install system dependencies
-RUN ./ci/install_dependencies.sh
+# Toolchain install location. Must be set before configure so it is baked
+# into config.mk (VERILATOR_PATH ?= $(TOOLDIR)/verilator) and matched by the
+# toolchain install below; config.mk uses ?= so this env value is also what
+# `make` resolves at runtime.
+ENV TOOLDIR=/opt
+
+# install system dependencies (--all: baseline + vulkan loader/glslc + gem5
+# runtime libs + OpenMPI, matching the CI image so every test suite runs)
+RUN ./ci/install_dependencies.sh --all
 
 # Configure the build folder
-RUN mkdir build && cd build && ../configure
+RUN mkdir build && cd build && ../configure --tooldir=$TOOLDIR
 
-# Install prebuilt toolchain
+# Install prebuilt toolchain into $TOOLDIR
 RUN cd build && ./ci/toolchain_install.sh --all
+
+# Build SST + OpenMPI from source (not part of the prebuilt toolchain).
+# Needs sudo (installed above) since sst_install.sh installs its build deps
+# via `sudo apt` under `set -e`.
+RUN cd build && ./ci/sst_install.sh
+
+# Tool homes consumed by the run scripts (gem5_run_app.py uses $GEM5_HOME;
+# sst_run_*.py use $SST_CORE_HOME / $SST_ELEMENTS_HOME).
+ENV GEM5_HOME=$TOOLDIR/gem5
+ENV MPIHOME=$TOOLDIR/openmpi_install
+ENV SST_CORE_HOME=$TOOLDIR/sst-install/sst-core
+ENV SST_ELEMENTS_HOME=$TOOLDIR/sst-install/sst-elements
 
 # No shell env sourcing required: the Vortex Makefiles invoke every
 # tool by absolute path baked at configure time. For interactive use
-# (verilator, vulkaninfo, hipcc CLI), the TOOLDIR layout is on $PATH:
-ENV TOOLDIR=/opt
-ENV PATH=$TOOLDIR/verilator/bin:$TOOLDIR/llvm-vortex/bin:$TOOLDIR/chipstar/bin:$TOOLDIR/pocl/bin:$TOOLDIR/mesa-vortex/bin:$PATH
-ENV LD_LIBRARY_PATH=$TOOLDIR/llvm-vortex/lib:$TOOLDIR/mesa-vortex/lib:$LD_LIBRARY_PATH
+# (verilator, hipcc, vulkaninfo, sv2v, yosys, sst, mpirun), the TOOLDIR
+# layout is on $PATH:
+ENV PATH=$TOOLDIR/verilator/bin:$TOOLDIR/llvm-vortex/bin:$TOOLDIR/chipstar/bin:$TOOLDIR/pocl/bin:$TOOLDIR/mesa-vortex/bin:$TOOLDIR/sv2v/bin:$TOOLDIR/yosys/bin:$TOOLDIR/sta/bin:$TOOLDIR/riscv32-gnu-toolchain/bin:$TOOLDIR/riscv64-gnu-toolchain/bin:$MPIHOME/bin:$SST_CORE_HOME/bin:$SST_ELEMENTS_HOME/bin:$PATH
+ENV LD_LIBRARY_PATH=$TOOLDIR/llvm-vortex/lib:$TOOLDIR/mesa-vortex/lib:$MPIHOME/lib:$SST_CORE_HOME/lib:$LD_LIBRARY_PATH
 ENV VK_ICD_FILENAMES=$TOOLDIR/mesa-vortex/share/vulkan/icd.d/lvp_icd.x86_64.json
 
 # Set the working directory to /vortex/build
