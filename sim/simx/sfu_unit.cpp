@@ -13,7 +13,6 @@
 
 #include "sfu_unit.h"
 #include "core.h"
-#include "socket.h"
 #include "cluster.h"
 #include "debug.h"
 #ifdef VX_CFG_EXT_OM_ENABLE
@@ -147,7 +146,7 @@ void SfuUnit::on_tick() {
 				continue;
 			}
 			if (*raster_p == RasterType::BEGIN) {
-				core_->socket()->cluster()->raster_core()->begin();
+				core_->cluster()->raster_core()->begin();
 				// fall through to synchronous SFU completion
 			}
 		}

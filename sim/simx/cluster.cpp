@@ -12,7 +12,6 @@
 // limitations under the License.
 
 #include "cluster.h"
-#include "socket.h"
 #include "core.h"
 #include "local_mem.h"
 #include "constants.h"
@@ -44,22 +43,21 @@ class Cluster::Impl {
 public:
   Impl(Cluster* simobject)
     : simobject_(simobject)
-    , sockets_(NUM_SOCKETS)
+    , cores_(VX_CFG_NUM_CORES)
     , gbarriers_(VX_CFG_NUM_BARRIERS)
-    , cores_per_socket_(VX_CFG_SOCKET_SIZE)
   {
     const std::string& name = simobject_->name();
     char sname[100];
 
-    uint32_t sockets_per_cluster = sockets_.size();
+    uint32_t cores_per_cluster = cores_.size();
     uint32_t cluster_id = simobject_->id();
 
-    // create sockets
+    // create cores
 
-    for (uint32_t i = 0; i < sockets_per_cluster; ++i) {
-      uint32_t socket_id = cluster_id * sockets_per_cluster + i;
-      snprintf(sname, 100, "%s-socket%d", name.c_str(), i);
-      sockets_.at(i) = Socket::Create(sname, socket_id, simobject_);
+    for (uint32_t i = 0; i < cores_per_cluster; ++i) {
+      uint32_t core_id = cluster_id * cores_per_cluster + i;
+      snprintf(sname, 100, "%s-core%d", name.c_str(), i);
+      cores_.at(i) = Core::Create(sname, core_id, simobject_);
     }
 
     // Create l2cache
@@ -104,20 +102,20 @@ public:
     snprintf(sname, 100, "%s-l2arb", name.c_str());
     auto l2arb = MemArbiter::Create(sname, ArbiterType::Priority,
                                     kL2Rows * VX_CFG_L2_NUM_REQS, VX_CFG_L2_NUM_REQS);
-    // sockets → row 0
-    for (uint32_t i = 0; i < sockets_per_cluster; ++i) {
+    // cores → row 0
+    for (uint32_t i = 0; i < cores_per_cluster; ++i) {
       for (uint32_t j = 0; j < VX_CFG_L1_MEM_PORTS; ++j) {
         uint32_t port = i * VX_CFG_L1_MEM_PORTS + j;
-        sockets_.at(i)->mem_req_out.at(j).bind(&l2arb->ReqIn.at(kL2Rows * port + 0));
-        l2arb->RspOut.at(kL2Rows * port + 0).bind(&sockets_.at(i)->mem_rsp_in.at(j));
+        cores_.at(i)->mem_req_out.at(j).bind(&l2arb->ReqIn.at(kL2Rows * port + 0));
+        l2arb->RspOut.at(kL2Rows * port + 0).bind(&cores_.at(i)->mem_rsp_in.at(j));
       }
     }
 #else
-    // No L2-sharing extensions: direct sockets → L2.
-    for (uint32_t i = 0; i < sockets_per_cluster; ++i) {
+    // No L2-sharing extensions: direct cores → L2.
+    for (uint32_t i = 0; i < cores_per_cluster; ++i) {
       for (uint32_t j = 0; j < VX_CFG_L1_MEM_PORTS; ++j) {
-        sockets_.at(i)->mem_req_out.at(j).bind(&l2cache_->core_req_in.at(i * VX_CFG_L1_MEM_PORTS + j));
-        l2cache_->core_rsp_out.at(i * VX_CFG_L1_MEM_PORTS + j).bind(&sockets_.at(i)->mem_rsp_in.at(j));
+        cores_.at(i)->mem_req_out.at(j).bind(&l2cache_->core_req_in.at(i * VX_CFG_L1_MEM_PORTS + j));
+        l2cache_->core_rsp_out.at(i * VX_CFG_L1_MEM_PORTS + j).bind(&cores_.at(i)->mem_rsp_in.at(j));
       }
     }
 #endif // any L2-sharing extension
@@ -136,12 +134,9 @@ public:
     }
 
     // Per-core SFU.dxa_req_out (DxaUnit decodes onto it) → DxaCore::dxa_req_in[cid].
-    for (uint32_t s = 0; s < sockets_per_cluster; ++s) {
-      for (uint32_t c = 0; c < cores_per_socket_; ++c) {
-        uint32_t cid = s * cores_per_socket_ + c;
-        auto sfu = sockets_.at(s)->core(c)->sfu_unit();
-        sfu->dxa_req_out.bind(&dxa_core_->dxa_req_in.at(cid));
-      }
+    for (uint32_t cid = 0; cid < cores_per_cluster; ++cid) {
+      auto sfu = cores_.at(cid)->sfu_unit();
+      sfu->dxa_req_out.bind(&dxa_core_->dxa_req_in.at(cid));
     }
 
     // DxaCore::lmem_req_out[cid] → core's LocalMem.Inputs[port_dxa].
@@ -151,21 +146,18 @@ public:
   #ifdef VX_CFG_EXT_TCU_ENABLE
     port_dxa += 1;
   #endif
-    for (uint32_t s = 0; s < sockets_per_cluster; ++s) {
-      for (uint32_t c = 0; c < cores_per_socket_; ++c) {
-        uint32_t cid = s * cores_per_socket_ + c;
-        Core* core = sockets_.at(s)->core(c).get();
-        auto& ch = dxa_core_->lmem_req_out.at(cid);
-        ch.bind(&core->local_mem()->Inputs.at(port_dxa));
-        ch.tx_callback([core](const MemReq& req, uint64_t /*cycles*/) {
-          if (req.is_write() && req.flags.dxa_notify_done) {
-            // notify_bar_id arrives in raw (encoded) form: low byte = cta_no,
-            // bits[30:8] = bar_no. Decode to flat barrier index before release.
-            uint32_t decoded = bar_decode_id(req.flags.dxa_notify_bar_id, VX_CFG_NUM_BARRIERS);
-            core->barrier_event_release(decoded);
-          }
-        });
-      }
+    for (uint32_t cid = 0; cid < cores_per_cluster; ++cid) {
+      Core* core = cores_.at(cid).get();
+      auto& ch = dxa_core_->lmem_req_out.at(cid);
+      ch.bind(&core->local_mem()->Inputs.at(port_dxa));
+      ch.tx_callback([core](const MemReq& req, uint64_t /*cycles*/) {
+        if (req.is_write() && req.flags.dxa_notify_done) {
+          // notify_bar_id arrives in raw (encoded) form: low byte = cta_no,
+          // bits[30:8] = bar_no. Decode to flat barrier index before release.
+          uint32_t decoded = bar_decode_id(req.flags.dxa_notify_bar_id, VX_CFG_NUM_BARRIERS);
+          core->barrier_event_release(decoded);
+        }
+      });
     }
 #endif
 
@@ -215,17 +207,13 @@ public:
     // Cluster-level TexBus arbiter: NUM_CORES_PER_CLUSTER inputs (one per
     // SfuUnit) → 1 TEX-core lane (kNumTexCores=1 by default).
     snprintf(sname, 100, "%s-tex-bus", name.c_str());
-    uint32_t cores_per_cluster = sockets_per_cluster * cores_per_socket_;
     auto tex_bus = TexBusArbiter::Create(sname, ArbiterType::RoundRobin,
                                          cores_per_cluster, 1);
     tex_bus_arb_ = tex_bus;
-    for (uint32_t s = 0; s < sockets_per_cluster; ++s) {
-      for (uint32_t c = 0; c < cores_per_socket_; ++c) {
-        uint32_t cid = s * cores_per_socket_ + c;
-        auto sfu = sockets_.at(s)->core(c)->sfu_unit();
-        sfu->tex_req_out.bind(&tex_bus->ReqIn.at(cid));
-        tex_bus->RspOut.at(cid).bind(&sfu->tex_rsp_in);
-      }
+    for (uint32_t cid = 0; cid < cores_per_cluster; ++cid) {
+      auto sfu = cores_.at(cid)->sfu_unit();
+      sfu->tex_req_out.bind(&tex_bus->ReqIn.at(cid));
+      tex_bus->RspOut.at(cid).bind(&sfu->tex_rsp_in);
     }
     tex_bus->ReqOut.at(0).bind(&tex_core_->tex_req_in.at(0));
     tex_core_->tex_rsp_out.at(0).bind(&tex_bus->RspIn.at(0));
@@ -284,12 +272,9 @@ public:
 
     // Per-core SFU.om_req_out (OmUnit decodes onto it) → OmCore::om_req_in[cid].
     // OM has no return value — no rsp channel back to SfuUnit.
-    for (uint32_t s = 0; s < sockets_per_cluster; ++s) {
-      for (uint32_t c = 0; c < cores_per_socket_; ++c) {
-        uint32_t cid = s * cores_per_socket_ + c;
-        auto sfu = sockets_.at(s)->core(c)->sfu_unit();
-        sfu->om_req_out.bind(&om_core_->om_req_in.at(cid));
-      }
+    for (uint32_t cid = 0; cid < cores_per_cluster; ++cid) {
+      auto sfu = cores_.at(cid)->sfu_unit();
+      sfu->om_req_out.bind(&om_core_->om_req_in.at(cid));
     }
 #endif
 
@@ -339,17 +324,13 @@ public:
     // Cluster-level RasterBus arbiter: NUM_CORES_PER_CLUSTER inputs (one per
     // SfuUnit) → 1 lane (kNumRasterLanes=1).
     snprintf(sname, 100, "%s-raster-bus", name.c_str());
-    uint32_t cores_per_cluster_r = sockets_per_cluster * cores_per_socket_;
     auto raster_bus = RasterBusArbiter::Create(sname, ArbiterType::RoundRobin,
-                                               cores_per_cluster_r, 1);
+                                               cores_per_cluster, 1);
     raster_bus_arb_ = raster_bus;
-    for (uint32_t s = 0; s < sockets_per_cluster; ++s) {
-      for (uint32_t c = 0; c < cores_per_socket_; ++c) {
-        uint32_t cid = s * cores_per_socket_ + c;
-        auto sfu = sockets_.at(s)->core(c)->sfu_unit();
-        sfu->raster_req_out.bind(&raster_bus->ReqIn.at(cid));
-        raster_bus->RspOut.at(cid).bind(&sfu->raster_rsp_in);
-      }
+    for (uint32_t cid = 0; cid < cores_per_cluster; ++cid) {
+      auto sfu = cores_.at(cid)->sfu_unit();
+      sfu->raster_req_out.bind(&raster_bus->ReqIn.at(cid));
+      raster_bus->RspOut.at(cid).bind(&sfu->raster_rsp_in);
     }
     raster_bus->ReqOut.at(0).bind(&raster_core_->raster_req_in.at(0));
     raster_core_->raster_rsp_out.at(0).bind(&raster_bus->RspIn.at(0));
@@ -360,12 +341,12 @@ public:
     for (auto& gbar : gbarriers_) {
       gbar.reset();
     }
-    // Sockets are SimObjects; reset by SimPlatform.
+    // Cores are SimObjects; reset by SimPlatform.
   }
 
   bool running() const {
-    for (auto& socket : sockets_) {
-      if (socket->running())
+    for (auto& core : cores_) {
+      if (core->running())
         return true;
     }
     return false;
@@ -373,8 +354,8 @@ public:
 
   int get_exitcode() const {
     int exitcode = 0;
-    for (auto& socket : sockets_) {
-      exitcode |= socket->get_exitcode();
+    for (auto& core : cores_) {
+      exitcode |= core->get_exitcode();
     }
     return exitcode;
   }
@@ -383,10 +364,7 @@ public:
     auto bar_index = bar_id % gbarriers_.size();
     auto& gbar = gbarriers_.at(bar_index);
 
-    auto sockets_per_cluster = sockets_.size();
-    auto cores_per_socket = cores_per_socket_;
-
-    uint32_t cores_per_cluster = sockets_per_cluster * cores_per_socket;
+    uint32_t cores_per_cluster = cores_.size();
     uint32_t local_core_id = core_id % cores_per_cluster;
 
     // set core arrival bit
@@ -396,12 +374,9 @@ public:
 
     if (gbar.mask.count() == (size_t)count) {
       // resume all suspended cores
-      for (uint32_t s = 0; s < sockets_per_cluster; ++s) {
-        for (uint32_t c = 0; c < cores_per_socket; ++c) {
-          uint32_t i = s * cores_per_socket + c;
-          if (gbar.mask.test(i)) {
-            sockets_.at(s)->global_barrier_resume(bar_id, c);
-          }
+      for (uint32_t i = 0; i < cores_per_cluster; ++i) {
+        if (gbar.mask.test(i)) {
+          cores_.at(i)->global_barrier_resume(bar_id);
         }
       }
       // reset mask and advance phase
@@ -451,8 +426,8 @@ public:
       return raster_core_->dcr_write(addr, value);
     }
 #endif
-    for (auto& socket : sockets_) {
-      int ret = socket->dcr_write(addr, value);
+    for (auto& core : cores_) {
+      int ret = core->dcr_write(addr, value);
       if (ret != 0)
         return ret;
     }
@@ -460,8 +435,12 @@ public:
   }
 
   int dcr_read(uint32_t addr, uint32_t tag, uint32_t* value) {
-    for (auto& socket : sockets_) {
-      int ret = socket->dcr_read(addr, tag, value);
+    for (auto& core : cores_) {
+      uint16_t core_id = tag & 0xfffff;
+      if (core_id != core->id())
+        continue; // skip cores that don't match the tag
+      uint32_t tag_value = tag >> 16;
+      int ret = core->dcr_read(addr, tag_value, value);
       if (ret != 0)
         return ret;
     }
@@ -469,27 +448,27 @@ public:
   }
 
   void dcache_flush_begin() {
-    for (auto& socket : sockets_) {
-      socket->dcache_flush_begin();
+    for (auto& core : cores_) {
+      core->dcache_flush_begin();
     }
   }
 
   bool dcache_flush_done() const {
-    for (auto& socket : sockets_) {
-      if (!socket->dcache_flush_done()) return false;
+    for (auto& core : cores_) {
+      if (!core->dcache_flush_done()) return false;
     }
     return true;
   }
 
   void icache_flush_begin() {
-    for (auto& socket : sockets_) {
-      socket->icache_flush_begin();
+    for (auto& core : cores_) {
+      core->icache_flush_begin();
     }
   }
 
   bool icache_flush_done() const {
-    for (auto& socket : sockets_) {
-      if (!socket->icache_flush_done()) return false;
+    for (auto& core : cores_) {
+      if (!core->icache_flush_done()) return false;
     }
     return true;
   }
@@ -518,11 +497,8 @@ public:
   }
 
   Core* get_core(uint32_t idx) const {
-    uint32_t sockets_per_cluster = sockets_.size();
-    if (idx >= sockets_per_cluster * cores_per_socket_) return nullptr;
-    uint32_t s = idx / cores_per_socket_;
-    uint32_t c = idx % cores_per_socket_;
-    return sockets_.at(s)->core(c).get();
+    if (idx >= cores_.size()) return nullptr;
+    return cores_.at(idx).get();
   }
 
 #ifdef VX_CFG_EXT_DXA_ENABLE
@@ -535,10 +511,9 @@ public:
 
 private:
   Cluster*                    simobject_;
-  std::vector<Socket::Ptr>    sockets_;
+  std::vector<Core::Ptr>      cores_;
   std::vector<core_barrier_t> gbarriers_;
   Cache::Ptr                  l2cache_;
-  uint32_t                    cores_per_socket_;
 #ifdef VX_CFG_EXT_DXA_ENABLE
   DxaCore::Ptr                dxa_core_;
 #endif

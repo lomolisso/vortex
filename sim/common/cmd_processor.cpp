@@ -25,13 +25,15 @@ constexpr unsigned cp_clog2(uint64_t n) {
     return r;
 }
 uint64_t gpu_dev_caps() {
-    const unsigned cluster_size = VX_CFG_NUM_CORES / VX_CFG_SOCKET_SIZE;
+    // Socket level removed: the core is the SM, so socket_size == 1
+    // (clog2 == 0) and the SM-per-cluster count is simply NUM_CORES.
+    const unsigned cluster_size = VX_CFG_NUM_CORES;
     const unsigned bank_addr_w  = VX_CFG_PLATFORM_MEMORY_ADDR_WIDTH
                                 - cp_clog2(VX_CFG_PLATFORM_MEMORY_NUM_BANKS);
     return  (uint64_t(VX_ISA_IMPL_ID) & 0xFF)
          | ((uint64_t(cp_clog2(VX_CFG_NUM_THREADS))  & 0x7)  << 8)
          | ((uint64_t(cp_clog2(VX_CFG_NUM_WARPS))    & 0x7)  << 11)
-         | ((uint64_t(cp_clog2(VX_CFG_SOCKET_SIZE))  & 0x7)  << 14)
+         | ((uint64_t(0)                             & 0x7)  << 14)
          | ((uint64_t(cp_clog2(cluster_size))        & 0x7)  << 17)
          | ((uint64_t(cp_clog2(VX_CFG_NUM_CLUSTERS)) & 0x7)  << 20)
          | ((uint64_t(cp_clog2(VX_CFG_ISSUE_WIDTH))  & 0x7)  << 23)

@@ -14,7 +14,6 @@
 #include <VX_types.h>
 #include "cta_dispatcher.h"
 #include "core.h"
-#include "socket.h"
 #include "cluster.h"
 #include "processor_impl.h"
 #include <VX_config.h>
@@ -25,7 +24,7 @@ using namespace vortex;
 CtaDispatcher::CtaDispatcher(const SimContext& ctx, const char* name, Core* core)
   : SimObject<CtaDispatcher>(ctx, name)
   , core_(core)
-  , kmu_(&core->socket()->cluster()->processor()->kmu())
+  , kmu_(&core->cluster()->processor()->kmu())
   , num_threads_(VX_CFG_NUM_THREADS)
   , num_warps_(VX_CFG_NUM_WARPS)
   , lmem_base_(VX_MEM_LMEM_BASE_ADDR)

@@ -19,7 +19,6 @@
 #include <vector>
 #include "core.h"
 #include "cluster.h"
-#include "socket.h"
 #include "mem_block_pool.h"
 #include "debug.h"
 #include "constants.h"
@@ -42,7 +41,7 @@ constexpr uint32_t kGmemLineSize = VX_CFG_L1_LINE_SIZE;
 constexpr uint64_t kGmemLineMask = ~uint64_t(VX_CFG_L1_LINE_SIZE - 1);
 
 // Cores per cluster.
-constexpr uint32_t kCoresPerCluster = NUM_SOCKETS * VX_CFG_SOCKET_SIZE;
+constexpr uint32_t kCoresPerCluster = VX_CFG_NUM_CORES;
 
 } // namespace
 

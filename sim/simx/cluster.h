@@ -31,8 +31,7 @@
 namespace vortex {
 
 class ProcessorImpl;
-
-class Socket;
+class Core;
 
 class Cluster : public SimObject<Cluster> {
 public:

@@ -5,7 +5,7 @@
 > **Local / Shared Memory (LMEM / SMEM)**. All numbers are reported for the **as-shipped
 > `VX_config.toml` defaults** (RV32, 4 threads / 4 warps, single core / socket / cluster).
 > It is descriptive only — a reference for the toy-H100 *Task 1* work
-> (`docs/proposals/socket_smem_simx_proposal.md`), which relocates the SMEM (LMEM) up to the
+> (`docs/proposals/socket_removal_simx_proposal.md`), which relocates the SMEM (LMEM) up to the
 > socket to sit alongside the L1D and L1I, **keeping them as separate structures** (no fusion).
 >
 > Every value is cited as `file:line`. Background prose lives in

@@ -134,7 +134,6 @@ ProcessorImpl::ProcessorImpl()
             << ", num_warps=" << VX_CFG_NUM_WARPS
             << ", num_cores=" << VX_CFG_NUM_CORES
             << ", num_clusters=" << VX_CFG_NUM_CLUSTERS
-            << ", socket_size=" << VX_CFG_SOCKET_SIZE
             << ", local_mem_base=0x" << std::hex << VX_MEM_LMEM_BASE_ADDR << std::dec
             << ", num_barriers=" << VX_CFG_NUM_BARRIERS
             << std::endl;

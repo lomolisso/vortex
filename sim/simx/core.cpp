@@ -38,7 +38,7 @@
 #include "sfu_unit.h"
 #include "csr_unit.h"
 #include "mem_coalescer.h"
-#include "socket.h"
+#include "cache_cluster.h"
 #include "cluster.h"
 #include "processor_impl.h"
 #include "kmu.h"
@@ -75,6 +75,83 @@ public:
   {
     const std::string& name = simobject_->name();
     char sname[100];
+
+    // create the core-resident L1 caches (each serves this one core).
+    snprintf(sname, 100, "%s-icache", name.c_str());
+    icache_ = CacheCluster::Create(sname, 1, VX_CFG_NUM_ICACHES, Cache::Config{
+      !VX_CFG_ICACHE_ENABLED,
+      log2ceil(VX_CFG_ICACHE_SIZE),  // C
+      log2ceil(VX_CFG_L1_LINE_SIZE), // L
+      log2ceil(sizeof(uint32_t)), // W
+      log2ceil(VX_CFG_ICACHE_NUM_WAYS),// A
+      log2ceil(1),            // B
+      VX_CFG_XLEN,                   // address bits
+      1,                      // number of inputs
+      VX_CFG_ICACHE_MEM_PORTS,       // memory ports
+      false,                  // write-back
+      false,                  // write response
+      VX_CFG_ICACHE_MSHR_SIZE,       // mshr size
+      1,                      // pipeline latency
+      VX_CFG_ICACHE_REPL_POLICY,     // replacement policy
+      false,                  // is_llc (icache never carries AMO state)
+    });
+
+    snprintf(sname, 100, "%s-dcache", name.c_str());
+    // L1 dcache is the LLC iff neither L2 nor L3 is enabled.
+    dcache_ = CacheCluster::Create(sname, 1, VX_CFG_NUM_DCACHES, Cache::Config{
+      !VX_CFG_DCACHE_ENABLED,
+      log2ceil(VX_CFG_DCACHE_SIZE),  // C
+      log2ceil(VX_CFG_L1_LINE_SIZE), // L
+      log2ceil(DCACHE_WORD_SIZE), // W
+      log2ceil(VX_CFG_DCACHE_NUM_WAYS),// A
+      log2ceil(VX_CFG_DCACHE_NUM_BANKS), // B
+      VX_CFG_XLEN,                   // address bits
+      VX_CFG_DCACHE_NUM_REQS,        // number of inputs
+      VX_CFG_L1_MEM_PORTS,           // memory ports
+      VX_CFG_DCACHE_WRITEBACK,       // write-back
+      false,                  // write response
+      VX_CFG_DCACHE_MSHR_SIZE,       // mshr size
+      1,                      // pipeline latency
+      VX_CFG_DCACHE_REPL_POLICY,     // replacement policy
+      (VX_CFG_DCACHE_ENABLED != 0) && (VX_CFG_L2_ENABLED == 0) && (VX_CFG_L3_ENABLED == 0), // is_llc
+    });
+
+    // connect the core's icache/dcache client ports to the L1 caches
+    simobject_->icache_req_out.at(0).bind(&icache_->core_req_in.at(0).at(0));
+    icache_->core_rsp_out.at(0).at(0).bind(&simobject_->icache_rsp_in.at(0));
+    for (uint32_t j = 0; j < VX_CFG_DCACHE_NUM_REQS; ++j) {
+      simobject_->dcache_req_out.at(j).bind(&dcache_->core_req_in.at(0).at(j));
+      dcache_->core_rsp_out.at(0).at(j).bind(&simobject_->dcache_rsp_in.at(j));
+    }
+
+    // merge icache + dcache traffic onto the core's outgoing memory ports
+    // (icache prioritized), exactly as the socket used to.
+    uint32_t overlap = __MIN(VX_CFG_ICACHE_MEM_PORTS, VX_CFG_L1_MEM_PORTS);
+    for (uint32_t i = 0; i < VX_CFG_L1_MEM_PORTS; ++i) {
+      snprintf(sname, 100, "%s-l1_arb%d", name.c_str(), i);
+      auto l1_arb = MemArbiter::Create(sname, ArbiterType::RoundRobin, 2 * overlap, overlap);
+
+      if (i < overlap) {
+        icache_->mem_req_out.at(i).bind(&l1_arb->ReqIn.at(i));
+        l1_arb->RspOut.at(i).bind(&icache_->mem_rsp_in.at(i));
+
+        dcache_->mem_req_out.at(i).bind(&l1_arb->ReqIn.at(overlap + i));
+        l1_arb->RspOut.at(overlap + i).bind(&dcache_->mem_rsp_in.at(i));
+
+        l1_arb->ReqOut.at(i).bind(&simobject_->mem_req_out.at(i));
+        simobject_->mem_rsp_in.at(i).bind(&l1_arb->RspIn.at(i));
+      } else {
+        if (VX_CFG_L1_MEM_PORTS > VX_CFG_ICACHE_MEM_PORTS) {
+          // if more dcache ports
+          dcache_->mem_req_out.at(i).bind(&simobject_->mem_req_out.at(i));
+          simobject_->mem_rsp_in.at(i).bind(&dcache_->mem_rsp_in.at(i));
+        } else {
+          // if more icache ports
+          icache_->mem_req_out.at(i).bind(&simobject_->mem_req_out.at(i));
+          simobject_->mem_rsp_in.at(i).bind(&icache_->mem_rsp_in.at(i));
+        }
+      }
+    }
 
     // create scheduler (SimObject) — also creates the CTA dispatcher.
     snprintf(sname, 100, "%s-scheduler", name.c_str());
@@ -812,6 +889,15 @@ public:
   const std::shared_ptr<MemCoalescer>& mem_coalescer(uint32_t idx) const { return mem_coalescers_.at(idx); }
   const std::shared_ptr<LocalMemSwitch>& lmem_switch(uint32_t idx) const { return lmem_switch_.at(idx); }
 
+  Core::MemPerfStats mem_perf_stats() const {
+    return { icache_->perf_stats(), dcache_->perf_stats() };
+  }
+
+  void dcache_flush_begin() { dcache_->flush_begin(); }
+  bool dcache_flush_done() const { return dcache_->flush_done(); }
+  void icache_flush_begin() { icache_->flush_begin(); }
+  bool icache_flush_done() const { return icache_->flush_done(); }
+
 #ifdef VX_CFG_VM_ENABLE
   // SATP write fans out to both per-core MMUs (dcache + icache). They
   // each maintain an independent TLB but share the same PT base from
@@ -845,6 +931,8 @@ private:
   LocalMem::Ptr local_mem_;
   std::vector<LocalMemSwitch::Ptr> lmem_switch_;
   std::vector<MemCoalescer::Ptr> mem_coalescers_;
+  CacheCluster::Ptr icache_;
+  CacheCluster::Ptr dcache_;
 
   TFifo<instr_trace_t*> fetch_latch_;
   TFifo<instr_trace_t*> decode_latch_;
@@ -882,15 +970,17 @@ private:
 Core::Core(const SimContext& ctx,
            const char* name,
            uint32_t core_id,
-           Socket* socket
+           Cluster* cluster
            )
   : SimObject(ctx, name)
   , icache_req_out(1, this)
   , icache_rsp_in(1, this)
   , dcache_req_out(VX_CFG_DCACHE_NUM_REQS, this)
   , dcache_rsp_in(VX_CFG_DCACHE_NUM_REQS, this)
+  , mem_req_out(VX_CFG_L1_MEM_PORTS, this)
+  , mem_rsp_in(VX_CFG_L1_MEM_PORTS, this)
   , core_id_(core_id)
-  , socket_(socket)
+  , cluster_(cluster)
   , impl_(new Impl(ctx, this))
 {}
 
@@ -907,7 +997,7 @@ void Core::on_tick() {
 }
 
 ProcessorImpl* Core::processor() const {
-  return socket_->cluster()->processor();
+  return cluster_->processor();
 }
 
 bool Core::running() const {
@@ -995,6 +1085,15 @@ std::shared_ptr<TcuUnit>& Core::tcu_unit() {
 std::shared_ptr<SfuUnit> Core::sfu_unit() {
   return impl_->sfu_unit();
 }
+
+Core::MemPerfStats Core::mem_perf_stats() const {
+  return impl_->mem_perf_stats();
+}
+
+void Core::dcache_flush_begin() { impl_->dcache_flush_begin(); }
+bool Core::dcache_flush_done() const { return impl_->dcache_flush_done(); }
+void Core::icache_flush_begin() { impl_->icache_flush_begin(); }
+bool Core::icache_flush_done() const { return impl_->icache_flush_done(); }
 
 const std::shared_ptr<LocalMem>& Core::local_mem() const {
   return impl_->local_mem();

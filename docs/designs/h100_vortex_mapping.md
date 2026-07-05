@@ -149,7 +149,7 @@ Fix `SOCKET_SIZE = 1` **and remove it as a knob**. The socket then contains exac
 its L1D and L1I become effectively **per-SM**, matching H100 — no RTL change needed for the
 caches; the socket tier collapses onto the core for cache purposes. To place **SMEM** at the SM
 as well, relocate the per-core `LMEM` scratchpad **up to the socket** so it sits alongside L1D and
-L1I (Task 1 — [`../proposals/socket_smem_simx_proposal.md`](../proposals/socket_smem_simx_proposal.md)).
+L1I (Task 1 — [`../proposals/socket_removal_simx_proposal.md`](../proposals/socket_removal_simx_proposal.md)).
 The three remain **separate** structures; this is a placement fix, **not** the fused-SRAM change
 in §5.2.
 
@@ -164,7 +164,7 @@ them. This is a deliberate soft-GPU simplification.
   H100 uses 256 KB (`LMEM_LOG_SIZE = 18`) — quoted only as the reference; the toy should pick a
   modest size. Matching 256 KB is **not** a goal (§1.1).
 - **The split is the accepted design** (LMEM = SMEM, L1D = the separate cache). Task 1
-  ([`../proposals/socket_smem_simx_proposal.md`](../proposals/socket_smem_simx_proposal.md))
+  ([`../proposals/socket_removal_simx_proposal.md`](../proposals/socket_removal_simx_proposal.md))
   implements the *placement* (SMEM → socket) **without** fusing. **True unification** — a shared
   banked SRAM with a configurable partition — needs RTL/SimX surgery and is recorded as an
   out-of-scope **follow-on** (§7), not part of the toy-H100 program.

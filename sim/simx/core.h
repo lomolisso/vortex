@@ -18,11 +18,12 @@
 #include <mempool.h>
 #include "types.h"
 #include "instr_trace.h"
+#include "cache.h"
 #include "VX_config.h"
 
 namespace vortex {
 
-class Socket;
+class Cluster;
 class ProcessorImpl;
 class Scheduler;
 class CsrUnit;
@@ -69,16 +70,28 @@ public:
     uint64_t load_latency = 0;
   };
 
+  // Per-core L1 icache/dcache perf counters (the L1 caches are core-resident).
+  struct MemPerfStats {
+    Cache::PerfStats icache;
+    Cache::PerfStats dcache;
+  };
+
+  // Core-internal icache/dcache client ports (bound to the core-owned L1
+  // CacheClusters); no longer cross a core→socket boundary.
   std::vector<SimChannel<MemReq>> icache_req_out;
   std::vector<SimChannel<MemRsp>> icache_rsp_in;
 
   std::vector<SimChannel<MemReq>> dcache_req_out;
   std::vector<SimChannel<MemRsp>> dcache_rsp_in;
 
+  // Post-L1 memory interface exposed to the cluster (after the L1 arbiter).
+  std::vector<SimChannel<MemReq>> mem_req_out;
+  std::vector<SimChannel<MemRsp>> mem_rsp_in;
+
   Core(const SimContext& ctx,
        const char* name,
        uint32_t core_id,
-       Socket* socket
+       Cluster* cluster
   );
 
   ~Core();
@@ -108,9 +121,18 @@ public:
     return core_id_;
   }
 
-  Socket* socket() const {
-    return socket_;
+  Cluster* cluster() const {
+    return cluster_;
   }
+
+  MemPerfStats mem_perf_stats() const;
+
+  // L1 cache-flush hooks (write-back eviction walk), forwarded to the
+  // core-resident icache/dcache CacheClusters.
+  void dcache_flush_begin();
+  bool dcache_flush_done() const;
+  void icache_flush_begin();
+  bool icache_flush_done() const;
 
   const std::shared_ptr<LocalMem>& local_mem() const;
 
@@ -162,7 +184,7 @@ protected:
 
 private:
   uint32_t core_id_;
-  Socket*  socket_;
+  Cluster* cluster_;
 
   class Impl;
   Impl* impl_;

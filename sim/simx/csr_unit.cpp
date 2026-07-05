@@ -19,7 +19,6 @@
 #include "debug.h"
 #include "core.h"
 #include "scheduler.h"
-#include "socket.h"
 #include "cluster.h"
 #include "processor_impl.h"
 #include "processor_impl.h"
@@ -141,7 +140,7 @@ Word CsrUnit::get_csr(uint32_t addr, uint32_t wid, uint32_t tid) {
     if ((addr >= VX_CSR_MPM_BASE && addr < (VX_CSR_MPM_BASE + 32))
      || (addr >= VX_CSR_MPM_BASE_H && addr < (VX_CSR_MPM_BASE_H + 32))) {
       // user-defined MPM CSRs
-      auto proc_perf = core_->socket()->cluster()->processor()->perf_stats();
+      auto proc_perf = core_->cluster()->processor()->perf_stats();
       auto perf_class = core_->mpm_class();
       switch (perf_class) {
       case VX_DCR_MPM_CLASS_BASE:
@@ -183,8 +182,8 @@ Word CsrUnit::get_csr(uint32_t addr, uint32_t wid, uint32_t tid) {
         }
       } break;
       case VX_DCR_MPM_CLASS_MEM: {
-        auto cluster_perf = core_->socket()->cluster()->perf_stats();
-        auto socket_perf = core_->socket()->perf_stats();
+        auto cluster_perf = core_->cluster()->perf_stats();
+        auto mem_perf = core_->mem_perf_stats();
         auto lmem_perf = core_->local_mem()->perf_stats();
 
         uint64_t coalescer_misses = 0;
@@ -193,16 +192,16 @@ Word CsrUnit::get_csr(uint32_t addr, uint32_t wid, uint32_t tid) {
         }
 
         switch (addr) {
-        CSR_READ_64(VX_CSR_MPM_ICACHE_READS, socket_perf.icache.reads);
-        CSR_READ_64(VX_CSR_MPM_ICACHE_MISS_R, socket_perf.icache.read_misses);
-        CSR_READ_64(VX_CSR_MPM_ICACHE_MSHR_ST, socket_perf.icache.mshr_stalls);
+        CSR_READ_64(VX_CSR_MPM_ICACHE_READS, mem_perf.icache.reads);
+        CSR_READ_64(VX_CSR_MPM_ICACHE_MISS_R, mem_perf.icache.read_misses);
+        CSR_READ_64(VX_CSR_MPM_ICACHE_MSHR_ST, mem_perf.icache.mshr_stalls);
 
-        CSR_READ_64(VX_CSR_MPM_DCACHE_READS, socket_perf.dcache.reads);
-        CSR_READ_64(VX_CSR_MPM_DCACHE_WRITES, socket_perf.dcache.writes);
-        CSR_READ_64(VX_CSR_MPM_DCACHE_MISS_R, socket_perf.dcache.read_misses);
-        CSR_READ_64(VX_CSR_MPM_DCACHE_MISS_W, socket_perf.dcache.write_misses);
-        CSR_READ_64(VX_CSR_MPM_DCACHE_BANK_ST, socket_perf.dcache.bank_stalls);
-        CSR_READ_64(VX_CSR_MPM_DCACHE_MSHR_ST, socket_perf.dcache.mshr_stalls);
+        CSR_READ_64(VX_CSR_MPM_DCACHE_READS, mem_perf.dcache.reads);
+        CSR_READ_64(VX_CSR_MPM_DCACHE_WRITES, mem_perf.dcache.writes);
+        CSR_READ_64(VX_CSR_MPM_DCACHE_MISS_R, mem_perf.dcache.read_misses);
+        CSR_READ_64(VX_CSR_MPM_DCACHE_MISS_W, mem_perf.dcache.write_misses);
+        CSR_READ_64(VX_CSR_MPM_DCACHE_BANK_ST, mem_perf.dcache.bank_stalls);
+        CSR_READ_64(VX_CSR_MPM_DCACHE_MSHR_ST, mem_perf.dcache.mshr_stalls);
 
         CSR_READ_64(VX_CSR_MPM_L2CACHE_READS, cluster_perf.l2cache.reads);
         CSR_READ_64(VX_CSR_MPM_L2CACHE_WRITES, cluster_perf.l2cache.writes);
@@ -242,7 +241,7 @@ Word CsrUnit::get_csr(uint32_t addr, uint32_t wid, uint32_t tid) {
     #endif
     #ifdef VX_CFG_EXT_DXA_ENABLE
       case VX_DCR_MPM_CLASS_DXA: {
-        auto cluster_perf = core_->socket()->cluster()->perf_stats();
+        auto cluster_perf = core_->cluster()->perf_stats();
         switch (addr) {
         CSR_READ_64(VX_CSR_MPM_DXA_TRANSFERS,  cluster_perf.dxa.transfers);
         CSR_READ_64(VX_CSR_MPM_DXA_GMEM_READS, cluster_perf.dxa.gmem_reads);
@@ -254,7 +253,7 @@ Word CsrUnit::get_csr(uint32_t addr, uint32_t wid, uint32_t tid) {
     #endif
     #ifdef VX_CFG_EXT_TEX_ENABLE
       case VX_DCR_MPM_CLASS_TEX: {
-        auto cluster_perf = core_->socket()->cluster()->perf_stats();
+        auto cluster_perf = core_->cluster()->perf_stats();
         switch (addr) {
         CSR_READ_64(VX_CSR_MPM_TEX_READS,     cluster_perf.tex.mem_reads);
         CSR_READ_64(VX_CSR_MPM_TEX_LAT,       cluster_perf.tex.mem_latency);
@@ -268,7 +267,7 @@ Word CsrUnit::get_csr(uint32_t addr, uint32_t wid, uint32_t tid) {
     #endif
     #ifdef VX_CFG_EXT_RASTER_ENABLE
       case VX_DCR_MPM_CLASS_RASTER: {
-        auto cluster_perf = core_->socket()->cluster()->perf_stats();
+        auto cluster_perf = core_->cluster()->perf_stats();
         switch (addr) {
         CSR_READ_64(VX_CSR_MPM_RASTER_READS,  cluster_perf.raster.mem_reads);
         CSR_READ_64(VX_CSR_MPM_RASTER_LAT,    cluster_perf.raster.mem_latency);
@@ -282,7 +281,7 @@ Word CsrUnit::get_csr(uint32_t addr, uint32_t wid, uint32_t tid) {
     #endif
     #ifdef VX_CFG_EXT_OM_ENABLE
       case VX_DCR_MPM_CLASS_OM: {
-        auto cluster_perf = core_->socket()->cluster()->perf_stats();
+        auto cluster_perf = core_->cluster()->perf_stats();
         switch (addr) {
         CSR_READ_64(VX_CSR_MPM_OM_READS,      cluster_perf.om.mem_reads);
         CSR_READ_64(VX_CSR_MPM_OM_WRITES,     cluster_perf.om.mem_writes);

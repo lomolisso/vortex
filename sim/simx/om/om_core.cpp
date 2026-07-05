@@ -36,7 +36,7 @@ constexpr uint64_t kOcacheLineMask = ~uint64_t(VX_CFG_MEM_BLOCK_SIZE - 1);
 constexpr uint32_t kInflight = VX_CFG_OM_MEM_QUEUE_SIZE;
 
 // Cores per cluster.
-constexpr uint32_t kCoresPerCluster = NUM_SOCKETS * VX_CFG_SOCKET_SIZE;
+constexpr uint32_t kCoresPerCluster = VX_CFG_NUM_CORES;
 
 } // namespace
 

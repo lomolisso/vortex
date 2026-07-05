@@ -22,7 +22,6 @@
 #include "instr_trace.h"
 #include "instr.h"
 #include "core.h"
-#include "socket.h"
 #include "cluster.h"
 #include "processor_impl.h"
 #include "local_mem.h"

@@ -23,7 +23,7 @@ class Core;
 class Scheduler;
 
 // Owns per-warp barrier state; resumes waiting warps via the parent Scheduler;
-// participates in cross-core global barriers via Socket.
+// participates in cross-core global barriers via Cluster.
 class BarrierUnit : public SimObject<BarrierUnit> {
 public:
   BarrierUnit(const SimContext& ctx, const char* name, Core* core, Scheduler* scheduler);

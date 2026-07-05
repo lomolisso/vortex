@@ -5,7 +5,7 @@
 [Toy-H100 SimX Roadmap](toy_h100_simx_roadmap_proposal.md); this is **Task 5**, the **last**
 task. It depends on Tasks 1–4 being implemented and C++-verified.
 
-**Goal:** expose the toy-H100 hardware features — **socket-level SMEM** (via `__local`),
+**Goal:** expose the toy-H100 hardware features — **core-level SMEM** (via `__local`),
 **DXA** (TMA), **DSMEM**, and **WGMMA** — to **OpenCL C**, then port the Task 1–4 C++
 verification kernels to OpenCL and confirm the OpenCL equivalents produce identical results in
 SimX. This is also the deliberate bridge to the future **CUDA→OpenCL workload transcription**
@@ -45,7 +45,7 @@ headers already emit, so the SimX hardware path is unchanged.
 
 | Feature | OpenCL surface | Lowers to | Notes |
 |---|---|---|---|
-| **Socket-level SMEM** (Task 1) | `__local` already maps to the scratchpad — now socket-resident; no new surface needed | the existing shared-memory intrinsics / `__local` address space | `__local` targets the relocated SMEM; `__global` exercises the **separate** socket dcache (no fused carveout — Task 1 keeps L1D and SMEM distinct) |
+| **Core-level SMEM** (Task 1) | `__local` already maps to the scratchpad — core-resident; no new surface needed | the existing shared-memory intrinsics / `__local` address space | `__local` targets the core SMEM; `__global` exercises the **separate** core dcache (no fused carveout — Task 1 keeps L1D and SMEM distinct) |
 | **DXA / TMA** (Task 2) | `cl_vortex_async_copy` builtins (`vx_dxa_issue_*` equivalents, **incl. the multicast variant**) + host descriptor programming | the `vx_dxa.h` issue intrinsics + `dxa.h` host API | mirror the existing C++ issue/descriptor surface; multicast covers Task 3c |
 | **DSMEM remote addressing** (Task 3b) | a work-group-cluster extension (cluster query + remote-shared pointer builtins) | the DSMEM (peer-rank, offset) addressing + `group_barrier` | OpenCL analog of CUDA thread-block clusters / `cluster.map_shared_rank` |
 | **TMA multicast** (Task 3c) | the multicast form of `cl_vortex_async_copy` + the cluster mask | the per-SM DXA multicast over the SM-to-SM network | must preserve the **single-global-read** property end-to-end |
@@ -64,9 +64,9 @@ mechanical:
 
 | CUDA / Hopper | OpenCL surface (this task) | Vortex (Tasks 1–4) |
 |---|---|---|
-| SM | work-group on one core | core (== socket == SM) |
+| SM | work-group on one core | core (== SM) |
 | SMSP | sub-group | issue slot (`ISSUE_WIDTH`) |
-| `__shared__` / SMEM | `__local` | socket `LocalMem` (SMEM) (Task 1) |
+| `__shared__` / SMEM | `__local` | core `LocalMem` (SMEM) (Task 1) |
 | Thread-Block Cluster | work-group-cluster extension | CTA cluster + `SmToSmNetwork` |
 | DSMEM (`cluster.map_shared_rank`) | remote-shared pointer builtin | DSMEM remote addressing (Task 3) |
 | TMA (`cp.async.bulk`) | `cl_vortex_async_copy` | per-SM DXA (Task 2) |
@@ -81,16 +81,16 @@ feature is exercised (same perf-CSR movement as the C++ oracle):
 
 | C++ oracle (Tasks 1–4) | OpenCL equivalent (Task 5) | Exercises |
 |---|---|---|
-| a shared-mem+global regression kernel | `opencl/socket_smem` | `__local` (socket SMEM) + `__global` (separate dcache) |
+| a shared-mem+global regression kernel | `opencl/core_smem` | `__local` (core SMEM) + `__global` (separate dcache) |
 | `regression/dxa_copy` | `opencl/dxa_copy` | per-SM DXA via `cl_vortex_async_copy` |
-| `regression/dsmem_pingpong` | `opencl/dsmem_pingpong` | cross-socket DSMEM (3b) via cluster extension |
+| `regression/dsmem_pingpong` | `opencl/dsmem_pingpong` | cross-core DSMEM (3b) via cluster extension |
 | `regression/dxa_multicast` | `opencl/dxa_multicast` | faithful TMA multicast (3c) — assert single global read, not just bytes |
 | `regression/proxy_fence` | `opencl/proxy_fence` | generic→async `fence.proxy.async` (Task 4) — incl. the negative no-fence variant |
 | `regression/async_push_mbar` | `opencl/async_push_mbar` | byte-granular mbarrier completion (Task 4) over the async push |
 
 ```bash
 # OpenCL equivalents on SimX (toy-H100 SM shape)
-make -C tests/opencl/socket_smem run-simx
+make -C tests/opencl/core_smem run-simx
 CONFIGS="-DVX_CFG_EXT_DXA_ENABLE" make -C tests/opencl/dxa_copy run-simx
 CONFIGS="-DVX_CFG_CLUSTER_MEM_MODE=DSMEM" make -C tests/opencl/dsmem_pingpong run-simx
 # or via blackbox
@@ -110,7 +110,7 @@ documented tolerance), within the 120 s cap, built inside the Docker dev contain
 - **Isolation.** Keep all of this in `sw/*`/`tests/*` — no references into `sim/*`/`hw/*`
   ([`ci/check_sw_sim_boundary.sh`](../../ci/check_sw_sim_boundary.sh)).
 - **WGMMA scope.** The tensor OpenCL surface is optional for the toy-H100 hierarchy goal;
-  prioritize socket-level SMEM / DXA / DSMEM (the Task 1–3 features). Defer WGMMA-in-OpenCL if time-boxed.
+  prioritize core-level SMEM / DXA / DSMEM (the Task 1–3 features). Defer WGMMA-in-OpenCL if time-boxed.
 
 ## 7. Proposed but not yet implemented (beyond this task)
 
