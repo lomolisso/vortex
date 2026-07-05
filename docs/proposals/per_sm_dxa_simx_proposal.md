@@ -3,14 +3,14 @@
 **Status:** proposal (pre-implementation). **Scope:** SimX only
 ([`sim/simx/`](../../sim/simx/)). Part of the
 [Toy-H100 SimX Roadmap](toy_h100_simx_roadmap_proposal.md); this is **Task 2**, and it
-**depends on [Task 1](unified_l1_simx_proposal.md)** (socket-resident `UnifiedL1`). Closes the
+**depends on [Task 1](socket_smem_simx_proposal.md)** (socket-resident SMEM). Closes the
 **"TMA placement"** divergence from
 [`../designs/h100_vortex_mapping.md`](../designs/h100_vortex_mapping.md) §5.5, and implements the
 already-specified-but-unbuilt **"per-socket DXA relocation"** from
 [`../designs/dxa_async_copy_multicast.md`](../designs/dxa_async_copy_multicast.md) §7.1.
 
 **Goal:** move the DXA engine model from the cluster down to the socket. With `SOCKET_SIZE=1`
-this yields a true **per-SM TMA**, writing directly into the socket's `UnifiedL1` scratchpad.
+this yields a true **per-SM TMA**, writing directly into the socket's `LocalMem` (SMEM) scratchpad.
 
 ---
 
@@ -35,12 +35,12 @@ So one cluster-wide engine serves all cores, reaching into each core's private L
 
 | | Owns (after Task 2) |
 |---|---|
-| **Socket (== SM)** | L1I + `UnifiedL1` + **`DxaCore`** |
+| **Socket (== SM)** | L1I + dcache (L1D) + `LocalMem` (SMEM) + **`DxaCore`** |
 | **Cluster** | L2 (no DXA fabric) |
 
 With `SOCKET_SIZE=1`: one `DxaCore` per socket == per SM == per-SM TMA. DXA's **GMEM-read side**
-joins the socket's L1 path to L2; DXA's **SMEM-write side** targets the socket's `UnifiedL1`
-scratchpad region (built in Task 1).
+joins the socket's L1 path to L2; DXA's **SMEM-write side** targets the socket's `LocalMem`
+(SMEM) scratchpad (relocated to the socket in Task 1).
 
 **Why per-SM is the *faithful* model.** Hopper's TMA units genuinely are per-SM, and multicast
 genuinely traverses the SM-to-SM fabric. The current cluster-resident DXA performs multicast
@@ -50,7 +50,7 @@ regression to apologize for. The faithful cross-SM data movement (DSMEM addressi
 multicast) is rebuilt on an explicit SM-to-SM network in [Task 3](dsmem_smtosm_simx_proposal.md).
 
 The socket-resident DXA established here is also the **async-proxy agent** of the two-proxy
-model: [Task 4](proxy_model_simx_proposal.md) tags its `UnifiedL1` writes as the async proxy
+model: [Task 4](proxy_model_simx_proposal.md) tags its socket-SMEM writes as the async proxy
 (vs the generic LSU proxy) and defines the generic↔async crossing contract. No proxy logic is
 added in Task 2 — this only notes which agent the DXA becomes.
 
@@ -66,12 +66,12 @@ DXA row.
 
 **3.2 GMEM-read path → socket L1 arbiter.** Instead of a DXA row on the *cluster* L2 arbiter,
 add a **DXA input on the socket's L1 `MemArbiter`** ([`socket.cpp:78`](../../sim/simx/socket.cpp#L78)),
-so DXA GMEM reads share the socket→L2 port with the icache/`UnifiedL1`-cache traffic. Priority
+so DXA GMEM reads share the socket→L2 port with the icache/dcache traffic. Priority
 per the DXA design doc: **dcache > DXA** (the "dcache→DXA arbiter"). The cluster L2 then sees
 only per-socket aggregated traffic — no DXA-specific rows.
 
-**3.3 SMEM-write path → `UnifiedL1` scratchpad.** `DxaCore::lmem_req_out` (now a single port,
-cores_per_socket=1) binds to a `UnifiedL1` scratchpad input port on the same socket. Preserve
+**3.3 SMEM-write path → socket `LocalMem` scratchpad.** `DxaCore::lmem_req_out` (now a single
+port, cores_per_socket=1) binds to a `LocalMem` (SMEM) input port on the same socket. Preserve
 the completion contract: the `flags.dxa_notify_done` write must still drive
 `core->barrier_event_release(...)`; route that callback across the new socket↔core interface
 introduced in Task 1 (the core exposed an SMEM interface; DXA completion notifies the resident
@@ -112,7 +112,7 @@ cap applies.
 - **Cross-socket multicast regresses until Task 3.** Today's `dxa_copy_mcast` /
   `sgemm_tcu_wg_dxa_mcast` rely on the *cluster-resident* DXA reaching **multiple cores'** LMEM
   to multicast into co-resident CTAs. A per-SM DXA can only write its **own** socket's
-  `UnifiedL1`. Therefore:
+  `LocalMem` (SMEM). Therefore:
   - **Single-CTA / single-socket DXA: fully supported by Task 2.**
   - **Faithful TMA multicast — single global read, fan-out over the SM-to-SM network — is
     deferred to [Task 3c](dsmem_smtosm_simx_proposal.md).** In Task 2, gate/skip the multicast

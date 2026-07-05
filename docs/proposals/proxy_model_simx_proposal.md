@@ -60,8 +60,8 @@ crossing-ordering is enforced.
 ## 4. The async-proxy datapath and the port ordering contract
 
 After [Task 2](per_sm_dxa_simx_proposal.md) the socket-resident `DxaCore` writes the
-[Task 1](unified_l1_simx_proposal.md) `UnifiedL1` scratchpad; that establishes it as the
-**async-proxy agent**, distinct from the generic LSU path at the **same unified L1/SMEM port**.
+[Task 1](socket_smem_simx_proposal.md) socket `LocalMem` (SMEM) scratchpad; that establishes it
+as the **async-proxy agent**, distinct from the generic LSU path at the **same socket SMEM port**.
 
 The port arbiter — already two-issuer after Task 1 (LSU-shared + TCU + DXA) and gaining the
 remote client after Task 3 — now carries a **proxy-ordering contract** layered on top of its
@@ -88,7 +88,8 @@ and DXA multicast already releases **per destination CTA** (`bar_id + cta`,
 **What this task adds:**
 
 1. **A shared-memory-resident mbarrier object** (directive §4.3). Promote the
-   transaction/phase state into an mbarrier modeled in `UnifiedL1` (the Task-1 class); keep
+   transaction/phase state into an mbarrier modeled in the socket SMEM (`LocalMem`, the Task-1
+   relocated scratchpad); keep
    warp-arrival counting in `BarrierUnit`. Document the migration from today's `BarrierUnit`
    `events`/`phase` proto-mechanism and the per-core `tx_callback`
    ([`cluster.cpp:147-170`](../../sim/simx/cluster.cpp#L147)) to the resident object.
@@ -110,7 +111,7 @@ The generic→async crossing fence, required on the **producer** side when threa
 with ordinary stores (generic proxy) and then hand it to the DXA to read (async proxy) — including
 the shared→shared push.
 
-- **Enforcement at the unified L1/SMEM port:** an async read issued *after* the fence must
+- **Enforcement at the socket SMEM port:** an async read issued *after* the fence must
   observe the generic-proxy writes that preceded it (even from the same thread).
 - **The negative case must be expressible:** without the fence, the model must be **allowed to
   expose stale/reordered data**, so the negative verification kernel (§9a) fails loudly. Do not
@@ -147,8 +148,8 @@ owned here is `fence.proxy.async`.
 
 | SimX class (this task) | Future SV module | Level |
 |---|---|---|
-| `Mbarrier` (shared-resident, in/with `UnifiedL1`) | `VX_mbarrier` (in `VX_unified_l1`/`VX_socket.sv`) | Socket |
-| proxy-ordering logic at the unified-L1 port | the proxy-order block in `VX_unified_l1` | Socket |
+| `Mbarrier` (shared-resident, with the socket SMEM) | `VX_mbarrier` (with the SMEM in `VX_socket.sv`) | Socket |
+| proxy-ordering logic at the socket SMEM port | the proxy-order block at the SMEM port in `VX_socket.sv` | Socket |
 | async-proxy datapath tag/handling | `VX_dxa_core` async-proxy port attrs | Socket |
 | `fence.proxy.async` handling | decode + the port fence hook | Core/Socket |
 

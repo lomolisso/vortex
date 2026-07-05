@@ -6,11 +6,19 @@ the umbrella roadmap; each task has its own proposal (linked in §4) and is impl
 verified in sequence.
 
 This program turns Vortex into a small-scale **"toy H100"** whose **compute *and* memory
-hierarchies map 1-to-1 to a real H100 SM**, in SimX. It is the implementation arm of the gap
-analysis in [`../designs/h100_vortex_mapping.md`](../designs/h100_vortex_mapping.md); read that
-first. The headline correspondence it relies on: **H100 SM ↔ Vortex core**, **H100 SMSP ↔
-Vortex issue slot**, and the cache placement / DSMEM / TMA gaps enumerated there are exactly
+hierarchies are *organized* like a real H100 SM**, in SimX. It is the implementation arm of the
+gap analysis in [`../designs/h100_vortex_mapping.md`](../designs/h100_vortex_mapping.md); read
+that first. The headline correspondence it relies on: **H100 SM ↔ Vortex core**, **H100 SMSP ↔
+Vortex issue slot**, and the SMEM-placement / DSMEM / TMA gaps enumerated there are exactly
 what these tasks close.
+
+> **Architecture, not resources.** "1-to-1" here is *structural and organizational* — the
+> *shape* of the machine and the way its blocks are placed and talk to each other — **never a
+> match of capacities or counts**. Vortex is a **soft GPU**, not a datacenter GPU: we do **not**
+> target H100's 256 KB SMEM, 2048-thread occupancy, ~50 MB L2, or 132 SMs. Every H100 figure in
+> this roadmap and the linked proposals is an *illustrative reference* for the architecture being
+> reproduced; each feature below is correct at **soft-GPU scale**, at whatever modest sizes the
+> toy is built with. See §2 and [`h100_vortex_mapping.md §1.1`](../designs/h100_vortex_mapping.md).
 
 ---
 
@@ -19,8 +27,11 @@ what these tasks close.
 The gap analysis found three structural divergences between the H100 SM and the Vortex
 core/socket, plus a memory-model fidelity gap and a software gap:
 
-1. **Cache placement.** H100 fuses a 256 KB **L1D + SMEM** in one per-SM array; Vortex splits
-   them — `LocalMem` scratchpad per **core**, dcache per **socket**. (→ **Task 1**)
+1. **SMEM placement.** H100 places L1D **and** SMEM together at the SM; Vortex splits them
+   *across levels* — `LocalMem` scratchpad per **core**, dcache/L1I per **socket**. We relocate
+   SMEM up to the socket so all three sit at the SM, **keeping L1D and SMEM as separate
+   structures**. (The H100's *fused* single-array L1D+SMEM is a deliberate non-goal — see §2 and
+   [`h100_vortex_mapping.md §5.2`](../designs/h100_vortex_mapping.md).) (→ **Task 1**)
 2. **TMA placement.** H100's TMA is per-SM; Vortex's DXA is cluster-shared. (→ **Task 2**)
 3. **DSMEM / SM-to-SM network *and* TMA multicast.** Absent in Vortex; only approximated by
    DXA multicast. The SM-to-SM network is a **substrate** with **two first-class consumers** —
@@ -43,6 +54,15 @@ core/socket, plus a memory-model fidelity gap and a software gap:
 - **Genuine reworks, no façades.** When a task says *remove* a class, delete it and replace it —
   do not wrap the old structure. Do not fake behavior (an unmodeled partition, unarbitrated
   routing, etc.). Reworks over workarounds.
+- **Soft-GPU scale — reproduce architecture, never resources.** Implement Hopper's *structural
+  and organizational* properties (SM-level SMEM placement, per-SM TMA, SM-to-SM network + DSMEM,
+  the two-proxy model), but keep all capacities/counts at soft-GPU scale. **Matching any H100
+  dimension is a non-goal**: no 256 KB SMEM, no 2048-thread occupancy, no ~50 MB L2, no 132 SMs.
+  The H100's *fused* single-array L1D/SMEM is likewise a non-goal (Task 1 co-locates them as two
+  separate structures at the socket; true fusion is a recorded follow-on — §4, gap analysis §5.2).
+  Capacity knobs (`LMEM_LOG_SIZE`, cache sizes, `NUM_CORES`, `NUM_CLUSTERS`, `NUM_WARPS`) are
+  free parameters — pick small values; H100 numbers are reference points only, and no task's
+  logic depends on them.
 - **Root-cause discipline** per [`../../AGENTS.md`](../../AGENTS.md) §3.
 - **Do not introduce a scoped memory-consistency *model*** (PTX/SASS-style scope qualifiers,
   scope-tree visibility) to deliver the **structural** tasks (1–3) or OpenCL (5). The feature set
@@ -56,37 +76,41 @@ core/socket, plus a memory-model fidelity gap and a software gap:
 | Level | SimX class | Owns — **before** | Owns — **after this program** |
 |---|---|---|---|
 | Cluster | `Cluster` | L2, **DxaCore** | L2 *or* **DSMEM SM-to-SM network** (mode-selected), no DXA |
-| Socket (== SM) | `Socket` | L1I + dcache (`CacheCluster`) | L1I + **`UnifiedL1`** (fused L1D/SMEM, + shared-resident **`Mbarrier`** & proxy-ordering port, Task 4) + **`DxaCore`** |
+| Socket (== SM) | `Socket` | L1I + dcache (`CacheCluster`) | L1I + dcache (L1D) + **relocated `LocalMem` (SMEM)** — three separate structures (+ shared-resident **`Mbarrier`** & proxy-ordering logic at the SMEM port, Task 4) + **`DxaCore`** |
 | Core | `Core` | regfile + TCU + **`LocalMem`** | regfile + TCU + **SMEM *interface*** (no storage) |
 
-`SOCKET_SIZE` is fixed to **1**, so socket == SM throughout.
+`SOCKET_SIZE` is fixed to **1** and removed as a tunable knob, so socket == SM throughout.
+**L1D and SMEM stay separate structures** at the socket — the H100's single *fused* L1D/SMEM
+array is a non-goal (§2, Task 1).
 
 ## 4. Task sequence (each builds on the previous)
 
-1. **[UnifiedL1](unified_l1_simx_proposal.md)** — fix `SOCKET_SIZE=1`; strip SMEM storage from
-   the core; delete the separate dcache + `LocalMem` classes; introduce a socket-resident
-   **`UnifiedL1`** (one banked SRAM, configurable cache↔scratchpad partition). *Foundation for
-   everything else — the socket now owns the shared memory.*
+1. **[Socket-Level SMEM](socket_smem_simx_proposal.md)** — fix `SOCKET_SIZE=1` and remove the
+   knob; strip SMEM storage from the core (which now exposes an SMEM *interface*); relocate the
+   `LocalMem` scratchpad up to the socket, **next to the existing dcache (L1D) and L1I as a
+   separate structure**. No fused array. *Foundation for everything else — the socket now owns
+   the shared memory.*
 2. **[Per-SM DXA](per_sm_dxa_simx_proposal.md)** — move `DxaCore` from cluster to socket; add a
-   dcache→DXA arbiter onto the socket's `UnifiedL1` path; with `SOCKET_SIZE=1` this is a true
-   per-SM TMA. *Requires Task 1's socket-resident SMEM.*
+   dcache→DXA arbiter onto the socket's L1→L2 path and target the socket `LocalMem` (SMEM) on the
+   write side; with `SOCKET_SIZE=1` this is a true per-SM TMA. *Requires Task 1's socket-resident
+   SMEM.*
 3. **[SM-to-SM network: DSMEM + TMA multicast](dsmem_smtosm_simx_proposal.md)** — a cluster-level
    SM-to-SM network **substrate** plus **two first-class consumers**: **(3a)** the network fabric
-   (**pluggable topology — crossbar default, ring/mesh/torus as a study axis**) + `UnifiedL1`
-   remote port + cluster memory mode **L2 / DSMEM / none**; **(3b)** **DSMEM remote
-   addressing** (real cross-socket shared-memory load/store); **(3c)** **faithful TMA multicast**
-   (single issuer, *one* global read, hardware fan-out into N scratchpads). *Uses Task 1's
-   `UnifiedL1` and Task 2's per-socket `DxaCore`; 3c restores — and makes faithful — the
-   cross-socket multicast that Task 2 defers.*
+   (**pluggable topology — crossbar default, ring/mesh/torus as a study axis**) + a socket
+   `LocalMem` (SMEM) remote port + cluster memory mode **L2 / DSMEM / none**; **(3b)** **DSMEM
+   remote addressing** (real cross-socket shared-memory load/store); **(3c)** **faithful TMA
+   multicast** (single issuer, *one* global read, hardware fan-out into N scratchpads). *Uses
+   Task 1's socket-resident SMEM and Task 2's per-socket `DxaCore`; 3c restores — and makes
+   faithful — the cross-socket multicast that Task 2 defers.*
 4. **[Proxy model & async-proxy instructions](proxy_model_simx_proposal.md)** — model PTX's
    two-proxy memory model (generic = LSU, async = DXA/TMA): a `proxy` tag on requests, the
    producer-side **`fence.proxy.async`**, and the byte-granular **mbarrier** completion (promoted
    from the existing `warp_barrier_t` proto-mechanism). An **additive fidelity layer on top of
-   Tasks 1–3, not a correction of them**; proxies ≠ scopes. *Uses Task 1's `UnifiedL1` port
+   Tasks 1–3, not a correction of them**; proxies ≠ scopes. *Uses Task 1's socket SMEM port
    (generic↔async crossing) and Task 2's socket DXA (the async agent).*
 5. **[OpenCL feature enablement](opencl_feature_enablement_proposal.md)** — expose the new
-   features (UnifiedL1 partition carveout, DXA, DSMEM, WGMMA) to **OpenCL C**, port the Task 1–4
-   C++ verification kernels to OpenCL, and verify the OpenCL equivalents produce identical
+   features (socket-level SMEM via `__local`, DXA, DSMEM, WGMMA) to **OpenCL C**, port the Task
+   1–4 C++ verification kernels to OpenCL, and verify the OpenCL equivalents produce identical
    results. *The bridge to the future CUDA→OpenCL transcription effort.*
 
 ## 5. Cross-cutting acceptance criteria (a task is **not done** until all hold)
@@ -115,11 +139,11 @@ Each new/changed SimX class names the single RTL module it will become:
 
 | SimX class (this program) | Future SV module | Level |
 |---|---|---|
-| `UnifiedL1` (`sim/simx/mem/unified_l1.{h,cpp}`) | `VX_unified_l1` (in `VX_socket.sv`) | Socket |
+| `LocalMem` (SMEM) relocated to `Socket` | `VX_local_mem` + `VX_lmem_switch` moved into `VX_socket.sv` | Socket |
 | `DxaCore` relocated to `Socket` | `VX_dxa_core` moved into `VX_socket.sv` | Socket |
 | `SmToSmNetwork` (`sim/simx/dsmem/`, pluggable topology backend) | `VX_smtosm_network` (parameterized module family, in `VX_cluster.sv`) | Cluster |
-| `Mbarrier` (shared-resident, Task 4) | `VX_mbarrier` (in `VX_unified_l1`) | Socket |
-| proxy-ordering port logic (Task 4) | proxy-order block in `VX_unified_l1` | Socket |
+| `Mbarrier` (shared-resident, Task 4) | `VX_mbarrier` (with the SMEM in `VX_socket.sv`) | Socket |
+| proxy-ordering port logic (Task 4) | proxy-order block at the SMEM port in `VX_socket.sv` | Socket |
 
 This is why façades are banned: a wrapper has no clean SV counterpart.
 
@@ -140,12 +164,18 @@ make -C tests/opencl/<app> run-simx
 Common knobs are exposed as `blackbox.sh` flags (`--clusters --cores --warps --threads
 --l2cache --l3cache --debug --perf`); everything else goes through `CONFIGS="-DVX_CFG_*"`.
 Baseline parameters live in [`VX_config.toml`](../../VX_config.toml) /
-[`VX_types.toml`](../../VX_types.toml) — edit those only for program-wide defaults (e.g.
-`SOCKET_SIZE=1`) and re-`configure`.
+[`VX_types.toml`](../../VX_types.toml) — edit those only for program-wide defaults and
+re-`configure`. Note `SOCKET_SIZE` is **fixed at 1 and removed as a knob** by Task 1, so it is no
+longer a `blackbox.sh`/CONFIGS override.
 
-The **toy-H100 SM config** (from the gap analysis) is the program's reference point:
-`NUM_THREADS=32`, `NUM_WARPS=64` (⇒ `ISSUE_WIDTH=4` SMSPs, 2048 threads/SM), `SOCKET_SIZE=1`,
-`LMEM_LOG_SIZE=18` (256 KB), `L2_ENABLE=false`, `L3_ENABLE=true`, `EXT_TCU/DXA` enabled.
+The **toy-H100 SM config** (from the gap analysis) is the program's reference point. The
+*structural* settings are load-bearing: `NUM_THREADS=32` (32-wide warp), `NUM_WARPS=64`
+(⇒ `ISSUE_WIDTH=4` SMSPs), `SOCKET_SIZE=1` (socket == SM), `L2_ENABLE=false`, `L3_ENABLE=true`,
+`EXT_TCU/DXA` enabled. The *capacity* settings are **soft-GPU scale and freely tunable**:
+`LMEM_LOG_SIZE`, cache sizes, and `NUM_CORES`/`NUM_CLUSTERS` should stay small — keep them
+modest. Any H100 magnitude (the 2048-thread occupancy that `NUM_WARPS=64` implies, the
+`LMEM_LOG_SIZE=18` = 256 KB that H100 uses) is quoted **only as the real-H100 reference, not a
+toy target** (§2); a smaller `NUM_WARPS` / smaller SMEM yields an equally valid toy.
 
 ## 8. Risks & open questions (program-level)
 
@@ -157,9 +187,10 @@ The **toy-H100 SM config** (from the gap analysis) is the program's reference po
   multicasts only *by accident of being shared*; the per-SM rebuild is the more faithful model,
   but it must not silently lose the **single-global-read** property (correct bytes in N
   scratchpads with N× global reads is a *failed* model).
-- **Address-map churn.** Tasks 1 and 3 both touch the shared-memory address space
-  (`VX_MEM_LMEM_BASE_ADDR`, `VX_CSR_LOCAL_MEM_BASE`, the WGMMA descriptor base). Keep these
-  consistent across tasks.
+- **Address-map churn.** Task 1 relocates SMEM **without** changing its address map (same
+  `VX_MEM_LMEM_BASE_ADDR` / size / `VX_CSR_LOCAL_MEM_BASE`); **Task 3** then extends the
+  shared-memory address space with the DSMEM (peer-rank, offset) encoding. Keep the base/size and
+  the WGMMA descriptor base consistent as Task 3 layers on.
 - **SimX-as-oracle for the eventual RTL.** Per [`../../AGENTS.md`](../../AGENTS.md) §4, these
   SimX models will later anchor the RTL via trace diffing. Keep per-class trace dumps in mind
   while designing (cycle, SRAM addr+data, partition/bank, hazards).
@@ -199,8 +230,8 @@ reconciliation below).
   3*; Task 4 is exactly where it is ported, on purpose. **Proxies ≠ scopes**: Task 4 orders
   datapath crossings; it does **not** build a scoped-visibility model.
 - **The one hard obligation.** The **DSMEM cluster barrier must drain *and* fence** (Task 3b
-  acceptance): every remote scratchpad write before it has landed in the peer's `UnifiedL1`, and
-  post-barrier reads cannot hoist above it. This is a barrier-*implementation* property, not a
+  acceptance): every remote scratchpad write before it has landed in the peer's socket SMEM
+  (`LocalMem`), and post-barrier reads cannot hoist above it. This is a barrier-*implementation* property, not a
   scope feature, and it underwrites both DSMEM addressing and multicast per-destination completion.
 - **Explicitly out of scope (separate, additive work).** Faithfully reproducing **scoped**-
   consistency *behavior* — scope qualifiers, scope-tree visibility rules, scope-bounded ordering,

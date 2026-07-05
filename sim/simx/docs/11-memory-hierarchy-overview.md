@@ -70,7 +70,8 @@ Every address is classified by `get_addr_type(addr)` ([`types.h:818`](../types.h
 
 `MemReq::addr_type()` ([`types.h:1212`](../types.h#L1212)) is the convenience wrapper; the LSU sets
 `MemFlags.local` to mirror Shared (doc 15). This single function is what makes the `LocalMemSwitch`
-fork deterministic and is the seam the Toy-H100 `UnifiedL1` proposal re-interprets.
+fork deterministic and is the seam the Toy-H100 socket-SMEM proposal reuses to route the shared
+path to the relocated socket SMEM (Task 1 keeps SMEM separate from the L1D — no fused array).
 
 ---
 

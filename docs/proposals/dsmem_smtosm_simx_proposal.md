@@ -3,7 +3,7 @@
 **Status:** proposal (pre-implementation). **Scope:** SimX only
 ([`sim/simx/`](../../sim/simx/)). Part of the
 [Toy-H100 SimX Roadmap](toy_h100_simx_roadmap_proposal.md); this is **Task 3**, and it
-**depends on [Task 1](unified_l1_simx_proposal.md)** (`UnifiedL1`) and
+**depends on [Task 1](socket_smem_simx_proposal.md)** (socket-resident SMEM) and
 **[Task 2](per_sm_dxa_simx_proposal.md)** (per-socket `DxaCore`). Closes the **DSMEM / SM-to-SM
 network** gap — the largest divergence from
 [`../designs/h100_vortex_mapping.md`](../designs/h100_vortex_mapping.md) §5.4 — and the
@@ -31,7 +31,7 @@ and verification kernel.
 - The cluster offers a single memory facility: **L2** (a `Cache`,
   [`cluster.cpp:69`](../../sim/simx/cluster.cpp#L69)) or a passthrough. There is **no
   cross-core shared-memory addressing**.
-- After Task 1, shared memory is socket-local (`UnifiedL1`), reachable only by the resident
+- After Task 1, shared memory is socket-local (the relocated `LocalMem`), reachable only by the resident
   core / its DXA. After Task 2, DXA is per-SM and can write only its **own** socket's
   scratchpad — cross-socket multicast is deferred here.
 - CTA-cluster membership exists in software: `get_cluster_size()` / `get_cluster_rank()` (CSRs
@@ -40,14 +40,14 @@ and verification kernel.
 
 ---
 
-## 2. Sub-task 3a — SM-to-SM network fabric + `UnifiedL1` remote port (substrate)
+## 2. Sub-task 3a — SM-to-SM network fabric + socket SMEM remote port (substrate)
 
 The substrate, with **no consumer semantics yet**.
 
 - **New SimObject `SmToSmNetwork`** (`sim/simx/dsmem/smtosm_network.{h,cpp}`), cluster-resident,
   1:1 with a future `VX_smtosm_network` in `VX_cluster.sv`. It exposes one request/response port
   pair per socket; it decodes a remote request's **target socket** and delivers to that socket's
-  `UnifiedL1` remote input. **The topology is a pluggable backend, not a fixed crossbar** —
+  `LocalMem` (SMEM) remote input. **The topology is a pluggable backend, not a fixed crossbar** —
   see below. The substrate's *interface* (per-socket ports, target-socket decode) is
   topology-independent, so 3b (DSMEM addressing) and 3c (multicast) ride it unchanged; only the
   routing function and per-hop timing model swap.
@@ -62,9 +62,9 @@ The substrate, with **no consumer semantics yet**.
   Emit per-class **trace metrics** (per-link bytes, hop count, contention/stall cycles) so
   topologies are quantitatively comparable — this is the NoC-characterization study the program
   targets (and §4.2's fan-out policy is topology-aware on top of it).
-- **`UnifiedL1` remote port.** Add a remote request/response input pair to the Task-1 class,
-  arbitrated with local LSU/TCU/DXA scratchpad accesses. Remote accesses hit the **scratchpad
-  region only** (DSMEM is scratchpad, never the cache region) — no tags.
+- **Socket SMEM remote port.** Add a remote request/response input pair to the Task-1 `LocalMem`
+  (SMEM), arbitrated with local LSU/TCU/DXA scratchpad accesses. Remote accesses target the
+  **SMEM (`LocalMem`) only** (DSMEM is scratchpad, never the dcache) — no tags.
 - **Cluster memory-mode selector.** Add `VX_CFG_CLUSTER_MEM_MODE = L2 | DSMEM | NONE` to
   [`VX_config.toml`](../../VX_config.toml). In `Cluster::Impl`
   ([`cluster.cpp`](../../sim/simx/cluster.cpp)): `L2` = today's `Cache`
@@ -73,7 +73,7 @@ The substrate, with **no consumer semantics yet**.
   the global L2, per gap analysis §5.6); `NONE` = passthrough. H100 has *both* a global L2 and
   DSMEM; the toy disables the per-cluster L2, so `DSMEM` mode replaces it with the network. If a
   future config wants both, the modes can be made additive.
-- **1:1 mapping.** `Cluster` owns the network; `Socket`'s `UnifiedL1` exposes the remote port.
+- **1:1 mapping.** `Cluster` owns the network; `Socket`'s `LocalMem` (SMEM) exposes the remote port.
   The split in this task is along **feature** lines, not class lines, so the 1:1 discipline is
   undisturbed.
 
@@ -83,14 +83,14 @@ The substrate, with **no consumer semantics yet**.
 
 Thread-issued cross-socket load/store on the 3a substrate.
 
-- **Remote vs local shared decode.** Extend the core's shared-address handling (the address
-  decode collapsed into `UnifiedL1` in Task 1) to distinguish **local shared** (home socket)
-  from **remote shared** (peer socket). Encode the DSMEM address space as **(peer rank,
+- **Remote vs local shared decode.** Extend the core's shared-address handling (which after Task 1
+  routes shared accesses out to the socket SMEM interface) to distinguish **local shared** (home
+  socket) from **remote shared** (peer socket). Encode the DSMEM address space as **(peer rank,
   offset)**, reusing the multicast remap (`issuer_base + rank·smem_stride`) as the cross-socket
   translation seed; `peer rank` maps via the CTA-cluster CSRs to a **target socket id** within
   the cluster.
-- **Routing.** Local-shared → home `UnifiedL1` scratchpad input (Task 1 path). Remote-shared →
-  core `dsmem_req_out` → `SmToSmNetwork` → target socket `UnifiedL1` remote input; response
+- **Routing.** Local-shared → home socket `LocalMem` (SMEM) input (Task 1 path). Remote-shared →
+  core `dsmem_req_out` → `SmToSmNetwork` → target socket `LocalMem` remote input; response
   returns the same way.
 - **Generic-proxy instruction surface (owned by 3b).** Add the remote-shared LSU ops:
   **`mapa.cluster`** (map a local shared offset + target CTA rank → a cluster-shared address —
@@ -107,7 +107,7 @@ Thread-issued cross-socket load/store on the 3a substrate.
 - **Acceptance criterion — the cluster barrier must drain *and* fence** (the one hard
   consistency obligation, roadmap §10). The DSMEM cluster barrier (`group_barrier` /
   `barrier.cluster` analog) must: (1) **drain** — guarantee every remote scratchpad write issued
-  before it has actually **landed** in the peer's `UnifiedL1` (network drained, remote write
+  before it has actually **landed** in the peer's socket SMEM (`LocalMem`) (network drained, remote write
   committed); and (2) **fence** — fence each participating thread so post-barrier reads do not
   hoist above it. This is a barrier-*implementation* property, not a memory scope; it is the
   concrete, testable form of "model ordering, not coherence." **In proxy terms**
@@ -223,9 +223,9 @@ fan-out policy and inspect bytes-per-link in the trace. 120 s cap applies.
 
 ## 8. Risks
 
-- **Local/remote scratchpad deadlock.** `UnifiedL1` now serves LSU + TCU + DXA + **remote
-  network** clients; guarantee forward progress (no cyclic wait between a socket awaiting a
-  remote read and serving an inbound remote request).
+- **Local/remote scratchpad deadlock.** The socket `LocalMem` (SMEM) now serves LSU + TCU + DXA +
+  **remote network** clients; guarantee forward progress (no cyclic wait between a socket awaiting
+  a remote read and serving an inbound remote request).
 - **Losing the single global read.** The single highest-value failure mode for 3c — guard it
   with the §7(c) assertion in CI, not just byte-correctness.
 - **No coherence by design.** DSMEM in Hopper is not coherent; correctness relies on explicit
@@ -237,7 +237,7 @@ fan-out policy and inspect bytes-per-link in the trace. 120 s cap applies.
 
 - **Cross-socket atomics on DSMEM.** The proposed kernels synchronize with **barriers**, not
   scoped atomics, so this does not arise for them. If we later want atomics on distributed
-  shared memory, correctness depends on whether the `UnifiedL1` banks carry atomic units and how
+  shared memory, correctness depends on whether the SMEM (`LocalMem`) banks carry atomic units and how
   RISC-V atomics behave across the **non-coherent socket boundary** — an atomics-implementation
   question (still orthogonal to scopes), the first place the unscoped/weak base would bite past
   barrier-based sync. **Known edge; do not solve now.**

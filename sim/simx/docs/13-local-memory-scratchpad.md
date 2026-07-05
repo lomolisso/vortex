@@ -52,7 +52,8 @@ accessor only — a clean example of the functional-vs-timing split (doc 01 §5)
 
 The TCU and DXA bind their LMEM channels here; the DXA write port additionally carries the
 completion `tx_callback` that releases barriers (doc 09 §5). This shared port is exactly what the
-Toy-H100 `UnifiedL1`/proxy proposals build on.
+Toy-H100 socket-SMEM (Task 1) and proxy proposals build on — Task 1 relocates this scratchpad up
+to the socket, keeping it a separate structure from the L1D.
 
 ---
 
