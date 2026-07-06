@@ -51,6 +51,17 @@ public:
   // fill *req with next CTA; returns false when grid is exhausted
   bool step(kmu_req_t* req);
 
+  // Non-destructive peek at the next CTA (fills *req from the current grid
+  // cursor without advancing); returns false when the grid is exhausted. This
+  // mirrors the RTL KMU holding the CTA on its bus (valid) until a consumer's
+  // ready fires — see VX_kmu.sv / VX_cta_dispatch.sv. A consumer peeks, checks
+  // admission, and only then calls advance() to pop.
+  bool peek(kmu_req_t* req) const;
+
+  // Advance the grid cursor past the current CTA (the pop). Only call after a
+  // successful peek() once admission has passed.
+  void advance();
+
 protected:
   void on_reset();
 

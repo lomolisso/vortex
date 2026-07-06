@@ -27,8 +27,9 @@ using namespace vortex;
 
 namespace {
 
-// Number of GMEM ports DxaCore exposes to L2 (one arb output per port).
-constexpr uint32_t kDxaMemPorts = std::min<uint32_t>(VX_CFG_NUM_DXA_UNITS, VX_CFG_L2_NUM_REQS);
+// Number of GMEM ports the per-core DxaCore exposes to its L1→L2 arbiter
+// (one arb output per port). Bounded by the core's L1 memory-port width.
+constexpr uint32_t kDxaMemPorts = std::min<uint32_t>(VX_CFG_NUM_DXA_UNITS, VX_CFG_L1_MEM_PORTS);
 
 // LMEM "word" granularity for splitting DXA writes. The LocalMem bank
 // model applies byteen relative to a VX_CFG_MEM_BLOCK_SIZE-aligned address,
@@ -39,9 +40,6 @@ constexpr uint32_t kLmemWordSize = VX_CFG_MEM_BLOCK_SIZE;
 // GMEM line size + mask.
 constexpr uint32_t kGmemLineSize = VX_CFG_L1_LINE_SIZE;
 constexpr uint64_t kGmemLineMask = ~uint64_t(VX_CFG_L1_LINE_SIZE - 1);
-
-// Cores per cluster.
-constexpr uint32_t kCoresPerCluster = VX_CFG_NUM_CORES;
 
 } // namespace
 
@@ -495,9 +493,8 @@ private:
     auto& s = w.inflight[slot];
     if (!s.rsp_arrived) return; // wait
 
-    // Determine destination core's LMEM port.
-    uint32_t cluster_local_cid = w.req.core->id() % kCoresPerCluster;
-    auto& lmem_ch = simobject_->lmem_req_out.at(cluster_local_cid);
+    // Per-core DXA: the single LMEM write port targets this core's own SMEM.
+    auto& lmem_ch = simobject_->lmem_req_out.at(0);
     if (lmem_ch.full()) return; // backpressure
 
     const LineWork& lw = s.work;
@@ -614,14 +611,14 @@ private:
 // DxaCore — wrappers
 // ════════════════════════════════════════════════════════════════════
 
-DxaCore::DxaCore(const SimContext& ctx, const char* name, Cluster* cluster)
+DxaCore::DxaCore(const SimContext& ctx, const char* name, Core* core)
   : SimObject<DxaCore>(ctx, name)
-  , dxa_req_in(kCoresPerCluster, this)
+  , dxa_req_in(1, this)
   , gmem_req_out(kDxaMemPorts, this)
   , gmem_rsp_in(kDxaMemPorts, this)
-  , lmem_req_out(kCoresPerCluster, this)
+  , lmem_req_out(1, this)
 {
-  __unused(cluster);
+  __unused(core);
 
   // Build the GMEM arbiter (VX_CFG_NUM_DXA_UNITS workers → kDxaMemPorts L2-facing).
   // Tag layout used by workers: high bit packs worker_id, low bits the

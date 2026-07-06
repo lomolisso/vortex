@@ -80,13 +80,18 @@ The dispatcher tracks (all in [`cta_dispatcher.h:69-104`](../cta_dispatcher.h#L6
 
 - a **current in-flight CTA** (`has_cta_`, `cur_slot_`, `rank_`, `block_size_rem_`) being placed
   warp-rank by warp-rank;
-- a **pending CTA** (`has_pending_`) fetched from the KMU but **blocked on LMEM admission** until
-  space frees;
+- a **peeked CTA** (`pending_cta_`) — the next CTA read *non-destructively* from the KMU each cycle
+  (`kmu_->peek()`) and re-peeked until admission passes; it is **popped** (`kmu_->advance()`) only
+  once a FIFO slot **and** LMEM are available. This peek-then-pop mirrors the RTL handshake
+  (`VX_cta_dispatch.sv`: `kmu_bus_if.ready = table_notfull && lmem_ok`, the KMU holding the CTA valid
+  until consumed). A core therefore never removes a CTA from the shared KMU it cannot seat — the
+  earlier speculative pull did, stranding it and deadlocking grid-wide barriers at 100% occupancy;
 - per-slot bookkeeping: `slot_rem_warps_` (live warps in a slot), `slot_lmem_size_`, `wid_to_slot_`,
   and a FIFO ring (`head_slot_`/`tail_slot_`) for in-order slot reuse.
 
-`running()` ([`cta_dispatcher.h:59`](../cta_dispatcher.h#L59)) is `has_cta_ || has_pending_ ||
-kmu_->running()` — i.e. the core is busy while any CTA is in flight, queued, or still to come.
+`running()` ([`cta_dispatcher.h:59`](../cta_dispatcher.h#L59)) is `has_cta_ || kmu_->running()` —
+i.e. the core is busy while a CTA is in flight or the KMU still has CTAs to hand out (a not-yet-popped
+CTA still shows in `kmu_->running()`, since nothing is pre-consumed).
 
 ### 4.2 Local-memory allocation (ring buffer + cluster contiguity)
 
@@ -101,8 +106,8 @@ classification of these LMEM bytes is in doc [15](15-memory-protocol-and-types.m
 ### 4.3 Reclaim
 
 When a warp exits, the scheduler calls `warp_done(wid)` ([`cta_dispatcher.h:56`](../cta_dispatcher.h#L56));
-once **all** warps of a CTA have exited, its LMEM slot is freed back into the ring, unblocking any
-`has_pending_` CTA waiting for space.
+once **all** warps of a CTA have exited, its LMEM slot is freed back into the ring, admitting the
+next peeked CTA that was waiting for space.
 
 ---
 
@@ -113,8 +118,9 @@ host: dcr_write(VX_DCR_KMU_*  …)         program the descriptor          (proc
 host: run() / first cycle()              reset + kmu_->start()           (processor.cpp:217 / :258)
 loop (each SimPlatform::tick):
    per core: scheduler asks CtaDispatcher.step()
-        ├─ pull a CTA from Kmu.step()    if no in-flight/pending CTA     (kmu.cpp:88)
-        ├─ admit LMEM (ring buffer)       block as has_pending_ if full  (cta_dispatcher §4.2)
+        ├─ peek next CTA from Kmu.peek()  non-destructive, if no in-flight (kmu.cpp:95)
+        ├─ admit FIFO slot + LMEM         re-peek next cycle if full     (cta_dispatcher §4.2)
+        ├─ pop it via Kmu.advance()       only once admitted             (kmu.cpp:132)
         └─ emit cta_warp_record_t → scheduler activates the warp slot
    warps fetch/execute (docs 04–10) …
    warp exits → CtaDispatcher.warp_done() → frees LMEM when CTA drains   (cta_dispatcher §4.3)

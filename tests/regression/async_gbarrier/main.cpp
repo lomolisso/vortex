@@ -3,7 +3,7 @@
 #include <cstdlib>
 #include <unistd.h>
 #include <vector>
-#include <vortex2.h>
+#include <vortex.h>   // superset of vortex2.h; provides vx_check_occupancy
 #include "common.h"
 
 #define RT_CHECK(_expr)                                         \
@@ -86,6 +86,12 @@ int main(int argc, char* argv[]) {
   kernel_arg.num_cores  = static_cast<uint32_t>(num_cores);
   kernel_arg.num_groups = static_cast<uint32_t>(num_cores * num_warps);
   kernel_arg.group_size = static_cast<uint32_t>(num_threads);
+
+  // Per-block occupancy sanity check (block fits a core; no local memory used),
+  // matching the other barrier/DXA tests. Note this validates the block, not
+  // the grid — the grid is intentionally sized to full occupancy
+  // (num_cores * num_warps single-warp CTAs).
+  RT_CHECK(vx_check_occupancy(device, kernel_arg.group_size, /*max_localmem=*/0));
 
   uint32_t buf_size = kernel_arg.num_cores * sizeof(uint32_t);
 

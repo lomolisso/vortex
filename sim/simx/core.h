@@ -20,6 +20,9 @@
 #include "instr_trace.h"
 #include "cache.h"
 #include "VX_config.h"
+#ifdef VX_CFG_EXT_DXA_ENABLE
+#include "dxa/dxa_core.h"
+#endif
 
 namespace vortex {
 
@@ -126,6 +129,11 @@ public:
   }
 
   MemPerfStats mem_perf_stats() const;
+
+#ifdef VX_CFG_EXT_DXA_ENABLE
+  // Per-core DXA (per-SM TMA) perf counters — the DXA engine is core-resident.
+  const DxaCore::PerfStats& dxa_perf_stats() const;
+#endif
 
   // L1 cache-flush hooks (write-back eviction walk), forwarded to the
   // core-resident icache/dcache CacheClusters.

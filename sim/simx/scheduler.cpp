@@ -79,6 +79,8 @@ void Scheduler::on_reset() {
   stalled_warps_.reset();
   stalled_warps_next_.reset();
   active_warps_.reset();
+  stall_timeout_ctr_ = 0;
+  stall_watch_en_ = false;
   // Sequencers live on Core now; Core::on_reset() resets them.
   wspawn_.valid = false;
 
@@ -210,6 +212,35 @@ instr_trace_t* Scheduler::schedule(const WarpMask& warp_mask) {
   // becomes visible to the pick loop next cycle — so a warp released as its
   // instruction resolves is never re-scheduled the same cycle.
   stalled_warps_ = stalled_warps_next_;
+
+  // Deadlock watchdog — SimX port of hw/rtl/core/VX_scheduler.sv:636-670,
+  // which the C++ model previously omitted (letting global-barrier deadlocks
+  // spin the run loop forever). Fires when every active warp has been stalled
+  // for VX_DBG_STALL_TIMEOUT consecutive cycles (no forward progress possible).
+  // Catches stall-deadlocks (suspended warps); not busy-spin livelocks — same
+  // limitation as the RTL watchdog.
+#if defined(VX_DBG_STALL_TIMEOUT) && (VX_DBG_STALL_TIMEOUT > 0)
+  if (active_warps_.any())
+    stall_watch_en_ = true;  // arm after first activity (RTL: decode unlock)
+  if (stall_watch_en_ && active_warps_.any()
+      && (active_warps_ & ~stalled_warps_).none()) {
+    if (++stall_timeout_ctr_ >= (uint32_t)VX_DBG_STALL_TIMEOUT) {
+      std::cerr << "*** SimX stall-timeout (deadlock) on core #" << core_->id()
+                << ": active_warps=" << active_warps_
+                << ", stalled_warps=" << stalled_warps_ << std::endl;
+      for (uint32_t w = 0; w < VX_CFG_NUM_WARPS; ++w) {
+        if (stalled_warps_.test(w)) {
+          std::cerr << "    wid=" << w << " PC=0x" << std::hex << warps_.at(w).PC
+                    << std::dec << " tmask=" << warps_.at(w).tmask << std::endl;
+        }
+      }
+      std::abort();
+    }
+  } else {
+    stall_timeout_ctr_ = 0;  // any progress / idle resets the counter (RTL semantics)
+  }
+#endif
+
   return trace;
 }
 

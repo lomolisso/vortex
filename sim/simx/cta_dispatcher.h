@@ -55,9 +55,11 @@ public:
   // Notify that a warp has exited; frees its lmem slot when all warps of the CTA are done.
   void warp_done(uint32_t wid);
 
-  // True while CTAs remain to dispatch or active slots hold live warps.
+  // True while CTAs remain to dispatch or active slots hold live warps. CTAs
+  // are no longer pre-consumed (peek-then-pop), so an un-popped CTA still shows
+  // in kmu_->running() — no separate pending flag needed.
   bool running() const {
-    return has_cta_ || has_pending_ || kmu_->running();
+    return has_cta_ || kmu_->running();
   }
 
 protected:
@@ -97,8 +99,8 @@ private:
   uint32_t  thread_idx_[3];
   uint64_t  lmem_addr_;
 
-  // CTA fetched from KMU but blocked on lmem admission
-  bool      has_pending_;
+  // Scratch for the CTA currently peeked from the KMU (re-peeked each cycle
+  // until admission passes and it is popped via kmu_->advance()).
   kmu_req_t pending_cta_;
   Word      cur_kernel_pc_;
   std::vector<bool> warp_init_mask_;

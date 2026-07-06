@@ -86,6 +86,13 @@ void Kmu::start() {
 }
 
 bool Kmu::step(kmu_req_t* req) {
+  if (!this->peek(req))
+    return false;
+  this->advance();
+  return true;
+}
+
+bool Kmu::peek(kmu_req_t* req) const {
   if (!running_) return false;
 
   // Effective block_idx = group_origin + intra_offset.
@@ -119,7 +126,10 @@ bool Kmu::step(kmu_req_t* req) {
   req->is_first_of_cluster = (intra_offset_[0] == 0)
                           && (intra_offset_[1] == 0)
                           && (intra_offset_[2] == 0);
+  return true;
+}
 
+void Kmu::advance() {
   // Advance the intra-cluster offset first (fills the cluster), then the
   // group_origin in (X, Y, Z) order when the inner loop wraps.
   ++cta_id_;
@@ -161,6 +171,4 @@ bool Kmu::step(kmu_req_t* req) {
       }
     }
   }
-
-  return true;
 }

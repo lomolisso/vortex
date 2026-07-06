@@ -42,7 +42,6 @@ CtaDispatcher::CtaDispatcher(const SimContext& ctx, const char* name, Core* core
   , rank_(0)
   , block_size_rem_(0)
   , lmem_addr_(0)
-  , has_pending_(false)
   , cur_kernel_pc_(0)
   , warp_init_mask_(num_warps_, false)
 {
@@ -55,7 +54,6 @@ void CtaDispatcher::on_reset() {
   lmem_tail_ = 0;
   free_size_  = lmem_capacity_;
   has_cta_    = false;
-  has_pending_= false;
   head_slot_  = 0;
   tail_slot_  = 0;
   for (uint32_t i = 0; i < num_warps_; ++i) {
@@ -71,11 +69,15 @@ void CtaDispatcher::on_reset() {
 
 bool CtaDispatcher::step(const WarpMask& active_warps, uint32_t* wid_out, cta_warp_record_t* rec_out) {
   if (!has_cta_) {
-    // Load next CTA: use stashed pending CTA if available, else request from KMU.
-    if (!has_pending_) {
-      if (!kmu_->step(&pending_cta_)) return false;
-      has_pending_ = true;
-    }
+    // Peek the next CTA WITHOUT consuming it. The KMU holds the CTA on its bus
+    // until we pop it (kmu_->advance() below), so re-peeking each cycle while we
+    // wait for capacity is idempotent. Popping speculatively here — the old
+    // kmu_->step() BEFORE the admission checks — stranded the CTA in a local
+    // buffer when the ring was full; at 100% occupancy that removed one CTA from
+    // circulation, shorted another core, and deadlocked a grid-wide barrier. This
+    // peek-then-pop mirrors the RTL handshake: VX_cta_dispatch.sv pops only when
+    // kmu_bus_if.ready = table_notfull && lmem_ok.
+    if (!kmu_->peek(&pending_cta_)) return false;
 
     // Admission control: wait until the next FIFO slot is free and enough lmem is available.
     if (slot_rem_warps_[tail_slot_] != 0)
@@ -115,9 +117,10 @@ bool CtaDispatcher::step(const WarpMask& active_warps, uint32_t* wid_out, cta_wa
       }
     }
 
-    // Accept the pending CTA.
+    // Admission passed — pop the CTA from the KMU now (the ring slot + lmem are
+    // committed to it below), then accept it.
+    kmu_->advance();
     cta_ = pending_cta_;
-    has_pending_ = false;
 
     // Round per-CTA LMEM allocation up to a MEM_BLOCK_SIZE multiple so
     // adjacent CTAs are stride-aligned. DXA Path A multicast resolves

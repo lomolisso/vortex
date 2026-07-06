@@ -165,6 +165,12 @@ private:
   wspawn_t wspawn_;
   uint32_t mpm_class_;
 
+  // Deadlock watchdog (SimX port of hw/rtl/core/VX_scheduler.sv:636-670).
+  // Counts consecutive cycles in which every active warp is stalled (no
+  // forward progress possible); aborts at VX_DBG_STALL_TIMEOUT.
+  uint32_t stall_timeout_ctr_ = 0;
+  bool     stall_watch_en_ = false;
+
   friend class SimObject<Scheduler>;
 };
 

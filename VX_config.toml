@@ -40,9 +40,9 @@ VX_CFG_EXT_DXA_ENABLE = false
 VX_CFG_EXT_TEX_ENABLE = false
 VX_CFG_EXT_RASTER_ENABLE = false
 VX_CFG_EXT_OM_ENABLE = false
-# Cluster-level DXA engine count (decoupled from VX_CFG_NUM_CORES).
-VX_CFG_NUM_DXA_UNITS = "expr: max(1, up($VX_CFG_NUM_CORES / 8))"
-VX_CFG_DXA_MEM_PORTS = "expr: min($VX_CFG_NUM_DXA_UNITS, $VX_CFG_NUM_CORES * $VX_CFG_L1_MEM_PORTS)"
+# Per-core (per-SM) DXA worker count. Each core owns its own DXA engine.
+VX_CFG_NUM_DXA_UNITS = 1
+VX_CFG_DXA_MEM_PORTS = "expr: min($VX_CFG_NUM_DXA_UNITS, $VX_CFG_L1_MEM_PORTS)"
 VX_CFG_DXA_QUEUE_SIZE = 16
 VX_CFG_DXA_MAX_INFLIGHT = 8
 

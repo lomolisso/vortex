@@ -42,9 +42,13 @@
 #include "cluster.h"
 #include "processor_impl.h"
 #include "kmu.h"
+#include "constants.h"
 #include "debug.h"
 #ifdef VX_CFG_EXT_TCU_ENABLE
 #include "tcu_unit.h"
+#endif
+#ifdef VX_CFG_EXT_DXA_ENABLE
+#include "dxa/dxa_core.h"
 #endif
 #ifdef VX_CFG_VM_ENABLE
 #include "mem/mmu.h"
@@ -52,6 +56,11 @@
 #endif
 
 using namespace vortex;
+
+#ifdef VX_CFG_EXT_DXA_ENABLE
+// Per-core L1→L2 arbiter rows: row 0 = demand (icache+dcache), row 1 = DXA GMEM.
+static constexpr uint32_t kDxaDemandRows = 2;
+#endif
 
 class Core::Impl {
 public:
@@ -124,12 +133,37 @@ public:
       dcache_->core_rsp_out.at(0).at(j).bind(&simobject_->dcache_rsp_in.at(j));
     }
 
+#ifdef VX_CFG_EXT_DXA_ENABLE
+    // Per-core L1→L2 arbiter: the merged icache+dcache demand (row 0) takes
+    // priority over the core-resident DXA engine's GMEM reads (row 1). This
+    // relocates the cluster L2 arbiter's cores>DXA ordering into the core now
+    // that DXA is per-SM (per_sm_dxa proposal §3.2, "dcache > DXA"). The DXA
+    // row is wired below, once the DxaCore exists.
+    snprintf(sname, 100, "%s-dxa_l2_arb", name.c_str());
+    dxa_l2_arb_ = MemArbiter::Create(sname, ArbiterType::Priority,
+                                     kDxaDemandRows * VX_CFG_L1_MEM_PORTS, VX_CFG_L1_MEM_PORTS);
+    for (uint32_t i = 0; i < VX_CFG_L1_MEM_PORTS; ++i) {
+      dxa_l2_arb_->ReqOut.at(i).bind(&simobject_->mem_req_out.at(i));
+      simobject_->mem_rsp_in.at(i).bind(&dxa_l2_arb_->RspIn.at(i));
+    }
+#endif
+
     // merge icache + dcache traffic onto the core's outgoing memory ports
-    // (icache prioritized), exactly as the socket used to.
+    // (icache prioritized), exactly as the socket used to. With DXA enabled,
+    // the demand sink is the L1→L2 arbiter's row-0 input (above DXA); without
+    // it, the demand binds straight to the core's mem_req_out.
     uint32_t overlap = __MIN(VX_CFG_ICACHE_MEM_PORTS, VX_CFG_L1_MEM_PORTS);
     for (uint32_t i = 0; i < VX_CFG_L1_MEM_PORTS; ++i) {
       snprintf(sname, 100, "%s-l1_arb%d", name.c_str(), i);
       auto l1_arb = MemArbiter::Create(sname, ArbiterType::RoundRobin, 2 * overlap, overlap);
+
+    #ifdef VX_CFG_EXT_DXA_ENABLE
+      auto& out_req = dxa_l2_arb_->ReqIn.at(kDxaDemandRows * i + 0);
+      auto& out_rsp = dxa_l2_arb_->RspOut.at(kDxaDemandRows * i + 0);
+    #else
+      auto& out_req = simobject_->mem_req_out.at(i);
+      auto& out_rsp = simobject_->mem_rsp_in.at(i);
+    #endif
 
       if (i < overlap) {
         icache_->mem_req_out.at(i).bind(&l1_arb->ReqIn.at(i));
@@ -138,17 +172,17 @@ public:
         dcache_->mem_req_out.at(i).bind(&l1_arb->ReqIn.at(overlap + i));
         l1_arb->RspOut.at(overlap + i).bind(&dcache_->mem_rsp_in.at(i));
 
-        l1_arb->ReqOut.at(i).bind(&simobject_->mem_req_out.at(i));
-        simobject_->mem_rsp_in.at(i).bind(&l1_arb->RspIn.at(i));
+        l1_arb->ReqOut.at(i).bind(&out_req);
+        out_rsp.bind(&l1_arb->RspIn.at(i));
       } else {
         if (VX_CFG_L1_MEM_PORTS > VX_CFG_ICACHE_MEM_PORTS) {
           // if more dcache ports
-          dcache_->mem_req_out.at(i).bind(&simobject_->mem_req_out.at(i));
-          simobject_->mem_rsp_in.at(i).bind(&dcache_->mem_rsp_in.at(i));
+          dcache_->mem_req_out.at(i).bind(&out_req);
+          out_rsp.bind(&dcache_->mem_rsp_in.at(i));
         } else {
           // if more icache ports
-          icache_->mem_req_out.at(i).bind(&simobject_->mem_req_out.at(i));
-          simobject_->mem_rsp_in.at(i).bind(&icache_->mem_rsp_in.at(i));
+          icache_->mem_req_out.at(i).bind(&out_req);
+          out_rsp.bind(&icache_->mem_rsp_in.at(i));
         }
       }
     }
@@ -327,6 +361,46 @@ public:
       uint32_t port = LSU_NUM_REQS;
       tbuf->lmem_req_out.bind(&local_mem_->Inputs.at(port));
       local_mem_->Outputs.at(port).bind(&tbuf->lmem_rsp_in);
+    }
+  #endif
+
+  #ifdef VX_CFG_EXT_DXA_ENABLE
+    // Per-core (per-SM) DXA async-copy engine. Created after local_mem_, the
+    // SFU, and the L1→L2 arbiter exist. GMEM reads join the L1→L2 arbiter's
+    // low-priority DXA row; SMEM writes target this core's own LocalMem.
+    snprintf(sname, 100, "%s-dxa-core", name.c_str());
+    dxa_core_ = DxaCore::Create(sname, simobject_);
+
+    // GMEM read side → dxa_l2_arb_ row 1 (below the icache/dcache demand).
+    for (uint32_t i = 0; i < dxa_core_->gmem_req_out.size(); ++i) {
+      dxa_core_->gmem_req_out.at(i).bind(&dxa_l2_arb_->ReqIn.at(kDxaDemandRows * i + 1));
+      dxa_l2_arb_->RspOut.at(kDxaDemandRows * i + 1).bind(&dxa_core_->gmem_rsp_in.at(i));
+    }
+
+    // Request side: this core's SFU (DxaUnit decodes onto it) → DxaCore.
+    // Use the Impl's own accessor — simobject_->impl_ isn't assigned until
+    // this Impl constructor returns, so simobject_->sfu_unit() would deref null.
+    sfu_unit()->dxa_req_out.bind(&dxa_core_->dxa_req_in.at(0));
+
+    // SMEM write side → this core's LocalMem[port_dxa]. A tx_callback snoops
+    // each write carrying notify_done and fires barrier_event_release at the
+    // cycle LMEM receives it (relocated verbatim from the old cluster path).
+    {
+      uint32_t port_dxa = LSU_NUM_REQS;
+    #ifdef VX_CFG_EXT_TCU_ENABLE
+      port_dxa += 1;
+    #endif
+      Core* core = simobject_;
+      auto& ch = dxa_core_->lmem_req_out.at(0);
+      ch.bind(&local_mem_->Inputs.at(port_dxa));
+      ch.tx_callback([core](const MemReq& req, uint64_t /*cycles*/) {
+        if (req.is_write() && req.flags.dxa_notify_done) {
+          // notify_bar_id is raw (encoded): low byte = cta_no, bits[30:8] =
+          // bar_no. Decode to a flat barrier index before release.
+          uint32_t decoded = bar_decode_id(req.flags.dxa_notify_bar_id, VX_CFG_NUM_BARRIERS);
+          core->barrier_event_release(decoded);
+        }
+      });
     }
   #endif
 
@@ -893,6 +967,11 @@ public:
     return { icache_->perf_stats(), dcache_->perf_stats() };
   }
 
+#ifdef VX_CFG_EXT_DXA_ENABLE
+  const DxaCore::PerfStats& dxa_perf_stats() const { return dxa_core_->perf_stats(); }
+  int dxa_dcr_write(uint32_t addr, uint32_t value) { return dxa_core_->dcr_write(addr, value); }
+#endif
+
   void dcache_flush_begin() { dcache_->flush_begin(); }
   bool dcache_flush_done() const { return dcache_->flush_done(); }
   void icache_flush_begin() { icache_->flush_begin(); }
@@ -933,6 +1012,10 @@ private:
   std::vector<MemCoalescer::Ptr> mem_coalescers_;
   CacheCluster::Ptr icache_;
   CacheCluster::Ptr dcache_;
+#ifdef VX_CFG_EXT_DXA_ENABLE
+  DxaCore::Ptr      dxa_core_;    // per-core (per-SM) async-copy engine
+  MemArbiter::Ptr   dxa_l2_arb_;  // L1→L2 arbiter: demand (row 0) > DXA (row 1)
+#endif
 
   TFifo<instr_trace_t*> fetch_latch_;
   TFifo<instr_trace_t*> decode_latch_;
@@ -1047,6 +1130,14 @@ bool Core::setTmask(uint32_t wid, const ThreadMask& tmask) {
 int Core::dcr_write(uint32_t addr, uint32_t value) {
   __unused(addr);
   __unused(value);
+#ifdef VX_CFG_EXT_DXA_ENABLE
+  // DXA descriptor DCRs target the core-resident DxaCore. Returning 0 lets the
+  // cluster keep broadcasting so every core (SM) programs its own descriptors.
+  if (addr >= VX_DCR_DXA_STATE_BEGIN && addr < VX_DCR_DXA_STATE_END) {
+    impl_->dxa_dcr_write(addr, value);
+    return 0;
+  }
+#endif
   // KMU DCRs are handled at ProcessorImpl level and never reach here.
   return 0;
 }
@@ -1089,6 +1180,12 @@ std::shared_ptr<SfuUnit> Core::sfu_unit() {
 Core::MemPerfStats Core::mem_perf_stats() const {
   return impl_->mem_perf_stats();
 }
+
+#ifdef VX_CFG_EXT_DXA_ENABLE
+const DxaCore::PerfStats& Core::dxa_perf_stats() const {
+  return impl_->dxa_perf_stats();
+}
+#endif
 
 void Core::dcache_flush_begin() { impl_->dcache_flush_begin(); }
 bool Core::dcache_flush_done() const { return impl_->dcache_flush_done(); }

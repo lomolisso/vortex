@@ -23,10 +23,10 @@ namespace vortex {
 class Core;
 class Cluster;
 
-// Cluster-shared DXA engine. Aggregates DxaReq packets from per-core
-// DxaUnits, dispatches to VX_CFG_NUM_DXA_UNITS workers, and drives GMEM reads
-// (through L2) and LMEM writes (per-core direct channels carrying real
-// MemReq packets with TLM payload + completion flag).
+// Per-core (per-SM) DXA engine. Consumes DxaReq packets from this core's
+// DxaUnit, dispatches to VX_CFG_NUM_DXA_UNITS workers, and drives GMEM reads
+// (through the core's L1→L2 arbiter) and LMEM writes (into this core's own
+// LocalMem, carrying real MemReq packets with TLM payload + completion flag).
 class DxaCore : public SimObject<DxaCore> {
 public:
   using Ptr = std::shared_ptr<DxaCore>;
@@ -48,21 +48,22 @@ public:
     }
   };
 
-  // Per-core DxaReq inputs (size = NUM_CORES_PER_CLUSTER). Cluster binds
-  // each core's DxaUnit::req_out here.
+  // DxaReq input (size = 1, per-core). The owning Core binds its
+  // SfuUnit::dxa_req_out here.
   std::vector<SimChannel<DxaReq>>  dxa_req_in;
 
   // GMEM ports to L2 (size = kDxaMemPorts). Internally fed by gmem_arb_
-  // from VX_CFG_NUM_DXA_UNITS worker outputs.
+  // from VX_CFG_NUM_DXA_UNITS worker outputs. The owning Core binds these
+  // into its L1→L2 arbiter (below the demand traffic).
   std::vector<SimChannel<MemReq>>  gmem_req_out;
   std::vector<SimChannel<MemRsp>>  gmem_rsp_in;
   MemArbiter::Ptr                  gmem_arb_;
 
-  // Per-core LMEM write ports (size = NUM_CORES_PER_CLUSTER). Cluster binds
-  // each core's LocalMem::Inputs[port_dxa] here. Write-only — no rsp.
+  // LMEM write port (size = 1, per-core). The owning Core binds its own
+  // LocalMem::Inputs[port_dxa] here. Write-only — no rsp.
   std::vector<SimChannel<MemReq>>  lmem_req_out;
 
-  DxaCore(const SimContext& ctx, const char* name, Cluster* cluster);
+  DxaCore(const SimContext& ctx, const char* name, Core* core);
   virtual ~DxaCore();
 
   int dcr_write(uint32_t addr, uint32_t value);

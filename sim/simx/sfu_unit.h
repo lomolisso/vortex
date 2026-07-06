@@ -53,8 +53,8 @@ public:
 	CsrUnit& csr_unit() { return *csr_unit_; }
 
 #ifdef VX_CFG_EXT_DXA_ENABLE
-	// Outbound DXA request channel — bound by Cluster to
-	// DxaCore::dxa_req_in[cid]. Owned here (SfuUnit is the SimObject;
+	// Outbound DXA request channel — bound by the owning Core to its
+	// per-core DxaCore::dxa_req_in[0]. Owned here (SfuUnit is the SimObject;
 	// DxaUnit is a plain helper sub-class).
 	SimChannel<DxaReq> dxa_req_out;
 #endif
