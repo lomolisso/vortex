@@ -63,6 +63,14 @@ public:
   // LocalMem::Inputs[port_dxa] here. Write-only — no rsp.
   std::vector<SimChannel<MemReq>>  lmem_req_out;
 
+#ifdef VX_CFG_CLUSTER_MEM_MODE_DSMEM
+  // Multicast fan-out port toward peer cores' LMEM over the SM-to-SM network
+  // (size = 1; the owning Core binds it into its DSMEM egress arbiter).
+  // Write-only like lmem_req_out; per-receiver completion rides the write's
+  // dxa_notify sideband and fires on the receiver core's ingress callback.
+  std::vector<SimChannel<MemReq>>  dsmem_req_out;
+#endif
+
   DxaCore(const SimContext& ctx, const char* name, Core* core);
   virtual ~DxaCore();
 

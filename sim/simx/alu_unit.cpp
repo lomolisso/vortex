@@ -45,6 +45,9 @@ uint32_t AluUnit::latency_of(const instr_trace_t* trace) const {
 		case AluType::AND:
 		case AluType::OR:
 		case AluType::CZERO:
+	#ifdef VX_CFG_CLUSTER_MEM_MODE_DSMEM
+		case AluType::MAPA_CLUSTER:
+	#endif
 			return 2;
 		default:
 			std::abort();
@@ -242,6 +245,29 @@ void AluUnit::execute(instr_trace_t* trace) {
 				rd_data[t].i = cond ? 0 : rs1_data[t].i;
 			}
 		} break;
+	#ifdef VX_CFG_CLUSTER_MEM_MODE_DSMEM
+		case AluType::MAPA_CLUSTER: {
+			// rd = the same intra-slice offset inside the target rank's DSMEM
+			// aperture. The region field encodes the RELATIVE rank distance, so
+			// mapping to one's own rank returns the pointer unchanged and the
+			// plain local window needs no translation.
+			auto& csrs = warp.cta_csrs;
+			uint32_t k = (csrs.cluster_size != 0) ? csrs.cluster_size : 1;
+			for (uint32_t t = thread_start; t < num_threads; ++t) {
+				if (!tmask.test(t)) continue;
+				uint32_t r = (uint32_t(rs2_data[t].i) + k - csrs.cluster_rank) % k;
+				assert(r < (1u << VX_CFG_DSMEM_REGION_BITS)
+				       && "cluster rank distance exceeds the DSMEM aperture");
+				if (r == 0) {
+					rd_data[t].i = rs1_data[t].i;
+				} else {
+					uint64_t offset = rs1_data[t].i - csrs.lmem_addr;
+					rd_data[t].i = Word(VX_MEM_LMEM_BASE_ADDR
+					                    + (uint64_t(r) << VX_CFG_LMEM_LOG_SIZE) + offset);
+				}
+			}
+		} break;
+	#endif
 		default:
 			std::abort();
 		}

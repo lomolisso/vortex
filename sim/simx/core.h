@@ -91,6 +91,16 @@ public:
   std::vector<SimChannel<MemReq>> mem_req_out;
   std::vector<SimChannel<MemRsp>> mem_rsp_in;
 
+#ifdef VX_CFG_CLUSTER_MEM_MODE_DSMEM
+  // SM-to-SM network interface. Egress: this core's remote-LMEM requests
+  // toward peers (LSU remote path + DXA fan-out, merged). Ingress: peers'
+  // requests delivered into this core's LocalMem remote port.
+  std::vector<SimChannel<MemReq>> dsmem_req_out;
+  std::vector<SimChannel<MemRsp>> dsmem_rsp_in;
+  std::vector<SimChannel<MemReq>> dsmem_remote_req_in;
+  std::vector<SimChannel<MemRsp>> dsmem_remote_rsp_out;
+#endif
+
   Core(const SimContext& ctx,
        const char* name,
        uint32_t core_id,
@@ -115,6 +125,23 @@ public:
   void barrier_event_attach(uint32_t bar_id, uint32_t count = 1);
 
   void barrier_event_release(uint32_t bar_id);
+
+#ifdef VX_CFG_CLUSTER_MEM_MODE_DSMEM
+  // Outstanding remote (DSMEM) stores per warp: incremented at LSU issue,
+  // decremented when the peer LMEM's store ack returns over the network.
+  // The cluster barrier's drain obligation waits on this reaching zero.
+  void dsmem_store_inc(uint32_t wid);
+  void dsmem_store_dec(uint32_t wid);
+  bool dsmem_store_pending(uint32_t wid) const;
+  uint32_t dsmem_store_count(uint32_t wid) const;
+  // Arm the drain: each subsequent store ack for this warp also releases one
+  // event on bar_id (the cluster barrier converted the outstanding count into
+  // events at arrive); disarms when the count reaches zero.
+  void dsmem_arm_drain(uint32_t wid, uint32_t bar_id);
+
+  // Cluster-barrier wake from the cluster-level accumulator.
+  void cluster_barrier_resume(uint32_t bar_id);
+#endif
 
   bool wspawn(uint32_t num_warps, Word nextPC);
 

@@ -590,20 +590,16 @@ extern int vx_dump_perf(vx_device_h hdevice, FILE *stream) {
   } break;
 
   case VX_DCR_MPM_CLASS_DXA: {
-    // DXA counters are cluster-level; query representative core per cluster.
-    uint64_t cores_per_cluster = (num_cores + num_clusters - 1) / num_clusters;
+    // DXA engines are per-core (per-SM) since the Task-2 relocation; sum all cores.
     uint64_t tot_transfers = 0, tot_gmem_reads = 0, tot_gmem_dedup = 0;
     uint64_t tot_lmem_writes = 0, tot_gmem_lt = 0;
-    for (uint32_t c = 0; c < num_clusters; ++c) {
-      uint32_t rep_core = (uint32_t)(c * cores_per_cluster);
-      if (rep_core >= num_cores)
-        break;
+    for (uint32_t core_id = 0; core_id < num_cores; ++core_id) {
       uint64_t transfers = 0, gmem_reads = 0, gmem_dedup = 0, lmem_writes = 0, gmem_lt = 0;
-      CHECK_ERR(vx_mpm_query(hdevice, mpm_class, VX_CSR_MPM_DXA_TRANSFERS,  rep_core, &transfers),  { return err; });
-      CHECK_ERR(vx_mpm_query(hdevice, mpm_class, VX_CSR_MPM_DXA_GMEM_READS, rep_core, &gmem_reads), { return err; });
-      CHECK_ERR(vx_mpm_query(hdevice, mpm_class, VX_CSR_MPM_DXA_GMEM_DEDUP, rep_core, &gmem_dedup), { return err; });
-      CHECK_ERR(vx_mpm_query(hdevice, mpm_class, VX_CSR_MPM_DXA_LMEM_WRITES,rep_core, &lmem_writes),{ return err; });
-      CHECK_ERR(vx_mpm_query(hdevice, mpm_class, VX_CSR_MPM_DXA_GMEM_LT,    rep_core, &gmem_lt),    { return err; });
+      CHECK_ERR(vx_mpm_query(hdevice, mpm_class, VX_CSR_MPM_DXA_TRANSFERS,  core_id, &transfers),  { return err; });
+      CHECK_ERR(vx_mpm_query(hdevice, mpm_class, VX_CSR_MPM_DXA_GMEM_READS, core_id, &gmem_reads), { return err; });
+      CHECK_ERR(vx_mpm_query(hdevice, mpm_class, VX_CSR_MPM_DXA_GMEM_DEDUP, core_id, &gmem_dedup), { return err; });
+      CHECK_ERR(vx_mpm_query(hdevice, mpm_class, VX_CSR_MPM_DXA_LMEM_WRITES,core_id, &lmem_writes),{ return err; });
+      CHECK_ERR(vx_mpm_query(hdevice, mpm_class, VX_CSR_MPM_DXA_GMEM_LT,    core_id, &gmem_lt),    { return err; });
       tot_transfers  += transfers;
       tot_gmem_reads += gmem_reads;
       tot_gmem_dedup += gmem_dedup;
@@ -611,7 +607,7 @@ extern int vx_dump_perf(vx_device_h hdevice, FILE *stream) {
       tot_gmem_lt    += gmem_lt;
       double avg_lat = safe_div((double)gmem_lt, (double)transfers);
       int dedup_pct  = calc_percent(gmem_dedup, gmem_reads + gmem_dedup);
-      perf_print_core(stream, rep_core, "dxa: transfers=%" PRIu64 ", gmem_reads=%" PRIu64 ", gmem_dedup=%" PRIu64 " (rate=%d%%), lmem_writes=%" PRIu64 ", avg_gmem_lat=%.1f",
+      perf_print_core(stream, core_id, "dxa: transfers=%" PRIu64 ", gmem_reads=%" PRIu64 ", gmem_dedup=%" PRIu64 " (rate=%d%%), lmem_writes=%" PRIu64 ", avg_gmem_lat=%.1f",
                       transfers, gmem_reads, gmem_dedup, dedup_pct, lmem_writes, avg_lat);
     }
     {

@@ -18,6 +18,9 @@
 #include "processor_impl.h"
 #include <VX_config.h>
 #include <cassert>
+#ifdef VX_CFG_CLUSTER_MEM_MODE_DSMEM
+#include "cta_residency_table.h"
+#endif
 
 using namespace vortex;
 
@@ -33,6 +36,11 @@ CtaDispatcher::CtaDispatcher(const SimContext& ctx, const char* name, Core* core
   , free_size_(1u << VX_CFG_LMEM_LOG_SIZE)
   , slot_rem_warps_(num_warps_, 0)
   , slot_lmem_size_(num_warps_, 0)
+#ifdef VX_CFG_CLUSTER_MEM_MODE_DSMEM
+  , slot_cluster_id_(num_warps_, 0)
+  , slot_cluster_rank_(num_warps_, 0)
+  , slot_in_table_(num_warps_, false)
+#endif
   , wid_to_slot_(num_warps_, num_warps_)  // num_warps_ = invalid/unassigned
   , head_slot_(0)
   , tail_slot_(0)
@@ -60,6 +68,9 @@ void CtaDispatcher::on_reset() {
     slot_rem_warps_[i] = 0;
     slot_lmem_size_[i] = 0;
     wid_to_slot_[i]    = num_warps_;  // invalid
+#ifdef VX_CFG_CLUSTER_MEM_MODE_DSMEM
+    slot_in_table_[i]  = false;
+#endif
   }
   cur_kernel_pc_ = 0;
   for (uint32_t i = 0; i < num_warps_; ++i) {
@@ -78,6 +89,35 @@ bool CtaDispatcher::step(const WarpMask& active_warps, uint32_t* wid_out, cta_wa
     // peek-then-pop mirrors the RTL handshake: VX_cta_dispatch.sv pops only when
     // kmu_bus_if.ready = table_notfull && lmem_ok.
     if (!kmu_->peek(&pending_cta_)) return false;
+
+#ifdef VX_CFG_CLUSTER_MEM_MODE_DSMEM
+    // Gang placement (the Hopper cluster-work-distributor analog): rank r of
+    // cluster c is owned by core (c + r) % cores-per-cluster within hardware
+    // cluster (c % num-clusters); peer cores leave the CTA on the KMU bus for
+    // its owner. Plain CTAs (K == 1) keep the free-for-all pull. The KMU walks
+    // clusters in order, so a gang is fully emitted before the next one — a
+    // stalled owner delays the grid but cannot interleave-deadlock it.
+    {
+      uint32_t k = pending_cta_.cluster_dim[0]
+                 * pending_cta_.cluster_dim[1]
+                 * pending_cta_.cluster_dim[2];
+      if (k > 1) {
+        uint32_t hw_cluster  = pending_cta_.cluster_id % VX_CFG_NUM_CLUSTERS;
+        uint32_t target_core = (pending_cta_.cluster_id + pending_cta_.cluster_rank) % VX_CFG_NUM_CORES;
+        if (core_->cluster()->id() != hw_cluster)
+          return false;
+        if ((core_->id() % VX_CFG_NUM_CORES) != target_core)
+          return false;
+        // Residency-table admission (the table_notfull half of the handshake).
+        if (!core_->cluster()->cta_table()->can_admit(pending_cta_.cluster_id))
+          return false;
+        // Ranks are placed via the residency table, not stride arithmetic, so
+        // the same-core K-span contiguity reservation is unnecessary: allocate
+        // each rank's slice independently.
+        pending_cta_.is_first_of_cluster = false;
+      }
+    }
+#endif
 
     // Admission control: wait until the next FIFO slot is free and enough lmem is available.
     if (slot_rem_warps_[tail_slot_] != 0)
@@ -170,6 +210,21 @@ bool CtaDispatcher::step(const WarpMask& active_warps, uint32_t* wid_out, cta_wa
     slot_lmem_size_[cur_slot_] = lmem_cost;
     slot_rem_warps_[cur_slot_] = cta_size_;
 
+#ifdef VX_CFG_CLUSTER_MEM_MODE_DSMEM
+    // Record this rank's residency (core + slice base) for the DSMEM/DXA/
+    // cluster-barrier consumers; retired in warp_done() when the CTA drains.
+    {
+      uint32_t k = cta_.cluster_dim[0] * cta_.cluster_dim[1] * cta_.cluster_dim[2];
+      if (k > 1) {
+        core_->cluster()->cta_table()->admit(
+            cta_.cluster_id, cta_.cluster_rank, k, core_->id(), cur_slot_, lmem_addr_);
+        slot_cluster_id_[cur_slot_]   = cta_.cluster_id;
+        slot_cluster_rank_[cur_slot_] = cta_.cluster_rank;
+        slot_in_table_[cur_slot_]     = true;
+      }
+    }
+#endif
+
     has_cta_ = true;
   }
 
@@ -200,6 +255,12 @@ void CtaDispatcher::warp_done(uint32_t wid) {
   wid_to_slot_[wid] = num_warps_;  // clear assignment
   assert(slot_rem_warps_[slot] > 0);
   if (--slot_rem_warps_[slot] == 0) {
+#ifdef VX_CFG_CLUSTER_MEM_MODE_DSMEM
+    if (slot_in_table_[slot]) {
+      core_->cluster()->cta_table()->retire(slot_cluster_id_[slot], slot_cluster_rank_[slot]);
+      slot_in_table_[slot] = false;
+    }
+#endif
     // only advance head and reclaim memory if the oldest CTA finished
     if (slot == head_slot_) {
       do {
@@ -242,6 +303,8 @@ bool CtaDispatcher::next_warp(bool do_init, cta_warp_record_t* out) {
 
   out->lmem_addr = lmem_addr_;
   out->cluster_size = cta_.cluster_dim[0] * cta_.cluster_dim[1] * cta_.cluster_dim[2];
+  out->cluster_id   = cta_.cluster_id;
+  out->cluster_rank = cta_.cluster_rank;
 
   // Thread mask: full warp or partial last warp.
   out->tmask.resize(num_threads_);

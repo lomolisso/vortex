@@ -34,24 +34,30 @@ cta_mask, smem_addr, coords[5]}` — and pushes it on the SFU's `dxa_req_out`
 ([`sfu_unit.h:59`](../sfu_unit.h#L59)); on channel backpressure it returns `nullptr` to retry next
 cycle.
 
-**Cluster engine (`DxaCore`, [`../dxa/dxa_core.h`](../dxa/dxa_core.h)).** Cluster-shared
-([`dxa_core.h:30`](../dxa/dxa_core.h#L30)):
+**Per-core engine (`DxaCore`, [`../dxa/dxa_core.h`](../dxa/dxa_core.h)).** One per core — a true
+per-SM TMA (Toy-H100 Task 2):
 
-- `dxa_req_in[]` — one per core in the cluster ([`dxa_core.h:53`](../dxa/dxa_core.h#L53)); the
-  `Cluster` binds each core's `dxa_req_out` here.
+- `dxa_req_in` (size 1) — the owning core's `SfuUnit::dxa_req_out` binds here
+  ([`core.cpp`](../core.cpp), DXA block).
 - It dispatches to `VX_CFG_NUM_DXA_UNITS` workers, reads GMEM through `gmem_req_out`/`gmem_rsp_in`
-  arbitrated by `gmem_arb_` into L2 ([`dxa_core.h:57-59`](../dxa/dxa_core.h#L57)), and writes LMEM
-  through **per-core direct** `lmem_req_out` channels ([`dxa_core.h:63`](../dxa/dxa_core.h#L63),
-  write-only).
+  merged into the core's L1→L2 arbiter **below** the icache/dcache demand row, and writes its own
+  core's SMEM through the single `lmem_req_out` (write-only, `LocalMem` port `[LSU_NUM_REQS+TCU]`,
+  doc 13 §2).
 - **Completion** rides on the LMEM write: the final write sets `flags.dxa_notify_done` +
-  `dxa_notify_bar_id`, and the per-core `tx_callback` (doc 09 §5, [`cluster.cpp:160`](../cluster.cpp#L160))
-  releases the barrier — **per destination CTA** under multicast (`cta_mask>1`, `bar_id + cta`).
-- Descriptors are programmed by the host over DCRs (`dcr_write`, [`dxa_core.h:68`](../dxa/dxa_core.h#L68)).
+  `dxa_notify_bar_id`, and a `tx_callback` on the write channel releases the barrier (doc 09 §5) —
+  **per destination CTA** under multicast (`cta_mask>1`).
+- **Multicast (Toy-H100 Task 3c).** The tile is read from GMEM **once** (a single work list;
+  `gmem_reads` is fan-out-independent) and the writes replay per receiver rank. In DSMEM mode each
+  rank resolves through the CTA residency table (doc 03 §4.2b): same-core ranks use the local port;
+  remote ranks leave via `dsmem_req_out` over the SM-to-SM transport (ideal placeholder; Omelet co-sim in roadmap Task 4) into the receiver core's LMEM
+  remote port, whose ingress `tx_callback` fires the **receiver's own** CTA barrier
+  (`dxa_notify_bar_id` carries the receiver's slot from the table). In non-DSMEM builds multicast
+  keeps the legacy same-core `issuer_base + rank·stride` replay.
+- Descriptors are programmed by the host over DCRs (`dcr_write`, [`dxa_core.h`](../dxa/dxa_core.h)).
 - `PerfStats`: `transfers, gmem_reads, gmem_dedup, lmem_writes, total_latency`.
 
 The full design rationale (descriptor format, K-major transpose, multicast) is in
-[`../../../docs/designs/dxa_async_copy_multicast.md`](../../../docs/designs/dxa_async_copy_multicast.md);
-the Toy-H100 proposals relocate this engine to the socket.
+[`../../../docs/designs/dxa_async_copy_multicast.md`](../../../docs/designs/dxa_async_copy_multicast.md).
 
 ---
 

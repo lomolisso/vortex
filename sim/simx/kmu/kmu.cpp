@@ -24,6 +24,7 @@ Kmu::Kmu(const SimContext& ctx, const char* name)
   , block_size_(0)
   , running_(false)
   , cta_id_(0)
+  , cluster_id_(0)
 {
   block_dim_[0]    = block_dim_[1]    = block_dim_[2]    = 1;
   grid_dim_[0]     = grid_dim_[1]     = grid_dim_[2]     = 1;
@@ -40,6 +41,7 @@ void Kmu::on_reset() {
   // SimPlatform::on_reset().
   running_         = false;
   cta_id_          = 0;
+  cluster_id_      = 0;
   group_origin_[0] = group_origin_[1] = group_origin_[2] = 0;
   intra_offset_[0] = intra_offset_[1] = intra_offset_[2] = 0;
 }
@@ -80,6 +82,7 @@ void Kmu::start() {
            && (cluster_dim_[2] > 0);
   if (running_) {
     cta_id_          = 0;
+    cluster_id_      = 0;
     group_origin_[0] = group_origin_[1] = group_origin_[2] = 0;
     intra_offset_[0] = intra_offset_[1] = intra_offset_[2] = 0;
   }
@@ -123,6 +126,10 @@ bool Kmu::peek(kmu_req_t* req) const {
   req->cluster_dim[0] = cluster_dim_[0];
   req->cluster_dim[1] = cluster_dim_[1];
   req->cluster_dim[2] = cluster_dim_[2];
+  req->cluster_id   = cluster_id_;
+  req->cluster_rank = intra_offset_[0]
+                    + cluster_dim_[0] * (intra_offset_[1]
+                    + cluster_dim_[1] * intra_offset_[2]);
   req->is_first_of_cluster = (intra_offset_[0] == 0)
                           && (intra_offset_[1] == 0)
                           && (intra_offset_[2] == 0);
@@ -149,6 +156,7 @@ void Kmu::advance() {
       } else {
         intra_offset_[2] = 0;
         // Cluster complete — advance group_origin in (X, Y, Z) order.
+        ++cluster_id_;
         uint32_t ox = group_origin_[0] + cluster_dim_[0];
         if (ox == grid_dim_[0]) {
           group_origin_[0] = 0;

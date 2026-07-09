@@ -103,6 +103,18 @@ and `free_size_`. A CTA reserves `lmem_size` bytes; **the first CTA of a cluster
 sharing (DSMEM/DXA multicast) addresses peers by `issuer_base + rank·stride` (doc 17). The address
 classification of these LMEM bytes is in doc [15](15-memory-protocol-and-types.md).
 
+### 4.2b DSMEM mode: gang placement + the residency table
+
+Under `VX_CFG_CLUSTER_MEM_MODE_DSMEM` (the Toy-H100 DSMEM mode), real CTA clusters
+(K > 1) are **gang-placed** (the Hopper cluster-work-distributor analog): the peek-phase gate
+admits rank r of cluster c only on core `(c + r) % cores`; other cores leave the CTA on the KMU
+bus for its owner. Each admitted rank is recorded in the cluster's **`CtaResidencyTable`**
+([`../dsmem/cta_residency_table.h`](../dsmem/cta_residency_table.h)) as
+`{core, local CTA slot, LMEM slice base}` and retired when the CTA drains. The table — not
+stride arithmetic — is how DSMEM remote addressing, DXA multicast fan-out, and the cluster
+barrier resolve ranks, so the §4.2 K×span contiguity reservation is skipped in this mode.
+Admission additionally backpressures on `can_admit()` (the table_notfull half of the handshake).
+
 ### 4.3 Reclaim
 
 When a warp exits, the scheduler calls `warp_done(wid)` ([`cta_dispatcher.h:56`](../cta_dispatcher.h#L56));

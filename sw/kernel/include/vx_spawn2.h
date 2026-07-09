@@ -131,9 +131,20 @@ static inline __attribute__((always_inline)) uint32_t get_cluster_size() {
   return v;
 }
 
-// Rank of this CTA within its cluster.
+// Rank of this CTA within its cluster. Hardware-supplied: the local CTA
+// slot index is per-core, so deriving the rank from it breaks once a
+// cluster's CTAs are placed on different cores (DSMEM mode).
 static inline __attribute__((always_inline)) uint32_t get_cluster_rank() {
-  return get_local_group_id() % get_cluster_size();
+  uint32_t __UNIFORM__ v;
+  __asm__ volatile("csrr %0, %1" : "=r"(v) : "i"(VX_CSR_CTA_CLUSTER_RANK));
+  return v;
+}
+
+// Launch-wide index of this CTA's cluster.
+static inline __attribute__((always_inline)) uint32_t get_cluster_id() {
+  uint32_t __UNIFORM__ v;
+  __asm__ volatile("csrr %0, %1" : "=r"(v) : "i"(VX_CSR_CTA_CLUSTER_ID));
+  return v;
 }
 
 static inline __attribute__((always_inline)) uint32_t get_sub_group_id() {

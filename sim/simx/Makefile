@@ -75,6 +75,15 @@ ifneq ($(filter -DVX_CFG_EXT_DXA_ENABLE, $(XCONFIGS)),)
 	SRCS += $(SRC_DIR)/dxa/dxa_unit.cpp
 endif
 
+# Add DSMEM sources (endpoints + ideal placeholder transport; NoC modeling
+# is delegated to the Omelet co-simulator, roadmap Task 4)
+ifneq ($(filter -DVX_CFG_CLUSTER_MEM_MODE_DSMEM, $(XCONFIGS)),)
+	CXXFLAGS += -I$(SRC_DIR)/dsmem
+	SRCS += $(SRC_DIR)/dsmem/cta_residency_table.cpp
+	SRCS += $(SRC_DIR)/dsmem/ideal_transport.cpp
+	SRCS += $(SRC_DIR)/dsmem/dsmem_lsu_adapter.cpp
+endif
+
 # Graphics SW helpers (TextureSampler / DepthTencil / Blender / Rasterizer).
 # Added once if any of TEX/OM/RASTER is enabled.
 ifneq ($(or $(filter -DVX_CFG_EXT_TEX_ENABLE, $(XCONFIGS)),$(filter -DVX_CFG_EXT_OM_ENABLE, $(XCONFIGS)),$(filter -DVX_CFG_EXT_RASTER_ENABLE, $(XCONFIGS))),)

@@ -43,6 +43,9 @@
 #include "processor_impl.h"
 #include "kmu.h"
 #include "constants.h"
+#ifdef VX_CFG_CLUSTER_MEM_MODE_DSMEM
+#include "dsmem_lsu_adapter.h"
+#endif
 #include "debug.h"
 #ifdef VX_CFG_EXT_TCU_ENABLE
 #include "tcu_unit.h"
@@ -74,6 +77,11 @@ public:
     , func_units_((uint32_t)FUType::Count)
     , lmem_switch_(VX_CFG_NUM_LSU_BLOCKS)
     , mem_coalescers_(VX_CFG_NUM_LSU_BLOCKS)
+#ifdef VX_CFG_CLUSTER_MEM_MODE_DSMEM
+    , dsmem_lsu_adapters_(VX_CFG_NUM_LSU_BLOCKS)
+    , dsmem_store_pending_(VX_CFG_NUM_WARPS, 0)
+    , dsmem_drain_bar_(VX_CFG_NUM_WARPS, kDrainDisarmed)
+#endif
     , fetch_latch_(ctx, "fetch_latch", 2, 2)
     , decode_latch_(ctx, "decode_latch", 1, 2)
     , pending_icache_(VX_CFG_NUM_WARPS)
@@ -233,6 +241,9 @@ public:
     // create local memory.
     snprintf(sname, 100, "%s-lmem", name.c_str());
     uint32_t lmem_num_reqs = LSU_NUM_REQS + VX_CFG_EXT_TCU_ENABLED + VX_CFG_EXT_DXA_ENABLED;
+#ifdef VX_CFG_CLUSTER_MEM_MODE_DSMEM
+    lmem_num_reqs += 1; // remote port: peers' DSMEM/DXA traffic via the SM-to-SM network
+#endif
     local_mem_ = LocalMem::Create(sname, LocalMem::Config{
       (1 << VX_CFG_LMEM_LOG_SIZE),
       LSU_WORD_SIZE,
@@ -404,6 +415,55 @@ public:
     }
   #endif
 
+  #ifdef VX_CFG_CLUSTER_MEM_MODE_DSMEM
+    // ── SM-to-SM (DSMEM) plumbing ──────────────────────────────────────────
+    // Ingress: the cluster network delivers peers' requests into this core's
+    // LocalMem remote port (the last port), arbitrated with local LSU/TCU/DXA
+    // masters by the LMEM bank crossbar.
+    {
+      uint32_t port_remote = LSU_NUM_REQS + VX_CFG_EXT_TCU_ENABLED + VX_CFG_EXT_DXA_ENABLED;
+      simobject_->dsmem_remote_req_in.at(0).bind(&local_mem_->Inputs.at(port_remote));
+      local_mem_->Outputs.at(port_remote).bind(&simobject_->dsmem_remote_rsp_out.at(0));
+    #ifdef VX_CFG_EXT_DXA_ENABLE
+      // Receiver-side DXA completion: a peer's multicast slice arriving over
+      // the network carries the notify sideband targeting THIS core's
+      // receiver CTA barrier — the cross-core twin of the local lmem-port
+      // callback above.
+      Core* core = simobject_;
+      simobject_->dsmem_remote_req_in.at(0).tx_callback([core](const MemReq& req, uint64_t /*cycles*/) {
+        if (req.is_write() && req.flags.dxa_notify_done) {
+          uint32_t decoded = bar_decode_id(req.flags.dxa_notify_bar_id, VX_CFG_NUM_BARRIERS);
+          core->barrier_event_release(decoded);
+        }
+      });
+    #endif
+    }
+    // Egress: merge the LSU remote paths (rows 0..B-1, favored — fine-grained
+    // demand loads/stores) and the DXA multicast fan-out (last row, bulk
+    // writes) onto the core's single network ingress port.
+    {
+      constexpr uint32_t kDsmemEgressRows = VX_CFG_NUM_LSU_BLOCKS + VX_CFG_EXT_DXA_ENABLED;
+      snprintf(sname, 100, "%s-dsmem_egress_arb", name.c_str());
+      dsmem_egress_arb_ = MemArbiter::Create(sname, ArbiterType::Priority, kDsmemEgressRows, 1);
+      dsmem_egress_arb_->ReqOut.at(0).bind(&simobject_->dsmem_req_out.at(0));
+      simobject_->dsmem_rsp_in.at(0).bind(&dsmem_egress_arb_->RspIn.at(0));
+    }
+    // LSU remote route: LocalMemSwitch remote-shared lanes → per-block
+    // DsmemLsuAdapter (rank resolution + address rebase) → egress arbiter.
+    for (uint32_t b = 0; b < VX_CFG_NUM_LSU_BLOCKS; ++b) {
+      snprintf(sname, 100, "%s-dsmem_lsu_adapter%d", name.c_str(), b);
+      dsmem_lsu_adapters_.at(b) = DsmemLsuAdapter::Create(sname, simobject_);
+      lmem_switch_.at(b)->ReqOutDsmem.bind(&dsmem_lsu_adapters_.at(b)->ReqIn);
+      dsmem_lsu_adapters_.at(b)->RspOut.bind(&lmem_switch_.at(b)->RspInDsmem);
+      dsmem_lsu_adapters_.at(b)->ReqOut.bind(&dsmem_egress_arb_->ReqIn.at(b));
+      dsmem_egress_arb_->RspOut.at(b).bind(&dsmem_lsu_adapters_.at(b)->RspIn);
+    }
+  #ifdef VX_CFG_EXT_DXA_ENABLE
+    // DXA multicast fan-out (write-only, no responses) → the last egress row.
+    dxa_core_->dsmem_req_out.at(0).bind(&dsmem_egress_arb_->ReqIn.at(VX_CFG_NUM_LSU_BLOCKS));
+  #endif
+  #endif
+
     // commit arbiters — per-iw inputs are filled at runtime in commit() by
     // routing per-block FU outputs to commit_arbs_[trace->wid % VX_CFG_ISSUE_WIDTH]
     // (no static binding because the iw is not knowable at setup time when
@@ -426,8 +486,39 @@ public:
 
     std::fill(ibuf_inflight_.begin(), ibuf_inflight_.end(), 0);
 
+#ifdef VX_CFG_CLUSTER_MEM_MODE_DSMEM
+    std::fill(dsmem_store_pending_.begin(), dsmem_store_pending_.end(), 0);
+    std::fill(dsmem_drain_bar_.begin(), dsmem_drain_bar_.end(), kDrainDisarmed);
+#endif
+
     perf_stats_ = PerfStats();
   }
+
+#ifdef VX_CFG_CLUSTER_MEM_MODE_DSMEM
+  void dsmem_store_inc(uint32_t wid) {
+    ++dsmem_store_pending_.at(wid);
+  }
+  void dsmem_store_dec(uint32_t wid) {
+    assert(dsmem_store_pending_.at(wid) > 0);
+    --dsmem_store_pending_.at(wid);
+    uint32_t bar_id = dsmem_drain_bar_.at(wid);
+    if (bar_id != kDrainDisarmed) {
+      if (dsmem_store_pending_.at(wid) == 0) {
+        dsmem_drain_bar_.at(wid) = kDrainDisarmed;
+      }
+      scheduler_->barrier_unit().event_release(bar_id);
+    }
+  }
+  bool dsmem_store_pending(uint32_t wid) const {
+    return dsmem_store_pending_.at(wid) != 0;
+  }
+  uint32_t dsmem_store_count(uint32_t wid) const {
+    return dsmem_store_pending_.at(wid);
+  }
+  void dsmem_arm_drain(uint32_t wid, uint32_t bar_id) {
+    dsmem_drain_bar_.at(wid) = bar_id;
+  }
+#endif
 
   void tick() {
     this->commit();
@@ -1016,6 +1107,13 @@ private:
   DxaCore::Ptr      dxa_core_;    // per-core (per-SM) async-copy engine
   MemArbiter::Ptr   dxa_l2_arb_;  // L1→L2 arbiter: demand (row 0) > DXA (row 1)
 #endif
+#ifdef VX_CFG_CLUSTER_MEM_MODE_DSMEM
+  static constexpr uint32_t kDrainDisarmed = 0xffffffffu;
+  MemArbiter::Ptr   dsmem_egress_arb_;  // LSU remote rows > DXA fan-out row
+  std::vector<DsmemLsuAdapter::Ptr> dsmem_lsu_adapters_;
+  std::vector<uint32_t> dsmem_store_pending_;  // per-warp in-flight remote stores
+  std::vector<uint32_t> dsmem_drain_bar_;      // per-warp armed cluster barrier
+#endif
 
   TFifo<instr_trace_t*> fetch_latch_;
   TFifo<instr_trace_t*> decode_latch_;
@@ -1062,6 +1160,12 @@ Core::Core(const SimContext& ctx,
   , dcache_rsp_in(VX_CFG_DCACHE_NUM_REQS, this)
   , mem_req_out(VX_CFG_L1_MEM_PORTS, this)
   , mem_rsp_in(VX_CFG_L1_MEM_PORTS, this)
+#ifdef VX_CFG_CLUSTER_MEM_MODE_DSMEM
+  , dsmem_req_out(1, this)
+  , dsmem_rsp_in(1, this)
+  , dsmem_remote_req_in(1, this)
+  , dsmem_remote_rsp_out(1, this)
+#endif
   , core_id_(core_id)
   , cluster_(cluster)
   , impl_(new Impl(ctx, this))
@@ -1118,6 +1222,32 @@ void Core::barrier_event_attach(uint32_t bar_id, uint32_t count) {
 void Core::barrier_event_release(uint32_t bar_id) {
   impl_->scheduler()->barrier_unit().event_release(bar_id);
 }
+
+#ifdef VX_CFG_CLUSTER_MEM_MODE_DSMEM
+void Core::dsmem_store_inc(uint32_t wid) {
+  impl_->dsmem_store_inc(wid);
+}
+
+void Core::dsmem_store_dec(uint32_t wid) {
+  impl_->dsmem_store_dec(wid);
+}
+
+bool Core::dsmem_store_pending(uint32_t wid) const {
+  return impl_->dsmem_store_pending(wid);
+}
+
+uint32_t Core::dsmem_store_count(uint32_t wid) const {
+  return impl_->dsmem_store_count(wid);
+}
+
+void Core::dsmem_arm_drain(uint32_t wid, uint32_t bar_id) {
+  impl_->dsmem_arm_drain(wid, bar_id);
+}
+
+void Core::cluster_barrier_resume(uint32_t bar_id) {
+  impl_->scheduler()->barrier_unit().global_resume(bar_id);
+}
+#endif
 
 bool Core::wspawn(uint32_t num_warps, Word nextPC) {
   return impl_->scheduler()->wspawn(num_warps, nextPC);

@@ -174,6 +174,36 @@ reconfigure from scratch.
 
 ---
 
+## Omelet (NoC co-simulator) in the same container
+
+The dev image doubles as the environment for **Omelet** (the packaging-aware
+gem5/Garnet NoC simulator used for Vortex NoC modeling — see
+`docs/proposals/omelet_noc_cosim_proposal.md`). `vortex-dev.sh up` auto-mounts
+a sibling `../omelet` checkout at `/omelet` (override with `OMELET_SRC=`, or
+set it empty to skip). Same hot-reload philosophy as `/vortex`: the image only
+carries Omelet's dependencies; the source — including its pinned gem5 v22.1
+tree — lives in the mount, so gem5-side SimObjects can be edited and rebuilt
+without touching the image.
+
+One-time provisioning (applies Omelet's Garnet patches + installs the Python
+package + builds `gem5.opt`, ~6–10 min, idempotent):
+
+```bash
+miscs/docker/vortex-dev.sh exec '/vortex/miscs/docker/omelet-setup.sh'
+```
+
+Then, inside the container:
+
+```bash
+cd /omelet && omelet-run examples/config/2_5d_org_mesh.yaml --injectionrate 0.1
+```
+
+Note: Omelet's gem5 is v22.1 (its Garnet patches pin it); the `/opt/gem5`
+provisioned by the Vortex toolchain (v25) is a separate tree used by the
+`VortexGPGPU` device flow — they coexist.
+
+---
+
 ## Packaged flow (self-contained)
 
 `Dockerfile.prod` bakes a checkout + build into the image for a mount-free

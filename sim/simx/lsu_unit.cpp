@@ -389,6 +389,22 @@ void LsuUnit::process_request_step(uint32_t b) {
 		lsu_req.cid  = trace->cid;
 		lsu_req.uuid = trace->uuid;
 
+	#ifdef VX_CFG_CLUSTER_MEM_MODE_DSMEM
+		// Count remote (DSMEM) store lanes at issue — the earliest post-retire
+		// point — so a cluster-barrier arrive on the next instruction already
+		// sees the drain obligation; the peer LMEM's ack releases it.
+		if (is_write) {
+			for (uint32_t i = 0; i < VX_CFG_NUM_LSU_LANES; ++i) {
+				if (!lsu_req.mask.test(i))
+					continue;
+				auto a = lsu_req.addrs.at(i);
+				if (get_addr_type(a) == AddrType::Shared && dsmem_region(a) != 0) {
+					core_->dsmem_store_inc(lsu_req.wid);
+				}
+			}
+		}
+	#endif
+
 		// send memory request
 		core_->lmem_switch(b)->ReqIn.send(lsu_req);
 		DT(3, this->name() << " mem-req: " << lsu_req);

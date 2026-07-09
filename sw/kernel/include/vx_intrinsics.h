@@ -567,6 +567,42 @@ inline float vx_packlh_f(const void* base, uint32_t stride) {
     return out;
 }
 
+// DSMEM cluster ops (custom0 / funct7=0x05): remote shared memory across the
+// CTA cluster's cores. Requires a DSMEM-mode device build
+// (VX_CFG_CLUSTER_MEM_MODE_DSMEM); rank distances beyond the aperture
+// (VX_CFG_DSMEM_REGION_BITS) are unencodable.
+
+// Map a pointer into this CTA's shared window to the same intra-slice offset
+// in the target CTA rank's scratchpad. Mapping to one's own rank returns the
+// pointer unchanged. The result is also a valid plain load/store address.
+__attribute__((always_inline))
+inline void* vx_mapa_cluster(const void* ptr, uint32_t rank) {
+    void* out;
+    __asm__ volatile (
+        ".insn r %1, 0, 5, %0, %2, %3" : "=r"(out) : "i"(RISCV_CUSTOM0), "r"(ptr), "r"(rank)
+    );
+    return out;
+}
+
+// Word load from a cluster-shared (mapa'd) address.
+__attribute__((always_inline))
+inline uint32_t vx_ld_cluster(const void* addr) {
+    uint32_t out;
+    __asm__ volatile (
+        ".insn r %1, 1, 5, %0, %2, x0" : "=r"(out) : "i"(RISCV_CUSTOM0), "r"(addr) : "memory"
+    );
+    return out;
+}
+
+// Word store to a cluster-shared (mapa'd) address. The write's completion is
+// tracked for the cluster barrier's drain (see vx_barrier.h).
+__attribute__((always_inline))
+inline void vx_st_cluster(void* addr, uint32_t value) {
+    __asm__ volatile (
+        ".insn r %0, 2, 5, x0, %1, %2" :: "i"(RISCV_CUSTOM0), "r"(addr), "r"(value) : "memory"
+    );
+}
+
 #ifdef __cplusplus
 }
 #endif

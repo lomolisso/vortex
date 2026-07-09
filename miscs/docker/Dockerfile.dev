@@ -85,6 +85,26 @@ ENV VK_ICD_FILENAMES=$TOOLDIR/mesa-vortex/share/vulkan/icd.d/lvp_icd.x86_64.json
 ENV CCACHE_DIR=/ccache
 RUN mkdir -p /ccache && chmod 1777 /ccache
 
+# Omelet co-simulator support (Toy-H100 NoC modeling). The Omelet repo
+# (gem5 v22.1 Garnet standalone + NoX builders) is bind-mounted at /omelet
+# at run time — same source-less hot-reload philosophy as /vortex. The image
+# carries only its build/runtime dependencies; the patched gem5 is built
+# in-container by miscs/docker/omelet-setup.sh (from the mounted vortex
+# tree), so the gem5 tree stays writable for co-sim SimObject iteration.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        scons m4 zlib1g-dev libgoogle-perftools-dev python3-pip && \
+    rm -rf /var/lib/apt/lists/* && \
+    pip3 install --no-cache-dir --upgrade pip setuptools && \
+    pip3 install --no-cache-dir pyyaml
+ENV OMELET_SRC=/omelet
+# gem5's embedded Python interpreter must import the omelet package too, and
+# it does not see pip user-site installs — PYTHONPATH covers both interpreters
+# (and makes a pip install of the package unnecessary).
+ENV PYTHONPATH=/omelet
+RUN printf '#!/bin/sh\nexec python3 -m omelet.cli "$@"\n' > /usr/local/bin/omelet-run && \
+    printf '#!/bin/sh\nexec python3 -m omelet.dse.cli "$@"\n' > /usr/local/bin/omelet-dse && \
+    chmod +x /usr/local/bin/omelet-run /usr/local/bin/omelet-dse
+
 COPY dev-entrypoint.sh /usr/local/bin/dev-entrypoint.sh
 RUN chmod +x /usr/local/bin/dev-entrypoint.sh
 

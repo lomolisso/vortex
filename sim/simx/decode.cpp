@@ -113,6 +113,9 @@ static op_string_t op_string(const Instr &instr) {
         }
       }
       case AluType::CZERO: return {aluArgs.imm ? "CZERO.NEZ":"CZERO.EQZ", ""};
+    #ifdef VX_CFG_CLUSTER_MEM_MODE_DSMEM
+      case AluType::MAPA_CLUSTER: return {"MAPA.CLUSTER", ""};
+    #endif
       default:
         std::abort();
       }
@@ -944,6 +947,40 @@ Instr::Ptr Decoder::decode(uint32_t code, uint64_t uuid) {
       instr->set_macro_op();
       instr->set_wstall(true);   // pause fetch while sequencer expands the N uops
     } break;
+  #ifdef VX_CFG_CLUSTER_MEM_MODE_DSMEM
+    case 5: { // DSMEM cluster ops (generic-proxy remote shared memory)
+      switch (funct3) {
+      case 0: { // mapa.cluster rd, rs1=local shared ptr, rs2=target CTA rank
+        instr->set_fu_type(FUType::ALU);
+        instr->set_op_type(AluType::MAPA_CLUSTER);
+        instr->set_dest_reg(rd, RegType::Integer);
+        instr->set_src_reg(0, rs1, RegType::Integer);
+        instr->set_src_reg(1, rs2, RegType::Integer);
+        instr->set_args(IntrAluArgs{0, 0, 0});
+      } break;
+      case 1: { // ld.cluster rd, rs1=cluster-shared addr (word width)
+        instr->set_fu_type(FUType::LSU);
+        instr->set_op_type(LsuType::LOAD);
+        instr->set_dest_reg(rd, RegType::Integer);
+        instr->set_src_reg(0, rs1, RegType::Integer);
+        instr->set_args(IntrLsuArgs{/*width=LW*/ 2, 0, 0});
+      } break;
+      case 2: { // st.cluster rs1=cluster-shared addr, rs2=data (word width)
+        instr->set_fu_type(FUType::LSU);
+        instr->set_op_type(LsuType::STORE);
+        instr->set_src_reg(0, rs1, RegType::Integer);
+        instr->set_src_reg(1, rs2, RegType::Integer);
+        instr->set_args(IntrLsuArgs{/*width=SW*/ 2, 0, 0});
+      } break;
+      // funct3=3 is reserved for atom.cluster: cross-core atomics on the
+      // non-coherent DSMEM boundary are deliberately unimplemented (the LMEM
+      // banks carry no atomic units even locally); kernels synchronize with
+      // cluster barriers instead.
+      default:
+        std::abort();
+      }
+    } break;
+  #endif
     default:
       std::abort();
     }

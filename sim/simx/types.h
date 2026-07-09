@@ -63,11 +63,12 @@ typedef std::bitset<MAX_NUM_WARPS>   WarpMask;
 ///////////////////////////////////////////////////////////////////////////////
 
 // Decode a packed kernel bar_id (local_group_id | (bar_no << 8)) to a flat barrier index.
-// Preserves the global barrier flag (bit 31).
+// Preserves the scope flags: bit 31 = global (cross-core), bit 30 = CTA-cluster
+// (DSMEM). Legacy handles never set bit 30, so the decode is unchanged for them.
 inline uint32_t bar_decode_id(uint32_t bar_id_raw, uint32_t num_barriers) {
   uint32_t cta_no = bar_id_raw & 0xffu;
-  uint32_t bar_no = (bar_id_raw >> 8) & 0x7fffffu;
-  return (cta_no * num_barriers + bar_no) | (bar_id_raw & 0x80000000u);
+  uint32_t bar_no = (bar_id_raw >> 8) & 0x3fffffu;
+  return (cta_no * num_barriers + bar_no) | (bar_id_raw & 0xC0000000u);
 }
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -202,6 +203,9 @@ enum class AluType {
   OR,
   XOR,
   CZERO
+#ifdef VX_CFG_CLUSTER_MEM_MODE_DSMEM
+  , MAPA_CLUSTER  // map a local shared address to a peer CTA's DSMEM aperture
+#endif
 };
 
 struct IntrAluArgs {
@@ -225,6 +229,9 @@ inline std::ostream &operator<<(std::ostream &os, const AluType& type) {
   case AluType::OR:      os << "OR"; break;
   case AluType::XOR:     os << "XOR"; break;
   case AluType::CZERO:   os << "CZERO"; break;
+#ifdef VX_CFG_CLUSTER_MEM_MODE_DSMEM
+  case AluType::MAPA_CLUSTER: os << "MAPA.CLUSTER"; break;
+#endif
   default:
     assert(false);
   }
@@ -427,6 +434,13 @@ struct MemFlags {
       // 16 bits leaves headroom for larger configs.
       uint32_t dxa_notify_done   : 1;   // bit 4
       uint32_t dxa_notify_bar_id : 16;  // bits 5..20
+    #endif
+    #ifdef VX_CFG_CLUSTER_MEM_MODE_DSMEM
+      // SM-to-SM network sideband: request routed to a peer core's LMEM.
+      // dsmem_target is the peer's local core index within the cluster,
+      // resolved at the source from the CTA-cluster residency table.
+      uint32_t dsmem_remote : 1;
+      uint32_t dsmem_target : 6;
     #endif
     };
   };
@@ -820,12 +834,34 @@ inline AddrType get_addr_type(uint64_t addr) {
      return AddrType::IO;
   }
   if (VX_CFG_LMEM_ENABLED) {
+  #ifdef VX_CFG_CLUSTER_MEM_MODE_DSMEM
+    // DSMEM aperture: the shared window widens to cover the peer regions —
+    // bits [LMEM_LOG_SIZE +: DSMEM_REGION_BITS] select a CTA-cluster peer
+    // (region 0 = the plain local window, byte-identical to non-DSMEM builds).
+    static_assert(!(VX_CFG_XLEN == 32)
+                  || (VX_CFG_LMEM_LOG_SIZE + VX_CFG_DSMEM_REGION_BITS <= 16),
+                  "DSMEM aperture must fit the address space above LMEM_BASE");
+    if (addr >= VX_MEM_LMEM_BASE_ADDR &&
+        (addr - VX_MEM_LMEM_BASE_ADDR) < (1ull << (VX_CFG_LMEM_LOG_SIZE + VX_CFG_DSMEM_REGION_BITS))) {
+        return AddrType::Shared;
+    }
+  #else
     if (addr >= VX_MEM_LMEM_BASE_ADDR && (addr-VX_MEM_LMEM_BASE_ADDR) < (1 << VX_CFG_LMEM_LOG_SIZE)) {
         return AddrType::Shared;
     }
+  #endif
   }
   return AddrType::Global;
 }
+
+#ifdef VX_CFG_CLUSTER_MEM_MODE_DSMEM
+// Peer-region field of a Shared address: 0 = this core's own window; r > 0 =
+// "the CTA at cluster rank (my_rank + r) mod K" (relative encoding, so the
+// plain local window needs no translation).
+inline uint32_t dsmem_region(uint64_t addr) {
+  return (addr - VX_MEM_LMEM_BASE_ADDR) >> VX_CFG_LMEM_LOG_SIZE;
+}
+#endif
 
 inline std::ostream &operator<<(std::ostream &os, const AddrType& type) {
   switch (type) {

@@ -26,6 +26,10 @@ LocalMemSwitch::LocalMemSwitch(
   , RspInLmem(this)
   , ReqOutDC(this)
   , RspInDC(this)
+#ifdef VX_CFG_CLUSTER_MEM_MODE_DSMEM
+  , ReqOutDsmem(this)
+  , RspInDsmem(this)
+#endif
   , delay_(delay)
 {}
 
@@ -45,6 +49,15 @@ void LocalMemSwitch::on_tick() {
       RspInDC.pop();
     }
   }
+#ifdef VX_CFG_CLUSTER_MEM_MODE_DSMEM
+  if (!RspInDsmem.empty()) {
+    auto& out_rsp = RspInDsmem.peek();
+    if (RspOut.try_send(out_rsp, 1)) {
+      DT(4, this->name() << " dsmem-rsp: " << out_rsp);
+      RspInDsmem.pop();
+    }
+  }
+#endif
 
   // process incoming requests
   if (!ReqIn.empty()) {
@@ -72,6 +85,15 @@ void LocalMemSwitch::on_tick() {
     // consistency (LD/ST distinction at the LMEM bank).
     out_lmem_req.op   = in_req.op;
 
+#ifdef VX_CFG_CLUSTER_MEM_MODE_DSMEM
+    LsuReq out_dsmem_req(in_req.mask.size());
+    out_dsmem_req.tag  = in_req.tag;
+    out_dsmem_req.cid  = in_req.cid;
+    out_dsmem_req.uuid = in_req.uuid;
+    out_dsmem_req.wid  = in_req.wid;
+    out_dsmem_req.op   = in_req.op;
+#endif
+
     for (uint32_t i = 0; i < in_req.mask.size(); ++i) {
       if (in_req.mask.test(i)) {
         auto type = get_addr_type(in_req.addrs.at(i));
@@ -80,6 +102,16 @@ void LocalMemSwitch::on_tick() {
         assert(!(in_is_amo && type == AddrType::Shared)
                && "AMO on Shared (LMEM) is unsupported in this build");
         if (type == AddrType::Shared) {
+        #ifdef VX_CFG_CLUSTER_MEM_MODE_DSMEM
+          if (dsmem_region(in_req.addrs.at(i)) != 0) {
+            // Remote-shared lane: a peer CTA's aperture.
+            out_dsmem_req.mask.set(i);
+            out_dsmem_req.addrs.at(i)  = in_req.addrs.at(i);
+            out_dsmem_req.data.at(i)   = in_req.data.at(i);
+            out_dsmem_req.byteen.at(i) = in_req.byteen.at(i);
+            continue;
+          }
+        #endif
           out_lmem_req.mask.set(i);
           out_lmem_req.addrs.at(i)  = in_req.addrs.at(i);
           out_lmem_req.data.at(i)   = in_req.data.at(i);
@@ -104,6 +136,12 @@ void LocalMemSwitch::on_tick() {
     if (send_to_lmem && ReqOutLmem.full())
       return; // stall
 
+#ifdef VX_CFG_CLUSTER_MEM_MODE_DSMEM
+    bool send_to_dsmem = !out_dsmem_req.mask.none();
+    if (send_to_dsmem && ReqOutDsmem.full())
+      return; // stall
+#endif
+
     if (send_to_dc) {
       ReqOutDC.send(out_dc_req, delay_);
       DT(4, this->name() << " dc-req: " << out_dc_req);
@@ -113,6 +151,13 @@ void LocalMemSwitch::on_tick() {
       ReqOutLmem.send(out_lmem_req, delay_);
       DT(4, this->name() << " lmem-req: " << out_lmem_req);
     }
+
+#ifdef VX_CFG_CLUSTER_MEM_MODE_DSMEM
+    if (send_to_dsmem) {
+      ReqOutDsmem.send(out_dsmem_req, delay_);
+      DT(4, this->name() << " dsmem-req: " << out_dsmem_req);
+    }
+#endif
     ReqIn.pop();
   }
 }

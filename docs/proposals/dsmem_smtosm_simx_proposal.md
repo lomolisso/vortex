@@ -1,6 +1,6 @@
-# Task 3 — SM-to-SM Network: DSMEM Addressing + TMA Multicast — SimX Proposal
+# Task 3 — DSMEM Endpoints + TMA Multicast — SimX Proposal
 
-**Status:** proposal (pre-implementation). **Scope:** SimX only
+**Status:** implemented in SimX (see §10 for the as-built notes). **Scope:** SimX only
 ([`sim/simx/`](../../sim/simx/)). Part of the
 [Toy-H100 SimX Roadmap](toy_h100_simx_roadmap_proposal.md); this is **Task 3**, and it
 **depends on [Task 1](socket_removal_simx_proposal.md)** (core-resident SMEM) and
@@ -9,6 +9,16 @@ network** gap — the largest divergence from
 [`../designs/h100_vortex_mapping.md`](../designs/h100_vortex_mapping.md) §5.4 — and the
 "Hopper-style cross-core DSMEM path" and multicast items left open in
 [`../designs/dxa_async_copy_multicast.md`](../designs/dxa_async_copy_multicast.md) §7.2, §7.6.
+
+> **Scope amendment (Omelet pivot).** This task owns the **endpoint microarchitecture and
+> semantics** (remote port, egress, residency table, addressing, cluster barrier, multicast
+> fan-out). **NoC modeling — topology, per-hop timing, link accounting — is NOT modeled in
+> SimX**: it is delegated to **[Task 4](omelet_noc_cosim_proposal.md)** (Omelet co-simulation).
+> The originally-shipped `SmToSmNetwork` topology model was removed in that pivot; cross-core
+> connectivity rides an explicit fixed-delay placeholder
+> (`sim/simx/dsmem/ideal_transport.{h,cpp}`) until Task 4 lands, and permanently when
+> co-simulation is off. §2's fabric text and §4.2's fan-out-policy study are retained below as
+> design rationale but are **superseded** where they describe a SimX-internal topology model.
 
 **Framing — substrate + two first-class consumers.** The SM-to-SM network is a **substrate**;
 **DSMEM remote addressing** and **TMA multicast** are **two distinct, co-equal consumers** that
@@ -43,6 +53,14 @@ and verification kernel.
 ## 2. Sub-task 3a — SM-to-SM network fabric + core SMEM remote port (substrate)
 
 The substrate, with **no consumer semantics yet**.
+
+> **Superseded in part (Omelet pivot):** the pluggable-topology fabric described in the next
+> two bullets was built, verified, then removed — a routing-function + per-hop-delay model is
+> not a real NoC, and the program now models every Vortex fabric with Omelet
+> ([Task 4](omelet_noc_cosim_proposal.md)). What survives of 3a as-built: the per-core ports,
+> the `LocalMem` remote port, the residency table, the mode selector, and the endpoint
+> contract (requests carry `dsmem_target`; responses back-route by tag) — plus the
+> `IdealTransport` fixed-delay placeholder standing where the fabric was.
 
 - **New SimObject `SmToSmNetwork`** (`sim/simx/dsmem/smtosm_network.{h,cpp}`), cluster-resident,
   1:1 with a future `VX_smtosm_network` in `VX_cluster.sv`. It exposes one request/response port
@@ -144,7 +162,13 @@ testable.
    receiver's mbarrier counts only **its own slice** of bytes.
 4. **Fan-out is a NoC design choice — surface it, don't hardcode it** (see §4.2).
 
-### 4.2 The fan-out policy is a NoC knob — swappable and traced
+### 4.2 The fan-out policy is a NoC knob — swappable and traced *(superseded: now a Task-4/Omelet axis)*
+
+> **Superseded by the Omelet pivot:** the fan-out policy and its per-link accounting are NoC
+> properties and belong to [Task 4](omelet_noc_cosim_proposal.md), where router-level multicast
+> replication exists physically rather than as an accounting trick. The DXA-side contract that
+> survives in this task: the issuer replays per-receiver writes (source fan-out) with
+> table-resolved destinations, and each receiver completes independently.
 
 Whether `SmToSmNetwork` does **source-side replication** (the issuer unicasts N−1 copies) or
 **true in-network multicast** (replication at routers) changes interconnect traffic
@@ -249,3 +273,62 @@ fan-out policy and inspect bytes-per-link in the trace. 120 s cap applies.
   keeps a CTA cluster within one cluster.
 - Faithful scoped-consistency *behavior* (scope tree, proxy semantics) — separate, additive
   project per roadmap §10; **not** part of this task.
+
+---
+
+## 10. Implementation notes (as-built)
+
+All of 3a/3b/3c is implemented in SimX behind `VX_CFG_CLUSTER_MEM_MODE_DSMEM`; the default
+`L2` mode is compiled out entirely (byte-identical PERF verified on the pre-Task-3 oracle).
+C++ builds select the mode with the **sibling flag form** (`-DVX_CFG_CLUSTER_MEM_MODE_DSMEM`,
+like `-DVX_CFG_FPU_TYPE_STD`); the value form only normalizes inside `gen_config.py`.
+
+- **Placement (the Hopper CWD analog).** Nothing in the pre-Task-3 dispatcher placed a
+  cluster's CTAs — the same-core contiguity was an unenforced assumption. In DSMEM mode the
+  per-core `CtaDispatcher` admits rank *r* of cluster *c* only on core `(c + r) % cores` (gang
+  spread; the in-order KMU bus prevents cross-cluster interleaving), records the rank in the
+  **`CtaResidencyTable`** (`sim/simx/dsmem/cta_residency_table.{h,cpp}`, future `VX_cta_table`)
+  as `{core, local CTA slot, LMEM slice base}`, and skips the K×lmem contiguity reservation —
+  slices resolve through the table, not stride arithmetic.
+- **DSMEM aperture (3b).** XLEN32 leaves only 2^16 B above `LMEM_BASE`, so the aperture uses
+  **2 region bits** (`VX_CFG_DSMEM_REGION_BITS`, K ≤ 4 cross-core): shared-window bits
+  `[LMEM_LOG_SIZE +: 2]` encode the **relative** rank distance (region 0 = the untouched local
+  window, so plain local accesses never translate). `mapa.cluster` (ALU), `ld.cluster` /
+  `st.cluster` (LSU) live in custom0 funct7=0x05; `atom.cluster` (funct3=3) is reserved-but-
+  trapped per §9. The `LocalMemSwitch` forks remote-shared lanes to a per-block
+  **`DsmemLsuAdapter`** (future `VX_dsmem_lsu_adapter`) that resolves region → absolute rank →
+  peer core/slice via the table, rebases the address, and rides the network; remote stores are
+  ack'ed (`strsp`) for drain accounting.
+- **Cluster barrier (3b drain+fence).** `vortex::cluster_barrier` uses free flag **bit 30**
+  (bit 31 stays the global barrier); the low byte carries `cluster_id % NUM_WARPS` so concurrent
+  clusters get distinct hardware slots. Local arrivals complete one rank's worth, then escalate
+  to `Cluster::cluster_barrier_arrive`, which counts ranks against the residency table and
+  broadcast-resumes participants. **Drain:** outstanding remote stores (counted per warp at LSU
+  issue — the earliest post-retire point) convert to barrier events at arrive and are released
+  one-per-ack; **fence** is structural (in-order warps cannot hoist past the suspension).
+- **TMA multicast (3c).** The issuing DXA's serial replay resolves each `cta_mask` rank through
+  the residency table: same-core ranks keep the local LMEM port; remote ranks leave through the
+  core's DSMEM egress with `dsmem_target`. The **single global read is preserved structurally**
+  (one work_list; only writes replay) and asserted by `tests/regression/dxa_multicast` via
+  `VX_CSR_MPM_DXA_GMEM_READS` (measured exactly 1× tile at 4-way fan-out). Per-receiver
+  completion re-targets `dxa_notify_bar_id` to the **receiver's own CTA slot** from the table
+  (the issuer-relative `bar_id + cta_idx` arithmetic only holds same-core) and fires on the
+  receiver core's network-ingress callback.
+- **Transport (3a, post-pivot).** The originally-shipped `SmToSmNetwork` (four topology
+  backends, fan-out policy, per-link accounting, MPM class 9) was **removed in the Omelet
+  pivot** — that modeling now belongs to [Task 4](omelet_noc_cosim_proposal.md). In its place,
+  **`IdealTransport`** (`sim/simx/dsmem/ideal_transport.{h,cpp}`) provides fixed-delay
+  point-to-point delivery over the same endpoint contract: requests route by
+  `MemFlags::dsmem_target`, responses back-route by source bits appended to the tag. It is an
+  explicit modeling placeholder (deliberately **not** a future SV module) and remains the
+  fallback transport whenever Omelet co-simulation is off.
+- **Verification.** `dsmem_pingpong` (remote ld/st + drain, K=2/2-core and K=4/4-core, plus a
+  debug-build trace showing the store-acks and rank escalations) and `dxa_multicast`
+  (bytes + per-receiver completion + the 1×-GMEM assertion, measured `gmem_reads` exactly 1×
+  tile and `lmem_writes` exactly N× at 4-way fan-out) pass on the ideal transport;
+  `dxa_copy_mcast` (same-core degenerate) and `sgemm_tcu_wg_dxa_mcast` pass under DSMEM mode.
+  Default L2 mode is byte-identical to the pre-Task-3 baseline on the 9-app oracle, with one
+  understood exception: the two multicast apps differ **only in kernel instruction count**
+  because `get_cluster_rank()` deliberately changed from the same-core-only `cta_id % K`
+  computation to the hardware `VX_CSR_CTA_CLUSTER_RANK` read (fewer instructions per CTA;
+  results and all sim-side paths unchanged — the other 7 apps are byte-identical).

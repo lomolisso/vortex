@@ -48,4 +48,13 @@ else
     echo "[dev-entrypoint] Bind-mount the Vortex source at $VORTEX_SRC (see miscs/docker/README.md)."
 fi
 
+# Omelet (NoC co-simulator), bind-mounted at /omelet when available. The
+# package is importable via the image's PYTHONPATH (no pip install needed);
+# only the patched-gem5 build is heavy and stays manual: omelet-setup.sh.
+OMELET_SRC="${OMELET_SRC:-/omelet}"
+if [ -f "$OMELET_SRC/pyproject.toml" ] && \
+   [ ! -x "$OMELET_SRC/gem5/build/Garnet_standalone/gem5.opt" ]; then
+    echo "[dev-entrypoint] Omelet gem5 not built yet; run: $VORTEX_SRC/miscs/docker/omelet-setup.sh"
+fi
+
 exec "$@"

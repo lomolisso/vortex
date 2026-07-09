@@ -31,6 +31,8 @@ struct kmu_req_t {
   uint32_t block_size;
   uint32_t warp_step[3];
   uint32_t cluster_dim[3];
+  uint32_t cluster_id;
+  uint32_t cluster_rank;
   bool     is_first_of_cluster;
 };
 
@@ -77,6 +79,9 @@ private:
   uint32_t cluster_dim_[3];
   bool     running_;
   uint32_t cta_id_;
+  // Monotonic CTA-cluster index within the launch (bumped when the
+  // intra-cluster walk wraps); keys the per-cluster residency table.
+  uint32_t cluster_id_;
   // Nested counter: group_origin advances by cluster_dim per axis;
   // intra_offset walks within the cluster.
   uint32_t group_origin_[3];

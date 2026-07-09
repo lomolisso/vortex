@@ -229,6 +229,24 @@ VX_CFG_L3_MEM_PORTS = "expr: min($VX_CFG_L3_NUM_BANKS, $VX_CFG_PLATFORM_MEMORY_N
 VX_CFG_LMEM_LOG_SIZE = 14
 VX_CFG_LMEM_NUM_BANKS = "expr: $VX_CFG_NUM_LSU_LANES"
 
+[dsmem]
+# VX_CFG_CLUSTER_MEM_MODE is a string enum: 'L2'|'DSMEM'|'NONE'.
+# L2 = the per-cluster cache (today's default); DSMEM = cross-core shared
+# memory over the SM-to-SM transport (global traffic rides the existing
+# L2-bypass path); NONE = passthrough, no transport.
+# NOTE: in DSMEM mode the transport is a fixed-delay ideal placeholder
+# (sim/simx/dsmem/ideal_transport.*). NoC topology/timing knobs return with
+# the Omelet co-simulator (docs/proposals/omelet_noc_cosim_proposal.md).
+VX_CFG_CLUSTER_MEM_MODE = "L2"
+# DSMEM aperture: peer-region bits above the per-CTA LMEM offset. XLEN32 has
+# only 2^16 bytes of address space above LMEM_BASE, capping
+# LMEM_LOG_SIZE + REGION_BITS at 16 (=> max cluster size 4 cross-core).
+VX_CFG_DSMEM_REGION_BITS = 2
+# CTA-cluster residency-table entries (concurrently tracked clusters); rank-0
+# admission stalls while the table is full, mirroring the dispatch
+# table_notfull handshake.
+VX_CFG_CTA_TABLE_SIZE = 8
+
 [tcu]
 # VX_CFG_TCU_TYPE is a string enum: 'DPI'|'DSP'|'BHF'|'TFR'
 # DSP uses vendor FP IP (Xilinx xil_fadd/...) and is FPGA-only; ASIC flows
@@ -325,6 +343,7 @@ VX_CFG_XLEN = [32, 64]
 VX_CFG_FLEN = [32, 64]
 VX_CFG_FPU_TYPE = ["DPI", "DSP", "FPNEW", "STD"]
 VX_CFG_TCU_TYPE = ["DPI", "DSP", "BHF", "TFR"]
+VX_CFG_CLUSTER_MEM_MODE = ["L2", "DSMEM", "NONE"]
 
 [[param]]
 VX_CFG_DCACHE_NUM_REQS = "int"

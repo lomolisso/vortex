@@ -15,6 +15,9 @@
 #include "core.h"
 #include "constants.h"
 #include "debug.h"
+#ifdef VX_CFG_CLUSTER_MEM_MODE_DSMEM
+#include "scheduler.h"
+#endif
 
 using namespace vortex;
 
@@ -56,6 +59,13 @@ instr_trace_t* DxaUnit::process(instr_trace_t* trace) {
   req.cta_mask  = cta_mask;
   req.smem_addr = smem_addr;
   for (int i = 0; i < 5; ++i) req.coords[i] = coords[i];
+#ifdef VX_CFG_CLUSTER_MEM_MODE_DSMEM
+  {
+    auto& csrs = core_->scheduler().warp(trace->wid).cta_csrs;
+    req.cluster_id   = csrs.cluster_id;
+    req.cluster_rank = csrs.cluster_rank;
+  }
+#endif
 
   // Barrier pre-registration is the kernel's responsibility via
   // vx_barrier_expect_tx(). The DXA pipeline only emits release events on

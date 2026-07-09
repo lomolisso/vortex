@@ -36,18 +36,43 @@ void BarrierUnit::on_reset() {
 }
 
 uint32_t BarrierUnit::get_phase(uint32_t bar_id) const {
-  auto bar_index = bar_id & 0x7fffffff;
+  auto bar_index = bar_id & 0x3fffffff;
   return barriers_.at(bar_index).phase;
 }
 
 void BarrierUnit::arrive(uint32_t bar_id, uint32_t count, uint32_t wid, bool is_sync_bar) {
   bool is_global = (bar_id >> 31);
-  auto bar_index = bar_id & 0x7fffffff;
+  auto bar_index = bar_id & 0x3fffffff;
 
   auto& barrier = barriers_.at(bar_index);
   const auto& active_warps = scheduler_->active_warps();
 
   DP(4, "*** Barrier arrive: core #" << core_->id() << ", warp #" << wid << " at barrier #" << bar_id << ", phase=" << barrier.phase << ", wait_mask=" << barrier.wait_mask << ", count=" << barrier.count << ", events=" << barrier.events);
+
+#ifdef VX_CFG_CLUSTER_MEM_MODE_DSMEM
+  if (!is_global && ((bar_id >> 30) & 1)) {
+    // CTA-cluster barrier: local arrivals complete one rank's worth (count =
+    // the CTA's warps), then escalate a rank arrival to the cluster, which
+    // counts ranks against the residency table and broadcast-resumes.
+    barrier.count = count;
+    barrier.arrival_mask.set(wid);
+    if (is_sync_bar) {
+      barrier.wait_mask.set(wid);
+    }
+    // Drain obligation: outstanding remote (DSMEM) stores become barrier
+    // events, released one-per-ack as they commit in the peers' LMEM banks.
+    // The warp is suspended past this point, so no new stores can slip in.
+    uint32_t drain = core_->dsmem_store_count(wid);
+    if (drain != 0) {
+      barrier.events += drain;
+      core_->dsmem_arm_drain(wid, bar_id);
+    }
+    if (barrier.arrival_mask.count() >= barrier.count && barrier.events == 0) {
+      this->cluster_escalate(bar_id, wid);
+    }
+    return;
+  }
+#endif
 
   if (is_global) {
     barrier.count = count;
@@ -94,7 +119,7 @@ void BarrierUnit::arrive(uint32_t bar_id, uint32_t count, uint32_t wid, bool is_
 }
 
 bool BarrierUnit::wait(uint32_t bar_id, uint32_t phase, uint32_t wid) {
-  auto bar_index = bar_id & 0x7fffffff;
+  auto bar_index = bar_id & 0x3fffffff;
 
   auto& barrier = barriers_.at(bar_index);
   bool wait = (barrier.phase == phase);
@@ -111,7 +136,7 @@ bool BarrierUnit::wait(uint32_t bar_id, uint32_t phase, uint32_t wid) {
 }
 
 void BarrierUnit::global_resume(uint32_t bar_id) {
-  auto bar_index = bar_id & 0x7fffffff;
+  auto bar_index = bar_id & 0x3fffffff;
   auto& barrier = barriers_.at(bar_index);
   // Only resume warps that actually suspended on this barrier (sync_bar or
   // bar_wait). Async bar_arrive leaves wait_mask empty so this is a no-op,
@@ -126,20 +151,49 @@ void BarrierUnit::global_resume(uint32_t bar_id) {
   ++barrier.phase;
 }
 
+#ifdef VX_CFG_CLUSTER_MEM_MODE_DSMEM
+void BarrierUnit::cluster_escalate(uint32_t bar_id, uint32_t wid) {
+  auto bar_index = bar_id & 0x3fffffff;
+  auto& barrier = barriers_.at(bar_index);
+  auto& csrs = scheduler_->warp(wid).cta_csrs;
+  DP(3, "*** Cluster-barrier escalate: core #" << core_->id() << ", cluster #"
+     << csrs.cluster_id << " at barrier #" << bar_id);
+  core_->cluster()->cluster_barrier_arrive(csrs.cluster_id, bar_id);
+  // One rank's worth of arrivals consumed; further ranks on this core (if
+  // any) accumulate afresh. wait_mask persists until the cluster resume.
+  barrier.arrival_mask.reset();
+}
+#endif
+
 void BarrierUnit::event_attach(uint32_t bar_id, uint32_t count) {
-  auto bar_index = bar_id & 0x7fffffff;
+  auto bar_index = bar_id & 0x3fffffff;
   auto& barrier = barriers_.at(bar_index);
   barrier.events += count;
 }
 
 void BarrierUnit::event_release(uint32_t bar_id) {
   bool is_global = (bar_id >> 31);
-  auto bar_index = bar_id & 0x7fffffff;
+  auto bar_index = bar_id & 0x3fffffff;
   auto& barrier = barriers_.at(bar_index);
   const auto& active_warps = scheduler_->active_warps();
   assert(barrier.events > 0);
   --barrier.events;
   if (barrier.events == 0) {
+#ifdef VX_CFG_CLUSTER_MEM_MODE_DSMEM
+    if (!is_global && ((bar_id >> 30) & 1)) {
+      if (barrier.count != 0 && barrier.arrival_mask.count() >= barrier.count) {
+        // Last drain ack / expected transaction landed after all local
+        // arrivals — escalate using any arrived warp's cluster identity.
+        for (uint32_t i = 0; i < VX_CFG_NUM_WARPS; ++i) {
+          if (barrier.arrival_mask.test(i)) {
+            this->cluster_escalate(bar_id, i);
+            break;
+          }
+        }
+      }
+      return;
+    }
+#endif
     if (is_global) {
       if (barrier.arrival_mask.count() == active_warps.count()) {
         uint32_t num_cores = barrier.count;

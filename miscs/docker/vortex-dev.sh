@@ -32,10 +32,15 @@ CCACHE_VOL="${CCACHE_VOL:-vortex-ccache}"
 XLEN="${XLEN:-32}"
 # Build dir on local disk (regenerable; keeps heavy compile writes off NFS).
 VORTEX_BUILD="${VORTEX_BUILD:-/scratch/$USER/vortex-build}"
+# Omelet checkout (NoC co-simulator), mounted at /omelet when present.
+# Defaults to a sibling of the Vortex checkout; set OMELET_SRC= (empty) to
+# skip the mount entirely.
+OMELET_SRC="${OMELET_SRC-$(cd -- "$VORTEX_SRC/../omelet" 2>/dev/null && pwd || true)}"
 
 # Container-internal paths (must match dev-entrypoint.sh / README).
 SRC_MNT=/vortex
 BUILD_MNT=/build_docker
+OMELET_MNT=/omelet
 
 # --- helpers ----------------------------------------------------------------
 
@@ -77,9 +82,18 @@ cmd_up() {
     fi
 
     mkdir -p "$VORTEX_BUILD"
+    local omelet_args=()
+    if [ -n "$OMELET_SRC" ] && [ -d "$OMELET_SRC" ]; then
+        omelet_args=(-v "$OMELET_SRC":"$OMELET_MNT")
+    fi
     info "Creating container '$CONTAINER'"
     info "  source : $VORTEX_SRC  -> $SRC_MNT   (hot reload, NFS ok)"
     info "  build  : $VORTEX_BUILD -> $BUILD_MNT (local disk)"
+    if [ ${#omelet_args[@]} -gt 0 ]; then
+        info "  omelet : $OMELET_SRC -> $OMELET_MNT (hot reload)"
+    else
+        info "  omelet : not found (set OMELET_SRC to mount it)"
+    fi
     info "  xlen   : $XLEN"
     docker run -dit --name "$CONTAINER" \
         --platform=linux/amd64 --privileged=true \
@@ -88,9 +102,13 @@ cmd_up() {
         -v "$VORTEX_SRC":"$SRC_MNT" \
         -v "$VORTEX_BUILD":"$BUILD_MNT" \
         -v "$CCACHE_VOL":/ccache \
+        "${omelet_args[@]}" \
         -w "$SRC_MNT" \
         "$IMAGE" >/dev/null
     info "Up. First start configures $BUILD_MNT (see '$0 logs')."
+    if [ ${#omelet_args[@]} -gt 0 ]; then
+        info "Omelet gem5 (one-time, ~10 min): $0 exec '$SRC_MNT/miscs/docker/omelet-setup.sh'"
+    fi
 }
 
 cmd_shell() {
@@ -159,8 +177,8 @@ Info:
   status                      Show image/container/paths.
   logs [-f]                   Show entrypoint/container logs.
 
-Overridable env: VORTEX_SRC, VORTEX_BUILD, IMAGE, CONTAINER, XLEN, CCACHE_VOL
-  current: src=$VORTEX_SRC build=$VORTEX_BUILD xlen=$XLEN
+Overridable env: VORTEX_SRC, VORTEX_BUILD, OMELET_SRC, IMAGE, CONTAINER, XLEN, CCACHE_VOL
+  current: src=$VORTEX_SRC build=$VORTEX_BUILD omelet=${OMELET_SRC:-<none>} xlen=$XLEN
 
 Examples:
   $0 build && $0 up && $0 shell

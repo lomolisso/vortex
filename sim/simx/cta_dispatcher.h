@@ -39,6 +39,8 @@ struct cta_warp_record_t {
   uint64_t   param;
   uint64_t   lmem_addr;
   uint32_t   cluster_size;
+  uint32_t   cluster_id;
+  uint32_t   cluster_rank;
 };
 
 // CTA dispatcher: walks the pending kernel grid and admits one warp rank per
@@ -83,6 +85,13 @@ private:
   // Per-slot tracking (indexed 0..num_warps_-1)
   std::vector<uint32_t> slot_rem_warps_;  // remaining active warps in this slot
   std::vector<uint32_t> slot_lmem_size_;  // lmem bytes allocated to this slot
+#ifdef VX_CFG_CLUSTER_MEM_MODE_DSMEM
+  // Residency-table identity of the CTA in each slot (valid while
+  // slot_in_table_), for retire() at CTA drain.
+  std::vector<uint32_t> slot_cluster_id_;
+  std::vector<uint32_t> slot_cluster_rank_;
+  std::vector<bool>     slot_in_table_;
+#endif
   // Reverse lookup: wid → slot index
   std::vector<uint32_t> wid_to_slot_;
   // FIFO ring for in-order slot allocation

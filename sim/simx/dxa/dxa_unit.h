@@ -36,6 +36,12 @@ struct DxaReq {
   uint32_t cta_mask;      // multicast warp mask (>1 bit ⇒ multicast)
   uint64_t smem_addr;
   uint32_t coords[5];
+#ifdef VX_CFG_CLUSTER_MEM_MODE_DSMEM
+  // Issuer's CTA-cluster identity: multicast destinations resolve through the
+  // residency table (rank → core/slot/slice) instead of stride arithmetic.
+  uint32_t cluster_id;
+  uint32_t cluster_rank;
+#endif
 };
 
 // DXA sub-unit of the SFU. Plain (non-SimObject) class owned by SfuUnit;

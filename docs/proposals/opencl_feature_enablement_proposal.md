@@ -1,8 +1,8 @@
-# Task 5 — OpenCL Feature Enablement & Verification — SimX Proposal
+# Task 6 — OpenCL Feature Enablement & Verification — SimX Proposal
 
 **Status:** proposal (pre-implementation). **Scope:** software stack
 ([`sw/`](../../sw/), [`tests/opencl/`](../../tests/opencl/)) + SimX validation. Part of the
-[Toy-H100 SimX Roadmap](toy_h100_simx_roadmap_proposal.md); this is **Task 5**, the **last**
+[Toy-H100 SimX Roadmap](toy_h100_simx_roadmap_proposal.md); this is **Task 6**, the **last**
 task. It depends on Tasks 1–4 being implemented and C++-verified.
 
 **Goal:** expose the toy-H100 hardware features — **core-level SMEM** (via `__local`),
@@ -49,7 +49,7 @@ headers already emit, so the SimX hardware path is unchanged.
 | **DXA / TMA** (Task 2) | `cl_vortex_async_copy` builtins (`vx_dxa_issue_*` equivalents, **incl. the multicast variant**) + host descriptor programming | the `vx_dxa.h` issue intrinsics + `dxa.h` host API | mirror the existing C++ issue/descriptor surface; multicast covers Task 3c |
 | **DSMEM remote addressing** (Task 3b) | a work-group-cluster extension (cluster query + remote-shared pointer builtins) | the DSMEM (peer-rank, offset) addressing + `group_barrier` | OpenCL analog of CUDA thread-block clusters / `cluster.map_shared_rank` |
 | **TMA multicast** (Task 3c) | the multicast form of `cl_vortex_async_copy` + the cluster mask | the per-SM DXA multicast over the SM-to-SM network | must preserve the **single-global-read** property end-to-end |
-| **Proxy fence + mbarrier** (Task 4) | a `fence.proxy.async` builtin + the async-copy completion (`mbarrier` query/wait) | `vx_fence_proxy_async` + byte-granular mbarrier | required for a correct generic→async handoff when OpenCL drives the async copy |
+| **Proxy fence + mbarrier** (Task 5) | a `fence.proxy.async` builtin + the async-copy completion (`mbarrier` query/wait) | `vx_fence_proxy_async` + byte-granular mbarrier | required for a correct generic→async handoff when OpenCL drives the async copy |
 | **WGMMA** (compute) | `cl_vortex_wmma` builtins or a tensor extension | `vx_tensor.h` `wgmma_context` | optional here — not part of the structural hierarchy changes, but listed for completeness |
 
 Implementation lands in the **POCL/Vortex builtin library** (the Vortex POCL fork's builtin
@@ -67,10 +67,10 @@ mechanical:
 | SM | work-group on one core | core (== SM) |
 | SMSP | sub-group | issue slot (`ISSUE_WIDTH`) |
 | `__shared__` / SMEM | `__local` | core `LocalMem` (SMEM) (Task 1) |
-| Thread-Block Cluster | work-group-cluster extension | CTA cluster + `SmToSmNetwork` |
+| Thread-Block Cluster | work-group-cluster extension | CTA cluster + SM-to-SM transport (NoC-modeled by Omelet, Task 4) |
 | DSMEM (`cluster.map_shared_rank`) | remote-shared pointer builtin | DSMEM remote addressing (Task 3) |
 | TMA (`cp.async.bulk`) | `cl_vortex_async_copy` | per-SM DXA (Task 2) |
-| `mbarrier` + `fence.proxy.async` | async-copy completion + a fence builtin | byte-granular mbarrier + proxy fence (Task 4) |
+| `mbarrier` + `fence.proxy.async` | async-copy completion + a fence builtin | byte-granular mbarrier + proxy fence (Task 5) |
 | `wgmma` | `cl_vortex_wmma` | per-core TCU (WGMMA) |
 
 ## 5. Verification — port the Task 1–4 kernels to OpenCL
@@ -79,14 +79,14 @@ For each C++ verification kernel, author the OpenCL equivalent under
 [`tests/opencl/`](../../tests/opencl/) and assert **identical numerical output** and that the
 feature is exercised (same perf-CSR movement as the C++ oracle):
 
-| C++ oracle (Tasks 1–4) | OpenCL equivalent (Task 5) | Exercises |
+| C++ oracle (Tasks 1–5) | OpenCL equivalent (Task 6) | Exercises |
 |---|---|---|
 | a shared-mem+global regression kernel | `opencl/core_smem` | `__local` (core SMEM) + `__global` (separate dcache) |
 | `regression/dxa_copy` | `opencl/dxa_copy` | per-SM DXA via `cl_vortex_async_copy` |
 | `regression/dsmem_pingpong` | `opencl/dsmem_pingpong` | cross-core DSMEM (3b) via cluster extension |
 | `regression/dxa_multicast` | `opencl/dxa_multicast` | faithful TMA multicast (3c) — assert single global read, not just bytes |
-| `regression/proxy_fence` | `opencl/proxy_fence` | generic→async `fence.proxy.async` (Task 4) — incl. the negative no-fence variant |
-| `regression/async_push_mbar` | `opencl/async_push_mbar` | byte-granular mbarrier completion (Task 4) over the async push |
+| `regression/proxy_fence` | `opencl/proxy_fence` | generic→async `fence.proxy.async` (Task 5) — incl. the negative no-fence variant |
+| `regression/async_push_mbar` | `opencl/async_push_mbar` | byte-granular mbarrier completion (Task 5) over the async push |
 
 ```bash
 # OpenCL equivalents on SimX (toy-H100 SM shape)

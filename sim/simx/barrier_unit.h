@@ -40,6 +40,12 @@ protected:
   void on_reset();
 
 private:
+#ifdef VX_CFG_CLUSTER_MEM_MODE_DSMEM
+  // Signal one rank's arrival (all local warps arrived + drained) to the
+  // cluster-level accumulator.
+  void cluster_escalate(uint32_t bar_id, uint32_t wid);
+#endif
+
   Core*       core_;
   Scheduler*  scheduler_;
   std::vector<warp_barrier_t> barriers_;

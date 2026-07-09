@@ -72,7 +72,15 @@ From [`../../../sw/kernel/include/vx_barrier.h`](../../../sw/kernel/include/vx_b
   through the cross-core cascade (§4).
 - **`group_barrier`** — cross-CTA within a cluster: `bar_id = (id<<8)` (wid=0), the *same slot* seen
   from every CTA, so co-resident CTAs of a cluster can rendezvous (used by DSMEM/DXA-multicast
-  rendezvous, doc 17).
+  rendezvous, doc 17). **Core-local only** — it cannot synchronize a cluster whose CTAs span cores.
+- **`cluster_barrier`** (DSMEM mode) — CTA-cluster-wide across cores: **bit 30** flags the cluster
+  scope (bit 31 stays global) and the low byte carries `cluster_id % NUM_WARPS` so concurrent
+  clusters use distinct slots. Local arrivals complete one rank's worth (count = the CTA's warps),
+  then a rank arrival escalates to `Cluster::cluster_barrier_arrive`, which counts ranks against
+  the residency table (doc 03 §4.2b) and broadcast-resumes every participant core. Arrival also
+  **drains**: the warp's outstanding remote (DSMEM) stores — counted at LSU issue — become barrier
+  `events`, each released when the peer LMEM's store ack returns over the SM-to-SM transport; the in-order
+  warp suspension provides the **fence** half. This is Task 3b's sole ordering point.
 
 All expose `arrive()/wait(phase)/arrive_and_wait()` and (for the async forms) `expect_tx(count)`.
 

@@ -49,6 +49,7 @@ accessor only — a clean example of the functional-vs-timing split (doc 01 §5)
 | `[0 : LSU_NUM_REQS)` | the **LSU** shared path (via `LocalMemSwitch` + adapter) |
 | `[LSU_NUM_REQS]` | the **TCU** tile-buffer (if `VX_CFG_EXT_TCU_ENABLE`, [`core.cpp:250`](../core.cpp#L250)) |
 | `[LSU_NUM_REQS + TCU]` | the **DXA** write port (if `VX_CFG_EXT_DXA_ENABLE`) |
+| `[LSU_NUM_REQS + TCU + DXA]` | the **remote** port (if `VX_CFG_CLUSTER_MEM_MODE_DSMEM`): peers' DSMEM loads/stores and DXA multicast slices delivered by the SM-to-SM transport (`IdealTransport` placeholder today; NoC-modeled by the Omelet co-simulator, roadmap Task 4); remote stores are ack'ed per-request (`flags.strsp`) for the cluster barrier's drain |
 
 The TCU and DXA bind their LMEM channels here; the DXA write port additionally carries the
 completion `tx_callback` that releases barriers (doc 09 §5). This shared port is exactly what the

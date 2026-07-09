@@ -39,17 +39,24 @@ core, plus a memory-model fidelity gap and a software gap:
    DXA multicast. The SM-to-SM network is a **substrate** with **two first-class consumers** —
    **DSMEM remote addressing** (thread-issued, fine-grained) and **TMA multicast** (bulk async
    copy with hardware fan-out, *one* global read). (→ **Task 3**)
-4. **Two-proxy memory model.** PTX distinguishes the **generic proxy** (LSU) from the **async
+4. **Real NoC models.** SimX's fabrics are functional arbiters with fixed delays — unusable for
+   the program's NoC studies (topology comparison now; 2.5D/3D chiplet partitioning of Vortex
+   next). Every NoC-class fabric in Vortex is instead modeled by the **Omelet** gem5/Garnet
+   chiplet-interconnect co-simulator; SimX keeps the traffic-generating microarchitecture.
+   (→ **Task 4**)
+5. **Two-proxy memory model.** PTX distinguishes the **generic proxy** (LSU) from the **async
    proxy** (TMA/DXA); Vortex models neither the proxy tag nor the generic↔async crossing fence.
    Reproducing it (incl. `fence.proxy.async` and byte-granular mbarrier completion) is an
-   additive **fidelity** layer — *not* a scoped-consistency model. (→ **Task 4**)
-5. **Feature reachability from OpenCL.** DXA/WGMMA/DSMEM are reachable only from the C++ kernel
-   model; OpenCL C cannot drive them — which also blocks the future CUDA→OpenCL effort. (→ **Task 5**)
+   additive **fidelity** layer — *not* a scoped-consistency model. (→ **Task 5**)
+6. **Feature reachability from OpenCL.** DXA/WGMMA/DSMEM are reachable only from the C++ kernel
+   model; OpenCL C cannot drive them — which also blocks the future CUDA→OpenCL effort. (→ **Task 6**)
 
 ## 2. Non-negotiable principles (apply to every task)
 
-- **SimX only.** All work lands under [`sim/simx/`](../../sim/simx/) (Tasks 4–5 also touch
-  [`sw/`](../../sw/) — the instruction surface and the OpenCL surface respectively). No RTL work
+- **SimX only.** All work lands under [`sim/simx/`](../../sim/simx/) (Task 4 also touches the
+  Omelet checkout and the gem5-device glue in [`sim/simx/gem5/`](../../sim/simx/gem5/); Tasks
+  5–6 also touch [`sw/`](../../sw/) — the instruction surface and the OpenCL surface
+  respectively). No RTL work
   in this program — and where a SimX change desynchronizes the model from the current RTL (e.g.
   Task 1 removing the socket level and its config knobs), **breaking the RTL build is
   acceptable**; the RTL is realigned later as an out-of-scope companion change.
@@ -70,19 +77,19 @@ core, plus a memory-model fidelity gap and a software gap:
   logic depends on them.
 - **Root-cause discipline** per [`../../AGENTS.md`](../../AGENTS.md) §3.
 - **Do not introduce a scoped memory-consistency *model*** (PTX/SASS-style scope qualifiers,
-  scope-tree visibility) to deliver the **structural** tasks (1–3) or OpenCL (5). The feature set
+  scope-tree visibility) to deliver the **structural** tasks (1–4) or OpenCL (6). The feature set
   is scratchpad-centric and barrier/transaction-synchronized, which is exactly the regime where
   scopes stop being load-bearing — see §10. The **two-proxy model** (`fence.proxy.async`, async
-  completion) is a *separate, deliberate* fidelity task (Task 4); **proxies ≠ scopes** — proxies
-  order datapath crossings, scopes bound visibility radius. Task 4 adds the former, not the latter.
+  completion) is a *separate, deliberate* fidelity task (Task 5); **proxies ≠ scopes** — proxies
+  order datapath crossings, scopes bound visibility radius. Task 5 adds the former, not the latter.
 
 ## 3. Target hierarchy (end state of the program)
 
 | Level | SimX class | Owns — **before** | Owns — **after this program** |
 |---|---|---|---|
-| Cluster | `Cluster` | L2, **DxaCore**; creates sockets | L2 *or* **DSMEM SM-to-SM network** (mode-selected), no DXA; **creates cores directly** |
+| Cluster | `Cluster` | L2, **DxaCore**; creates sockets | L2 *or* **DSMEM SM-to-SM transport** (mode-selected; NoC-modeled by **Omelet**, Task 4), no DXA; **creates cores directly** |
 | ~~Socket~~ | ~~`Socket`~~ | ~~L1I + dcache (`CacheCluster`); creates cores~~ | **removed (Task 1)** |
-| Core (== SM) | `Core` | regfile + TCU + **`LocalMem`** | regfile + TCU + `LocalMem` (SMEM) + **L1I + dcache (L1D)** — three separate SRAM arrays + **L1 arbiter** (+ shared-resident **`Mbarrier`** & proxy-ordering logic at the SMEM port, Task 4) + **`DxaCore`** |
+| Core (== SM) | `Core` | regfile + TCU + **`LocalMem`** | regfile + TCU + `LocalMem` (SMEM) + **L1I + dcache (L1D)** — three separate SRAM arrays + **L1 arbiter** (+ shared-resident **`Mbarrier`** & proxy-ordering logic at the SMEM port, Task 5) + **`DxaCore`** |
 
 The `Socket` level is **removed** and its knobs deleted (Task 1), so **the core is the SM**
 throughout. **L1D and SMEM stay separate structures** in the core — the H100's single *fused*
@@ -99,23 +106,35 @@ L1D/SMEM array is a non-goal (§2, Task 1).
    add a dcache→DXA arbiter onto the core's L1→L2 path and target the core `LocalMem` (SMEM) on
    the write side; one `DxaCore` per core is a true per-SM TMA. *Requires Task 1's core-as-SM
    consolidation.*
-3. **[SM-to-SM network: DSMEM + TMA multicast](dsmem_smtosm_simx_proposal.md)** — a cluster-level
-   SM-to-SM network **substrate** plus **two first-class consumers**: **(3a)** the network fabric
-   (**pluggable topology — crossbar default, ring/mesh/torus as a study axis**) + a core
-   `LocalMem` (SMEM) remote port + cluster memory mode **L2 / DSMEM / none**; **(3b)** **DSMEM
-   remote addressing** (real cross-core shared-memory load/store); **(3c)** **faithful TMA
-   multicast** (single issuer, *one* global read, hardware fan-out into N scratchpads). *Uses
-   Task 1's core-resident SMEM and Task 2's per-core `DxaCore`; 3c restores — and makes
-   faithful — the cross-core multicast that Task 2 defers.*
-4. **[Proxy model & async-proxy instructions](proxy_model_simx_proposal.md)** — model PTX's
+3. **[DSMEM endpoints + TMA multicast](dsmem_smtosm_simx_proposal.md)** — the SM-to-SM
+   **endpoint microarchitecture** plus **two first-class consumers**: **(3a)** the substrate —
+   core `LocalMem` (SMEM) remote port, per-core DSMEM egress, the **CTA residency table** with
+   gang placement, cluster memory mode **L2 / DSMEM / none** (cross-core connectivity rides an
+   explicit fixed-delay `IdealTransport` placeholder — **NoC modeling is delegated to Task 4**);
+   **(3b)** **DSMEM remote addressing** (real cross-core shared-memory load/store + the cluster
+   barrier with store drain); **(3c)** **faithful TMA multicast** (single issuer, *one* global
+   read, hardware fan-out into N scratchpads). *Uses Task 1's core-resident SMEM and Task 2's
+   per-core `DxaCore`; 3c restores — and makes faithful — the cross-core multicast that Task 2
+   defers.*
+4. **[Omelet NoC co-simulation](omelet_noc_cosim_proposal.md)** — model **all four Vortex
+   NoC-class fabrics** (SM-to-SM DSMEM, cores→L2, clusters→LLC, LLC→DRAM channels) with
+   **Omelet**, the packaging-aware gem5/Garnet chiplet-interconnect simulator, via
+   single-process embedded co-simulation (SimX inside Omelet's gem5 through the existing
+   `VortexGPGPU` device; timing-only tokens — functional data stays in SimX). Topology /
+   routing / clocks become `VX_CFG_NOC_*` knobs linked to Omelet's design-point yaml by a
+   configure-time generator. Single 2D die now; the same interface carries the future 2.5D/3D
+   chiplet partition (NoI/NoL). *Replaces Task 3's `IdealTransport` placeholder and every
+   SimX-internal fabric model; SimX keeps the traffic-generating microarchitecture.*
+5. **[Proxy model & async-proxy instructions](proxy_model_simx_proposal.md)** — model PTX's
    two-proxy memory model (generic = LSU, async = DXA/TMA): a `proxy` tag on requests, the
    producer-side **`fence.proxy.async`**, and the byte-granular **mbarrier** completion (promoted
    from the existing `warp_barrier_t` proto-mechanism). An **additive fidelity layer on top of
-   Tasks 1–3, not a correction of them**; proxies ≠ scopes. *Uses Task 1's core SMEM port
-   (generic↔async crossing) and Task 2's core DXA (the async agent).*
-5. **[OpenCL feature enablement](opencl_feature_enablement_proposal.md)** — expose the new
+   Tasks 1–3, not a correction of them**; proxies ≠ scopes. mbarrier completion tokens ride
+   whichever NoC model is active (ideal or Omelet) — the semantics do not change. *Uses Task 1's
+   core SMEM port (generic↔async crossing) and Task 2's core DXA (the async agent).*
+6. **[OpenCL feature enablement](opencl_feature_enablement_proposal.md)** — expose the new
    features (core-level SMEM via `__local`, DXA, DSMEM, WGMMA) to **OpenCL C**, port the Task
-   1–4 C++ verification kernels to OpenCL, and verify the OpenCL equivalents produce identical
+   1–5 C++ verification kernels to OpenCL, and verify the OpenCL equivalents produce identical
    results. *The bridge to the future CUDA→OpenCL transcription effort.*
 
 ## 5. Cross-cutting acceptance criteria (a task is **not done** until all hold)
@@ -126,10 +145,10 @@ Per [`../../AGENTS.md`](../../AGENTS.md) §4 and §6:
 - **Builds and passes inside the Docker dev container.** Use
   [`miscs/docker/vortex-dev.sh`](../../miscs/docker/vortex-dev.sh) (`build` → `up` → `shell`),
   run from the generated `build/` tree. "Compiles on my machine" is not done.
-- **C++ verification kernel(s) prove the feature** (Tasks 1–4); **OpenCL equivalents** prove it
-  (Task 5). A feature with no passing kernel is incomplete. Kernels live under
+- **C++ verification kernel(s) prove the feature** (Tasks 1–5); **OpenCL equivalents** prove it
+  (Task 6). A feature with no passing kernel is incomplete. Kernels live under
   [`tests/regression/`](../../tests/regression/) (C++) and [`tests/opencl/`](../../tests/opencl/)
-  (Task 5), each as `{kernel.*, main.*, common.h, Makefile}`.
+  (Task 6), each as `{kernel.*, main.*, common.h, Makefile}`.
 - **120-second timeout cap** on every test invocation.
 - **`CONFIGS` must match on both sides** — rebuild the app with the same `-DVX_CFG_*` before
   running `blackbox.sh` (see §7).
@@ -147,23 +166,31 @@ Each new/changed SimX class names the single RTL module it will become:
 | `Socket` **removed**; L1I + dcache + L1 arbiter pushed into `Core` | `VX_socket.sv` **retired**; `VX_cache_cluster` + L1 arbiter move into `VX_core.sv` | Core |
 | `LocalMem` (SMEM) + `LocalMemSwitch`, core-resident | `VX_local_mem` + `VX_lmem_switch` in `VX_core.sv` | Core |
 | `DxaCore` relocated to `Core` | `VX_dxa_core` moved into `VX_core.sv` | Core |
-| `SmToSmNetwork` (`sim/simx/dsmem/`, pluggable topology backend) | `VX_smtosm_network` (parameterized module family, in `VX_cluster.sv`) | Cluster |
-| `Mbarrier` (shared-resident, Task 4) | `VX_mbarrier` (with the SMEM in `VX_core.sv`) | Core |
-| proxy-ordering port logic (Task 4) | proxy-order block at the SMEM port in `VX_core.sv` | Core |
+| `CtaResidencyTable` (`sim/simx/dsmem/`) | `VX_cta_table` (in `VX_cluster.sv`) | Cluster |
+| `DsmemLsuAdapter` + `LocalMem` remote port (`sim/simx/dsmem/`) | `VX_dsmem_lsu_adapter` + remote port in `VX_core.sv` | Core |
+| `Mbarrier` (shared-resident, Task 5) | `VX_mbarrier` (with the SMEM in `VX_core.sv`) | Core |
+| proxy-ordering port logic (Task 5) | proxy-order block at the SMEM port in `VX_core.sv` | Core |
 
 This is why façades are banned: a wrapper has no clean SV counterpart.
+
+**Modeling-infrastructure exemptions (deliberately outside the 1:1 discipline):**
+`IdealTransport` (`sim/simx/dsmem/`) is a fixed-delay connectivity placeholder, not a future SV
+module — the network it stands in for is *modeled*, not synthesized, by the Omelet co-simulator
+(Task 4). Likewise the Task-4 co-sim glue (`OmeletNocPort`, the gem5-side bridge SimObjects)
+is simulation infrastructure with no RTL counterpart; the RTL analog of a modeled NoC is a
+separate, later design activity informed by the Omelet studies.
 
 ## 7. Verification harness conventions (shared by all tasks)
 
 Build + run a single test on SimX (from `build/`):
 
 ```bash
-# C++ regression kernel (Tasks 1-4)
+# C++ regression kernel (Tasks 1-5)
 make -C tests/regression/<app> clean
 CONFIGS="-DVX_CFG_NUM_THREADS=32 -D<feature flags>" make -C tests/regression/<app>
 CONFIGS="-D<feature flags>" ./ci/blackbox.sh --driver=simx --app=<app> --cores=<N> --warps=64 --threads=32
 
-# OpenCL kernel (Task 5)
+# OpenCL kernel (Task 6)
 make -C tests/opencl/<app> run-simx
 ```
 
@@ -200,22 +227,29 @@ toy target** (§2); a smaller `NUM_WARPS` / smaller SMEM yields an equally valid
 - **SimX-as-oracle for the eventual RTL.** Per [`../../AGENTS.md`](../../AGENTS.md) §4, these
   SimX models will later anchor the RTL via trace diffing. Keep per-class trace dumps in mind
   while designing (cycle, SRAM addr+data, partition/bank, hazards).
+- **gem5 version skew (Task 4).** The `VortexGPGPU` gem5 device targets gem5 v25.0.0.1
+  (`VERSION`'s `GEM5_REV`); Omelet pins gem5 v22.1.0.0 (its Garnet patches apply against that
+  tag). The two trees coexist in the dev container, but the device needs a v22.1 compatibility
+  pass before Task 4's embedding works.
+- **Co-simulation reproducibility (Task 4).** A single event loop keeps SimX+Garnet
+  deterministic, but Garnet-side random arbitration must be fix-seeded, and `IDEAL` mode must
+  stay byte-identical so functional regressions never depend on the co-simulator.
 
 ## 9. Per-task deliverable flow
 
 For each task, in order: (1) re-read `AGENTS.md`; (2) update that task's proposal with the
 concrete SimX plan; (3) implement the SimX classes; (4) write the C++ verification kernel(s)
-(OpenCL for Task 5); (5) build and run in Docker; (6) only then start the next task. When a
+(OpenCL for Task 6); (5) build and run in Docker; (6) only then start the next task. When a
 task is implemented and merged, promote its proposal content into
 [`../designs/`](../designs/) per [`../../AGENTS.md`](../../AGENTS.md) §7.
 
 ## 10. Memory consistency — what's in and out of scope
 
 Vortex is a weakly-ordered RISC-V GPU with **no PTX/SASS-style memory scopes**. This is **not a
-blocker** for the **structural** tasks (1–3) or OpenCL (5), because the entire Hopper-SM feature
+blocker** for the **structural** tasks (1–4) or OpenCL (6), because the entire Hopper-SM feature
 set being reproduced is **scratchpad-centric and barrier/transaction-synchronized** — the regime
 where scopes stop being load-bearing for correctness. **Proxies are a separate axis from scopes,
-and the proxy half is deliberately scheduled as [Task 4](proxy_model_simx_proposal.md)** (see the
+and the proxy half is deliberately scheduled as [Task 5](proxy_model_simx_proposal.md)** (see the
 reconciliation below).
 
 - **Why it's orthogonal.** SMEM, DSMEM, the TMA/DXA destination, and the WGMMA operands are all
@@ -229,11 +263,11 @@ reconciliation below).
   `fence.proxy.async`** and the "WGMMA reads TMA-written SMEM" hazard is just a "is the tile
   present?" check gated by the lockstep owner (`VX_tcu_lockstep`). **This simplification is
   correct for the structural goal** — Tasks 1–3 rest on barriers, not proxy fences.
-- **Reconciliation — the proxy model is Task 4, additive.** [Task 4](proxy_model_simx_proposal.md)
+- **Reconciliation — the proxy model is Task 5, additive.** [Task 5](proxy_model_simx_proposal.md)
   **deliberately introduces** the two-proxy model (a `proxy` tag, a real `fence.proxy.async` for
   the generic→async crossing, byte-granular mbarrier completion) as a **fidelity layer on top of
   Tasks 1–3, not a correction of them**. So "do not port proxy machinery" applies *through Task
-  3*; Task 4 is exactly where it is ported, on purpose. **Proxies ≠ scopes**: Task 4 orders
+  3*; Task 5 is exactly where it is ported, on purpose. **Proxies ≠ scopes**: Task 5 orders
   datapath crossings; it does **not** build a scoped-visibility model.
 - **The one hard obligation.** The **DSMEM cluster barrier must drain *and* fence** (Task 3b
   acceptance): every remote scratchpad write before it has landed in the peer's core SMEM
@@ -242,5 +276,5 @@ reconciliation below).
 - **Explicitly out of scope (separate, additive work).** Faithfully reproducing **scoped**-
   consistency *behavior* — scope qualifiers, scope-tree visibility rules, scope-bounded ordering,
   or mis-scope failure modes — is a **different project** (a consistency-protocol study), **not
-  part of Tasks 1–5**. (The *proxy* half of the originally-parked item is now Task 4; the *scope*
+  part of Tasks 1–6**. (The *proxy* half of the originally-parked item is now Task 5; the *scope*
   half remains parked.) It must not be folded into the program.

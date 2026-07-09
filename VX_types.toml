@@ -389,6 +389,9 @@ VX_CSR_CTA_CLUSTER_SIZE = 0xCE0
 
 VX_CSR_CTA_ENTRY = 0xCE1  # kernel entry PC, supplied per-CTA by the KMU
 
+VX_CSR_CTA_CLUSTER_ID   = 0xCE2  # launch-wide CTA-cluster index
+VX_CSR_CTA_CLUSTER_RANK = 0xCE3  # this CTA's rank within its cluster
+
 [dcr_mpm_class]
 VX_DCR_MPM_CLASS_BASE   = 0
 VX_DCR_MPM_CLASS_CORE   = 1

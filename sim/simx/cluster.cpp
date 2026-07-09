@@ -17,6 +17,11 @@
 #include "constants.h"
 #include "types.h"
 #include "debug.h"
+#ifdef VX_CFG_CLUSTER_MEM_MODE_DSMEM
+#include "cta_residency_table.h"
+#include "ideal_transport.h"
+#include <unordered_map>
+#endif
 #ifdef VX_CFG_EXT_TEX_ENABLE
 #include "tex_core.h"
 #include "tex_unit.h"
@@ -41,6 +46,9 @@ public:
     : simobject_(simobject)
     , cores_(VX_CFG_NUM_CORES)
     , gbarriers_(VX_CFG_NUM_BARRIERS)
+#ifdef VX_CFG_CLUSTER_MEM_MODE_DSMEM
+    , cta_table_(VX_CFG_CTA_TABLE_SIZE)
+#endif
   {
     const std::string& name = simobject_->name();
     char sname[100];
@@ -115,6 +123,22 @@ public:
       }
     }
 #endif // any L2-sharing extension
+
+#ifdef VX_CFG_CLUSTER_MEM_MODE_DSMEM
+    // ── SM-to-SM transport: cross-core LMEM connectivity (DSMEM mode) ──────
+    // Purely additive to the global path: shared-memory traffic between cores
+    // rides this transport; global traffic keeps the L2/bypass path above.
+    // IdealTransport is a fixed-delay placeholder — NoC modeling is delegated
+    // to the Omelet co-simulator (roadmap Task 4).
+    snprintf(sname, 100, "%s-dsmem-transport", name.c_str());
+    dsmem_transport_ = IdealTransport::Create(sname, cores_per_cluster);
+    for (uint32_t i = 0; i < cores_per_cluster; ++i) {
+      cores_.at(i)->dsmem_req_out.at(0).bind(&dsmem_transport_->ReqIn.at(i));
+      dsmem_transport_->RspOut.at(i).bind(&cores_.at(i)->dsmem_rsp_in.at(0));
+      dsmem_transport_->ReqOut.at(i).bind(&cores_.at(i)->dsmem_remote_req_in.at(0));
+      cores_.at(i)->dsmem_remote_rsp_out.at(0).bind(&dsmem_transport_->RspIn.at(i));
+    }
+#endif
 
 #ifdef VX_CFG_EXT_TEX_ENABLE
     // ── Cluster-shared TEX engine + tcache ──────────────────────────────
@@ -296,6 +320,10 @@ public:
     for (auto& gbar : gbarriers_) {
       gbar.reset();
     }
+#ifdef VX_CFG_CLUSTER_MEM_MODE_DSMEM
+    cta_table_.reset();
+    cbar_arrivals_.clear();
+#endif
     // Cores are SimObjects; reset by SimPlatform.
   }
 
@@ -338,6 +366,28 @@ public:
       gbar.mask.reset();
     }
   }
+
+#ifdef VX_CFG_CLUSTER_MEM_MODE_DSMEM
+  void cluster_barrier_arrive(uint32_t cluster_id, uint32_t bar_id) {
+    uint32_t expected = cta_table_.num_ranks(cluster_id);
+    assert(expected != 0 && "cluster barrier arrival for a non-resident cluster");
+    uint64_t key = (uint64_t(cluster_id) << 32) | (bar_id & 0x3fffffff);
+    uint32_t arrived = ++cbar_arrivals_[key];
+    DT(4, "*** Cluster-barrier arrive: cluster #" << simobject_->id()
+       << ", cta-cluster #" << cluster_id << " at barrier #" << bar_id
+       << ", arrived=" << arrived << "/" << expected);
+    if (arrived == expected) {
+      cbar_arrivals_.erase(key);
+      uint64_t participants = cta_table_.participant_mask(cluster_id);
+      uint32_t cores_per_cluster = cores_.size();
+      for (uint32_t i = 0; i < cores_per_cluster; ++i) {
+        if (participants & (1ull << cores_.at(i)->id())) {
+          cores_.at(i)->cluster_barrier_resume(bar_id);
+        }
+      }
+    }
+  }
+#endif
 
   Cluster::PerfStats perf_stats() const {
     Cluster::PerfStats perf_stats;
@@ -458,10 +508,20 @@ public:
   RasterCore::Ptr& raster_core() { return raster_core_; }
 #endif
 
+#ifdef VX_CFG_CLUSTER_MEM_MODE_DSMEM
+  CtaResidencyTable* cta_table() { return &cta_table_; }
+#endif
+
 private:
   Cluster*                    simobject_;
   std::vector<Core::Ptr>      cores_;
   std::vector<core_barrier_t> gbarriers_;
+#ifdef VX_CFG_CLUSTER_MEM_MODE_DSMEM
+  CtaResidencyTable           cta_table_;
+  IdealTransport::Ptr         dsmem_transport_;
+  // (cluster_id, bar_index) → rank arrivals for in-flight cluster barriers.
+  std::unordered_map<uint64_t, uint32_t> cbar_arrivals_;
+#endif
   Cache::Ptr                  l2cache_;
 #ifdef VX_CFG_EXT_TEX_ENABLE
   TexCore::Ptr                tex_core_;
@@ -532,6 +592,16 @@ int Cluster::dcr_read(uint32_t addr, uint32_t tag, uint32_t* value) {
 Core* Cluster::get_core(uint32_t idx) const {
   return impl_->get_core(idx);
 }
+
+#ifdef VX_CFG_CLUSTER_MEM_MODE_DSMEM
+CtaResidencyTable* Cluster::cta_table() const {
+  return impl_->cta_table();
+}
+
+void Cluster::cluster_barrier_arrive(uint32_t cluster_id, uint32_t bar_id) {
+  impl_->cluster_barrier_arrive(cluster_id, bar_id);
+}
+#endif
 
 void Cluster::dcache_flush_begin() {
   impl_->dcache_flush_begin();

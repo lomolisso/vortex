@@ -22,6 +22,9 @@
 #include "mem_block_pool.h"
 #include "debug.h"
 #include "constants.h"
+#ifdef VX_CFG_CLUSTER_MEM_MODE_DSMEM
+#include "cta_residency_table.h"
+#endif
 
 using namespace vortex;
 
@@ -493,9 +496,36 @@ private:
     auto& s = w.inflight[slot];
     if (!s.rsp_arrived) return; // wait
 
+    // Resolve this replay's destination before touching any channel: under
+    // DSMEM mode, multicast receivers come from the CTA residency table
+    // (rank → core/slot/slice), so a replica may leave over the SM-to-SM
+    // network instead of the local LMEM port.
+    uint32_t cta_warp_idx = 0;
+    if (w.is_multicast) {
+      cta_warp_idx = w.cta_indices.at(w.mc_cta_idx);
+    }
+#ifdef VX_CFG_CLUSTER_MEM_MODE_DSMEM
+    const CtaResidencyTable::RankSlot* dest_slot = nullptr;
+    const CtaResidencyTable::RankSlot* issuer_slot = nullptr;
+    bool remote = false;
+    if (w.is_multicast) {
+      auto* table = w.req.core->cluster()->cta_table();
+      dest_slot   = table->resolve(w.req.cluster_id, cta_warp_idx);
+      issuer_slot = table->resolve(w.req.cluster_id, w.req.cluster_rank);
+      // The kernel's pre-issue rendezvous (cluster barrier) guarantees every
+      // receiver is resident before the multicast fires.
+      assert(dest_slot != nullptr && issuer_slot != nullptr
+             && "DXA multicast to a non-resident cluster rank");
+      remote = (dest_slot->core_id != w.req.core->id());
+    }
+    auto& lmem_ch = remote ? simobject_->dsmem_req_out.at(0)
+                           : simobject_->lmem_req_out.at(0);
+    if (lmem_ch.full()) return; // backpressure
+#else
     // Per-core DXA: the single LMEM write port targets this core's own SMEM.
     auto& lmem_ch = simobject_->lmem_req_out.at(0);
     if (lmem_ch.full()) return; // backpressure
+#endif
 
     const LineWork& lw = s.work;
 
@@ -530,11 +560,21 @@ private:
     req.data = blk;
 
     // For multicast, replay across cta_indices; for single, dest = req.smem_addr.
-    uint32_t cta_warp_idx = 0;
+#ifdef VX_CFG_CLUSTER_MEM_MODE_DSMEM
     if (w.is_multicast) {
-      cta_warp_idx = w.cta_indices.at(w.mc_cta_idx);
+      // Rebase the issuer-relative tile offset onto the receiver rank's own
+      // slice (residency-table addressing — no contiguity assumption).
+      req.addr = dest_slot->lmem_base + (lw.smem_word_addr - issuer_slot->lmem_base);
+      if (remote) {
+        req.flags.dsmem_remote = 1;
+        req.flags.dsmem_target = dest_slot->core_id % VX_CFG_NUM_CORES;
+      }
+    }
+#else
+    if (w.is_multicast) {
       req.addr += uint64_t(cta_warp_idx) * w.smem_stride;
     }
+#endif
 
     // Set notify_done flag on the LAST LMEM write of the transfer (or
     // last per-CTA replay of the last work item under multicast). The
@@ -545,7 +585,16 @@ private:
     bool is_last_replay = !w.is_multicast || (w.mc_cta_idx + 1 == w.cta_indices.size());
     if (is_last_work && (w.is_multicast || is_last_replay)) {
       req.flags.dxa_notify_done   = 1;
+#ifdef VX_CFG_CLUSTER_MEM_MODE_DSMEM
+      // Per-receiver completion targets the receiver's OWN local bar slot
+      // (from the residency table) — the +cta_idx arithmetic assumes the
+      // issuer core's sequential slots and breaks across cores.
+      req.flags.dxa_notify_bar_id = w.is_multicast
+          ? ((w.req.bar_id & ~0xffu) | dest_slot->cta_slot)
+          : w.req.bar_id;
+#else
       req.flags.dxa_notify_bar_id = w.req.bar_id + (w.is_multicast ? cta_warp_idx : 0u);
+#endif
     }
 
     lmem_ch.send(req);
@@ -569,6 +618,19 @@ private:
     // bar_id is RAW (encoded); decode at release call site.
     if (w.is_multicast) {
       for (uint32_t cta : w.cta_indices) {
+#ifdef VX_CFG_CLUSTER_MEM_MODE_DSMEM
+        // Error path (invalid descriptor / empty transfer): release each
+        // receiver's own barrier on its own core when it is resident;
+        // otherwise fall back to the issuer-local release.
+        auto* slot = w.req.core->cluster()->cta_table()->resolve(w.req.cluster_id, cta);
+        if (slot != nullptr) {
+          uint32_t raw = (w.req.bar_id & ~0xffu) | slot->cta_slot;
+          uint32_t decoded = bar_decode_id(raw, VX_CFG_NUM_BARRIERS);
+          uint32_t local = slot->core_id % VX_CFG_NUM_CORES;
+          w.req.core->cluster()->get_core(local)->barrier_event_release(decoded);
+          continue;
+        }
+#endif
         uint32_t decoded = bar_decode_id(w.req.bar_id + cta, VX_CFG_NUM_BARRIERS);
         w.req.core->barrier_event_release(decoded);
       }
@@ -617,6 +679,9 @@ DxaCore::DxaCore(const SimContext& ctx, const char* name, Core* core)
   , gmem_req_out(kDxaMemPorts, this)
   , gmem_rsp_in(kDxaMemPorts, this)
   , lmem_req_out(1, this)
+#ifdef VX_CFG_CLUSTER_MEM_MODE_DSMEM
+  , dsmem_req_out(1, this)
+#endif
 {
   __unused(core);
 

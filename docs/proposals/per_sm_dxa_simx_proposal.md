@@ -51,7 +51,7 @@ regression to apologize for. The faithful cross-SM data movement (DSMEM addressi
 multicast) is rebuilt on an explicit SM-to-SM network in [Task 3](dsmem_smtosm_simx_proposal.md).
 
 The core-resident DXA established here is also the **async-proxy agent** of the two-proxy
-model: [Task 4](proxy_model_simx_proposal.md) tags its core-SMEM writes as the async proxy
+model: [Task 5](proxy_model_simx_proposal.md) tags its core-SMEM writes as the async proxy
 (vs the generic LSU proxy) and defines the generic↔async crossing contract. No proxy logic is
 added in Task 2 — this only notes which agent the DXA becomes.
 

@@ -1,11 +1,11 @@
-# Task 4 — Proxy Model and Async-Proxy Instruction Support — SimX Proposal
+# Task 5 — Proxy Model and Async-Proxy Instruction Support — SimX Proposal
 
 **Status:** proposal (pre-implementation). **Scope:** SimX
 ([`sim/simx/`](../../sim/simx/)) + the instruction surface in [`sw/`](../../sw/) under the
 `sw`/`sim` isolation boundary. Part of the
-[Toy-H100 SimX Roadmap](toy_h100_simx_roadmap_proposal.md); this is **Task 4**, inserted after
+[Toy-H100 SimX Roadmap](toy_h100_simx_roadmap_proposal.md); this is **Task 5**, inserted after
 [Task 3](dsmem_smtosm_simx_proposal.md) (DSMEM / SM-to-SM network) and before
-[OpenCL (now Task 5)](opencl_feature_enablement_proposal.md).
+[OpenCL (now Task 6)](opencl_feature_enablement_proposal.md).
 
 **Goal:** model PTX's **two-proxy memory model** — the **generic proxy** (ordinary LSU
 load/store/atomic) and the **async proxy** (the TMA / DXA bulk-copy path) — and the instruction

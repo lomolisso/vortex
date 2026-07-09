@@ -95,6 +95,51 @@ private:
   uint32_t num_cores_;
 };
 
+// CTA-cluster barrier (DSMEM mode): synchronizes all CTAs of one CTA cluster
+// even when they reside on different cores. Each rank's warps arrive locally
+// (num_warps = warps per CTA); rank arrivals then aggregate at the cluster
+// level against the residency table and every participant resumes together.
+// Arrival DRAINS the warp's outstanding remote (DSMEM) stores — every
+// vx_st_cluster issued before the barrier has landed in the peer's scratchpad
+// when it releases — and, being the warp's sole suspension point, FENCES
+// post-barrier reads behind it. Bit 30 flags the cluster scope; the low byte
+// carries the cluster id so concurrent clusters use distinct hardware slots.
+class cluster_barrier {
+public:
+  cluster_barrier(uint32_t id, uint32_t num_warps = get_num_sub_groups()) {
+    // The low byte indexes hardware slots like a local CTA id does, so it
+    // must stay below NUM_WARPS; concurrently-resident clusters are far fewer
+    // (the residency table), so the modulo cannot alias two live clusters.
+    bar_id_ = (id << 8) | (get_cluster_id() % vx_num_warps()) | 0x40000000;
+    num_warps_ = num_warps;
+  }
+
+  uint32_t arrive() {
+    return vx_barrier_arrive(bar_id_, num_warps_);
+  }
+
+  void wait(uint32_t phase) {
+    vx_barrier_wait(bar_id_, phase);
+  }
+
+  void arrive_and_wait() {
+    vx_barrier(bar_id_, num_warps_);
+  }
+
+  // Pre-register expected async transactions (e.g. a DXA multicast slice
+  // landing in this rank's scratchpad) that must complete before this rank's
+  // arrival escalates.
+  void expect_tx(uint32_t count = 1) {
+    vx_barrier_expect_tx(bar_id_, count);
+  }
+
+  uint32_t id() const { return bar_id_; }
+
+private:
+  uint32_t bar_id_;
+  uint32_t num_warps_;
+};
+
 // Cross-CTA barrier for all CTAs in a local group (same core/cluster).
 // Unlike `barrier`, the bar slot does NOT embed the caller's CTA id, so
 // all CTAs sharing the same id/num_peers use one hardware bar_unit slot.

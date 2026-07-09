@@ -116,6 +116,8 @@ Word CsrUnit::get_csr(uint32_t addr, uint32_t wid, uint32_t tid) {
   case VX_CSR_CTA_ENTRY:       return warp.cta_csrs.entry;
   case VX_CSR_CTA_LMEM_ADDR:   return warp.cta_csrs.lmem_addr;
   case VX_CSR_CTA_CLUSTER_SIZE: return warp.cta_csrs.cluster_size;
+  case VX_CSR_CTA_CLUSTER_ID:   return warp.cta_csrs.cluster_id;
+  case VX_CSR_CTA_CLUSTER_RANK: return warp.cta_csrs.cluster_rank;
 
 #ifdef VX_CFG_EXT_RASTER_ENABLE
   case VX_CSR_RASTER_POS_MASK:  return raster_csrs_.at(wid).at(tid).pos_mask;

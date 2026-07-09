@@ -32,6 +32,9 @@ namespace vortex {
 
 class ProcessorImpl;
 class Core;
+#ifdef VX_CFG_CLUSTER_MEM_MODE_DSMEM
+class CtaResidencyTable;
+#endif
 
 class Cluster : public SimObject<Cluster> {
 public:
@@ -74,6 +77,13 @@ public:
 
   void global_barrier_arrive(uint32_t bar_id, uint32_t count, uint32_t core_id);
 
+#ifdef VX_CFG_CLUSTER_MEM_MODE_DSMEM
+  // CTA-cluster barrier: accumulate rank arrivals for (cluster_id, bar_id);
+  // when all of the cluster's ranks (from the residency table) have arrived,
+  // broadcast-resume the participant cores.
+  void cluster_barrier_arrive(uint32_t cluster_id, uint32_t bar_id);
+#endif
+
   PerfStats perf_stats() const;
 
   int dcr_write(uint32_t addr, uint32_t value);
@@ -81,6 +91,12 @@ public:
   int dcr_read(uint32_t addr, uint32_t tag, uint32_t* value);
 
   class Core* get_core(uint32_t idx) const;
+
+#ifdef VX_CFG_CLUSTER_MEM_MODE_DSMEM
+  // CTA-cluster residency table (rank → core/LMEM-base); written by the
+  // per-core CtaDispatchers, read by the DSMEM/DXA/cluster-barrier paths.
+  CtaResidencyTable* cta_table() const;
+#endif
 
   // Cache flush walk. ProcessorImpl ticks in level order (L1 in parallel
   // → L2 → L3) to avoid downstream evictions racing the next-level walk.
