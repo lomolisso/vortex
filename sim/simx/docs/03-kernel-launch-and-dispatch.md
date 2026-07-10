@@ -105,7 +105,7 @@ classification of these LMEM bytes is in doc [15](15-memory-protocol-and-types.m
 
 ### 4.2b DSMEM mode: gang placement + the residency table
 
-Under `VX_CFG_CLUSTER_MEM_MODE_DSMEM` (the Toy-H100 DSMEM mode), real CTA clusters
+Under `VX_CFG_DSMEM_ENABLE` (the Toy-H100 DSMEM mode), real CTA clusters
 (K > 1) are **gang-placed** (the Hopper cluster-work-distributor analog): the peek-phase gate
 admits rank r of cluster c only on core `(c + r) % cores`; other cores leave the CTA on the KMU
 bus for its owner. Each admitted rank is recorded in the cluster's **`CtaResidencyTable`**

@@ -32,6 +32,7 @@ uint32_t tiles[DXA_MAX_DIMS] = {4, 4, 1, 1, 1};
 
 vx_device_h device = nullptr;
 vx_buffer_h src_buffer = nullptr;
+vx_buffer_h dst_buffer = nullptr;
 vx_queue_h  queue = nullptr;
 vx_module_h module_ = nullptr;
 vx_kernel_h kernel = nullptr;
@@ -91,6 +92,7 @@ static void parse_args(int argc, char** argv) {
 void cleanup() {
   if (device) {
     if (src_buffer) vx_buffer_release(src_buffer);
+    if (dst_buffer) vx_buffer_release(dst_buffer);
     if (kernel)  vx_kernel_release(kernel);
     if (module_) vx_module_release(module_);
     if (queue)   vx_queue_release(queue);
@@ -172,6 +174,11 @@ int main(int argc, char* argv[]) {
     h_src[i] = static_cast<TYPE>(i + 1);
   RT_CHECK(vx_enqueue_write(queue, src_buffer, 0, h_src.data(), buf_size, 0, nullptr, nullptr));
 
+  // Copy-back buffer: the kernel writes each landed tile element out; the
+  // host verifies dst == src (byte-correctness of the whole tiled copy).
+  RT_CHECK(vx_buffer_create(device, buf_size, VX_MEM_WRITE, &dst_buffer));
+  RT_CHECK(vx_buffer_address(dst_buffer, &kernel_arg.dst_addr));
+
 #ifdef VX_CFG_EXT_DXA_ENABLE
   // Program DXA descriptor for N-D source tile.
   constexpr uint32_t kDescSrc = 0;
@@ -236,11 +243,29 @@ int main(int argc, char* argv[]) {
     li.lmem_size    = local_mem;
     RT_CHECK(vx_enqueue_launch(queue, &li, 0, nullptr, &launch_ev));
   }
-  RT_CHECK(vx_event_wait_value(launch_ev, 1, VX_TIMEOUT_INFINITE));
+  std::vector<TYPE> h_dst(total_elems, static_cast<TYPE>(0));
+  vx_event_h read_ev = nullptr;
+  RT_CHECK(vx_enqueue_read(queue, h_dst.data(), dst_buffer, 0, buf_size, 1, &launch_ev, &read_ev));
+  RT_CHECK(vx_event_wait_value(read_ev, 1, VX_TIMEOUT_INFINITE));
+  vx_event_release(read_ev);
   vx_event_release(launch_ev);
 
-  std::cout << "PASSED\n";
+  // Verify the copied-back bytes against the source.
+  int errors = 0;
+  for (uint32_t i = 0; i < total_elems; ++i) {
+    if (h_dst[i] != h_src[i]) {
+      if (errors < 20)
+        printf("*** error: elem=%u expected=%f actual=%f\n", i,
+               (double)h_src[i], (double)h_dst[i]);
+      ++errors;
+    }
+  }
 
   cleanup();
+  if (errors) {
+    std::cout << "FAILED (" << errors << " errors)\n";
+    return errors;
+  }
+  std::cout << "PASSED\n";
   return 0;
 }

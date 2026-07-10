@@ -389,7 +389,7 @@ void LsuUnit::process_request_step(uint32_t b) {
 		lsu_req.cid  = trace->cid;
 		lsu_req.uuid = trace->uuid;
 
-	#ifdef VX_CFG_CLUSTER_MEM_MODE_DSMEM
+	#ifdef VX_CFG_DSMEM_ENABLE
 		// Count remote (DSMEM) store lanes at issue — the earliest post-retire
 		// point — so a cluster-barrier arrive on the next instruction already
 		// sees the drain obligation; the peer LMEM's ack releases it.

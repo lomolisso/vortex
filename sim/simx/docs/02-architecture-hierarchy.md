@@ -1,9 +1,10 @@
 # 02 — Architecture Hierarchy
 
-**Scope:** the five nesting levels of the simulated machine — **Platform → Processor → Cluster →
-Socket → Core** — what each level owns, how they are wired with `SimChannel`s, how the per-cycle
-clock actually advances them, and how the `VX_CFG_*` counts drive instantiation. Sources:
-[`../processor.cpp`](../processor.cpp), [`../cluster.h`](../cluster.h), [`../socket.h`](../socket.h),
+**Scope:** the four nesting levels of the simulated machine — **Platform → Processor → Cluster →
+Core** (the former `Socket` level was removed; **core == SM**) — what each level owns, how they
+are wired with `SimChannel`s, how the per-cycle clock actually advances them, and how the
+`VX_CFG_*` counts drive instantiation. Sources:
+[`../processor.cpp`](../processor.cpp), [`../cluster.h`](../cluster.h),
 [`../core.h`](../core.h), [`../constants.h`](../constants.h). Prereq: [01](01-simulation-framework.md).
 
 ---
@@ -14,9 +15,10 @@ clock actually advances them, and how the `VX_CFG_*` counts drive instantiation.
 SimPlatform                      the event wheel + clock (doc 01)
 └─ Processor / ProcessorImpl     processor.cpp — owns: Kmu, clusters[], L3 cache, Memory(DRAM)
    ├─ Kmu                        kernel grid walker (doc 03)
-   ├─ Cluster  × NUM_CLUSTERS    cluster.cpp — owns: L2 cache, extension engines (DXA/TEX/OM/RASTER)
-   │  └─ Socket × NUM_SOCKETS    socket.cpp  — owns: I-cache, D-cache (CacheCluster), L1 arbiter
-   │     └─ Core × SOCKET_SIZE   core.cpp    — owns: Scheduler, FUs, regfile/CSR, LocalMem, barriers, TCU
+   ├─ Cluster  × NUM_CLUSTERS    cluster.cpp — owns: L2 cache, extension engines (TEX/OM/RASTER),
+   │  │                                        DSMEM SM-to-SM transport (when enabled)
+   │  └─ Core × NUM_CORES        core.cpp    — owns: Scheduler, FUs, regfile/CSR, I-cache, D-cache,
+   │                                           L1 arbiter, LocalMem (SMEM), barriers, TCU, DxaCore
    ├─ L3 cache                   the LLC when enabled, else a transparent bypass arbiter
    └─ Memory ("dram")            the DRAM timing model
 ```
@@ -24,7 +26,7 @@ SimPlatform                      the event wheel + clock (doc 01)
 Every box is a `SimObject` (doc [01](01-simulation-framework.md)); every arrow between boxes is a
 pair of `SimChannel<MemReq>` / `SimChannel<MemRsp>` (doc [15](15-memory-protocol-and-types.md)).
 
-> **pImpl everywhere.** `Cluster`, `Socket`, and `Core` each expose a thin public header and hide
+> **pImpl everywhere.** `Cluster` and `Core` each expose a thin public header and hide
 > the real child-instantiation + channel-binding inside a private `class Impl; Impl* impl_;`
 > (e.g. [`cluster.h:127`](../cluster.h#L127), [`core.h:167`](../core.h#L167)). When you want to
 > see *how* children are created and wired, read the `Impl` constructor in the corresponding
@@ -70,7 +72,7 @@ spurious failure, not success). See doc [12](12-cache-architecture.md) for the A
 
 ## 3. The per-cycle clock — how levels actually advance
 
-A common misconception is that `ProcessorImpl` ticks clusters → sockets → cores in order. It does
+A common misconception is that `ProcessorImpl` ticks clusters → cores in order. It does
 **not**. `ProcessorImpl::cycle()` ([`:251`](../processor.cpp#L251)) is just:
 
 ```cpp
@@ -106,32 +108,29 @@ is a no-op on write-through caches (`Cache::flush_begin` early-exits, doc 12).
 ### 3.3 Device Control Registers (DCR)
 
 `dcr_write` ([`:266`](../processor.cpp#L266)) routes **KMU DCRs** (`VX_DCR_KMU_STATE_BEGIN..END`)
-to the KMU and **broadcasts everything else to every cluster** (which fans to sockets→cores).
+to the KMU and **broadcasts everything else to every cluster** (which fans to its cores).
 `dcr_read` ([`:281`](../processor.cpp#L281)) special-cases the cache-flush address. This is the
 host→device configuration channel; see doc [03](03-kernel-launch-and-dispatch.md) for the kernel
 descriptor DCRs and doc [21](21-host-runtime-and-external-sim.md) for who writes them.
 
 ---
 
-## 4. Cluster, Socket, Core — ownership
+## 4. Cluster, Core — ownership
 
 ### 4.1 `Cluster` ([`../cluster.h`](../cluster.h))
-Owns the **L2 cache** and the **cluster-shared extension engines** — DXA, TEX, OM, RASTER — each
-behind a `VX_CFG_EXT_*` gate ([`cluster.h:39-56`](../cluster.h#L39), reflected in `PerfStats`).
-Exposes `mem_req_out`/`mem_rsp_in` (to L3), `running()`, `get_exitcode()`,
-`global_barrier_arrive()`, the per-level flush hooks, and `dxa_core()`/`raster_core()` accessors so
-per-core SFUs can dispatch to the shared engines. (TCU is **per-core**, not here — doc 17.)
+Owns the **L2 cache**, the **cluster-shared extension engines** — TEX, OM, RASTER — each behind a
+`VX_CFG_EXT_*` gate (reflected in `PerfStats`), and, when `VX_CFG_DSMEM_ENABLE` is set, the
+**DSMEM machinery**: the `CtaResidencyTable` and the SM-to-SM `IdealTransport` (docs 03 §4.2b,
+13 §2). Exposes `mem_req_out`/`mem_rsp_in` (to L3), `running()`, `get_exitcode()`,
+`global_barrier_arrive()`, the per-level flush hooks, and `raster_core()` accessors so per-core
+SFUs can dispatch to the shared engines. (TCU and DXA are **per-core**, not here — doc 17.)
 
-### 4.2 `Socket` ([`../socket.h`](../socket.h))
-Owns the per-socket **I-cache and D-cache** (each a `CacheCluster`, doc 12) and the **L1 arbiter**
-merging them toward L2 (icache prioritized). Exposes `mem_req_out`/`mem_rsp_in` (to the cluster's
-L2), `core(idx)`, and `global_barrier_arrive`/`global_barrier_resume` (the cross-core barrier
-cascade, doc 09). `PerfStats` = `{icache, dcache}`.
-
-### 4.3 `Core` ([`../core.h`](../core.h))
-The big one. Owns the `Scheduler`, all functional units (`SfuUnit`, `TcuUnit`, …), the register
-file/`CsrUnit`, `LocalMem` + `LocalMemSwitch` + `MemCoalescer`, and the barrier machinery. Exposes
-`icache_req_out`/`dcache_req_out` channel arrays, the rich `PerfStats` struct
+### 4.2 `Core` ([`../core.h`](../core.h))
+The big one — **the SM**. Owns the `Scheduler`, all functional units (`SfuUnit`, `TcuUnit`, …),
+the register file/`CsrUnit`, the **I-cache and D-cache** (single-input `CacheCluster`s, doc 12)
+plus the **L1 arbiter** merging them toward L2 (icache prioritized), `LocalMem` (SMEM) +
+`LocalMemSwitch` + `MemCoalescer`, the per-core `DxaCore` (doc 17), and the barrier machinery.
+Exposes `mem_req_out`/`mem_rsp_in` (the post-L1 path to L2), the rich `PerfStats` struct
 ([`core.h:37-70`](../core.h#L37)) that powers doc [19](19-profiling-and-perf-counters.md), the
 barrier API (`barrier_arrive`/`barrier_wait`/`barrier_event_attach`/`barrier_event_release`,
 doc 09), `wspawn`/`setTmask`, and DTM debug accessors (doc 20). Its internals are documented across
@@ -145,8 +144,7 @@ All derived in [`../constants.h`](../constants.h):
 
 | Quantity | Formula | Source |
 |---|---|---|
-| Sockets per cluster grouping | `NUM_SOCKETS = up(NUM_CORES / SOCKET_SIZE)` | [`:61`](../constants.h#L61) |
-| L2 input ports | `L2_NUM_REQS = NUM_SOCKETS * L1_MEM_PORTS` | [`:63`](../constants.h#L63) |
+| L2 input ports | `L2_NUM_REQS = NUM_CORES * L1_MEM_PORTS` | [`constants.h`](../constants.h) |
 | L3 input ports | `L3_NUM_REQS = NUM_CLUSTERS * L2_MEM_PORTS` | [`:64`](../constants.h#L64) |
 | Warps per issue slot | `PER_ISSUE_WARPS = NUM_WARPS / ISSUE_WIDTH` | [`:66`](../constants.h#L66) |
 | LSU request fan | `LSU_NUM_REQS = NUM_LSU_BLOCKS * NUM_LSU_LANES` | [`:54`](../constants.h#L54) |

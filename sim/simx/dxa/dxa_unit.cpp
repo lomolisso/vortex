@@ -15,7 +15,7 @@
 #include "core.h"
 #include "constants.h"
 #include "debug.h"
-#ifdef VX_CFG_CLUSTER_MEM_MODE_DSMEM
+#ifdef VX_CFG_DSMEM_ENABLE
 #include "scheduler.h"
 #endif
 
@@ -59,7 +59,7 @@ instr_trace_t* DxaUnit::process(instr_trace_t* trace) {
   req.cta_mask  = cta_mask;
   req.smem_addr = smem_addr;
   for (int i = 0; i < 5; ++i) req.coords[i] = coords[i];
-#ifdef VX_CFG_CLUSTER_MEM_MODE_DSMEM
+#ifdef VX_CFG_DSMEM_ENABLE
   {
     auto& csrs = core_->scheduler().warp(trace->wid).cta_csrs;
     req.cluster_id   = csrs.cluster_id;

@@ -43,7 +43,7 @@
 #include "processor_impl.h"
 #include "kmu.h"
 #include "constants.h"
-#ifdef VX_CFG_CLUSTER_MEM_MODE_DSMEM
+#ifdef VX_CFG_DSMEM_ENABLE
 #include "dsmem_lsu_adapter.h"
 #endif
 #include "debug.h"
@@ -77,7 +77,7 @@ public:
     , func_units_((uint32_t)FUType::Count)
     , lmem_switch_(VX_CFG_NUM_LSU_BLOCKS)
     , mem_coalescers_(VX_CFG_NUM_LSU_BLOCKS)
-#ifdef VX_CFG_CLUSTER_MEM_MODE_DSMEM
+#ifdef VX_CFG_DSMEM_ENABLE
     , dsmem_lsu_adapters_(VX_CFG_NUM_LSU_BLOCKS)
     , dsmem_store_pending_(VX_CFG_NUM_WARPS, 0)
     , dsmem_drain_bar_(VX_CFG_NUM_WARPS, kDrainDisarmed)
@@ -157,7 +157,7 @@ public:
 #endif
 
     // merge icache + dcache traffic onto the core's outgoing memory ports
-    // (icache prioritized), exactly as the socket used to. With DXA enabled,
+    // (icache prioritized). With DXA enabled,
     // the demand sink is the L1→L2 arbiter's row-0 input (above DXA); without
     // it, the demand binds straight to the core's mem_req_out.
     uint32_t overlap = __MIN(VX_CFG_ICACHE_MEM_PORTS, VX_CFG_L1_MEM_PORTS);
@@ -241,7 +241,7 @@ public:
     // create local memory.
     snprintf(sname, 100, "%s-lmem", name.c_str());
     uint32_t lmem_num_reqs = LSU_NUM_REQS + VX_CFG_EXT_TCU_ENABLED + VX_CFG_EXT_DXA_ENABLED;
-#ifdef VX_CFG_CLUSTER_MEM_MODE_DSMEM
+#ifdef VX_CFG_DSMEM_ENABLE
     lmem_num_reqs += 1; // remote port: peers' DSMEM/DXA traffic via the SM-to-SM network
 #endif
     local_mem_ = LocalMem::Create(sname, LocalMem::Config{
@@ -415,7 +415,7 @@ public:
     }
   #endif
 
-  #ifdef VX_CFG_CLUSTER_MEM_MODE_DSMEM
+  #ifdef VX_CFG_DSMEM_ENABLE
     // ── SM-to-SM (DSMEM) plumbing ──────────────────────────────────────────
     // Ingress: the cluster network delivers peers' requests into this core's
     // LocalMem remote port (the last port), arbitrated with local LSU/TCU/DXA
@@ -486,7 +486,7 @@ public:
 
     std::fill(ibuf_inflight_.begin(), ibuf_inflight_.end(), 0);
 
-#ifdef VX_CFG_CLUSTER_MEM_MODE_DSMEM
+#ifdef VX_CFG_DSMEM_ENABLE
     std::fill(dsmem_store_pending_.begin(), dsmem_store_pending_.end(), 0);
     std::fill(dsmem_drain_bar_.begin(), dsmem_drain_bar_.end(), kDrainDisarmed);
 #endif
@@ -494,7 +494,7 @@ public:
     perf_stats_ = PerfStats();
   }
 
-#ifdef VX_CFG_CLUSTER_MEM_MODE_DSMEM
+#ifdef VX_CFG_DSMEM_ENABLE
   void dsmem_store_inc(uint32_t wid) {
     ++dsmem_store_pending_.at(wid);
   }
@@ -988,7 +988,7 @@ public:
   }
 
   int dcr_read(uint32_t addr, uint32_t tag, uint32_t* value) {
-    // tag arrives as (mpm_class << 6) | mpm_tag_idx after socket strips core_id
+    // tag arrives as (mpm_class << 6) | mpm_tag_idx after the cluster strips core_id
     switch (addr) {
     case VX_DCR_BASE_CACHE_FLUSH:
       *value = 0;
@@ -1107,7 +1107,7 @@ private:
   DxaCore::Ptr      dxa_core_;    // per-core (per-SM) async-copy engine
   MemArbiter::Ptr   dxa_l2_arb_;  // L1→L2 arbiter: demand (row 0) > DXA (row 1)
 #endif
-#ifdef VX_CFG_CLUSTER_MEM_MODE_DSMEM
+#ifdef VX_CFG_DSMEM_ENABLE
   static constexpr uint32_t kDrainDisarmed = 0xffffffffu;
   MemArbiter::Ptr   dsmem_egress_arb_;  // LSU remote rows > DXA fan-out row
   std::vector<DsmemLsuAdapter::Ptr> dsmem_lsu_adapters_;
@@ -1160,7 +1160,7 @@ Core::Core(const SimContext& ctx,
   , dcache_rsp_in(VX_CFG_DCACHE_NUM_REQS, this)
   , mem_req_out(VX_CFG_L1_MEM_PORTS, this)
   , mem_rsp_in(VX_CFG_L1_MEM_PORTS, this)
-#ifdef VX_CFG_CLUSTER_MEM_MODE_DSMEM
+#ifdef VX_CFG_DSMEM_ENABLE
   , dsmem_req_out(1, this)
   , dsmem_rsp_in(1, this)
   , dsmem_remote_req_in(1, this)
@@ -1223,7 +1223,7 @@ void Core::barrier_event_release(uint32_t bar_id) {
   impl_->scheduler()->barrier_unit().event_release(bar_id);
 }
 
-#ifdef VX_CFG_CLUSTER_MEM_MODE_DSMEM
+#ifdef VX_CFG_DSMEM_ENABLE
 void Core::dsmem_store_inc(uint32_t wid) {
   impl_->dsmem_store_inc(wid);
 }

@@ -77,7 +77,7 @@ endif
 
 # Add DSMEM sources (endpoints + ideal placeholder transport; NoC modeling
 # is delegated to the Omelet co-simulator, roadmap Task 4)
-ifneq ($(filter -DVX_CFG_CLUSTER_MEM_MODE_DSMEM, $(XCONFIGS)),)
+ifneq ($(filter -DVX_CFG_DSMEM_ENABLE, $(XCONFIGS)),)
 	CXXFLAGS += -I$(SRC_DIR)/dsmem
 	SRCS += $(SRC_DIR)/dsmem/cta_residency_table.cpp
 	SRCS += $(SRC_DIR)/dsmem/ideal_transport.cpp

@@ -2,7 +2,7 @@ ROOT_DIR := $(realpath ../../..)
 include $(ROOT_DIR)/config.mk
 
 CONFIGS := $(if $(findstring -DVX_CFG_EXT_DXA_ENABLE,$(CONFIGS)),$(CONFIGS),$(CONFIGS) -DVX_CFG_EXT_DXA_ENABLE)
-CONFIGS := $(if $(findstring -DVX_CFG_CLUSTER_MEM_MODE,$(CONFIGS)),$(CONFIGS),$(CONFIGS) -DVX_CFG_CLUSTER_MEM_MODE_DSMEM)
+CONFIGS := $(if $(findstring -DVX_CFG_DSMEM_ENABLE,$(CONFIGS)),$(CONFIGS),$(CONFIGS) -DVX_CFG_DSMEM_ENABLE)
 
 PROJECT := dxa_multicast
 

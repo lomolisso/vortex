@@ -40,7 +40,7 @@ protected:
   void on_reset();
 
 private:
-#ifdef VX_CFG_CLUSTER_MEM_MODE_DSMEM
+#ifdef VX_CFG_DSMEM_ENABLE
   // Signal one rank's arrival (all local warps arrived + drained) to the
   // cluster-level accumulator.
   void cluster_escalate(uint32_t bar_id, uint32_t wid);

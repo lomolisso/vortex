@@ -113,7 +113,7 @@ static op_string_t op_string(const Instr &instr) {
         }
       }
       case AluType::CZERO: return {aluArgs.imm ? "CZERO.NEZ":"CZERO.EQZ", ""};
-    #ifdef VX_CFG_CLUSTER_MEM_MODE_DSMEM
+    #ifdef VX_CFG_DSMEM_ENABLE
       case AluType::MAPA_CLUSTER: return {"MAPA.CLUSTER", ""};
     #endif
       default:
@@ -947,7 +947,7 @@ Instr::Ptr Decoder::decode(uint32_t code, uint64_t uuid) {
       instr->set_macro_op();
       instr->set_wstall(true);   // pause fetch while sequencer expands the N uops
     } break;
-  #ifdef VX_CFG_CLUSTER_MEM_MODE_DSMEM
+  #ifdef VX_CFG_DSMEM_ENABLE
     case 5: { // DSMEM cluster ops (generic-proxy remote shared memory)
       switch (funct3) {
       case 0: { // mapa.cluster rd, rs1=local shared ptr, rs2=target CTA rank

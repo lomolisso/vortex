@@ -1,6 +1,6 @@
 # Task 1 — Socket-Level Removal (Core-as-SM Consolidation) — SimX Proposal
 
-**Status:** proposal (pre-implementation). **Scope:** SimX only
+**Status:** implemented in SimX (the socket level is gone from SimX; core == SM). **Scope:** SimX only
 ([`sim/simx/`](../../../sim/simx/)). Part of the
 [DSMEM & TMA Roadmap](README.md); this is **Task 1**, the foundation
 for Tasks 2–5. Closes the **"L1D/SMEM placement"** divergence from

@@ -173,9 +173,12 @@ The DSMEM endpoints + ideal fabric are implemented in SimX; TMA multicast (below
   structural.
 - **Fabric.** `IdealTransport` (`sim/simx/dsmem/ideal_transport.{h,cpp}`) — fixed-delay,
   `dsmem_target`-routed, tag-back-routed; an explicit placeholder, not a future SV module.
-- **Verification.** `dsmem_pingpong` passes (remote ld/st + drain, 2-core K=2 and 4-core K=4,
-  plus a debug-build trace of the store-acks and rank escalations).
-- **Doc/code reconciliation pending (out of scope now).** The current code still gates DSMEM
-  with the legacy `VX_CFG_CLUSTER_MEM_MODE_DSMEM` sibling flag (a leftover of the old
-  mode-selector). The intended knob is the additive `VX_CFG_DSMEM_ENABLE` described above;
-  aligning the code to it is a follow-on, not part of this doc-reorganization.
+- **Knob.** The additive `VX_CFG_DSMEM_ENABLE` boolean described above is the as-built gate
+  (the old `CLUSTER_MEM_MODE = L2|DSMEM|NONE` enum was removed; its non-DSMEM arms were never
+  consumed by any code). Follows the `VX_CFG_EXT_DXA_ENABLE` idiom: default-false, opt in with
+  `CONFIGS="-DVX_CFG_DSMEM_ENABLE"`.
+- **Verification.** `dsmem_pingpong` passes: remote `ld.cluster`/`st.cluster` + plain `lw`/`sw`
+  through mapa'd pointers (aperture decode) + region-0 self-map, barrier drain with mixed store
+  paths, at 2-core K=2 and 4-core K=4 (the region-bit limit), with single- and multi-warp CTAs
+  (`-w`), and with the L2 cache enabled (`--l2cache`) — the additive-to-L2 property is tested,
+  not assumed. A debug-build trace shows the store-acks and rank escalations.

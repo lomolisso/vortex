@@ -29,7 +29,7 @@ lifecycle); those two unlock everything else.
 |---|---|---|
 | — | [README.md](README.md) | This index, reading order, quick-reference tables. |
 | 01 | [01-simulation-framework.md](01-simulation-framework.md) | `SimObject`/`SimChannel`/`SimPlatform`, the timing wheel, delta cycles, backpressure, and the **functional-vs-timing split**. The bedrock. |
-| 02 | [02-architecture-hierarchy.md](02-architecture-hierarchy.md) | Processor → Cluster → Socket → Core ownership and channel wiring; tick order; how configuration drives instantiation. |
+| 02 | [02-architecture-hierarchy.md](02-architecture-hierarchy.md) | Processor → Cluster → Core (core == SM) ownership and channel wiring; tick order; how configuration drives instantiation. |
 | 03 | [03-kernel-launch-and-dispatch.md](03-kernel-launch-and-dispatch.md) | DCR kernel descriptor, the KMU grid walk, `CtaDispatcher` slot/LMEM management, warp admission. |
 | 04 | [04-pipeline-frontend.md](04-pipeline-frontend.md) | Fetch → decode → issue; warp scheduling; IPDOM divergence; the decoder; operand collection & scoreboard. |
 | 05 | [05-pipeline-dispatch-execution.md](05-pipeline-dispatch-execution.md) | Dispatch, `op_type`→FU routing, SIMD-split (`num_pkts`) commit, writeback. |
@@ -62,7 +62,6 @@ lifecycle); those two unlock everything else.
 | Platform | `SimPlatform` | [`../../common/simobject.h`](../../common/simobject.h) | the event wheel + every `SimObject` |
 | Top | `Processor` / `ProcessorImpl` | [`../processor.cpp`](../processor.cpp) | clusters, L3, memory, KMU; the `cycle()` loop |
 | Cluster | `Cluster` | [`../cluster.cpp`](../cluster.cpp) | L2 + cluster-shared extension engines (DXA/TEX/OM/RASTER) |
-| Socket | `Socket` | [`../socket.cpp`](../socket.cpp) | per-socket I-cache + D-cache + L1 arbiter |
 | Core | `Core` | [`../core.cpp`](../core.cpp) | scheduler, FUs (ALU/FPU/LSU/SFU + per-core TCU), regfile/CSR, LMEM, barriers |
 
 ### The canonical data flows

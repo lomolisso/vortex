@@ -13,8 +13,8 @@ Prereqs: [02](02-architecture-hierarchy.md), [08](08-lsu-and-memory-ops.md).
 | Level | Class | Where instantiated | Notes |
 |---|---|---|---|
 | **LMEM** (scratchpad) | `LocalMem` | per **core** | banked SRAM, shared by a core's warps (doc 13) |
-| **L1 D-cache / I-cache** | `CacheCluster` of `Cache` | per **socket** | private to the socket's cores (doc 12) |
-| **L2** | `Cache` | per **cluster** | shared across the cluster's sockets |
+| **L1 D-cache / I-cache** | `CacheCluster` of `Cache` | per **core** | private to the core (core == SM, doc 12) |
+| **L2** | `Cache` | per **cluster** | shared across the cluster's cores |
 | **L3 (LLC)** | `Cache` | per **processor** | LLC when enabled, else a bypass arbiter ([`processor.cpp:64`](../processor.cpp#L64)) |
 | **DRAM** | `Memory` (+ backing `RAM`) | per **processor** | the timing model + functional bytes (doc 14 of this set is MMU; DRAM is §4 here) |
 
@@ -31,7 +31,7 @@ LSU (doc 08)
   └─ Core.lmem_switch(b)  ── Shared ─► LocalMem (scratchpad)                          (doc 13)
                           └─ Global ─► [MemCoalescer] ─► [Mmu] ─► dcache (CacheCluster) (docs 12,14)
                                                                      │
-                              socket L1 arbiter (icache prioritized) ◄┘                 (doc 02 §4.2)
+                              core L1 arbiter (icache prioritized) ◄┘                   (doc 02 §4.2)
                                      │
                                      ▼
                               L2 (cluster) ─► L3 (processor, LLC) ─► Memory/DRAM
@@ -70,8 +70,8 @@ Every address is classified by `get_addr_type(addr)` ([`types.h:818`](../types.h
 
 `MemReq::addr_type()` ([`types.h:1212`](../types.h#L1212)) is the convenience wrapper; the LSU sets
 `MemFlags.local` to mirror Shared (doc 15). This single function is what makes the `LocalMemSwitch`
-fork deterministic and is the seam the Toy-H100 socket-SMEM proposal reuses to route the shared
-path to the relocated socket SMEM (Task 1 keeps SMEM separate from the L1D — no fused array).
+fork deterministic and is the seam the DSMEM roadmap reuses to route the shared path to the
+core-resident SMEM (kept separate from the L1D — no fused array).
 
 ---
 

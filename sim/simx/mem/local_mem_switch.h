@@ -30,7 +30,7 @@ public:
   SimChannel<LsuReq> ReqOutDC;
   SimChannel<LsuRsp> RspInDC;
 
-#ifdef VX_CFG_CLUSTER_MEM_MODE_DSMEM
+#ifdef VX_CFG_DSMEM_ENABLE
   // Remote-shared lanes (DSMEM aperture region > 0): forwarded, still in
   // (region, offset) form, to the DsmemLsuAdapter for rank resolution.
   SimChannel<LsuReq> ReqOutDsmem;

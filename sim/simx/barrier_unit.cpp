@@ -49,7 +49,7 @@ void BarrierUnit::arrive(uint32_t bar_id, uint32_t count, uint32_t wid, bool is_
 
   DP(4, "*** Barrier arrive: core #" << core_->id() << ", warp #" << wid << " at barrier #" << bar_id << ", phase=" << barrier.phase << ", wait_mask=" << barrier.wait_mask << ", count=" << barrier.count << ", events=" << barrier.events);
 
-#ifdef VX_CFG_CLUSTER_MEM_MODE_DSMEM
+#ifdef VX_CFG_DSMEM_ENABLE
   if (!is_global && ((bar_id >> 30) & 1)) {
     // CTA-cluster barrier: local arrivals complete one rank's worth (count =
     // the CTA's warps), then escalate a rank arrival to the cluster, which
@@ -151,7 +151,7 @@ void BarrierUnit::global_resume(uint32_t bar_id) {
   ++barrier.phase;
 }
 
-#ifdef VX_CFG_CLUSTER_MEM_MODE_DSMEM
+#ifdef VX_CFG_DSMEM_ENABLE
 void BarrierUnit::cluster_escalate(uint32_t bar_id, uint32_t wid) {
   auto bar_index = bar_id & 0x3fffffff;
   auto& barrier = barriers_.at(bar_index);
@@ -179,7 +179,7 @@ void BarrierUnit::event_release(uint32_t bar_id) {
   assert(barrier.events > 0);
   --barrier.events;
   if (barrier.events == 0) {
-#ifdef VX_CFG_CLUSTER_MEM_MODE_DSMEM
+#ifdef VX_CFG_DSMEM_ENABLE
     if (!is_global && ((bar_id >> 30) & 1)) {
       if (barrier.count != 0 && barrier.arrival_mask.count() >= barrier.count) {
         // Last drain ack / expected transaction landed after all local

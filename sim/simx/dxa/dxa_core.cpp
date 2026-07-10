@@ -22,7 +22,7 @@
 #include "mem_block_pool.h"
 #include "debug.h"
 #include "constants.h"
-#ifdef VX_CFG_CLUSTER_MEM_MODE_DSMEM
+#ifdef VX_CFG_DSMEM_ENABLE
 #include "cta_residency_table.h"
 #endif
 
@@ -504,7 +504,7 @@ private:
     if (w.is_multicast) {
       cta_warp_idx = w.cta_indices.at(w.mc_cta_idx);
     }
-#ifdef VX_CFG_CLUSTER_MEM_MODE_DSMEM
+#ifdef VX_CFG_DSMEM_ENABLE
     const CtaResidencyTable::RankSlot* dest_slot = nullptr;
     const CtaResidencyTable::RankSlot* issuer_slot = nullptr;
     bool remote = false;
@@ -560,7 +560,7 @@ private:
     req.data = blk;
 
     // For multicast, replay across cta_indices; for single, dest = req.smem_addr.
-#ifdef VX_CFG_CLUSTER_MEM_MODE_DSMEM
+#ifdef VX_CFG_DSMEM_ENABLE
     if (w.is_multicast) {
       // Rebase the issuer-relative tile offset onto the receiver rank's own
       // slice (residency-table addressing — no contiguity assumption).
@@ -585,7 +585,7 @@ private:
     bool is_last_replay = !w.is_multicast || (w.mc_cta_idx + 1 == w.cta_indices.size());
     if (is_last_work && (w.is_multicast || is_last_replay)) {
       req.flags.dxa_notify_done   = 1;
-#ifdef VX_CFG_CLUSTER_MEM_MODE_DSMEM
+#ifdef VX_CFG_DSMEM_ENABLE
       // Per-receiver completion targets the receiver's OWN local bar slot
       // (from the residency table) — the +cta_idx arithmetic assumes the
       // issuer core's sequential slots and breaks across cores.
@@ -618,7 +618,7 @@ private:
     // bar_id is RAW (encoded); decode at release call site.
     if (w.is_multicast) {
       for (uint32_t cta : w.cta_indices) {
-#ifdef VX_CFG_CLUSTER_MEM_MODE_DSMEM
+#ifdef VX_CFG_DSMEM_ENABLE
         // Error path (invalid descriptor / empty transfer): release each
         // receiver's own barrier on its own core when it is resident;
         // otherwise fall back to the issuer-local release.
@@ -679,7 +679,7 @@ DxaCore::DxaCore(const SimContext& ctx, const char* name, Core* core)
   , gmem_req_out(kDxaMemPorts, this)
   , gmem_rsp_in(kDxaMemPorts, this)
   , lmem_req_out(1, this)
-#ifdef VX_CFG_CLUSTER_MEM_MODE_DSMEM
+#ifdef VX_CFG_DSMEM_ENABLE
   , dsmem_req_out(1, this)
 #endif
 {

@@ -26,7 +26,7 @@ using namespace vortex;
 
 namespace {
 
-// TEX-core fan-in: cluster TexBus arb collapses sockets → 1.
+// TEX-core fan-in: cluster TexBus arb collapses cores → 1.
 constexpr uint32_t kNumTexCores = 1;
 
 // tcache request ports exposed to the L2 path.

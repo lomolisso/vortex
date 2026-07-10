@@ -203,7 +203,7 @@ enum class AluType {
   OR,
   XOR,
   CZERO
-#ifdef VX_CFG_CLUSTER_MEM_MODE_DSMEM
+#ifdef VX_CFG_DSMEM_ENABLE
   , MAPA_CLUSTER  // map a local shared address to a peer CTA's DSMEM aperture
 #endif
 };
@@ -229,7 +229,7 @@ inline std::ostream &operator<<(std::ostream &os, const AluType& type) {
   case AluType::OR:      os << "OR"; break;
   case AluType::XOR:     os << "XOR"; break;
   case AluType::CZERO:   os << "CZERO"; break;
-#ifdef VX_CFG_CLUSTER_MEM_MODE_DSMEM
+#ifdef VX_CFG_DSMEM_ENABLE
   case AluType::MAPA_CLUSTER: os << "MAPA.CLUSTER"; break;
 #endif
   default:
@@ -435,7 +435,7 @@ struct MemFlags {
       uint32_t dxa_notify_done   : 1;   // bit 4
       uint32_t dxa_notify_bar_id : 16;  // bits 5..20
     #endif
-    #ifdef VX_CFG_CLUSTER_MEM_MODE_DSMEM
+    #ifdef VX_CFG_DSMEM_ENABLE
       // SM-to-SM network sideband: request routed to a peer core's LMEM.
       // dsmem_target is the peer's local core index within the cluster,
       // resolved at the source from the CTA-cluster residency table.
@@ -834,7 +834,7 @@ inline AddrType get_addr_type(uint64_t addr) {
      return AddrType::IO;
   }
   if (VX_CFG_LMEM_ENABLED) {
-  #ifdef VX_CFG_CLUSTER_MEM_MODE_DSMEM
+  #ifdef VX_CFG_DSMEM_ENABLE
     // DSMEM aperture: the shared window widens to cover the peer regions —
     // bits [LMEM_LOG_SIZE +: DSMEM_REGION_BITS] select a CTA-cluster peer
     // (region 0 = the plain local window, byte-identical to non-DSMEM builds).
@@ -854,7 +854,7 @@ inline AddrType get_addr_type(uint64_t addr) {
   return AddrType::Global;
 }
 
-#ifdef VX_CFG_CLUSTER_MEM_MODE_DSMEM
+#ifdef VX_CFG_DSMEM_ENABLE
 // Peer-region field of a Shared address: 0 = this core's own window; r > 0 =
 // "the CTA at cluster rank (my_rank + r) mod K" (relative encoding, so the
 // plain local window needs no translation).

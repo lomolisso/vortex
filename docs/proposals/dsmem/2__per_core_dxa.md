@@ -1,6 +1,6 @@
 # Task 2 — Per-Core (Per-SM) DXA Relocation — SimX Proposal
 
-**Status:** proposal (pre-implementation). **Scope:** SimX only
+**Status:** implemented in SimX (DxaCore is core-resident; per-core knobs in place). **Scope:** SimX only
 ([`sim/simx/`](../../../sim/simx/)). Part of the
 [DSMEM & TMA Roadmap](README.md); this is **Task 2**, and it
 **depends on [Task 1](1__socket_removal.md)** (core-as-SM consolidation, core-resident
@@ -100,7 +100,7 @@ CONFIGS="-DVX_CFG_EXT_DXA_ENABLE -DVX_CFG_EXT_TCU_ENABLE -DVX_CFG_TCU_WGMMA_ENAB
 CONFIGS="-DVX_CFG_EXT_DXA_ENABLE" ./ci/blackbox.sh --driver=simx --app=dxa_copy --cores=4 --warps=64 --threads=32
 ```
 
-Confirm DXA perf CSRs (`--perf=2`, the `[csr_mpm_dxa]` class) attribute traffic per core. 120 s
+Confirm DXA perf CSRs (`--perf=6`, `VX_DCR_MPM_CLASS_DXA` — the `[csr_mpm_dxa]` class) attribute traffic per core. 120 s
 cap applies.
 
 ## 5. Risks & sequencing

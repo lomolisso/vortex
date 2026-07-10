@@ -230,14 +230,15 @@ VX_CFG_LMEM_LOG_SIZE = 14
 VX_CFG_LMEM_NUM_BANKS = "expr: $VX_CFG_NUM_LSU_LANES"
 
 [dsmem]
-# VX_CFG_CLUSTER_MEM_MODE is a string enum: 'L2'|'DSMEM'|'NONE'.
-# L2 = the per-cluster cache (today's default); DSMEM = cross-core shared
-# memory over the SM-to-SM transport (global traffic rides the existing
-# L2-bypass path); NONE = passthrough, no transport.
-# NOTE: in DSMEM mode the transport is a fixed-delay ideal placeholder
-# (sim/simx/dsmem/ideal_transport.*). NoC topology/timing knobs return with
-# the Omelet co-simulator (docs/proposals/dsmem/5__omelet_cosimulation.md).
-VX_CFG_CLUSTER_MEM_MODE = "L2"
+# DSMEM (distributed shared memory): cross-SM scratchpad addressing over the
+# SM-to-SM transport. ADDITIVE to the global memory hierarchy — it coexists
+# with L1/L2/L3 and does not replace them (non-coherent scratchpad,
+# barrier-synchronized). Opt in per build with CONFIGS="-DVX_CFG_DSMEM_ENABLE".
+# NOTE: the transport is a fixed-delay ideal placeholder
+# (sim/simx/dsmem/ideal_transport.*). NoC topology/timing modeling arrives
+# with the Omelet co-simulator (docs/proposals/dsmem/5__omelet_cosimulation.md).
+VX_CFG_DSMEM_ENABLE = false
+VX_CFG_DSMEM_ENABLED = "expr: 1 if $VX_CFG_DSMEM_ENABLE else 0"
 # DSMEM aperture: peer-region bits above the per-CTA LMEM offset. XLEN32 has
 # only 2^16 bytes of address space above LMEM_BASE, capping
 # LMEM_LOG_SIZE + REGION_BITS at 16 (=> max cluster size 4 cross-core).
@@ -343,7 +344,6 @@ VX_CFG_XLEN = [32, 64]
 VX_CFG_FLEN = [32, 64]
 VX_CFG_FPU_TYPE = ["DPI", "DSP", "FPNEW", "STD"]
 VX_CFG_TCU_TYPE = ["DPI", "DSP", "BHF", "TFR"]
-VX_CFG_CLUSTER_MEM_MODE = ["L2", "DSMEM", "NONE"]
 
 [[param]]
 VX_CFG_DCACHE_NUM_REQS = "int"

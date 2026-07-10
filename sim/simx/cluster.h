@@ -32,7 +32,7 @@ namespace vortex {
 
 class ProcessorImpl;
 class Core;
-#ifdef VX_CFG_CLUSTER_MEM_MODE_DSMEM
+#ifdef VX_CFG_DSMEM_ENABLE
 class CtaResidencyTable;
 #endif
 
@@ -77,7 +77,7 @@ public:
 
   void global_barrier_arrive(uint32_t bar_id, uint32_t count, uint32_t core_id);
 
-#ifdef VX_CFG_CLUSTER_MEM_MODE_DSMEM
+#ifdef VX_CFG_DSMEM_ENABLE
   // CTA-cluster barrier: accumulate rank arrivals for (cluster_id, bar_id);
   // when all of the cluster's ranks (from the residency table) have arrived,
   // broadcast-resume the participant cores.
@@ -92,7 +92,7 @@ public:
 
   class Core* get_core(uint32_t idx) const;
 
-#ifdef VX_CFG_CLUSTER_MEM_MODE_DSMEM
+#ifdef VX_CFG_DSMEM_ENABLE
   // CTA-cluster residency table (rank → core/LMEM-base); written by the
   // per-core CtaDispatchers, read by the DSMEM/DXA/cluster-barrier paths.
   CtaResidencyTable* cta_table() const;

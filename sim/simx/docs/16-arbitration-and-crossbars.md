@@ -60,8 +60,8 @@ demuxes to the originating channel. This is why `MemReq::tag` is "application-sp
 
 The memory fabric uses `MemReq`/`MemRsp` specializations of the above:
 
-- **`MemArbiter`** — e.g. the socket L1 arbiter merging icache+dcache onto the L2 port
-  (`MemArbiter::Create(name, ArbiterType::RoundRobin, …)` in [`../socket.cpp`](../socket.cpp), with
+- **`MemArbiter`** — e.g. the core L1 arbiter merging icache+dcache onto the L2 port
+  (`MemArbiter::Create(name, ArbiterType::RoundRobin, …)` in [`../core.cpp`](../core.cpp), with
   the icache effectively prioritized), the cluster L2 input arbiter, and the DXA `gmem_arb_`
   ([`dxa/dxa_core.h:59`](../dxa/dxa_core.h#L59)).
 - **`MemCrossBar`** — e.g. `LocalMem`'s internal `num_reqs`→`banks` switch with a **bank-select hash

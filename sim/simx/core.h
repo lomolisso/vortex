@@ -80,7 +80,7 @@ public:
   };
 
   // Core-internal icache/dcache client ports (bound to the core-owned L1
-  // CacheClusters); no longer cross a core→socket boundary.
+  // CacheClusters); both are core-resident (core == SM).
   std::vector<SimChannel<MemReq>> icache_req_out;
   std::vector<SimChannel<MemRsp>> icache_rsp_in;
 
@@ -91,7 +91,7 @@ public:
   std::vector<SimChannel<MemReq>> mem_req_out;
   std::vector<SimChannel<MemRsp>> mem_rsp_in;
 
-#ifdef VX_CFG_CLUSTER_MEM_MODE_DSMEM
+#ifdef VX_CFG_DSMEM_ENABLE
   // SM-to-SM network interface. Egress: this core's remote-LMEM requests
   // toward peers (LSU remote path + DXA fan-out, merged). Ingress: peers'
   // requests delivered into this core's LocalMem remote port.
@@ -126,7 +126,7 @@ public:
 
   void barrier_event_release(uint32_t bar_id);
 
-#ifdef VX_CFG_CLUSTER_MEM_MODE_DSMEM
+#ifdef VX_CFG_DSMEM_ENABLE
   // Outstanding remote (DSMEM) stores per warp: incremented at LSU issue,
   // decremented when the peer LMEM's store ack returns over the network.
   // The cluster barrier's drain obligation waits on this reaching zero.

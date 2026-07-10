@@ -395,8 +395,8 @@ dxa()
     # multi-units with 2 cores
     CONFIGS="-DVX_CFG_EXT_DXA_ENABLE -DVX_CFG_NUM_DXA_UNITS=4" ./ci/blackbox.sh --driver=simx --app=sgemm2_dxa --cores=2
     CONFIGS="-DVX_CFG_EXT_DXA_ENABLE -DVX_CFG_NUM_DXA_UNITS=4" ./ci/blackbox.sh --driver=rtlsim --app=sgemm2_dxa --cores=2
-    CONFIGS="-DVX_CFG_EXT_DXA_ENABLE -DVX_CFG_NUM_DXA_UNITS=4 -DVX_CFG_SOCKET_SIZE=2" ./ci/blackbox.sh --driver=simx --app=sgemm2_dxa --cores=4
-    CONFIGS="-DVX_CFG_EXT_DXA_ENABLE -DVX_CFG_NUM_DXA_UNITS=4 -DVX_CFG_SOCKET_SIZE=2" ./ci/blackbox.sh --driver=rtlsim --app=sgemm2_dxa --cores=4
+    CONFIGS="-DVX_CFG_EXT_DXA_ENABLE -DVX_CFG_NUM_DXA_UNITS=4" ./ci/blackbox.sh --driver=simx --app=sgemm2_dxa --cores=4
+    CONFIGS="-DVX_CFG_EXT_DXA_ENABLE -DVX_CFG_NUM_DXA_UNITS=4" ./ci/blackbox.sh --driver=rtlsim --app=sgemm2_dxa --cores=4
     CONFIGS="-DVX_CFG_EXT_DXA_ENABLE -DVX_CFG_NUM_DXA_UNITS=4" ./ci/blackbox.sh --driver=simx --app=sgemm2_dxa --cores=2 --clusters=2
     CONFIGS="-DVX_CFG_EXT_DXA_ENABLE -DVX_CFG_NUM_DXA_UNITS=4" ./ci/blackbox.sh --driver=rtlsim --app=sgemm2_dxa --cores=2 --clusters=2
 
@@ -505,8 +505,8 @@ graphics()
     CONFIGS="$GFX_ALL" ./ci/blackbox.sh --driver=xrt    --app=gfx_draw3d --args="-w 128 -h 128 -t box.cgltrace -r box_ref_128.png"
     CONFIGS="$GFX_ALL" ./ci/blackbox.sh --driver=opae   --app=gfx_draw3d --args="-w 128 -h 128 -t box.cgltrace -r box_ref_128.png"
 
-    # SOCKET_SIZE=1 (no socket-internal sharing) + multi-core.
-    CONFIGS="$GFX_ALL -DVX_CFG_SOCKET_SIZE=1" ./ci/blackbox.sh --driver=rtlsim --app=gfx_draw3d --cores=2 --args="-w 128 -h 128 -t box.cgltrace -r box_ref_128.png"
+    # multi-core (socket level removed; cores attach to the cluster directly).
+    CONFIGS="$GFX_ALL" ./ci/blackbox.sh --driver=rtlsim --app=gfx_draw3d --cores=2 --args="-w 128 -h 128 -t box.cgltrace -r box_ref_128.png"
 
     # Multi-cluster + caches disabled — stresses cross-cluster arb.
     CONFIGS="$GFX_ALL -DICACHE_DISABLE -DDCACHE_DISABLE -DLMEM_DISABLE" ./ci/blackbox.sh --driver=simx   --app=gfx_draw3d --clusters=2 --cores=2 --warps=1 --threads=2 --args="-w 128 -h 128 -t box.cgltrace -r box_ref_128.png"
@@ -680,17 +680,17 @@ cache()
     CONFIGS="-DVX_CFG_DCACHE_WRITEBACK=1 -DVX_CFG_DCACHE_DIRTYBYTES=0 -DVX_CFG_DCACHE_NUM_WAYS=4" ./ci/blackbox.sh --driver=rtlsim --app=mstress
     CONFIGS="-DVX_CFG_DCACHE_WRITEBACK=1 -DVX_CFG_DCACHE_DIRTYBYTES=1 -DVX_CFG_DCACHE_NUM_WAYS=4" ./ci/blackbox.sh --driver=rtlsim --app=mstress
     CONFIGS="-DVX_CFG_DCACHE_WRITEBACK=1 -DVX_CFG_DCACHE_NUM_WAYS=4" ./ci/blackbox.sh --driver=simx --app=mstress
-    CONFIGS="-DVX_CFG_SOCKET_SIZE=1 -DVX_CFG_L2_WRITEBACK=1 -DVX_CFG_L3_WRITEBACK=1" ./ci/blackbox.sh --driver=rtlsim --cores=2 --clusters=2 --l2cache --l3cache --app=mstress
-    CONFIGS="-DVX_CFG_SOCKET_SIZE=1 -DVX_CFG_L2_WRITEBACK=1 -DVX_CFG_L3_WRITEBACK=1" ./ci/blackbox.sh --driver=simx --cores=2 --clusters=2 --l2cache --l3cache --app=mstress
+    CONFIGS="-DVX_CFG_L2_WRITEBACK=1 -DVX_CFG_L3_WRITEBACK=1" ./ci/blackbox.sh --driver=rtlsim --cores=2 --clusters=2 --l2cache --l3cache --app=mstress
+    CONFIGS="-DVX_CFG_L2_WRITEBACK=1 -DVX_CFG_L3_WRITEBACK=1" ./ci/blackbox.sh --driver=simx --cores=2 --clusters=2 --l2cache --l3cache --app=mstress
 
     # cache clustering
-    CONFIGS="-DVX_CFG_SOCKET_SIZE=4 -DVX_CFG_NUM_DCACHES=4 -DVX_CFG_NUM_ICACHES=2" ./ci/blackbox.sh --driver=rtlsim --app=sgemm --cores=4 --warps=1 --threads=2
+    CONFIGS="-DVX_CFG_NUM_DCACHES=4 -DVX_CFG_NUM_ICACHES=2" ./ci/blackbox.sh --driver=rtlsim --app=sgemm --cores=4 --warps=1 --threads=2
 
     # L2/L3
-    CONFIGS="-DVX_CFG_SOCKET_SIZE=1" ./ci/blackbox.sh --driver=rtlsim --cores=4 --l2cache --app=diverge --args="-n1"
-    CONFIGS="-DVX_CFG_SOCKET_SIZE=1" ./ci/blackbox.sh --driver=simx --cores=4 --l2cache --app=diverge --args="-n1"
-    CONFIGS="-DVX_CFG_SOCKET_SIZE=1" ./ci/blackbox.sh --driver=rtlsim --cores=2 --clusters=2 --l2cache --l3cache --app=diverge --args="-n1"
-    CONFIGS="-DVX_CFG_SOCKET_SIZE=1" ./ci/blackbox.sh --driver=simx --cores=2 --clusters=2 --l2cache --l3cache --app=diverge --args="-n1"
+    ./ci/blackbox.sh --driver=rtlsim --cores=4 --l2cache --app=diverge --args="-n1"
+    ./ci/blackbox.sh --driver=simx --cores=4 --l2cache --app=diverge --args="-n1"
+    ./ci/blackbox.sh --driver=rtlsim --cores=2 --clusters=2 --l2cache --l3cache --app=diverge --args="-n1"
+    ./ci/blackbox.sh --driver=simx --cores=2 --clusters=2 --l2cache --l3cache --app=diverge --args="-n1"
 
     echo "begin cache tests..."
 }
@@ -720,10 +720,10 @@ config1()
     ./ci/blackbox.sh --driver=simx --cores=4 --app=diverge --args="-n1"
     ./ci/blackbox.sh --driver=rtlsim --cores=2 --clusters=2 --app=diverge --args="-n1"
     ./ci/blackbox.sh --driver=simx --cores=2 --clusters=2 --app=diverge --args="-n1"
-    CONFIGS="-DVX_CFG_SOCKET_SIZE=1" ./ci/blackbox.sh --driver=rtlsim --cores=2 --clusters=2 --app=diverge --args="-n1"
-    CONFIGS="-DVX_CFG_SOCKET_SIZE=1" ./ci/blackbox.sh --driver=simx --cores=2 --clusters=2 --app=diverge --args="-n1"
-    CONFIGS="-DVX_CFG_SOCKET_SIZE=4" ./ci/blackbox.sh --driver=rtlsim --cores=4 --app=diverge --args="-n1"
-    CONFIGS="-DVX_CFG_SOCKET_SIZE=4" ./ci/blackbox.sh --driver=simx --cores=4 --app=diverge --args="-n1"
+    ./ci/blackbox.sh --driver=rtlsim --cores=2 --clusters=2 --app=diverge --args="-n1"
+    ./ci/blackbox.sh --driver=simx --cores=2 --clusters=2 --app=diverge --args="-n1"
+    ./ci/blackbox.sh --driver=rtlsim --cores=4 --app=diverge --args="-n1"
+    ./ci/blackbox.sh --driver=simx --cores=4 --app=diverge --args="-n1"
 
     # issue width
     CONFIGS="-DVX_CFG_ISSUE_WIDTH=2" ./ci/blackbox.sh --driver=rtlsim --app=diverge
@@ -896,9 +896,9 @@ debug()
 
     CONFIGS="-O0" ./ci/blackbox.sh --driver=opae --app=demo --args="-n1"
     CONFIGS="-O0" ./ci/blackbox.sh --driver=xrt --app=demo --args="-n1"
-    CONFIGS="-DVX_CFG_SOCKET_SIZE=1" ./ci/blackbox.sh --driver=opae --cores=2 --clusters=2 --l2cache --debug=1 --perf=1 --app=demo --args="-n1"
-    CONFIGS="-DVX_CFG_SOCKET_SIZE=1" ./ci/blackbox.sh --driver=xrt --cores=2 --clusters=2 --l2cache --debug=1 --perf=1 --app=demo --args="-n1"
-    CONFIGS="-DVX_CFG_SOCKET_SIZE=1" ./ci/blackbox.sh --driver=simx --cores=2 --clusters=2 --l2cache --debug=1 --perf=1 --app=demo --args="-n1"
+    ./ci/blackbox.sh --driver=opae --cores=2 --clusters=2 --l2cache --debug=1 --perf=1 --app=demo --args="-n1"
+    ./ci/blackbox.sh --driver=xrt --cores=2 --clusters=2 --l2cache --debug=1 --perf=1 --app=demo --args="-n1"
+    ./ci/blackbox.sh --driver=simx --cores=2 --clusters=2 --l2cache --debug=1 --perf=1 --app=demo --args="-n1"
 
     # test perfetto trace generation
     DEBUG=3 CONFIGS="-DVX_CFG_EXT_TCU_ENABLE" make -C sim/simx > /dev/null
@@ -927,7 +927,7 @@ stress()
     echo "begin stress tests..."
 
     # test verilator reset values
-    CONFIGS="-DVERILATOR_RESET_VALUE=1 -DVX_CFG_SOCKET_SIZE=1 -DVX_CFG_DCACHE_WRITEBACK=1 -DVX_CFG_L2_WRITEBACK=1 -DVX_CFG_L3_WRITEBACK=1" ./ci/blackbox.sh --driver=opae --cores=2 --clusters=2 --l2cache --l3cache --app=dogfood
+    CONFIGS="-DVERILATOR_RESET_VALUE=1 -DVX_CFG_DCACHE_WRITEBACK=1 -DVX_CFG_L2_WRITEBACK=1 -DVX_CFG_L3_WRITEBACK=1" ./ci/blackbox.sh --driver=opae --cores=2 --clusters=2 --l2cache --l3cache --app=dogfood
     CONFIGS="-DVERILATOR_RESET_VALUE=1" ./ci/blackbox.sh --driver=xrt --app=sgemm --args="-n128" --l2cache
 
     echo "stress tests done!"

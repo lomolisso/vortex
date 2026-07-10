@@ -26,24 +26,27 @@
 
 static const char* kernel_file = "kernel.vxbin";
 static uint32_t    num_ranks   = 2;
+static uint32_t    warps_per_cta = 1;
 
 static vx_device_h  device      = nullptr;
 static vx_buffer_h  dstA_buffer = nullptr;
 static vx_buffer_h  dstB_buffer = nullptr;
+static vx_buffer_h  dstC_buffer = nullptr;
 static vx_queue_h   queue       = nullptr;
 static vx_module_h  module_     = nullptr;
 static vx_kernel_h  kernel      = nullptr;
 static kernel_arg_t kernel_arg  = {};
 
 static void show_usage() {
-  std::cout << "Usage: [-k kernel] [-n num_ranks] [-h]\n";
+  std::cout << "Usage: [-k kernel] [-n num_ranks] [-w warps_per_cta] [-h]\n";
 }
 
 static void parse_args(int argc, char** argv) {
   int c;
-  while ((c = getopt(argc, argv, "n:k:h")) != -1) {
+  while ((c = getopt(argc, argv, "n:w:k:h")) != -1) {
     switch (c) {
       case 'n': num_ranks = atoi(optarg); break;
+      case 'w': warps_per_cta = atoi(optarg); break;
       case 'k': kernel_file = optarg; break;
       case 'h': show_usage(); exit(0);
       default:  show_usage(); exit(-1);
@@ -55,6 +58,7 @@ void cleanup() {
   if (device) {
     if (dstA_buffer) vx_buffer_release(dstA_buffer);
     if (dstB_buffer) vx_buffer_release(dstB_buffer);
+    if (dstC_buffer) vx_buffer_release(dstC_buffer);
     if (kernel)  vx_kernel_release(kernel);
     if (module_) vx_module_release(module_);
     if (queue)   vx_queue_release(queue);
@@ -82,12 +86,13 @@ int main(int argc, char* argv[]) {
     return -1;
   }
 
-  const uint32_t buf_elems = (uint32_t)num_threads;   // single-warp CTAs
+  const uint32_t buf_elems = warps_per_cta * (uint32_t)num_threads;
   const uint32_t local_mem = 2 * buf_elems * sizeof(uint32_t); // phases A+B
   const uint32_t dst_bytes = num_ranks * buf_elems * sizeof(uint32_t);
 
   std::cout << "dsmem_pingpong (cross-core DSMEM)\n";
-  std::cout << "  num_ranks=" << num_ranks << ", buf_elems=" << buf_elems
+  std::cout << "  num_ranks=" << num_ranks << ", warps_per_cta=" << warps_per_cta
+            << ", buf_elems=" << buf_elems
             << ", local_mem=" << local_mem << " bytes\n";
 
   RT_CHECK(vx_check_occupancy(device, buf_elems, local_mem));
@@ -96,6 +101,8 @@ int main(int argc, char* argv[]) {
   RT_CHECK(vx_buffer_address(dstA_buffer, &kernel_arg.dstA_addr));
   RT_CHECK(vx_buffer_create(device, dst_bytes, VX_MEM_WRITE, &dstB_buffer));
   RT_CHECK(vx_buffer_address(dstB_buffer, &kernel_arg.dstB_addr));
+  RT_CHECK(vx_buffer_create(device, dst_bytes, VX_MEM_WRITE, &dstC_buffer));
+  RT_CHECK(vx_buffer_address(dstC_buffer, &kernel_arg.dstC_addr));
 
   kernel_arg.num_ranks = num_ranks;
   kernel_arg.buf_elems = buf_elems;
@@ -105,6 +112,7 @@ int main(int argc, char* argv[]) {
 
   std::vector<uint32_t> h_dstA(num_ranks * buf_elems, 0);
   std::vector<uint32_t> h_dstB(num_ranks * buf_elems, 0);
+  std::vector<uint32_t> h_dstC(num_ranks * buf_elems, 0);
 
   std::cout << "start\n";
   vx_event_h launch_ev = nullptr;
@@ -122,10 +130,12 @@ int main(int argc, char* argv[]) {
     RT_CHECK(vx_enqueue_launch(queue, &li, 0, nullptr, &launch_ev));
   }
 
-  vx_event_h readA_ev = nullptr, readB_ev = nullptr;
+  vx_event_h readA_ev = nullptr, readB_ev = nullptr, readC_ev = nullptr;
   RT_CHECK(vx_enqueue_read(queue, h_dstA.data(), dstA_buffer, 0, dst_bytes, 1, &launch_ev, &readA_ev));
   RT_CHECK(vx_enqueue_read(queue, h_dstB.data(), dstB_buffer, 0, dst_bytes, 1, &readA_ev, &readB_ev));
-  RT_CHECK(vx_event_wait_value(readB_ev, 1, VX_TIMEOUT_INFINITE));
+  RT_CHECK(vx_enqueue_read(queue, h_dstC.data(), dstC_buffer, 0, dst_bytes, 1, &readB_ev, &readC_ev));
+  RT_CHECK(vx_event_wait_value(readC_ev, 1, VX_TIMEOUT_INFINITE));
+  vx_event_release(readC_ev);
   vx_event_release(readB_ev);
   vx_event_release(readA_ev);
   vx_event_release(launch_ev);
@@ -148,6 +158,16 @@ int main(int argc, char* argv[]) {
       if (gotB != expB) {
         if (errors < 20)
           printf("*** error B (drain): rank=%u t=%u expected=%u actual=%u\n", r, t, expB, gotB);
+        ++errors;
+      }
+      // Phase C: plain lw of the peer's A pattern; the 0xDEAD0000 high bits
+      // flag a failed region-0 self-map identity/roundtrip.
+      uint32_t expC = expA;
+      uint32_t gotC = h_dstC[r * buf_elems + t];
+      if (gotC != expC) {
+        if (errors < 20)
+          printf("*** error C (plain-lw/self-map): rank=%u t=%u expected=%u actual=%u\n",
+                 r, t, expC, gotC);
         ++errors;
       }
     }

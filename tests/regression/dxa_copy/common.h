@@ -15,6 +15,7 @@ typedef struct {
   uint32_t tiles[DXA_MAX_DIMS];  // per-dimension tile sizes
   uint32_t grids[DXA_MAX_DIMS];  // per-dimension grid sizes (sizes[d]/tiles[d])
   uint64_t src_addr;
+  uint64_t dst_addr;           // copy-back buffer: host verifies dst == src
 } kernel_arg_t;
 
 #endif

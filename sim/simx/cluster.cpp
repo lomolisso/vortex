@@ -17,7 +17,7 @@
 #include "constants.h"
 #include "types.h"
 #include "debug.h"
-#ifdef VX_CFG_CLUSTER_MEM_MODE_DSMEM
+#ifdef VX_CFG_DSMEM_ENABLE
 #include "cta_residency_table.h"
 #include "ideal_transport.h"
 #include <unordered_map>
@@ -46,7 +46,7 @@ public:
     : simobject_(simobject)
     , cores_(VX_CFG_NUM_CORES)
     , gbarriers_(VX_CFG_NUM_BARRIERS)
-#ifdef VX_CFG_CLUSTER_MEM_MODE_DSMEM
+#ifdef VX_CFG_DSMEM_ENABLE
     , cta_table_(VX_CFG_CTA_TABLE_SIZE)
 #endif
   {
@@ -124,7 +124,7 @@ public:
     }
 #endif // any L2-sharing extension
 
-#ifdef VX_CFG_CLUSTER_MEM_MODE_DSMEM
+#ifdef VX_CFG_DSMEM_ENABLE
     // ── SM-to-SM transport: cross-core LMEM connectivity (DSMEM mode) ──────
     // Purely additive to the global path: shared-memory traffic between cores
     // rides this transport; global traffic keeps the L2/bypass path above.
@@ -242,7 +242,7 @@ public:
       ocache->core_rsp_out.at(i).bind(&om_core_->ocache_rsp_in.at(i));
     }
 
-    // ocache memory side → l2arb. Row index is sockets + DXA + TEX (if those are present).
+    // ocache memory side → l2arb. Row index is cores + TEX (if present).
     constexpr uint32_t kOmRow = 1 + VX_CFG_EXT_TEX_ENABLED;
     for (uint32_t i = 0; i < kOcacheMemPorts; ++i) {
       ocache->mem_req_out.at(i).bind(&l2arb->ReqIn.at(kL2Rows * i + kOmRow));
@@ -320,7 +320,7 @@ public:
     for (auto& gbar : gbarriers_) {
       gbar.reset();
     }
-#ifdef VX_CFG_CLUSTER_MEM_MODE_DSMEM
+#ifdef VX_CFG_DSMEM_ENABLE
     cta_table_.reset();
     cbar_arrivals_.clear();
 #endif
@@ -367,7 +367,7 @@ public:
     }
   }
 
-#ifdef VX_CFG_CLUSTER_MEM_MODE_DSMEM
+#ifdef VX_CFG_DSMEM_ENABLE
   void cluster_barrier_arrive(uint32_t cluster_id, uint32_t bar_id) {
     uint32_t expected = cta_table_.num_ranks(cluster_id);
     assert(expected != 0 && "cluster barrier arrival for a non-resident cluster");
@@ -508,7 +508,7 @@ public:
   RasterCore::Ptr& raster_core() { return raster_core_; }
 #endif
 
-#ifdef VX_CFG_CLUSTER_MEM_MODE_DSMEM
+#ifdef VX_CFG_DSMEM_ENABLE
   CtaResidencyTable* cta_table() { return &cta_table_; }
 #endif
 
@@ -516,7 +516,7 @@ private:
   Cluster*                    simobject_;
   std::vector<Core::Ptr>      cores_;
   std::vector<core_barrier_t> gbarriers_;
-#ifdef VX_CFG_CLUSTER_MEM_MODE_DSMEM
+#ifdef VX_CFG_DSMEM_ENABLE
   CtaResidencyTable           cta_table_;
   IdealTransport::Ptr         dsmem_transport_;
   // (cluster_id, bar_index) → rank arrivals for in-flight cluster barriers.
@@ -593,7 +593,7 @@ Core* Cluster::get_core(uint32_t idx) const {
   return impl_->get_core(idx);
 }
 
-#ifdef VX_CFG_CLUSTER_MEM_MODE_DSMEM
+#ifdef VX_CFG_DSMEM_ENABLE
 CtaResidencyTable* Cluster::cta_table() const {
   return impl_->cta_table();
 }

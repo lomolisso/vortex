@@ -42,7 +42,7 @@ public:
     }
   };
 
-  // Inputs from the per-socket TexBus arbiter; size = VX_CFG_NUM_TEX_CORES.
+  // Inputs from the cluster TexBus arbiter; size = VX_CFG_NUM_TEX_CORES.
   std::vector<SimChannel<TexReq>>  tex_req_in;
   std::vector<SimChannel<TexRsp>>  tex_rsp_out;
 

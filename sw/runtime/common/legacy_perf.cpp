@@ -193,7 +193,6 @@ extern int vx_dump_perf(vx_device_h hdevice, FILE *stream) {
 
   uint64_t num_cores = 0;
   uint64_t num_clusters = 0;
-  uint64_t socket_size = 0;
   uint64_t num_warps = 0;
   uint64_t num_threads = 0;
   uint64_t issue_width = 0;
@@ -206,7 +205,6 @@ extern int vx_dump_perf(vx_device_h hdevice, FILE *stream) {
 
   CHECK_ERR(vx_dev_caps(hdevice, VX_CAPS_NUM_CORES, &num_cores), { return err; });
   CHECK_ERR(vx_dev_caps(hdevice, VX_CAPS_NUM_CLUSTERS, &num_clusters), { return err; });
-  CHECK_ERR(vx_dev_caps(hdevice, VX_CAPS_SOCKET_SIZE, &socket_size), { return err; });
   CHECK_ERR(vx_dev_caps(hdevice, VX_CAPS_NUM_WARPS, &num_warps), { return err; });
   CHECK_ERR(vx_dev_caps(hdevice, VX_CAPS_NUM_THREADS, &num_threads), { return err; });
   CHECK_ERR(vx_dev_caps(hdevice, VX_CAPS_ISSUE_WIDTH, &issue_width), { return err; });
@@ -465,7 +463,6 @@ extern int vx_dump_perf(vx_device_h hdevice, FILE *stream) {
   } break;
 
   case VX_DCR_MPM_CLASS_MEM: {
-    const uint64_t num_sockets = (num_cores + socket_size - 1) / socket_size;
     const uint64_t cores_per_cluster = (num_cores + num_clusters - 1) / num_clusters;
 
     CacheCounters icache_tot, dcache_tot, l2_tot, l3_tot;
@@ -495,12 +492,8 @@ extern int vx_dump_perf(vx_device_h hdevice, FILE *stream) {
       }
     }
 
-    // Per-Socket L1
-    for (uint32_t s = 0; s < num_sockets; ++s) {
-      uint32_t rep_core = s * (uint32_t)socket_size;
-      if (rep_core >= num_cores)
-        continue;
-
+    // Per-Core L1 (L1I + L1D are core-resident; core == SM)
+    for (uint32_t rep_core = 0; rep_core < num_cores; ++rep_core) {
       if (icache_en) {
         uint64_t r = 0, m = 0, st = 0;
         CHECK_ERR(vx_mpm_query(hdevice, mpm_class, VX_CSR_MPM_ICACHE_READS, rep_core, &r), { return err; });

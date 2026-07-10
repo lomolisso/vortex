@@ -46,7 +46,7 @@ tree, doc per `AGENTS.md` §2) are what `constants.h` and every source include.
 - sets `-DVX_CFG_XLEN=$(XLEN)` and appends `$(CONFIGS)`;
 - links **softfloat** (`softfloat.a`, for bit-accurate FP, doc 07) and **ramulator**
   (`-lramulator`, the external DRAM model);
-- compiles the `SRCS` list — `processor/cluster/socket/core/scheduler/...` plus `mem/*` and `dtm/*`
+- compiles the `SRCS` list — `processor/cluster/core/scheduler/...` plus `mem/*` and `dtm/*`
   — into a shared library under `DESTDIR`.
 
 ### 3.1 Extensions are conditionally compiled

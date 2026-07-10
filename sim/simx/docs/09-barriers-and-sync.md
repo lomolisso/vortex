@@ -14,7 +14,7 @@ a DXA copy wake a waiting warp. Sources: [`../barrier_unit.h`](../barrier_unit.h
 
 `BarrierUnit` ([`barrier_unit.h:27`](../barrier_unit.h#L27)) is a **child `SimObject` of the
 `Scheduler`** (doc 04), one per core. It owns the per-warp barrier state and resumes parked warps
-through the parent scheduler; for cross-core barriers it cooperates with the `Socket` (doc 02).
+through the parent scheduler; for cross-core barriers it cooperates with the `Cluster` (doc 02).
 Kernels reach it indirectly: a `BAR` instruction is a warp-control op executed by `WctlUnit`
 ([`wctl_unit.h:26`](../wctl_unit.h#L26)), which calls into `BarrierUnit`.
 
@@ -89,11 +89,11 @@ All expose `arrive()/wait(phase)/arrive_and_wait()` and (for the async forms) `e
 ## 4. Global (cross-core) barriers
 
 A global barrier can't complete on one core alone. `arrive` on a global `bar_id` calls
-`core_->socket()->global_barrier_arrive(bar_id, count, core_id)`
-([`barrier_unit.cpp:64`](../barrier_unit.cpp#L64)); the `Socket`/`Cluster` accumulate per-core
+`core_->cluster()->global_barrier_arrive(bar_id, count, core_id)`
+([`barrier_unit.cpp:64`](../barrier_unit.cpp#L64)); the `Cluster` accumulates per-core
 arrivals (`arrival_mask`), and when all participating cores have arrived, the cascade calls
 `global_resume(bar_id)` back on each core ([`barrier_unit.cpp:113`](../barrier_unit.cpp#L113),
-`++phase` at [`:126`](../barrier_unit.cpp#L126)), waking everyone. `Socket::global_barrier_arrive`
+`++phase` at [`:126`](../barrier_unit.cpp#L126)), waking everyone. `Cluster::global_barrier_arrive`
 / `global_barrier_resume` (doc 02 §4.2) are the cross-core hops.
 
 ---

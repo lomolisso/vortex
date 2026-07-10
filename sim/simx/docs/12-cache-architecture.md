@@ -34,13 +34,13 @@ in a pImpl (`class Impl;`, [`cache.h:91`](../mem/cache.h#L91)) in `cache.cpp`.
 | `is_llc` | this is the last-level cache (affects AMO handling, §4) |
 
 These come from `VX_CFG_{ICACHE,DCACHE,L2,L3}_*` (doc 18); see the construction sites in
-[`processor.cpp:64`](../processor.cpp#L64) (L3), `cluster.cpp` (L2), `socket.cpp` (L1).
+[`processor.cpp:64`](../processor.cpp#L64) (L3), `cluster.cpp` (L2), `core.cpp` (L1).
 
 ---
 
 ## 2. Banking — `CacheCluster`
 
-A socket's L1 isn't one `Cache` but a `CacheCluster` ([`cache_cluster.h:20`](../mem/cache_cluster.h#L20))
+A core's L1 isn't one `Cache` but a `CacheCluster` ([`cache_cluster.h:20`](../mem/cache_cluster.h#L20))
 of `num_units` `Cache` instances fronting `num_inputs` cores. Its `core_req_in` is a **2-D** array
 `[input][port]` ([`cache_cluster.h:22`](../mem/cache_cluster.h#L22)); it fans the cores' requests
 across the bank units and aggregates `mem_req_out` toward L2. Flush is forwarded to every unit

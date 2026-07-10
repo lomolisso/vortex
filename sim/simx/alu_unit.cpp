@@ -45,7 +45,7 @@ uint32_t AluUnit::latency_of(const instr_trace_t* trace) const {
 		case AluType::AND:
 		case AluType::OR:
 		case AluType::CZERO:
-	#ifdef VX_CFG_CLUSTER_MEM_MODE_DSMEM
+	#ifdef VX_CFG_DSMEM_ENABLE
 		case AluType::MAPA_CLUSTER:
 	#endif
 			return 2;
@@ -245,7 +245,7 @@ void AluUnit::execute(instr_trace_t* trace) {
 				rd_data[t].i = cond ? 0 : rs1_data[t].i;
 			}
 		} break;
-	#ifdef VX_CFG_CLUSTER_MEM_MODE_DSMEM
+	#ifdef VX_CFG_DSMEM_ENABLE
 		case AluType::MAPA_CLUSTER: {
 			// rd = the same intra-slice offset inside the target rank's DSMEM
 			// aperture. The region field encodes the RELATIVE rank distance, so

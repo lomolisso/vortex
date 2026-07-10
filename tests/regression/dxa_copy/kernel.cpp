@@ -33,6 +33,25 @@ __kernel void kernel_main(kernel_arg_t* arg) {
   // Allocate shared memory for one tile.
   auto shmem = reinterpret_cast<TYPE*>(__local_mem());
 
+  // Per-thread element mapping, shared by both modes and the copy-back
+  // verification: tid decomposes row-major into per-dim tile-local offsets,
+  // which combine with the block coords into the global linear index.
+  const uint32_t tid = threadIdx.x;
+  uint32_t gidx = 0;
+  {
+    uint32_t local[DXA_MAX_DIMS] = {};
+    uint32_t rem = tid;
+    for (uint32_t d = 0; d < ndim; ++d) {
+      local[d] = rem % arg->tiles[d];
+      rem /= arg->tiles[d];
+    }
+    uint32_t stride = 1;
+    for (uint32_t d = 0; d < ndim; ++d) {
+      gidx += (coords[d] + local[d]) * stride;
+      stride *= arg->sizes[d];
+    }
+  }
+
 #ifdef VX_CFG_EXT_DXA_ENABLE
   // ── DXA path: issue N-D tile copy, barrier wait ──
   vortex::barrier bar(0);
@@ -64,25 +83,17 @@ __kernel void kernel_main(kernel_arg_t* arg) {
 #else
   // ── LSU path: each thread loads one element, syncthreads ──
   auto src = reinterpret_cast<const TYPE*>(arg->src_addr);
-  const uint32_t tid = threadIdx.x;
   if (tid < num_elems) {
-    // Decompose tid into per-dim local offsets and compute global linear index.
-    uint32_t local[DXA_MAX_DIMS] = {};
-    uint32_t rem = tid;
-    for (uint32_t d = 0; d < ndim; ++d) {
-      local[d] = rem % arg->tiles[d];
-      rem /= arg->tiles[d];
-    }
-    // Global linear index in row-major order.
-    uint32_t gidx = 0;
-    uint32_t stride = 1;
-    for (uint32_t d = 0; d < ndim; ++d) {
-      gidx += (coords[d] + local[d]) * stride;
-      stride *= arg->sizes[d];
-    }
     shmem[tid] = src[gidx];
   }
   __syncthreads();
 #endif
-  (void)num_elems;
+
+  // Copy-back verification: every thread writes its landed tile element out
+  // to GMEM; the host asserts dst == src byte-for-byte. (The DXA lays the
+  // tile row-major in SMEM — same tid mapping as the LSU path.)
+  auto dst = reinterpret_cast<TYPE*>(arg->dst_addr);
+  if (tid < num_elems) {
+    dst[gidx] = shmem[tid];
+  }
 }

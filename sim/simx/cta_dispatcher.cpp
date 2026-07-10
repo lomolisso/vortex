@@ -18,7 +18,7 @@
 #include "processor_impl.h"
 #include <VX_config.h>
 #include <cassert>
-#ifdef VX_CFG_CLUSTER_MEM_MODE_DSMEM
+#ifdef VX_CFG_DSMEM_ENABLE
 #include "cta_residency_table.h"
 #endif
 
@@ -36,7 +36,7 @@ CtaDispatcher::CtaDispatcher(const SimContext& ctx, const char* name, Core* core
   , free_size_(1u << VX_CFG_LMEM_LOG_SIZE)
   , slot_rem_warps_(num_warps_, 0)
   , slot_lmem_size_(num_warps_, 0)
-#ifdef VX_CFG_CLUSTER_MEM_MODE_DSMEM
+#ifdef VX_CFG_DSMEM_ENABLE
   , slot_cluster_id_(num_warps_, 0)
   , slot_cluster_rank_(num_warps_, 0)
   , slot_in_table_(num_warps_, false)
@@ -68,7 +68,7 @@ void CtaDispatcher::on_reset() {
     slot_rem_warps_[i] = 0;
     slot_lmem_size_[i] = 0;
     wid_to_slot_[i]    = num_warps_;  // invalid
-#ifdef VX_CFG_CLUSTER_MEM_MODE_DSMEM
+#ifdef VX_CFG_DSMEM_ENABLE
     slot_in_table_[i]  = false;
 #endif
   }
@@ -90,7 +90,7 @@ bool CtaDispatcher::step(const WarpMask& active_warps, uint32_t* wid_out, cta_wa
     // kmu_bus_if.ready = table_notfull && lmem_ok.
     if (!kmu_->peek(&pending_cta_)) return false;
 
-#ifdef VX_CFG_CLUSTER_MEM_MODE_DSMEM
+#ifdef VX_CFG_DSMEM_ENABLE
     // Gang placement (the Hopper cluster-work-distributor analog): rank r of
     // cluster c is owned by core (c + r) % cores-per-cluster within hardware
     // cluster (c % num-clusters); peer cores leave the CTA on the KMU bus for
@@ -210,7 +210,7 @@ bool CtaDispatcher::step(const WarpMask& active_warps, uint32_t* wid_out, cta_wa
     slot_lmem_size_[cur_slot_] = lmem_cost;
     slot_rem_warps_[cur_slot_] = cta_size_;
 
-#ifdef VX_CFG_CLUSTER_MEM_MODE_DSMEM
+#ifdef VX_CFG_DSMEM_ENABLE
     // Record this rank's residency (core + slice base) for the DSMEM/DXA/
     // cluster-barrier consumers; retired in warp_done() when the CTA drains.
     {
@@ -255,7 +255,7 @@ void CtaDispatcher::warp_done(uint32_t wid) {
   wid_to_slot_[wid] = num_warps_;  // clear assignment
   assert(slot_rem_warps_[slot] > 0);
   if (--slot_rem_warps_[slot] == 0) {
-#ifdef VX_CFG_CLUSTER_MEM_MODE_DSMEM
+#ifdef VX_CFG_DSMEM_ENABLE
     if (slot_in_table_[slot]) {
       core_->cluster()->cta_table()->retire(slot_cluster_id_[slot], slot_cluster_rank_[slot]);
       slot_in_table_[slot] = false;

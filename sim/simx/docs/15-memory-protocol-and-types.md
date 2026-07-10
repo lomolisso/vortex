@@ -108,8 +108,8 @@ into an `LsuRsp`. AMO mapping helpers (`amo_to_memop`, `amo_is_unsigned`,
 ([`types.h:818`](../types.h#L818)) returns `IO` for the IO window, `Shared` for
 `[VX_MEM_LMEM_BASE_ADDR, +2^VX_CFG_LMEM_LOG_SIZE)`, else `Global`. This is the single decision
 point that the `LocalMemSwitch` (doc 13) and the LSU's `flags.local` derive from; the Toy-H100
-Task 1 proposal (`docs/proposals/socket_smem_simx_proposal.md`) keeps this shared/global
-classification unchanged, relocating only the shared (SMEM) target up to the socket — it does
+DSMEM roadmap (`docs/proposals/dsmem/`) keeps this shared/global
+classification unchanged (the SMEM target is core-resident; DSMEM widens the shared window) — it does
 **not** fold scratchpad and cache into one array.
 
 ---

@@ -569,7 +569,7 @@ inline float vx_packlh_f(const void* base, uint32_t stride) {
 
 // DSMEM cluster ops (custom0 / funct7=0x05): remote shared memory across the
 // CTA cluster's cores. Requires a DSMEM-mode device build
-// (VX_CFG_CLUSTER_MEM_MODE_DSMEM); rank distances beyond the aperture
+// (VX_CFG_DSMEM_ENABLE); rank distances beyond the aperture
 // (VX_CFG_DSMEM_REGION_BITS) are unencodable.
 
 // Map a pointer into this CTA's shared window to the same intra-slice offset
