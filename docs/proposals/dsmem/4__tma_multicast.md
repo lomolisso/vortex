@@ -127,15 +127,17 @@ compared word-for-word). `tests/regression/dxa_copy/` verifies plain rank-1..5 b
 byte-for-byte (copy-back to GMEM + host compare).
 
 ```bash
-# faithful TMA multicast — verify the single global read
+# faithful TMA multicast — verify the single global read at 8-way fan-out
+# (pocket-H100: K=8, one receiver rank per core)
 CONFIGS="-DVX_CFG_EXT_DXA_ENABLE -DVX_CFG_DSMEM_ENABLE" \
-  ./ci/blackbox.sh --driver=simx --app=dxa_multicast --clusters=1 --cores=4 --threads=32 --perf=6
-# the cross-core multicast Task 2 deferred now passes over the fabric
-CONFIGS="-DVX_CFG_EXT_DXA_ENABLE -DVX_CFG_DSMEM_ENABLE" \
-  ./ci/blackbox.sh --driver=simx --app=sgemm_tcu_wg_dxa_mcast --cores=4 --threads=32
+  ./ci/blackbox.sh --driver=simx --app=dxa_multicast --cores=8 --perf=6
+# cross-core WGMMA multicast over the fabric (cluster-barrier rendezvous;
+# warps=8 pinned by the Makefile — mc_group=2 fits the 8 KB scratchpad)
+CONFIGS="-DVX_CFG_EXT_TCU_ENABLE -DVX_CFG_EXT_DXA_ENABLE -DVX_CFG_DSMEM_ENABLE -DVX_CFG_TCU_WGMMA_ENABLE" \
+  ./ci/blackbox.sh --driver=simx --app=sgemm_tcu_wg_dxa_mcast --cores=8 --l2cache --args="-m128 -n64 -k32"
 # TMA copy modes: element strides, 3D K-major, 32/64/128B swizzle
 CONFIGS="-DVX_CFG_EXT_DXA_ENABLE" \
-  ./ci/blackbox.sh --driver=simx --app=dxa_tma_modes --threads=32
+  ./ci/blackbox.sh --driver=simx --app=dxa_tma_modes
 ```
 
 120 s cap applies.

@@ -12,8 +12,11 @@ SRCS := $(SRC_DIR)/main.cpp $(SW_COMMON_DIR)/rvfloats.cpp $(SW_COMMON_DIR)/softf
 
 VX_SRCS := $(SRC_DIR)/kernel.cpp
 
-# NUM_WARPS=16 needed so 4 co-resident CTAs of 4 warps each fit.
-CONFIGS := $(if $(findstring -DVX_CFG_NUM_WARPS=,$(CONFIGS)),$(CONFIGS),$(CONFIGS) -DVX_CFG_NUM_WARPS=16)
+# NUM_WARPS=8 => mc_group_size = 8/4 = 2 co-resident 4-warp CTAs. At the
+# pocket-H100 8 KB scratchpad, each CTA's A+B tiles need 2560 B, and the
+# cluster admission reserves the whole mc_group span contiguously — 2 CTAs
+# (5120 B) fit; 4 (10240 B) can never be admitted.
+CONFIGS := $(if $(findstring -DVX_CFG_NUM_WARPS=,$(CONFIGS)),$(CONFIGS),$(CONFIGS) -DVX_CFG_NUM_WARPS=8)
 CONFIGS := $(if $(findstring -DVX_CFG_ISSUE_WIDTH=,$(CONFIGS)),$(CONFIGS),$(CONFIGS) -DVX_CFG_ISSUE_WIDTH=4)
 CONFIGS += -DVX_CFG_TCU_WGMMA_ENABLE -DWGMMA_RS
 

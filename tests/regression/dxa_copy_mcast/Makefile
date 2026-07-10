@@ -11,7 +11,9 @@ SRCS := $(SRC_DIR)/main.cpp
 
 VX_SRCS := $(SRC_DIR)/kernel.cpp
 
-OPTS ?= -r16 -c16 -R16 -C4
+# Pocket-H100 shape: tile_cols must equal NUM_THREADS (32), and a 1-warp CTA's
+# scratchpad budget at 8 KB LMEM / 16 warps is 512 B => tile 4x32 floats.
+OPTS ?= -r4 -c32 -R4 -C32
 
 KERNEL_LIB := vortex2
 

@@ -100,6 +100,37 @@ non-goal (a recorded follow-on, gap analysis §5.2).
    the traffic; Omelet models the network; topology becomes a `VX_CFG_NOC_*` knob. Single 2D die
    now; the same interface carries a future 2.5D/3D chiplet partition. *Uses Task 3's endpoints.*
 
+## 4b. Reference configuration — the "pocket H100"
+
+The paper baseline. Framing: H100 thread-block clusters are **GPC-bound** — DSMEM traffic never
+leaves a GPC — so the pocket machine is **one scaled GPC**. A K=8 cluster on a 16-SM machine
+mirrors H100's 8-CTA-cluster-on-a-~16-SM-GPC ratio exactly.
+
+| Parameter | H100 SXM5 | Pocket | Where |
+|---|---|---|---|
+| Warp width | 32 | **32** (exact) | `VX_CFG_NUM_THREADS` (default) |
+| SMSPs per SM | 4 | **4** (exact) | `VX_CFG_ISSUE_WIDTH` (literal default; `NUM_OPCS` derives to 1) |
+| Warps per SM | 64 | **16** (1/4 depth, 4/SMSP) | `VX_CFG_NUM_WARPS` (default) |
+| SMs | 132 (~16/GPC) | **16**, single cluster | run flags: `--cores=16` |
+| Max cluster size K | 8 portable | **8** | `VX_CFG_DSMEM_REGION_BITS=3` |
+| SMEM per SM | ≤228 KB | **8 KB**, 32 banks | `VX_CFG_LMEM_LOG_SIZE=13` (the aperture trade, task 3 §3) |
+| L1D / L1I per SM | 256 KB fused | 16 KB + 16 KB, separate | defaults (fusion is a non-goal) |
+| L2 (device LLC) | 50 MB | **2 MB** | `VX_CFG_L2_CACHE_SIZE`; run flag `--l2cache` (single cluster ⇒ the cluster L2 *is* the device LLC; L3 off) |
+| DRAM channels | 5 HBM3 | **4** | `VX_CFG_PLATFORM_MEMORY_NUM_BANKS` |
+| Peak DRAM BW | 3.35 TB/s | 460 GB/s (≈ SM-count scale) | default |
+| TMA per SM | 1 | 1 `DxaCore` | as-built (task 2) |
+
+**Canonical invocation** (per-SM shape and memory map come from the `VX_config.toml` defaults;
+machine size is a run flag so small dev runs stay cheap):
+
+```bash
+CONFIGS="-D<feature flags>" ./ci/blackbox.sh --driver=simx --app=<app> --cores=16 --l2cache ...
+```
+
+Capacity notes at this scale: a 1-warp CTA's scratchpad budget is 512 B
+(`8 KB / 16 warps`), and cluster launches reserve `K × lmem` contiguously — WGMMA multicast
+groups are capped at 2 co-resident 4-warp CTAs (see `sgemm_tcu_wg_dxa_mcast`'s Makefile pin).
+
 ## 5. Complexity assessment
 
 Honest difficulty of each task (building it correctly from scratch), with current status.

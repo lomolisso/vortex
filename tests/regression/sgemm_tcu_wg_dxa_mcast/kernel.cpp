@@ -1,11 +1,16 @@
-// sgemm_tcu_wg_dxa_mcast — Intra-core DXA multicast variant of sgemm_tcu_wg_dxa.
+// sgemm_tcu_wg_dxa_mcast — DXA multicast variant of sgemm_tcu_wg_dxa.
 //
-// WGMMA pattern: each CTA uses (num_warps_per_cta) warps in a warp group.
-// `mc_group_size` such CTAs are co-resident on one core, sharing the same
-// B tile via intra-core DXA multicast.
+// WGMMA pattern: each CTA uses (num_warps_per_cta) warps in a warp group;
+// `mc_group_size` CTAs share the same B tile via DXA multicast.
 //
-// Constraint: mc_group_size * warps_per_cta ≤ NUM_WARPS_per_core
-// (e.g., VX_CFG_NUM_WARPS=16 + 4-warp CTAs → 4 co-resident CTAs).
+// Two placement modes:
+//   - default (no DSMEM): the mc group is CO-RESIDENT on one core (same-core
+//     stride multicast; rendezvous = core-local group barrier). Constraint:
+//     mc_group_size * warps_per_cta ≤ NUM_WARPS, and the cluster-span LMEM
+//     reservation must fit (pocket-H100 8 KB SMEM → warps=8, mc=2).
+//   - DSMEM builds: gang placement spreads one rank per core; the multicast
+//     fans out over the SM-to-SM fabric and the rendezvous uses the CLUSTER
+//     barrier (a core-local count can never complete across cores).
 
 #include "common.h"
 #include <vx_spawn2.h>
@@ -51,12 +56,20 @@ __kernel void kernel_main(kernel_arg_t* __UNIFORM__ arg) {
   // Barriers:
   //   local_A — per-CTA bar for A (each CTA fetches its own slice).
   //   local_B — per-CTA bar for B (receives the multicast release).
-  //   group_B — local-group bar across the mc_group; the
-  //             vortex::dxa_multicast_2d helper rendezvouses on it before
-  //             rank-0 fires the multicast each iteration.
+  //   group_B — the mc_group rendezvous the vortex::dxa_multicast_2d helper
+  //             uses before rank-0 fires the multicast each iteration.
+  //             Same-core builds use the core-local group barrier; DSMEM
+  //             builds use the CLUSTER barrier, because gang placement
+  //             spreads the group one-rank-per-core and a core-local count
+  //             can never complete there (only the loader warp arrives, so
+  //             the cluster barrier expects 1 warp per rank).
   vortex::barrier       local_A(0);
   vortex::barrier       local_B(1);
-  vortex::group_barrier group_B(2, mc_group_size);
+#ifdef VX_CFG_DSMEM_ENABLE
+  vortex::cluster_barrier group_B(2, /*num_warps=*/1);
+#else
+  vortex::group_barrier   group_B(2, mc_group_size);
+#endif
   const bool is_loader_warp = (get_sub_group_id() == 0);
 
   for (uint32_t k = 0; k < K; k += ctx::tileK) {

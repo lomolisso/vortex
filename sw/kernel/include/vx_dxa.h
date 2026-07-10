@@ -311,11 +311,15 @@ namespace vortex {
 // num_members (= K, the cluster size / multicast group size) must be
 // supplied explicitly by the caller.
 
+// Rendezvous barrier type: vortex::group_barrier for same-core groups,
+// vortex::cluster_barrier when DSMEM gang placement spreads the group
+// across cores (C++17 CTAD picks the type from the ctor argument).
+template <typename GroupBarT = vortex::group_barrier>
 class dxa_multicast_1d {
 public:
   dxa_multicast_1d(uint32_t desc_slot, uint32_t num_members,
-                   vortex::barrier&       local_bar,
-                   vortex::group_barrier& group_bar)
+                   vortex::barrier& local_bar,
+                   GroupBarT&       group_bar)
     : desc_slot_(desc_slot), mask_((1u << num_members) - 1u),
       local_bar_(local_bar), group_bar_(group_bar) {
     local_bar_.expect_tx(1);
@@ -334,14 +338,18 @@ private:
   uint32_t                desc_slot_;
   uint32_t                mask_;
   vortex::barrier&        local_bar_;
-  vortex::group_barrier&  group_bar_;
+  GroupBarT&              group_bar_;
 };
 
+// Rendezvous barrier type: vortex::group_barrier for same-core groups,
+// vortex::cluster_barrier when DSMEM gang placement spreads the group
+// across cores (C++17 CTAD picks the type from the ctor argument).
+template <typename GroupBarT = vortex::group_barrier>
 class dxa_multicast_2d {
 public:
   dxa_multicast_2d(uint32_t desc_slot, uint32_t num_members,
-                   vortex::barrier&       local_bar,
-                   vortex::group_barrier& group_bar)
+                   vortex::barrier& local_bar,
+                   GroupBarT&       group_bar)
     : desc_slot_(desc_slot), mask_((1u << num_members) - 1u),
       local_bar_(local_bar), group_bar_(group_bar) {
     local_bar_.expect_tx(1);
@@ -361,14 +369,18 @@ private:
   uint32_t                desc_slot_;
   uint32_t                mask_;
   vortex::barrier&        local_bar_;
-  vortex::group_barrier&  group_bar_;
+  GroupBarT&              group_bar_;
 };
 
+// Rendezvous barrier type: vortex::group_barrier for same-core groups,
+// vortex::cluster_barrier when DSMEM gang placement spreads the group
+// across cores (C++17 CTAD picks the type from the ctor argument).
+template <typename GroupBarT = vortex::group_barrier>
 class dxa_multicast_3d {
 public:
   dxa_multicast_3d(uint32_t desc_slot, uint32_t num_members,
-                   vortex::barrier&       local_bar,
-                   vortex::group_barrier& group_bar)
+                   vortex::barrier& local_bar,
+                   GroupBarT&       group_bar)
     : desc_slot_(desc_slot), mask_((1u << num_members) - 1u),
       local_bar_(local_bar), group_bar_(group_bar) {
     local_bar_.expect_tx(1);
@@ -389,14 +401,18 @@ private:
   uint32_t                desc_slot_;
   uint32_t                mask_;
   vortex::barrier&        local_bar_;
-  vortex::group_barrier&  group_bar_;
+  GroupBarT&              group_bar_;
 };
 
+// Rendezvous barrier type: vortex::group_barrier for same-core groups,
+// vortex::cluster_barrier when DSMEM gang placement spreads the group
+// across cores (C++17 CTAD picks the type from the ctor argument).
+template <typename GroupBarT = vortex::group_barrier>
 class dxa_multicast_4d {
 public:
   dxa_multicast_4d(uint32_t desc_slot, uint32_t num_members,
-                   vortex::barrier&       local_bar,
-                   vortex::group_barrier& group_bar)
+                   vortex::barrier& local_bar,
+                   GroupBarT&       group_bar)
     : desc_slot_(desc_slot), mask_((1u << num_members) - 1u),
       local_bar_(local_bar), group_bar_(group_bar) {
     local_bar_.expect_tx(1);
@@ -418,14 +434,18 @@ private:
   uint32_t                desc_slot_;
   uint32_t                mask_;
   vortex::barrier&        local_bar_;
-  vortex::group_barrier&  group_bar_;
+  GroupBarT&              group_bar_;
 };
 
+// Rendezvous barrier type: vortex::group_barrier for same-core groups,
+// vortex::cluster_barrier when DSMEM gang placement spreads the group
+// across cores (C++17 CTAD picks the type from the ctor argument).
+template <typename GroupBarT = vortex::group_barrier>
 class dxa_multicast_5d {
 public:
   dxa_multicast_5d(uint32_t desc_slot, uint32_t num_members,
-                   vortex::barrier&       local_bar,
-                   vortex::group_barrier& group_bar)
+                   vortex::barrier& local_bar,
+                   GroupBarT&       group_bar)
     : desc_slot_(desc_slot), mask_((1u << num_members) - 1u),
       local_bar_(local_bar), group_bar_(group_bar) {
     local_bar_.expect_tx(1);
@@ -447,7 +467,7 @@ private:
   uint32_t                desc_slot_;
   uint32_t                mask_;
   vortex::barrier&        local_bar_;
-  vortex::group_barrier&  group_bar_;
+  GroupBarT&              group_bar_;
 };
 
 } // namespace vortex

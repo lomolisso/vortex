@@ -61,13 +61,20 @@ VX_CFG_EXT_OM_ENABLED = "expr: 1 if $VX_CFG_EXT_OM_ENABLE else 0"
 VX_CFG_VLEN = "expr: $VX_CFG_XLEN * 4"
 
 [pipeline]
-VX_CFG_NUM_WARPS = 4
-VX_CFG_NUM_THREADS = 4
+# Pocket-H100 reference SM shape (docs/proposals/dsmem/README.md, "Reference
+# configuration"): 32-wide warps (H100-exact), 16 warps/SM (1/4 of H100's 64),
+# 4 SMSPs (H100-exact). ISSUE_WIDTH is a literal — the legacy derivation
+# up(NUM_WARPS/16) assumed 16 warps per issue slot and would yield 1 here;
+# with 16 warps / 4 slots, PER_ISSUE_WARPS = 4 and NUM_OPCS derives to 1
+# (one operand collector per issue slot group — a deliberate pocket-scale
+# choice).
+VX_CFG_NUM_WARPS = 16
+VX_CFG_NUM_THREADS = 32
 VX_CFG_NUM_BARRIERS = 8
 VX_CFG_MAX_BAR_EVENTS = 32
 
 VX_CFG_IBUF_SIZE = 4
-VX_CFG_ISSUE_WIDTH = "expr: up($VX_CFG_NUM_WARPS / 16)"
+VX_CFG_ISSUE_WIDTH = 4
 VX_CFG_SIMD_WIDTH = "expr: $VX_CFG_NUM_THREADS"
 VX_CFG_NUM_OPCS = "expr: up($VX_CFG_NUM_WARPS / (4 * $VX_CFG_ISSUE_WIDTH))"
 
@@ -83,7 +90,9 @@ VX_CFG_L2_LINE_SIZE = "expr: $VX_CFG_MEM_BLOCK_SIZE"
 VX_CFG_L3_LINE_SIZE = "expr: $VX_CFG_MEM_BLOCK_SIZE"
 
 [platform]
-VX_CFG_PLATFORM_MEMORY_NUM_BANKS = 2
+# 4 DRAM channels (pocket-H100: the memory-controller crossbar endpoints for
+# the NoC study; must be a power of two — the bank interleave is a mask).
+VX_CFG_PLATFORM_MEMORY_NUM_BANKS = 4
 VX_CFG_PLATFORM_MEMORY_ADDR_WIDTH = "expr: 48 if $VX_CFG_XLEN_64 else 32"
 VX_CFG_PLATFORM_MEMORY_DATA_SIZE = 64
 VX_CFG_PLATFORM_MEMORY_INTERLEAVE = 1
@@ -198,7 +207,8 @@ VX_CFG_DCACHE_NUM_BANKS = "expr: pow(2, clog2(min($VX_CFG_DCACHE_NUM_REQS, 16)))
 VX_CFG_L1_MEM_PORTS = "expr: min($VX_CFG_DCACHE_NUM_BANKS, $VX_CFG_PLATFORM_MEMORY_NUM_BANKS) if ($VX_CFG_ICACHE_ENABLE or $VX_CFG_DCACHE_ENABLE) else min($VX_CFG_DCACHE_NUM_REQS, $VX_CFG_PLATFORM_MEMORY_NUM_BANKS)"
 
 [l2cache]
-VX_CFG_L2_CACHE_SIZE = 1048576
+# Pocket-H100: 2 MB device LLC (~128 KB/SM at 16 SMs; H100: 50 MB/132 SMs).
+VX_CFG_L2_CACHE_SIZE = 2097152
 VX_CFG_L2_NUM_WAYS = 8
 VX_CFG_L2_WRITEBACK = 0
 VX_CFG_L2_DIRTYBYTES = "expr: $VX_CFG_L2_WRITEBACK"
@@ -226,7 +236,10 @@ VX_CFG_L3_NUM_BANKS = "expr: pow(2, clog2(min($VX_CFG_L3_NUM_REQS, 16)))"
 VX_CFG_L3_MEM_PORTS = "expr: min($VX_CFG_L3_NUM_BANKS, $VX_CFG_PLATFORM_MEMORY_NUM_BANKS) if $VX_CFG_L3_ENABLE else min($VX_CFG_L3_NUM_REQS, $VX_CFG_PLATFORM_MEMORY_NUM_BANKS)"
 
 [lmem]
-VX_CFG_LMEM_LOG_SIZE = 14
+# Pocket-H100: 8 KB SMEM per SM. On XLEN32 the DSMEM aperture budget is
+# LMEM_LOG_SIZE + DSMEM_REGION_BITS <= 16, so 8 KB (13) buys 3 region bits
+# => cluster size K <= 8 (H100-portable parity). 16 KB would cap K at 4.
+VX_CFG_LMEM_LOG_SIZE = 13
 VX_CFG_LMEM_NUM_BANKS = "expr: $VX_CFG_NUM_LSU_LANES"
 
 [dsmem]
@@ -242,7 +255,7 @@ VX_CFG_DSMEM_ENABLED = "expr: 1 if $VX_CFG_DSMEM_ENABLE else 0"
 # DSMEM aperture: peer-region bits above the per-CTA LMEM offset. XLEN32 has
 # only 2^16 bytes of address space above LMEM_BASE, capping
 # LMEM_LOG_SIZE + REGION_BITS at 16 (=> max cluster size 4 cross-core).
-VX_CFG_DSMEM_REGION_BITS = 2
+VX_CFG_DSMEM_REGION_BITS = 3
 # CTA-cluster residency-table entries (concurrently tracked clusters); rank-0
 # admission stalls while the table is full, mirroring the dispatch
 # table_notfull handshake.

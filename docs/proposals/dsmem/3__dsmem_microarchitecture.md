@@ -67,8 +67,17 @@ Thread-issued cross-core load/store on the 3a substrate.
   few high bits above the per-CTA offset encode a **relative rank distance**: region 0 is the
   plain local window (unchanged semantics/bytes), region *r > 0* means "the CTA at rank
   `(my_rank + r) mod K`". Relative encoding keeps local accesses free of translation. On XLEN32
-  only 2^16 B sit above `LMEM_BASE`, so the aperture uses **2 region bits**
-  (`VX_CFG_DSMEM_REGION_BITS`) ⇒ cross-core `K ≤ 4`.
+  only 2^16 B sit above `LMEM_BASE`, so SMEM size and cluster reach trade against each other
+  (`LMEM_LOG_SIZE + DSMEM_REGION_BITS ≤ 16`, compile-enforced):
+
+  | SMEM/SM | `LMEM_LOG_SIZE` | `REGION_BITS` | max K |
+  |---|---|---|---|
+  | 16 KB | 14 | 2 | 4 |
+  | **8 KB (pocket-H100 default)** | **13** | **3** | **8** — H100-portable parity |
+  | 4 KB | 12 | 4 | 16 |
+
+  The pocket-H100 reference configuration (README §"Reference configuration") takes the middle
+  row. XLEN64 lifts the constraint entirely (untested).
 - **Instruction surface.** Free **custom0 / `funct7 = 0x05`** family:
   - `mapa.cluster` (funct3 0, ALU) — map a local shared pointer + target rank → a cluster-shared
     address (`r = (rank − my_rank) mod K`; region-encode).
@@ -124,10 +133,17 @@ including a phase where each rank remote-**stores** into a peer and the second b
 what makes the writes visible.
 
 ```bash
+# K=2 / K=4 (region-bit interior), single-warp CTAs
 CONFIGS="-DVX_CFG_DSMEM_ENABLE" \
-  ./ci/blackbox.sh --driver=simx --app=dsmem_pingpong --clusters=1 --cores=2 --warps=64 --threads=32
+  ./ci/blackbox.sh --driver=simx --app=dsmem_pingpong --cores=2 --args="-n2"
 CONFIGS="-DVX_CFG_DSMEM_ENABLE" \
-  ./ci/blackbox.sh --driver=simx --app=dsmem_pingpong --clusters=1 --cores=4 --warps=64 --threads=32
+  ./ci/blackbox.sh --driver=simx --app=dsmem_pingpong --cores=4 --args="-n4"
+# K=8 (the pocket-H100 headline: region-bit limit, one rank per core)
+CONFIGS="-DVX_CFG_DSMEM_ENABLE" \
+  ./ci/blackbox.sh --driver=simx --app=dsmem_pingpong --cores=8 --args="-n8"
+# multi-warp CTAs + the canonical 16-SM machine with the L2 enabled
+CONFIGS="-DVX_CFG_DSMEM_ENABLE" \
+  ./ci/blackbox.sh --driver=simx --app=dsmem_pingpong --cores=16 --l2cache --args="-n8 -w2"
 ```
 
 Set the cluster dims so CTAs co-reside across cores. 120 s cap applies.

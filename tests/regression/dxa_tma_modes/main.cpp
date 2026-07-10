@@ -121,7 +121,10 @@ int main(int argc, char* argv[]) {
     cleanup();
     return -1;
   }
-  const uint32_t block_size = (uint32_t)num_threads; // one warp
+  // 4-warp CTA: the per-CTA scratchpad budget scales with warps-per-block
+  // (LMEM / floor(NUM_WARPS / warps_per_block)); the 1 KB swizzle tile needs
+  // more than a single warp's share at the pocket-H100 8 KB scratchpad.
+  const uint32_t block_size = 4 * (uint32_t)num_threads;
 
   RT_CHECK(vx_check_occupancy(device, block_size, kMaxTileWords * sizeof(uint32_t)));
 
