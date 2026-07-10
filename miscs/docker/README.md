@@ -178,7 +178,7 @@ reconfigure from scratch.
 
 The dev image doubles as the environment for **Omelet** (the packaging-aware
 gem5/Garnet NoC simulator used for Vortex NoC modeling — see
-`docs/proposals/omelet_noc_cosim_proposal.md`). `vortex-dev.sh up` auto-mounts
+`docs/proposals/dsmem/5__omelet_cosimulation.md`). `vortex-dev.sh up` auto-mounts
 a sibling `../omelet` checkout at `/omelet` (override with `OMELET_SRC=`, or
 set it empty to skip). Same hot-reload philosophy as `/vortex`: the image only
 carries Omelet's dependencies; the source — including its pinned gem5 v22.1

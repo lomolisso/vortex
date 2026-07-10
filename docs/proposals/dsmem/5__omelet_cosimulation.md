@@ -1,9 +1,10 @@
-# Task 4 — Omelet NoC Co-Simulation: All Vortex Fabrics on a Real Network Model
+# Task 5 — Omelet NoC Co-Simulation: All Vortex Fabrics on a Real Network Model
 
-Part of the [Toy-H100 SimX Roadmap](toy_h100_simx_roadmap_proposal.md); this is **Task 4**, and
-it **depends on [Task 3](dsmem_smtosm_simx_proposal.md)** (DSMEM endpoints, residency table,
-cluster barrier, DXA multicast fan-out). It replaces SimX-internal NoC modeling — including
-Task 3's interim `IdealTransport` placeholder — with **co-simulation against Omelet**, the
+Part of the [DSMEM & TMA Roadmap](README.md); this is **Task 5** (the final task), and
+it **depends on [Task 3](3__dsmem_microarchitecture.md)** (DSMEM endpoints, residency table,
+cluster barrier) and **[Task 4](4__tma_multicast.md)** (TMA multicast fan-out). It replaces
+SimX-internal NoC modeling — including Task 3's interim `IdealTransport` placeholder — with
+**co-simulation against Omelet**, the
 packaging-aware gem5/Garnet chiplet-interconnect simulator (sibling checkout `../omelet`,
 mounted at `/omelet` in the dev container).
 
@@ -28,7 +29,7 @@ intra-block wiring and stays SimX-modeled):
 
 | # | Fabric | SimX site | Endpoints (config-general) |
 |---|---|---|---|
-| ① | SM-to-SM DSMEM transport | `cluster.cpp` (DSMEM mode, `IdealTransport` today) | `NUM_CORES` × `NUM_CORES` |
+| ① | SM-to-SM DSMEM transport | `cluster.cpp` (DSMEM-enabled, `IdealTransport` today) | `NUM_CORES` × `NUM_CORES` |
 | ② | cores → L2 (cluster interconnect) | `cluster.cpp` L2 fan-in | `NUM_CORES·L1_MEM_PORTS` → `L2_NUM_REQS` |
 | ③ | clusters → L3/LLC (processor interconnect) | `processor.cpp` L3 wiring | `NUM_CLUSTERS·L2_MEM_PORTS` → `L3_NUM_REQS` |
 | ④ | LLC → DRAM channels (memory-controller crossbar) | `mem/memory.cpp` `mem_xbar_` | `L3_MEM_PORTS` → `PLATFORM_MEMORY_NUM_BANKS` |

@@ -236,7 +236,7 @@ VX_CFG_LMEM_NUM_BANKS = "expr: $VX_CFG_NUM_LSU_LANES"
 # L2-bypass path); NONE = passthrough, no transport.
 # NOTE: in DSMEM mode the transport is a fixed-delay ideal placeholder
 # (sim/simx/dsmem/ideal_transport.*). NoC topology/timing knobs return with
-# the Omelet co-simulator (docs/proposals/omelet_noc_cosim_proposal.md).
+# the Omelet co-simulator (docs/proposals/dsmem/5__omelet_cosimulation.md).
 VX_CFG_CLUSTER_MEM_MODE = "L2"
 # DSMEM aperture: peer-region bits above the per-CTA LMEM offset. XLEN32 has
 # only 2^16 bytes of address space above LMEM_BASE, capping

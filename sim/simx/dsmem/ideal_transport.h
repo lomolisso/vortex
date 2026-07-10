@@ -23,7 +23,7 @@ namespace vortex {
 // LocalMem remote ports, DXA multicast) point-to-point connectivity with a
 // fixed delay and no topology, contention, or link accounting: NoC modeling
 // for every Vortex fabric is delegated to the Omelet co-simulator
-// (docs/proposals/omelet_noc_cosim_proposal.md). This class remains the
+// (docs/proposals/dsmem/5__omelet_cosimulation.md). This class remains the
 // fallback transport when co-simulation is off, so standalone simx keeps
 // working without gem5.
 //
