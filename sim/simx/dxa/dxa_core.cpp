@@ -248,10 +248,27 @@ private:
 
   // K-major destination layout (NVIDIA-TMA style): SMEM addr per element is
   // base + i1 * elem_bytes + e0 * tile1 * elem_bytes (instead of the default
-  // row-major base + i1 * tile0 * elem_bytes + e0 * elem_bytes).
+  // row-major base + i1 * tile0 * elem_bytes + e0 * elem_bytes). For rank ≥ 3
+  // the transpose applies per 2D (dim0×dim1) slice; outer dims stack slices
+  // row-major (slice stride = tile0*tile1*elem_bytes).
   static bool desc_dest_kmajor(uint32_t meta) {
     return (meta >> VX_DXA_DESC_META_LAYOUT_LSB)
            & ((1u << VX_DXA_DESC_META_LAYOUT_BITS) - 1u);
+  }
+
+  // Destination SMEM swizzle (NVIDIA-TMA style XOR bank swizzle): 0 = none,
+  // 1/2/3 = 32B/64B/128B modes (CUTLASS Swizzle<B,4,3> with B = the mode).
+  // The 16-byte unit index within each 128-byte chunk (offset bits [6:4]) is
+  // XORed with the chunk index bits [9:7], tile-relative:
+  //   off ^= ((off >> 7) & ((1 << B) - 1)) << 4
+  // The permutation stays inside its 128-byte chunk (only bits [6:4] change).
+  static uint32_t desc_swizzle(uint32_t meta) {
+    return (meta >> VX_DXA_DESC_META_SWIZZLE_LSB)
+           & ((1u << VX_DXA_DESC_META_SWIZZLE_BITS) - 1u);
+  }
+
+  static uint64_t swizzle_offset(uint64_t off, uint32_t swz_bits) {
+    return off ^ (((off >> 7) & ((1ull << swz_bits) - 1u)) << 4);
   }
 
   // ── Pull from per-core dxa_req_in[] into queue_ (round-robin) ────────
@@ -332,14 +349,18 @@ private:
 
     uint32_t elem_bytes = desc_elem_bytes(desc.meta);
     bool     dest_kmajor = desc_dest_kmajor(desc.meta);
+    uint32_t swz_bits    = desc_swizzle(desc.meta);
     std::array<uint32_t, 5> tiles = {};
-    for (uint32_t d = 0; d < 5; ++d)
+    std::array<uint32_t, 5> estrides = {};
+    for (uint32_t d = 0; d < 5; ++d) {
       tiles[d] = (d < rank) ? std::max<uint32_t>(1u, desc.tile_sizes[d]) : 1u;
-
-    // K-major requires rank ≤ 2; silently disable if violated.
-    if (dest_kmajor && rank > 2) {
-      dest_kmajor = false;
+      // TMA traversal strides: element d of the box maps to tensor element
+      // coords[d] + local_d * estride_d. 0 (unprogrammed) means dense (1).
+      estrides[d] = std::max<uint32_t>(1u, desc.element_strides[d]);
     }
+    // estride0 > 1 breaks dim-0 contiguity: gather one element per LineWork
+    // (the SMEM destination stays dense).
+    const bool unit_gather = (estrides[0] > 1);
 
     uint32_t total_rows = 1;
     for (uint32_t d = 1; d < rank; ++d) total_rows *= tiles[d];
@@ -360,22 +381,27 @@ private:
         rem /= tiles[d];
       }
 
-      // OOB check on outer dims.
+      // OOB check on outer dims (element coord = box origin + local·estride).
       bool row_in_bounds = true;
       for (uint32_t d = 1; d < rank; ++d) {
-        if (w.req.coords[d] + outer[d - 1] >= desc.sizes[d]) { row_in_bounds = false; break; }
+        if (w.req.coords[d] + outer[d - 1] * estrides[d] >= desc.sizes[d]) { row_in_bounds = false; break; }
       }
 
       // First element GMEM addr in this row.
       uint64_t row_gbase = desc.base_addr + uint64_t(w.req.coords[0]) * elem_bytes;
       for (uint32_t d = 1; d < rank; ++d)
-        row_gbase += uint64_t(w.req.coords[d] + outer[d - 1]) * uint64_t(desc.strides[d - 1]);
+        row_gbase += uint64_t(w.req.coords[d] + outer[d - 1] * estrides[d]) * uint64_t(desc.strides[d - 1]);
 
       // SMEM destination base for this row:
       //   Row-major:  base + row_idx * row_elems * elem_bytes  (i1 outer × i0 inner).
-      //   K-major:    base + outer[0] * elem_bytes              (lane stride applies per e0 below).
+      //   K-major:    base + slice_idx * tile0*tile1 * elem_bytes + outer[0] * elem_bytes
+      //               (per-2D-slice transpose; dims ≥ 2 stack slices row-major;
+      //                the lane stride applies per e0 below).
+      uint32_t slice_idx = (rank >= 3) ? (row / tiles[1]) : 0;
       uint64_t row_smem_base = dest_kmajor
-          ? (w.req.smem_addr + uint64_t(outer[0]) * elem_bytes)
+          ? (w.req.smem_addr
+             + uint64_t(slice_idx) * tiles[0] * tiles[1] * elem_bytes
+             + uint64_t(outer[0]) * elem_bytes)
           : (w.req.smem_addr + uint64_t(row * row_elems) * elem_bytes);
 
       // Walk dim-0 elements; each LineWork carries one MemReq write of at
@@ -383,10 +409,18 @@ private:
       // 64-byte mem_block payload). K-major scatters each element to its
       // own SMEM destination (lane stride = tile1 * elem_bytes).
       for (uint32_t e0 = 0; e0 < row_elems; ) {
-        uint64_t gaddr_e = row_gbase + uint64_t(e0) * elem_bytes;
+        uint64_t gaddr_e = row_gbase + uint64_t(e0) * estrides[0] * elem_bytes;
         uint64_t saddr_e = dest_kmajor
             ? (row_smem_base + uint64_t(e0) * uint64_t(per_lane_stride_bytes))
             : (row_smem_base + uint64_t(e0) * elem_bytes);
+        // Swizzle permutes the destination within the tile (tile-relative, so
+        // the multicast rebase onto each receiver's slice preserves the
+        // layout). Bits [3:0] are untouched, so a span inside one 16-byte
+        // unit stays contiguous after the XOR.
+        if (swz_bits != 0) {
+          saddr_e = w.req.smem_addr
+                  + swizzle_offset(saddr_e - w.req.smem_addr, swz_bits);
+        }
         uint64_t cl_addr = gaddr_e & kGmemLineMask;
         uint64_t sword   = saddr_e & ~uint64_t(kLmemWordSize - 1);
         uint32_t cl_off  = uint32_t(gaddr_e - cl_addr);
@@ -395,17 +429,24 @@ private:
         uint32_t sw_room  = kLmemWordSize - s_off;
         uint32_t row_room = (row_elems - e0) * elem_bytes;
         // Cap to VX_CFG_MEM_BLOCK_SIZE (the byteen mask is 64 bits wide and the
-        // mem_block_t payload is 64 bytes). K-major: each element scatters
-        // to a distinct SMEM destination, so span is exactly one element.
-        uint32_t span = dest_kmajor
+        // mem_block_t payload is 64 bytes). K-major and strided (estride0>1)
+        // gathers: each element scatters/gathers independently, so span is
+        // exactly one element.
+        uint32_t span = (dest_kmajor || unit_gather)
             ? elem_bytes
             : std::min({cl_room, sw_room, row_room, uint32_t(VX_CFG_MEM_BLOCK_SIZE)});
+        // Under swizzle a contiguous span must not cross its 16-byte unit —
+        // the XOR relocates whole units, not bytes within them.
+        if (swz_bits != 0 && !dest_kmajor && !unit_gather) {
+          span = std::min(span, 16u - uint32_t(saddr_e & 15u));
+        }
         // Round to a whole-element multiple — ensures e0 advances by an
         // integer count and avoids off-by-one element splits.
         span -= span % elem_bytes;
         if (span == 0) break;
 
-        bool elem_oob = !row_in_bounds || (w.req.coords[0] + e0 >= desc.sizes[0]);
+        bool elem_oob = !row_in_bounds
+                     || (w.req.coords[0] + e0 * estrides[0] >= desc.sizes[0]);
         // OOB is determined per-element at the start of the span; tile widths
         // are typically aligned to dim-0 size, so this is exact for the common case.
 

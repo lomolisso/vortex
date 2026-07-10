@@ -1,6 +1,6 @@
 # Task 4 — TMA Multicast & TMA Features — SimX Proposal
 
-**Status:** multicast implemented in SimX (see §6); the other TMA features are proposed.
+**Status:** implemented in SimX (multicast + completion + copy modes; see §6).
 **Scope:** SimX only ([`sim/simx/`](../../../sim/simx/)) plus the `sw/` intrinsic surface. Part of
 the [DSMEM & TMA Roadmap](README.md); this is **Task 4**, and it **depends on
 [Task 2](2__per_core_dxa.md)** (per-core `DxaCore`) and
@@ -89,19 +89,26 @@ barrier alone).
 
 ---
 
-## 4. TMA tiled / multi-dimensional copies (additive)
+## 4. TMA tiled / multi-dimensional copies
 
-The DXA descriptor already carries tile geometry; this item rounds it out to the TMA copy modes
-that are not yet covered:
+The DXA descriptor carries the full tensor geometry. As-built coverage:
 
-- **2D/3D box copies** — a tensor descriptor (global base, per-dim extents + strides, element
-  size) copying a rectangular sub-tile into a (swizzled) scratchpad layout, so a WGMMA can
-  consume it directly.
-- **Descriptor formats** aligned with the WGMMA operand layout (K-major, already partly present
-  for the tensor-core feed).
+- **Rank-1..5 box copies** — tensor descriptor (global base, per-dim extents + byte strides,
+  element size, per-dim tile box, OOB clamp + constant fill), 16 DCR-programmed slots.
+- **Element (traversal) strides** — `ESTRIDE0..4`: box element `local_d` maps to tensor element
+  `coords[d] + local_d · estride_d` (dense SMEM destination, strided GMEM gather; the CUDA
+  tensor-map `elementStrides` analog). Host: `vortex::dxa::set_element_strides`.
+- **K-major destination layout** — per-2D-slice transpose (`smem[e0·tile1 + i1]`), generalized
+  to **any rank**: dims ≥ 2 stack the transposed slices row-major.
+- **Destination swizzle** — NVIDIA-TMA-style XOR bank swizzle, modes 32B/64B/128B (CUTLASS
+  `Swizzle<B,4,3>`): tile-relative `off ^= ((off >> 7) & ((1<<B)-1)) << 4`, permuting 16-byte
+  units within each 128-byte chunk. Host: `vortex::dxa::set_layout(..., Swizzle::B128)`.
+  Composes with multicast (the permutation is tile-relative, so the per-receiver rebase
+  preserves it).
+- **Reserved (documented, not wired):** `INTERLEAVE` / `L2PROMO` meta fields — packing and
+  cache-promotion hints, not copy-layout; they stay reserved.
 
-These extend the existing engine and descriptor path; they are additive and can land after
-multicast. (Full descriptor/geometry rationale lives in
+(Full descriptor/geometry rationale lives in
 [`../../designs/dxa_async_copy_multicast.md`](../../designs/dxa_async_copy_multicast.md).)
 
 ---
@@ -114,13 +121,21 @@ receiver's barrier fired (per-destination completion); **(c)** — the load-bear
 **GMEM read traffic for the N-way multicast is ≈ 1× the tile, not N×**, read from the
 `[csr_mpm_dxa]` perf counters. **Byte-correctness alone is not sufficient and must not pass.**
 
+`tests/regression/dxa_tma_modes/` — the §4 copy modes against a host reference-layout model:
+element strides (2,2), rank-3 K-major, and all three swizzle modes (raw SMEM image dumped and
+compared word-for-word). `tests/regression/dxa_copy/` verifies plain rank-1..5 box copies
+byte-for-byte (copy-back to GMEM + host compare).
+
 ```bash
 # faithful TMA multicast — verify the single global read
 CONFIGS="-DVX_CFG_EXT_DXA_ENABLE -DVX_CFG_DSMEM_ENABLE" \
-  ./ci/blackbox.sh --driver=simx --app=dxa_multicast --clusters=1 --cores=4 --threads=32 --perf=2
+  ./ci/blackbox.sh --driver=simx --app=dxa_multicast --clusters=1 --cores=4 --threads=32 --perf=6
 # the cross-core multicast Task 2 deferred now passes over the fabric
 CONFIGS="-DVX_CFG_EXT_DXA_ENABLE -DVX_CFG_DSMEM_ENABLE" \
   ./ci/blackbox.sh --driver=simx --app=sgemm_tcu_wg_dxa_mcast --cores=4 --threads=32
+# TMA copy modes: element strides, 3D K-major, 32/64/128B swizzle
+CONFIGS="-DVX_CFG_EXT_DXA_ENABLE" \
+  ./ci/blackbox.sh --driver=simx --app=dxa_tma_modes --threads=32
 ```
 
 120 s cap applies.
@@ -137,7 +152,13 @@ Multicast is implemented over the ideal fabric:
 - **Per-receiver completion** re-targets `dxa_notify_bar_id` to the **receiver's own** CTA slot
   (from the residency table — the issuer-relative `bar_id + cta_idx` arithmetic only holds
   same-core) and fires on the receiver core's fabric-ingress callback.
+- **Copy modes (§4) implemented in `enumerate_work_list`** with the default paths bit-identical
+  when unused: element strides (0/1 = dense fast path), K-major at any rank (per-2D-slice
+  transpose; the old rank≤2 clamp removed), and the 32/64/128B XOR swizzle (applied
+  tile-relative; contiguous spans additionally capped to 16-byte swizzle units).
+- **Completion (§3) is as-designed** — the barrier-event mechanism (`expect_tx` +
+  `dxa_notify_done`, per-receiver retarget) *is* the completion API; nothing further is planned.
 - **Passes:** `dxa_multicast` (bytes + per-receiver completion + the 1×-GMEM assertion),
-  `dxa_copy_mcast` (same-core degenerate), `sgemm_tcu_wg_dxa_mcast`.
-- **Not yet built:** the async-completion API surface (§3, beyond the internal barrier event
-  already used) and the multi-dimensional/tensor copy modes (§4).
+  `dxa_copy` (byte-verified rank-1..5), `dxa_tma_modes` (estrides + 3D K-major + all swizzle
+  modes vs a host reference model), `dxa_copy_mcast` (same-core degenerate),
+  `sgemm_tcu_wg_dxa_mcast`, `dxa_kmajor_check`.

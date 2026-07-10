@@ -255,20 +255,54 @@ inline int set_multicast(
   return vx_dcr_write(dev, dcr + VX_DCR_DXA_DESC_SMEM_STRIDE_OFF, smem_stride_bytes);
 }
 
+// ── Destination SMEM swizzle (NVIDIA-TMA style XOR bank swizzle) ────
+//
+// Permutes 16-byte units within each 128-byte chunk of the destination
+// tile (tile-relative): off ^= ((off >> 7) & ((1 << B) - 1)) << 4, with
+// B = 1/2/3 for the 32B/64B/128B modes (CUTLASS Swizzle<B,4,3>). Avoids
+// SMEM bank conflicts when a consumer walks the tile column-wise.
+enum class Swizzle : uint32_t {
+  None = 0,
+  B32  = 1,
+  B64  = 2,
+  B128 = 3,
+};
+
 // Override the destination SMEM layout for an already-programmed descriptor.
-// META is rewritten from scratch (rank + elem_bytes + layout); call AFTER
-// program_Nd, passing the same rank and elem_bytes you used. (DCR is
-// write-only on most paths — we don't read-modify-write META; we re-pack
-// it locally.)
+// META is rewritten from scratch (rank + elem_bytes + layout + swizzle);
+// call AFTER program_Nd, passing the same rank and elem_bytes you used.
+// (DCR is write-only on most paths — we don't read-modify-write META; we
+// re-pack it locally.)
 inline int set_layout(
     vx_device_h dev, uint32_t slot,
     Layout layout,
-    uint32_t rank, uint32_t elem_bytes) {
+    uint32_t rank, uint32_t elem_bytes,
+    Swizzle swizzle = Swizzle::None) {
   uint32_t dcr  = VX_DCR_DXA_DESC_BASE + slot * VX_DCR_DXA_DESC_STRIDE;
   uint32_t meta = detail::pack_meta(rank, detail::elem_size_enc(elem_bytes))
                 | ((static_cast<uint32_t>(layout) & ((1u << VX_DXA_DESC_META_LAYOUT_BITS) - 1u))
-                   << VX_DXA_DESC_META_LAYOUT_LSB);
+                   << VX_DXA_DESC_META_LAYOUT_LSB)
+                | ((static_cast<uint32_t>(swizzle) & ((1u << VX_DXA_DESC_META_SWIZZLE_BITS) - 1u))
+                   << VX_DXA_DESC_META_SWIZZLE_LSB);
   return vx_dcr_write(dev, dcr + VX_DCR_DXA_DESC_META_OFF, meta);
+}
+
+// Program the TMA traversal strides (element granularity) for an
+// already-programmed descriptor: element local_d of the box maps to tensor
+// element coords[d] + local_d * estride_d. Defaults are dense (1). The SMEM
+// destination stays densely packed; only the GMEM gather is strided.
+inline int set_element_strides(
+    vx_device_h dev, uint32_t slot,
+    uint32_t e0, uint32_t e1 = 1, uint32_t e2 = 1,
+    uint32_t e3 = 1, uint32_t e4 = 1) {
+  uint32_t dcr = VX_DCR_DXA_DESC_BASE + slot * VX_DCR_DXA_DESC_STRIDE;
+  return detail::write_regs(dev, dcr, {
+    {VX_DCR_DXA_DESC_ESTRIDE0_OFF, e0},
+    {VX_DCR_DXA_DESC_ESTRIDE1_OFF, e1},
+    {VX_DCR_DXA_DESC_ESTRIDE2_OFF, e2},
+    {VX_DCR_DXA_DESC_ESTRIDE3_OFF, e3},
+    {VX_DCR_DXA_DESC_ESTRIDE4_OFF, e4},
+  });
 }
 
 } // namespace dxa

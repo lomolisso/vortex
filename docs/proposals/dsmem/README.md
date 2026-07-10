@@ -108,8 +108,8 @@ Honest difficulty of each task (building it correctly from scratch), with curren
 |---|---|---|---|
 | 1 Socket removal | **Medium** | delete a hierarchy level + rewire cluster→core + drop socket knobs; broad but a refactor, no new algorithms | implemented |
 | 2 Per-core DXA | **Medium** | relocate one engine + add a dcache→DXA arbiter + retarget writes; relocation/rewiring | implemented |
-| 3 DSMEM microarch | **High** | new aperture/region encoding, three new instructions through decode/ALU/LSU, residency table, gang placement, `cluster_id`/`rank` plumbing, remote port + egress, cross-SM barrier + drain — many new SimObjects and cross-cutting plumbing (the ideal fabric keeps it bounded) | largely implemented |
-| 4 TMA multicast + features | **Medium-High** | fan-out with single-global-read + per-receiver completion on the Task-3 machinery; completion and tiled modes are additive | multicast implemented |
+| 3 DSMEM microarch | **High** | new aperture/region encoding, three new instructions through decode/ALU/LSU, residency table, gang placement, `cluster_id`/`rank` plumbing, remote port + egress, cross-SM barrier + drain — many new SimObjects and cross-cutting plumbing (the ideal fabric keeps it bounded) | implemented |
+| 4 TMA multicast + features | **Medium-High** | fan-out with single-global-read + per-receiver completion on the Task-3 machinery; completion and tiled modes are additive | implemented |
 | 5 Omelet co-sim | **Very High** | embed SimX in gem5 v22.1 (VortexGPGPU v25→v22.1 port), a C-ABI token protocol, a Garnet NetworkInterface bridge, timing-only tokens + backpressure, a knob→yaml generator; the least-bounded, cross-simulator work | not started |
 
 ## 6. The 1:1 mapping discipline (intended future SV modules)
