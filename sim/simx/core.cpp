@@ -45,6 +45,7 @@
 #include "constants.h"
 #ifdef VX_CFG_DSMEM_ENABLE
 #include "dsmem_lsu_adapter.h"
+#include "cta_residency_table.h"
 #endif
 #include "debug.h"
 #ifdef VX_CFG_EXT_TCU_ENABLE
@@ -81,6 +82,7 @@ public:
     , dsmem_lsu_adapters_(VX_CFG_NUM_LSU_BLOCKS)
     , dsmem_store_pending_(VX_CFG_NUM_WARPS, 0)
     , dsmem_drain_bar_(VX_CFG_NUM_WARPS, kDrainDisarmed)
+    , cta_replica_(VX_CFG_CTA_TABLE_SIZE)
 #endif
     , fetch_latch_(ctx, "fetch_latch", 2, 2)
     , decode_latch_(ctx, "decode_latch", 1, 2)
@@ -489,6 +491,7 @@ public:
 #ifdef VX_CFG_DSMEM_ENABLE
     std::fill(dsmem_store_pending_.begin(), dsmem_store_pending_.end(), 0);
     std::fill(dsmem_drain_bar_.begin(), dsmem_drain_bar_.end(), kDrainDisarmed);
+    cta_replica_.reset();
 #endif
 
     perf_stats_ = PerfStats();
@@ -517,6 +520,9 @@ public:
   }
   void dsmem_arm_drain(uint32_t wid, uint32_t bar_id) {
     dsmem_drain_bar_.at(wid) = bar_id;
+  }
+  CtaReplica* cta_replica() {
+    return &cta_replica_;
   }
 #endif
 
@@ -1113,6 +1119,7 @@ private:
   std::vector<DsmemLsuAdapter::Ptr> dsmem_lsu_adapters_;
   std::vector<uint32_t> dsmem_store_pending_;  // per-warp in-flight remote stores
   std::vector<uint32_t> dsmem_drain_bar_;      // per-warp armed cluster barrier
+  CtaReplica            cta_replica_;          // per-SM residency read replica
 #endif
 
   TFifo<instr_trace_t*> fetch_latch_;
@@ -1246,6 +1253,10 @@ void Core::dsmem_arm_drain(uint32_t wid, uint32_t bar_id) {
 
 void Core::cluster_barrier_resume(uint32_t bar_id) {
   impl_->scheduler()->barrier_unit().global_resume(bar_id);
+}
+
+CtaReplica* Core::cta_replica() {
+  return impl_->cta_replica();
 }
 #endif
 

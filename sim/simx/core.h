@@ -29,6 +29,7 @@ namespace vortex {
 class Cluster;
 class ProcessorImpl;
 class Scheduler;
+class CtaReplica;
 class CsrUnit;
 class TcuUnit;
 class SfuUnit;
@@ -141,6 +142,11 @@ public:
 
   // Cluster-barrier wake from the cluster-level accumulator.
   void cluster_barrier_resume(uint32_t bar_id);
+
+  // Per-SM residency read replica (filled by the cluster master's broadcast at
+  // full-cluster admission). Hot-path resolves (DSMEM remote access, DXA
+  // fan-out) read this LOCAL copy — no shared-structure contention.
+  CtaReplica* cta_replica();
 #endif
 
   bool wspawn(uint32_t num_warps, Word nextPC);

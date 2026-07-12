@@ -546,11 +546,13 @@ private:
       cta_warp_idx = w.cta_indices.at(w.mc_cta_idx);
     }
 #ifdef VX_CFG_DSMEM_ENABLE
-    const CtaResidencyTable::RankSlot* dest_slot = nullptr;
-    const CtaResidencyTable::RankSlot* issuer_slot = nullptr;
+    const CtaRankSlot* dest_slot = nullptr;
+    const CtaRankSlot* issuer_slot = nullptr;
     bool remote = false;
     if (w.is_multicast) {
-      auto* table = w.req.core->cluster()->cta_table();
+      // Per-SM residency replica (local read); the issuing SM holds the full
+      // cluster set because it is a participant.
+      auto* table = w.req.core->cta_replica();
       dest_slot   = table->resolve(w.req.cluster_id, cta_warp_idx);
       issuer_slot = table->resolve(w.req.cluster_id, w.req.cluster_rank);
       // The kernel's pre-issue rendezvous (cluster barrier) guarantees every
@@ -663,7 +665,7 @@ private:
         // Error path (invalid descriptor / empty transfer): release each
         // receiver's own barrier on its own core when it is resident;
         // otherwise fall back to the issuer-local release.
-        auto* slot = w.req.core->cluster()->cta_table()->resolve(w.req.cluster_id, cta);
+        auto* slot = w.req.core->cta_replica()->resolve(w.req.cluster_id, cta);
         if (slot != nullptr) {
           uint32_t raw = (w.req.bar_id & ~0xffu) | slot->cta_slot;
           uint32_t decoded = bar_decode_id(raw, VX_CFG_NUM_BARRIERS);

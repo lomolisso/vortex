@@ -93,9 +93,17 @@ public:
   class Core* get_core(uint32_t idx) const;
 
 #ifdef VX_CFG_DSMEM_ENABLE
-  // CTA-cluster residency table (rank → core/LMEM-base); written by the
-  // per-core CtaDispatchers, read by the DSMEM/DXA/cluster-barrier paths.
+  // CTA-cluster residency MASTER directory (rank → core/LMEM-base). Owns the
+  // control plane: admission gate (can_admit), participant mask + rank count for
+  // the cluster barrier. Hot-path resolves read the per-SM CtaReplica instead.
   CtaResidencyTable* cta_table() const;
+
+  // Master admit/retire with per-SM replica broadcast/evict (Task 5). The
+  // dispatcher calls these instead of cta_table()->admit/retire so the replicas
+  // stay in sync with the master.
+  void cta_admit(uint32_t cluster_id, uint32_t rank, uint32_t num_ranks,
+                 uint32_t core_id, uint32_t cta_slot, uint64_t lmem_base);
+  void cta_retire(uint32_t cluster_id, uint32_t rank);
 #endif
 
   // Cache flush walk. ProcessorImpl ticks in level order (L1 in parallel

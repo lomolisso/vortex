@@ -216,7 +216,7 @@ bool CtaDispatcher::step(const WarpMask& active_warps, uint32_t* wid_out, cta_wa
     {
       uint32_t k = cta_.cluster_dim[0] * cta_.cluster_dim[1] * cta_.cluster_dim[2];
       if (k > 1) {
-        core_->cluster()->cta_table()->admit(
+        core_->cluster()->cta_admit(
             cta_.cluster_id, cta_.cluster_rank, k, core_->id(), cur_slot_, lmem_addr_);
         slot_cluster_id_[cur_slot_]   = cta_.cluster_id;
         slot_cluster_rank_[cur_slot_] = cta_.cluster_rank;
@@ -257,7 +257,7 @@ void CtaDispatcher::warp_done(uint32_t wid) {
   if (--slot_rem_warps_[slot] == 0) {
 #ifdef VX_CFG_DSMEM_ENABLE
     if (slot_in_table_[slot]) {
-      core_->cluster()->cta_table()->retire(slot_cluster_id_[slot], slot_cluster_rank_[slot]);
+      core_->cluster()->cta_retire(slot_cluster_id_[slot], slot_cluster_rank_[slot]);
       slot_in_table_[slot] = false;
     }
 #endif

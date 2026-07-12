@@ -368,6 +368,49 @@ public:
   }
 
 #ifdef VX_CFG_DSMEM_ENABLE
+  Core* core_by_id(uint32_t gid) const {
+    for (auto& c : cores_) {
+      if (c->id() == gid)
+        return c.get();
+    }
+    return nullptr;
+  }
+
+  // Master admit + replica broadcast. The master records the rank; once the
+  // cluster is fully placed, its complete rank->{core,base} set is broadcast to
+  // each participating SM's read replica (so hot-path resolves are local). The
+  // broadcast is a control-plane event (once per cluster launch), off the DSMEM
+  // access critical path — the residency read latency modeled on the hot path is
+  // VX_CFG_CTA_TABLE_LOOKUP_LATENCY (charged at the DSMEM egress).
+  void cta_admit(uint32_t cluster_id, uint32_t rank, uint32_t num_ranks,
+                 uint32_t core_id, uint32_t cta_slot, uint64_t lmem_base) {
+    cta_table_.admit(cluster_id, rank, num_ranks, core_id, cta_slot, lmem_base);
+    if (!cta_table_.fully_admitted(cluster_id))
+      return;
+    // Placement complete: push every rank entry into every participant replica.
+    for (uint32_t p = 0; p < num_ranks; ++p) {
+      auto* pslot = cta_table_.resolve(cluster_id, p);
+      assert(pslot != nullptr);
+      Core* pcore = core_by_id(pslot->core_id);
+      assert(pcore != nullptr && "cluster rank on a core outside this hw cluster");
+      for (uint32_t r = 0; r < num_ranks; ++r) {
+        auto* rslot = cta_table_.resolve(cluster_id, r);
+        assert(rslot != nullptr);
+        pcore->cta_replica()->install(cluster_id, r, num_ranks, *rslot);
+      }
+    }
+  }
+
+  void cta_retire(uint32_t cluster_id, uint32_t rank) {
+    bool freed = cta_table_.retire(cluster_id, rank);
+    if (freed) {
+      // Cluster torn down: drop it from every SM's replica (no-op where absent).
+      for (auto& c : cores_) {
+        c->cta_replica()->evict(cluster_id);
+      }
+    }
+  }
+
   void cluster_barrier_arrive(uint32_t cluster_id, uint32_t bar_id) {
     uint32_t expected = cta_table_.num_ranks(cluster_id);
     assert(expected != 0 && "cluster barrier arrival for a non-resident cluster");
@@ -596,6 +639,15 @@ Core* Cluster::get_core(uint32_t idx) const {
 #ifdef VX_CFG_DSMEM_ENABLE
 CtaResidencyTable* Cluster::cta_table() const {
   return impl_->cta_table();
+}
+
+void Cluster::cta_admit(uint32_t cluster_id, uint32_t rank, uint32_t num_ranks,
+                        uint32_t core_id, uint32_t cta_slot, uint64_t lmem_base) {
+  impl_->cta_admit(cluster_id, rank, num_ranks, core_id, cta_slot, lmem_base);
+}
+
+void Cluster::cta_retire(uint32_t cluster_id, uint32_t rank) {
+  impl_->cta_retire(cluster_id, rank);
 }
 
 void Cluster::cluster_barrier_arrive(uint32_t cluster_id, uint32_t bar_id) {

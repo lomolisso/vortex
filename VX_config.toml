@@ -260,6 +260,13 @@ VX_CFG_DSMEM_REGION_BITS = 3
 # admission stalls while the table is full, mirroring the dispatch
 # table_notfull handshake.
 VX_CFG_CTA_TABLE_SIZE = 8
+# Residency directory is a per-SM READ replica of the cluster master (Task 5):
+# the master (one per hardware cluster) owns admit/retire; when a cluster is
+# fully placed it broadcasts its rank->{core,base} entries to the participating
+# SMs' replicas, so every hot-path resolve (DSMEM remote access, DXA fan-out) is
+# a LOCAL read — no shared-structure contention. This is the modeled fixed
+# lookup latency of that local replica read, charged on the DSMEM egress.
+VX_CFG_CTA_TABLE_LOOKUP_LATENCY = 2
 
 [tcu]
 # VX_CFG_TCU_TYPE is a string enum: 'DPI'|'DSP'|'BHF'|'TFR'

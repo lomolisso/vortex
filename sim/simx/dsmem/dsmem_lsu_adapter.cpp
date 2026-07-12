@@ -83,7 +83,9 @@ void DsmemLsuAdapter::on_tick() {
       assert(region != 0 && "local-shared lane routed onto the DSMEM path");
       uint32_t target_rank = (csrs.cluster_rank + region) % k;
 
-      auto* slot = core_->cluster()->cta_table()->resolve(csrs.cluster_id, target_rank);
+      // Local residency read: the per-SM replica (filled by the master's
+      // broadcast at admission), NOT the shared master — no cross-SM contention.
+      auto* slot = core_->cta_replica()->resolve(csrs.cluster_id, target_rank);
       // The kernel must rendezvous (cluster barrier) before touching a peer's
       // scratchpad — a missing entry means the peer CTA is not resident.
       assert(slot != nullptr && "DSMEM access to a non-resident cluster rank");
@@ -106,7 +108,9 @@ void DsmemLsuAdapter::on_tick() {
         out_req.flags.strsp = 1;
       }
 
-      if (ReqOut.try_send(out_req, 1)) {
+      // Egress delay folds in the modeled per-SM residency-replica lookup
+      // latency (a local associative read before the flit departs).
+      if (ReqOut.try_send(out_req, 1 + VX_CFG_CTA_TABLE_LOOKUP_LATENCY)) {
         DT(4, this->name() << " req" << i << ": " << out_req);
         pending_mask_.reset(i);
       }
