@@ -322,6 +322,31 @@ void LsuUnit::process_request_step(uint32_t b) {
 		if (core_->lmem_switch(b)->ReqIn.full())
 			return; // stall
 
+	#ifdef VX_CFG_DSMEM_ENABLE
+		// Finite outstanding-remote-store credit (checked BEFORE the build loop
+		// consumes remain_addrs, so a stall retries cleanly). Count the remote
+		// (region != 0) store lanes in this batch; if the warp already has
+		// outstanding stores and admitting this batch would exceed the credit,
+		// backpressure issue until acks free credit. A zero-pending warp always
+		// issues (credit >= warp width), so a single store can never perma-stall.
+		if (is_write && !is_amo) {
+			uint32_t t0 = state.addr_list.size() - state.remain_addrs;
+			uint32_t batch = std::min<uint32_t>(VX_CFG_NUM_LSU_LANES, state.remain_addrs);
+			uint32_t remote_lanes = 0;
+			for (uint32_t i = 0; i < batch; ++i) {
+				auto& e = state.addr_list.at(t0 + i);
+				if (e.size > 0 && get_addr_type(e.addr) == AddrType::Shared
+				    && dsmem_region(e.addr) != 0)
+					++remote_lanes;
+			}
+			uint32_t pending = core_->dsmem_store_count(trace->wid);
+			if (remote_lanes != 0 && pending != 0
+			    && pending + remote_lanes > VX_CFG_DSMEM_STORE_CREDITS) {
+				return; // stall — outstanding remote-store credit exhausted
+			}
+		}
+	#endif
+
 		// setup memory request
 		LsuReq lsu_req(VX_CFG_NUM_LSU_LANES);
 		// LsuReq.write is derived from op via is_write(); no separate field.

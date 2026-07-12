@@ -275,6 +275,12 @@ VX_CFG_CTA_TABLE_LOOKUP_LATENCY = 2
 # network; Omelet (Task 6) replaces the timing. The aggregation counting itself
 # is a modeled cluster-level structure (updated in the delayed arrive callback).
 VX_CFG_CLUSTER_BARRIER_LATENCY = 4
+# Per-warp outstanding remote-store credit (Task 5): the DSMEM store scoreboard
+# is finite. LSU issue of remote (region != 0) stores backpressures once this
+# many are in flight for the warp, instead of an unbounded scoreboard bump. A
+# warp with zero outstanding stores always issues (>= warp width so a single
+# 32-lane store can never perma-stall); acks (over the transport) free credit.
+VX_CFG_DSMEM_STORE_CREDITS = 64
 
 [tcu]
 # VX_CFG_TCU_TYPE is a string enum: 'DPI'|'DSP'|'BHF'|'TFR'
