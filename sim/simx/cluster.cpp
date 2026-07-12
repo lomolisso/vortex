@@ -343,7 +343,21 @@ public:
     return exitcode;
   }
 
+  // Payload for delayed barrier-signal events (Task 5). The cross-SM barrier
+  // arrive and release ride the SM-to-SM barrier network, modeled here as
+  // fixed-latency scheduled events rather than zero-cycle synchronous calls.
+  struct BarSchedPkt { uint32_t x, y, z; };
+
+  // Arrive hop (SM -> cluster aggregator): modeled latency. The aggregation
+  // itself runs in the delayed apply (a modeled cluster-level structure).
   void global_barrier_arrive(uint32_t bar_id, uint32_t count, uint32_t core_id) {
+    auto* self = this;
+    SimPlatform::instance().schedule(
+      [self](const BarSchedPkt& p) { self->global_barrier_apply(p.x, p.y, p.z); },
+      BarSchedPkt{bar_id, count, core_id}, VX_CFG_CLUSTER_BARRIER_LATENCY);
+  }
+
+  void global_barrier_apply(uint32_t bar_id, uint32_t count, uint32_t core_id) {
     auto bar_index = bar_id % gbarriers_.size();
     auto& gbar = gbarriers_.at(bar_index);
 
@@ -356,10 +370,13 @@ public:
     DT(4, "*** Global barrier arrive: cluster #" << simobject_->id() << ", core #" << core_id << " at barrier #" << bar_id << ", arrived=" << gbar.mask.count());
 
     if (gbar.mask.count() == (size_t)count) {
-      // resume all suspended cores
+      // Release hop (aggregator -> SMs): each resume is a modeled-latency event.
       for (uint32_t i = 0; i < cores_per_cluster; ++i) {
         if (gbar.mask.test(i)) {
-          cores_.at(i)->global_barrier_resume(bar_id);
+          Core* c = cores_.at(i).get();
+          SimPlatform::instance().schedule(
+            [c](const BarSchedPkt& p) { c->global_barrier_resume(p.x); },
+            BarSchedPkt{bar_id, 0, 0}, VX_CFG_CLUSTER_BARRIER_LATENCY);
         }
       }
       // reset mask and advance phase
@@ -411,7 +428,15 @@ public:
     }
   }
 
+  // Arrive hop (SM rank -> cluster aggregator): modeled latency.
   void cluster_barrier_arrive(uint32_t cluster_id, uint32_t bar_id) {
+    auto* self = this;
+    SimPlatform::instance().schedule(
+      [self](const BarSchedPkt& p) { self->cluster_barrier_apply(p.x, p.y); },
+      BarSchedPkt{cluster_id, bar_id, 0}, VX_CFG_CLUSTER_BARRIER_LATENCY);
+  }
+
+  void cluster_barrier_apply(uint32_t cluster_id, uint32_t bar_id) {
     uint32_t expected = cta_table_.num_ranks(cluster_id);
     assert(expected != 0 && "cluster barrier arrival for a non-resident cluster");
     uint64_t key = (uint64_t(cluster_id) << 32) | (bar_id & 0x3fffffff);
@@ -425,7 +450,11 @@ public:
       uint32_t cores_per_cluster = cores_.size();
       for (uint32_t i = 0; i < cores_per_cluster; ++i) {
         if (participants & (1ull << cores_.at(i)->id())) {
-          cores_.at(i)->cluster_barrier_resume(bar_id);
+          Core* c = cores_.at(i).get();
+          // Release hop (aggregator -> SM): modeled-latency event.
+          SimPlatform::instance().schedule(
+            [c](const BarSchedPkt& p) { c->cluster_barrier_resume(p.x); },
+            BarSchedPkt{bar_id, 0, 0}, VX_CFG_CLUSTER_BARRIER_LATENCY);
         }
       }
     }

@@ -267,6 +267,14 @@ VX_CFG_CTA_TABLE_SIZE = 8
 # a LOCAL read — no shared-structure contention. This is the modeled fixed
 # lookup latency of that local replica read, charged on the DSMEM egress.
 VX_CFG_CTA_TABLE_LOOKUP_LATENCY = 2
+# Cluster/global barrier signalling latency (Task 5): the cross-SM barrier
+# arrive (SM -> cluster aggregator) and release (aggregator -> SMs) are modeled
+# as delayed events, NOT zero-cycle synchronous calls. Each hop costs this many
+# cycles, so a cluster.sync/barrier round trip is no longer free. Like the DSMEM
+# data transport this is a fixed-delay placeholder for the SM-to-SM barrier
+# network; Omelet (Task 6) replaces the timing. The aggregation counting itself
+# is a modeled cluster-level structure (updated in the delayed arrive callback).
+VX_CFG_CLUSTER_BARRIER_LATENCY = 4
 
 [tcu]
 # VX_CFG_TCU_TYPE is a string enum: 'DPI'|'DSP'|'BHF'|'TFR'
