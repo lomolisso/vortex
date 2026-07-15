@@ -409,6 +409,18 @@ dxa()
     echo "dxa tests done!"
 }
 
+dsmem()
+{
+    echo "begin dsmem tests..."
+    # Cross-core DSMEM cycle-accurate feature bench (F1 residency replica, F2
+    # barrier latency, F3 store credit): correctness, no deadlocks, and the
+    # feature-active differential. These need one-rank-per-core placement
+    # (--cores >= K), so they run via ci/dsmem_testbench.sh (Path B), not the
+    # 1-core default TESTS sweep. SimX only — the RTL has none of these.
+    bash ci/dsmem_testbench.sh .
+    echo "dsmem tests done!"
+}
+
 graphics()
 {
     echo "begin graphics tests..."
@@ -1220,7 +1232,7 @@ hip()
 show_usage()
 {
     echo "Vortex Regression Test"
-    echo "Usage: $0 [--clean] [--unittest] [--runtime] [--riscv] [--kernel] [--regression] [--amo] [--dxa] [--opencl] [--cache] [--vm] [--rvc] [--config1] [--config2] [--debug] [--scope] [--stress] [--synthesis] [--vector] [--graphics] [--vulkan] [--tensor] [--tensor_sp] [--tensor_wg] [--cupbop] [--hip] [--sst] [--gem5] [--dtm] [--mpi] [--all] [--h|--help]"
+    echo "Usage: $0 [--clean] [--unittest] [--runtime] [--riscv] [--kernel] [--regression] [--amo] [--dxa] [--dsmem] [--opencl] [--cache] [--vm] [--rvc] [--config1] [--config2] [--debug] [--scope] [--stress] [--synthesis] [--vector] [--graphics] [--vulkan] [--tensor] [--tensor_sp] [--tensor_wg] [--cupbop] [--hip] [--sst] [--gem5] [--dtm] [--mpi] [--all] [--h|--help]"
 }
 
 declare -a tests=()
@@ -1251,6 +1263,9 @@ while [ "$1" != "" ]; do
                 ;;
         --dxa )
                 tests+=("dxa")
+                ;;
+        --dsmem )
+                tests+=("dsmem")
                 ;;
         --graphics )
                 tests+=("graphics")
@@ -1330,6 +1345,7 @@ while [ "$1" != "" ]; do
                 tests+=("regression")
                 tests+=("amo")
                 tests+=("dxa")
+                tests+=("dsmem")
                 tests+=("graphics")
                 tests+=("mpi")
                 tests+=("opencl")
