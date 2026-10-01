@@ -1,0 +1,99 @@
+# Copyright © 2019-2023
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Vortex developer image (hot reload).
+#
+# Unlike Dockerfile.prod (which bakes a Vortex checkout + build into the
+# image), this image is SOURCE-LESS: it installs the full non-ASIC toolchain
+# into /opt and nothing else. The Vortex source tree is bind-mounted at
+# /vortex at run time (see miscs/docker/README.md), so edits on the host are
+# seen live by the container -- recompiling picks them up, with no image
+# rebuild or container restart.
+#
+# Build it with `miscs/docker/vortex-dev.sh build`, which stages the build
+# context: this file's directory plus a `bootstrap/` copy of the checkout's
+# installers (VERSION, configure, VX_*.toml, ci/). Installing from the
+# checkout itself pins the toolchain to that checkout's TOOLCHAIN_REV.
+#
+# ASIC EDA tools (Synopsys/Cadence) are intentionally NOT installed; those
+# flows run on the host. Everything else is included: SimX, rtlsim/verilator,
+# RISC-V LLVM+GCC, POCL/OpenCL, chipstar/HIP, mesa/Vulkan, gem5, and SST.
+
+FROM ubuntu:22.04
+
+ARG DEBIAN_FRONTEND=noninteractive
+
+# Toolchain install prefix. Set before configure so it is baked into
+# config.mk (VERILATOR_PATH ?= $(TOOLDIR)/verilator); config.mk uses ?= so
+# this same value is what `make` resolves at run time.
+ENV TOOLDIR=/opt
+
+# Base packages. `sudo` is required because ci/sst_install.sh installs its
+# build dependencies via `sudo apt` under `set -e`. pytest/yaml drive the
+# catalog-driven test harness (ci/regression.sh -> pytest ci); xdist lets a
+# local run fan out (`pytest ci -m <expr> -n auto --dist=loadgroup`).
+RUN apt-get update && apt-get install -y \
+    software-properties-common \
+    build-essential \
+    cmake \
+    python3 \
+    python3-pytest \
+    python3-pytest-xdist \
+    python3-yaml \
+    git \
+    wget \
+    curl \
+    ca-certificates \
+    sudo && \
+    rm -rf /var/lib/apt/lists/*
+
+# Drive the dependency/toolchain/SST installers from the staged checkout
+# copy; they deposit their payloads into /opt (or system apt). The copy and
+# its scratch build dir are removed in the same layer, so no Vortex source
+# is baked into the image -- the real source arrives via the bind mount.
+COPY bootstrap /tmp/vortex-bootstrap
+RUN cd /tmp/vortex-bootstrap && \
+    ./ci/install_dependencies.sh --all && \
+    mkdir build && cd build && \
+    ../configure --tooldir=$TOOLDIR && \
+    ./ci/toolchain_install.sh --all && \
+    ./ci/sst_install.sh && \
+    cd / && rm -rf /tmp/vortex-bootstrap
+
+# Tool homes consumed by the run scripts (gem5_run_app.py uses $GEM5_HOME;
+# sst_run_*.py use $SST_CORE_HOME / $SST_ELEMENTS_HOME; SST/OpenMPI layout
+# matches ci/sst_install.sh).
+ENV GEM5_HOME=$TOOLDIR/gem5
+ENV MPIHOME=$TOOLDIR/openmpi_install
+ENV SST_CORE_HOME=$TOOLDIR/sst-install/sst-core
+ENV SST_ELEMENTS_HOME=$TOOLDIR/sst-install/sst-elements
+
+# Interactive convenience: the Vortex Makefiles invoke every tool by absolute
+# path baked at configure time, but putting the TOOLDIR layout on $PATH lets
+# you call verilator, hipcc, vulkaninfo, sv2v, yosys, sst, mpirun, etc.
+ENV PATH=$TOOLDIR/verilator/bin:$TOOLDIR/llvm-vortex/bin:$TOOLDIR/chipstar/bin:$TOOLDIR/pocl/bin:$TOOLDIR/mesa-vortex/bin:$TOOLDIR/sv2v/bin:$TOOLDIR/yosys/bin:$TOOLDIR/sta/bin:$TOOLDIR/riscv32-gnu-toolchain/bin:$TOOLDIR/riscv64-gnu-toolchain/bin:$MPIHOME/bin:$SST_CORE_HOME/bin:$SST_ELEMENTS_HOME/bin:$PATH
+ENV LD_LIBRARY_PATH=$TOOLDIR/llvm-vortex/lib:$TOOLDIR/mesa-vortex/lib:$MPIHOME/lib:$SST_CORE_HOME/lib:$LD_LIBRARY_PATH
+ENV VK_ICD_FILENAMES=$TOOLDIR/mesa-vortex/share/vulkan/icd.d/lvp_icd.x86_64.json
+
+# ccache lives on a named volume mounted here. Create the mount point with
+# sticky world-write perms so a fresh volume inherits them and stays writable
+# whatever (arbitrary host) UID the container is run as.
+ENV CCACHE_DIR=/ccache
+RUN mkdir -p /ccache && chmod 1777 /ccache
+
+COPY dev-entrypoint.sh /usr/local/bin/dev-entrypoint.sh
+RUN chmod +x /usr/local/bin/dev-entrypoint.sh
+
+WORKDIR /vortex
+ENTRYPOINT ["/usr/local/bin/dev-entrypoint.sh"]
+CMD ["bash"]
