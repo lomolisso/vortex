@@ -65,6 +65,12 @@ module Vortex import VX_gpu_pkg::*, VX_trace_pkg::*, VX_tlb_pkg::*; (
   `elsif VX_CFG_L2_ENABLE
     `STATIC_ASSERT(`VX_CFG_DCACHE_WRITEBACK == 0, ("AMO requires write-through L1 (DCACHE_WRITEBACK=0) when L2 is the LLC"));
   `endif
+
+    // RVA atomicity is device-wide: every hart's AMOs and reservations must meet in one LLC instance.
+    `STATIC_ASSERT((`VX_CFG_L3_ENABLED != 0)
+                || ((`VX_CFG_NUM_CLUSTERS * ((`VX_CFG_L2_ENABLED != 0) ? 1
+                       : (NUM_SOCKETS * `VX_CFG_NUM_DCACHES * `VX_CFG_DCACHE_ENABLED))) == 1),
+        ("the A extension needs one shared last-level cache: enable L2 (one cluster) or L3 (several clusters)"));
 `endif
 
     VX_dcr_bus_if dcr_bus_if();

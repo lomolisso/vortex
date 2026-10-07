@@ -23,7 +23,8 @@
 //
 //   IS_LLC=0 (passthrough): forward the AMO downstream (the LLC does the
 //     RMW), latch the returned result word, and replay it back to the
-//     requester. Also enforces same-hart program order at the bank input.
+//     requester. Also holds same-line atomics and loads apart at the bank
+//     input (not exact, see below).
 //
 // The two roles are mutually exclusive, so each ties off the other's
 // outputs and the synthesizer keeps only the selected datapath.
@@ -65,6 +66,7 @@ module VX_cache_amo import VX_gpu_pkg::*; #(
     input  wire [WORD_WIDTH-1:0]         write_word_st1,
     input  wire [WORD_SEL_WIDTH-1:0]     word_idx_st0,
     input  wire [WORD_SEL_WIDTH-1:0]     word_idx_st1,
+    input  wire [LINE_ADDR_BITS-1:0]     addr_st0,
     input  wire [LINE_ADDR_BITS-1:0]     addr_st1,
     input  wire [LINE_ADDR_BITS-1:0]     res_addr_n,   // line entering the commit stage next cycle
     input  wire [WORD_SIZE-1:0]          byteen_n,     // byteen entering the commit stage next cycle
@@ -101,7 +103,7 @@ module VX_cache_amo import VX_gpu_pkg::*; #(
     // commit outputs (tied off when IS_LLC=0)
     output wire                          amo_hit_st1,    // AMO commits locally at S1
     output wire                          commit_busy,    // commit in flight
-    output wire                          chain_stall,    // pace same-line chained AMO
+    output wire                          chain_stall,    // hold an AMO behind a same-line or still-computing one
     output wire                          wb_pending,     // writeback request live
     output wire [WORD_WIDTH-1:0]         rsp_data,       // response word on amo_hit_st1
     // Read forward: a request reading the AMO'd word while the result is still
@@ -131,9 +133,11 @@ module VX_cache_amo import VX_gpu_pkg::*; #(
     // the payload->CAM->ready cone. fresh_r marks a request the registered
     // result does not yet describe; the persist pulses bridge the one
     // transition a result captured last cycle cannot have seen. The defers
-    // are a per-cycle superset of the combinational originals -- deferral
-    // only ever gets stronger, by at most one cycle, and only while the
-    // hazard class has a pending entry.
+    // are not exact: a result registered for one request is applied to the
+    // next when the input changes without firing (an unbuffered crossbar
+    // switching ports), and an entry is invisible to all three terms in its
+    // finalize cycle, so a request can still enter while its hazard class
+    // has a pending entry.
     reg fresh_r, probe_ld_hit_r, probe_amo_hit_r, persist_ld_r, persist_amo_r;
     always @(posedge clk) begin
         if (reset) begin
@@ -178,14 +182,12 @@ module VX_cache_amo import VX_gpu_pkg::*; #(
         // entry, so writebacks pipeline without stalling any replay (coalescer-
         // safe) or the pipe (deadlock-free). Entries are keyed per {word, lane}:
         // a same-line AMO burst leaves one writeback per distinct target in
-        // flight. commit_busy serializes AMO instructions (the next instruction
-        // waits for wb_pending to clear), so the occupancy never exceeds the
-        // distinct targets one instruction's requests touch in this bank --
-        // bounded by the core-port fan-in (<= 4 for this cache family), not the
-        // full line. Sizing to that bound (min 2, cap 4) halves the coalesce/
-        // forward/enqueue fanout vs a full-line queue; the cap is a constant
-        // here because the engine has no NUM_REQS parameter, and the overflow
-        // assertion guards it if a wider core-port config ever exceeds 4.
+        // flight. The head drains only through an input slot that replays and
+        // fills take first, so a run of fills each replaying an atomic pushes
+        // results with no drain in between; the occupancy is bounded at
+        // admission instead (see amo_live). Small (min 2, cap 4) to keep the
+        // coalesce/forward/enqueue fanout of a full-line queue off the commit
+        // path.
         localparam WBQ_TARGETS = WORDS_PER_LINE * NUM_LANES;
         localparam WBQ_SIZE = (WBQ_TARGETS < 4) ? ((WBQ_TARGETS < 2) ? 2 : WBQ_TARGETS) : 4;
         localparam WBQ_CNTW = `CLOG2(WBQ_SIZE+1);
@@ -206,33 +208,32 @@ module VX_cache_amo import VX_gpu_pkg::*; #(
         wire                         wb_pending_r  = (wbq_count != '0);
         wire [LINE_ADDR_BITS-1:0]    wb_addr_r     = wbq_addr[0];
         wire [WORD_SEL_WIDTH-1:0]    wb_word_idx_r = wbq_wsel[0];
-        wire [WORD_SIZE-1:0]         wb_byteen_r;
-        for (genvar l = 0; l < NUM_LANES; ++l) begin : g_wb_byteen_x
-            assign wb_byteen_r[l*LANE_SIZE +: LANE_SIZE] =
-                (wbq_lane[0] == LANE_IDXW'(l)) ? wbq_byteen[0] : {LANE_SIZE{1'b0}};
-        end
         wire [WORD_WIDTH-1:0]        wb_data_r     = {NUM_LANES{wbq_data[0]}};
         wire [TAG_WIDTH-1:0]         wb_tag_r      = wbq_tag[0];
         wire [REQ_SEL_WIDTH-1:0]     wb_idx_r      = wbq_idx[0];
         wire [ATTR_WIDTH-1:0]        wb_attr_r     = wbq_attr[0];
 
-        // BRAM-settle window: a fired writeback takes a couple cycles to land
-        // in cache_data; commit_busy stays high across it so the next AMO reads
-        // the committed line. post_wb_{addr,data} hold the just-drained entry.
-        reg [1:0]                    post_wb_age;
+        // Settle window: a fired writeback's array write lands only as it
+        // reaches stC; until then the read forward serves its bytes from
+        // post_wb_*, the just-drained entry. [k]: the fired writeback sits k
+        // stages past S0; it leaves the vector when it reaches stC. A stall
+        // holds the vector, as it holds the writeback.
+        reg [PIPE_EX:0]              wb_settle;
+        wire [PIPE_EX:0]             wb_settle_n = pipe_stall ? wb_settle : (PIPE_EX+1)'({wb_settle, wb_fire});
         reg [LINE_ADDR_BITS-1:0]     post_wb_addr;
         reg [WORD_SEL_WIDTH-1:0]     post_wb_wsel;
         reg [LANE_IDXW-1:0]          post_wb_lane;
         reg [LANE_SIZE-1:0]          post_wb_byteen;
         reg [LANE_WIDTH-1:0]         post_wb_data;
-        wire                         post_wb_valid = (post_wb_age != 2'd0);
+        wire                         post_wb_valid = (| wb_settle);
 
         // Compute stage: S1 latches the aligned operands, the RMW ALU + the
-        // re-align shift run the next cycle, off the S1 critical path. AMO
-        // commits are serialized by commit_busy (the bank holds off core
-        // requests), so the stage holds at most one operation; the old operand
-        // is byte-forwarded from the writeback queue when a prior AMO to the same
-        // bytes has not yet reached the array (see line_lane_st1).
+        // re-align shift run the next cycle, off the S1 critical path.
+        // commit_busy holds off core requests and chain_stall holds a store-
+        // bearing replay while the stage is busy, so it holds at most one
+        // operation; the old operand is byte-forwarded from the writeback queue
+        // when a prior AMO to the same bytes has not yet reached the array (see
+        // line_lane_st1).
         reg                          cmp_valid;
         reg [63:0]                   cmp_old, cmp_rhs;
     `ifdef VX_CFG_EXT_ZACAS_ENABLE
@@ -332,7 +333,7 @@ module VX_cache_amo import VX_gpu_pkg::*; #(
             wire                cmp_key  = pipe_stall ? cmp_key_st1 : cmp_key_n;
             wire                post_key = pipe_stall ? post_key_st1 : post_key_n;
 
-            wire post_wb_valid_n = wb_fire || (post_wb_age == 2'd2);
+            wire post_wb_valid_n = (| wb_settle_n);
 
             // Mirrors the queue update below: the push lands after the drain shift.
             reg [WBQ_SIZE-1:0]      hit_n;
@@ -492,6 +493,18 @@ module VX_cache_amo import VX_gpu_pkg::*; #(
         end
         wire [LANE_SIZE-1:0] post_wb_clr_byteen = LANE_SIZE'(byteen_st1 >> (post_wb_lane * LANE_SIZE));
 
+        // A head drained the cycle a younger store supersedes it leaves with
+        // those bytes cleared: the clear reaches the queue only a cycle later,
+        // after the request has been selected. A drain implies ~pipe_stall,
+        // so the term is left out of this cone.
+        wire wb_head_clr = do_write_st1 && ~wb_self_stc && wbq_word_hit[0];
+        wire [LANE_SIZE-1:0] wb_head_byteen = wbq_byteen[0] & ~(wb_head_clr ? clr_byteen[0] : {LANE_SIZE{1'b0}});
+        wire [WORD_SIZE-1:0] wb_byteen_r;
+        for (genvar l = 0; l < NUM_LANES; ++l) begin : g_wb_byteen_x
+            assign wb_byteen_r[l*LANE_SIZE +: LANE_SIZE] =
+                (wbq_lane[0] == LANE_IDXW'(l)) ? wb_head_byteen : {LANE_SIZE{1'b0}};
+        end
+
         wire [LANE_WIDTH-1:0] line_lane_shifted_st1 = line_lane_st1 >> bit_off_st1;
         wire [LANE_WIDTH-1:0] rhs_lane_st1 = LANE_WIDTH'(write_word_st1 >> (lane_st1 * LANE_WIDTH));
         wire [LANE_WIDTH-1:0] rhs_lane_shifted_st1  = rhs_lane_st1 >> bit_off_st1;
@@ -527,11 +540,14 @@ module VX_cache_amo import VX_gpu_pkg::*; #(
         // comes straight from S1 (no ALU).
         wire [63:0] new_word;
         wire [63:0] ret_word_unused;
+        // A hold must outlast one refused LR from every other hart that can reach the bank.
+        localparam LLC_HOLD_CREDIT_BITS = `MAX(6, `CLOG2(NUM_TOTAL_CORES * `VX_CFG_NUM_WARPS * `VX_CFG_NUM_THREADS));
         VX_amo_unit #(
-            .NUM_RES_ENTRIES (NUM_RES_ENTRIES),
-            .LINE_ADDR_BITS  (LINE_ADDR_BITS),
-            .DATA_WIDTH      (AMO_OLD_BITS),  // 32-bit word cache -> 32-bit RMW datapath
-            .ARITH_WIDTH     (`MIN(`VX_CFG_XLEN, AMO_OLD_BITS)) // only the Zacas pair is wider than a register
+            .NUM_RES_ENTRIES  (NUM_RES_ENTRIES),
+            .HOLD_CREDIT_BITS (LLC_HOLD_CREDIT_BITS),
+            .LINE_ADDR_BITS   (LINE_ADDR_BITS),
+            .DATA_WIDTH       (AMO_OLD_BITS),  // 32-bit word cache -> 32-bit RMW datapath
+            .ARITH_WIDTH      (`MIN(`VX_CFG_XLEN, AMO_OLD_BITS)) // only the Zacas pair is wider than a register
         ) amo_unit (
             .clk           (clk),
             .reset         (reset),
@@ -609,20 +625,16 @@ module VX_cache_amo import VX_gpu_pkg::*; #(
             if (reset) begin
                 cmp_valid   <= 1'b0;
                 wbq_count   <= '0;
-                post_wb_age <= 2'd0;
+                wb_settle   <= '0;
             end else begin
+                wb_settle <= wb_settle_n;
                 if (wb_fire) begin
-                    post_wb_age    <= 2'd2;
                     post_wb_addr   <= wbq_addr[0];
                     post_wb_wsel   <= wbq_wsel[0];
                     post_wb_lane   <= wbq_lane[0];
-                    post_wb_byteen <= wbq_byteen[0] & ~(wbq_clr_hit[0] ? clr_byteen[0] : {LANE_SIZE{1'b0}})
-                                                    & ~(post_push_head ? cmp_byteen : {LANE_SIZE{1'b0}});
+                    post_wb_byteen <= wb_head_byteen & ~(post_push_head ? cmp_byteen : {LANE_SIZE{1'b0}});
                     post_wb_data   <= wbq_data[0];
                 end else begin
-                    if (post_wb_valid) begin
-                        post_wb_age <= post_wb_age - 2'd1;
-                    end
                     post_wb_byteen <= post_wb_byteen & ~(post_wb_clr ? post_wb_clr_byteen : {LANE_SIZE{1'b0}})
                                                      & ~(post_push_post ? cmp_byteen : {LANE_SIZE{1'b0}});
                 end
@@ -750,8 +762,12 @@ module VX_cache_amo import VX_gpu_pkg::*; #(
         // line AMOs back to back); those are paced instead by chain_stall.
         assign commit_busy = do_store_st0 || amo_inflight || do_store_st1 || cmp_valid || wb_pending_r;
         // Pace any same-line request sitting behind an in-flight compute by one
-        // cycle, so the result lands in wb_data_r and forwards cleanly. Gated on
-        // cmp_valid (an AMO is computing), so it never fires for baseline traffic.
+        // cycle, so the result lands in wb_data_r and forwards cleanly. A
+        // store-bearing atomic of any line is held the same way: the compute
+        // stage holds one operation, and a replay reaches it without passing
+        // commit_busy. A failing SC is held too (its outcome is not known in
+        // time); it loses one cycle. Gated on cmp_valid (an AMO is computing),
+        // so it never fires for baseline traffic.
         // The address match is registered from the look-ahead operands: both only
         // move on ~pipe_stall, so a held match stays valid across a stall. The
         // compare feeds pipe_stall's bank-wide enable fanout, and computing it at
@@ -765,7 +781,84 @@ module VX_cache_amo import VX_gpu_pkg::*; #(
                 chain_match_r <= (cmp_addr_n == res_addr_n);
             end
         end
-        assign chain_stall = cmp_valid && valid_st1 && is_creq_st1 && chain_match_r;
+        wire store_amo_st1 = amo_st1.amo_valid && is_hit_st1 && (amo_st1.amo_op != AMO_OP_LR);
+        assign chain_stall = cmp_valid && valid_st1 && is_creq_st1 && (chain_match_r || store_amo_st1);
+
+        // Atomics that may still push a result: store-bearing ones past S0 and
+        // not yet committed at stC, plus a new one at S0. Every queued result
+        // comes from one of them, and a core request enters only while the
+        // queue and the compute stage are empty (commit_busy), so admitting an
+        // atomic only while fewer than WBQ_SIZE may push keeps queued +
+        // computing + pending within WBQ_SIZE. Holding the pipe on a full queue
+        // instead would deadlock: the head drains only through an unstalled
+        // input slot.
+        wire amo_new_st0  = valid_st0 && is_creq_st0 && ~is_replay_st0 && amo_st0.amo_valid
+                         && (amo_st0.amo_op != AMO_OP_LR);
+        wire amo_done_st1 = amo_hit_w && (amo_st1.amo_op != AMO_OP_LR);
+        reg [WBQ_CNTW-1:0] amo_live;
+        always @(posedge clk) begin
+            if (reset) begin
+                amo_live <= '0;
+            end else if (~pipe_stall) begin
+                amo_live <= amo_live + WBQ_CNTW'(amo_new_st0) - WBQ_CNTW'(amo_done_st1);
+            end
+        end
+        wire amo_admit_full = ((WBQ_CNTW+1)'(amo_live) + (WBQ_CNTW+1)'(amo_new_st0)) >= (WBQ_CNTW+1)'(WBQ_SIZE);
+
+        // A queued result must not enter the pipe behind a younger write to its
+        // word that has not reached stC: that write supersedes the queued bytes
+        // only at stC, after which the stale result would land over it. Hold
+        // the head while a real write to its {line, word} sits in S0 .. stC-1.
+        // The engine's own writebacks are older than the head and excluded.
+        // Stage k is S0+k; stC-1 takes the look-ahead key, earlier stages carry
+        // the S0 key.
+        reg wb_self_st0;
+        always @(posedge clk) begin
+            if (reset) begin
+                wb_self_st0 <= 1'b0;
+            end else if (~pipe_stall) begin
+                wb_self_st0 <= wb_fire;
+            end
+        end
+        wire [PIPE_EX:0]                     ahead_wr;
+        wire [PIPE_EX:0][LINE_ADDR_BITS-1:0] ahead_addr;
+        wire [PIPE_EX:0][WORD_SEL_WIDTH-1:0] ahead_wsel;
+        assign ahead_wr[0]          = valid_st0 && is_creq_st0 && rw_st0 && ~wb_self_st0;
+        assign ahead_addr[PIPE_EX]  = res_addr_n;
+        assign ahead_wsel[PIPE_EX]  = word_idx_n;
+        if (PIPE_EX != 0) begin : g_ahead
+            reg [PIPE_EX-1:0] wr_q;
+            always @(posedge clk) begin
+                if (reset) begin
+                    wr_q <= '0;
+                end else if (~pipe_stall) begin
+                    wr_q <= PIPE_EX'({wr_q, ahead_wr[0]});
+                end
+            end
+            assign ahead_wr[PIPE_EX:1] = wr_q;
+            assign ahead_addr[0] = addr_st0;
+            assign ahead_wsel[0] = word_idx_st0;
+            for (genvar k = 1; k < PIPE_EX; ++k) begin : g_key
+                reg [LINE_ADDR_BITS-1:0] addr_q;
+                reg [WORD_SEL_WIDTH-1:0] wsel_q;
+                always @(posedge clk) begin
+                    if (~pipe_stall) begin
+                        addr_q <= ahead_addr[k-1];
+                        wsel_q <= ahead_wsel[k-1];
+                    end
+                end
+                assign ahead_addr[k] = addr_q;
+                assign ahead_wsel[k] = wsel_q;
+            end
+        end else begin : g_no_ahead
+            `UNUSED_VAR (addr_st0)
+            `UNUSED_VAR (word_idx_st0)
+        end
+        wire [PIPE_EX:0] ahead_hit;
+        for (genvar k = 0; k <= PIPE_EX; ++k) begin : g_ahead_hit
+            assign ahead_hit[k] = ahead_wr[k] && (ahead_addr[k] == wbq_addr[0]) && (ahead_wsel[k] == wbq_wsel[0]);
+        end
+        wire wb_store_ahead = (| ahead_hit);
 
         // Invariants: a store-bearing AMO is only ever accepted into a free
         // compute stage (the queue absorbs different-line writebacks behind it),
@@ -774,6 +867,10 @@ module VX_cache_amo import VX_gpu_pkg::*; #(
             ("%t: AMO compute-stage overwrite (addr=0x%0h)", $time, addr_st1))
         `RUNTIME_ASSERT (~(wb_push && ~wb_coalesce && ~wb_fire && (wbq_count == WBQ_CNTW'(WBQ_SIZE))),
             ("%t: AMO writeback queue overflow (addr=0x%0h)", $time, cmp_addr))
+        `RUNTIME_ASSERT ((32'(wbq_count) + 32'(cmp_valid) + 32'(amo_live) + 32'(amo_new_st0)) <= WBQ_SIZE,
+            ("%t: AMO results outnumber the writeback queue (queued=%0d live=%0d)", $time, wbq_count, amo_live))
+        `RUNTIME_ASSERT (~(~pipe_stall && amo_done_st1 && ~amo_new_st0 && (amo_live == '0)),
+            ("%t: AMO commit with no admitted atomic outstanding (addr=0x%0h)", $time, addr_st1))
         // The lane datapath rests on natural alignment: an AMO's byteen may
         // not cross its 8-byte lane.
         `RUNTIME_ASSERT (~(amo_st1.amo_valid && valid_st1 && is_creq_st1)
@@ -785,7 +882,16 @@ module VX_cache_amo import VX_gpu_pkg::*; #(
             `RUNTIME_ASSERT (~(do_store_st1 && (width_st1 == 2'd3) && (amo_st1.amo_op != AMO_OP_CAS)),
                 ("%t: non-CAS 64-bit AMO on a 32-bit hart (addr=0x%0h)", $time, addr_st1))
         end
-        assign wb_pending  = wb_pending_r;
+        // post_wb_* holds one writeback, so the next head drains only once
+        // the previous one has reached stC-1, leaving the window as the next
+        // enters it.
+        wire wb_settle_busy;
+        if (PIPE_EX != 0) begin : g_settle_busy
+            assign wb_settle_busy = (| wb_settle[PIPE_EX-1:0]);
+        end else begin : g_no_settle_busy
+            assign wb_settle_busy = 1'b0;
+        end
+        assign wb_pending  = wb_pending_r && ~wb_store_ahead && ~wb_settle_busy;
         assign wb_addr     = wb_addr_r;
         assign wb_word_idx = wb_word_idx_r;
         assign wb_byteen   = wb_byteen_r;
@@ -801,27 +907,27 @@ module VX_cache_amo import VX_gpu_pkg::*; #(
         assign is_passthru_fill_sel = 1'b0;
         assign amo_ptw_word_st1     = '0;
 
-        // Same-line ordering guard: a request must not enter the pipe while
-        // an AMO to its line waits in the MSHR (or is allocating at S0) — it
-        // would read or write the line before the replayed AMO commits. The
-        // MSHR probe covers the AMO through its dequeue cycle; commit_busy
-        // covers it from S0 onward. Consumes only the registered probe (see
-        // the header block) so the CAM stays out of core_req_ready.
+        // Keeps a request out of the pipe while an AMO to its line waits in
+        // the MSHR or is allocating at S0, so it does not queue behind the
+        // atomic's replay; one that slips past (see the header block) joins
+        // the line's MSHR chain, and a write among them is ordered against
+        // the queued result by the supersede and the writeback guard above.
+        // Consumes only the registered probe so the CAM stays out of
+        // core_req_ready. Also holds an atomic while the writeback queue has
+        // no room for another result (amo_admit_full).
         assign req_input_defer = core_req_valid
                               && (st0_amo_alloc_any || persist_amo_r
-                               || (fresh_r ? mshr_any_amo : probe_amo_hit_r));
+                               || (fresh_r ? mshr_any_amo : probe_amo_hit_r)
+                               || (core_req_is_amo && amo_admit_full));
 
         `UNUSED_VAR (amo_st0) // only amo_valid/amo_op are consumed at S0
-        `UNUSED_VAR (is_replay_st0)
         `UNUSED_VAR (is_replay_st1)
-        `UNUSED_VAR (word_idx_st0)
         `UNUSED_VAR (mshr_alloc_id_st0)
         `UNUSED_VAR (mshr_id_st1)
         `UNUSED_VAR (mem_rsp_fire)
         `UNUSED_VAR (mem_rsp_id)
         `UNUSED_VAR (mem_rsp_data)
         `UNUSED_VAR (is_fill_sel)
-        `UNUSED_VAR (core_req_is_amo)
         `UNUSED_VAR (core_req_rw)
         `UNUSED_VAR ({st0_ld_alloc_any, persist_ld_r, probe_ld_hit_r, mshr_any_ld})
     end else begin : g_passthru
@@ -898,6 +1004,7 @@ module VX_cache_amo import VX_gpu_pkg::*; #(
         `UNUSED_VAR (byteen_st1)
         `UNUSED_VAR (write_word_st1)
         `UNUSED_VAR (word_idx_st1)
+        `UNUSED_VAR (addr_st0)
         `UNUSED_VAR (addr_st1)
         `UNUSED_VAR (res_addr_n)
         `UNUSED_VAR (byteen_n)

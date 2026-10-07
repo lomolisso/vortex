@@ -176,7 +176,9 @@ module VX_local_mem import VX_gpu_pkg::*; #(
         .NUM_OUTPUTS (NUM_BANKS),
         .DATAW       (REQ_DATAW),
         .PERF_CTR_BITS (PERF_CTR_BITS),
-        .ARBITER     ("P"),
+        // Inputs are ordered block-major, so a fixed-priority grant would
+        // starve every higher-index LSU block at a contended bank.
+        .ARBITER     ("R"),
         .OUT_BUF     (3) // output should be registered for the data_store addressing
     ) req_xbar (
         .clk       (clk),
@@ -222,20 +224,32 @@ module VX_local_mem import VX_gpu_pkg::*; #(
     wire [NUM_BANKS-1:0][REQ_SEL_WIDTH-1:0] per_bank_rsp_idx;
     wire [NUM_BANKS-1:0][TAG_WIDTH-1:0]  per_bank_rsp_tag;
     wire [NUM_BANKS-1:0]                 per_bank_rsp_ready;
+    wire [NUM_BANKS-1:0]                 bank_amo_busy;
 
     // DMA port handshake
     //   rw=0 reads  : accepted when the response pipe-buffer has space.
-    //   rw=1 writes : always accepted; no response issued.
+    //   rw=1 writes : accepted without a response.
+    //   A beat touching a bank whose atomic has not yet written back waits, or
+    //   it would split the read-modify-write; while waiting it still holds LSU
+    //   off those banks, so no new atomic can extend the wait.
     //   DMA has priority over LSU at every bank SRAM.
 
     wire dma_rsp_buf_ready; // driven by pipe-buffer or tied 0 when disabled
+    wire dma_amo_stall;
 
     if (DMA_ENABLE) begin : g_dma_enable
         `UNUSED_VAR (dma_bus_if.req_data.attr)
 
-        assign dma_bus_if.req_ready = dma_bus_if.req_data.rw || dma_rsp_buf_ready;
+        wire [NUM_BANKS-1:0] dma_touch;
+        for (genvar i = 0; i < NUM_BANKS; ++i) begin : g_dma_touch
+            assign dma_touch[i] = ~dma_bus_if.req_data.rw
+                               || (|dma_bus_if.req_data.byteen[i*WORD_SIZE +: WORD_SIZE]);
+        end
+        assign dma_amo_stall = |(bank_amo_busy & dma_touch);
 
-        wire dma_rd_fire = dma_bus_if.req_valid && ~dma_bus_if.req_data.rw && dma_rsp_buf_ready;
+        assign dma_bus_if.req_ready = ~dma_amo_stall && (dma_bus_if.req_data.rw || dma_rsp_buf_ready);
+
+        wire dma_rd_fire = dma_bus_if.req_valid && ~dma_bus_if.req_data.rw && dma_rsp_buf_ready && ~dma_amo_stall;
 
         // Delay tag by 1 cycle to align with SRAM OUT_REG latency
         VX_pipe_buffer #(
@@ -256,7 +270,7 @@ module VX_local_mem import VX_gpu_pkg::*; #(
         // Same back-pressure hazard as the LSU side: dma_rsp_buf buffers only
         // the tag/valid; the data (all banks) is the live SRAM OUT_REG. While a
         // DMA read response is back-pressured, an interleaving LSU read
-        // (~dma_active) re-drives a bank's OUT_REG and corrupts the held DMA
+        // (~dma_pending) re-drives a bank's OUT_REG and corrupts the held DMA
         // line. Latch the whole line on the first response-valid cycle (rdata
         // is still valid then) and serve the latched copy while stalled. One
         // DMA response spans all banks, so this is a single full-line hold.
@@ -280,27 +294,34 @@ module VX_local_mem import VX_gpu_pkg::*; #(
 
     end else begin : g_no_dma
         assign dma_rsp_buf_ready    = 1'b0;
+        assign dma_amo_stall        = 1'b0;
         assign dma_bus_if.req_ready = 1'b0;
         assign dma_bus_if.rsp_valid = 1'b0;
         assign dma_bus_if.rsp_data  = '0;
         `UNUSED_VAR (dma_bus_if.req_valid)
         `UNUSED_VAR (dma_bus_if.req_data)
         `UNUSED_VAR (dma_bus_if.rsp_ready)
+        `UNUSED_VAR (bank_amo_busy)
     end
 
     for (genvar i = 0; i < NUM_BANKS; ++i) begin : g_data_store
         wire bank_rsp_valid, bank_rsp_ready;
 
         // DMA active signals (priority over LSU)
-        wire dma_wr_b = DMA_ENABLE
-                     && dma_bus_if.req_valid
-                     && dma_bus_if.req_data.rw
-                     && (|dma_bus_if.req_data.byteen[i*WORD_SIZE +: WORD_SIZE]);
+        wire dma_wr_req = DMA_ENABLE
+                       && dma_bus_if.req_valid
+                       && dma_bus_if.req_data.rw
+                       && (|dma_bus_if.req_data.byteen[i*WORD_SIZE +: WORD_SIZE]);
 
-        wire dma_rd_b = DMA_ENABLE
-                     && dma_bus_if.req_valid
-                     && ~dma_bus_if.req_data.rw
-                     && dma_rsp_buf_ready;
+        wire dma_rd_req = DMA_ENABLE
+                       && dma_bus_if.req_valid
+                       && ~dma_bus_if.req_data.rw
+                       && dma_rsp_buf_ready;
+
+        wire dma_pending = dma_wr_req | dma_rd_req;
+
+        wire dma_wr_b = dma_wr_req && ~dma_amo_stall;
+        wire dma_rd_b = dma_rd_req && ~dma_amo_stall;
 
         wire dma_active = dma_wr_b | dma_rd_b;
 
@@ -347,8 +368,9 @@ module VX_local_mem import VX_gpu_pkg::*; #(
             wire amo_accept = lsu_active && per_bank_req_amo_valid[i];
 
             // Reservation commit stage. Every accepted request that can touch a
-            // reservation -- an atomic, or a plain store -- reaches it one cycle
-            // after acceptance, so a single address port serves both. The look-ahead
+            // reservation -- an atomic, a plain store, or a DMA write -- reaches it one
+            // cycle after acceptance, so a single address port serves all three; no LSU
+            // request is accepted beside a DMA beat, so they never meet. The look-ahead
             // read is driven from the acceptance cycle, which is what makes the
             // registered reservation entry land here.
             wire is_lr_in = per_bank_req_amo_valid[i]
@@ -356,7 +378,13 @@ module VX_local_mem import VX_gpu_pkg::*; #(
             wire is_sc_in = per_bank_req_amo_valid[i]
                          && (amo_op_e'(per_bank_req_amo_op[i]) == AMO_OP_SC);
 
+            wire [BANK_ADDR_WIDTH-1:0] dma_row = BANK_ADDR_WIDTH'(dma_bus_if.req_data.addr);
+            // Keyed on the pending beat to keep the cross-bank stall off the look-ahead
+            // read; while a beat stalls nothing commits, so that read goes unused.
+            wire [BANK_ADDR_WIDTH-1:0] res_addr_n = dma_wr_req ? dma_row : per_bank_req_addr[i];
+
             reg                       res_valid_r;
+            reg                       res_dma_r;
             reg                       res_is_lr_r;
             reg                       res_is_sc_r;
             reg                       res_is_amo_r;
@@ -367,18 +395,26 @@ module VX_local_mem import VX_gpu_pkg::*; #(
             always @(posedge clk) begin
                 if (reset) begin
                     res_valid_r <= 1'b0;
+                    res_dma_r   <= 1'b0;
                 end else begin
                     res_valid_r <= lsu_active;
+                    res_dma_r   <= dma_wr_b;
+                end
+                if (lsu_active || dma_wr_b) begin
+                    res_addr_r <= res_addr_n;
                 end
                 if (lsu_active) begin
                     res_is_lr_r    <= is_lr_in;
                     res_is_sc_r    <= is_sc_in;
                     res_is_amo_r   <= per_bank_req_amo_valid[i];
                     res_is_store_r <= per_bank_req_rw[i];
-                    res_addr_r     <= per_bank_req_addr[i];
                     res_hart_id_r  <= per_bank_req_amo_hart_id[i];
                 end
             end
+
+            `RUNTIME_ASSERT(~(lsu_active && dma_wr_req), ("%t: *** %s bank%0d: LSU request accepted beside a pending DMA write", $time, INSTANCE_ID, i))
+            `RUNTIME_ASSERT(~(dma_wr_b && amo_busy), ("%t: *** %s bank%0d: DMA write inside an atomic", $time, INSTANCE_ID, i))
+            `RUNTIME_ASSERT(~(res_dma_r && res_valid_r), ("%t: *** %s bank%0d: DMA write and LSU request share the reservation stage", $time, INSTANCE_ID, i))
 
             // A store-conditional fails when its reservation is gone. The outcome is
             // known at the commit stage, one cycle before the write-back, so it can
@@ -479,11 +515,12 @@ module VX_local_mem import VX_gpu_pkg::*; #(
             // holder-credit protocol a hot word maps to exactly one station, so
             // depth only reduces false eviction between distinct reserved words
             // aliasing in one bank -- and a spurious SC failure is architecturally
-            // legal. Clamp the depth and shorten the credit budget to the local
-            // round trip instead of inheriting the L1-miss sizing.
+            // legal. Clamp the depth instead of inheriting the L1-miss sizing.
+            // A hold must outlast one refused LR from every other hart of the core.
+            localparam LMEM_HOLD_CREDIT_BITS = `MAX(3, `CLOG2(`VX_CFG_NUM_WARPS * `VX_CFG_NUM_THREADS));
             VX_amo_unit #(
                 .NUM_RES_ENTRIES  (`MIN(`VX_CFG_AMO_RS_SIZE, 4)),
-                .HOLD_CREDIT_BITS (3),
+                .HOLD_CREDIT_BITS (LMEM_HOLD_CREDIT_BITS),
                 .LINE_ADDR_BITS   (BANK_ADDR_WIDTH),
                 .DATA_WIDTH       (WORD_WIDTH)
             ) amo_unit (
@@ -507,10 +544,10 @@ module VX_local_mem import VX_gpu_pkg::*; #(
                 // breaks whoever else holds one.
                 .res_reserve      (res_valid_r && res_is_lr_r),
                 .res_clear        (res_valid_r && res_is_sc_r),
-                .res_invalidate   (res_valid_r && res_commits_store),
+                .res_invalidate   (res_dma_r || (res_valid_r && res_commits_store)),
                 .res_hart_id      (res_hart_id_r),
                 .res_line_addr    (res_addr_r),
-                .res_line_addr_n  (per_bank_req_addr[i]),
+                .res_line_addr_n  (res_addr_n),
                 .res_check        (res_check)
             );
             `UNUSED_VAR (amo_ret_word)
@@ -538,6 +575,8 @@ module VX_local_mem import VX_gpu_pkg::*; #(
             `UNUSED_VAR (per_bank_req_amo_cmp[i])
         `endif
         end
+
+        assign bank_amo_busy[i] = amo_busy;
 
         // SRAM address / write-data / write-enable mux: DMA first, then an owed
         // atomic write-back, then the incoming request
@@ -591,12 +630,12 @@ module VX_local_mem import VX_gpu_pkg::*; #(
         // LSU response valid / request ready — blocked by DMA and RDW hazards
 
         assign bank_rsp_valid = per_bank_req_valid[i]
-                             && ~dma_active
+                             && ~dma_pending
                              && ~amo_busy
                              && ~per_bank_req_rw[i]
                              && ~is_rdw_hazard;
 
-        assign per_bank_req_ready[i] = ~dma_active
+        assign per_bank_req_ready[i] = ~dma_pending
                                     && ~amo_busy
                                     && (bank_rsp_ready || per_bank_req_rw[i])
                                     && ~is_rdw_hazard;

@@ -60,7 +60,8 @@ public:
 	{
 		char sname[100];
 		snprintf(sname, 100, "%s-xbar", simobject->name().c_str());
-		mem_xbar_ = MemCrossBar::Create(sname, ArbiterType::RoundRobin, config.num_ports, config.num_banks,
+		mem_xbar_ = MemCrossBar::Create(sname, ArbiterType::RoundRobin, ArbiterType::RoundRobin,
+			config.num_ports, config.num_banks,
 			[lg2_block_size = log2ceil(config.block_size), num_banks = config.num_banks](const MemCrossBar::ReqType& req) {
     	// Custom logic to calculate the output index using bank interleaving
 			return (uint32_t)((req.addr >> lg2_block_size) & (num_banks-1));

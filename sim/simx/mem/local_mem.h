@@ -23,6 +23,7 @@ public:
     uint32_t capacity;
     uint32_t line_size;
     uint32_t num_reqs;
+    uint32_t dma_begin; // ports [dma_begin, num_reqs) are DMA ports
     uint32_t B; // log2 number of banks
     bool write_reponse;
   };

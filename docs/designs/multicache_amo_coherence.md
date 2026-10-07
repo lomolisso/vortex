@@ -29,7 +29,8 @@ multi-level deep-dive.
 Exactly one cache level — the **last-level cache (LLC)** — commits atomics
 and holds the reservation stations. Every level above it is a
 **passthrough**: it forwards the atomic down, returns the result up, and
-keeps no copy of the line.
+keeps no copy of the line. The device must build exactly one LLC instance
+([`atomic_memory_operations.md`](atomic_memory_operations.md) §9).
 
 ```
 DCACHE_IS_LLC = ¬L2 ∧ ¬L3
@@ -46,7 +47,7 @@ consumer's responsibility at a synchronization point.
 |---|---|
 | atomic vs. atomic, any cores | every atomic serializes at the LLC |
 | a hart reads its own atomic through a plain load | the issuing cache drops its copy as the atomic passes (§5.2) |
-| same-hart program order, atomic vs. load | the younger access waits at the bank input (§5.3) |
+| same-hart program order, atomic vs. plain access | at the LLC, the bank applies a word's requests in the order it accepted them ([`cache_subsystem.md`](cache_subsystem.md) §4.5); above it, the younger access waits at the bank input (§5.3) |
 | `LR`/`SC` forward progress across the round trip | the reservation holder is protected (§5.4) |
 | another core's plain load sees a remote atomic | **not by hardware** — Regime B (§6) |
 
@@ -175,11 +176,19 @@ input until the older one drains:
 
 The MSHR exposes the two conditions as probes of the waiting request's
 address. They are consumed **registered**, which keeps the MSHR's address
-compare off the request-ready path; two extra terms close the windows a
-registered result cannot see — an allocation in the lookup stage this cycle,
-and an entry that became persistent last cycle. The defer is therefore a
-superset of the exact condition: it can hold a request one cycle longer than
-necessary, and never shorter.
+compare off the request-ready path; two extra terms cover an allocation in
+the lookup stage this cycle and an entry that became persistent last cycle.
+
+The defer is not exact. It can hold a request a cycle longer than necessary,
+and it can also miss one: a result registered for one request is applied to
+the next when the bank's input changes without firing — an unbuffered request
+crossbar switching ports — and an entry is visible to none of the terms in
+the cycle it is finalized. The LLC uses the same registered probe for its own
+input guard, but its ordering does not depend on it: a request that slips
+past joins the line's chain and is ordered there
+([`atomic_memory_operations.md`](atomic_memory_operations.md) §6.5). A
+passthrough bank has no such backstop — its atomic entries never chain — so
+there the two windows are open (§10).
 
 ### 5.4 `LR`/`SC` forward progress
 
@@ -190,9 +199,10 @@ overwrote the station, the holder's reservation would be gone before its
 
 The station therefore **refuses an `LR` from a different hart for a line it
 already holds**, for a bounded number of refusals. The holder's `SC` lands
-first and one hart wins each round. The bound — 63 refusals at a cache LLC —
-is sized for the miss round trip and frees a station whose holder abandoned
-its attempt. Mechanism and sizing are in
+first and one hart wins each round. At a cache LLC the bound covers one
+refused `LR` from every other hart in the device — `2^b - 1` refusals with
+`b = max(6, clog2(H))` for `H` harts, so at least 63 — and its lapse frees a
+station whose holder abandoned its attempt. Mechanism and sizing are in
 [`atomic_memory_operations.md`](atomic_memory_operations.md) §5.3.
 
 Any committed store to the line breaks the reservation, whichever hart made
@@ -217,9 +227,12 @@ role is selected inside the bank by `IS_LLC`.
 
 The LLC commits one atomic instruction at a time. `commit_busy` holds off new
 core requests from the lookup-stage prediction through the compute stage and
-the writeback, so an atomic to a different line cannot reach the commit stage
-while the previous result is still in flight. It is zero at every
-passthrough bank — serialization applies only where atomics commit.
+the writeback. A replayed atomic does not pass that gate: one that stores is
+held at the commit stage instead while the previous operation is still
+computing (`chain_stall`,
+[`atomic_memory_operations.md`](atomic_memory_operations.md) §6.5). Both are
+zero at every passthrough bank — serialization applies only where atomics
+commit.
 
 ---
 
@@ -275,6 +288,8 @@ stage by that many cycles.
 | `commit_busy` between prediction and commit | the two are adjacent | a `PIPE_EX`-deep shift of the prediction bridges the gap |
 | reservation look-ahead address | the lookup-stage request | the request one stage before commit |
 | writeback-queue key compares | combinational at commit | registered a stage early when the word spans several lanes |
+| a younger store ahead of a queued result | one stage to watch, the lookup stage | every stage from lookup to commit, each compared with the queue head's `{line, word}` |
+| consecutive writebacks from the queue | back to back | the next waits until the previous one is a stage from commit: a single settling entry forwards a writeback until it reaches the commit stage |
 | passthrough release decision | evaluated at the commit port | evaluated on the second-stage request, where the MSHR decides |
 
 The MSHR itself is **not** deferred: its chain needs allocate and finalize
@@ -325,6 +340,13 @@ Two cases in the suite exist for this design:
 
 `atomic_critical` is skipped when `cores > 1` (§6.2).
 
+[`tests/regression/cache_order`](../../tests/regression/cache_order) adds two
+smoke cases on both simulators, `cache-order-l2` (4 cores, 4 × L1 → 1 × L2)
+and `cache-order-shared` (4 cores on one write-through dcache, which is then
+the LLC). They race atomics against stores and against each other while
+their lines fill ([`atomic_memory_operations.md`](atomic_memory_operations.md)
+§10).
+
 ---
 
 ## 10. Not implemented
@@ -333,7 +355,13 @@ Two cases in the suite exist for this design:
   clears the inner cache's valid bits without the full flush walk, modeled
   identically in RTL and SimX, with a regression case for fence-managed
   visibility.
-- **rtlsim coverage of the L2-as-LLC hierarchy.** `mc-l2` runs on SimX only.
+- **The `amo` suite on rtlsim over the L2-as-LLC hierarchy.** `mc-l2` runs on
+  SimX only; rtlsim covers that hierarchy with `cache-order-l2` and the
+  `LR`/`SC` loops of `mc-l2-w8t8-lanes2`.
+- **An exact input guard above the LLC** (§5.3). The registered probe leaves
+  two windows in which an atomic can enter beside a pending fill of its line,
+  or a load beside a pending atomic. No testbench drives a passthrough bank,
+  and neither window has been exercised.
 - **Push coherence** with a directory or snoop filter (§4) — revisit only if
   a strong cross-core guarantee is ever required.
 - **Per-line acquire invalidate**, finer than a whole-cache invalidate, if

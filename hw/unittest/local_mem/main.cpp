@@ -11,10 +11,2115 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include "vl_simulator.h"
+// VX_local_mem testbench: LSU lanes and the DMA row port share the bank
+// SRAMs. Directed runs inject one DMA access at every cycle offset of an
+// atomic's bank occupancy and across an LR/SC window; a randomized run mixes
+// atomics, loads, stores and DMA traffic. Everything is checked against a
+// golden memory model.
 
-int main(int argc, char **argv) {
+#include "vl_simulator.h"
+#include "VVX_local_mem_top.h"
+#include "VX_config.h"
+
+#include <algorithm>
+#include <array>
+#include <cinttypes>
+#include <cstdarg>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <deque>
+#include <optional>
+#include <random>
+#include <string>
+#include <type_traits>
+#include <unordered_map>
+#include <vector>
+
+constexpr uint32_t XLEN       = VX_CFG_XLEN;
+constexpr uint32_t WORD_SIZE  = XLEN / 8;
+constexpr uint32_t NUM_REQS   = VX_CFG_NUM_LSU_BLOCKS * VX_CFG_NUM_LSU_LANES;
+constexpr uint32_t NUM_BANKS  = VX_CFG_LMEM_NUM_BANKS;
+constexpr uint32_t LMEM_SIZE  = 1u << VX_CFG_LMEM_LOG_SIZE;
+constexpr uint32_t NUM_ROWS   = LMEM_SIZE / (NUM_BANKS * WORD_SIZE);
+constexpr uint32_t NUM_WORDS  = NUM_ROWS * NUM_BANKS;
+constexpr uint32_t BANK_BITS  = __CLOG2(NUM_BANKS);
+constexpr uint32_t ROW_BITS   = __CLOG2(NUM_ROWS);
+constexpr uint32_t ADDR_BITS  = ROW_BITS + BANK_BITS;
+constexpr bool     AMO_EN     = VX_CFG_EXT_A_ENABLED;
+constexpr bool     CAS_EN     = VX_CFG_EXT_ZACAS_ENABLED;
+
+// Must match the VX_local_mem_top localparams.
+constexpr uint32_t TAG_BITS     = 16;
+constexpr uint32_t DMA_TAG_BITS = 8;
+constexpr uint32_t AMO_OP_BITS  = 4;
+
+constexpr uint64_t WORD_MASK = (XLEN == 64) ? ~0ull : 0xffffffffull;
+constexpr uint64_t MASK32    = 0xffffffffull;
+constexpr uint32_t FULL_BE   = (1u << WORD_SIZE) - 1;
+
+static_assert((NUM_BANKS & (NUM_BANKS - 1)) == 0, "NUM_BANKS must be a power of two");
+static_assert(WORD_SIZE == 4 || WORD_SIZE == 8, "unsupported XLEN");
+
+// VX_gpu_pkg amo_op_e
+enum AmoOp : uint8_t {
+  AMO_LR = 0, AMO_SC = 1, AMO_ADD = 2, AMO_SWAP = 3, AMO_XOR = 4,
+  AMO_OR = 5, AMO_AND = 6, AMO_MIN = 7, AMO_MAX = 8, AMO_CAS = 9
+};
+
+static const char* amo_name(uint8_t op, bool uns) {
+  switch (op) {
+  case AMO_LR:   return "LR";
+  case AMO_SC:   return "SC";
+  case AMO_ADD:  return "AMOADD";
+  case AMO_SWAP: return "AMOSWAP";
+  case AMO_XOR:  return "AMOXOR";
+  case AMO_OR:   return "AMOOR";
+  case AMO_AND:  return "AMOAND";
+  case AMO_MIN:  return uns ? "AMOMINU" : "AMOMIN";
+  case AMO_MAX:  return uns ? "AMOMAXU" : "AMOMAX";
+  case AMO_CAS:  return "AMOCAS";
+  default:       return "AMO?";
+  }
+}
+
+///////////////////////////////////////////////////////////////////////////////
+
+// Bit-field access that works on every Verilator port type (CData..QData
+// and VlWide), so the testbench is independent of the configured widths.
+template <typename T>
+static void set_bits(T& sig, uint32_t lsb, uint32_t width, uint64_t value) {
+  if constexpr (std::is_integral_v<T>) {
+    uint64_t mask = (width >= 64) ? ~0ull : ((1ull << width) - 1);
+    uint64_t v = static_cast<uint64_t>(sig);
+    v = (v & ~(mask << lsb)) | ((value & mask) << lsb);
+    sig = static_cast<T>(v);
+  } else {
+    uint32_t i = 0;
+    while (i < width) {
+      uint32_t bit = lsb + i;
+      uint32_t w = bit / 32;
+      uint32_t o = bit % 32;
+      uint32_t n = std::min(32 - o, width - i);
+      uint32_t m = (n == 32) ? 0xffffffffu : ((1u << n) - 1);
+      uint32_t chunk = static_cast<uint32_t>(value >> i) & m;
+      sig[w] = (sig[w] & ~(m << o)) | (chunk << o);
+      i += n;
+    }
+  }
+}
+
+template <typename T>
+static uint64_t get_bits(const T& sig, uint32_t lsb, uint32_t width) {
+  if constexpr (std::is_integral_v<T>) {
+    uint64_t mask = (width >= 64) ? ~0ull : ((1ull << width) - 1);
+    return (static_cast<uint64_t>(sig) >> lsb) & mask;
+  } else {
+    uint64_t value = 0;
+    uint32_t i = 0;
+    while (i < width) {
+      uint32_t bit = lsb + i;
+      uint32_t w = bit / 32;
+      uint32_t o = bit % 32;
+      uint32_t n = std::min(32 - o, width - i);
+      uint32_t m = (n == 32) ? 0xffffffffu : ((1u << n) - 1);
+      value |= static_cast<uint64_t>((sig[w] >> o) & m) << i;
+      i += n;
+    }
+    return value;
+  }
+}
+
+static std::string hex(uint64_t v) {
+  char buf[24];
+  std::snprintf(buf, sizeof(buf), "0x%0*" PRIx64, static_cast<int>(XLEN / 4), v);
+  return buf;
+}
+
+static std::string strf(const char* fmt, ...) {
+  char buf[1024];
+  va_list args;
+  va_start(args, fmt);
+  std::vsnprintf(buf, sizeof(buf), fmt, args);
+  va_end(args);
+  return buf;
+}
+
+///////////////////////////////////////////////////////////////////////////////
+// Golden model
+
+struct LsuReq {
+  bool     rw     = false;
+  uint32_t byteen = 0;
+  uint32_t addr   = 0; // word address: {row, bank}
+  uint64_t data   = 0;
+  uint32_t tag    = 0;
+  bool     amo    = false;
+  uint8_t  op     = 0;
+  bool     uns    = false;
+  uint64_t cmp    = 0;
+};
+
+struct DmaReq {
+  bool     rw  = false;
+  uint32_t row = 0;
+  std::array<uint32_t, NUM_BANKS> be{};
+  std::array<uint64_t, NUM_BANKS> data{};
+  uint32_t tag = 0;
+};
+
+using Row = std::array<uint64_t, NUM_BANKS>;
+
+static uint32_t word_addr(uint32_t row, uint32_t bank) {
+  return (row << BANK_BITS) | bank;
+}
+
+static uint64_t byte_mask(uint32_t byteen) {
+  uint64_t m = 0;
+  for (uint32_t b = 0; b < WORD_SIZE; ++b) {
+    if ((byteen >> b) & 1) {
+      m |= 0xffull << (8 * b);
+    }
+  }
+  return m;
+}
+
+static uint64_t merge(uint64_t old, uint64_t data, uint32_t byteen) {
+  uint64_t m = byte_mask(byteen);
+  return ((old & ~m) | (data & m)) & WORD_MASK;
+}
+
+// Lane placement mirrors the bank: a .W on a 64-bit word is selected by
+// byteen, operands arrive lane-positioned, the comparand right-aligned.
+static uint64_t amo_new_word(const LsuReq& r, uint64_t old) {
+  bool lane_hi = (XLEN == 64) && !(r.byteen & 1);
+  bool is_w = (XLEN == 32) || (r.byteen != FULL_BE);
+  uint32_t sh = lane_hi ? 32 : 0;
+  uint64_t a = old >> sh;
+  uint64_t b = r.data >> sh;
+  uint64_t c = r.cmp;
+  if (is_w) {
+    a &= MASK32;
+    b &= MASK32;
+    c &= MASK32;
+  }
+  bool lt_s = is_w ? (static_cast<int32_t>(a) < static_cast<int32_t>(b))
+                   : (static_cast<int64_t>(a) < static_cast<int64_t>(b));
+  bool lt_u = a < b;
+  bool lt = r.uns ? lt_u : lt_s;
+  uint64_t res = a;
+  switch (r.op) {
+  case AMO_LR:   res = a; break;
+  case AMO_SC:   res = b; break;
+  case AMO_SWAP: res = b; break;
+  case AMO_ADD:  res = a + b; break;
+  case AMO_XOR:  res = a ^ b; break;
+  case AMO_OR:   res = a | b; break;
+  case AMO_AND:  res = a & b; break;
+  case AMO_MIN:  res = lt ? a : b; break;
+  case AMO_MAX:  res = lt ? b : a; break;
+  case AMO_CAS:  res = (a == c) ? b : a; break;
+  default:       break;
+  }
+  if (is_w) {
+    res &= MASK32;
+  }
+  return merge(old, res << sh, r.byteen);
+}
+
+static uint64_t dma_merge(const DmaReq& d, uint32_t bank, uint64_t old) {
+  return merge(old, d.data[bank], d.be[bank]);
+}
+
+static uint64_t sc_rsp_word(const LsuReq& r, bool fail) {
+  bool lane_hi = (XLEN == 64) && !(r.byteen & 1);
+  return static_cast<uint64_t>(fail ? 1 : 0) << (lane_hi ? 32 : 0);
+}
+
+///////////////////////////////////////////////////////////////////////////////
+// DUT driver
+
+struct Events {
+  std::array<bool, NUM_REQS>     lsu_acc{};
+  std::array<bool, NUM_REQS>     lsu_rsp{};
+  std::array<uint64_t, NUM_REQS> rsp_data{};
+  std::array<uint32_t, NUM_REQS> rsp_tag{};
+  bool     dma_acc   = false;
+  bool     dma_stall = false;
+  bool     dma_rsp   = false;
+  Row      dma_rsp_data{};
+  uint32_t dma_rsp_tag = 0;
+  bool any() const {
+    for (uint32_t i = 0; i < NUM_REQS; ++i) {
+      if (lsu_acc[i] || lsu_rsp[i]) {
+        return true;
+      }
+    }
+    return dma_acc || dma_rsp;
+  }
+};
+
+class Dut {
+public:
+  std::array<std::optional<LsuReq>, NUM_REQS> lane;
+  std::array<bool, NUM_REQS> rsp_ready;
+  std::optional<DmaReq> dma;
+  bool dma_rsp_ready = true;
+
+  Dut() {
+    rsp_ready.fill(true);
+    auto* t = sim_.operator->();
+    t->reset = 1;
+    for (int i = 0; i < 8; ++i) {
+      this->clock();
+    }
+    t->reset = 0;
+    cycle_ = 0;
+  }
+
+  uint64_t cycle() const {
+    return cycle_;
+  }
+
+  // Inputs are applied, outputs sampled, then one rising edge.
+  Events clock() {
+    auto* t = sim_.operator->();
+    this->drive(t);
+    t->eval();
+    Events ev;
+    for (uint32_t i = 0; i < NUM_REQS; ++i) {
+      ev.lsu_acc[i] = lane[i].has_value() && get_bits(t->mem_req_ready, i, 1);
+      ev.lsu_rsp[i] = rsp_ready[i] && get_bits(t->mem_rsp_valid, i, 1);
+      ev.rsp_data[i] = get_bits(t->mem_rsp_data, i * XLEN, XLEN);
+      ev.rsp_tag[i] = static_cast<uint32_t>(get_bits(t->mem_rsp_tag, i * TAG_BITS, TAG_BITS));
+    }
+    bool dma_ready = t->dma_req_ready;
+    ev.dma_acc   = dma.has_value() && dma_ready;
+    ev.dma_stall = dma.has_value() && !dma_ready;
+    ev.dma_rsp   = dma_rsp_ready && t->dma_rsp_valid;
+    for (uint32_t b = 0; b < NUM_BANKS; ++b) {
+      ev.dma_rsp_data[b] = get_bits(t->dma_rsp_data, b * XLEN, XLEN);
+    }
+    ev.dma_rsp_tag = static_cast<uint32_t>(t->dma_rsp_tag);
+    tick_ = sim_.step(tick_, 2);
+    ++cycle_;
+    for (uint32_t i = 0; i < NUM_REQS; ++i) {
+      if (ev.lsu_acc[i]) {
+        lane[i].reset();
+      }
+    }
+    if (ev.dma_acc) {
+      dma.reset();
+    }
+    return ev;
+  }
+
+private:
+  void drive(VVX_local_mem_top* t) {
+    for (uint32_t i = 0; i < NUM_REQS; ++i) {
+      LsuReq r = lane[i].value_or(LsuReq{});
+      set_bits(t->mem_req_valid, i, 1, lane[i].has_value());
+      set_bits(t->mem_req_rw, i, 1, r.rw);
+      set_bits(t->mem_req_byteen, i * WORD_SIZE, WORD_SIZE, r.byteen);
+      set_bits(t->mem_req_addr, i * ADDR_BITS, ADDR_BITS, r.addr);
+      set_bits(t->mem_req_data, i * XLEN, XLEN, r.data);
+      set_bits(t->mem_req_tag, i * TAG_BITS, TAG_BITS, r.tag);
+      set_bits(t->mem_req_amo_valid, i, 1, r.amo);
+      set_bits(t->mem_req_amo_op, i * AMO_OP_BITS, AMO_OP_BITS, r.op);
+      set_bits(t->mem_req_amo_unsigned, i, 1, r.uns);
+      set_bits(t->mem_req_amo_cmp, i * XLEN, XLEN, r.cmp);
+      set_bits(t->mem_rsp_ready, i, 1, rsp_ready[i]);
+    }
+    DmaReq d = dma.value_or(DmaReq{});
+    t->dma_req_valid = dma.has_value();
+    t->dma_req_rw = d.rw;
+    t->dma_req_addr = d.row;
+    for (uint32_t b = 0; b < NUM_BANKS; ++b) {
+      set_bits(t->dma_req_byteen, b * WORD_SIZE, WORD_SIZE, d.be[b]);
+      set_bits(t->dma_req_data, b * XLEN, XLEN, d.data[b]);
+    }
+    t->dma_req_tag = d.tag;
+    t->dma_rsp_ready = dma_rsp_ready;
+  }
+
+  vl_simulator<VVX_local_mem_top> sim_;
+  uint64_t tick_  = 0;
+  uint64_t cycle_ = 0;
+};
+
+///////////////////////////////////////////////////////////////////////////////
+
+struct Options {
+  uint32_t seed          = 1;
+  uint32_t stress_seeds  = 4;
+  uint32_t stress_cycles = 20000;
+  uint32_t max_report    = 3;
+  bool     verbose       = false;
+};
+
+class Testbench {
+public:
+  explicit Testbench(const Options& opts)
+    : opts_(opts)
+    , rng_(opts.seed)
+    , gold_(NUM_WORDS, 0) {
+  }
+
+  int run() {
+    std::printf("local_mem: XLEN=%u lanes=%u banks=%u rows=%u size=%u amo=%d zacas=%d seed=%u\n",
+                XLEN, NUM_REQS, NUM_BANKS, NUM_ROWS, LMEM_SIZE, AMO_EN, CAS_EN, opts_.seed);
+    this->init_memory();
+    if (!this->calibrate()) {
+      return 1;
+    }
+    if (AMO_EN) {
+      this->directed();
+      this->lrsc_window();
+    } else {
+      std::printf("atomics disabled (VX_CFG_EXT_A_ENABLE not set): directed atomic runs skipped\n");
+    }
+    for (uint32_t s = 0; s < opts_.stress_seeds; ++s) {
+      this->stress(opts_.seed * 7919u + s);
+    }
+    this->final_check();
+    std::printf("total cycles: %" PRIu64 "\n", dut_.cycle());
+    if (failures_ != 0) {
+      std::printf("FAILED: %u check(s) failed\n", failures_);
+      return 1;
+    }
+    std::printf("PASSED\n");
+    return 0;
+  }
+
+private:
+  ///////////////////////////////////////////////////////////////////////////
+  // helpers
+
+  uint64_t rand_word() {
+    return rng_() & WORD_MASK;
+  }
+
+  uint32_t rand_below(uint32_t n) {
+    return static_cast<uint32_t>(rng_() % n);
+  }
+
+  uint64_t& gold(uint32_t row, uint32_t bank) {
+    return gold_.at(row * NUM_BANKS + bank);
+  }
+
+  uint32_t next_tag() {
+    tag_ = (tag_ + 1) & ((1u << TAG_BITS) - 1);
+    return tag_;
+  }
+
+  uint32_t next_dma_tag() {
+    dma_tag_ = (dma_tag_ + 1) & ((1u << DMA_TAG_BITS) - 1);
+    return dma_tag_;
+  }
+
+  void fail(const std::string& msg) {
+    ++failures_;
+    if (failures_ <= 200) {
+      std::printf("%s\n", msg.c_str());
+    } else if (failures_ == 201) {
+      std::printf("... further failure messages suppressed\n");
+    }
+  }
+
+  void idle(uint32_t n) {
+    for (uint32_t i = 0; i < n; ++i) {
+      Events ev = dut_.clock();
+      if (ev.any()) {
+        this->fail(strf("FAIL [cycle %" PRIu64 "] unexpected activity while idle", dut_.cycle()));
+      }
+    }
+  }
+
+  // Blocking DMA access, used outside the timed windows.
+  Row dma_access(const DmaReq& req) {
+    DmaReq d = req;
+    d.tag = this->next_dma_tag();
+    dut_.dma = d;
+    bool accepted = false;
+    for (uint32_t i = 0; i < 64; ++i) {
+      Events ev = dut_.clock();
+      accepted |= ev.dma_acc;
+      if (ev.dma_rsp) {
+        if (ev.dma_rsp_tag != d.tag) {
+          this->fail(strf("FAIL [cycle %" PRIu64 "] DMA response tag 0x%x, expected 0x%x",
+                          dut_.cycle(), ev.dma_rsp_tag, d.tag));
+        }
+        return ev.dma_rsp_data;
+      }
+      if (accepted && d.rw) {
+        return Row{};
+      }
+    }
+    this->fail(strf("FAIL [cycle %" PRIu64 "] DMA %s row 0x%x timed out (accepted=%d)",
+                    dut_.cycle(), d.rw ? "write" : "read", d.row, accepted));
+    dut_.dma.reset();
+    return Row{};
+  }
+
+  Row dma_read(uint32_t row) {
+    DmaReq d;
+    d.rw = false;
+    d.row = row;
+    return this->dma_access(d);
+  }
+
+  void dma_write(uint32_t row, const Row& data) {
+    DmaReq d;
+    d.rw = true;
+    d.row = row;
+    d.be.fill(FULL_BE);
+    d.data = data;
+    this->dma_access(d);
+  }
+
+  // Blocking LSU access; returns the response word (reads only).
+  std::optional<uint64_t> lsu_access(uint32_t lane, LsuReq req) {
+    req.tag = this->next_tag();
+    dut_.lane[lane] = req;
+    bool expects_rsp = !req.rw;
+    bool accepted = false;
+    for (uint32_t i = 0; i < 64; ++i) {
+      Events ev = dut_.clock();
+      accepted |= ev.lsu_acc[lane];
+      for (uint32_t l = 0; l < NUM_REQS; ++l) {
+        if (!ev.lsu_rsp[l]) {
+          continue;
+        }
+        if (l != lane || ev.rsp_tag[l] != req.tag) {
+          this->fail(strf("FAIL [cycle %" PRIu64 "] stray LSU response lane=%u tag=0x%x (waiting lane=%u tag=0x%x)",
+                          dut_.cycle(), l, ev.rsp_tag[l], lane, req.tag));
+          continue;
+        }
+        return ev.rsp_data[l];
+      }
+      if (accepted && !expects_rsp) {
+        return std::nullopt;
+      }
+    }
+    this->fail(strf("FAIL [cycle %" PRIu64 "] LSU request lane=%u addr=0x%x timed out (accepted=%d)",
+                    dut_.cycle(), lane, req.addr, accepted));
+    dut_.lane[lane].reset();
+    return std::nullopt;
+  }
+
+  bool check_rows(const char* ctx, const std::vector<uint32_t>& rows) {
+    bool ok = true;
+    for (uint32_t row : rows) {
+      Row got = this->dma_read(row);
+      for (uint32_t b = 0; b < NUM_BANKS; ++b) {
+        if (got[b] != this->gold(row, b)) {
+          this->fail(strf("FAIL %s [cycle %" PRIu64 "] word (row 0x%x, bank %u): expected %s, got %s",
+                          ctx, dut_.cycle(), row, b, hex(this->gold(row, b)).c_str(), hex(got[b]).c_str()));
+          ok = false;
+        }
+      }
+    }
+    return ok;
+  }
+
+  ///////////////////////////////////////////////////////////////////////////
+
+  void init_memory() {
+    for (uint32_t row = 0; row < NUM_ROWS; ++row) {
+      Row data;
+      for (uint32_t b = 0; b < NUM_BANKS; ++b) {
+        data[b] = this->rand_word();
+        this->gold(row, b) = data[b];
+      }
+      this->dma_write(row, data);
+    }
+    this->idle(2);
+    std::vector<uint32_t> rows;
+    for (uint32_t row = 0; row < NUM_ROWS; row += std::max(1u, NUM_ROWS / 16)) {
+      rows.push_back(row);
+    }
+    this->check_rows("init", rows);
+  }
+
+  // Finds the cycle a request reaches its bank, relative to its LSU port
+  // handshake, without looking inside the DUT: a plain store and a DMA read
+  // of the same word are swept against each other, and the first DMA offset
+  // that observes the new value is one past the store's SRAM write.
+  bool calibrate() {
+    const uint32_t lane = 0;
+    const uint32_t row = 3 % NUM_ROWS;
+    const uint32_t bank = NUM_BANKS - 1;
+    int first_new = -1;
+    std::string trace;
+    for (int off = 0; off <= 8; ++off) {
+      uint64_t old_val = this->gold(row, bank);
+      uint64_t new_val = (~old_val) & WORD_MASK;
+      LsuReq st;
+      st.rw = true;
+      st.byteen = FULL_BE;
+      st.addr = word_addr(row, bank);
+      st.data = new_val;
+      st.tag = this->next_tag();
+      DmaReq rd;
+      rd.rw = false;
+      rd.row = row;
+      rd.tag = this->next_dma_tag();
+      dut_.lane[lane] = st;
+      uint64_t c0 = dut_.cycle();
+      std::optional<uint64_t> seen;
+      bool st_acc_at_0 = false;
+      for (uint32_t i = 0; i < 32 && !seen; ++i) {
+        int rel = static_cast<int>(dut_.cycle() - c0);
+        if (rel == off) {
+          dut_.dma = rd;
+        }
+        Events ev = dut_.clock();
+        if (ev.lsu_acc[lane] && rel == 0) {
+          st_acc_at_0 = true;
+        }
+        if (ev.dma_rsp) {
+          seen = ev.dma_rsp_data[bank];
+        }
+      }
+      this->gold(row, bank) = new_val;
+      this->idle(2);
+      if (!st_acc_at_0 || !seen) {
+        this->fail(strf("FAIL calibrate: store accepted at port cycle 0: %d, DMA response: %d",
+                        st_acc_at_0, seen.has_value()));
+        return false;
+      }
+      bool is_new = (*seen == new_val);
+      if (!is_new && *seen != old_val) {
+        this->fail(strf("FAIL calibrate: DMA read at +%d returned %s, neither old %s nor new %s",
+                        off, hex(*seen).c_str(), hex(old_val).c_str(), hex(new_val).c_str()));
+        return false;
+      }
+      trace += is_new ? "N" : "o";
+      if (is_new && first_new < 0) {
+        first_new = off;
+      }
+      if (!is_new && first_new >= 0) {
+        this->fail(strf("FAIL calibrate: store visibility not monotonic over DMA offsets (%s)", trace.c_str()));
+        return false;
+      }
+    }
+    if (first_new < 1) {
+      this->fail(strf("FAIL calibrate: could not locate the bank acceptance cycle (%s)", trace.c_str()));
+      return false;
+    }
+    bank_lat_ = first_new - 1;
+    std::printf("calibrate: store visibility over DMA offsets 0..8 = %s -> request reaches its bank at port+%d\n",
+                trace.c_str(), bank_lat_);
+
+    LsuReq ld;
+    ld.byteen = FULL_BE;
+    ld.addr = word_addr(row, bank);
+    ld.tag = this->next_tag();
+    dut_.lane[lane] = ld;
+    int ld_acc = -1, ld_rsp = -1;
+    for (int rel = 0; rel < 32 && ld_rsp < 0; ++rel) {
+      Events ev = dut_.clock();
+      if (ev.lsu_acc[lane]) {
+        ld_acc = rel;
+      }
+      if (ev.lsu_rsp[lane] && ev.rsp_tag[lane] == ld.tag) {
+        ld_rsp = rel;
+        if (ev.rsp_data[lane] != this->gold(row, bank)) {
+          this->fail(strf("FAIL calibrate: load returned %s, expected %s",
+                          hex(ev.rsp_data[lane]).c_str(), hex(this->gold(row, bank)).c_str()));
+          return false;
+        }
+      }
+    }
+    this->idle(2);
+    if (ld_acc != 0 || ld_rsp <= ld_acc + bank_lat_) {
+      this->fail(strf("FAIL calibrate: load accepted at port +%d, responded at +%d", ld_acc, ld_rsp));
+      return false;
+    }
+    rsp_lat_ = ld_rsp - ld_acc - bank_lat_;
+    std::printf("calibrate: load responds at port+%d -> response leaves the bank %d cycle(s) after acceptance\n",
+                ld_rsp, rsp_lat_);
+    return true;
+  }
+
+  ///////////////////////////////////////////////////////////////////////////
+  // Directed: one atomic on one bank and one DMA access injected at a fixed
+  // offset k from the cycle t the atomic reaches that bank.
+
+  enum Scn {
+    S_WR_BANK,
+    S_RD_BANK,
+    S_WR_WORD,
+    S_RD_WORD,
+    S_SC_WR_BANK,
+    S_WR_OTHER,
+    NUM_SCN
+  };
+
+  static const char* scn_name(int s) {
+    static const char* names[NUM_SCN] = {
+      "dma-wr same-bank/other-word",
+      "dma-rd same-bank/other-word",
+      "dma-wr same-word",
+      "dma-rd same-word",
+      "sc + dma-wr same-bank",
+      "dma-wr other-banks (control)"
+    };
+    return names[s];
+  }
+
+  static constexpr int K_MIN = -1;
+  static constexpr int K_MAX = 4;
+  static constexpr int NUM_K = K_MAX - K_MIN + 1;
+
+  struct Cell {
+    uint32_t runs  = 0;
+    uint32_t fails = 0;
+    uint32_t stall_max = 0;
+    uint32_t sc_ok = 0;
+  };
+
+  // A 64-bit bank word holds two .W lanes; a 32-bit word is always W_LO.
+  enum Width { W_LO, W_HI, W_D };
+  static constexpr int NUM_WIDTHS = (XLEN == 64) ? 3 : 1;
+
+  static uint32_t lane_byteen(int width) {
+    if (XLEN == 32) {
+      return FULL_BE;
+    }
+    return (width == W_LO) ? 0x0f : (width == W_HI) ? 0xf0 : 0xff;
+  }
+
+  static const char* width_name(int width) {
+    if (XLEN == 32) {
+      return "W";
+    }
+    return (width == W_LO) ? "W.lo" : (width == W_HI) ? "W.hi" : "D";
+  }
+
+  static uint64_t lane_position(int width, uint64_t v) {
+    if (XLEN == 64 && width == W_LO) {
+      return v & MASK32;
+    }
+    if (XLEN == 64 && width == W_HI) {
+      return v & ~MASK32;
+    }
+    return v & WORD_MASK;
+  }
+
+  uint64_t lane_data(int width) {
+    uint64_t v = lane_position(width, this->rand_word());
+    return v ? v : lane_position(width, 0x0000000100000001ull);
+  }
+
+  uint32_t other_row(uint32_t row) {
+    uint32_t r = this->rand_below(NUM_ROWS - 1);
+    return (r >= row) ? r + 1 : r;
+  }
+
+  DmaReq make_dma_write(int scn, uint32_t row, uint32_t bank) {
+    DmaReq d;
+    d.rw = true;
+    d.row = row;
+    for (uint32_t b = 0; b < NUM_BANKS; ++b) {
+      d.data[b] = this->rand_word();
+    }
+    if (scn == S_WR_OTHER) {
+      for (uint32_t b = 0; b < NUM_BANKS; ++b) {
+        d.be[b] = (b == bank) ? 0 : this->rand_below(FULL_BE + 1);
+      }
+      d.be[(bank + 1) % NUM_BANKS] = FULL_BE;
+      return d;
+    }
+    switch (this->rand_below(3)) {
+    case 0: // full row
+      d.be.fill(FULL_BE);
+      break;
+    case 1: // only the atomic's bank
+      d.be.fill(0);
+      d.be[bank] = FULL_BE;
+      break;
+    default: // random bytes, at least one in the atomic's bank
+      for (uint32_t b = 0; b < NUM_BANKS; ++b) {
+        d.be[b] = this->rand_below(FULL_BE + 1);
+      }
+      if (d.be[bank] == 0 || (scn == S_WR_WORD && d.be[bank] == FULL_BE)) {
+        d.be[bank] = 1 + this->rand_below(FULL_BE - 1);
+      }
+      break;
+    }
+    return d;
+  }
+
+  void directed() {
+    std::array<std::array<Cell, NUM_K>, NUM_SCN> cells{};
+    std::array<std::array<uint32_t, NUM_K>, NUM_SCN> reported{};
+    uint32_t lane_rr = 0;
+    for (int s = 0; s < NUM_SCN; ++s) {
+      if (s == S_WR_OTHER && NUM_BANKS < 2) {
+        continue;
+      }
+      for (int k = K_MIN; k <= K_MAX; ++k) {
+        for (uint32_t bank = 0; bank < NUM_BANKS; ++bank) {
+          for (int width = 0; width < NUM_WIDTHS; ++width) {
+            for (int rep = 0; rep < 2; ++rep) {
+              uint32_t lane = (lane_rr++) % NUM_REQS;
+              Cell& cell = cells[s][k - K_MIN];
+              uint32_t& nrep = reported[s][k - K_MIN];
+              std::string msg;
+              bool ok = this->directed_run(s, k, bank, lane, width, cell, msg);
+              ++cell.runs;
+              if (!ok) {
+                ++cell.fails;
+                ++failures_;
+                if (nrep < opts_.max_report) {
+                  std::printf("%s", msg.c_str());
+                  ++nrep;
+                }
+              } else if (opts_.verbose) {
+                std::printf("%s", msg.c_str());
+              }
+            }
+          }
+        }
+      }
+    }
+
+    std::printf("\ndirected summary (t = cycle the atomic reaches its bank; cells = failed/runs):\n");
+    std::printf("  %-34s", "scenario");
+    for (int k = K_MIN; k <= K_MAX; ++k) {
+      std::printf(" %9s", (k == 0) ? "t" : strf("t%+d", k).c_str());
+    }
+    std::printf("\n");
+    for (int s = 0; s < NUM_SCN; ++s) {
+      std::printf("  %-34s", scn_name(s));
+      for (int k = K_MIN; k <= K_MAX; ++k) {
+        const Cell& c = cells[s][k - K_MIN];
+        if (c.runs == 0) {
+          std::printf(" %9s", "-");
+        } else if (c.fails == 0) {
+          std::printf(" %9s", strf("ok %u", c.runs).c_str());
+        } else {
+          std::printf(" %9s", strf("FAIL %u/%u", c.fails, c.runs).c_str());
+        }
+      }
+      std::printf("\n");
+    }
+    std::printf("  %-34s", "max DMA stall cycles (any scn)");
+    for (int k = K_MIN; k <= K_MAX; ++k) {
+      uint32_t m = 0;
+      for (int s = 0; s < NUM_SCN; ++s) {
+        m = std::max(m, cells[s][k - K_MIN].stall_max);
+      }
+      std::printf(" %9u", m);
+    }
+    std::printf("\n");
+    uint32_t sc_ok = 0;
+    uint32_t sc_runs = 0;
+    for (int k = 0; k < NUM_K; ++k) {
+      sc_ok += cells[S_SC_WR_BANK][k].sc_ok;
+      sc_runs += cells[S_SC_WR_BANK][k].runs;
+    }
+    std::printf("  store-conditionals that succeeded: %u/%u\n\n", sc_ok, sc_runs);
+    if (sc_runs != 0 && sc_ok == 0) {
+      this->fail("FAIL: no store-conditional succeeded, so the LR/SC scenario exercised nothing");
+    }
+  }
+
+  bool directed_run(int scn, int k, uint32_t bank, uint32_t lane, int width, Cell& cell, std::string& msg) {
+    const bool same_word = (scn == S_WR_WORD || scn == S_RD_WORD);
+    const bool dma_wr = (scn != S_RD_BANK && scn != S_RD_WORD);
+    const uint32_t row_w = this->rand_below(NUM_ROWS);
+    const uint32_t row_d = same_word ? row_w : this->other_row(row_w);
+    const uint64_t old0 = this->gold(row_w, bank);
+    const uint64_t cyc_base = dut_.cycle();
+
+    std::string head = strf("%s @%s lane=%u bank=%u width=%s row_w=0x%x row_d=0x%x",
+                            scn_name(scn), (k == 0) ? "t" : strf("t%+d", k).c_str(),
+                            lane, bank, width_name(width), row_w, row_d);
+    std::vector<std::string> errs;
+
+    LsuReq amo;
+    amo.rw = false;
+    amo.amo = true;
+    amo.byteen = this->lane_byteen(width);
+    amo.addr = word_addr(row_w, bank);
+    amo.data = this->lane_data(width);
+    amo.op = (scn == S_SC_WR_BANK) ? AMO_SC : AMO_ADD;
+
+    if (scn == S_SC_WR_BANK) {
+      LsuReq lr = amo;
+      lr.op = AMO_LR;
+      lr.data = 0;
+      std::optional<uint64_t> got = this->lsu_access(lane, lr);
+      if (!got || *got != old0) {
+        errs.push_back(strf("LR returned %s, expected %s", got ? hex(*got).c_str() : "nothing",
+                            hex(old0).c_str()));
+      }
+      this->idle(2);
+    }
+
+    DmaReq dma;
+    if (dma_wr) {
+      dma = this->make_dma_write(scn, row_d, bank);
+    } else {
+      dma.rw = false;
+      dma.row = row_d;
+    }
+    dma.tag = this->next_dma_tag();
+    amo.tag = this->next_tag();
+
+    const Row row_d_before = [&] {
+      Row r;
+      for (uint32_t b = 0; b < NUM_BANKS; ++b) {
+        r[b] = this->gold(row_d, b);
+      }
+      return r;
+    }();
+
+    // Timed window. All cycle numbers are relative to the cycle the atomic
+    // is presented at its LSU port.
+    const int dma_start = bank_lat_ + k;
+    int c_acc = -1, d_acc = -1, d_rsp = -1, a_rsp = -1;
+    uint32_t stalls = 0;
+    uint64_t amo_ret = 0;
+    Row dma_row{};
+    const uint64_t c0 = dut_.cycle();
+    dut_.lane[lane] = amo;
+    for (int rel = 0; rel < 64; ++rel) {
+      if (rel == dma_start) {
+        dut_.dma = dma;
+      }
+      Events ev = dut_.clock();
+      if (ev.lsu_acc[lane]) {
+        c_acc = rel;
+      }
+      if (ev.dma_acc) {
+        d_acc = rel;
+      }
+      if (ev.dma_stall) {
+        ++stalls;
+      }
+      for (uint32_t l = 0; l < NUM_REQS; ++l) {
+        if (!ev.lsu_rsp[l]) {
+          continue;
+        }
+        if (l != lane || ev.rsp_tag[l] != amo.tag || a_rsp >= 0) {
+          errs.push_back(strf("stray LSU response at +%d: lane=%u tag=0x%x", rel, l, ev.rsp_tag[l]));
+          continue;
+        }
+        a_rsp = rel;
+        amo_ret = ev.rsp_data[l];
+      }
+      if (ev.dma_rsp) {
+        if (dma_wr || d_rsp >= 0 || ev.dma_rsp_tag != dma.tag) {
+          errs.push_back(strf("unexpected DMA response at +%d tag=0x%x", rel, ev.dma_rsp_tag));
+        } else {
+          d_rsp = rel;
+          dma_row = ev.dma_rsp_data;
+        }
+      }
+      bool dma_done = (d_acc >= 0) && (dma_wr || d_rsp >= 0);
+      if (c_acc >= 0 && a_rsp >= 0 && dma_done) {
+        break;
+      }
+    }
+    cell.stall_max = std::max(cell.stall_max, stalls);
+    std::string timing = strf("    timing (port cycle %" PRIu64 " = +0): atomic accepted +%d, rsp +%d; "
+                              "DMA valid +%d, accepted +%d (stalled %u)%s\n",
+                              c0, c_acc, a_rsp, dma_start, d_acc, stalls,
+                              dma_wr ? "" : strf(", rsp +%d", d_rsp).c_str());
+    if (c_acc < 0 || a_rsp < 0 || d_acc < 0 || (!dma_wr && d_rsp < 0)) {
+      errs.push_back("handshake did not complete within 64 cycles (deadlock?)");
+      dut_.lane[lane].reset();
+      dut_.dma.reset();
+    }
+    this->idle(4);
+
+    // Read back every row the window could have touched.
+    std::vector<uint32_t> rows{row_w};
+    if (row_d != row_w) {
+      rows.push_back(row_d);
+    }
+    std::vector<Row> after;
+    for (uint32_t row : rows) {
+      after.push_back(this->dma_read(row));
+    }
+    auto actual = [&](uint32_t row, uint32_t b) {
+      return after[(row == row_w) ? 0 : 1][b];
+    };
+
+    // Real time rules out a serial order only when the two operations cannot
+    // overlap: a DMA access takes effect in its acceptance cycle, which can
+    // precede the atomic reaching its bank; an atomic that already responded
+    // has completed before a later DMA is accepted.
+    const bool allow_ad = !(d_acc >= 0 && c_acc >= 0 && d_acc < c_acc + bank_lat_);
+    const bool allow_da = !(a_rsp >= 0 && a_rsp < (d_acc >= 0 ? d_acc : dma_start));
+
+    auto expect_word = [&](uint32_t row, uint32_t b, uint64_t exp, const char* what) {
+      uint64_t got = actual(row, b);
+      if (got != exp) {
+        errs.push_back(strf("%s (row 0x%x, bank %u): expected %s, got %s", what, row, b,
+                            hex(exp).c_str(), hex(got).c_str()));
+      }
+    };
+
+    if (scn == S_SC_WR_BANK) {
+      uint64_t ok_word = sc_rsp_word(amo, false);
+      uint64_t fail_word = sc_rsp_word(amo, true);
+      bool sc_ok = (amo_ret == ok_word);
+      if (!sc_ok && amo_ret != fail_word) {
+        errs.push_back(strf("SC returned %s, expected %s (success) or %s (failure)",
+                            hex(amo_ret).c_str(), hex(ok_word).c_str(), hex(fail_word).c_str()));
+      }
+      cell.sc_ok += sc_ok;
+      uint64_t exp_w = sc_ok ? amo_new_word(amo, old0) : old0;
+      uint64_t got_w = actual(row_w, bank);
+      if (got_w != exp_w) {
+        errs.push_back(strf("SC %s but word (row 0x%x, bank %u) is %s, expected %s%s",
+                            sc_ok ? "reported success" : "reported failure", row_w, bank,
+                            hex(got_w).c_str(), hex(exp_w).c_str(),
+                            (sc_ok && got_w == old0) ? " -> store-conditional write-back lost" : ""));
+      }
+      for (uint32_t b = 0; b < NUM_BANKS; ++b) {
+        expect_word(row_d, b, dma_merge(dma, b, row_d_before[b]), "DMA-written word");
+      }
+    } else if (!same_word) {
+      uint64_t exp_w = amo_new_word(amo, old0);
+      if (amo_ret != old0) {
+        errs.push_back(strf("%s returned %s, expected old value %s", amo_name(amo.op, amo.uns),
+                            hex(amo_ret).c_str(), hex(old0).c_str()));
+      }
+      uint64_t got_w = actual(row_w, bank);
+      if (got_w != exp_w) {
+        const char* why = "";
+        if (got_w == old0) {
+          why = " -> atomic write-back lost";
+        }
+        errs.push_back(strf("atomic word (row 0x%x, bank %u): expected %s, got %s%s",
+                            row_w, bank, hex(exp_w).c_str(), hex(got_w).c_str(), why));
+      }
+      if (!dma_wr) {
+        for (uint32_t b = 0; b < NUM_BANKS; ++b) {
+          if (dma_row[b] != row_d_before[b]) {
+            errs.push_back(strf("DMA read data (row 0x%x, bank %u): expected %s, got %s",
+                                row_d, b, hex(row_d_before[b]).c_str(), hex(dma_row[b]).c_str()));
+          }
+        }
+      }
+      for (uint32_t b = 0; b < NUM_BANKS; ++b) {
+        uint64_t exp = dma_wr ? dma_merge(dma, b, row_d_before[b]) : row_d_before[b];
+        uint64_t got = actual(row_d, b);
+        if (got != exp) {
+          const char* why = "";
+          if (!dma_wr && b == bank && got == exp_w) {
+            why = " -> atomic result written into the DMA-read word";
+          } else if (dma_wr) {
+            why = " -> DMA write corrupted";
+          } else {
+            why = " -> DMA-read row corrupted";
+          }
+          errs.push_back(strf("%s word (row 0x%x, bank %u): expected %s, got %s%s",
+                              dma_wr ? "DMA-written" : "DMA-read", row_d, b,
+                              hex(exp).c_str(), hex(got).c_str(), why));
+        }
+      }
+    } else {
+      // Same word: the outcome must equal one of the two serial orders.
+      struct Order { const char* name; bool allowed; uint64_t ret; uint64_t fin; uint64_t dma_seen; };
+      std::vector<Order> orders;
+      uint64_t new_ad = amo_new_word(amo, old0);
+      if (dma_wr) {
+        uint64_t w1 = dma_merge(dma, bank, old0);
+        orders.push_back({"atomic-then-DMA", allow_ad, old0, dma_merge(dma, bank, new_ad), 0});
+        orders.push_back({"DMA-then-atomic", allow_da, w1, amo_new_word(amo, w1), 0});
+      } else {
+        orders.push_back({"atomic-then-DMA", allow_ad, old0, new_ad, new_ad});
+        orders.push_back({"DMA-then-atomic", allow_da, old0, new_ad, old0});
+      }
+      uint64_t got_w = actual(row_w, bank);
+      uint64_t seen_w = dma_wr ? 0 : dma_row[bank];
+      const Order* match = nullptr;
+      for (const Order& o : orders) {
+        if (o.allowed && o.ret == amo_ret && o.fin == got_w && (dma_wr || o.dma_seen == seen_w)) {
+          match = &o;
+          break;
+        }
+      }
+      if (!match) {
+        std::string e = strf("atomic word (row 0x%x, bank %u) matches no serial order: atomic returned %s, final %s%s",
+                             row_w, bank, hex(amo_ret).c_str(), hex(got_w).c_str(),
+                             dma_wr ? "" : strf(", DMA read %s", hex(seen_w).c_str()).c_str());
+        for (const Order& o : orders) {
+          e += strf("\n      %s%s: returns %s, final %s%s", o.name, o.allowed ? "" : " (excluded by real time)",
+                    hex(o.ret).c_str(), hex(o.fin).c_str(),
+                    dma_wr ? "" : strf(", DMA read %s", hex(o.dma_seen).c_str()).c_str());
+        }
+        if (dma_wr && amo_ret == old0 && got_w == new_ad) {
+          e += "\n      -> atomicity violated: the atomic overwrote a DMA write that landed between its read and write-back";
+        } else if (dma_wr && amo_ret == old0 && got_w == dma_merge(dma, bank, old0)) {
+          e += "\n      -> atomic write-back lost: the DMA write replaced it, bytes the DMA did not cover were reverted";
+        }
+        errs.push_back(e);
+      } else if (opts_.verbose) {
+        head += strf(" [order %s]", match->name);
+      }
+      for (uint32_t b = 0; b < NUM_BANKS; ++b) {
+        if (b == bank) {
+          continue;
+        }
+        uint64_t exp = dma_wr ? dma_merge(dma, b, row_d_before[b]) : row_d_before[b];
+        if (!dma_wr && dma_row[b] != exp) {
+          errs.push_back(strf("DMA read data (row 0x%x, bank %u): expected %s, got %s",
+                              row_d, b, hex(exp).c_str(), hex(dma_row[b]).c_str()));
+        }
+        expect_word(row_d, b, exp, dma_wr ? "DMA-written word" : "untouched word");
+      }
+    }
+
+    // Keep the golden model in step with the DUT so a failure does not
+    // cascade into the next run.
+    for (size_t i = 0; i < rows.size(); ++i) {
+      for (uint32_t b = 0; b < NUM_BANKS; ++b) {
+        this->gold(rows[i], b) = after[i][b];
+      }
+    }
+
+    bool ok = errs.empty();
+    msg = (ok ? "ok   " : "FAIL ") + head + strf(" [cycle %" PRIu64 "]\n", cyc_base);
+    if (!ok || opts_.verbose) {
+      msg += timing;
+    }
+    for (const std::string& e : errs) {
+      msg += "    " + e + "\n";
+    }
+    return ok;
+  }
+
+  ///////////////////////////////////////////////////////////////////////////
+  // LR/SC window: an LR, its SC issued once the LR has responded, and one
+  // DMA access swept across the window. A DMA write to a reserved byte that
+  // lands between the LR and the SC must make the SC fail; every other DMA
+  // access must leave the reservation alone. An atomic's bank cycle is its
+  // response cycle minus the calibrated response latency, which places the
+  // DMA in real time against the LR and SC occupancies.
+
+  enum LrscMode {
+    L_FULL_ROW,
+    L_BANK_ONLY,
+    L_ONE_BYTE,
+    L_OTHER_LANE,
+    L_OTHER_ROW,
+    L_OTHER_BANKS,
+    L_DMA_READ,
+    L_TWO_A,
+    L_TWO_B,
+    L_RERESERVE,
+    NUM_LMODES
+  };
+
+  static const char* lrsc_name(int m) {
+    static const char* names[NUM_LMODES] = {
+      "dma-wr full row",
+      "dma-wr reserved bank only",
+      "dma-wr one byte of the lane",
+      "dma-wr other lane of the word",
+      "dma-wr other row, same bank",
+      "dma-wr other banks, same row",
+      "dma-rd same row",
+      "two harts: A, DMA covers W_A",
+      "two harts: B, other bank",
+      "re-reserve: LR, DMA, LR, SC"
+    };
+    return names[m];
+  }
+
+  // Reservations are kept per bank word, so a write to the other .W lane of
+  // a 64-bit word may break one, though it does not have to.
+  static const char* lrsc_expect(int m) {
+    switch (m) {
+    case L_FULL_ROW:
+    case L_BANK_ONLY:
+    case L_ONE_BYTE:
+    case L_TWO_A:
+      return "fail in LR..SC";
+    case L_OTHER_LANE:
+      return "either in LR..SC";
+    default:
+      return "succeed";
+    }
+  }
+
+  enum Pos { P_PRE, P_AT_LR, P_MID, P_AT_SC, P_POST, NUM_POS };
+
+  static const char* pos_name(int p) {
+    static const char* names[NUM_POS] = {"pre-LR", "@LR", "LR..SC", "@SC", "post-SC"};
+    return names[p];
+  }
+
+  static constexpr int J_MIN = -2;
+  static constexpr int J_MAX = 11;
+
+  struct LrscCell {
+    uint32_t runs  = 0;
+    uint32_t fails = 0;
+    uint32_t sc_ok = 0;
+    uint32_t port_runs  = 0; // DMA accepted between the LR response and the SC port handshake
+    uint32_t port_fails = 0;
+  };
+
+  using LrscCells = std::array<std::array<LrscCell, NUM_POS>, NUM_LMODES>;
+  using LrscReported = std::array<std::array<uint32_t, NUM_POS>, NUM_LMODES>;
+
+  struct LrscHart {
+    uint32_t lane  = 0;
+    uint32_t bank  = 0;
+    uint32_t row   = 0;
+    int      width = W_LO;
+    bool     rereserve = false;
+    LsuReq   lr, lr2, sc;
+    uint64_t old = 0;
+    int      lr_acc = -1, lr_rsp = -1, lr2_acc = -1, lr2_rsp = -1, sc_acc = -1, sc_rsp = -1;
+    uint64_t lr_ret = 0, lr2_ret = 0, sc_ret = 0;
+    int      stage = 0;   // request in flight: 0 LR, 1 second LR, 2 SC, 3 done
+    int      next_at = 0; // cycle the stage's request is presented, -1 once presented
+    bool     wait_dma = false;
+  };
+
+  struct LrscResult {
+    int  pos   = P_PRE;
+    bool sc_ok = false;
+    bool port_between = false;
+    std::vector<std::string> errs;
+  };
+
+  // Every byte the DMA writes differs from the word it replaces, so the LR's
+  // return value and the final word show which side of the DMA each atomic
+  // fell on.
+  uint64_t fresh_bytes(uint64_t cur, uint32_t be) {
+    uint64_t v = this->rand_word();
+    for (uint32_t k = 0; k < WORD_SIZE; ++k) {
+      if ((be >> k) & 1) {
+        uint64_t b = ((cur >> (8 * k)) & 0xff) ^ (1 + this->rand_below(255));
+        v = (v & ~(0xffull << (8 * k))) | (b << (8 * k));
+      }
+    }
+    return v & WORD_MASK;
+  }
+
+  uint64_t sc_bytes(uint32_t byteen, uint64_t old, uint64_t dma_word) {
+    uint64_t v = 0;
+    for (uint32_t k = 0; k < WORD_SIZE; ++k) {
+      if (!((byteen >> k) & 1)) {
+        continue;
+      }
+      uint64_t o = (old >> (8 * k)) & 0xff;
+      uint64_t d = (dma_word >> (8 * k)) & 0xff;
+      uint64_t b;
+      do {
+        b = this->rand_below(256);
+      } while (b == o || b == d);
+      v |= b << (8 * k);
+    }
+    return v;
+  }
+
+  void lrsc_window() {
+    LrscCells cells{};
+    LrscReported reported{};
+    uint32_t rep = 0;
+    for (int mode = 0; mode < NUM_LMODES; ++mode) {
+      if (mode == L_TWO_B) {
+        continue; // tallied from the two-hart runs
+      }
+      if ((mode == L_OTHER_BANKS || mode == L_TWO_A) && NUM_BANKS < 2) {
+        continue;
+      }
+      if (mode == L_TWO_A && NUM_REQS < 2) {
+        continue;
+      }
+      const int j_min = (mode == L_RERESERVE) ? 0 : J_MIN;
+      const int j_max = (mode == L_RERESERVE) ? 0 : J_MAX;
+      for (int j = j_min; j <= j_max; ++j) {
+        for (int gap : {1, 3}) {
+          for (uint32_t bank = 0; bank < NUM_BANKS; ++bank) {
+            for (int width = 0; width < NUM_WIDTHS; ++width) {
+              if (mode == L_OTHER_LANE && lane_byteen(width) == FULL_BE) {
+                continue;
+              }
+              for (uint32_t lane = 0; lane < NUM_REQS; ++lane) {
+                this->lrsc_run(mode, j, gap, bank, lane, width, rep++, cells, reported);
+              }
+            }
+          }
+        }
+      }
+    }
+
+    std::printf("\nLR/SC window summary (DMA acceptance against the LR and SC bank occupancies; cells = failed/runs):\n");
+    std::printf("  %-31s %-17s", "mode", "SC must");
+    for (int p = 0; p < NUM_POS; ++p) {
+      std::printf(" %10s", pos_name(p));
+    }
+    std::printf("   SC ok in LR..SC   rsp(LR)<DMA<acc(SC)\n");
+    for (int m = 0; m < NUM_LMODES; ++m) {
+      std::printf("  %-31s %-17s", lrsc_name(m), lrsc_expect(m));
+      for (int p = 0; p < NUM_POS; ++p) {
+        const LrscCell& c = cells[m][p];
+        if (c.runs == 0) {
+          std::printf(" %10s", "-");
+        } else if (c.fails == 0) {
+          std::printf(" %10s", strf("ok %u", c.runs).c_str());
+        } else {
+          std::printf(" %10s", strf("FAIL %u/%u", c.fails, c.runs).c_str());
+        }
+      }
+      const LrscCell& mid = cells[m][P_MID];
+      std::printf("   %-17s", (mid.runs == 0) ? "-" : strf("%u/%u", mid.sc_ok, mid.runs).c_str());
+      if (mid.port_runs == 0) {
+        std::printf("   -\n");
+      } else if (mid.port_fails == 0) {
+        std::printf("   ok %u\n", mid.port_runs);
+      } else {
+        std::printf("   FAIL %u/%u\n", mid.port_fails, mid.port_runs);
+      }
+    }
+    std::printf("\n");
+
+    const bool two_harts = (NUM_BANKS >= 2 && NUM_REQS >= 2);
+    auto require = [&](int m, int p) {
+      if (cells[m][p].runs == 0) {
+        this->fail(strf("FAIL: the LR/SC sweep never placed the DMA %s for '%s'", pos_name(p), lrsc_name(m)));
+      }
+    };
+    for (int m : {L_FULL_ROW, L_BANK_ONLY, L_ONE_BYTE, L_TWO_A}) {
+      if (m == L_TWO_A && !two_harts) {
+        continue;
+      }
+      for (int p : {P_PRE, P_MID, P_POST}) {
+        require(m, p);
+      }
+    }
+    for (int m : {L_OTHER_ROW, L_OTHER_BANKS, L_DMA_READ, L_TWO_B}) {
+      if ((m == L_OTHER_BANKS && NUM_BANKS < 2) || (m == L_TWO_B && !two_harts)) {
+        continue;
+      }
+      require(m, P_MID);
+    }
+    if (WORD_SIZE == 8) {
+      require(L_OTHER_LANE, P_MID);
+    }
+    require(L_RERESERVE, P_PRE);
+  }
+
+  void lrsc_run(int mode, int j, int gap, uint32_t bank, uint32_t lane, int width, uint32_t rep,
+                LrscCells& cells, LrscReported& reported) {
+    const bool two = (mode == L_TWO_A);
+    std::vector<LrscHart> harts(two ? 2 : 1);
+    harts[0].lane = lane;
+    harts[0].bank = bank;
+    harts[0].width = width;
+    harts[0].row = this->rand_below(NUM_ROWS);
+    harts[0].rereserve = (mode == L_RERESERVE);
+    if (two) {
+      harts[1].lane = (lane + 1) % NUM_REQS;
+      harts[1].bank = (bank + 1 + this->rand_below(NUM_BANKS - 1)) % NUM_BANKS;
+      harts[1].width = (width + 1) % NUM_WIDTHS;
+      harts[1].row = (rep & 1) ? harts[0].row : this->rand_below(NUM_ROWS);
+    }
+    const uint32_t row_w = harts[0].row;
+    const uint32_t lane_be = lane_byteen(width);
+
+    DmaReq dma;
+    dma.rw = (mode != L_DMA_READ);
+    dma.row = row_w;
+    switch (mode) {
+    case L_FULL_ROW:
+      dma.be.fill(FULL_BE);
+      break;
+    case L_BANK_ONLY:
+      dma.be[bank] = FULL_BE;
+      break;
+    case L_ONE_BYTE: {
+      uint32_t k;
+      do {
+        k = this->rand_below(WORD_SIZE);
+      } while (!((lane_be >> k) & 1));
+      dma.be[bank] = 1u << k;
+      break;
+    }
+    case L_OTHER_LANE: {
+      const uint32_t other = FULL_BE & ~lane_be;
+      uint32_t be = other;
+      if (rep & 1) {
+        do {
+          be = this->rand_below(FULL_BE + 1) & other;
+        } while (be == 0);
+      }
+      dma.be[bank] = be;
+      break;
+    }
+    case L_OTHER_ROW:
+      // Flipping only the top row bit keeps the reservation station index,
+      // so the write must be told apart by the full row address.
+      dma.row = (rep & 1) ? (row_w ^ (NUM_ROWS / 2)) : this->other_row(row_w);
+      dma.be.fill(FULL_BE);
+      break;
+    case L_OTHER_BANKS:
+      dma.be.fill(FULL_BE);
+      dma.be[bank] = 0;
+      break;
+    case L_TWO_A:
+      for (uint32_t b = 0; b < NUM_BANKS; ++b) {
+        dma.be[b] = this->rand_below(FULL_BE + 1);
+      }
+      dma.be[bank] = FULL_BE;
+      if (harts[1].row == row_w) {
+        dma.be[harts[1].bank] = 0;
+      }
+      break;
+    case L_RERESERVE:
+      if (rep & 1) {
+        dma.be.fill(FULL_BE);
+      } else {
+        dma.be[bank] = FULL_BE;
+      }
+      break;
+    default:
+      break;
+    }
+    for (uint32_t b = 0; b < NUM_BANKS; ++b) {
+      dma.data[b] = this->fresh_bytes(this->gold(dma.row, b), dma.be[b]);
+    }
+    dma.tag = this->next_dma_tag();
+
+    for (LrscHart& h : harts) {
+      h.old = this->gold(h.row, h.bank);
+      h.lr.amo = true;
+      h.lr.op = AMO_LR;
+      h.lr.byteen = lane_byteen(h.width);
+      h.lr.addr = word_addr(h.row, h.bank);
+      h.lr.tag = this->next_tag();
+      h.lr2 = h.lr;
+      h.lr2.tag = this->next_tag();
+      h.sc = h.lr;
+      h.sc.op = AMO_SC;
+      const uint64_t dma_word = (dma.rw && dma.row == h.row) ? dma.data[h.bank] : h.old;
+      h.sc.data = this->sc_bytes(h.lr.byteen, h.old, dma_word);
+      h.sc.tag = this->next_tag();
+    }
+
+    std::vector<uint32_t> rows;
+    auto add_row = [&](uint32_t r) {
+      if (std::find(rows.begin(), rows.end(), r) == rows.end()) {
+        rows.push_back(r);
+      }
+    };
+    for (const LrscHart& h : harts) {
+      add_row(h.row);
+    }
+    add_row(dma.row);
+    auto row_idx = [&](uint32_t r) {
+      return static_cast<size_t>(std::find(rows.begin(), rows.end(), r) - rows.begin());
+    };
+    std::vector<Row> before(rows.size());
+    for (size_t i = 0; i < rows.size(); ++i) {
+      for (uint32_t b = 0; b < NUM_BANKS; ++b) {
+        before[i][b] = this->gold(rows[i], b);
+      }
+    }
+
+    // Timed window; cycles are relative to the cycle the LR is presented.
+    // The re-reserve DMA follows the first LR's response instead of j.
+    const uint64_t cyc_base = dut_.cycle();
+    const int rel0 = std::min(j, 0);
+    std::optional<int> dma_at;
+    if (mode != L_RERESERVE) {
+      dma_at = j;
+    }
+    bool dma_sent = false;
+    int d_acc = 0, d_rsp = 0;
+    bool d_accepted = false, d_responded = false;
+    Row d_data{};
+    std::vector<std::string> common;
+    auto stage_req = [](LrscHart& h) -> LsuReq& {
+      return (h.stage == 0) ? h.lr : (h.stage == 1) ? h.lr2 : h.sc;
+    };
+    bool done = false;
+    for (int rel = rel0; rel < rel0 + 128 && !done; ++rel) {
+      if (!dma_sent && dma_at && rel >= *dma_at) {
+        dut_.dma = dma;
+        dma_sent = true;
+      }
+      for (LrscHart& h : harts) {
+        if (h.stage < 3 && h.next_at >= 0 && rel >= h.next_at) {
+          dut_.lane[h.lane] = stage_req(h);
+          h.next_at = -1;
+        }
+      }
+      Events ev = dut_.clock();
+      if (ev.dma_acc) {
+        d_acc = rel;
+        d_accepted = true;
+      }
+      if (ev.dma_rsp) {
+        if (dma.rw || d_responded || ev.dma_rsp_tag != dma.tag) {
+          common.push_back(strf("unexpected DMA response at %+d tag=0x%x", rel, ev.dma_rsp_tag));
+        } else {
+          d_rsp = rel;
+          d_responded = true;
+          d_data = ev.dma_rsp_data;
+        }
+      }
+      for (LrscHart& h : harts) {
+        if (ev.lsu_acc[h.lane] && h.stage < 3) {
+          ((h.stage == 0) ? h.lr_acc : (h.stage == 1) ? h.lr2_acc : h.sc_acc) = rel;
+        }
+      }
+      for (uint32_t l = 0; l < NUM_REQS; ++l) {
+        if (!ev.lsu_rsp[l]) {
+          continue;
+        }
+        LrscHart* h = nullptr;
+        for (LrscHart& x : harts) {
+          if (x.lane == l) {
+            h = &x;
+          }
+        }
+        if (!h || h->stage > 2 || ev.rsp_tag[l] != stage_req(*h).tag) {
+          common.push_back(strf("stray LSU response at %+d: lane=%u tag=0x%x", rel, l, ev.rsp_tag[l]));
+          continue;
+        }
+        if (h->stage == 0) {
+          h->lr_rsp = rel;
+          h->lr_ret = ev.rsp_data[l];
+          if (h->rereserve) {
+            h->stage = 1;
+            h->wait_dma = true;
+            dma_at = rel + 1;
+          } else {
+            h->stage = 2;
+            h->next_at = rel + gap;
+          }
+        } else if (h->stage == 1) {
+          h->lr2_rsp = rel;
+          h->lr2_ret = ev.rsp_data[l];
+          h->stage = 2;
+          h->next_at = rel + gap;
+        } else {
+          h->sc_rsp = rel;
+          h->sc_ret = ev.rsp_data[l];
+          h->stage = 3;
+        }
+      }
+      for (LrscHart& h : harts) {
+        if (h.wait_dma && d_accepted) {
+          h.wait_dma = false;
+          h.next_at = rel + 1;
+        }
+      }
+      done = d_accepted && (dma.rw || d_responded);
+      for (const LrscHart& h : harts) {
+        done = done && (h.stage == 3);
+      }
+    }
+    if (!done) {
+      common.push_back("handshakes did not complete within 128 cycles (deadlock?)");
+      for (const LrscHart& h : harts) {
+        dut_.lane[h.lane].reset();
+      }
+      dut_.dma.reset();
+    }
+    this->idle(4);
+
+    std::vector<Row> after;
+    for (uint32_t r : rows) {
+      after.push_back(this->dma_read(r));
+    }
+
+    std::vector<Row> exp = before;
+    if (dma.rw) {
+      Row& er = exp[row_idx(dma.row)];
+      for (uint32_t b = 0; b < NUM_BANKS; ++b) {
+        er[b] = dma_merge(dma, b, er[b]);
+      }
+    }
+
+    std::array<LrscResult, 2> res;
+    for (size_t k = 0; k < harts.size(); ++k) {
+      const LrscHart& h = harts[k];
+      LrscResult& r = res[k];
+      const char* who = two ? ((k == 0) ? "A: " : "B: ") : "";
+      const int t_lr1 = h.lr_rsp - rsp_lat_;
+      const int t_lr2 = h.lr2_rsp - rsp_lat_;
+      const int t_sc  = h.sc_rsp - rsp_lat_;
+      const int t_lr  = h.rereserve ? t_lr2 : t_lr1;
+      const int d = d_acc;
+      r.pos = (d < t_lr) ? P_PRE : (d <= t_lr + 2) ? P_AT_LR : (d < t_sc) ? P_MID : (d <= t_sc + 2) ? P_AT_SC : P_POST;
+      r.port_between = (r.pos == P_MID) && d > (h.rereserve ? h.lr2_rsp : h.lr_rsp) && d < h.sc_acc;
+      if (!done) {
+        r.errs.push_back(strf("%sincomplete window", who));
+        continue;
+      }
+      const bool touches = !dma.rw || dma.be[h.bank] != 0;
+      const bool writes = dma.rw && dma.row == h.row && dma.be[h.bank] != 0;
+      const bool covers = writes && (dma.be[h.bank] & h.lr.byteen) != 0;
+      auto D = [&](uint64_t x) { return writes ? dma_merge(dma, h.bank, x) : x; };
+      auto S = [&](uint64_t x) { return amo_new_word(h.sc, x); };
+
+      // A DMA beat must never be accepted on a bank while an atomic owns it.
+      struct Atomic { const char* name; int acc; int t; };
+      std::vector<Atomic> atomics{{"LR", h.lr_acc, t_lr1}};
+      if (h.rereserve) {
+        atomics.push_back({"second LR", h.lr2_acc, t_lr2});
+      }
+      atomics.push_back({"SC", h.sc_acc, t_sc});
+      bool a1 = false;
+      for (const Atomic& at : atomics) {
+        if (at.t < at.acc + bank_lat_) {
+          r.errs.push_back(strf("%s%s responded at %+d, too early for a request accepted at %+d",
+                                who, at.name, at.t + rsp_lat_, at.acc));
+          a1 = true;
+        }
+        if (touches && d >= at.t && d <= at.t + 2) {
+          r.errs.push_back(strf("%sDMA %s accepted at %+d while the %s owned bank %u (%+d..%+d)",
+                                who, dma.rw ? "write" : "read", d, at.name, h.bank, at.t, at.t + 2));
+          a1 = true;
+        }
+      }
+      if (h.rereserve && !(d > t_lr1 + 2 && d < t_lr2)) {
+        r.errs.push_back(strf("%sDMA at %+d is not between the first LR (bank %+d) and the second (bank %+d)",
+                              who, d, t_lr1, t_lr2));
+      }
+
+      const uint64_t ok_word = sc_rsp_word(h.sc, false);
+      const uint64_t fail_word = sc_rsp_word(h.sc, true);
+      r.sc_ok = (h.sc_ret == ok_word);
+      if (!r.sc_ok && h.sc_ret != fail_word) {
+        r.errs.push_back(strf("%sSC returned %s, expected %s (success) or %s (failure)", who,
+                              hex(h.sc_ret).c_str(), hex(ok_word).c_str(), hex(fail_word).c_str()));
+      }
+      uint64_t fin = h.old;
+      if (writes && d < t_sc) {
+        fin = D(fin);
+      }
+      if (r.sc_ok) {
+        fin = S(fin);
+      }
+      if (writes && d > t_sc + 2) {
+        fin = D(fin);
+      }
+      exp[row_idx(h.row)][h.bank] = fin;
+      if (a1) {
+        continue;
+      }
+
+      if (h.rereserve && h.lr_ret != h.old) {
+        r.errs.push_back(strf("%sfirst LR returned %s, expected %s", who, hex(h.lr_ret).c_str(), hex(h.old).c_str()));
+      }
+      const uint64_t lr_exp = (writes && d < t_lr) ? D(h.old) : h.old;
+      const uint64_t lr_got = h.rereserve ? h.lr2_ret : h.lr_ret;
+      if (lr_got != lr_exp) {
+        r.errs.push_back(strf("%s%s returned %s, expected %s", who, h.rereserve ? "second LR" : "LR",
+                              hex(lr_got).c_str(), hex(lr_exp).c_str()));
+      }
+
+      const bool between = (r.pos == P_MID);
+      const uint64_t got_w = after[row_idx(h.row)][h.bank];
+      if (covers && between && r.sc_ok) {
+        r.errs.push_back(strf("%sSC succeeded although a DMA write to its reserved bytes (byteen 0x%x) was accepted at %+d, "
+                              "after the LR (bank %+d) and before the SC (bank %+d); word is %s, the DMA data alone is %s%s",
+                              who, dma.be[h.bank] & h.lr.byteen, d, t_lr, t_sc, hex(got_w).c_str(),
+                              hex(D(h.old)).c_str(), (got_w == S(D(h.old))) ? " -> the SC overwrote the DMA write" : ""));
+      } else if (!(writes && between) && !r.sc_ok) {
+        r.errs.push_back(strf("%sSC failed although no DMA write to its word landed between the LR (bank %+d) and the SC "
+                              "(bank %+d): DMA %s row 0x%x byteen 0x%x accepted at %+d -> reservation lost to an access "
+                              "that does not cover it",
+                              who, t_lr, t_sc, dma.rw ? "write" : "read", dma.row, dma.rw ? dma.be[h.bank] : 0, d));
+      }
+
+      if (!dma.rw && dma.row == h.row) {
+        const uint64_t seen = (r.sc_ok && d > t_sc + 2) ? S(h.old) : h.old;
+        if (d_data[h.bank] != seen) {
+          r.errs.push_back(strf("%sDMA read of the reserved word returned %s, expected %s", who,
+                                hex(d_data[h.bank]).c_str(), hex(seen).c_str()));
+        }
+      }
+    }
+
+    if (!dma.rw && done) {
+      for (uint32_t b = 0; b < NUM_BANKS; ++b) {
+        bool reserved = false;
+        for (const LrscHart& h : harts) {
+          reserved |= (h.row == dma.row && h.bank == b);
+        }
+        uint64_t exp_rd = before[row_idx(dma.row)][b];
+        if (!reserved && d_data[b] != exp_rd) {
+          common.push_back(strf("DMA read (row 0x%x, bank %u): expected %s, got %s",
+                                dma.row, b, hex(exp_rd).c_str(), hex(d_data[b]).c_str()));
+        }
+      }
+    }
+
+    for (size_t i = 0; i < rows.size(); ++i) {
+      for (uint32_t b = 0; b < NUM_BANKS; ++b) {
+        if (after[i][b] == exp[i][b]) {
+          continue;
+        }
+        std::string e = strf("word (row 0x%x, bank %u): expected %s, got %s",
+                             rows[i], b, hex(exp[i][b]).c_str(), hex(after[i][b]).c_str());
+        bool owned = false;
+        for (size_t k = 0; k < harts.size(); ++k) {
+          if (harts[k].row == rows[i] && harts[k].bank == b) {
+            res[k].errs.push_back(e);
+            owned = true;
+          }
+        }
+        if (!owned) {
+          common.push_back(e);
+        }
+      }
+    }
+
+    for (size_t i = 0; i < rows.size(); ++i) {
+      for (uint32_t b = 0; b < NUM_BANKS; ++b) {
+        this->gold(rows[i], b) = after[i][b];
+      }
+    }
+
+    bool run_ok = true;
+    bool report = opts_.verbose;
+    for (size_t k = 0; k < harts.size(); ++k) {
+      const int m = (k == 0) ? mode : L_TWO_B;
+      const LrscResult& r = res[k];
+      LrscCell& c = cells[m][r.pos];
+      const bool failed = !r.errs.empty() || !common.empty();
+      ++c.runs;
+      if (r.pos == P_MID && r.sc_ok) {
+        ++c.sc_ok;
+      }
+      if (r.port_between) {
+        ++c.port_runs;
+        c.port_fails += failed;
+      }
+      if (failed) {
+        ++c.fails;
+        run_ok = false;
+        uint32_t& nrep = reported[m][r.pos];
+        if (nrep < opts_.max_report) {
+          ++nrep;
+          report = true;
+        }
+      }
+    }
+    if (!run_ok) {
+      ++failures_;
+    }
+    if (!report) {
+      return;
+    }
+
+    std::string msg = strf("%s lr/sc %s @%s lane=%u bank=%u width=%s gap=%d j=%+d row=0x%x",
+                           run_ok ? "ok  " : "FAIL", lrsc_name(mode), pos_name(res[0].pos), lane, bank,
+                           width_name(width), gap, j, row_w);
+    if (two) {
+      msg += strf(" | B @%s lane=%u bank=%u width=%s row=0x%x", pos_name(res[1].pos), harts[1].lane,
+                  harts[1].bank, width_name(harts[1].width), harts[1].row);
+    }
+    msg += strf(" [cycle %" PRIu64 "]\n", cyc_base);
+    for (size_t k = 0; k < harts.size(); ++k) {
+      const LrscHart& h = harts[k];
+      msg += strf("    timing %s(LR presented = +0): LR acc %+d rsp %+d (bank %+d)", two ? ((k == 0) ? "A " : "B ") : "",
+                  h.lr_acc, h.lr_rsp, h.lr_rsp - rsp_lat_);
+      if (h.rereserve) {
+        msg += strf("; second LR acc %+d rsp %+d (bank %+d)", h.lr2_acc, h.lr2_rsp, h.lr2_rsp - rsp_lat_);
+      }
+      msg += strf("; SC acc %+d rsp %+d (bank %+d)\n", h.sc_acc, h.sc_rsp, h.sc_rsp - rsp_lat_);
+    }
+    msg += strf("    DMA %s row 0x%x", dma.rw ? "write" : "read", dma.row);
+    if (dma.rw) {
+      msg += " byteen";
+      for (uint32_t b = 0; b < NUM_BANKS; ++b) {
+        msg += strf(" %0*x", static_cast<int>((WORD_SIZE + 3) / 4), dma.be[b]);
+      }
+    }
+    msg += d_accepted ? strf(": accepted %+d", d_acc) : std::string(": not accepted");
+    if (!dma.rw) {
+      msg += d_responded ? strf(", rsp %+d", d_rsp) : std::string(", no response");
+    }
+    msg += "\n";
+    for (const std::string& e : common) {
+      msg += "    " + e + "\n";
+    }
+    for (size_t k = 0; k < harts.size(); ++k) {
+      for (const std::string& e : res[k].errs) {
+        msg += "    " + e + "\n";
+      }
+    }
+    std::printf("%s", msg.c_str());
+  }
+
+  ///////////////////////////////////////////////////////////////////////////
+  // Randomized stress. Every word is owned by exactly one agent so each
+  // response has a single correct value no matter how the bank arbitration
+  // interleaves: DMA owns half of each row, every lane owns a private set
+  // of words, and a few shared counters see only AMOADD +1 from all lanes.
+
+  struct Pending {
+    uint32_t lane;
+    int      counter; // shared counter index, or -1
+    uint64_t expect;
+    uint64_t issued;
+    std::string desc;
+  };
+
+  struct DmaPending {
+    uint32_t tag;
+    uint32_t row;
+    Row      expect;
+    uint64_t issued;
+  };
+
+  // A DMA write has no response to wait on, so it stalls only behind an
+  // atomic that already owns one of its banks, for at most that atomic's
+  // capture and write-back cycles.
+  static constexpr uint32_t DMA_WR_STALL_BOUND = 2;
+
+  static bool dma_owned(uint32_t row, uint32_t bank) {
+    return ((row + bank) & 1) == 0;
+  }
+
+  void stress(uint32_t seed) {
+    std::mt19937_64 rng(seed);
+    auto rnd = [&](uint32_t n) { return static_cast<uint32_t>(rng() % n); };
+    auto chance = [&](uint32_t pct) { return rnd(100) < pct; };
+
+    const uint32_t rows = std::min<uint32_t>(NUM_ROWS, 16);
+    std::vector<uint32_t> shared;
+    std::array<std::vector<uint32_t>, NUM_REQS> priv;
+    uint32_t next_owner = 0;
+    for (uint32_t row = 0; row < rows; ++row) {
+      for (uint32_t b = 0; b < NUM_BANKS; ++b) {
+        if (dma_owned(row, b)) {
+          continue;
+        }
+        uint32_t w = row * NUM_BANKS + b;
+        if (row < 2 && AMO_EN) {
+          shared.push_back(w);
+        } else {
+          priv[next_owner++ % NUM_REQS].push_back(w);
+        }
+      }
+    }
+    std::vector<uint64_t> sh_init(shared.size());
+    std::vector<uint32_t> sh_count(shared.size(), 0);
+    std::vector<std::vector<uint64_t>> sh_olds(shared.size());
+    for (size_t j = 0; j < shared.size(); ++j) {
+      sh_init[j] = gold_[shared[j]];
+    }
+
+    std::unordered_map<uint32_t, Pending> pend;
+    std::deque<DmaPending> dma_pend;
+    std::array<uint32_t, NUM_REQS> outstanding{};
+    uint32_t errors = 0;
+    uint64_t n_amo = 0, n_shared = 0, n_ld = 0, n_st = 0, n_dma_rd = 0, n_dma_wr = 0;
+    uint64_t dma_stalls = 0, dma_wr_stalls = 0;
+    uint32_t wr_stall_run = 0, wr_stall_max = 0;
+    const uint64_t start = dut_.cycle();
+    uint64_t last_progress = start;
+
+    auto report = [&](const std::string& m) {
+      ++errors;
+      if (errors <= 10) {
+        this->fail(strf("FAIL stress seed=%u [cycle %" PRIu64 "] %s", seed, dut_.cycle(), m.c_str()));
+      } else {
+        ++failures_;
+      }
+    };
+
+    static const uint8_t priv_ops[] = {AMO_ADD, AMO_SWAP, AMO_XOR, AMO_OR, AMO_AND, AMO_MIN, AMO_MAX, AMO_CAS};
+    const uint32_t num_priv_ops = CAS_EN ? 8 : 7;
+
+    auto gen_lane = [&](uint32_t l) {
+      if (priv[l].empty() && shared.empty()) {
+        return;
+      }
+      LsuReq r;
+      r.tag = this->next_tag();
+      Pending p{l, -1, 0, dut_.cycle(), ""};
+      uint32_t kind = rnd(100);
+      if (AMO_EN && !shared.empty() && (kind < 25 || priv[l].empty())) {
+        uint32_t j = rnd(static_cast<uint32_t>(shared.size()));
+        uint32_t w = shared[j];
+        r.amo = true;
+        r.op = AMO_ADD;
+        r.byteen = FULL_BE;
+        r.addr = word_addr(w / NUM_BANKS, w % NUM_BANKS);
+        r.data = 1;
+        p.counter = static_cast<int>(j);
+        p.desc = strf("AMOADD +1 shared counter %u (row 0x%x, bank %u)", j, w / NUM_BANKS, w % NUM_BANKS);
+        ++sh_count[j];
+        ++n_shared;
+      } else {
+        uint32_t w = priv[l][rnd(static_cast<uint32_t>(priv[l].size()))];
+        uint64_t& g = gold_[w];
+        r.addr = word_addr(w / NUM_BANKS, w % NUM_BANKS);
+        if (AMO_EN && kind < 65) {
+          int width = static_cast<int>(rnd(NUM_WIDTHS));
+          r.amo = true;
+          r.op = priv_ops[rnd(num_priv_ops)];
+          r.uns = (r.op == AMO_MIN || r.op == AMO_MAX) && chance(50);
+          r.byteen = this->lane_byteen(width);
+          r.data = lane_position(width, rng());
+          if (r.op == AMO_CAS) {
+            uint64_t cur = (XLEN == 64 && width == W_HI) ? (g >> 32) : g;
+            if (XLEN == 32 || width != W_D) {
+              cur &= MASK32;
+            }
+            r.cmp = chance(50) ? cur : (rng() & WORD_MASK);
+          }
+          p.expect = g;
+          p.desc = strf("%s.%s private (row 0x%x, bank %u)", amo_name(r.op, r.uns), width_name(width),
+                        w / NUM_BANKS, w % NUM_BANKS);
+          g = amo_new_word(r, g);
+          ++n_amo;
+        } else if (kind < 82) {
+          r.byteen = FULL_BE;
+          p.expect = g;
+          p.desc = strf("load private (row 0x%x, bank %u)", w / NUM_BANKS, w % NUM_BANKS);
+          ++n_ld;
+        } else {
+          r.rw = true;
+          r.byteen = 1 + rnd(FULL_BE);
+          r.data = rng() & WORD_MASK;
+          g = merge(g, r.data, r.byteen);
+          ++n_st;
+        }
+      }
+      if (!r.rw) {
+        pend[r.tag] = p;
+        ++outstanding[l];
+      }
+      dut_.lane[l] = r;
+    };
+
+    auto gen_dma = [&]() {
+      uint32_t row = rnd(rows);
+      DmaReq d;
+      d.row = row;
+      d.tag = this->next_dma_tag();
+      d.rw = chance(50);
+      if (d.rw) {
+        bool any = false;
+        for (uint32_t b = 0; b < NUM_BANKS; ++b) {
+          d.data[b] = rng() & WORD_MASK;
+          d.be[b] = (dma_owned(row, b) && chance(60)) ? rnd(FULL_BE + 1) : 0;
+          any |= (d.be[b] != 0);
+        }
+        if (!any) {
+          uint32_t b = (row & 1) % NUM_BANKS;
+          if (!dma_owned(row, b)) {
+            return;
+          }
+          d.be[b] = FULL_BE;
+        }
+        for (uint32_t b = 0; b < NUM_BANKS; ++b) {
+          this->gold(row, b) = dma_merge(d, b, this->gold(row, b));
+        }
+        ++n_dma_wr;
+      } else {
+        DmaPending dp{d.tag, row, {}, dut_.cycle()};
+        for (uint32_t b = 0; b < NUM_BANKS; ++b) {
+          dp.expect[b] = this->gold(row, b);
+        }
+        dma_pend.push_back(dp);
+        ++n_dma_rd;
+      }
+      dut_.dma = d;
+    };
+
+    auto busy = [&]() {
+      if (!pend.empty() || !dma_pend.empty() || dut_.dma) {
+        return true;
+      }
+      for (uint32_t l = 0; l < NUM_REQS; ++l) {
+        if (dut_.lane[l]) {
+          return true;
+        }
+      }
+      return false;
+    };
+
+    bool draining = false;
+    while (true) {
+      uint64_t now = dut_.cycle();
+      if (!draining && now - start >= opts_.stress_cycles) {
+        draining = true;
+      }
+      if (draining && !busy()) {
+        break;
+      }
+      if (now - last_progress > 2000) {
+        std::string st;
+        for (uint32_t l = 0; l < NUM_REQS; ++l) {
+          st += strf(" lane%u{valid=%d out=%u}", l, dut_.lane[l].has_value(), outstanding[l]);
+        }
+        report(strf("no progress for 2000 cycles (deadlock): dma valid=%d, dma reads pending=%zu,%s",
+                    dut_.dma.has_value(), dma_pend.size(), st.c_str()));
+        dut_.dma.reset();
+        for (uint32_t l = 0; l < NUM_REQS; ++l) {
+          dut_.lane[l].reset();
+        }
+        break;
+      }
+      if (!draining) {
+        for (uint32_t l = 0; l < NUM_REQS; ++l) {
+          if (!dut_.lane[l] && outstanding[l] < 4 && chance(60)) {
+            gen_lane(l);
+          }
+        }
+        if (!dut_.dma && chance(45)) {
+          gen_dma();
+        }
+      }
+      for (uint32_t l = 0; l < NUM_REQS; ++l) {
+        dut_.rsp_ready[l] = chance(80);
+      }
+      dut_.dma_rsp_ready = chance(70);
+
+      const bool dma_is_wr = dut_.dma && dut_.dma->rw;
+      Events ev = dut_.clock();
+      if (ev.any()) {
+        last_progress = dut_.cycle();
+      }
+      dma_stalls += ev.dma_stall;
+      dma_wr_stalls += ev.dma_stall && dma_is_wr;
+      wr_stall_run = (ev.dma_stall && dma_is_wr) ? wr_stall_run + 1 : 0;
+      wr_stall_max = std::max(wr_stall_max, wr_stall_run);
+      if (wr_stall_run == DMA_WR_STALL_BOUND + 1) {
+        report(strf("DMA write to row 0x%x stalled more than %u cycles: a pending DMA must block new atomics "
+                    "on its banks so the in-flight ones drain", dut_.dma->row, DMA_WR_STALL_BOUND));
+      }
+      for (uint32_t l = 0; l < NUM_REQS; ++l) {
+        if (!ev.lsu_rsp[l]) {
+          continue;
+        }
+        auto it = pend.find(ev.rsp_tag[l]);
+        if (it == pend.end()) {
+          report(strf("lane %u: response with unknown tag 0x%x", l, ev.rsp_tag[l]));
+          continue;
+        }
+        Pending p = it->second;
+        pend.erase(it);
+        --outstanding[p.lane];
+        if (p.lane != l) {
+          report(strf("tag 0x%x issued on lane %u answered on lane %u", ev.rsp_tag[l], p.lane, l));
+        }
+        if (p.counter >= 0) {
+          sh_olds[p.counter].push_back(ev.rsp_data[l]);
+        } else if (ev.rsp_data[l] != p.expect) {
+          report(strf("lane %u %s issued at cycle %" PRIu64 ": expected %s, got %s",
+                      l, p.desc.c_str(), p.issued, hex(p.expect).c_str(), hex(ev.rsp_data[l]).c_str()));
+        }
+      }
+      if (ev.dma_rsp) {
+        if (dma_pend.empty()) {
+          report(strf("unexpected DMA response tag 0x%x", ev.dma_rsp_tag));
+        } else {
+          DmaPending dp = dma_pend.front();
+          dma_pend.pop_front();
+          if (ev.dma_rsp_tag != dp.tag) {
+            report(strf("DMA response tag 0x%x, expected 0x%x (out of order)", ev.dma_rsp_tag, dp.tag));
+          }
+          for (uint32_t b = 0; b < NUM_BANKS; ++b) {
+            if (dma_owned(dp.row, b) && ev.dma_rsp_data[b] != dp.expect[b]) {
+              report(strf("DMA read (row 0x%x, bank %u) issued at cycle %" PRIu64 ": expected %s, got %s",
+                          dp.row, b, dp.issued, hex(dp.expect[b]).c_str(), hex(ev.dma_rsp_data[b]).c_str()));
+            }
+          }
+        }
+      }
+    }
+    dut_.rsp_ready.fill(true);
+    dut_.dma_rsp_ready = true;
+    this->idle(4);
+
+    for (size_t j = 0; j < shared.size(); ++j) {
+      uint64_t mask = WORD_MASK;
+      std::vector<uint64_t> offs;
+      for (uint64_t v : sh_olds[j]) {
+        offs.push_back((v - sh_init[j]) & mask);
+      }
+      std::sort(offs.begin(), offs.end());
+      for (size_t i = 0; i < offs.size(); ++i) {
+        if (offs[i] != i) {
+          report(strf("shared counter %zu (row 0x%x, bank %u): AMOADD returned old value init+%" PRIu64
+                      " where init+%zu was due; %u increments issued, %zu answered",
+                      j, shared[j] / NUM_BANKS, shared[j] % NUM_BANKS, offs[i], i, sh_count[j], offs.size()));
+          break;
+        }
+      }
+      gold_[shared[j]] = (sh_init[j] + sh_count[j]) & mask;
+    }
+
+    std::printf("stress seed=%u: %" PRIu64 " cycles, lsu %" PRIu64 " amo + %" PRIu64 " shared-amo + %" PRIu64
+                " ld + %" PRIu64 " st, dma %" PRIu64 " rd + %" PRIu64 " wr, dma stall cycles %" PRIu64
+                " (writes %" PRIu64 ", longest %u), %u error(s)\n",
+                seed, dut_.cycle() - start, n_amo, n_shared, n_ld, n_st, n_dma_rd, n_dma_wr,
+                dma_stalls, dma_wr_stalls, wr_stall_max, errors);
+  }
+
+  void final_check() {
+    std::vector<uint32_t> rows(NUM_ROWS);
+    for (uint32_t r = 0; r < NUM_ROWS; ++r) {
+      rows[r] = r;
+    }
+    uint32_t before = failures_;
+    this->check_rows("final memory", rows);
+    std::printf("final memory check: %u mismatching word(s) over %u rows\n", failures_ - before, NUM_ROWS);
+  }
+
+  Options opts_;
+  std::mt19937_64 rng_;
+  std::vector<uint64_t> gold_;
+  Dut dut_;
+  int bank_lat_ = 1;
+  int rsp_lat_ = 2;
+  uint32_t tag_ = 0;
+  uint32_t dma_tag_ = 0;
+  uint32_t failures_ = 0;
+};
+
+static void usage(const char* prog) {
+  std::printf("usage: %s [--seed=N] [--stress-seeds=N] [--stress-cycles=N] [--max-report=N] [--verbose]\n", prog);
+}
+
+int main(int argc, char** argv) {
   Verilated::commandArgs(argc, argv);
 
-  return 0;
+  Options opts;
+  for (int i = 1; i < argc; ++i) {
+    const char* a = argv[i];
+    if (a[0] == '+') {
+      continue;
+    }
+    if (std::strncmp(a, "--seed=", 7) == 0) {
+      opts.seed = static_cast<uint32_t>(std::strtoul(a + 7, nullptr, 0));
+    } else if (std::strncmp(a, "--stress-seeds=", 15) == 0) {
+      opts.stress_seeds = static_cast<uint32_t>(std::strtoul(a + 15, nullptr, 0));
+    } else if (std::strncmp(a, "--stress-cycles=", 16) == 0) {
+      opts.stress_cycles = static_cast<uint32_t>(std::strtoul(a + 16, nullptr, 0));
+    } else if (std::strncmp(a, "--max-report=", 13) == 0) {
+      opts.max_report = static_cast<uint32_t>(std::strtoul(a + 13, nullptr, 0));
+    } else if (std::strcmp(a, "--verbose") == 0) {
+      opts.verbose = true;
+    } else {
+      usage(argv[0]);
+      return 2;
+    }
+  }
+
+  Testbench tb(opts);
+  return tb.run();
 }

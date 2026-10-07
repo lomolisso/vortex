@@ -51,6 +51,9 @@ module VX_lsu_slice import VX_gpu_pkg::*; #(
     // tag_width = header + op_type + align + pkt_addr + fence
     localparam TAG_WIDTH = $bits(lsu_header_t) + INST_LSU_BITS + (NUM_LANES * REQ_ASHIFT) + LSUQ_SIZEW + 1;
     `STATIC_ASSERT (TAG_WIDTH == LSU_CLIENT_TAG_WIDTH, ("LSU client tag width mismatch — pkg/slice out of sync"))
+`ifdef VX_CFG_EXT_A_ENABLE
+    `STATIC_ASSERT ((CORE_ID >> (HART_ID_BITS - NW_BITS - NT_BITS)) == 0, ("global core id does not fit the hart id core field"))
+`endif
 
     VX_result_if #(
         .data_t (lsu_result_t)
@@ -138,10 +141,14 @@ module VX_lsu_slice import VX_gpu_pkg::*; #(
         assign lane_amo.amo_cmp      = execute_if.data.rs3_data[i];
     `endif
         // make_hart_id(cid, wid, tid) — packed concatenation, low bits = tid.
+        // Lane i of packet pid carries warp thread pid * NUM_LANES + i.
+        wire [HART_ID_WIDTH-1:0] lane_tid = (PID_BITS != 0)
+            ? HART_ID_WIDTH'(execute_if.data.header.pid * NUM_LANES + i)
+            : HART_ID_WIDTH'(i);
         assign lane_amo.hart_id      = HART_ID_WIDTH'(
             (HART_ID_WIDTH'(CORE_ID) << (NW_BITS + NT_BITS))
           | (HART_ID_WIDTH'(execute_if.data.header.wid) << NT_BITS)
-          |  HART_ID_WIDTH'(i)
+          |  lane_tid
         );
         assign mem_req_attr_struct[i].amo = lane_amo;
     `else

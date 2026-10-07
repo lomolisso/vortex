@@ -18,3 +18,6 @@ hw/syn/libs/asap7/verilog/
 hw/syn/libs/asap7/metadata/
 hw/syn/libs/asap7/.installed_*
 hw/syn/libs/asap7/install.sh
+
+
+changelog/

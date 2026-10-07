@@ -43,9 +43,11 @@ owns the word:
 5. The **response** returns the word as it was before the operation (or the
    `SC` outcome) and the LSU writes it to `rd`.
 
-The defining choice is that **global atomics resolve at the LLC**. Every cache
-level above it is required to be write-through (§9), so the LLC observes every
-store to a line and can keep `LR`/`SC` reservations honest.
+The defining choice is that **global atomics resolve at the LLC**. The device
+must build exactly one LLC instance, so every hart's atomics on a word meet at
+one point, and every cache level above it must be write-through, so the LLC
+observes every store to a line and can keep `LR`/`SC` reservations honest
+(§9).
 
 ---
 
@@ -59,7 +61,7 @@ store to a line and can keep `LR`/`SC` reservations honest.
 |---|---|
 | `funct3` | width — `010` = `.W` (32-bit), `011` = `.D` (64-bit) |
 | `funct5` | operation (table below) |
-| `aq`, `rl` | captured, carry no behavior — commit at a single serialization point makes the ordering hints redundant |
+| `aq`, `rl` | captured, carry no behavior. An atomic is ordered against the other accesses to its own word (§6.5); the order against the hart's accesses to *other* addresses that the bits ask for is not enforced, by the LSU or by the cache — a `fence` gives it ([LSU design §3.3](lsu_pipeline_design.md#33-fence-ordering)) |
 | `rs1` | address (no immediate offset) |
 | `rs2` | operand; not read by `LR` |
 | `rd` | destination; for `AMOCAS` also the comparand |
@@ -96,7 +98,7 @@ per lane into the lane's memory attribute
 
 | field | width | meaning |
 |---|---|---|
-| `hart_id` | `NC_BITS + NW_BITS + NT_BITS` | `{core, warp, thread}` — the reservation owner |
+| `hart_id` | `clog2(NUM_TOTAL_CORES) + NW_BITS + NT_BITS`, `NUM_TOTAL_CORES` = the instantiated cores | `{global core, warp, thread}` — the reservation owner |
 | `amo_cmp` | `XLEN` | compare-and-swap comparand; present only with Zacas |
 | `amo_unsigned` | 1 | unsigned `MIN`/`MAX` |
 | `amo_op` | 4 | `amo_op_e` |
@@ -110,6 +112,19 @@ Load-bearing properties:
   free, and gives every atomic the response slot it needs to reach `rd`.
 - **Width is not carried.** The commit point derives it from the request's
   byte-enable popcount — four bytes is `.W`, eight is `.D`.
+- **The thread field is the warp thread, not the lane.** With fewer LSU lanes
+  than threads, a warp's request leaves in packets, and lane `i` of packet
+  `pid` carries thread `pid * NUM_LANES + i` — the id SimX's `make_hart_id`
+  uses. A lane index would give threads a packet apart one owner, and either
+  could store-conditional on the other's reservation.
+- **The core field is the global core id, not the core's index in its
+  cluster.** An L3 last-level cache holds reservations from every cluster,
+  and SimX's `make_hart_id` takes the global id too. A per-cluster index would
+  give core `c` of every cluster one owner, and either could store-conditional
+  on the other's reservation. The field counts the instantiated cores,
+  `NUM_CLUSTERS × NUM_SOCKETS × SOCKET_SIZE`, not `NUM_CLUSTERS × NUM_CORES`:
+  with `SOCKET_SIZE > NUM_CORES` every cluster still builds a full socket. A
+  `STATIC_ASSERT` in `VX_lsu_slice` checks that its core id fits the field.
 - **The operand rides the data word**, lane-positioned exactly like a plain
   store's data. Compare-and-swap needs a third value and the data word is
   already taken by the swap value, which is why the comparand travels in the
@@ -196,7 +211,7 @@ carry 128 line addresses and a 128-way compare **per bank**.
 |---|---|---|
 | `res_reserve` | an `LR` commits | claim the station for `{hart, line}` unless refused (§5.3) |
 | `res_clear` | an `SC` commits, pass or fail | clear the station if this hart holds it |
-| `res_invalidate` | any store commits to the line | clear the station if it holds that line, whichever hart reserved it |
+| `res_invalidate` | any store commits to the line; in local memory, also a DMA write | clear the station if it holds that line, whichever hart reserved it |
 | `res_check` | combinational | `SC` succeeds iff the station holds `{this hart, this line}` |
 
 ### 5.3 The holder is protected
@@ -212,10 +227,45 @@ holder that never issues its `SC` would otherwise own the station forever.
 Each refused `LR` spends one **hold credit**; when the credit reaches zero the
 next foreign `LR` takes the station.
 
-| deployment | stations | `HOLD_CREDIT_BITS` | budget | sized for |
+The budget must outlast the foreign `LR`s that arrive between the holder's
+`LR` and its `SC`. In a constrained `LR`/`SC` loop a hart has at most one `LR`
+or `SC` in flight: the `SC` waits on the `LR`'s value, and the next `LR` waits
+on the `SC`'s outcome. A hart refused during a hold must finish its failing
+`SC` before it can `LR` again, while the holder's `SC` follows its own `LR` by
+one round trip. With `H` harts that can reach the bank,
+`HOLD_CREDIT_BITS >= clog2(H)` gives `2^HOLD_CREDIT_BITS - 1 >= H - 1`: one
+refused `LR` from every other hart. That sizing is empirical: it held in
+every configuration measured, single-issue cores and, in local memory, two
+LSU blocks per bank (`lmem-2blocks`, §10). The local-memory bank grants its
+LSU inputs round-robin
+([LSU design §5.2](lsu_pipeline_design.md#52-local-path)), so no LSU block
+can lock the holder's `SC` out of the bank. What stays unproven is the order
+the bound assumes: that the holder's `SC` reaches the bank before any refused
+hart has finished its failing `SC` and sent a second `LR`. Nothing ahead of
+the bank enforces it: neither the warp scheduler nor the LSU queues keep the
+holder's one round trip shorter than a refused hart's two, and a hart refused
+twice inside one hold spends the budget early.
+
+| deployment | stations | `HOLD_CREDIT_BITS` | harts `H` that reach the bank | default budget |
 |---|---|---|---|---|
-| cache LLC bank | `VX_CFG_AMO_RS_SIZE` | 6 | 63 refusals | an `LR`→`SC` spanning an L1-miss round trip |
-| local-memory bank | `min(VX_CFG_AMO_RS_SIZE, 4)` | 3 | 7 refusals | a round trip of a few cycles |
+| cache LLC bank | `VX_CFG_AMO_RS_SIZE` | `max(6, clog2(H))` | every hart in the device: instantiated cores × warps × threads | 63 refusals |
+| local-memory bank | `min(VX_CFG_AMO_RS_SIZE, 4)` | `max(3, clog2(H))` | the owning core's warps × threads | 15 refusals (4 warps × 4 threads) |
+
+A budget below `H - 1` lets the holder be displaced before its `SC` lands,
+and contended loops can starve. Every thread has its own hart id, so when an
+8-thread warp is split into LSU packets the holder's 7 warp siblings alone
+spend a 7-refusal budget.
+
+A cache bank does not know whether it is a socket's L1, a cluster's L2 or
+the L3, so the LLC sizes for the whole device. That count is exact: the A
+extension requires one LLC instance that every hart reaches (§9). The
+floors set the minimum for small configurations: 63 refusals in the LLC,
+where an `LR`→`SC` spans an L1-miss round trip, and 7 in local memory. The
+budget stays finite on purpose. Its lapse is what frees a station whose
+holder abandoned its attempt, or whose `SC` is held back behind other
+requests to the bank. A larger budget makes that slower: a lone contender
+needs `2^HOLD_CREDIT_BITS - 1` refused rounds to reclaim a station whose
+holder abandoned its attempt.
 
 ### 5.4 Why this is legal
 
@@ -223,9 +273,9 @@ RISC-V allows `SC` to fail for any reason, so capacity eviction, an index
 conflict between two lines, and a refused `LR` are all conforming. What the
 specification forbids is a spurious **success**, and every path that can
 write the line — an atomic's store, a plain store arriving write-through
-from above, the LLC's own write hit — drives `res_invalidate`. Forward
-progress is the system property the hold credit exists to preserve: one hart
-wins each round.
+from above, the LLC's own write hit, a DMA write into local memory — drives
+`res_invalidate`. Forward progress is the system property the hold credit
+exists to preserve: one hart wins each round.
 
 ---
 
@@ -257,7 +307,11 @@ offset. The requester extracts its sub-word by address, so no full-width
 shift round trip sits on the read-to-response path.
 
 A miss takes an MSHR entry like a load. The fill replays the atomic through
-the same stage, so miss and hit commit identically.
+the same stage, so miss and hit commit identically. So does an atomic that
+hits a line whose chain still holds an older entry for its word: the bank
+demotes it onto that chain like any other request
+([`cache_subsystem.md`](cache_subsystem.md) §4.5), and it commits at its
+replay.
 
 ### 6.2 The lane datapath
 
@@ -275,16 +329,25 @@ cross its lane.
 |---|---|---|
 | compute | one operation: aligned `old`, `rhs`, `cmp`, op, width, lane, offset | `VX_amo_alu`, then re-align to the lane — a full cycle, off the response path |
 | writeback queue | 2–4 entries, one per `{line, word, lane}` | queues the result; a result for a target already queued byte-merges into that entry |
-| settling entry | the drained head, for 2 cycles | covers the window until the array write lands |
+| settling entry | the drained head, until the writeback reaches the commit stage ([`PIPE_EX`](cache_subsystem.md#41-the-bank-pipeline) + 1 stages, held across stalls) | covers the window until the array write lands |
 
 The queue head drains as a **synthetic store** through the bank's
 core-request slot: `rw = 1`, `amo_valid = 0`, the lane's byte-enable. It
 takes the ordinary write path, so on a write-through LLC it also goes to
 memory, and on a write-back LLC it dirties the line.
 
-The queue depth is bounded by the distinct targets one instruction's requests
-can touch in a bank, which is the core-port fan-in — not the line width.
-Overflow is asserted.
+The queue is bounded at admission, not by its sizing. The head drains only
+through a free input slot, and replays and fills take that slot first, so a
+run of fills that each replay an atomic queues one result after another with
+no drain in between. An atomic is therefore admitted only while fewer than
+the queue depth of store-bearing atomics are in the bank and not yet
+committed, those waiting in the MSHR included (`req_input_defer`, §6.5). A
+core request enters only with the queue and the compute stage empty, so the
+results queued, computing and still to come never exceed the queue. Holding
+the pipe on a full queue instead would deadlock: the drain needs an unstalled
+input slot. The bound and the overflow are both asserted. The cost is that a
+bank has at most a queue's worth of store-bearing atomics outstanding,
+however large its MSHR.
 
 ### 6.4 Read forwarding
 
@@ -298,23 +361,53 @@ plain OR-tree rather than a newest-wins priority scan.
 The same network supplies the next atomic's old operand. And it works in the
 other direction: a younger plain store to queued or settling bytes
 supersedes them, clearing those bytes so neither the writeback nor the
-forward resurrects a stale value.
+forward resurrects a stale value. A head that drains in the cycle the store
+commits leaves with those bytes already cleared, and a head is not drained at
+all while a younger store to its word is still between lookup and commit
+(§6.5), so a queued result never lands over the store that superseded it.
+
+Only a replayed store supersedes anything. A core request is admitted while
+the engine is idle, so a store on its first pass finds nothing queued or
+settling — including a store the bank demotes onto a chain
+([`cache_subsystem.md`](cache_subsystem.md) §4.5), whose array write waits
+for its replay while older chained requests still read the word. The bank
+asserts that case.
 
 ### 6.5 Ordering controls
 
 | signal | condition | effect |
 |---|---|---|
 | `commit_busy` | from the lookup-stage prediction through compute and writeback | new core requests wait — atomic instructions commit one at a time |
-| `chain_stall` | an atomic is computing and the commit stage holds a request to the same line | the pipe stalls one cycle, so a chained replay reads the previous result |
-| `req_input_defer` | an atomic to the incoming request's line waits in the MSHR or is allocating | the request waits at the input |
+| `chain_stall` | an atomic is computing and the commit stage holds a request to the same line, or any store-bearing atomic | the pipe stalls one cycle, so a chained replay reads the previous result and the compute stage never holds two operations |
+| writeback guard | a younger write to the queue head's word is between lookup and commit | the head is not drained, so the result cannot land over that write |
+| settle hold | in a deep bank, the previous writeback is more than one stage from commit | the head is not drained: a single settling entry forwards the writeback in flight until it reaches the commit stage |
+| `req_input_defer` | an atomic to the incoming request's line waits in the MSHR or is allocating; or the request is an atomic and the writeback queue has no room for another result (§6.3) | the request waits at the input |
 
 `commit_busy` does not block replays: the MSHR streams same-line atomics that
-coalesced on a miss back to back, and `chain_stall` paces those instead. In a
-deep bank the lookup and commit stages are several cycles apart, so the
-lookup-stage prediction is carried across the gap to keep `commit_busy`
-continuous. `req_input_defer` consumes a **registered** MSHR probe, which
-keeps the MSHR's address compare off the request-ready path at the cost of
-deferring, at most, one cycle longer than strictly needed.
+coalesced on a miss back to back, and `chain_stall` paces those instead. It
+also holds a replayed store-bearing atomic of any other line, which reaches
+the commit stage without passing `commit_busy` and would otherwise overwrite
+the operation still in the compute stage. A failing `SC` is held with them —
+its outcome is not known in time — and loses a cycle. In a deep bank the
+lookup and commit stages are several cycles apart, so the lookup-stage
+prediction is carried across the gap to keep `commit_busy` continuous.
+
+`req_input_defer` keeps a request from queueing up behind a pending atomic on
+its line. It consumes a **registered** MSHR probe, which keeps the MSHR's
+address compare off the request-ready path, and it is not exact. A result
+registered for one request is applied to the next when the bank's input
+changes without firing — an unbuffered request crossbar switching ports — and
+an entry is visible to none of the guard's terms in the cycle it is
+finalized. So a request can enter while an atomic to its line is pending.
+
+**Ordering does not depend on the guard.** A request that slips past it joins
+the line's MSHR chain, and the bank's per-word order
+([`cache_subsystem.md`](cache_subsystem.md) §4.5) applies to atomics as to
+every other request: a store-bearing atomic counts as a store, whether it is
+the chained entry or the incoming hit, so nothing to its word completes
+around it. A younger store chained behind it supersedes its queued bytes
+(§6.4), and the writeback guard keeps the queued result from landing over
+that store.
 
 ---
 
@@ -333,6 +426,15 @@ The bank is single-ported, so an atomic owns it for three cycles:
 | 2 — capture | the word is registered | `LR` reserves, `SC` checks and clears, a store invalidates |
 | 3 — write back | the ALU result is written under the request's byte-enable | — |
 
+A DMA beat — a DXA tile write or a tensor-core WGMMA operand read — that
+touches a bank whose atomic has not yet written back waits rather than split
+the read-modify-write, and while it waits it holds LSU acceptance off the
+banks it touches, so the wait is bounded by the capture and write-back cycles.
+SimX holds a DXA beat only behind an atomic on the bank its block address
+maps to, where the RTL waits on every bank the beat touches. SimX applies an
+atomic's read-modify-write in one step, so no beat can split it there either;
+the difference is timing only.
+
 The word is registered **before** the ALU sees it. Feeding the ALU from the
 SRAM output would put the memory's clock-to-out, the adder, and the memory's
 setup in one period; the register splits that in two.
@@ -347,6 +449,17 @@ A plain store reaches the reservation stage the same way an atomic does, one
 cycle after acceptance, so a plain store to a reserved word breaks the
 reservation.
 
+A DMA write breaks reservations too. RISC-V requires an `SC` to fail when
+another device writes the reserved bytes between the `LR` and the `SC`, and a
+DXA tile write is such a write. The beat takes the reservation stage the
+cycle after it writes the bank — no LSU request can hold that cycle, since
+none is accepted beside a DMA beat — and clears the reservation on every bank
+word it wrote, whichever hart holds it. It adds no cycle, and a DMA read
+leaves reservations alone. Because a beat never lands inside an atomic's
+three cycles, it cannot fall between an `SC`'s check and its write-back. SimX
+does the same: a DXA write carries the `dma` request flag, and the bank
+breaks every hart's reservation on each bank word the write touches.
+
 ---
 
 ## 8. SimX model
@@ -357,6 +470,7 @@ reservation.
 | operation encoding | `amo_op_e`, 0–9 | `MemOp::AMO_LR`…`AMO_CAS`, 3–12, inside the unified memory-op enum |
 | request direction | `rw = 0` | `is_write()` is **true** for an atomic |
 | LLC commit | `VX_cache_amo`, commit role | `CacheBank::commitAmo()` |
+| atomics outstanding per LLC bank | at most the writeback queue's depth of store-bearing ones (§6.3) | bounded by the MSHR only: the read-modify-write is one step, with no queue |
 | above the LLC | `VX_cache_amo`, passthrough role | `AmoProbe` request type |
 | local memory | 3-cycle in-place RMW | same occupancy, modeled as a per-bank busy count |
 | reservations | bounded line-indexed stations with hold credit | one reservation **per hart** |
@@ -410,6 +524,40 @@ Enforced in [`Vortex.sv`](../../hw/rtl/Vortex.sv) and
 expressions already satisfy it, since each level is write-back only when it
 is the LLC.
 
+**The device must build exactly one LLC instance.** An atomic must be atomic
+with respect to every hart in the device, and nothing keeps two LLC instances
+coherent: each executes the atomics and holds the reservations for its own
+copy of a line. Harts behind different instances would update one word at two
+points, so an `AMOADD` from each loses an update and an `SC` succeeds against
+a store the other instance absorbed. The instances are counted as the RTL and
+SimX build them:
+
+| enabled | LLC | instances | allowed with A |
+|---|---|---|---|
+| L3 | the L3 | 1 | always |
+| L2, no L3 | each cluster's L2 | `NUM_CLUSTERS` | one cluster |
+| neither | each socket's dcaches | `NUM_CLUSTERS × NUM_SOCKETS × NUM_DCACHES` | one dcache in the device |
+
+with `NUM_SOCKETS = max(1, floor(NUM_CORES / SOCKET_SIZE))` and
+`NUM_DCACHES = max(1, floor(SOCKET_SIZE / 4))`, or 0 with the dcache disabled.
+So a build with the A extension is rejected when it has:
+
+- two or more clusters with an L2 and no L3 (one LLC per cluster);
+- no L2 or L3 and more than one dcache in the device — `--cores=N` with the
+  default `SOCKET_SIZE=1` (one socket, and one dcache, per core), more than
+  one cluster, or one socket of 8 or more cores (two or more dcaches);
+- no cache at all: the dcache disabled with no L2 or L3, where nothing
+  executes a global atomic.
+
+The fix is to enable the L2 for one cluster or the L3 for several. The check
+is a `STATIC_ASSERT` in [`Vortex.sv`](../../hw/rtl/Vortex.sv), so rtlsim and
+xrtsim stop at time 0 with the message, and a `static_assert` in
+[`processor.cpp`](../../sim/simx/processor.cpp), so SimX does not compile.
+Synthesis does not check it: `STATIC_ASSERT` is empty under `SYNTHESIS`. It
+applies to every build that enables A, including applications that force the
+extension on, such as those built through
+[`tests/vulkan/common.mk`](../../tests/vulkan/common.mk).
+
 ---
 
 ## 10. Verification
@@ -427,11 +575,101 @@ is the LLC.
 | 12 | `self_consistency` | a hart reads back its own atomic through a plain load |
 | 13, 14 | `amoadd_lmem`, `lrsc_lmem` | cases 0 and 7 on local memory |
 | 15, 16 | `cas_ladder`, `cas_lmem` | every hart races compare-and-swap for each slot; compiled only with Zacas |
+| 15, 16 (17, 18 with Zacas) | `lrsc_foreign`, `lrsc_foreign_lmem` | one warp: an `SC` into another thread's reservation fails and leaves it for the owner's `SC`, which succeeds unless the warp has more threads than the stations can keep apart; the two threads share an LSU lane when the warp splits into packets |
+| 17 (19 with Zacas) | `lrsc_peer` | a peer hart's `SC` into a word that core 0 holds fails, writes nothing and leaves the reservation live, so the holder's `SC` succeeds; once the holder reserves the word again, the peer's swap fails the holder's next `SC`, and the peer's own `LR`/`SC` on another line succeeds; the peer is the first core of the last cluster, core 1 with one cluster, and warp 1 with one core |
+
+The `LR`/`SC` increment loops (7, 9, 14) give up after a fixed number of
+retries per increment, so a loop that starves comes up short and fails
+instead of hanging the run.
 
 The `amo` category in [`ci/testcases/amo.yaml`](../../ci/testcases/amo.yaml)
-runs them on both simulators at both `XLEN`s, with and without Zacas, on a
-write-back LLC, at 8 threads, and across the 4-core L2 and L2+L3 hierarchies,
-alongside the `rv32ua` / `rv64ua` ISA conformance tests.
+runs them on both simulators at both `XLEN`s, with and without Zacas, with
+fewer LSU lanes than threads and with a narrower SIMD width, on a write-back
+LLC, at 8 threads, and across the 4-core L2 and L2+L3 hierarchies, alongside
+the `rv32ua` / `rv64ua` ISA conformance tests. With 8-thread warps split
+into LSU packets of 2, two cases pin the local-memory budget to its sizing —
+the contended `LR`/`SC` loops at 4 warps (`threads8-lanes2`, RV32 only) and
+at 8 warps (`warps8-threads8-lanes2`) — and `mc-l2-w8t8-lanes2` runs the
+global loops with 256 harts behind one L2 (4 cores of 8 warps), where the LLC
+budget rises above its floor. A 63-refusal LLC budget there slowed the loops
+about fourfold without stopping them, so that case covers progress at this
+scale rather than pinning the LLC sizing.
+
+Two clusters of two cores behind an L3, with L2s (`mc-xcluster-l3`) and
+without (`mc-xcluster-l3-nol2`), run the global `LR`/`SC` loops and
+`lrsc_peer` where the L3 holds reservations from both clusters. There the
+peer differs from core 0 only in the cluster part of its core id.
+
+The order of an atomic against the other accesses to its word (§6.4, §6.5)
+is checked at two levels. The cache testbench
+([`hw/unittest/cache`](../../hw/unittest/cache),
+`make -C hw/unittest run-cache`) drives a last-level bank directly and
+releases a held fill at every cycle offset around a race: an atomic on a
+resident line against a replayed one on another line, a store or a load
+chained behind an atomic (also with memory refusing requests while the chain
+replays), atomics on several missing lines whose fills return together, and
+a request that reaches the filled line while an older access to its word
+still waits in the chain.
+[`tests/regression/cache_order`](../../tests/regression/cache_order) runs the
+patterns from software — a hart's `amoadd` or `LR` after its own store, its
+load after its own `amoadd`, an `amoadd` racing another warp's store, and
+every hart's atomics on cold and resident lines of one bank — as
+`amo:cache-order` (one core, write-back dcache, every pattern),
+`amo:cache-order-l2` (four cores under a write-back L2: the patterns that
+race different harts, since each L1 holds a hart's atomic behind its own
+older accesses, up to the open input-guard windows in
+[`multicache_amo_coherence.md`](multicache_amo_coherence.md) §10) and
+`amo:cache-order-shared` (four cores on one
+write-through dcache, where an atomic and a younger store to its word must
+also reach memory in order).
+
+The one-LLC rule (§9) has no CI case, because the catalog cannot express a
+build that must fail; check it by hand:
+`CONFIGS=-DVX_CFG_EXT_A_ENABLE ./ci/blackbox.sh --driver=simx --app=amo --cores=2`
+must fail to build with the §9 message, and `--driver=rtlsim` must stop at
+time 0.
+
+[`tests/regression/lmem_amo_dma`](../../tests/regression/lmem_amo_dma) races
+DXA copies against local-memory atomics: one warp streams tile copies into
+local memory while the others hammer atomics on words that share every bank,
+and the run fails if no atomic completed while the copies were in flight. It
+runs as `amo:lmem-dma` on both simulators and as the `amo:parity-lmem-dma`
+cycle-parity case. The `VX_local_mem` unit testbench
+([`hw/unittest/local_mem`](../../hw/unittest/local_mem),
+`make -C hw/unittest run-lmem`) injects a DMA access at every cycle offset
+around an atomic and across an `LR`/`SC` window, then runs a randomized
+golden-model stress, with A and with A + Zacas; a build with atomics off runs
+the load/store/DMA stress alone. In the window, a DMA write to a reserved
+byte between the `LR` and the `SC` must fail the `SC`; a write to another
+word, a DMA read, a write before the `LR` or after the `SC`, and a word
+reserved again after the write must not.
+
+[`tests/regression/lmem_lrsc_dma`](../../tests/regression/lmem_lrsc_dma)
+checks the same rule end to end: lanes of one warp reserve local-memory words,
+the warp copies a tile over some of them with the DXA, and each lane then
+tries its `SC`. It must fail on a word the copy wrote — on RV64 also an
+`lr.d` word the copy wrote only the upper half of — and succeed on a word
+outside the copy, on a word in a bank the copy's partial last row skips (when
+the bank count leaves it one), and after a fresh `LR`. It runs as
+`amo:lrsc-dma` on both simulators.
+
+At 32 warps a core issues two-wide, so two LSU blocks share every
+local-memory bank, which must grant them fairly
+([LSU design §5.2](lsu_pipeline_design.md#52-local-path)). `amo:lmem-2blocks`
+runs the local-memory `LR`/`SC` loop in that shape, where neither block's
+retries may lock the other out of the counter's bank.
+[`tests/regression/lmem_fairness`](../../tests/regression/lmem_fairness)
+tests the grant directly: the warps of LSU block 0 poll a local-memory flag
+with atomics, keeping its bank busy, while one warp of another block sets it
+with a plain store. The run repeats with each other block as the setter, and
+a control swaps the roles. A poller gives up after a bounded number of polls,
+so a starved store fails the run instead of hanging it; a poller that sees the
+flag on its first poll fails it too, since the store then landed before the
+pollers contended. It runs on both simulators as `amo:lmem-fairness` (two
+blocks of 8 lanes, one in each 8-input slice of the bank's arbiter tree),
+`amo:lmem-fairness-4blocks` (four blocks of 4 lanes, so a setter either shares
+the pollers' slice or meets them only at the join) and
+`amo:lmem-fairness-flat` (two blocks of 4 lanes under one flat arbiter).
 
 Unsigned min/max cases need operands above `0x7fffffff`. With small positive
 values the signed and unsigned compares agree, and a test cannot tell the two
@@ -451,4 +689,6 @@ variants apart.
 - **Local-memory reservation granularity.** The RTL local-memory bank
   reserves and invalidates on the bank word; SimX keys on the request's byte
   address. They agree for operations on the same address and can differ for
-  a store to a different byte of the same word.
+  an LSU store to a different byte of the same word. A DMA write is bank-word
+  granular in both models: on RV64 it breaks a `.W` reservation even when it
+  writes only the other 32-bit lane.

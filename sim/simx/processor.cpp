@@ -120,6 +120,12 @@ ProcessorImpl::ProcessorImpl()
   // L1 is unconstrained when L1 itself is the LLC.
 #endif
 
+  // RVA atomicity is device-wide: every hart's AMOs and reservations must meet in one LLC instance.
+  static_assert((VX_CFG_L3_ENABLED != 0)
+                || ((VX_CFG_NUM_CLUSTERS * ((VX_CFG_L2_ENABLED != 0) ? 1
+                       : (NUM_SOCKETS * VX_CFG_NUM_DCACHES * VX_CFG_DCACHE_ENABLED))) == 1),
+                "the A extension needs one shared last-level cache: enable L2 (one cluster) or L3 (several clusters)");
+
   // Non-LLC AMO passthrough: AmoProbe entries probe-and-invalidate the local
   // line then forward via mem_req_out tagged with AMO_PASSTHRU_TAG_FLAG so
   // the response routes back to core_rsp_out without installing a fill.

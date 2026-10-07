@@ -46,7 +46,7 @@
   <rect x="40" y="296" width="388" height="214" rx="6" class="core"/>
   <text x="52" y="318" class="tb">VX_lsu_slice — per-lane sideband</text>
   <text x="52" y="340" class="ts">packs amo_req_t into each lane's mem_bus_attr_t:</text>
-  <text x="64" y="360" class="mono">hart_id       {core, warp, thread}</text>
+  <text x="64" y="360" class="mono">hart_id       {global core, warp, thread}</text>
   <text x="64" y="376" class="mono">amo_cmp       comparand (Zacas only)</text>
   <text x="64" y="392" class="mono">amo_unsigned  MIN / MAX variant</text>
   <text x="64" y="408" class="mono">amo_op        amo_op_e</text>
@@ -90,7 +90,7 @@
   <text x="924" y="140" class="ts">single-ported SRAM: an atomic owns its bank for 3 cycles</text>
   <text x="924" y="160" class="ts">① read the word      ② register it, resolve the reservation</text>
   <text x="924" y="176" class="ts">③ VX_amo_alu result written back under the request byteen</text>
-  <text x="924" y="200" class="ts">VX_amo_unit: min(AMO_RS_SIZE, 4) stations, 3-bit hold credit</text>
+  <text x="924" y="200" class="ts">VX_amo_unit: min(AMO_RS_SIZE, 4) stations, hold credit per core hart</text>
   <text x="924" y="216" class="ts">a plain store to the word also breaks its reservation</text>
   <text x="924" y="244" class="tt">one instance per core: shared memory is visible to one core's warps</text>
 
@@ -113,7 +113,7 @@
   <text x="924" y="560" class="ts">response: the old word, straight from the commit stage</text>
   <text x="924" y="576" class="ts">compute stage: VX_amo_alu on the atomic's 8-byte lane</text>
   <text x="924" y="592" class="ts">writeback queue → synthetic store through the bank pipe</text>
-  <text x="924" y="612" class="ts">VX_amo_unit: VX_CFG_AMO_RS_SIZE stations, 6-bit hold credit</text>
+  <text x="924" y="612" class="ts">VX_amo_unit: VX_CFG_AMO_RS_SIZE stations, hold credit per hart (≥ 63)</text>
   <text x="924" y="628" class="ts">any committed store to the line breaks its reservation</text>
   <text x="924" y="656" class="tt">every level above it is write-through, so it sees every store</text>
 

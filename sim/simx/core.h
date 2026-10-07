@@ -125,6 +125,9 @@ public:
     return socket_;
   }
 
+  // LocalMem ports: the LSU's, then the DXA's from here, then the TCU tile buffer.
+  static constexpr uint32_t LMEM_DXA_PORT = LSU_NUM_REQS;
+
   const std::shared_ptr<LocalMem>& local_mem() const;
 
   const std::shared_ptr<MemCoalescer>& mem_coalescer(uint32_t idx) const;

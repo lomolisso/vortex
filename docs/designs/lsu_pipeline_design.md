@@ -312,6 +312,24 @@ Local memory is a banked SRAM, so lanes addressing different banks are served
 in the same cycle. Its second port is shared by the direct-memory clients —
 the DXA writes and the tensor unit's reads.
 
+Lanes that address the same bank are granted **round-robin** across every
+block's lanes. The bank inputs are ordered block-major, so a fixed-priority
+grant would let block 0 shut a higher block out of a busy bank, e.g. a flag
+that block 0 polls with atomics and block 1 must store. The pointer advances
+only on an accepted grant, so a bank stalled by a DMA beat or an atomic costs
+no lane its turn. Above 12 inputs per bank,
+[`VX_stream_arb`](../../hw/rtl/libs/VX_stream_arb.sv) builds the grant as a
+tree: round-robin within slices of 8 inputs, then round-robin across the
+slices. A direct-memory beat goes ahead of every LSU lane at each bank it
+touches, and when both direct-memory clients have a beat waiting, the DXA's
+goes first.
+
+SimX's local-memory crossbar is round-robin over the LSU ports, and the DXA's
+ports, then the tensor unit's, win before any of them. Two differences are
+timing only: the rotation covers every LSU port at once rather than slice by
+slice (both are starvation-free), and a direct-memory block wins only at the
+bank its base address maps to, not at every bank it covers.
+
 ### 5.3 Global path
 
 | stage | role |

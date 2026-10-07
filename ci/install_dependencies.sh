@@ -26,6 +26,7 @@
 #   install_dependencies.sh --vulkan     + Vulkan loader + glslc  (tests/vulkan)
 #   install_dependencies.sh --gem5       + gem5.opt runtime libs  (gem5 tests)
 #   install_dependencies.sh --mpi        + OpenMPI                (tests/mpi)
+#   install_dependencies.sh --synth      + yosys/OpenSTA runtime  (hw/syn/yosys)
 #   install_dependencies.sh --all        baseline + every group
 #
 # Flags compose: e.g. `--gem5 --mpi` installs both groups. CI workflows
@@ -34,24 +35,27 @@
 set -e
 
 usage() {
-    echo "Usage: $0 [--vulkan] [--gem5] [--mpi] [--all] [-h|--help]"
+    echo "Usage: $0 [--vulkan] [--gem5] [--mpi] [--synth] [--all] [-h|--help]"
     echo "  (no flags)   install baseline packages for the Vortex core only"
     echo "  --vulkan     also install the Vulkan loader and glslc (tests/vulkan)"
     echo "  --gem5       also install gem5.opt's runtime shared libraries"
     echo "  --mpi        also install OpenMPI (tests/mpi)"
-    echo "  --all        install baseline + vulkan + gem5 + mpi"
+    echo "  --synth      also install the prebuilt yosys/OpenSTA runtime (Tcl)"
+    echo "  --all        install baseline + vulkan + gem5 + mpi + synth"
 }
 
 enable_vulkan=0
 enable_gem5=0
 enable_mpi=0
+enable_synth=0
 
 for arg in "$@"; do
     case "$arg" in
         --vulkan) enable_vulkan=1 ;;
         --gem5)   enable_gem5=1 ;;
         --mpi)    enable_mpi=1 ;;
-        --all)    enable_vulkan=1; enable_gem5=1; enable_mpi=1 ;;
+        --synth)  enable_synth=1 ;;
+        --all)    enable_vulkan=1; enable_gem5=1; enable_mpi=1; enable_synth=1 ;;
         -h|--help) usage; exit 0 ;;
         *) echo "Invalid argument: $arg" >&2; usage >&2; exit 1 ;;
     esac
@@ -103,6 +107,17 @@ fi
 if [ "$enable_mpi" -eq 1 ]; then
     echo "Installing MPI dependencies..."
     apt-get install -y openmpi-bin libopenmpi-dev
+fi
+
+###############################################################################
+# --synth — runtime of the prebuilt yosys and OpenSTA (toolchain_install.sh
+# --yosys/--sta). Both link libtcl8.6 and load Tcl's library scripts at start-up;
+# without tcl8.6 they fail with "libtcl8.6.so: cannot open shared object file".
+# Their installers only pull tcl-dev in on the build-from-source path.
+###############################################################################
+if [ "$enable_synth" -eq 1 ]; then
+    echo "Installing yosys/OpenSTA runtime dependencies..."
+    apt-get install -y tcl8.6
 fi
 
 ###############################################################################

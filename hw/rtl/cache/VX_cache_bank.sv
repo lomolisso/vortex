@@ -143,6 +143,7 @@ module VX_cache_bank import VX_gpu_pkg::*; #(
         req_t                          req;
         logic [`CS_WORD_WIDTH-1:0]     wdata;
         logic [NUM_WAYS-1:0]           tag_matches;
+        logic                          hit_demoted; // tags-hit held back by the order hazard
     } data_t;
 
     typedef struct packed {            // response + memory request (S0 -> S1 -> stC)
@@ -316,8 +317,9 @@ module VX_cache_bank import VX_gpu_pkg::*; #(
     // wb_hold pauses the commit while a multi-beat per-sector writeback drains
     // (0 for single-sector lines, so the baseline pipe is unaffected).
     wire wb_hold;
-    // amo_chain_stall paces a same-line AMO behind an in-flight commit by one
-    // cycle; it is 0 for non-AMO traffic, so the baseline pipe is unaffected.
+    // amo_chain_stall holds the commit stage one cycle behind an atomic that is
+    // still computing (a same-line request, or any store-bearing atomic); it
+    // is 0 for non-AMO traffic, so the baseline pipe is unaffected.
     assign pipe_stall = crsp_queue_stall || amo_chain_stall || wb_hold;
 
     // ========================================================================
@@ -326,6 +328,16 @@ module VX_cache_bank import VX_gpu_pkg::*; #(
     // replay maximizes utilization (guaranteed hit); fill precedes flush/creq to
     // avoid deadlock on a miss; flush precedes creq for consistency.
     // ========================================================================
+    // What changes a word: a write, or a store-bearing atomic, which carries
+    // rw=0. Only the level that commits the atomic orders on it: a passthrough
+    // forwards it, and its entry never chains.
+    wire st0_amo_store    = (AMO_ENABLE != 0) && (IS_LLC != 0)
+                         && st0.req.amo.amo_valid && (st0.req.amo.amo_op != AMO_OP_LR);
+    wire replay_amo_store = (AMO_ENABLE != 0) && (IS_LLC != 0)
+                         && replay_amo.amo_valid && (replay_amo.amo_op != AMO_OP_LR);
+    wire st0_modify    = st0.req.rw || st0_amo_store;
+    wire replay_modify = replay_rw || replay_amo_store;
+
     // A chain head claimed by the forward port is masked from the arbiter
     // (it completes at the forward-response port instead of replaying); a
     // fill is held off while a forward drain is in progress so the staged
@@ -341,13 +353,13 @@ module VX_cache_bank import VX_gpu_pkg::*; #(
     // answers from the staged fill sector, which a younger array access cannot
     // disturb.
     // The hold matters only when the vanishing entry would have constrained
-    // the prober: same word, and at least one side writes. Read-after-read and
-    // disjoint words carry no order constraint, so the entry may hide and the
-    // prober proceed as a fresh hit — which keeps a streaming drain from being
-    // stalled one cycle per incoming same-line beat.
+    // the prober: same word, and at least one side changes it. Read-after-read
+    // and disjoint words carry no order constraint, so the entry may hide and
+    // the prober proceed as a fresh hit — which keeps a streaming drain from
+    // being stalled one cycle per incoming same-line beat.
     wire replay_link_hold = replay_valid && mshr_allocate_st0 && ~pipe_stall
                          && (st0.req.addr == replay_addr)
-                         && (replay_rw || st0.req.rw)
+                         && (replay_modify || st0_modify)
                          && (replay_wsel == st0.req.word_idx);
 
     wire replay_mux    = replay_valid && ~fwd_head && ~replay_link_hold;
@@ -363,7 +375,10 @@ module VX_cache_bank import VX_gpu_pkg::*; #(
 
     // A core-request slot fires from a real core_req or a pending LLC AMO
     // writeback (synthetic write injected after a commit); mutually exclusive.
-    // amo_commit_busy/req_input_defer enforce AMO ordering (0 for non-AMO banks).
+    // amo_commit_busy holds admission off across an atomic's commit and
+    // req_input_defer is the engine's same-line input guard (both 0 for
+    // non-AMO banks). Where atomics commit, per-word order does not rest on
+    // the guard: the order hazard at S0 enforces it.
     wire amo_creq_path = core_req_valid && ~amo_commit_busy && ~req_input_defer;
     wire amo_wb_path   = amo_wb_pending && ~amo_hit_st1;
     wire creq_enable   = creq_grant && (amo_creq_path || amo_wb_path);
@@ -609,25 +624,30 @@ module VX_cache_bank import VX_gpu_pkg::*; #(
     );
 
     // A tags-hit is completable only while no OLDER same-WORD MSHR chain entry
-    // could still change the word (a chained write not yet applied) or observe
-    // it (any chained entry, against a write request): chained entries replay
-    // through the pipe AFTER this request's data-array access, so completing
-    // the hit would invert arrival order — a load reads pre-store data, or a
-    // store lands before an older chained load reads. Demote such a hit to a
-    // chained miss: the request links onto the line's chain (it is pending, so
-    // no fill is issued) and replays in arrival order once the chain drains.
+    // could still change the word (a chained write or store-bearing atomic not
+    // yet applied) or observe it (any chained entry, against a request that
+    // changes the word): chained entries replay through the pipe AFTER this
+    // request's data-array access, so completing the hit would invert arrival
+    // order — a load reads pre-store data, or a store lands before an older
+    // chained load reads. Demote such a hit to a chained miss: the request
+    // links onto the line's chain (so no fill is issued), leaves the data
+    // array alone on this pass, and replays in arrival order once the chain
+    // drains. An atomic is ordered like any other request by the level that
+    // commits it; only one being forwarded downstream is exempt.
     // A chained entry's replay touches exactly its own word, so hits to
     // disjoint words — the common case in streaming, where the whole warp's
     // beats land on one sector — keep the fast release path, as does
     // read-after-read on the same word.
+    // Not gated on mshr_pending_raw: a write-through bank leaves chained
+    // writes out of it, and they order a hit all the same.
     wire creq_hit_order_hazard_st0 = st0.req.is_creq && ~st0.req.is_replay
-                                  && mshr_pending_raw
-                                  && (mshr_pending_wr_raw || (st0.req.rw && mshr_pending_ovl_raw))
-                                  && ~is_amo_fwd_st0
-                                  && ~((AMO_ENABLE != 0) && st0.req.amo.amo_valid);
+                                  && (mshr_pending_wr_raw || (st0_modify && mshr_pending_ovl_raw))
+                                  && ~is_amo_fwd_st0;
 
-    // S0 lookup delta (single combinational driver). The AMO requester is forced
-    // non-pending so it never coalesces onto a prior same-line entry.
+    // S0 lookup delta (single combinational driver). A forwarded AMO is forced
+    // non-pending so it never coalesces onto a prior same-line entry. A demoted
+    // hit is pending whatever the raw probe says: it must stay in the MSHR and
+    // link behind the chain, or nothing would replay it.
     always @(*) begin
         lk_st0 = '0;
         lk_st0.is_hit       = (| tag_matches_st0) && ~creq_hit_order_hazard_st0;
@@ -636,8 +656,28 @@ module VX_cache_bank import VX_gpu_pkg::*; #(
         lk_st0.evict_dirty_mask = evict_dirty_mask_st0;
         lk_st0.evict_tag    = evict_tag_st0;
         lk_st0.mshr_previd  = mshr_previd;
-        lk_st0.mshr_pending = mshr_pending_raw && ~is_amo_fwd_st0;
+        lk_st0.mshr_pending = (mshr_pending_raw || creq_hit_order_hazard_st0) && ~is_amo_fwd_st0;
     end
+
+`ifdef SIMULATION
+    // A demoted store still supersedes queued atomic results for its bytes at
+    // stC, though the older chained requests it waits behind replay first and
+    // would read them. It never meets one: a core request enters only while
+    // the atomic engine is idle and no replay overtakes it, so nothing is
+    // queued or settling by then. The engine's own writeback is older than
+    // every chained entry and is never demoted.
+    reg amo_wb_st0;
+    always @(posedge clk) begin
+        if (reset) begin
+            amo_wb_st0 <= 1'b0;
+        end else if (~pipe_stall) begin
+            amo_wb_st0 <= amo_wb_fire;
+        end
+    end
+    wire store_demoted_st0 = do_write_st0 && (| tag_matches_st0) && creq_hit_order_hazard_st0 && ~pipe_stall;
+    `RUNTIME_ASSERT (~(store_demoted_st0 && (amo_wb_st0 || amo_commit_busy)),
+        ("%t: %s store demoted while an atomic result is pending: addr=0x%0h", $time, INSTANCE_ID, `CS_BANK_TO_FULL_ADDR(st0.req.addr, BANK_ID)))
+`endif
 
     // ========================================================================
     // Pipeline registration
@@ -652,11 +692,14 @@ module VX_cache_bank import VX_gpu_pkg::*; #(
     // ========================================================================
 
     // data path: carry the request + fill line + tag compare, resolving the way
-    // for the data array (victim way for fill/flush, hit way otherwise).
+    // for the data array (victim way for fill/flush, hit way otherwise). A
+    // demoted hit keeps its raw tag match, so the hazard stays off the way
+    // select and the array address; it only masks the write enable at stD.
     always @(*) begin
         dat_in = st0;
         dat_in.req.way_idx = evict_way_st0;
         dat_in.tag_matches = tag_matches_st0;
+        dat_in.hit_demoted = creq_hit_order_hazard_st0;
     end
 
     // commit path: the request (with the resolved hit/victim way and MSHR id)
@@ -747,7 +790,8 @@ module VX_cache_bank import VX_gpu_pkg::*; #(
         .fill         (do_fill_std && ~stD.req.is_passthru_fill && ~pipe_stall),
         .flush        (do_flush_std && ~pipe_stall),
         .read         (do_read_std && ~pipe_stall),
-        .write        (do_write_std && ~pipe_stall),
+        // a demoted store lands at its replay, behind the older chained entries
+        .write        (do_write_std && ~stD.hit_demoted && ~pipe_stall),
         .evict_way    (stD.req.way_idx),
         .tag_matches  (stD.tag_matches),
         .line_idx     (stD.req.addr[`CS_LINE_SEL_BITS-1:0]),
@@ -868,6 +912,7 @@ module VX_cache_bank import VX_gpu_pkg::*; #(
         // Only non-LLC AMOs must not coalesce; at the LLC same-line AMOs coalesce
         // and serialize their commits on the single filled line.
         .allocate_is_amo     (AMO_ENABLE ? st0.req.amo.amo_valid : 1'b0),
+        .allocate_amo_store  (st0_amo_store),
         .allocate_data       ({st0.req.word_idx, st0.req.byteen, write_word_st0, st0.req.tag, st0.req.req_idx, st0.req.amo}),
         .allocate_id         (mshr_alloc_id),
         .allocate_pending    (mshr_pending_raw),
@@ -893,7 +938,7 @@ module VX_cache_bank import VX_gpu_pkg::*; #(
     // AMO engine
     //
     // The read word lands at the deferred commit stage stC; the engine consumes
-    // it at S1 (== stC when PIPE_EX=0, the validated case).
+    // it at S1 (== stC when PIPE_EX=0).
     // ========================================================================
     if (AMO_ENABLE) begin : g_amo
         // Look-ahead {line address, byteen} for the AMO engine: the request
@@ -945,8 +990,9 @@ module VX_cache_bank import VX_gpu_pkg::*; #(
             .amo_st0                (st0.req.amo),
             .valid_st0              (st0.req.valid),
             .is_creq_st0            (st0.req.is_creq),
-            // Atomics are exempt from the hit-order hazard, so their S0 hit is
-            // the raw tag match; the MSHR probe stays off the commit_busy cone.
+            // The raw tag match, so the MSHR probe stays off the commit_busy
+            // cone: an atomic the order hazard demotes holds commit_busy for
+            // this pass only and commits at its replay.
             .is_hit_st0             ((| tag_matches_st0)),
             .is_replay_st0          (st0.req.is_replay),
             // Commit ports are fed from stC (the deferred data-output stage), so
@@ -964,6 +1010,7 @@ module VX_cache_bank import VX_gpu_pkg::*; #(
             .write_word_st1         (word_stc),
             .word_idx_st0           (st0.req.word_idx),
             .word_idx_st1           (stC.req.word_idx),
+            .addr_st0               (st0.req.addr),
             .addr_st1               (addr_stc),
             .res_addr_n             (amo_res_addr_n),
             .byteen_n               (amo_byteen_n),
@@ -1029,7 +1076,7 @@ module VX_cache_bank import VX_gpu_pkg::*; #(
     // Fires for reads (and LLC AMO commits) on hit, never for the synthetic
     // writeback (rw=1). A non-LLC AMO's first pass forwards downstream and must
     // not respond locally (its result returns via the passthru replay). Suppress
-    // while a same-line AMO is chain-stalled so a held read enqueues once.
+    // while the commit stage is chain-stalled so a held read enqueues once.
     // ========================================================================
     wire crsp_queue_valid = do_read_stc && eff_hit_stc && ~is_amo_fwd_st1 && ~amo_chain_stall;
     wire crsp_queue_ready;

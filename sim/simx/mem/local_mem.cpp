@@ -85,11 +85,17 @@ public:
 		snprintf(sname, 100, "%s-xbar", simobject->name().c_str());
 		uint32_t lg2_line_size = log2ceil(config_.line_size);
 		uint32_t num_banks = 1 << config.B;
-		mem_xbar_ = MemCrossBar::Create(sname, ArbiterType::Priority, config.num_reqs, num_banks,
+		// Round-robin across the LSU ports: a fixed priority lets a lower LSU
+		// block hold a contended bank forever and starve the others.
+		mem_xbar_ = MemCrossBar::Create(sname, ArbiterType::RoundRobin, ArbiterType::Priority,
+		 config.num_reqs, num_banks,
 		 [lg2_line_size, num_banks](const MemCrossBar::ReqType& req) {
     	// Custom logic to calculate the output index using bank interleaving
 			return (uint32_t)((req.addr >> lg2_line_size) & (num_banks-1));
 		});
+		// The RTL serves DMA traffic (DXA writes, TCU tile-buffer reads) through
+		// its DMA port ahead of the LSU at every bank.
+		mem_xbar_->set_priority_inputs(config.dma_begin);
 		for (uint32_t i = 0; i < config.num_reqs; ++i) {
 			simobject->Inputs.at(i).bind(&mem_xbar_->ReqIn.at(i));
 			mem_xbar_->RspOut.at(i).bind(&simobject->Outputs.at(i));
@@ -219,11 +225,26 @@ public:
 					}
 				}
 #if VX_CFG_EXT_A_ENABLED
-				// A plain store breaks a reservation on the word it writes, the
-				// same as an atomic's commit does; otherwise a store between a
-				// hart's load-reserved and its store-conditional would go
-				// unnoticed and the conditional would wrongly succeed.
-				amo_unit_.invalidate(to_local_addr(bank_req.addr), bank_req.hart_id);
+				if (bank_req.flags.dma) {
+					// A DMA write is another device's write, so it breaks every
+					// hart's reservation on each bank word it writes, as the RTL does.
+					const uint64_t word_mask = config_.line_size - 1;
+					const uint64_t word_en   = (uint64_t(1) << config_.line_size) - 1;
+					const uint64_t byteen    = bank_req.byteen;
+					amo_unit_.invalidate_if([&](uint64_t addr) {
+						if ((addr & ~uint64_t(VX_CFG_MEM_BLOCK_SIZE - 1)) != line_addr) {
+							return false;
+						}
+						const uint64_t word_off = (addr & ~word_mask) - line_addr;
+						return ((byteen >> word_off) & word_en) != 0;
+					});
+				} else {
+					// A plain store breaks a reservation on the word it writes, the
+					// same as an atomic's commit does; otherwise a store between a
+					// hart's load-reserved and its store-conditional would go
+					// unnoticed and the conditional would wrongly succeed.
+					amo_unit_.invalidate(to_local_addr(bank_req.addr), bank_req.hart_id);
+				}
 #endif
 			}
 

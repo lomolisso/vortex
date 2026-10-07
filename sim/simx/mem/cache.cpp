@@ -692,6 +692,7 @@ protected:
     pending_amo_probes_ = 0;
     pipe_fill_count_ = 0;
     pipe_core_lines_.clear();
+    commit_writers_.clear();
     pending_read_reqs_ = 0;
     pending_write_reqs_ = 0;
     pending_fill_reqs_ = 0;
@@ -890,7 +891,6 @@ private:
       // causes them to stall on the wt-merge enqueue, blocking fill
       // responses from draining — a deadlock. Reserve at admission.
       bool needs_mshr = !is_amo_passthru;
-      (void)is_amo;
       if (needs_mshr && (mshr_.size() + pending_mshr_size_) >= mshr_.capacity()) {
         ++perf_stats_.mshr_stalls;
         return;
@@ -911,7 +911,8 @@ private:
       // emitted at the commit stage so same-line stores reach memory in
       // pipeline order (an at-admission emission could overtake an older
       // store still riding the pipe). The pipe-exit paths order them
-      // correctly and defer only the line merge when a chain is pending.
+      // correctly: they defer only the line merge when a chain is pending,
+      // or the whole store while an older atomic has yet to write through.
       const bool is_wt_store = (core_req.op == MemOp::ST) && !config_.write_back;
       if (!is_amo_passthru && !is_wt_store && mshr_.size() != 0) {
         uint32_t adm_set_id   = params_.addr_set_id(core_req.addr);
@@ -944,6 +945,9 @@ private:
             // in-flight replays.
             if (!fill_pending) {
               mshr_.defer_to_replay(id);
+            }
+            if (is_amo) {
+              this->commitWriterAdd(adm_set_id, adm_addr_tag, adm_sector, coalesced.adm_seq);
             }
             DT(3, this->name() << " mshr-coalesce@admission: " << coalesced);
             // Chain joiners count as misses, matching the pipe-exit chaining
@@ -989,6 +993,10 @@ private:
         ++pending_mshr_size_;
         pipe_core_lines_.emplace_back(params_.addr_set_id(core_req.addr),
                                       params_.addr_tag(core_req.addr));
+        if (is_amo) {
+          this->commitWriterAdd(params_.addr_set_id(core_req.addr), params_.addr_tag(core_req.addr),
+                                params_.addr_sector_id(core_req.addr), bank_req.adm_seq);
+        }
       }
 #if VX_CFG_EXT_A_ENABLED
       if (is_amo_passthru) ++pending_amo_probes_;
@@ -1222,6 +1230,7 @@ private:
     this->core_rsp_out.send(rsp);
     crsp_sent_ = true;
     DT(3, this->name() << " amo-rsp op=" << op << " sc_fail=" << sc_fail << ": " << rsp);
+    this->commitWriterErase(bank_req.adm_seq);
     return true;
   }
 #endif
@@ -1439,11 +1448,16 @@ private:
 
       auto &hit_sec = set.lines.at(hit_id).sectors.at(sector_id);
       if (bank_req.write) {
-        // Write-through replay only exists for the wt-merge case: the core
-        // response and the memory write were already issued at miss time.
-        // Guard so a future change doesn't silently drop a store.
-        if (!config_.write_back) {
-          assert(bank_req.skip_core_rsp && "WT replay without pre-sent store");
+        // A write-through replay either folds in a store that already wrote
+        // through (wt-merge, response already sent) or commits a store held
+        // behind an older atomic, which writes through now.
+        if (!config_.write_back && !bank_req.skip_core_rsp) {
+          if (!this->emitWritethrough(set_id, addr_tag, sector_id,
+                                      bank_req.addr, bank_req.hart_id, bank_req.uuid,
+                                      bank_req.data, bank_req.byteen, false, 0)) {
+            return; // stall
+          }
+          this->commitWriterErase(bank_req.adm_seq);
         }
         sector_merge(hit_sec, bank_req.data, bank_req.byteen);
         if (config_.write_back) {
@@ -1487,6 +1501,27 @@ private:
       // Sector hit: line resident AND the requested sector valid (a sector miss
       // on a resident line takes the miss path and refills just that sector).
       int hit_id = (present_id != -1 && set.lines.at(present_id).sectors.at(sector_id).valid) ? present_id : -1;
+
+      // Atomics, and stores held behind them, take effect downstream only
+      // when they commit. A younger write-through store must not overtake
+      // them, or memory ends with the older write: hold the whole store in
+      // the chain, so it writes through at its replay in admission order.
+      if (bank_req.write && !config_.write_back
+       && this->hasOlderCommitWriter(set_id, addr_tag, sector_id, bank_req.adm_seq)) {
+        bool fill_pending = mshr_.has_pending_fill(set_id, addr_tag, sector_id, -1);
+        assert(!mshr_.full());
+        int id = mshr_.enqueue(bank_req, set_id, addr_tag, sector_id);
+        if (!fill_pending) {
+          mshr_.defer_to_replay(id);
+        }
+        this->commitWriterAdd(set_id, addr_tag, sector_id, bank_req.adm_seq);
+        DT(3, this->name() << " mshr-defer (wt-hold): " << bank_req);
+        if (hit_id == -1) ++perf_stats_.write_misses;
+        --pending_mshr_size_;
+        this->pipeLineErase(set_id, addr_tag);
+        pipe_req_->pop();
+        return;
+      }
 
       if (hit_id != -1) {
         // Hit while a same-(set,tag,sector) chain still carries a write or
@@ -1721,6 +1756,44 @@ private:
     }
     assert(false && "in-pipe line mirror underflow");
   }
+
+  // Write-through banks only: requests that write downstream when they
+  // commit rather than at pipe exit (atomics, and stores held behind them),
+  // from admission until commit, whether in the pipe, the MSHR, or replaying.
+  struct commit_writer_t {
+    uint32_t set_id;
+    uint64_t addr_tag;
+    uint32_t sector_id;
+    uint64_t seq;
+  };
+  std::vector<commit_writer_t> commit_writers_;
+
+  void commitWriterAdd(uint32_t set_id, uint64_t addr_tag, uint32_t sector_id, uint64_t seq) {
+    if (!config_.write_back) {
+      commit_writers_.push_back({set_id, addr_tag, sector_id, seq});
+    }
+  }
+
+  void commitWriterErase(uint64_t seq) {
+    if (config_.write_back)
+      return;
+    for (auto it = commit_writers_.begin(); it != commit_writers_.end(); ++it) {
+      if (it->seq == seq) {
+        commit_writers_.erase(it);
+        return;
+      }
+    }
+    assert(false && "untracked commit writer");
+  }
+
+  bool hasOlderCommitWriter(uint32_t set_id, uint64_t addr_tag, uint32_t sector_id, uint64_t seq) const {
+    for (const auto &w : commit_writers_) {
+      if (w.seq < seq && w.set_id == set_id && w.addr_tag == addr_tag && w.sector_id == sector_id)
+        return true;
+    }
+    return false;
+  }
+
   TFifo<bank_req_t>::Ptr pipe_req_;
 
   Cache::PerfStats perf_stats_;
@@ -1814,7 +1887,8 @@ public:
 
     // Create bank's core crossbar
     snprintf(sname, 100, "%s-core_xbar", simobject->name().c_str());
-    bank_core_xbar_ = MemCrossBar::Create(sname, ArbiterType::RoundRobin, config_.num_inputs, num_banks,
+    bank_core_xbar_ = MemCrossBar::Create(sname, ArbiterType::RoundRobin, ArbiterType::RoundRobin,
+                                          config_.num_inputs, num_banks,
                                           [&](const MemCrossBar::ReqType &req) {
                                             return params_.addr_bank_id(req.addr);
                                           });

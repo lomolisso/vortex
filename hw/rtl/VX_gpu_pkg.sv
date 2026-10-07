@@ -137,9 +137,11 @@ package VX_gpu_pkg;
     localparam SRC_OPD_BITS = `CLOG2(NUM_SRC_OPDS);
     localparam SRC_OPD_WIDTH = `UP(SRC_OPD_BITS);
     localparam NUM_SOCKETS = `UP(`VX_CFG_NUM_CORES / `VX_CFG_SOCKET_SIZE);
+    // Cores actually built: SOCKET_SIZE > NUM_CORES still fills a whole socket.
+    localparam NUM_TOTAL_CORES = `VX_CFG_NUM_CLUSTERS * NUM_SOCKETS * `VX_CFG_SOCKET_SIZE;
 
     // Per-thread stack window: one stack per hardware thread below the stack base.
-    localparam NUM_STACKS = `VX_CFG_NUM_CLUSTERS * NUM_SOCKETS * `VX_CFG_SOCKET_SIZE * `VX_CFG_NUM_WARPS * `VX_CFG_NUM_THREADS;
+    localparam NUM_STACKS = NUM_TOTAL_CORES * `VX_CFG_NUM_WARPS * `VX_CFG_NUM_THREADS;
     localparam [`VX_CFG_XLEN-1:0] STACK_WINDOW_TOP    = `VX_CFG_XLEN'(`VX_MEM_STACK_BASE_ADDR);
     localparam [`VX_CFG_XLEN-1:0] STACK_WINDOW_SPAN   = `VX_CFG_XLEN'(NUM_STACKS) << `VX_MEM_STACK_LOG2_SIZE;
     localparam [`VX_CFG_XLEN-1:0] STACK_WINDOW_BOTTOM = STACK_WINDOW_TOP - STACK_WINDOW_SPAN;
@@ -151,7 +153,8 @@ package VX_gpu_pkg;
     // MINU/MAXU collapse into MIN/MAX + amo_unsigned.
 
     // make_hart_id(cid, wid, tid) — packed concatenation, low bits = tid.
-    localparam HART_ID_BITS = NC_BITS + NW_BITS + NT_BITS;
+    // cid is the global id of an instantiated core: an L3 holds reservations from every cluster.
+    localparam HART_ID_BITS = `CLOG2(NUM_TOTAL_CORES) + NW_BITS + NT_BITS;
     localparam HART_ID_WIDTH = `UP(HART_ID_BITS);
 
     // ───────────────────────────────────────────────────────────────────────

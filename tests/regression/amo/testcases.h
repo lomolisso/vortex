@@ -4,7 +4,7 @@
 #include <vector>
 #include <cstdint>
 #include <cstring>
-#include <vortex.h>
+#include <vortex2.h>
 #include "common.h"
 
 void cleanup();
@@ -30,9 +30,18 @@ public:
   size_t size() const { return _tests.size(); }
   vx_device_h device() const { return device_; }
 
+  uint32_t num_cores() const { return num_cores_; }
+  uint32_t num_warps() const { return num_warps_; }
+  uint32_t peer_core() const { return peer_core_; }
+  uint32_t peer_warp() const { return peer_warp_; }
+
 private:
   std::vector<ITestCase*> _tests;
   vx_device_h device_;
+  uint32_t num_cores_ = 0;
+  uint32_t num_warps_ = 0;
+  uint32_t peer_core_ = 0;
+  uint32_t peer_warp_ = 0;
 };
 
 class ITestCase {
@@ -51,6 +60,12 @@ public:
   // Returns 0 on pass, error count on fail.
   virtual int verify(uint32_t n, uint32_t iters,
                      const uint32_t* shared, const uint32_t* per_hart) = 0;
+
+  // Threads of the one block to launch, or 0 to fill the device with n harts.
+  virtual uint32_t block_threads() const { return 0; }
+
+  // Why the device's geometry cannot run this case, or nullptr to run it.
+  virtual const char* skip_reason() const { return nullptr; }
 
 protected:
   TestSuite* suite_;
@@ -290,6 +305,14 @@ public:
   Test_ATOMIC_CRITICAL(TestSuite* s, uint32_t num_threads_per_warp)
     : ITestCase(s, "atomic_critical")
     , num_threads_(num_threads_per_warp) {}
+  // The non-atomic load/store inside the lock-protected critical section
+  // needs L1<->L1 coherence, which Vortex does not implement: each core's L1
+  // is private, and an AMO commits at the LLC and invalidates only the issuing
+  // core's L1. The lock itself works across cores, but the counter access
+  // inside it observes stale L1 copies on other cores.
+  const char* skip_reason() const override {
+    return (suite_->num_cores() > 1) ? "multi-core" : nullptr;
+  }
   void setup(uint32_t /*n*/, uint32_t* shared, uint32_t* per_hart) override {
     *shared = 0;
     per_hart[0] = 0;  // lock starts unheld
@@ -474,11 +497,146 @@ public:
   }
 };
 
+// 15/16) Store-conditional into another thread's reservation, on global and
+//     on local memory (17/18 with Zacas). A single warp runs. A thread below
+//     LRSC_FOREIGN_DIST must fail its SC, and its word keep its seed. Every
+//     other thread's own SC must succeed, leaving the complement, unless the
+//     warp outnumbers the stations; then it may fail and leave the seed.
+class Test_LRSC_FOREIGN : public ITestCase {
+public:
+  Test_LRSC_FOREIGN(TestSuite* s, const char* name, uint32_t num_threads_per_warp,
+                    uint32_t stations)
+    : ITestCase(s, name)
+    , num_threads_(num_threads_per_warp)
+    , distinct_(num_threads_per_warp <= stations) {}
+  uint32_t block_threads() const override { return num_threads_; }
+  const char* skip_reason() const override {
+    return (num_threads_ > 1) ? nullptr : "one-thread warp";
+  }
+  // No thread leaves its word at 0, so a thread that did not run fails the case.
+  void setup(uint32_t /*n*/, uint32_t* shared, uint32_t* per_hart) override {
+    for (uint32_t t = 0; t < num_threads_; ++t) {
+      shared[t * LLC_LINE_WORDS] = 0;
+      per_hart[t] = 0;
+    }
+  }
+  int verify(uint32_t /*n*/, uint32_t /*iters*/,
+             const uint32_t* shared, const uint32_t* per_hart) override {
+    int errors = 0;
+    for (uint32_t t = 0; t < num_threads_; ++t) {
+      const bool     foreign  = (t < LRSC_FOREIGN_DIST);
+      const bool     sc_ok    = (per_hart[t] == 0);
+      const bool     legal    = foreign ? !sc_ok : (sc_ok || !distinct_);
+      const uint32_t word     = shared[t * LLC_LINE_WORDS];
+      const uint32_t seed     = LRSC_FOREIGN_SEED + t;
+      // The word must match the reported outcome, or the required one.
+      const bool     stored   = legal ? sc_ok : !foreign;
+      const uint32_t expected = stored ? ~seed : seed;
+      if (legal && word == expected) continue;
+      if (errors < 8) {
+        std::cout << "  thread " << t << ": "
+                  << (foreign ? "foreign" : "own") << " sc "
+                  << (sc_ok ? "succeeded" : "failed")
+                  << " word=0x" << std::hex << word
+                  << " expected=0x" << expected << std::dec << std::endl;
+      }
+      ++errors;
+    }
+    return errors;
+  }
+private:
+  uint32_t num_threads_;
+  bool     distinct_;
+};
+
+// 17) Store-conditional by a peer hart (19 with Zacas). The holder, thread 0
+//     of warp 0 on core 0, reserves X. The peer reserves Y and
+//     store-conditionals X, which must fail and leave X alone: the peer's plain
+//     load of X right after it must read the seed. The holder's SC on X then
+//     must succeed, so its reservation was live when the peer's SC arrived, and
+//     the holder reserves X again. The peer swaps X, breaking that reservation,
+//     and runs a control LR/SC on Y, which must succeed. The holder's last SC
+//     on X then must fail, leaving the peer's swap in X.
+class Test_LRSC_PEER : public ITestCase {
+public:
+  Test_LRSC_PEER(TestSuite* s) : ITestCase(s, "lrsc_peer") {}
+  // The holder and the peer spin on each other, so they need separate warps.
+  const char* skip_reason() const override {
+    return (suite_->num_cores() > 1 || suite_->num_warps() > 1)
+         ? nullptr : "one core of one warp";
+  }
+  // The kernel seeds X and Y itself; main zeroes the flags and the out lines.
+  void setup(uint32_t, uint32_t*, uint32_t*) override {}
+  int verify(uint32_t /*n*/, uint32_t /*iters*/,
+             const uint32_t* shared, const uint32_t* /*per_hart*/) override {
+    const uint32_t  x = shared[LRSC_PEER_X * LLC_LINE_WORDS];
+    const uint32_t  y = shared[LRSC_PEER_Y * LLC_LINE_WORDS];
+    const uint32_t* a = &shared[LRSC_PEER_A_OUT * LLC_LINE_WORDS];
+    const uint32_t* b = &shared[LRSC_PEER_B_OUT * LLC_LINE_WORDS];
+    int errors = 0;
+    auto fail = [&]() -> std::ostream& {
+      if (errors++ == 0)
+        std::cout << "  holder core 0 warp 0, peer core " << suite_->peer_core()
+                  << " warp " << suite_->peer_warp() << std::endl;
+      return std::cout << "  ";
+    };
+    auto check = [&](bool ok, const char* what, uint32_t got, uint32_t expected) {
+      if (!ok)
+        fail() << what << "=0x" << std::hex << got << " expected 0x" << expected
+               << std::dec << std::endl;
+    };
+    for (auto [out, role] : {std::pair{a, "holder"}, std::pair{b, "peer"}}) {
+      if (out[LRSC_PEER_RAN] != 1)
+        fail() << role << " did not run" << std::endl;
+      else if (out[LRSC_PEER_TIMEOUT] != 0)
+        fail() << role << " gave up after " << out[LRSC_PEER_POLLS]
+               << " polls for the other role" << std::endl;
+    }
+    // The value checks assume both roles ran in step; otherwise they mislead.
+    if (errors != 0)
+      return errors;
+    check(a[LRSC_PEER_A_LR] == LRSC_PEER_X_SEED, "holder's LR of X",
+          a[LRSC_PEER_A_LR], LRSC_PEER_X_SEED);
+    if (b[LRSC_PEER_B_SC] == 0)
+      fail() << "peer's SC on X succeeded on the holder's reservation" << std::endl;
+    check(b[LRSC_PEER_B_SEEN] == LRSC_PEER_X_SEED, "X read by the peer after its SC",
+          b[LRSC_PEER_B_SEEN], LRSC_PEER_X_SEED);
+    if (a[LRSC_PEER_A_LIVE] != 0)
+      fail() << "holder's SC on X failed after the peer's SC: its reservation was not live"
+             << std::endl;
+    check(a[LRSC_PEER_A_LR2] == LRSC_PEER_A_LIVE_VALUE, "holder's second LR of X",
+          a[LRSC_PEER_A_LR2], LRSC_PEER_A_LIVE_VALUE);
+    check(b[LRSC_PEER_B_PREV] == LRSC_PEER_A_LIVE_VALUE, "X found by the peer's swap",
+          b[LRSC_PEER_B_PREV], LRSC_PEER_A_LIVE_VALUE);
+    if (b[LRSC_PEER_B_CTRL] != 0)
+      fail() << "peer's control SC on Y failed" << std::endl;
+    check(y == LRSC_PEER_Y_SEED + 1, "Y", y, LRSC_PEER_Y_SEED + 1);
+    if (a[LRSC_PEER_A_SC] == 0)
+      fail() << "holder's SC on X succeeded after the peer's swap" << std::endl;
+    check(x == LRSC_PEER_B_SWAP_VALUE, "X", x, LRSC_PEER_B_SWAP_VALUE);
+    return errors;
+  }
+};
+
 inline TestSuite::TestSuite(vx_device_h device) : device_(device) {
-  // Test_ATOMIC_CRITICAL needs to know VX_CFG_NUM_THREADS to compute the
-  // expected count; query it from the device caps.
-  uint64_t num_threads = 0;
-  vx_dev_caps(device, VX_CAPS_NUM_THREADS, &num_threads);
+  uint64_t num_clusters, num_cores, num_warps, num_threads;
+  RT_CHECK(vx_device_query(device, VX_CAPS_NUM_CLUSTERS, &num_clusters));
+  RT_CHECK(vx_device_query(device, VX_CAPS_NUM_CORES, &num_cores));
+  RT_CHECK(vx_device_query(device, VX_CAPS_NUM_WARPS, &num_warps));
+  RT_CHECK(vx_device_query(device, VX_CAPS_NUM_THREADS, &num_threads));
+  num_cores_ = (uint32_t)num_cores;
+  num_warps_ = (uint32_t)num_warps;
+
+  // lrsc_peer's peer is the first core of the last cluster: it holds core 0's
+  // position within its cluster, so only the cluster part of the global core
+  // id tells the two harts apart. One cluster takes core 1, one core warp 1.
+  if (num_clusters > 1) {
+    peer_core_ = (uint32_t)((num_clusters - 1) * (num_cores / num_clusters));
+  } else if (num_cores > 1) {
+    peer_core_ = 1;
+  } else {
+    peer_warp_ = 1;
+  }
 
   add_test(new Test_AMOADD(this));
   add_test(new Test_AMOOR(this));
@@ -502,6 +660,11 @@ inline TestSuite::TestSuite(vx_device_h device) : device_(device) {
   add_test(new Test_CAS_LADDER(this));
   add_test(new Test_CAS_LMEM(this));
 #endif
+  add_test(new Test_LRSC_FOREIGN(this, "lrsc_foreign", (uint32_t)num_threads,
+                                 LRSC_LLC_STATIONS));
+  add_test(new Test_LRSC_FOREIGN(this, "lrsc_foreign_lmem", (uint32_t)num_threads,
+                                 LRSC_LMEM_STATIONS));
+  add_test(new Test_LRSC_PEER(this));
 }
 
 inline TestSuite::~TestSuite() {

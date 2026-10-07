@@ -106,6 +106,7 @@ module VX_cache_mshr import VX_gpu_pkg::*; #(
     input wire [WORD_SEL_WIDTH-1:0]     allocate_word_idx,
     input wire                          allocate_rw,
     input wire                          allocate_is_amo, // AMO: never coalesce
+    input wire                          allocate_amo_store, // AMO that stores: orders as a write
     input wire [DATA_WIDTH-1:0]         allocate_data,
     output wire [MSHR_ADDR_WIDTH-1:0]   allocate_id,
     output wire                         allocate_pending,
@@ -152,6 +153,9 @@ module VX_cache_mshr import VX_gpu_pkg::*; #(
     // amo_mask is the per-entry AMO flag, zero when AMO_ENABLE=0 so the
     // mask folds out of addr_matches and the probe logic disappears.
     wire [MSHR_SIZE-1:0] amo_mask;
+    // Entries that change their word although write_table has them as reads:
+    // a store-bearing atomic carries rw=0. Zero where no atomic commits.
+    wire [MSHR_SIZE-1:0] amo_store_mask;
 
     reg allocate_rdy, allocate_rdy_n;
     reg [MSHR_ADDR_WIDTH-1:0] allocate_id_r, allocate_id_n;
@@ -370,9 +374,20 @@ module VX_cache_mshr import VX_gpu_pkg::*; #(
         end
         // Never-coalesce applies only to passthrough entries (non-LLC): each
         // atomic needs its own downstream round-trip. At the LLC, AMOs chain
-        // in arrival order like any request; the probe outputs alone provide
-        // the same-line ordering guard.
+        // in arrival order like any request; amo_table feeds only the
+        // input-guard probes, and per-word order comes from the allocate
+        // hazard (amo_store_table).
         assign amo_mask = (AMO_PASSTHRU != 0) ? amo_table : '0;
+
+        // A passthrough entry never matches (amo_mask), so only the level
+        // that commits atomics keeps the flag.
+        reg [MSHR_SIZE-1:0] amo_store_table;
+        always @(posedge clk) begin
+            if (allocate_fire) begin
+                amo_store_table[allocate_id] <= allocate_amo_store;
+            end
+        end
+        assign amo_store_mask = (AMO_PASSTHRU != 0) ? '0 : amo_store_table;
 
         wire [MSHR_SIZE-1:0] probe_ld, probe_amo;
         for (genvar i = 0; i < MSHR_SIZE; ++i) begin : g_probe_matches
@@ -407,11 +422,12 @@ module VX_cache_mshr import VX_gpu_pkg::*; #(
         assign persist_amo = finalize_valid && ~finalize_is_release &&  amo_table[finalize_id];
     end else begin : g_no_amo
         assign amo_mask = '0;
+        assign amo_store_mask = '0;
         assign probe_pending_ld  = 1'b0;
         assign probe_pending_amo = 1'b0;
         assign {probe_any_ld, probe_any_amo, persist_ld, persist_amo} = '0;
         `UNUSED_PARAM (AMO_PASSTHRU)
-        `UNUSED_VAR ({allocate_is_amo, probe_addr})
+        `UNUSED_VAR ({allocate_is_amo, allocate_amo_store, probe_addr})
     end
 
     assign allocate_ready = allocate_rdy;
@@ -433,13 +449,14 @@ module VX_cache_mshr import VX_gpu_pkg::*; #(
     for (genvar i = 0; i < MSHR_SIZE; ++i) begin : g_word_matches
         assign word_matches[i] = (word_table[i] == allocate_word_idx);
     end
-    // The probed word's chain holds a WRITE that has not reached the data array
-    // yet. A same-word hit completing ahead of it would read pre-store data (or
-    // a write-hit would be overwritten by the older store's replay), inverting
-    // arrival order — the bank demotes such a hit to a chained miss.
-    assign allocate_pending_wr  = |(addr_matches & write_table & word_matches);
-    // Any undrained same-word entry: an incoming WRITE hit must not land ahead
-    // of an older chained read of the same word.
+    // The probed word's chain holds a WRITE, or an atomic that stores, that has
+    // not reached the data array yet. A same-word hit completing ahead of it
+    // would read pre-store data (or a write-hit would be overwritten by the
+    // older store's replay), inverting arrival order — the bank demotes such a
+    // hit to a chained miss.
+    assign allocate_pending_wr  = |(addr_matches & (write_table | amo_store_mask) & word_matches);
+    // Any undrained same-word entry: an incoming hit that changes the word must
+    // not land ahead of an older chained read of it.
     assign allocate_pending_ovl = |(addr_matches & word_matches);
 
     assign dequeue_valid = dequeue_val;

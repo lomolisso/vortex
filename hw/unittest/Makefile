@@ -66,6 +66,57 @@ run-fpu:
 	$(MAKE) -C fcvt_unit run
 	$(MAKE) -C fdivsqrt_unit run
 
+# Local memory — LSU atomics racing the DMA row port, executed with the A
+# extension, again with Zacas so the compare-and-swap operand path is covered,
+# and once with atomics off so the load/store/DMA path runs with the atomic
+# hardware compiled out.
+# Each config rebuilds: CONFIGS is not a make dependency of the testbench.
+LMEM_BASE := -DVX_CFG_EXT_A_ENABLE
+define lmem_case
+	$(MAKE) -C local_mem clean
+	$(MAKE) -C local_mem CONFIGS="$(1)"
+	$(MAKE) -C local_mem run CONFIGS="$(1)"
+endef
+run-lmem:
+	$(call lmem_case,$(LMEM_BASE))
+	$(call lmem_case,$(LMEM_BASE) -DVX_CFG_EXT_ZACAS_ENABLE)
+	$(call lmem_case,)
+
+# Cache bank in the last-level role: directed fill/replay races around the
+# atomic engine and the MSHR chains plus randomized traffic, checked against a
+# reference memory. Nine sets: the synthesis-gate DUT as configured; the L1
+# dcache LLC as built (2 ports and 2 banks, behind an unbuffered request
+# crossbar) with Zacas; one LSU channel into one bank; a deferred data stage
+# (LATENCY=3); write-through, also with two deferred stages (LATENCY=4); the
+# L2/L3 shape (word = sector, 2-sector lines, 2 memory ports); and atomics
+# compiled out, write-back and write-through, as in the default build, whose
+# load/store ordering is the same bank logic.
+# Each set rebuilds: CONFIGS and CACHE_PARAMS are not make dependencies, so an
+# extra run goes in the call that builds its set.
+CACHE_BASE := -DVX_CFG_EXT_A_ENABLE
+CACHE_L2   := WORD_SIZE=64 LINE_SIZE=128 SECTOR_SIZE=64 NUM_WAYS=8 LATENCY=4 NUM_BANKS=2 MEM_PORTS=2 CACHE_SIZE=32768
+# $(1)=CONFIGS $(2)=CACHE_PARAMS $(3)=OPTS of an extra run on the same build
+define cache_case
+	$(MAKE) -C cache clean
+	$(MAKE) -C cache CONFIGS="$(1)" CACHE_PARAMS="$(2)"
+	$(MAKE) -C cache run CONFIGS="$(1)" CACHE_PARAMS="$(2)"
+	$(if $(3),$(MAKE) -C cache run CONFIGS="$(1)" CACHE_PARAMS="$(2)" OPTS="$(3)")
+endef
+# Long stress, memory accepting 30% of the time: it shifts when fills and
+# replays arrive, and response stalls (85% ready) hold the pipe across an
+# atomic's settling writeback, the case the settle sweep directs.
+CACHE_STALL := --tests=stress --seed=2 --stress-seeds=16 --stress-cycles=40000 --mem-ready=30
+run-cache:
+	$(call cache_case,$(CACHE_BASE),)
+	$(call cache_case,$(CACHE_BASE) -DVX_CFG_EXT_ZACAS_ENABLE,NUM_REQS=2 NUM_BANKS=2,$(CACHE_STALL))
+	$(call cache_case,$(CACHE_BASE),NUM_REQS=1 NUM_BANKS=1)
+	$(call cache_case,$(CACHE_BASE) -DVX_CFG_EXT_ZACAS_ENABLE,NUM_BANKS=2 LATENCY=3)
+	$(call cache_case,$(CACHE_BASE),WRITEBACK=0 NUM_REQS=2)
+	$(call cache_case,$(CACHE_BASE),WRITEBACK=0 NUM_REQS=2 LATENCY=4)
+	$(call cache_case,$(CACHE_BASE) -DVX_CFG_EXT_ZACAS_ENABLE,$(CACHE_L2))
+	$(call cache_case,,AMO_ENABLE=0)
+	$(call cache_case,,AMO_ENABLE=0 WRITEBACK=0 NUM_REQS=2)
+
 # TCU FEDP datapath — executed per format so a tcu/tfr change is gated by CI.
 # Each format must enable its own RTL datapath (FP16-only is the default). Covers
 # the native TFR and the DPI reference. Float formats compare against the windowed

@@ -326,10 +326,7 @@ public:
     // DxaCore::lmem_req_out[c] → core's LocalMem.Inputs[port_dxa].
     // A tx_callback on the channel fires barrier_event_release for each
     // DXA-write packet carrying notify_done at the cycle LMEM receives it.
-    uint32_t port_dxa = LSU_NUM_REQS;
-  #ifdef VX_CFG_EXT_TCU_ENABLE
-    port_dxa += 1;
-  #endif
+    uint32_t port_dxa = Core::LMEM_DXA_PORT;
     for (uint32_t c = 0; c < cores_per_socket; ++c) {
       Core* core = cores_.at(c).get();
       for (uint32_t p = 0; p < DxaCore::LMEM_PORTS_PER_CORE; ++p) {

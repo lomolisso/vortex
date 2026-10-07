@@ -7,7 +7,10 @@ defaults:
   configs: "-DVX_CFG_EXT_A_ENABLE"
   xlen: [32, 64]
   tier: smoke
-  touches: [hw/rtl/cache, hw/rtl/mem, hw/rtl/core/VX_decode.sv, hw/rtl/core/VX_lsu_slice.sv, sim/simx/amo, sim/simx/mem]
+  touches: [hw/rtl/cache, hw/rtl/mem, hw/rtl/core/VX_decode.sv, hw/rtl/core/VX_lsu_slice.sv,
+            hw/rtl/VX_gpu_pkg.sv, hw/rtl/Vortex.sv, hw/rtl/VX_cluster.sv, hw/rtl/VX_socket.sv,
+            sim/simx/amo, sim/simx/mem, sim/simx/processor.cpp, sim/simx/cluster.cpp,
+            sim/simx/socket.cpp]
 tests:
   # RISC-V 'A' ISA conformance (rv{XLEN}ua-p-{amo*,lrsc}); shares the A-built sim.
   - id: isa-conformance
@@ -26,6 +29,91 @@ tests:
     app: amo
     drivers: [simx, rtlsim]
     configs+: "-DVX_CFG_EXT_ZACAS_ENABLE"
+  # Fewer LSU lanes than threads, so a warp's request is split into packets and
+  # threads a lane-width apart ride the same LSU lane. Each must still hold its
+  # own LR/SC reservation.
+  - id: lsu-lanes2
+    app: amo
+    drivers: [simx, rtlsim]
+    configs+: "-DVX_CFG_NUM_LSU_LANES=2"
+    touches: [hw/rtl/cache, hw/rtl/mem, hw/rtl/core/VX_decode.sv, hw/rtl/core/VX_lane_dispatch.sv,
+              hw/rtl/core/VX_lsu_slice.sv, hw/rtl/VX_gpu_pkg.sv, sim/simx/amo, sim/simx/mem]
+  # The same split made at dispatch: a SIMD width below the thread count
+  # narrows the LSU lanes with every other unit's.
+  - id: simd2
+    app: amo
+    drivers: [simx, rtlsim]
+    configs+: "-DVX_CFG_SIMD_WIDTH=2"
+    touches: [hw/rtl/cache, hw/rtl/mem, hw/rtl/core/VX_decode.sv, hw/rtl/core/VX_lane_dispatch.sv,
+              hw/rtl/core/VX_lsu_slice.sv, hw/rtl/VX_gpu_pkg.sv, sim/simx/amo, sim/simx/mem]
+  # Local-memory atomics racing DXA tile writes on the same banks: a DXA beat
+  # landing inside an atomic's read-modify-write must not drop its write-back.
+  - id: lmem-dma
+    app: lmem_amo_dma
+    drivers: [simx, rtlsim]
+    configs+: "-DVX_CFG_EXT_DXA_ENABLE"
+    touches: [hw/rtl/cache, hw/rtl/mem, hw/rtl/core/VX_decode.sv, hw/rtl/core/VX_lsu_slice.sv,
+              hw/rtl/core/VX_mem_unit.sv, hw/rtl/dxa, hw/rtl/VX_gpu_pkg.sv, sim/simx/amo,
+              sim/simx/mem, sim/simx/dxa]
+  # SimX<->rtlsim cycle parity on the same race. At -n150 the copies finish
+  # first, so every hammer runs exactly its minimum and instret is exact.
+  - id: parity-lmem-dma
+    check: model_parity
+    app: lmem_amo_dma
+    configs+: "-DVX_CFG_EXT_DXA_ENABLE"
+    args: "-n150"
+  # A DXA write into local memory is a write by another device: it must break
+  # the LR/SC reservation on every word it writes, and only on those.
+  - id: lrsc-dma
+    app: lmem_lrsc_dma
+    drivers: [simx, rtlsim]
+    configs+: "-DVX_CFG_EXT_DXA_ENABLE"
+    touches: [hw/rtl/cache, hw/rtl/mem, hw/rtl/core/VX_decode.sv, hw/rtl/core/VX_lsu_slice.sv,
+              hw/rtl/core/VX_mem_unit.sv, hw/rtl/dxa, hw/rtl/VX_gpu_pkg.sv, sim/simx/amo,
+              sim/simx/mem, sim/simx/dxa]
+  # 32 warps issue two-wide, so two LSU blocks share every local-memory bank.
+  # Each bank must arbitrate fairly between the blocks: block 0's LR/SC
+  # retries must not lock block 1's out of the counter's bank.
+  - id: lmem-2blocks
+    app: amo
+    drivers: [simx, rtlsim]
+    shape: {warps: 32, threads: 8}
+    args: "-n8 -tlrsc_lmem"
+    touches: [hw/rtl/cache, hw/rtl/mem, hw/rtl/core/VX_decode.sv, hw/rtl/core/VX_lsu_slice.sv,
+              hw/rtl/core/VX_mem_unit.sv, hw/rtl/libs/VX_stream_xbar.sv, hw/rtl/libs/VX_stream_arb.sv,
+              hw/rtl/libs/VX_generic_arbiter.sv, hw/rtl/libs/VX_rr_arbiter.sv,
+              hw/rtl/VX_gpu_pkg.sv, sim/simx/amo, sim/simx/mem, sim/simx/types.h]
+  # One LSU block's warps poll a local-memory flag with atomics while a warp
+  # of each other block in turn sets it; a starved setter fails the bounded
+  # pollers. Both 16-input shapes make the bank arbiter a two-level tree (8:1
+  # slices, then a 2:1 join); with four blocks, blocks 0 and 1 share a slice.
+  # The 8-input flat shape keeps a single round-robin arbiter.
+  - id: lmem-fairness
+    app: lmem_fairness
+    drivers: [simx, rtlsim]
+    shape: {warps: 32, threads: 8}
+    touches: [hw/rtl/mem, hw/rtl/core/VX_lsu_slice.sv, hw/rtl/core/VX_mem_unit.sv,
+              hw/rtl/libs/VX_stream_xbar.sv, hw/rtl/libs/VX_stream_arb.sv,
+              hw/rtl/libs/VX_generic_arbiter.sv, hw/rtl/libs/VX_rr_arbiter.sv,
+              hw/rtl/VX_gpu_pkg.sv, sim/simx/mem, sim/simx/types.h]
+  - id: lmem-fairness-4blocks
+    app: lmem_fairness
+    drivers: [simx, rtlsim]
+    shape: {warps: 64, threads: 4}
+    tier: full
+    touches: [hw/rtl/mem, hw/rtl/core/VX_lsu_slice.sv, hw/rtl/core/VX_mem_unit.sv,
+              hw/rtl/libs/VX_stream_xbar.sv, hw/rtl/libs/VX_stream_arb.sv,
+              hw/rtl/libs/VX_generic_arbiter.sv, hw/rtl/libs/VX_rr_arbiter.sv,
+              hw/rtl/VX_gpu_pkg.sv, sim/simx/mem, sim/simx/types.h]
+  - id: lmem-fairness-flat
+    app: lmem_fairness
+    drivers: [simx, rtlsim]
+    shape: {warps: 32, threads: 4}
+    tier: full
+    touches: [hw/rtl/mem, hw/rtl/core/VX_lsu_slice.sv, hw/rtl/core/VX_mem_unit.sv,
+              hw/rtl/libs/VX_stream_xbar.sv, hw/rtl/libs/VX_stream_arb.sv,
+              hw/rtl/libs/VX_generic_arbiter.sv, hw/rtl/libs/VX_rr_arbiter.sv,
+              hw/rtl/VX_gpu_pkg.sv, sim/simx/mem, sim/simx/types.h]
   # Write-back D-cache variants (rtlsim only in the legacy suite).
   - id: wb-dirtybytes0
     app: amo
@@ -45,6 +133,31 @@ tests:
     drivers: [simx, rtlsim]
     shape: {threads: 8}
     args: "-n1"
+  # Eight threads split into four LSU packets: a reservation holder's warp
+  # siblings and the other warps all issue their LRs inside its LR->SC window.
+  # Every contended retry loop, global and local, must still make progress.
+  # The split-warp starvation at 4 warps reproduces at RV32 at this size.
+  - id: threads8-lanes2
+    app: amo
+    drivers: [simx, rtlsim]
+    xlen: [32]
+    shape: {threads: 8}
+    configs+: "-DVX_CFG_NUM_LSU_LANES=2"
+    args: "-n8 -tlrsc_counter -tlrsc_counter_aqrl -tlrsc_lmem"
+    touches: [hw/rtl/cache, hw/rtl/mem, hw/rtl/core/VX_decode.sv, hw/rtl/core/VX_lane_dispatch.sv,
+              hw/rtl/core/VX_lsu_slice.sv, hw/rtl/core/VX_mem_unit.sv, hw/rtl/VX_gpu_pkg.sv,
+              sim/simx/amo, sim/simx/mem]
+  # The same with eight warps: 64 harts contend, and a fixed 7-refusal budget
+  # starves here.
+  - id: warps8-threads8-lanes2
+    app: amo
+    drivers: [simx, rtlsim]
+    shape: {warps: 8, threads: 8}
+    configs+: "-DVX_CFG_NUM_LSU_LANES=2"
+    args: "-n1 -tlrsc_counter -tlrsc_counter_aqrl -tlrsc_lmem"
+    touches: [hw/rtl/cache, hw/rtl/mem, hw/rtl/core/VX_decode.sv, hw/rtl/core/VX_lane_dispatch.sv,
+              hw/rtl/core/VX_lsu_slice.sv, hw/rtl/core/VX_mem_unit.sv, hw/rtl/VX_gpu_pkg.sv,
+              sim/simx/amo, sim/simx/mem]
   # Multi-core AMO across a shared cache hierarchy (atomics resolve at the LLC).
   # 4x L1 -> 1x L2 (multi-core base configuration).
   - id: mc-l2
@@ -53,6 +166,19 @@ tests:
     shape: {cores: 4, l2cache: true}
     args: "-n8"
     tier: full
+  # 4 cores of 8 warps x 8 threads behind one L2, each warp split into LSU
+  # packets of 2: 256 harts contend for one word, and the LLC hold budget
+  # rises above its 63-refusal floor.
+  - id: mc-l2-w8t8-lanes2
+    app: amo
+    drivers: [simx, rtlsim]
+    shape: {cores: 4, l2cache: true, warps: 8, threads: 8}
+    configs+: "-DVX_CFG_NUM_LSU_LANES=2"
+    args: "-n1 -tlrsc_counter -tlrsc_counter_aqrl"
+    tier: full
+    touches: [hw/rtl/cache, hw/rtl/mem, hw/rtl/core/VX_decode.sv, hw/rtl/core/VX_lane_dispatch.sv,
+              hw/rtl/core/VX_lsu_slice.sv, hw/rtl/core/VX_mem_unit.sv, hw/rtl/VX_gpu_pkg.sv,
+              sim/simx/amo, sim/simx/mem]
   # 4x L2 -> 1x L3 (two-level hierarchy). L2 must be write-through above the LLC.
   - id: mc-l3
     app: amo
@@ -61,3 +187,56 @@ tests:
     shape: {cores: 4, l2cache: true, l3cache: true}
     args: "-n8"
     tier: full
+  # Two clusters of two cores behind one L3 LLC, which holds reservations from
+  # both clusters: core c of one cluster must not pass for core c of the other.
+  # lrsc_peer pairs core 0 with the first core of the last cluster.
+  - id: mc-xcluster-l3
+    app: amo
+    drivers: [simx, rtlsim]
+    configs+: "-DVX_CFG_L2_WRITEBACK=0"
+    shape: {clusters: 2, cores: 2, l2cache: true, l3cache: true}
+    args: "-n8 -tlrsc_counter -tlrsc_counter_aqrl -tlrsc_peer"
+  # The same with the L1s feeding the L3 directly.
+  - id: mc-xcluster-l3-nol2
+    app: amo
+    drivers: [simx, rtlsim]
+    shape: {clusters: 2, cores: 2, l3cache: true}
+    args: "-n8 -tlrsc_counter -tlrsc_counter_aqrl -tlrsc_peer"
+    tier: full
+  # Per-word order of atomics while a line fills (cache_order): a hart's
+  # amoadd or LR after its own store, an amoadd racing another warp's store, a
+  # hart's load after its own amoadd, and every hart's adds on cold and
+  # resident lines of one bank, none lost. One core: the dcache is the
+  # write-back last level.
+  - id: cache-order
+    app: cache_order
+    drivers: [simx, rtlsim]
+    args: "-tstore_amo -tstore_lr -tamo_store -tamo_load -tamo_storm"
+    touches: [hw/rtl/cache, hw/rtl/mem, hw/rtl/core/VX_decode.sv, hw/rtl/core/VX_lsu_slice.sv,
+              hw/rtl/VX_gpu_pkg.sv, hw/rtl/Vortex.sv, hw/rtl/VX_cluster.sv, hw/rtl/VX_socket.sv,
+              sim/simx/amo, sim/simx/mem, sim/simx/processor.cpp, sim/simx/cluster.cpp,
+              sim/simx/socket.cpp, tests/regression/cache_order]
+  # The atomics execute at a write-back L2 under write-through L1s. The L1
+  # passthrough's input guard usually holds a hart's atomic behind its own older
+  # accesses there (with known windows), so this shape runs the races between harts.
+  - id: cache-order-l2
+    app: cache_order
+    drivers: [simx, rtlsim]
+    shape: {cores: 4, l2cache: true}
+    args: "-tamo_store -tamo_storm"
+    touches: [hw/rtl/cache, hw/rtl/mem, hw/rtl/core/VX_decode.sv, hw/rtl/core/VX_lsu_slice.sv,
+              hw/rtl/VX_gpu_pkg.sv, hw/rtl/Vortex.sv, hw/rtl/VX_cluster.sv, hw/rtl/VX_socket.sv,
+              sim/simx/amo, sim/simx/mem, sim/simx/processor.cpp, sim/simx/cluster.cpp,
+              sim/simx/socket.cpp, tests/regression/cache_order]
+  # One write-through dcache shared by four cores is the last level: an
+  # atomic and a younger store to its word must also reach memory in order.
+  - id: cache-order-shared
+    app: cache_order
+    drivers: [simx, rtlsim]
+    configs+: "-DVX_CFG_SOCKET_SIZE=4"
+    shape: {cores: 4}
+    args: "-tstore_amo -tstore_lr -tamo_store -tamo_storm"
+    touches: [hw/rtl/cache, hw/rtl/mem, hw/rtl/core/VX_decode.sv, hw/rtl/core/VX_lsu_slice.sv,
+              hw/rtl/VX_gpu_pkg.sv, hw/rtl/Vortex.sv, hw/rtl/VX_cluster.sv, hw/rtl/VX_socket.sv,
+              sim/simx/amo, sim/simx/mem, sim/simx/processor.cpp, sim/simx/cluster.cpp,
+              sim/simx/socket.cpp, tests/regression/cache_order]

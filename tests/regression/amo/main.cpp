@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <iostream>
 #include <vector>
 #include <unordered_set>
@@ -88,8 +89,12 @@ int main(int argc, char *argv[]) {
   // Shared region: contended tests use the first word (a full line so
   // AMOs stay on one bank). self_consistency uses one private 64B line
   // per hart (shared + hart_id*64) to test issuer self-consistency
-  // WITHOUT false sharing. Size to the larger of the two needs.
-  const size_t shared_bytes  = (size_t)num_harts * 64;
+  // WITHOUT false sharing, the lrsc_foreign cases one last-level-cache
+  // line per thread of a warp, and lrsc_peer its LRSC_PEER_LINES lines.
+  // Size to the largest need.
+  const size_t shared_bytes  = std::max({(size_t)num_harts * 64,
+                                         (size_t)num_threads * LLC_LINE_SIZE,
+                                         (size_t)LRSC_PEER_LINES * LLC_LINE_SIZE});
   const size_t per_hart_bytes = num_harts * sizeof(uint32_t);
 
   RT_CHECK(vx_buffer_create(device, shared_bytes,   VX_MEM_READ_WRITE, &shared_buffer));
@@ -106,6 +111,8 @@ int main(int argc, char *argv[]) {
 
   testSuite = new TestSuite(device);
   if (testid_e == 0) testid_e = (int)testSuite->size() - 1;
+  kernel_arg.peer_core = testSuite->peer_core();
+  kernel_arg.peer_warp = testSuite->peer_warp();
 
   RT_CHECK(vx_module_load_file(device, kernel_file, &module_));
   RT_CHECK(vx_module_get_kernel(module_, "main", &kernel));
@@ -118,15 +125,8 @@ int main(int argc, char *argv[]) {
     if (!selected.empty() && selected.count(name) == 0) continue;
     if (!excluded.empty() && excluded.count(name) != 0) continue;
 
-    // atomic_critical uses non-atomic load/store inside a lock-protected
-    // critical section. That pattern requires L1↔L1 cache coherence,
-    // which Vortex does not implement (each core's L1 is private; AMOs
-    // commit at the LLC and only invalidate the issuing core's L1).
-    // The lock itself works correctly across cores, but the unprotected
-    // counter read/write inside the CS observes stale L1 copies on
-    // other cores. Skip on multi-core configs.
-    if (name == std::string("atomic_critical") && num_cores > 1) {
-      std::cout << "Test" << t << "-" << name << " SKIPPED (multi-core)" << std::endl;
+    if (auto reason = test->skip_reason()) {
+      std::cout << "Test" << t << "-" << name << " SKIPPED (" << reason << ")" << std::endl;
       continue;
     }
 
@@ -144,9 +144,15 @@ int main(int argc, char *argv[]) {
 
     vx_event_h launch_ev = nullptr, read_ev0 = nullptr, read_ev1 = nullptr;
     {
-      uint32_t n = num_harts;
       uint32_t grid_dim[1], block_dim[1];
-      RT_CHECK(vx_device_max_occupancy_grid(device, 1, &n, grid_dim, block_dim));
+      const uint32_t block = test->block_threads();
+      if (block != 0) {
+        grid_dim[0]  = 1;
+        block_dim[0] = block;
+      } else {
+        uint32_t n = num_harts;
+        RT_CHECK(vx_device_max_occupancy_grid(device, 1, &n, grid_dim, block_dim));
+      }
       vx_launch_info_t li = {};
       li.struct_size  = sizeof(li);
       li.kernel       = kernel;

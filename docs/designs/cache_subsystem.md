@@ -379,6 +379,53 @@ invalidated and be orphaned with nothing to wake it. Excluded, the requester
 proceeds as a fresh hit or miss — safe, because a draining chain implies its fill
 has already completed.
 
+**Per-word order is the contract.** A bank applies the requests to one word in
+the order it accepted them, whichever path each takes: hit, chained miss, fill
+forward, or atomic commit. On one port that is the port's order, and a hart's
+requests reach a bank through one port in program order
+([lsu_pipeline_design.md](lsu_pipeline_design.md)), so at the LLC a hart sees
+its own same-address loads, stores and atomics in program order, as RVWMO
+requires. Across ports it is the order in which the bank accepted the requests;
+harts that need more than that synchronize. Requests to different words carry
+no order. Above the LLC, an atomic's order against the hart's plain accesses is
+subject to the input-guard windows in
+[multicache_amo_coherence.md](multicache_amo_coherence.md) §10.
+
+**So a hit cannot always complete.** While a chain drains, its line is resident
+and a new request to it hits, yet chained entries that arrived earlier have not
+replayed. Completing the hit would let a load read a word before an older
+chained store reaches it, or let a store land before an older chained load
+reads. At S0 the bank therefore probes the chain for the request's *word*:
+
+| the chain still holds, for that word | a hit is demoted when it is |
+|---|---|
+| a store, or an atomic other than `LR` | any request |
+| any entry | a store, or an atomic other than `LR` |
+
+A demoted hit becomes a chained miss. It keeps its MSHR entry, links onto the
+chain's tail, issues no fill, leaves the data array untouched on this pass — a
+demoted store writes the array only at its replay — and replays in arrival
+order. The entry the MSHR is dequeuing this cycle is hidden from the probe (the
+subtlety above), so when it and the prober meet on one word and either changes
+it, the replay is held a cycle and the prober links behind it.
+
+The probe is word-granular: hits to the other words of a draining line — the
+common case when a warp streams through a sector — keep the fast path, and so
+does a load behind chained loads. It is not gated on the chain's fill status.
+A write-through bank does not count a chained store as pending, because the
+store went downstream when it was accepted and only its merge into the line
+waits; that store still orders a younger hit to its word, and the demoted hit
+is marked pending so it stays in the MSHR.
+
+**Atomics obey it where they commit.** Every atomic but `LR` counts as a store
+on both sides of the probe although it travels as `rw = 0` — an `SC` that will
+fail included, since its outcome is known only at commit — and an `LR` counts
+as a load. Above the LLC a forwarded atomic is exempt: its entry never
+chains, the LLC orders it against other atomics and stores, and the forwarding
+level keeps it apart from the hart's plain accesses by other means
+([multicache_amo_coherence.md](multicache_amo_coherence.md) §5.2–5.3),
+subject to the input-guard windows listed there in §10.
+
 ### 4.6 Fill buffer and fill forwarding
 
 ![Miss, chain, and fill](../assets/img/cache_miss_sequence.svg)
@@ -394,8 +441,11 @@ into the response queue. No pipeline traversal, and the input arbiter stays open
 to new requests. This removes the read-after-fill round trip from miss latency.
 
 The window closes on the **first write or AMO head**. That head and every later
-chain entry replay through the pipeline as usual, preserving program order: an
-older store must merge before a younger same-line read responds.
+chain entry replay through the pipeline as usual, which keeps the per-word order
+of §4.5: an older store must merge before a younger read of its word responds.
+The forward cycles are also when a new request can reach the freshly filled
+line while older entries still wait in the chain — the case §4.5's probe
+demotes.
 
 Two details make it correct:
 
@@ -759,11 +809,35 @@ closely enough to be a parity oracle:
 |---|---|---|
 | Bank pipeline | `PIPELINE_STAGES = LATENCY` register stages | `TFifo` of depth `config.latency`; one request processed per tick |
 | Input priority | `init > replay > fill > flush > creq` | `replay > fill > flush > core_req` |
+| Core request crossbar | round-robin per bank; above 12 inputs a tree of 8-input slices | round-robin per bank over all inputs |
+| Core response crossbar | `VX_stream_omega`, round-robin; small shapes fall back to a flat crossbar | flat crossbar, round-robin per requester port; the pointer moves only on an accepted response |
 | MSHR | linked chain, keyed `{line, sector}` | `class MSHR`, linear scan, keyed `(set_id, addr_tag, sector_id)` |
 | Sectors | per-sector valid/dirty | `sector_t` with per-byte `dirty_mask` |
 | Fill forwarding | leading run of plain reads, closes on write/AMO | `processForward()`, identical closing rule |
+| Hit under a draining chain | demoted per word (§4.5) | joins the chain per `{line, sector}` when the chain holds a store or an atomic, or the request is one |
 | AMOs | LLC commits, non-LLC probes and forwards | `amo_unit_` at LLC; `AmoProbe` above it |
 | Flush | per-bank set × way walk | per-bank set × way × sector walk |
+
+**Known gap: a replay in flight is invisible at pipe exit.** A chained request
+that leaves the MSHR to replay re-enters the bank pipe behind any younger
+same-line request already in it. When the younger request leaves the pipe, the
+older one is no longer in the MSHR, so the pipe-exit order checks miss it and
+the younger request commits first. At a write-through LLC, atomics and the
+stores held behind them stay tracked from admission to commit
+(`commit_writers_`), which closes the window for them. Two shapes remain open,
+found by reading the code and not reproduced:
+
+- at a write-through bank, a store admitted behind a fill overtakes an older
+  chained load whose fill forward falls back to replay under core-response
+  back-pressure, and the load returns the store's data;
+- at a write-back bank, a store admitted while a chain of loads drains through
+  the fill forward overtakes the chain's last load when that load falls back
+  to replay.
+
+In the RTL the load stays in the MSHR until it replays, so the store is demoted
+behind it (§4.5). No test reaches either window. The fix is to make every
+in-flight replay visible at pipe exit, extending the `commit_writers_`
+bookkeeping to all ordered chain entries.
 
 `Cache::Config` fields: `bypass, C, L, S, W, A, B, addr_width, num_inputs,
 mem_ports, write_back, write_reponse, mshr_size, latency, repl_policy, is_llc`
@@ -991,11 +1065,25 @@ the same set plus `mem_latency`, accumulated as `pending_fill_reqs_` per tick.
 ## 10. Verification
 
 - [hw/unittest/cache/](../../hw/unittest/cache/) — a standalone Verilator bench
-  (`VX_cache_top.sv`) parameterized from the dcache defaults.
+  (`VX_cache_top.sv`) parameterized from the dcache defaults. It drives the
+  cache in the last-level role against a reference memory that applies each
+  word's requests in acceptance order (§4.5): directed sweeps release a held
+  fill at every cycle offset around a racing load, store or atomic, and a
+  randomized run mixes them under random latency and back-pressure.
+  `make -C hw/unittest run-cache` runs it over write-back and write-through
+  banks, two-stage and deferred pipelines, the L1 and L2/L3 geometries, and two
+  builds with atomics compiled out, plus a long randomized run under
+  back-pressure.
+- [tests/regression/cache_order](../../tests/regression/cache_order) — the same
+  order end to end: a hart's load after its own store and its store after its
+  own load on a filling line, and with the A extension the atomic variants.
+  The `cache:order*` and `amo:cache-order*` cases run it on both simulators
+  with a write-back dcache, write-through L1s under an L2, and one
+  write-through dcache shared by four cores.
 - `DBG_TRACE_CACHE` — per-bank tracing of every fire: tag hit/miss, fill, replay,
   fill-forward, writeback, write-through, and the full MSHR table dump.
 - Runtime assertions guard the invariants that are otherwise invisible: MSHR
   in-use allocation, invalid release, invalid fill, missed replay, fill-forward
-  address mismatch, dirty-byte/dirty-line disagreement, and flush during a
-  fill-forward drain.
+  address mismatch, dirty-byte/dirty-line disagreement, flush during a
+  fill-forward drain, and a store demoted while an atomic result is pending.
 - SimX↔RTL cycle parity — see [simx_simulator_architecture.md](simx_simulator_architecture.md).

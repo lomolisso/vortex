@@ -726,6 +726,7 @@ private:
       req.tag    = w.req.core->id();           // routing tag
       req.hart_id = w.req.core->id();
       req.uuid   = w.req.uuid;
+      req.flags.dma = 1;
       uint64_t byteen = 0;
       auto blk = make_mem_block();
       const uint32_t pat = lw.cfill;

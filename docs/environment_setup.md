@@ -66,7 +66,7 @@ export VORTEX_BUILD="/scratch/$USER/vortex-build"
 mkdir -p "$VORTEX_BUILD"                       # create once, as yourself
 miscs/docker/vortex-dev.sh build              # stages the context, builds vortex-dev
 docker run -dit --name vortex-dev --platform=linux/amd64 --privileged=true \
-    --user "$(id -u):$(id -g)" -e HOME=/tmp -e XLEN=32 -e BUILD_DIR=/build_docker \
+    --user "$(id -u):$(id -g)" -e HOME=/tmp -e CONFIG_XLEN=32 -e BUILD_DIR=/build_docker \
     -v "$VORTEX_SRC":/vortex -v "$VORTEX_BUILD":/build_docker \
     -v vortex-ccache:/ccache -w /vortex vortex-dev
 docker exec -it vortex-dev bash

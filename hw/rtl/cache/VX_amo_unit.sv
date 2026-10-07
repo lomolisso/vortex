@@ -34,18 +34,17 @@
 //
 // A bounded set with conflict/capacity eviction is RISC-V-legal: SC may fail
 // spuriously for any reason, and forward progress is a system property (some
-// hart's SC wins each round). To keep that property when the L1 is non-LLC —
-// where an LR->SC spans a full round-trip to this bank and a co-contending
-// hart's LR would otherwise overwrite the slot before the SC returns — a live
-// reservation resists a different hart's LR for a bounded age, so its own SC
-// lands first; the age still frees an abandoned slot. This removes the per-hart
-// table's O(NUM_HARTS) storage and CAM.
+// hart's SC wins each round). To keep that property while every co-contending
+// hart's LR can land inside the holder's LR->SC window — a full round trip
+// when the L1 is not the LLC — a live reservation refuses a different hart's
+// LR a bounded number of times, so its own SC lands first; the bound still
+// frees an abandoned slot. This removes the per-hart table's O(NUM_HARTS)
+// storage and CAM.
 module VX_amo_unit import VX_gpu_pkg::*; #(
     parameter NUM_RES_ENTRIES = 4,   // reservation stations per bank (NUM_RS)
     // Holder-refusal budget, in refused-LR events, before a held station may
-    // be displaced. Sized for the holder's LR->SC round trip: the LLC sees an
-    // L1-miss round trip (default 6 bits = 63 refusals); a local-memory bank's
-    // round trip is single-digit cycles and needs far less.
+    // be displaced. Instances size it to at least clog2 of the harts that
+    // reach the bank, so it covers one refused LR from each other hart.
     parameter HOLD_CREDIT_BITS = 6,
     parameter LINE_ADDR_BITS  = 32,
     parameter DATA_WIDTH      = 64,  // ALU operand width (cache word, capped at 64)

@@ -22,7 +22,7 @@
 #
 # Build it with `miscs/docker/vortex-dev.sh build`, which stages the build
 # context: this file's directory plus a `bootstrap/` copy of the checkout's
-# installers (VERSION, configure, VX_*.toml, ci/). Installing from the
+# installers (VERSION, configure, VX_*.toml, ci/ scripts). Installing from the
 # checkout itself pins the toolchain to that checkout's TOOLCHAIN_REV.
 #
 # ASIC EDA tools (Synopsys/Cadence) are intentionally NOT installed; those
@@ -40,8 +40,9 @@ ENV TOOLDIR=/opt
 
 # Base packages. `sudo` is required because ci/sst_install.sh installs its
 # build dependencies via `sudo apt` under `set -e`. pytest/yaml drive the
-# catalog-driven test harness (ci/regression.sh -> pytest ci); xdist lets a
-# local run fan out (`pytest ci -m <expr> -n auto --dist=loadgroup`).
+# catalog-driven test harness (ci/regression.sh -> pytest ci). Run one pytest
+# per build dir: blackbox cases rebuild the driver in place per CONFIGS, so
+# parallel workers (xdist) must not share a build tree.
 RUN apt-get update && apt-get install -y \
     software-properties-common \
     build-essential \

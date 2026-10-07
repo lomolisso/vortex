@@ -444,6 +444,7 @@ struct MemFlags {
       uint32_t io           : 1;  // bit 1: uncacheable I/O
       uint32_t local        : 1;  // bit 2: LMEM port
       uint32_t amo_unsigned : 1;  // bit 3: MIN/MAX signedness (1=unsigned)
+      uint32_t dma          : 1;  // bit 4: written by a DMA engine, not a hart
     #ifdef VX_CFG_EXT_DXA_ENABLE
       // DXA completion sideband — populated only on DXA's LMEM-DMA writes.
       // notify_bar_id carries the RAW (kernel-encoded) bar handle:
@@ -453,8 +454,8 @@ struct MemFlags {
       // be wide enough to hold (bar_no << 8) | (MAX_CTAS_per_core - 1).
       // For NUM_BARRIERS = 8 and NUM_WARPS ≤ 16, that's at most 11 bits;
       // 16 bits leaves headroom for larger configs.
-      uint32_t dxa_notify_done   : 1;   // bit 4
-      uint32_t dxa_notify_bar_id : 16;  // bits 5..20
+      uint32_t dxa_notify_done   : 1;   // bit 5
+      uint32_t dxa_notify_bar_id : 16;  // bits 6..21
     #endif
     };
   };
@@ -1589,6 +1590,7 @@ public:
   TxCrossBar(
     const SimContext& ctx,
     const char* name,
+    ArbiterType type,
     uint32_t num_inputs,
     uint32_t num_outputs,
     std::function<uint32_t(const Type& req)> output_sel,
@@ -1597,13 +1599,15 @@ public:
     : SimObject<TxCrossBar<Type>>(ctx, name)
     , Inputs(num_inputs, this)
     , Outputs(num_outputs, this)
+    , type_(type)
     , delay_(delay)
-    , lg2_inputs_(log2ceil(num_inputs))
     , lg2_outputs_(log2ceil(num_outputs))
     , output_sel_(output_sel)
+    , prio_begin_(num_inputs)
+    , rr_next_(num_outputs, 0)
     , collisions_(0) {
-    assert(num_inputs <= 64);
-    assert(num_outputs <= 64);
+    __assert(type == ArbiterType::Priority || type == ArbiterType::RoundRobin,
+             "TxCrossBar supports Priority and RoundRobin arbitration only");
     assert(ispow2(num_outputs));
     assert(output_sel != nullptr);
 
@@ -1616,12 +1620,21 @@ public:
   TxCrossBar(
     const SimContext& ctx,
     const char* name,
+    ArbiterType type,
     uint32_t num_inputs,
     uint32_t num_outputs,
     std::function<uint32_t(const Type& req)> output_sel
-  ) : TxCrossBar<Type>(ctx, name, num_inputs, num_outputs,
+  ) : TxCrossBar<Type>(ctx, name, type, num_inputs, num_outputs,
       output_sel, ((num_inputs > 2) || (num_outputs > 2)) ? 1 : 0)
   {}
+
+  // Inputs [first, num_inputs) win their output outright, lowest index first,
+  // ahead of the inputs the crossbar's policy arbitrates.
+  void set_priority_inputs(uint32_t first) {
+    __assert(first <= Inputs.size(), "priority inputs out of range");
+    prio_begin_ = first;
+    std::fill(rr_next_.begin(), rr_next_.end(), 0);
+  }
 
   uint64_t collisions() const {
     return collisions_;
@@ -1629,14 +1642,17 @@ public:
 
 protected:
   void on_reset() {
-    //--
+    // The first round-robin grant goes to input 0, as the RTL arbiter's does.
+    std::fill(rr_next_.begin(), rr_next_.end(), 0);
   }
   void on_tick();
 
+  ArbiterType type_;
   uint32_t delay_;
-  uint32_t lg2_inputs_;
   uint32_t lg2_outputs_;
   std::function<uint32_t(const Type& req)> output_sel_;
+  uint32_t prio_begin_;
+  std::vector<uint32_t> rr_next_; // per output: first arbitrated input to scan
   uint64_t collisions_;
 
   friend class SimObject<TxCrossBar<Type>>;
@@ -1651,22 +1667,32 @@ void TxCrossBar<Type>::on_tick() {
     return;
   }
 
+  uint32_t P = prio_begin_;
+  uint32_t num_prio = I - P;
+
   // process incoming requests
   for (uint32_t o = 0; o < O; ++o) {
+    // Scan the priority inputs lowest first, then the arbitrated inputs from
+    // this output's round-robin pointer (always 0 under Priority).
     int32_t input_idx = -1;
     bool has_collision = false;
-    for (uint32_t i = 0; i < I; ++i) {
+    for (uint32_t k = 0; k < I; ++k) {
+      uint32_t i;
+      if (k < num_prio) {
+        i = P + k;
+      } else {
+        i = rr_next_[o] + (k - num_prio);
+        if (i >= P) {
+          i -= P;
+        }
+      }
       auto& req_in = Inputs.at(i);
-      if (req_in.empty())
+      if (req_in.empty()) {
         continue;
-      auto& req = req_in.peek();
-      uint32_t output_idx = 0;
-      if (lg2_outputs_ != 0) {
-        // select output index
-        output_idx = output_sel_(req);
-        // skip if input is not going to current output
-        if (output_idx != o)
-          continue;
+      }
+      // skip if input is not going to current output
+      if (lg2_outputs_ != 0 && output_sel_(req_in.peek()) != o) {
+        continue;
       }
       if (input_idx != -1) {
         has_collision = true;
@@ -1680,6 +1706,11 @@ void TxCrossBar<Type>::on_tick() {
       if (Outputs.at(o).try_send(RspType(req, input_idx), delay_)) {
         DT(4, this->name() << " req" << input_idx << "_" << o << ": " << req);
         req_in.pop();
+        // The pointer moves only on acceptance, as the RTL arbiter's state
+        // updates only on grant_ready: a blocked output keeps its turn order.
+        if (type_ == ArbiterType::RoundRobin && uint32_t(input_idx) < P) {
+          rr_next_[o] = (uint32_t(input_idx) + 1 == P) ? 0 : (input_idx + 1);
+        }
       }
       collisions_ += has_collision;
     }
@@ -1832,7 +1863,8 @@ public:
   TxRxCrossBar(
     const SimContext& ctx,
     const char* name,
-    ArbiterType type,
+    ArbiterType req_type,
+    ArbiterType rsp_type,
     uint32_t num_inputs,
     uint32_t num_outputs,
     std::function<uint32_t(const Req& req)> output_sel,
@@ -1845,12 +1877,15 @@ public:
     , ReqOut(num_outputs, this)
     , RspIn(num_outputs, this)
     , crossbar_(nullptr)
-    , arbiter_(type, num_outputs)
+    , rsp_type_(rsp_type)
+    , rsp_last_(num_inputs, num_outputs - 1)
     , rsp_delay_(rsp_delay)
     , lg2_inputs_(log2ceil(num_inputs)) {
+    __assert(rsp_type == ArbiterType::Priority || rsp_type == ArbiterType::RoundRobin,
+             "TxRxCrossBar supports Priority and RoundRobin response arbitration only");
 
     if (num_inputs != 1 || num_outputs != 1) {
-      crossbar_ = ReqXbar::Create(name, num_inputs, num_outputs, output_sel, req_delay);
+      crossbar_ = ReqXbar::Create(name, req_type, num_inputs, num_outputs, output_sel, req_delay);
       for (uint32_t i = 0; i < num_inputs; ++i) {
         ReqIn.at(i).bind(&crossbar_->Inputs.at(i));
       }
@@ -1874,14 +1909,21 @@ public:
   TxRxCrossBar(
     const SimContext& ctx,
     const char* name,
-    ArbiterType type,
+    ArbiterType req_type,
+    ArbiterType rsp_type,
     uint32_t num_inputs,
     uint32_t num_outputs,
     std::function<uint32_t(const Req& req)> output_sel
-  ) : TxRxCrossBar<Req, Rsp>(ctx, name, type, num_inputs, num_outputs, output_sel,
+  ) : TxRxCrossBar<Req, Rsp>(ctx, name, req_type, rsp_type, num_inputs, num_outputs, output_sel,
       ((num_inputs > 2) || (num_outputs > 2)) ? 1 : 0,
       ((num_inputs > 2) || (num_outputs > 2)) ? 1 : 0)
   {}
+
+  void set_priority_inputs(uint32_t first) {
+    if (crossbar_) {
+      crossbar_->set_priority_inputs(first);
+    }
+  }
 
   uint64_t collisions() const {
     if (crossbar_) {
@@ -1892,14 +1934,16 @@ public:
 
 protected:
   void on_reset() {
-    arbiter_.reset();
+    // The first round-robin grant goes to output 0, as the RTL arbiter's does.
+    std::fill(rsp_last_.begin(), rsp_last_.end(), uint32_t(RspIn.size() - 1));
   }
   void on_tick();
 
   typedef TxCrossBar<Req> ReqXbar;
 
   typename ReqXbar::Ptr crossbar_;
-  Arbiter arbiter_;
+  ArbiterType rsp_type_;
+  std::vector<uint32_t> rsp_last_; // per input: last output granted
   uint32_t rsp_delay_;
   uint32_t lg2_inputs_;
 
@@ -1918,34 +1962,37 @@ void TxRxCrossBar<Req, Rsp>::on_tick() {
   uint32_t O = ReqOut.size();
   uint32_t R = 1 << lg2_inputs_;
 
-  // process outgoing responses
+  // process outgoing responses: each input arbitrates its own outputs, and its
+  // round-robin pointer moves only on acceptance, as the RTL's per-output
+  // VX_stream_arb updates only on grant_ready.
   for (uint32_t i = 0; i < I; ++i) {
-    BitVector<> requests(O);
-    for (uint32_t o = 0; o < O; ++o) {
+    int32_t g = -1;
+    for (uint32_t k = 1; k <= O; ++k) {
+      uint32_t o = (rsp_type_ == ArbiterType::RoundRobin) ? ((rsp_last_[i] + k) % O) : (k - 1);
       auto& rsp_in = RspIn.at(o);
-      if (rsp_in.empty())
+      if (rsp_in.empty()) {
         continue;
-      auto& rsp = rsp_in.peek();
+      }
       // skip if response is not going to current input
-      if (lg2_inputs_ != 0) {
-        uint32_t input_idx = rsp.tag & (R-1);
-        if (input_idx != i)
-          continue;
+      if (lg2_inputs_ != 0 && (rsp_in.peek().tag & (R-1)) != i) {
+        continue;
       }
-      requests.set(o);
+      g = o;
+      break;
     }
-    if (requests.any()) {
-      uint32_t g = arbiter_.grant(requests);
-      auto& rsp_in = RspIn.at(g);
-      auto& rsp = rsp_in.peek();
-      Rsp out_rsp(rsp);
-      if (lg2_inputs_ != 0) {
-        out_rsp.tag = rsp.tag >> lg2_inputs_;
-      }
-      if (RspOut.at(i).try_send(out_rsp, rsp_delay_)) {
-        DT(4, this->name() << " rsp" << g << "_" << i << ": " << out_rsp);
-        rsp_in.pop();
-      }
+    if (g == -1) {
+      continue;
+    }
+    auto& rsp_in = RspIn.at(g);
+    auto& rsp = rsp_in.peek();
+    Rsp out_rsp(rsp);
+    if (lg2_inputs_ != 0) {
+      out_rsp.tag = rsp.tag >> lg2_inputs_;
+    }
+    if (RspOut.at(i).try_send(out_rsp, rsp_delay_)) {
+      DT(4, this->name() << " rsp" << g << "_" << i << ": " << out_rsp);
+      rsp_in.pop();
+      rsp_last_[i] = g;
     }
   }
 

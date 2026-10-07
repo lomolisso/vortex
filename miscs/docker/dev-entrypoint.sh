@@ -33,7 +33,10 @@ VORTEX_SRC=/vortex
 # to keep heavy compile writes off a shared/NFS source tree; defaults to a dir
 # inside the checkout when no separate mount is provided.
 BUILD_DIR="${BUILD_DIR:-$VORTEX_SRC/build_docker}"
-XLEN="${XLEN:-32}"
+# Not read from $XLEN: an XLEN in the container environment would override
+# config.mk's `XLEN ?=` in every other build dir, building a 64-bit tree as
+# 32-bit (or vice versa).
+XLEN="${CONFIG_XLEN:-32}"
 TOOLDIR="${TOOLDIR:-/opt}"
 
 if [ -f "$VORTEX_SRC/configure" ]; then

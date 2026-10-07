@@ -18,6 +18,25 @@ tests:
   - id: hw-fpu
     via: script
     run: "make -C hw/unittest run-fpu"
+  # Local memory banks, built with A, A+Zacas and atomics off. With atomics, a
+  # DMA access at every cycle offset of an atomic's bank occupancy and across an
+  # LR/SC window; every build then runs a randomized golden-model stress (atomics
+  # off: load/store/DMA only). The `hw` lane only builds local_mem without atomics.
+  - id: hw-lmem
+    via: script
+    run: "make -C hw/unittest run-lmem"
+    touches: [hw/rtl/mem, hw/rtl/cache/VX_amo_unit.sv, hw/rtl/cache/VX_amo_alu.sv,
+              hw/rtl/VX_gpu_pkg.sv, hw/unittest/local_mem]
+  # Last-level cache bank (VX_cache_top): a held fill released at every cycle
+  # offset around a racing atomic, store or load (also with memory refusing
+  # requests), loads replaying ahead of an atomic's writeback while responses
+  # stall, then randomized loads, stores, atomics and LR/SC against a
+  # reference memory, in nine parameter sets, two with atomics compiled out.
+  # The `hw` lane only builds the cache testbench.
+  - id: hw-cache
+    via: script
+    run: "make -C hw/unittest run-cache"
+    touches: [hw/rtl/cache, hw/rtl/VX_gpu_pkg.sv, hw/unittest/cache, hw/unittest/Makefile]
   # TCU FEDP datapath: the `hw` lane only builds it; this lane executes tcu_fedp
   # per format (native TFR + DPI). touches gates it on tcu changes.
   - id: hw-tcu

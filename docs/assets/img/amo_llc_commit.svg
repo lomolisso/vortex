@@ -1,4 +1,4 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1400 800" font-family="Helvetica, Arial, sans-serif">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1400 900" font-family="Helvetica, Arial, sans-serif">
   <defs>
     <marker id="arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
       <path d="M0,0 L10,5 L0,10 z" fill="#444"/>
@@ -30,7 +30,7 @@
     .lbk     { fill:#44525f; font-size:12px; }
   </style>
 
-  <rect x="0" y="0" width="1400" height="800" fill="#ffffff"/>
+  <rect x="0" y="0" width="1400" height="900" fill="#ffffff"/>
   <text x="24" y="34" class="tb" font-size="20">Last-level cache bank — atomic commit datapath (VX_cache_amo, IS_LLC = 1)</text>
 
   <!-- read forward (top) -->
@@ -85,13 +85,14 @@
   <rect x="1064" y="150" width="312" height="200" rx="6" class="mem"/>
   <text x="1076" y="172" class="tb">writeback queue</text>
   <text x="1076" y="194" class="ts">2 to 4 entries, one per {line, word, lane}</text>
-  <text x="1076" y="214" class="ts">a result for a queued target byte-merges</text>
-  <text x="1076" y="230" class="ts">into that entry instead of adding one</text>
-  <text x="1076" y="254" class="ts">head drains as a synthetic store:</text>
-  <text x="1076" y="270" class="ts">rw = 1, amo_valid = 0, lane byteen</text>
-  <text x="1076" y="294" class="ts">settling entry: the drained head is kept</text>
-  <text x="1076" y="310" class="ts">2 cycles, until the array write lands</text>
-  <text x="1076" y="336" class="tt">a younger plain store clears its bytes</text>
+  <text x="1076" y="212" class="ts">a result for a queued target byte-merges</text>
+  <text x="1076" y="228" class="ts">into that entry instead of adding one</text>
+  <text x="1076" y="248" class="ts">head drains as a synthetic store:</text>
+  <text x="1076" y="264" class="ts">rw = 1, amo_valid = 0, lane byteen</text>
+  <text x="1076" y="284" class="ts">settling entry: the drained head, forwarded</text>
+  <text x="1076" y="300" class="ts">until it reaches stC: PIPE_EX + 1 stages,</text>
+  <text x="1076" y="316" class="ts">held across stalls</text>
+  <text x="1076" y="338" class="tt">a younger plain store clears its bytes</text>
 
   <path d="M 236 250 L 276 250" class="flow"/>
   <path d="M 488 250 L 528 250" class="flow"/>
@@ -125,24 +126,29 @@
   <path d="M 700 350 L 700 410 L 916 410 L 916 430" class="flow"/>
 
   <!-- ══════════ ordering controls ══════════ -->
-  <rect x="24" y="620" width="1352" height="150" class="grp"/>
+  <rect x="24" y="620" width="1352" height="262" class="grp"/>
   <text x="36" y="644" class="tb">Ordering controls</text>
 
-  <rect x="40" y="658" width="430" height="96" rx="6" class="box"/>
+  <rect x="40" y="658" width="652" height="96" rx="6" class="box"/>
   <text x="52" y="680" class="t">commit_busy</text>
-  <text x="52" y="700" class="ts">up from the S0 prediction through compute and writeback;</text>
-  <text x="52" y="716" class="ts">holds off new core requests, so atomic instructions</text>
-  <text x="52" y="732" class="ts">commit one at a time. Replays are not blocked.</text>
+  <text x="52" y="700" class="ts">up from the S0 prediction through compute and writeback; holds off new core requests,</text>
+  <text x="52" y="716" class="ts">so atomic instructions commit one at a time. Replays are not blocked.</text>
 
-  <rect x="486" y="658" width="430" height="96" rx="6" class="box"/>
-  <text x="498" y="680" class="t">chain_stall</text>
-  <text x="498" y="700" class="ts">stalls the pipe one cycle when the request at the commit</text>
-  <text x="498" y="716" class="ts">stage targets the line being computed — a chained replay</text>
-  <text x="498" y="732" class="ts">reads the previous result from the queue, not the array</text>
+  <rect x="708" y="658" width="652" height="96" rx="6" class="box"/>
+  <text x="720" y="680" class="t">chain_stall</text>
+  <text x="720" y="700" class="ts">while an atomic computes, stalls the pipe one cycle when the commit stage holds a request</text>
+  <text x="720" y="716" class="ts">to the line being computed, or any store-bearing atomic: a chained replay reads the previous</text>
+  <text x="720" y="732" class="ts">result from the queue, not the array, and the compute stage never holds two operations</text>
 
-  <rect x="932" y="658" width="428" height="96" rx="6" class="box"/>
-  <text x="944" y="680" class="t">req_input_defer</text>
-  <text x="944" y="700" class="ts">holds a request at the input while an atomic to its line</text>
-  <text x="944" y="716" class="ts">waits in the MSHR or is allocating; consumes a registered</text>
-  <text x="944" y="732" class="ts">MSHR probe, so the CAM stays off the ready path</text>
+  <rect x="40" y="770" width="652" height="96" rx="6" class="box"/>
+  <text x="52" y="792" class="t">writeback guard, settle hold</text>
+  <text x="52" y="812" class="ts">the queue head is not drained while a younger write to its word is between S0 and stC,</text>
+  <text x="52" y="828" class="ts">so the result cannot land over that write; in a deep bank it also waits until the previous</text>
+  <text x="52" y="844" class="ts">writeback is one stage from stC, because a single settling entry forwards it</text>
+
+  <rect x="708" y="770" width="652" height="96" rx="6" class="box"/>
+  <text x="720" y="792" class="t">req_input_defer</text>
+  <text x="720" y="812" class="ts">holds a request at the input while an atomic to its line waits in the MSHR or is allocating,</text>
+  <text x="720" y="828" class="ts">and an atomic while the writeback queue has no room for another result (admission bound)</text>
+  <text x="720" y="844" class="ts">registered MSHR probe, CAM off the ready path; not exact, so ordering does not rest on it</text>
 </svg>

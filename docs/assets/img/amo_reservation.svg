@@ -155,6 +155,6 @@
   <line x1="692" y1="636" x2="1348" y2="636" stroke="#d5dce3"/>
 
   <text x="692" y="662" class="tt">The holder keeps the station until its own SC resolves it, so one hart wins every round of a contended</text>
-  <text x="692" y="680" class="tt">retry loop. The budget is 2^HOLD_CREDIT_BITS − 1 refusals: 63 at a cache LLC, where LR→SC spans an</text>
-  <text x="692" y="698" class="tt">L1-miss round trip; 7 at a local-memory bank, where it is a few cycles.</text>
+  <text x="692" y="680" class="tt">retry loop. The budget is 2^HOLD_CREDIT_BITS − 1 refusals, about one per other hart that can reach the</text>
+  <text x="692" y="698" class="tt">station: max(6, clog2(harts)) bits at a cache LLC, max(3, clog2(warps × threads)) at a local-memory bank.</text>
 </svg>

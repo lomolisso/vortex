@@ -2,9 +2,9 @@
 #include <vx_intrinsics.h>
 #include "common.h"
 
-// Retry bound for the local-memory LR/SC loop. High enough that genuine
-// contention between the harts of a group always resolves, low enough that a
-// store-conditional which never succeeds fails the case instead of hanging it.
+// Retry bound for each LR/SC increment. High enough that genuine contention
+// always resolves, low enough that a store-conditional which never succeeds
+// fails the case, with the count short, instead of hanging it.
 static const uint32_t LRSC_MAX_RETRIES = 4096;
 
 // All harts contend on a single shared word. Each test exercises a
@@ -124,6 +124,7 @@ void kernel_lrsc_counter(kernel_arg_t* __UNIFORM__ arg) {
   uint32_t r = 0;
   for (uint32_t i = 0; i < arg->iters; ++i) {
     int32_t old, sc_fail;
+    uint32_t guard = 0;
     do {
       asm volatile ("lr.w %0, (%1)"
                     : "=r"(old)
@@ -135,7 +136,8 @@ void kernel_lrsc_counter(kernel_arg_t* __UNIFORM__ arg) {
                     : "r"(shared), "r"(newv)
                     : "memory");
       if (sc_fail) ++r;
-    } while (sc_fail);
+      ++guard;
+    } while (sc_fail && guard < LRSC_MAX_RETRIES);
   }
   retries[hid] = r;
 }
@@ -170,6 +172,7 @@ void kernel_lrsc_counter_aqrl(kernel_arg_t* __UNIFORM__ arg) {
   auto shared = (int32_t*)arg->shared_addr;
   for (uint32_t i = 0; i < arg->iters; ++i) {
     int32_t old, sc_fail;
+    uint32_t guard = 0;
     do {
       asm volatile ("lr.w.aq %0, (%1)"
                     : "=r"(old)
@@ -180,7 +183,8 @@ void kernel_lrsc_counter_aqrl(kernel_arg_t* __UNIFORM__ arg) {
                     : "=r"(sc_fail)
                     : "r"(shared), "r"(newv)
                     : "memory");
-    } while (sc_fail);
+      ++guard;
+    } while (sc_fail && guard < LRSC_MAX_RETRIES);
   }
 }
 
@@ -401,6 +405,177 @@ void kernel_cas_lmem(kernel_arg_t* __UNIFORM__ arg) {
 }
 #endif
 
+static inline uint32_t sc_w(volatile uint32_t* addr, uint32_t value) {
+  uint32_t sc_fail;
+  asm volatile ("sc.w %0, %2, (%1)"
+                : "=r"(sc_fail)
+                : "r"(addr), "r"(value)
+                : "memory");
+  return sc_fail;
+}
+
+// Every thread seeds and reserves its own word. Threads below
+// LRSC_FOREIGN_DIST then store-conditional into the word LRSC_FOREIGN_DIST
+// above, whose owner holds the reservation: that SC must fail and leave the
+// reservation in place, so the owner's own SC after it succeeds unless another
+// thread's LR displaced it from a shared station. A lost reservation only
+// fails an SC, which the host reports, so it cannot fake a pass. The seed
+// store breaks any reservation an earlier test left on the word, and the fence
+// keeps it ahead of the LR. The foreign SC takes its data from the LR, so it
+// issues once every thread holds its reservation. Each SC's result store waits
+// for the SC's response and the warp issues in order, so the owners' SCs, and
+// any access that follows, reach memory after the foreign SCs.
+static inline void lrsc_foreign(volatile uint32_t* words, uint32_t stride,
+                                uint32_t* result) {
+  const uint32_t tid = (uint32_t)vx_thread_id();
+  volatile uint32_t* own = &words[tid * stride];
+  *own = LRSC_FOREIGN_SEED + tid;
+  vx_fence();
+  uint32_t old;
+  asm volatile ("lr.w %0, (%1)"
+                : "=r"(old)
+                : "r"(own)
+                : "memory");
+  if (tid < LRSC_FOREIGN_DIST) {
+    result[tid] = sc_w(&words[(tid + LRSC_FOREIGN_DIST) * stride], ~old);
+  }
+  if (tid >= LRSC_FOREIGN_DIST) {
+    result[tid] = sc_w(own, ~old);
+  }
+}
+
+// 15) Store-conditional into another thread's reservation (17 with Zacas).
+//   One warp, each thread's word on a line of its own. One LR and one SC per
+//   thread with no retry, so the outcome does not depend on timing.
+void kernel_lrsc_foreign(kernel_arg_t* __UNIFORM__ arg) {
+  lrsc_foreign((volatile uint32_t*)arg->shared_addr, LLC_LINE_WORDS,
+               (uint32_t*)arg->per_hart_addr);
+}
+
+// 16) The same on local memory (18 with Zacas). Words sit one register apart,
+//   so each fills a bank word of its own and no reservation covers two
+//   threads' words. Local memory is not host-visible, so each thread copies
+//   its word out.
+void kernel_lrsc_foreign_lmem(kernel_arg_t* __UNIFORM__ arg) {
+  constexpr uint32_t stride = sizeof(size_t) / sizeof(uint32_t);
+  auto lmem  = (volatile uint32_t*)__local_mem();
+  auto words = (uint32_t*)arg->shared_addr;
+  lrsc_foreign(lmem, stride, (uint32_t*)arg->per_hart_addr);
+  // The SC result stores in lrsc_foreign order this read-back after every SC.
+  const uint32_t tid = (uint32_t)vx_thread_id();
+  words[tid * LLC_LINE_WORDS] = lmem[tid * stride];
+}
+
+// Flag polls, over all of a role's waits, before it gives up on the other
+// role. A peer that never runs then fails the case instead of hanging it.
+static const uint32_t LRSC_PEER_MAX_POLLS = 1024;
+
+static inline uint32_t lr_w(volatile uint32_t* addr) {
+  uint32_t value;
+  asm volatile ("lr.w %0, (%1)" : "=r"(value) : "r"(addr) : "memory");
+  return value;
+}
+
+static inline uint32_t amo_swap(volatile uint32_t* addr, uint32_t value) {
+  uint32_t old;
+  asm volatile ("amoswap.w %0, %2, (%1)" : "=r"(old) : "r"(addr), "r"(value) : "memory");
+  return old;
+}
+
+// An atomic read at the LLC, past any stale copy in the L1.
+static inline uint32_t amo_read(volatile uint32_t* addr) {
+  uint32_t value;
+  asm volatile ("amoor.w %0, zero, (%1)" : "=r"(value) : "r"(addr) : "memory");
+  return value;
+}
+
+// `addr`, computed from `dep`, so an access to it issues only once the access
+// that produced `dep` has returned from the LLC.
+static inline volatile uint32_t* after(volatile uint32_t* addr, uint32_t dep) {
+  uint32_t zero;
+  asm volatile ("and %0, %1, zero" : "=r"(zero) : "r"(dep));
+  return addr + zero;
+}
+
+// Returns the flag, or 0 if it was still clear when the role's budget ran out.
+static inline uint32_t wait_flag(volatile uint32_t* flag, uint32_t* polls) {
+  uint32_t value = amo_read(flag);
+  while (value == 0 && *polls < LRSC_PEER_MAX_POLLS) {
+    ++*polls;
+    value = amo_read(flag);
+  }
+  return value;
+}
+
+// 17) Store-conditional by a peer hart (19 with Zacas).
+//   The holder (core 0, warp 0, thread 0) and the peer (thread 0 of the host's
+//   peer warp and core) each take every access's address from the previous
+//   access's response, and hand over through flags, so the order at the LLC is
+//   fixed: holder LR X; peer LR Y, SC X, load X; holder SC X, LR X; peer swap
+//   X, LR Y, SC Y; holder SC X. The peer reads X back with a plain load, since
+//   an atomic read stores and would break the holder's reservation; its SC
+//   dropped X from its caches above the LLC, so the load reads X at the LLC.
+//   The seeds are writes, so they also break any reservation left on X or Y.
+void kernel_lrsc_peer(kernel_arg_t* __UNIFORM__ arg) {
+  if (vx_thread_id() != 0)
+    return;
+  const uint32_t cid = (uint32_t)vx_core_id();
+  const uint32_t wid = (uint32_t)vx_warp_id();
+  const bool holder = (cid == 0 && wid == 0);
+  const bool peer   = (cid == arg->peer_core && wid == arg->peer_warp);
+  if (!holder && !peer)
+    return;
+
+  auto base   = (volatile uint32_t*)arg->shared_addr;
+  auto x      = base + LRSC_PEER_X * LLC_LINE_WORDS;
+  auto y      = base + LRSC_PEER_Y * LLC_LINE_WORDS;
+  auto held   = base + LRSC_PEER_HELD * LLC_LINE_WORDS;
+  auto tried  = base + LRSC_PEER_TRIED * LLC_LINE_WORDS;
+  auto reheld = base + LRSC_PEER_REHELD * LLC_LINE_WORDS;
+  auto wrote  = base + LRSC_PEER_WROTE * LLC_LINE_WORDS;
+  uint32_t polls = 0;
+
+  if (holder) {
+    auto out = base + LRSC_PEER_A_OUT * LLC_LINE_WORDS;
+    uint32_t r = amo_swap(y, LRSC_PEER_Y_SEED);
+    r = amo_swap(after(x, r), LRSC_PEER_X_SEED);
+    const uint32_t xv   = lr_w(after(x, r));
+    amo_swap(after(held, xv), 1);
+    const uint32_t t    = wait_flag(tried, &polls);
+    const uint32_t live = sc_w(after(x, t), LRSC_PEER_A_LIVE_VALUE);
+    const uint32_t xv2  = lr_w(after(x, live));
+    amo_swap(after(reheld, xv2), 1);
+    const uint32_t w    = wait_flag(wrote, &polls);
+    const uint32_t sc   = sc_w(after(x, w), LRSC_PEER_A_SC_VALUE);
+    out[LRSC_PEER_A_LR]    = xv;
+    out[LRSC_PEER_A_LIVE]  = live;
+    out[LRSC_PEER_A_LR2]   = xv2;
+    out[LRSC_PEER_A_SC]    = sc;
+    out[LRSC_PEER_POLLS]   = polls;
+    out[LRSC_PEER_TIMEOUT] = (t == 0 || w == 0);
+    out[LRSC_PEER_RAN]     = 1;
+  } else {
+    auto out = base + LRSC_PEER_B_OUT * LLC_LINE_WORDS;
+    const uint32_t h    = wait_flag(held, &polls);
+    const uint32_t yv   = lr_w(after(y, h));
+    const uint32_t sc   = sc_w(after(x, yv), LRSC_PEER_B_SC_VALUE);
+    const uint32_t seen = *after(x, sc);
+    amo_swap(after(tried, seen), 1);
+    const uint32_t rh   = wait_flag(reheld, &polls);
+    const uint32_t prev = amo_swap(after(x, rh), LRSC_PEER_B_SWAP_VALUE);
+    const uint32_t yv2  = lr_w(after(y, prev));
+    const uint32_t ctrl = sc_w(after(y, yv2), yv2 + 1);
+    amo_swap(after(wrote, ctrl), 1);
+    out[LRSC_PEER_B_SC]    = sc;
+    out[LRSC_PEER_B_SEEN]  = seen;
+    out[LRSC_PEER_B_PREV]  = prev;
+    out[LRSC_PEER_B_CTRL]  = ctrl;
+    out[LRSC_PEER_POLLS]   = polls;
+    out[LRSC_PEER_TIMEOUT] = (h == 0 || rh == 0);
+    out[LRSC_PEER_RAN]     = 1;
+  }
+}
+
 static const PFN_Kernel sc_tests[] = {
   kernel_amoadd,             // 0
   kernel_amoor,              // 1
@@ -421,6 +596,9 @@ static const PFN_Kernel sc_tests[] = {
   kernel_cas_ladder,         // 15  native compare-and-swap (Zacas amocas)
   kernel_cas_lmem,           // 16  compare-and-swap on local memory (LMEM banks)
 #endif
+  kernel_lrsc_foreign,       // 15 (17 with Zacas)  SC into another thread's reservation
+  kernel_lrsc_foreign_lmem,  // 16 (18 with Zacas)  the same on local memory
+  kernel_lrsc_peer,          // 17 (19 with Zacas)  SC by a peer hart
 };
 
 __kernel void kernel_main(kernel_arg_t* __UNIFORM__ arg) {

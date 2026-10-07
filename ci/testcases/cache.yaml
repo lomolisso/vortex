@@ -264,3 +264,36 @@ tests:
   configs: -DVX_CFG_SOCKET_SIZE=3 -DVX_CFG_NUM_ICACHES=2
   shape:
     cores: 3
+
+# Per-word order while a line fills (cache_order): a hart's load after its
+# own store (raw) and its store after its own load (war), each line's miss
+# chain headed by a load the fill forward answers, with every warp's probes in
+# flight. The default write-back dcache, write-through L1s under an L2, and
+# one write-through dcache shared by four cores as the last level.
+- id: order
+  via: blackbox
+  drivers:
+  - simx
+  - rtlsim
+  app: cache_order
+  args: -traw -twar
+- id: order-l2
+  via: blackbox
+  drivers:
+  - simx
+  - rtlsim
+  app: cache_order
+  shape:
+    cores: 4
+    l2cache: true
+  args: -traw -twar
+- id: order-shared
+  via: blackbox
+  drivers:
+  - simx
+  - rtlsim
+  app: cache_order
+  configs: -DVX_CFG_SOCKET_SIZE=4
+  shape:
+    cores: 4
+  args: -traw -twar

@@ -23,7 +23,8 @@ namespace vortex {
 // Per-LLC-bank AMO helper: the RVA RMW kernel + a reservation set.
 // Reservations are tracked per hart — each hart owns at most one
 // reservation, which only another hart's committed write to the same
-// line can break. A hart's reservation is never displaced by another
+// line can break, or a DMA write to it (invalidate_if), which breaks
+// any hart's. A hart's reservation is never displaced by another
 // hart's LR, so a contended LR/SC retry loop always has a winner each
 // round (forward progress); the prior fixed-size CAM could evict a
 // hart's reservation between its own LR and SC and livelock when the
@@ -59,6 +60,18 @@ public:
   // Drop the reservation matching this entry. Called on a successful
   // SC to consume the lock.
   void clear(uint32_t hart_id, uint64_t line_addr);
+
+  // Break every hart's reservation whose address `hit` accepts.
+  template <typename Hit>
+  void invalidate_if(Hit&& hit) {
+    for (auto it = reservations_.begin(); it != reservations_.end(); ) {
+      if (hit(it->second)) {
+        it = reservations_.erase(it);
+      } else {
+        ++it;
+      }
+    }
+  }
 
   void reset();
 

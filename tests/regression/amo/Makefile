@@ -9,6 +9,9 @@ SRCS := $(SRC_DIR)/main.cpp
 
 VX_SRCS := $(SRC_DIR)/kernel.cpp
 
+VX_HDRS := $(SRC_DIR)/common.h
+HDRS    := $(SRC_DIR)/common.h $(SRC_DIR)/testcases.h
+
 # Per-hart iters — small enough to run quickly under simx, big enough
 # to actually exercise contention.
 OPTS ?= -n32

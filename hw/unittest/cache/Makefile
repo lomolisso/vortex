@@ -22,4 +22,12 @@ RTL_INCLUDE += -I$(RTL_DIR)/interfaces -I$(RTL_DIR)/mem -I$(RTL_DIR)/vm -I$(RTL_
 
 TOP := VX_cache_top
 
+# VX_cache_top parameter overrides, e.g. CACHE_PARAMS="NUM_BANKS=2 LATENCY=3".
+# VX_cache_top.sv is also a synthesis-gate DUT, so its defaults stay put; each
+# override reaches the model as -G<NAME> and the driver as -DTB_<NAME>.
+CACHE_PARAMS ?=
+
 include ../common.mk
+
+VL_FLAGS += $(addprefix -G,$(CACHE_PARAMS))
+CXXFLAGS += $(addprefix -DTB_,$(CACHE_PARAMS))

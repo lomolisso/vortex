@@ -72,7 +72,8 @@ cmd_build() {
         mkdir -p "$ctx/bootstrap"
         cp -p "$SCRIPT_DIR/Dockerfile.dev" "$SCRIPT_DIR/dev-entrypoint.sh" "$ctx/"
         cp -p "$VORTEX_SRC/VERSION" "$VORTEX_SRC/configure" "$VORTEX_SRC"/VX_*.toml "$ctx/bootstrap/"
-        cp -rp "$VORTEX_SRC/ci" "$ctx/bootstrap/"
+        mkdir -p "$ctx/bootstrap/ci"
+        cp -p "$VORTEX_SRC"/ci/*.sh "$VORTEX_SRC"/ci/*.in "$VORTEX_SRC"/ci/*.py "$ctx/bootstrap/ci/"
         info "Building image '$IMAGE' from $SCRIPT_DIR/Dockerfile.dev ($(grep -m1 '^TOOLCHAIN_REV' "$VORTEX_SRC/VERSION")) ..."
         docker build --platform=linux/amd64 -t "$IMAGE" \
             -f "$ctx/Dockerfile.dev" "$ctx" "$@"
@@ -99,7 +100,7 @@ cmd_up() {
     docker run -dit --name "$CONTAINER" \
         --platform=linux/amd64 --privileged=true \
         --user "$(id -u):$(id -g)" \
-        -e HOME=/tmp -e XLEN="$XLEN" -e BUILD_DIR="$BUILD_DIR" \
+        -e HOME=/tmp -e CONFIG_XLEN="$XLEN" -e BUILD_DIR="$BUILD_DIR" \
         -v "$VORTEX_SRC":"$SRC_MNT" \
         -v "$VORTEX_BUILD":"$BUILD_MNT" \
         -v "$CCACHE_VOL":/ccache \

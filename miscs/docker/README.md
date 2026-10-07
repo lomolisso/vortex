@@ -112,13 +112,16 @@ miscs/docker/vortex-dev.sh build
 The image installs the toolchain with this checkout's own installers, so it
 always matches the checkout's `TOOLCHAIN_REV` (see [VERSION](../../VERSION)).
 The script stages a small build context (`Dockerfile.dev`, `dev-entrypoint.sh`
-and a `bootstrap/` copy of `VERSION`, `configure`, `VX_*.toml` and `ci/`); the
+and a `bootstrap/` copy of `VERSION`, `configure`, `VX_*.toml` and the `ci/`
+scripts, without the test catalog or baselines, so editing those does not
+invalidate the toolchain layer); the
 equivalent manual commands are:
 
 ```bash
 ctx=$(mktemp -d) && mkdir -p $ctx/bootstrap
 cp miscs/docker/Dockerfile.dev miscs/docker/dev-entrypoint.sh $ctx/
-cp -p VERSION configure VX_*.toml $ctx/bootstrap/ && cp -rp ci $ctx/bootstrap/
+cp -p VERSION configure VX_*.toml $ctx/bootstrap/
+mkdir -p $ctx/bootstrap/ci && cp -p ci/*.sh ci/*.in ci/*.py $ctx/bootstrap/ci/
 docker build --platform=linux/amd64 -t vortex-dev -f $ctx/Dockerfile.dev $ctx
 rm -rf $ctx
 ```
@@ -145,7 +148,7 @@ root. The entrypoint configures the build dir on first start.
 docker run -dit --name vortex-dev \
     --platform=linux/amd64 --privileged=true \
     --user "$(id -u):$(id -g)" \
-    -e HOME=/tmp -e XLEN=32 -e BUILD_DIR=/build_docker \
+    -e HOME=/tmp -e CONFIG_XLEN=32 -e BUILD_DIR=/build_docker \
     -v "$VORTEX_SRC":/vortex \
     -v "$VORTEX_BUILD":/build_docker \
     -v vortex-ccache:/ccache \
@@ -153,8 +156,10 @@ docker run -dit --name vortex-dev \
     vortex-dev
 ```
 
-Set `-e XLEN=64` for a 64-bit build. (A harmless `groups: cannot find name for
-group ID ...` line may print because your host UID has no entry in the
+Set `-e CONFIG_XLEN=64` for a 64-bit build. It is deliberately not `XLEN`: an
+`XLEN` in the container environment would override every build dir's
+`config.mk`, so a 64-bit build dir would silently build as 32-bit. (A harmless
+`groups: cannot find name for group ID ...` line may print because your host UID has no entry in the
 container's `/etc/passwd`.) If you omit the `$VORTEX_BUILD` mount and
 `BUILD_DIR`, the build dir falls back to inside the NFS checkout — it works, but
 compile writes then load the shared file server.
