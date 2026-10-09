@@ -2,7 +2,7 @@ ROOT_DIR := $(realpath ../..)
 include $(ROOT_DIR)/config.mk
 
 # Distributed local memory units: the feature is RV64 only.
-DLMEM_UNITS :=
+DLMEM_UNITS := $(if $(filter 64,$(XLEN)),dlmem_noc)
 
 all:
 	$(MAKE) -C generic_queue
@@ -126,9 +126,45 @@ ifeq ($(XLEN),64)
 endif
 
 # Distributed local memory units, each over its parameter sets (RV64 only).
+# The network at every cluster shape (sockets x socket size) and two packet
+# widths: random traffic, then the fixed latency schedule, whose CSV must match
+# the SimX model's run of the same schedule packet for packet (fabric parity).
+# The width doubles as the random seed, so the two builds of a shape see
+# different traffic. 16x1 and 2x16 also have stages above 12 ports (a 16-port
+# crossbar, a 17-port switch), where the arbiters must stay flat.
+# $(1)=NUM_CORES $(2)=SOCKET_SIZE $(3)=DATAW
+DLMEM_NOC_SIMX := $(ROOT_DIR)/sim/simx/dlmem_noc_test
+define dlmem_noc_case
+	$(MAKE) -C dlmem_noc clean
+	$(MAKE) -C dlmem_noc CONFIGS="-DVX_CFG_EXT_DLMEM_ENABLE -DVX_CFG_NUM_CORES=$(1) -DVX_CFG_SOCKET_SIZE=$(2)" DATAW=$(3)
+	$(MAKE) -C dlmem_noc run CONFIGS="-DVX_CFG_EXT_DLMEM_ENABLE -DVX_CFG_NUM_CORES=$(1) -DVX_CFG_SOCKET_SIZE=$(2)" DATAW=$(3) \
+		OPTS="--seed=$(3)"
+	$(MAKE) -C dlmem_noc run CONFIGS="-DVX_CFG_EXT_DLMEM_ENABLE -DVX_CFG_NUM_CORES=$(1) -DVX_CFG_SOCKET_SIZE=$(2)" DATAW=$(3) \
+		OPTS="--mode=latency --csv=latency_c$(1)_s$(2)_w$(3).csv"
+	$(DLMEM_NOC_SIMX) --shape=$(shell expr $(1) / $(2))x$(2) --mode=latency --dataw=$(3) \
+		--csv=dlmem_noc/simx_latency_c$(1)_s$(2)_w$(3).csv
+	python3 $(VORTEX_HOME)/hw/unittest/dlmem_noc/compare_latency.py --socket-size=$(2) \
+		dlmem_noc/latency_c$(1)_s$(2)_w$(3).csv dlmem_noc/simx_latency_c$(1)_s$(2)_w$(3).csv
+endef
 run-dlmem:
 ifeq ($(XLEN),64)
-	@true
+	$(MAKE) -C $(ROOT_DIR)/tests/unittest/dlmem_noc
+	$(call dlmem_noc_case,1,1,160)
+	$(call dlmem_noc_case,1,1,48)
+	$(call dlmem_noc_case,2,2,160)
+	$(call dlmem_noc_case,2,2,48)
+	$(call dlmem_noc_case,4,4,160)
+	$(call dlmem_noc_case,4,4,48)
+	$(call dlmem_noc_case,2,1,160)
+	$(call dlmem_noc_case,2,1,48)
+	$(call dlmem_noc_case,4,2,160)
+	$(call dlmem_noc_case,4,2,48)
+	$(call dlmem_noc_case,4,1,160)
+	$(call dlmem_noc_case,4,1,48)
+	$(call dlmem_noc_case,8,2,160)
+	$(call dlmem_noc_case,8,2,48)
+	$(call dlmem_noc_case,16,1,160)
+	$(call dlmem_noc_case,32,16,48)
 else
 	@echo "run-dlmem: distributed local memory is RV64 only; nothing to run at XLEN $(XLEN)"
 endif

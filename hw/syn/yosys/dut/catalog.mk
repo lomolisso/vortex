@@ -9,7 +9,7 @@
 # synthesizes, so both gates measure the same modules and a divergence between
 # them is meaningful rather than an artefact of two DUT lists.
 
-DUTS := cache core tcu gfx tex raster om rtu dxa vm tensor vortex
+DUTS := cache core tcu gfx tex raster om rtu dxa vm tensor dlmem vortex
 
 UNITTEST_DIR ?= $(VORTEX_HOME)/hw/unittest
 
@@ -78,6 +78,13 @@ tensor_CFG := -DVX_CFG_NUM_THREADS=16 -DVX_CFG_NUM_WARPS=16 -DVX_CFG_EXT_TCU_ENA
               -DVX_CFG_EXT_DXA_ENABLE -DVX_CFG_TCU_WGMMA_ENABLE -DVX_CFG_TCU_MX_ENABLE \
               -DVX_CFG_EXT_A_ENABLE -DVX_CFG_NUM_CORES=2 -DVX_CFG_SOCKET_SIZE=2 \
               -DVX_CFG_PLATFORM_MEMORY_NUM_BANKS=1 -DVX_CFG_L2_ENABLE -DVX_CFG_L2_SIZE=262144
+
+# One cluster's DLMEM network: 4 socket switches of 2 cores plus the cluster
+# crossbar, at the top's default 160-bit (request-sized) packet. DLMEM is RV64
+# only, so synthesize it from an XLEN=64 build tree.
+dlmem_TOP := VX_dlmem_noc_top
+dlmem_INC := -I$(VORTEX_HOME)/hw/rtl/dlmem -I$(UNITTEST_DIR)/dlmem_noc
+dlmem_CFG := -DVX_CFG_EXT_DLMEM_ENABLE -DVX_CFG_NUM_CORES=8 -DVX_CFG_SOCKET_SIZE=2
 
 # The whole GPU. Hours-long; nightly only, never a PR gate.
 vortex_TOP := Vortex

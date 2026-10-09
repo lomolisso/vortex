@@ -145,7 +145,14 @@ DXA_OOO_TEST      := $(DESTDIR)/dxa_ooo_test
 RVC_TEST_OBJ      := $(OBJ_DIR)/tests/rvc_decompress_test.o
 RVC_TEST          := $(DESTDIR)/rvc_decompress_test
 
+# The DLMEM network links standalone into its unit test, outside libsimx.
+DLMEM_NOC_SRCS     := $(SRC_DIR)/dlmem/dlmem_switch.cpp $(SRC_DIR)/dlmem/dlmem_xbar.cpp
+DLMEM_NOC_OBJS     := $(patsubst $(SRC_DIR)/%.cpp,$(OBJ_DIR)/%.o,$(DLMEM_NOC_SRCS))
+DLMEM_NOC_TEST_OBJ := $(OBJ_DIR)/tests/dlmem_noc_test.o
+DLMEM_NOC_TEST     := $(DESTDIR)/dlmem_noc_test
+
 DEPS := $(OBJS:.o=.d) $(MAIN_OBJ:.o=.d) $(DXA_OOO_TEST_OBJ:.o=.d) $(RVC_TEST_OBJ:.o=.d)
+DEPS += $(DLMEM_NOC_OBJS:.o=.d) $(DLMEM_NOC_TEST_OBJ:.o=.d)
 
 # generate .d files alongside .o files
 CXXFLAGS += -MMD -MP -MF $(@:.o=.d)
@@ -168,7 +175,7 @@ PROJECT := simx
 VORTEX_LIB := libvortex.so
 VORTEX_GEM5_LIB := libvortex-gem5.so
 
-.PHONY: all force test-dxa-ooo test-rvc-decompress clean clean-lib clean-exe clean-obj libvortex clean-libvortex libvortex-gem5 clean-libvortex-gem5
+.PHONY: all force test-dxa-ooo test-rvc-decompress test-dlmem-noc clean clean-lib clean-exe clean-obj libvortex clean-libvortex libvortex-gem5 clean-libvortex-gem5
 
 ifeq ($(USE_SST), 1)
 all: $(DESTDIR)/$(PROJECT) $(DESTDIR)/$(VORTEX_LIB)
@@ -211,6 +218,10 @@ $(RVC_TEST_OBJ): $(VORTEX_HOME)/tests/unittest/rvc_decompress/main.cpp $(CONFIG_
 	@mkdir -p $(@D)
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
+$(DLMEM_NOC_TEST_OBJ): $(VORTEX_HOME)/tests/unittest/dlmem_noc/main.cpp $(CONFIG_FILE)
+	@mkdir -p $(@D)
+	$(CXX) $(CXXFLAGS) -c $< -o $@
+
 # Main executable
 $(DESTDIR)/$(PROJECT): $(OBJS) $(MAIN_OBJ)
 	$(CXX) $(CXXFLAGS) $^ $(LDFLAGS) -o $@
@@ -225,6 +236,12 @@ test-rvc-decompress: $(RVC_TEST)
 	$(RVC_TEST)
 
 $(RVC_TEST): $(OBJS) $(RVC_TEST_OBJ)
+	$(CXX) $(CXXFLAGS) $^ $(LDFLAGS) -o $@
+
+test-dlmem-noc: $(DLMEM_NOC_TEST)
+	$(DLMEM_NOC_TEST) $(DLMEM_NOC_OPTS)
+
+$(DLMEM_NOC_TEST): $(DLMEM_NOC_OBJS) $(DLMEM_NOC_TEST_OBJ)
 	$(CXX) $(CXXFLAGS) $^ $(LDFLAGS) -o $@
 
 # Shared library
@@ -271,7 +288,7 @@ clean-libvortex-gem5:
 	rm -f $(DESTDIR)/$(VORTEX_GEM5_LIB)
 
 clean-exe:
-	rm -f $(DESTDIR)/$(PROJECT) $(DXA_OOO_TEST)
+	rm -f $(DESTDIR)/$(PROJECT) $(DXA_OOO_TEST) $(DLMEM_NOC_TEST)
 
 clean-obj:
 	rm -rf $(OBJ_DIR)
