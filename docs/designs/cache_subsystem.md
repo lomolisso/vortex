@@ -4,7 +4,7 @@ The complete reference for the Vortex cache: the bus contract it speaks, the
 operations it understands, the bank pipeline that executes them, how it scales,
 how it is flushed, and every knob that shapes it.
 
-**Files:** [hw/rtl/cache/](../../hw/rtl/cache/) — 15 modules, ~4.9k lines.
+**Files:** [hw/rtl/cache/](../../hw/rtl/cache/) — 16 modules, ~6.0k lines.
 
 | Module | Role |
 |---|---|
@@ -17,7 +17,8 @@ how it is flushed, and every knob that shapes it.
 | [VX_cache_data.sv](../../hw/rtl/cache/VX_cache_data.sv) | word-sliced, way-folded data array |
 | [VX_cache_mshr.sv](../../hw/rtl/cache/VX_cache_mshr.sv) | miss status holding registers + same-line chaining |
 | [VX_cache_repl.sv](../../hw/rtl/cache/VX_cache_repl.sv) | random / FIFO / PLRU victim selection |
-| [VX_cache_init.sv](../../hw/rtl/cache/VX_cache_init.sv) | cache-level flush FSM + input lock |
+| [VX_cache_init.sv](../../hw/rtl/cache/VX_cache_init.sv) | flush and fence admission: walk lock, fair admission, shared-level drain (§6.4–6.5) |
+| [VX_cache_drain.sv](../../hw/rtl/cache/VX_cache_drain.sv) | per-bank fence drain at the shared level |
 | [VX_cache_flush.sv](../../hw/rtl/cache/VX_cache_flush.sv) | per-bank init/flush walk FSM |
 | [VX_cache_amo.sv](../../hw/rtl/cache/VX_cache_amo.sv), [VX_amo_unit.sv](../../hw/rtl/cache/VX_amo_unit.sv), [VX_amo_alu.sv](../../hw/rtl/cache/VX_amo_alu.sv) | atomics at the LLC, probe/passthrough above it |
 | [VX_cache_define.vh](../../hw/rtl/cache/VX_cache_define.vh) | geometry macros |
@@ -150,11 +151,12 @@ SimX. Operations that are not plain read/write are selected by `attr`, typed
 | `is_addr_local` | `MEM_ATTR_LOCAL_OFFS = 2` | local (scratchpad) aperture |
 | `is_addr_om` | `MEM_ATTR_OM_OFFS = 3` | OM aperture |
 | `amo` | `MEM_ATTR_AMO_OFFS = 4` | AMO sideband, `amo_req_t` |
+| `is_fence` | `MEM_ATTR_FENCE_OFFS = MEM_ATTR_AMO_OFFS + AMO_REQ_BITS` | with `is_flush`: an LSU fence, which the device's shared level drains instead of walking ([§6.4](#64-the-fence-walk-above-the-shared-level-drain-at-it)) |
 
 Two placement decisions are load-bearing and documented as such in the source:
 
 - `is_flush` sits at the LSB so `VX_dcr_flush` can drive it deterministically.
-- `is_addr_om` was appended **above** `amo`, not below. `VX_cache_bank` casts the
+- New fields go **above** `amo`, as `is_fence` does. `VX_cache_bank` casts the
   AMO sideband **by offset**, so a bit inserted below it would silently shift
   `MEM_ATTR_AMO_OFFS` and reinterpret the atomic. Do not reorder these fields.
 
@@ -545,10 +547,14 @@ stage added is a cycle on every hit, so it buys frequency, not bandwidth.
 The cache exposes exactly **one** flush primitive: a whole-cache
 invalidate-and-writeback, gated on `attr.is_flush`. There is no line-granular
 invalidate, no way-granular invalidate, no tag-only invalidate, and no
-software-addressable per-line writeback. The only thing software can ask for is
-"drain this cache."
+software-addressable per-line writeback. Two requests use it:
 
-A flush walks every line in every way and:
+| request | attr | what each cache does |
+|---|---|---|
+| the host cache flush (§6.1–6.3) | `is_flush` | walks, at every level |
+| an LSU fence ([lsu_pipeline_design.md](lsu_pipeline_design.md) §3.3) | `is_flush` and `is_fence` | walks above the device's shared level; the shared level drains it instead (§6.4) |
+
+A walk visits every line in every way and:
 
 - in **write-back** mode, emits a writeback for each dirty sector, then clears
   valid and dirty;
@@ -626,21 +632,79 @@ port.
 
 ![Flush sequence](../assets/img/cache_flush_sequence.svg)
 
-### 6.4 VX_cache_init — the input lock
+### 6.4 The fence: walk above the shared level, drain at it
 
-`VX_cache_init` is a 5-state FSM (`IDLE → WAIT1 → FLUSH → WAIT2 → DONE`) sitting
-between the cache's input ports and the request crossbar.
+The **shared level** is the first cache that every memory agent of the device
+reaches. Whether an instance is that level is its `SHARED_LEVEL` parameter,
+computed where the cache is instantiated, never inside it:
 
-```systemverilog
-wire input_enable = ~flush_req_enable || lock_released[i];
-assign core_bus_out_if[i].req_valid = core_bus_in_if[i].req_valid && input_enable;
-assign core_bus_in_if[i].req_ready  = core_bus_out_if[i].req_ready && input_enable;
-```
+| instance | `SHARED_LEVEL` when |
+|---|---|
+| L3 ([Vortex.sv](../../hw/rtl/Vortex.sv)) | the L3 is enabled: every cluster and the page walker meet there |
+| L2 ([VX_cluster.sv](../../hw/rtl/VX_cluster.sv)) | the L2 is enabled, there is no L3, and the device has one cluster |
+| dcache ([VX_socket.sv](../../hw/rtl/VX_socket.sv)) | there is no L2 or L3, the device has one socket with one dcache, and no DXA, TEX, RTU, raster or OM unit has a memory port below it |
 
-While a flush is in flight every input port presents `valid=0` downstream and
-`ready=0` upstream, so upstream stalls. Only the port that originated the flush is
-unlocked (`lock_released_n = flush_req_mask`), so its `MemReq` enters the cache and
-generates the acknowledging response; the rest unlock on the return to IDLE.
+A device with several sockets and no L2 or L3, or with several clusters and
+no L3, has no shared level: every cache walks on a fence.
+
+**Above the shared level** a fence is a flush (§6.5–6.7): the cache locks its
+inputs, walks, and bank 0 forwards the fence on its memory port, behind every
+earlier request on that port; the requests on the other ports have left the
+banks before the walk, but may still be on their way (§6.9). A
+write-through level only clears valid bits; a write-back one, such as a
+dcache that DXA reads below, also writes its dirty lines back. Later loads
+miss and refetch, which is the consumer-side invalidate that device-scope
+ordering needs ([multicache_amo_coherence.md](multicache_amo_coherence.md)
+§6.2).
+
+**At the shared level** a fence neither locks the cache nor walks it:
+
+1. `VX_cache_init` holds the fence requests, and regular requests keep
+   entering. The drain covers the fences waiting when it starts; a later one
+   waits for the next drain.
+2. The bank-select stage can reorder requests, so each one carries an
+   acceptance epoch. The fence flips the epoch, and the banks start draining
+   once no request of the old epoch is still in transit to them.
+3. Each bank's [`VX_cache_drain`](../../hw/rtl/cache/VX_cache_drain.sv) waits
+   for a snapshot of its own older work, one step at a time: the requests in
+   the pipeline commit; the misses they left in the MSHR fill and leave it;
+   their replays commit; the atomic engine settles and its writebacks commit;
+   the memory requests queued by then are sent. Requests arriving meanwhile
+   are not waited for, so they cannot hold the drain off. A bank that is or
+   becomes empty finishes at once.
+4. When every bank has finished, the held fences enter the cache as reads of
+   their word, whose responses answer them.
+
+The response therefore proves that every request the shared level accepted
+before the fence has committed there. That includes every earlier request on
+the fence's own path, which is what the LSU relies on
+([lsu_pipeline_design.md](lsu_pipeline_design.md) §3.3), but not one still on
+its way on another memory port (§6.9). The host flush still
+walks the shared level, because the host reads memory after it.
+
+The shared level is where a walk would cost most: it locks out the whole
+device, and a write-back walk takes `sets × ways` cycles per bank, 4,096 for
+the default 2 MB, 8-way L3 at four banks.
+
+### 6.5 VX_cache_init — admission
+
+`VX_cache_init` sits between the cache's input ports and the request crossbar.
+Its FSM runs a walk as `IDLE → WAIT1 → FLUSH → WAIT2 → DONE → GRACE → IDLE` and,
+at the shared level, a fence's drain as `IDLE → DRAIN → DREL → IDLE`. It gates
+whole ports:
+
+| state | ports admitted |
+|---|---|
+| `IDLE` | every port without a flush request, until a walking request shows up; then none |
+| `WAIT1`, `FLUSH`, `WAIT2` | none |
+| `DONE` | the flush requests the walk covers; the other ports once no flush request waits |
+| `GRACE`, `DRAIN` | every port without a flush request |
+| `DREL` | every port without a flush request, and the drained fences |
+
+While a walk is in flight every input port presents `valid=0` downstream and
+`ready=0` upstream, so upstream stalls. When the walk ends, every flush request
+waiting at that moment is released (`lock_released_n = flush_req_mask`), so one
+walk answers the flushes of all ports at once.
 
 - `STATE_WAIT1` waits for `BANK_SEL_LATENCY × NUM_BANKS` outstanding crossbar
   requests to drain. When there is no crossbar latency this state is bypassed and
@@ -649,11 +713,20 @@ generates the acknowledging response; the rest unlock on the return to IDLE.
 - `STATE_WAIT2` accumulates `flush_done |= flush_end` until every bank has
   reported.
 
-That lock is the load-bearing piece for correctness. Once engaged, no core request
-can reach any bank pipeline — which is what lets the per-bank walk assume the only
-in-flight entries are its own.
+**Fair admission.** A port whose regular request waited through a walk is
+admitted once before another walk may start: `STATE_DONE` records those ports,
+and `STATE_GRACE` holds the next walk off until each of them has had a request
+accepted. A stream of flushes on one port therefore delays another port's
+request by at most one more walk, instead of starving it. Gating whole ports,
+never single requests, keeps each port's requests in order: a later request
+never overtakes an earlier one on its port.
 
-### 6.5 VX_cache_flush — the per-bank walk
+The lock is the load-bearing piece for a walk's correctness. Once engaged, no
+core request can reach any bank pipeline — which is what lets the per-bank walk
+assume the only in-flight entries are its own. A drain needs no lock, because
+it waits only for its snapshot.
+
+### 6.6 VX_cache_flush — the per-bank walk
 
 A 6-state FSM per bank, about 14 flip-flops:
 
@@ -693,7 +766,7 @@ overtaken.
 gates the counter, so under write-back with a near-full egress queue the walk
 pauses until it drains.
 
-### 6.6 What flush does to the arrays
+### 6.7 What flush does to the arrays
 
 **Tags** ([VX_cache_tags.sv](../../hw/rtl/cache/VX_cache_tags.sv)):
 
@@ -718,7 +791,7 @@ line; the dirty-byte LUTRAM reads on flush too, so the writeback's byteen tracks
 per-byte dirty marks. In write-through mode neither happens — the data array
 ignores `flush` entirely.
 
-### 6.7 Cost
+### 6.8 Cost
 
 **Area is essentially free.** The flush subsystem reuses the bank's existing
 tag/data write ports and the existing memory-request queue.
@@ -726,7 +799,8 @@ tag/data write ports and the existing memory-request queue.
 | Component | Storage |
 |---|---|
 | `VX_cache_flush` | 3 bits state, 1 bit pending, ~10 bits counter — ~14 FF/bank |
-| `VX_cache_init` | 3 bits state, `NUM_BANKS`-bit `flush_done`, `NUM_REQS`-bit `lock_released`, UUID register |
+| `VX_cache_init` | 3 bits state, `NUM_BANKS`-bit `flush_done`, `NUM_REQS`-bit `lock_released` and `grace_mask`, UUID register; at the shared level also the epoch bit and two in-transit counters |
+| `VX_cache_drain` | shared level only, per bank: state, step and pipeline counters, an `MSHR_SIZE`-bit snapshot, a memory-queue counter |
 | `VX_dcr_flush` | 2 bits (`flush_inflight_r`, `flush_done_r`) + a 2:1 arbiter |
 | tag / data RAM | **no extra storage** |
 | mreq queue | **no extra entries** |
@@ -746,15 +820,20 @@ fraction serialized through `mreq_queue`.
 Pre-flush latency is dominated by `STATE_WAIT1` waiting for `mshr_empty` — worst
 case the longest in-flight memory round trip.
 
+A fence's drain at the shared level does not depend on the cache size: it
+lasts as long as the oldest work in the bank, at worst a memory round trip plus
+the pipeline, and other ports keep issuing meanwhile.
+
 **Throughput coupling:** because flush outranks core requests in the bank arbiter
 *and* the input lock blocks all new traffic for the duration, the cache is
-effectively off for the whole walk. Every other warp's loads and stores stall.
-Flush is intended as an infrequent, coarse operation; it is not a fine-grained
-primitive.
+effectively off for the whole walk. Every other warp's loads and stores stall,
+for one walk at a time: fair admission (§6.5) lets each waiting port in between
+two walks. A walk is coarse; the fences that would issue many of them skip it
+at the shared level (§6.4).
 
-### 6.8 Correctness invariants
+### 6.9 Correctness invariants
 
-1. **Atomicity against normal traffic.** Once a flush is in flight no core request
+1. **Atomicity against normal traffic.** Once a walk is in flight no core request
    reaches a bank pipeline — enforced by the `VX_cache_init` input lock.
 2. **The bank is fully quiesced before the walk starts.** `STATE_WAIT1` waits for
    `mshr_empty && bank_empty` — both, not just the MSHR. Otherwise a fill could
@@ -768,6 +847,14 @@ primitive.
    until `bank_empty`.
 6. **The init walk is one-shot per reset.** `flush_pending_r` only records a
    `flush_begin` arriving *during* init; it never re-enters `STATE_INIT`.
+7. **A drained fence answers after its port's older requests commit.** The drain
+   starts only once no request accepted before the fence is in transit to a
+   bank, and each bank finishes only after the work it held then has committed
+   and its memory requests have left.
+8. **No request overtakes an older one on its port.** Admission gates whole
+   ports: a port with a held flush or fence admits nothing behind it.
+9. **A regular request waits through at most one whole walk** — `STATE_GRACE`
+   admits every port that waited through a walk before the next one starts.
 
 Edge cases:
 
@@ -783,7 +870,25 @@ Edge cases:
 - **`STATE_WAIT2`'s `bank_empty` does not re-check `mshr_empty`.** It does not need
   to: WAIT1 established it and the input lock guarantees nothing can refill.
 
-### 6.9 Why flush is not the substrate for line-granular invalidation
+**Known gap: a fence orders one memory port, not all of them.** A walking
+level forwards the fence through bank 0, which owns line 0, so the fence
+leaves on memory port 0 (bank *i* uses port *i* mod `MEM_PORTS`; two ports by
+default). WAIT1 and the walk only prove that the level's earlier requests have
+left its banks. One on another port can still sit in the memory-side path, or
+at a back-pressured input of the next level, when the fence reaches the shared
+level, and the drain covers only what that level has already accepted. A
+fence that arrives while another fence's walk holds a level is released when
+that walk ends, ahead of the regular requests waiting on the other ports, so
+those also reach the next level after it. The LSU's dcache channels have the
+same property. So a fence proves that its own path's earlier requests
+committed at the shared level, and that the rest have left the walking
+caches. A violation needs a port held back for about as long as
+the walk, the drain and the response's return trip. Closing it needs a fence
+on every memory port, answered when all of them return, in RTL and SimX
+alike. SimX has the same gap: its banks share the memory ports in contiguous
+groups, so its fence also leaves on port 0 alone.
+
+### 6.10 Why flush is not the substrate for line-granular invalidation
 
 It is whole-cache only, counter-driven with no external address input, and it
 freezes every cache input for the duration of the walk.
@@ -816,7 +921,25 @@ closely enough to be a parity oracle:
 | Fill forwarding | leading run of plain reads, closes on write/AMO | `processForward()`, identical closing rule |
 | Hit under a draining chain | demoted per word (§4.5) | joins the chain per `{line, sector}` when the chain holds a store or an atomic, or the request is one |
 | AMOs | LLC commits, non-LLC probes and forwards | `amo_unit_` at LLC; `AmoProbe` above it |
+| AMO commit hold | `commit_busy` holds core admission from S0 through the writeback, for an atomic admitted or replayed | `amo_hold_`: `latency + 3` cycles from the admission of a storing atomic that hits, or from its replay |
 | Flush | per-bank set × way walk | per-bank set × way × sector walk |
+| Fence (§6.4) | `is_fence`; walk above the shared level, drain at it (`SHARED_LEVEL`); admission with `STATE_GRACE` | `MemFlags::fence`; the same walk, one set per cycle per bank (set and way when write-back), or drain (`Config::fence_shared`); the same admission states |
+| LSU block 0, dcache channel 0 | `VX_dcr_flush` adds one register stage to every request | one more cycle for fence tokens only, an approximation: other requests on that channel arrive a cycle earlier than in the RTL |
+
+**Known gap: a fence's cost depends on warp interleaving.** A fence sends a
+token on each dcache channel its lanes use, and a walking cache lets a token
+go only when a walk ends with the token at the head of its port. When
+another warp's request sits ahead of one channel's token as a walk ends,
+`STATE_DONE` releases only the other token, and the held one needs a walk of
+its own, at that level and at every walking level below it. Which requests
+share a channel at that moment depends on the order in which warps issue,
+and SimX's greedy-then-oldest issue does not follow the RTL's sticky
+round-robin cycle for cycle. At 2 × 2 cores with a write-through L2 and an L3,
+`fence -tvecadd -n32` sends 23 tokens down from the L1s for 16 fences on
+rtlsim and 16 on SimX, and the L2s walk 18 times against 10: 8,200 cycles
+against 6,604 (−19.5%). No parity cell has that shape; the
+`fence:parity-amomax*` cells, at one core and at 2 × 2 cores + L3, stay
+within 3%.
 
 **Known gap: a replay in flight is invisible at pipe exit.** A chained request
 that leaves the MSHR to replay re-enters the bank pipe behind any younger
@@ -1073,7 +1196,21 @@ the same set plus `mem_latency`, accumulated as `pending_fill_reqs_` per tick.
   `make -C hw/unittest run-cache` runs it over write-back and write-through
   banks, two-stage and deferred pipelines, the L1 and L2/L3 geometries, and two
   builds with atomics compiled out, plus a long randomized run under
-  back-pressure.
+  back-pressure. Fence and flush rounds check that a fence drains a
+  shared-level instance without a walk, and only after its older requests,
+  that it walks and invalidates a write-through instance above that level,
+  that the host flush still walks, and that a stream of flushes on one port
+  does not starve the others.
+- [tests/regression/fence](../../tests/regression/fence) `-tstorm` — the
+  fence end to end. The first warp times loads and atomics while every warp of
+  the other cores (on one core, the timer's siblings) fences in a loop until a
+  fence makes the timer's done flag visible to it; then, after one more fence,
+  it must read the timer's final count. The timer must finish within a cycle
+  budget, after which a fencer gives up, so a starved timer or a stale flag
+  fails the run instead of hanging it. The `fence:storm*` cases run it on
+  both simulators at one core, 1 × 4 cores + L2, 2 × 2 cores + L3 and
+  2 × 2 cores + write-through L2 + L3; `fence:parity-amomax*` hold the two
+  models' fence cost within the parity tolerance.
 - [tests/regression/cache_order](../../tests/regression/cache_order) — the same
   order end to end: a hart's load after its own store and its store after its
   own load on a filling line, and with the A extension the atomic variants.

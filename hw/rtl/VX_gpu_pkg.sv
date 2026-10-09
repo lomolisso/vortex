@@ -213,10 +213,13 @@ package VX_gpu_pkg;
     // Cross-cache mem-bus attr — FIXED OFFSETS so arbitration is clean.
     // Shared by every VX_mem_bus_if instance that carries attr.
     // is_flush at LSB so dcr_flush can drive it deterministically.
-    // is_addr_om is appended ABOVE amo, deliberately: the amo field is cast by
-    // offset (VX_cache_bank), so inserting a bit below it would silently shift
-    // MEM_ATTR_AMO_OFFS and reinterpret the AMO sideband.
+    // The amo field is cast by offset (VX_cache_bank), so new fields go above
+    // it: a bit inserted below would silently shift MEM_ATTR_AMO_OFFS and
+    // reinterpret the AMO sideband.
+    // is_fence marks an LSU fence's is_flush: the device's shared cache level
+    // drains it instead of walking. A host flush carries is_flush alone.
     typedef struct packed {
+        logic                        is_fence;      // MEM_ATTR_FENCE_OFFS = MEM_ATTR_AMO_OFFS + AMO_REQ_BITS
         amo_req_t                    amo;           // MEM_ATTR_AMO_OFFS   = 4
         logic                        is_addr_om;    // MEM_ATTR_OM_OFFS    = 3
         logic                        is_addr_local; // MEM_ATTR_LOCAL_OFFS = 2
@@ -229,6 +232,7 @@ package VX_gpu_pkg;
     localparam MEM_ATTR_LOCAL_OFFS  = 2;
     localparam MEM_ATTR_OM_OFFS     = 3;
     localparam MEM_ATTR_AMO_OFFS    = 4;
+    localparam MEM_ATTR_FENCE_OFFS  = MEM_ATTR_AMO_OFFS + AMO_REQ_BITS;
 
     // Total width of the mem-bus attr field. Use this as the parameter
     // default for VX_mem_bus_if's ATTR_WIDTH parameter and as the

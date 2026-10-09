@@ -115,10 +115,15 @@ public:
       ibuffers_.at(i) = TFifo<instr_trace_t*>::Create(sname, 1, VX_CFG_IBUF_SIZE);
     }
 
+    // Block 0's first dcache port crosses the hardware's host-flush injection
+    // stage, one register more than the others. Only fence tokens model that
+    // skew: it decides whether a warp's tokens share one shared-level drain.
+    const auto port0_fence_delay = [](uint32_t b) { return (b == 0) ? 1u : 0u; };
+
     // create the memory coalescer
     for (uint32_t b = 0; b < VX_CFG_NUM_LSU_BLOCKS; ++b) {
       snprintf(sname, 100, "%s-coalescer%d", name.c_str(), b);
-      mem_coalescers_.at(b) = MemCoalescer::Create(sname, LSU_CHANNELS, DCACHE_CHANNELS, DCACHE_WORD_SIZE, LSU_QUEUE_OUT_SIZE, 1);
+      mem_coalescers_.at(b) = MemCoalescer::Create(sname, LSU_CHANNELS, DCACHE_CHANNELS, DCACHE_WORD_SIZE, LSU_QUEUE_OUT_SIZE, 1, port0_fence_delay(b));
     }
 
     // create local memory.
@@ -188,7 +193,7 @@ public:
       std::vector<LsuMemAdapter::Ptr> lsu_dcache_adapter(VX_CFG_NUM_LSU_BLOCKS);
       for (uint32_t b = 0; b < VX_CFG_NUM_LSU_BLOCKS; ++b) {
         snprintf(sname, 100, "%s-lsu_dcache_adapter%d", name.c_str(), b);
-        lsu_dcache_adapter.at(b) = LsuMemAdapter::Create(sname, DCACHE_CHANNELS, 1);
+        lsu_dcache_adapter.at(b) = LsuMemAdapter::Create(sname, DCACHE_CHANNELS, 1, port0_fence_delay(b));
         lmem_switch_.at(b)->ReqOutDC.bind(&lsu_dcache_adapter.at(b)->ReqIn);
         lsu_dcache_adapter.at(b)->RspOut.bind(&lmem_switch_.at(b)->RspInDC);
         for (uint32_t c = 0; c < DCACHE_CHANNELS; ++c) {

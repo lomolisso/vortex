@@ -244,6 +244,7 @@ void LsuUnit::process_response_step(uint32_t b) {
 		return; // stall
 	DT(3, this->name() << " mem-rsp: " << lsu_rsp);
 	assert(entry.count != 0);
+	const bool is_fence = entry.is_fence;
 
 	if (entry.is_load) {
 		bool dst_float = (trace->dst_reg.type == RegType::Float);
@@ -308,7 +309,13 @@ void LsuUnit::process_response_step(uint32_t b) {
 		beat->eop = false;
 		output.send(beat, 2);
 	}
-	pending_loads_ -= lsu_rsp.mask.count();
+	if (is_fence) {
+		if (is_final) {
+			state.fence.token_returned();
+		}
+	} else {
+		pending_loads_ -= lsu_rsp.mask.count();
+	}
 	lsu_rsp_in.pop();
 }
 
@@ -332,19 +339,56 @@ void LsuUnit::ingest_inputs(uint32_t b) {
 	input.pop();
 }
 
+// Send the fence token down the data-cache path and lock the block until it
+// returns. The token rides the active lanes of the warp's last packet, the
+// one that carries end-of-packet, each addressing line 0.
+void LsuUnit::issue_fence(uint32_t b, instr_trace_t* trace) {
+	auto& state = states_.at(b);
+	if (state.pending_reqs.full() || core_->lmem_switch(b)->ReqIn.full())
+		return; // stall
+
+	LsuReq lsu_req(VX_CFG_NUM_LSU_LANES);
+	lsu_req.op = MemOp::FLUSH;
+	lsu_req.flags.fence = 1;
+	lsu_req.wid = trace->wid;
+	uint32_t last = 0;
+	for (uint32_t t = 0; t < VX_CFG_NUM_THREADS; ++t) {
+		if (trace->tmask.test(t))
+			last = t;
+	}
+	uint32_t t0 = (last / VX_CFG_NUM_LSU_LANES) * VX_CFG_NUM_LSU_LANES;
+	for (uint32_t t = t0; t < VX_CFG_NUM_THREADS && t < t0 + VX_CFG_NUM_LSU_LANES; ++t) {
+		if (!trace->tmask.test(t))
+			continue;
+		uint32_t i = t - t0;
+		lsu_req.mask.set(i);
+		lsu_req.addrs.at(i) = 0;
+		lsu_req.tids.at(i) = t;
+	}
+	uint32_t count = lsu_req.mask.count();
+	pending_req_t entry{trace, count, true, std::vector<mem_addr_size_t>(VX_CFG_NUM_LSU_LANES), IntrLsuArgs{}, false};
+	entry.is_fence = true;
+	lsu_req.tag  = state.pending_reqs.allocate(std::move(entry));
+	lsu_req.cid  = trace->cid;
+	lsu_req.uuid = trace->uuid;
+	core_->lmem_switch(b)->ReqIn.send(lsu_req);
+	state.fence.engage(trace);
+	state.req_queue.pop();
+	DT(3, this->name() << " fence-lock: " << *trace);
+}
+
 // Per-cycle request handler. Dispatches at most one batch (one
 // memory-side mem_req) per call. The head trace stays at the queue
 // front until all its batches are issued (req_sent_all-driven).
 void LsuUnit::process_request_step(uint32_t b) {
 	auto& state = states_.at(b);
 
-	// Attempt fence release first so a steady stream of TCU client forwards
-	// (which consume the dispatch slot and return) cannot starve it.
 	const bool fence_locked = state.fence.locked();
 	if (fence_locked) {
-		bool released = state.fence.try_release(Outputs.at(b), state.pending_reqs.empty());
-		if (released) {
-			DT(3, this->name() << " fence-unlock: " << state.fence.trace());
+		auto fence_trace = state.fence.trace();
+		__unused(fence_trace);
+		if (state.fence.try_release()) {
+			DT(3, this->name() << " fence-unlock: " << *fence_trace);
 		}
 	}
 
@@ -353,8 +397,7 @@ void LsuUnit::process_request_step(uint32_t b) {
 	// cycle into lmem_switch, ahead of the block's own dispatch. The wire tag
 	// is re-allocated from pending_reqs so it stays unique on the switch; the
 	// client's own tag is restored on the response. An independent client, so
-	// not gated by the fence lock — its entries still hold fence release via
-	// pending_reqs.empty().
+	// not gated by the fence lock.
 	if (b == 0 && !TcuReqIn.empty()) {
 		if (!state.pending_reqs.full() && !core_->lmem_switch(0)->ReqIn.full()) {
 			LsuReq lsu_req = TcuReqIn.peek();
@@ -388,7 +431,7 @@ void LsuUnit::process_request_step(uint32_t b) {
 #endif
 
 	// No dispatch while a fence is engaged (per-block total barrier); the
-	// release attempt already ran above.
+	// fence token's response releases it.
 	if (fence_locked) {
 		return;
 	}
@@ -416,11 +459,7 @@ void LsuUnit::process_request_step(uint32_t b) {
 	const bool is_write = (lsu_tag && *lsu_tag == LsuType::STORE);
 
 	if (is_fence) {
-		// Engage fence lock; the next call will try to release it once
-		// the pending-reqs table drains.
-		state.fence.engage(trace);
-		DT(3, this->name() << " fence-lock: " << *trace);
-		state.req_queue.pop();
+		this->issue_fence(b, trace);
 		return;
 	}
 

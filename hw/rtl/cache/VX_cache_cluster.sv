@@ -56,6 +56,8 @@ module VX_cache_cluster import VX_gpu_pkg::*; #(
 
     parameter IS_LLC                = 0,      // Indicates this cache cluster is the LLC (handles AMO completion).
 
+    parameter SHARED_LEVEL          = IS_LLC, // Every memory agent reaches these caches: a fence drains them, never walks them.
+
     parameter AMO_ENABLE            = 0       // Enable atomic memory operations.
  ) (
     input wire clk,
@@ -145,6 +147,7 @@ module VX_cache_cluster import VX_gpu_pkg::*; #(
             .NC_ENABLE (NC_ENABLE),
             .PASSTHRU     (PASSTHRU),
             .IS_LLC       (IS_LLC),
+            .SHARED_LEVEL (SHARED_LEVEL),
             .AMO_ENABLE   (AMO_ENABLE)
         ) cache_wrap (
         `ifdef PERF_ENABLE

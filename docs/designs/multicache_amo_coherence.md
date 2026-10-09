@@ -251,24 +251,35 @@ coherence traffic between the L1s at all. Fully implemented in both models.
 If core 0 plain-loaded a word, caching its line, and core 3 then atomically
 updates it, core 0's copy is stale. The LLC never reaches up. The weak model
 resolves this the way a GPU does: the **consumer** discards its own copies at
-an acquire point and refetches.
+an acquire point and refetches, and the **producer** pushes its writes to the
+shared level at a release point. A `fence` is both, at device scope, and RTL
+and SimX model it the same way ([`cache_subsystem.md`](cache_subsystem.md)
+§6.4):
 
-There is no dedicated acquire-invalidate. What exists today:
-
-| model | what a `fence` does to the issuing core's data cache |
+| where the fence is | what it does |
 |---|---|
-| RTL | the LSU sends the fence as a request with `is_flush` set, which starts the **whole-cache flush**; on a write-through cache the walk clears every valid bit |
-| SimX | the fence is an ordering barrier in the LSU only; a flush of a write-through cache is a no-op and no line is invalidated |
+| a cache above the device's shared level, or any cache of a device without one | walks the cache: every line is invalidated, a dirty one written back first; then forwards the fence behind the level's earlier requests |
+| the shared level, the first one every memory agent of the device reaches | no walk: answers once every request it accepted before the fence has drained |
 
-So an RTL `fence` happens to give the consumer-side invalidate, at the cost
-of a full flush walk that locks the cache's inputs for its duration, and
-SimX does not model it. **The two models disagree, and no regression case
-exercises fence-managed cross-core visibility** — `atomic_critical`, which
-runs plain loads and stores inside a lock, is skipped on multi-core
-configurations for exactly this reason.
+The fence's response therefore proves that the issuing core's earlier stores
+and atomics on the fence's own memory path have reached the shared level, and
+its later loads miss above it and see whatever other cores published there
+before their own fences. That is the device-scope behaviour of CUDA's
+`__threadfence()` and of an OpenCL device-scope fence, with one gap: an
+earlier request that left a walking cache on another memory port is only
+known to have left it ([`cache_subsystem.md`](cache_subsystem.md) §6.9).
 
-Programs that share data across cores through plain memory are outside what
-is validated. Share through atomics, or through the single shared level.
+The `fence:storm*` cases ([`tests/regression/fence`](../../tests/regression/fence))
+exercise it on both models: fencing warps on the other cores poll a flag that
+a timer warp sets with a plain store, then, after one more fence, must read
+the timer's final atomic count from a line their own caches held stale.
+
+`atomic_critical` runs plain loads and stores inside a lock with no fence, so
+it stays skipped on multi-core configurations: its counter access needs an
+acquire fence after taking the lock and a release fence before dropping it.
+
+Programs that share data across cores through plain memory must bracket it
+with fences. Otherwise share through atomics, or through the shared level.
 
 ---
 
@@ -351,10 +362,9 @@ their lines fill ([`atomic_memory_operations.md`](atomic_memory_operations.md)
 
 ## 10. Not implemented
 
-- **A dedicated acquire-invalidate** (§6.2) — a consumer-side invalidate that
-  clears the inner cache's valid bits without the full flush walk, modeled
-  identically in RTL and SimX, with a regression case for fence-managed
-  visibility.
+- **A constant-time acquire-invalidate** (§6.2) — above the shared level a
+  fence still walks every set of the cache; clearing the valid bits at once
+  would make it independent of the cache size.
 - **The `amo` suite on rtlsim over the L2-as-LLC hierarchy.** `mc-l2` runs on
   SimX only; rtlsim covers that hierarchy with `cache-order-l2` and the
   `LR`/`SC` loops of `mc-l2-w8t8-lanes2`.

@@ -43,6 +43,9 @@ public:
 		uint8_t latency;        // pipeline latency
 		uint8_t repl_policy;    // replacement policy (ReplPolicy)
 		bool    is_llc;					// is last-level cache
+		// Every memory agent of the device reaches this cache: a fence drains
+		// here instead of locking the inputs and walking the lines.
+		bool    fence_shared = false;
 	};
 
 	struct PerfStats {

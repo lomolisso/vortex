@@ -101,6 +101,7 @@ module VX_lsu_slice import VX_gpu_pkg::*; #(
         wire [MEM_ADDRW-1:0] io_addr_start = MEM_ADDRW'(`VX_CFG_XLEN'(`VX_MEM_IO_BASE_ADDR) >> MEM_ASHIFT);
         wire [MEM_ADDRW-1:0] io_addr_end = MEM_ADDRW'(`VX_CFG_XLEN'(`VX_MEM_IO_END_ADDR) >> MEM_ASHIFT);
         assign mem_req_attr_struct[i].is_flush  = req_is_fence;
+        assign mem_req_attr_struct[i].is_fence  = req_is_fence;
     `ifdef VX_CFG_EXT_OM_ENABLE
         // OM fragment-export aperture.
         //

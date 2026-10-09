@@ -191,6 +191,18 @@ module VX_socket import VX_gpu_pkg::*, VX_tlb_pkg::*;
         .TAG_WIDTH (DCACHE_MEM_TAG_WIDTH)
     ) dcache_mem_bus_if[L1_MEM_PORTS]();
 
+    // The dcache is the device's shared level, where a fence drains, only when
+    // no other cache or memory port could hold or read data behind it: no L2
+    // or L3, one socket with one dcache, and no unit with a memory port below
+    // it. Otherwise a fence walks it.
+    localparam DCACHE_SHARED_LEVEL = (`VX_CFG_DCACHE_ENABLED != 0)
+                                  && (`VX_CFG_L2_ENABLED == 0) && (`VX_CFG_L3_ENABLED == 0)
+                                  && (`VX_CFG_NUM_CLUSTERS == 1) && (NUM_SOCKETS == 1)
+                                  && (`VX_CFG_NUM_DCACHES == 1)
+                                  && (`VX_CFG_EXT_DXA_ENABLED == 0) && (`VX_CFG_EXT_TEX_ENABLED == 0)
+                                  && (`VX_CFG_EXT_RTU_ENABLED == 0) && (`VX_CFG_EXT_RASTER_ENABLED == 0)
+                                  && (`VX_CFG_EXT_OM_ENABLED == 0);
+
     VX_cache_cluster #(
         .INSTANCE_ID    (`SFORMATF(("%s-dcache", INSTANCE_ID))),
         .NUM_UNITS      (`VX_CFG_NUM_DCACHES),
@@ -218,6 +230,7 @@ module VX_socket import VX_gpu_pkg::*, VX_tlb_pkg::*;
         .CORE_OUT_BUF   (3),
         .MEM_OUT_BUF    (3),
         .IS_LLC         (DCACHE_IS_LLC),
+        .SHARED_LEVEL   (DCACHE_SHARED_LEVEL),
         .AMO_ENABLE     (`VX_CFG_EXT_A_ENABLED)
     ) dcache (
     `ifdef PERF_ENABLE

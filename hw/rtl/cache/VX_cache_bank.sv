@@ -36,6 +36,7 @@ module VX_cache_bank import VX_gpu_pkg::*; #(
     parameter MEM_OUT_BUF       = 0,
     parameter IS_LLC            = 0,        // last-level cache: AMOs commit locally here
     parameter AMO_ENABLE        = 0,        // synthesize atomic-op logic
+    parameter SHARED_LEVEL      = 0,        // a fence drains this bank instead of walking it
     parameter LATENCY           = 2,        // pipeline depth; >2 defers the data array to break the tag->data path
     parameter MSHR_ADDR_WIDTH   = `LOG2UP(MSHR_SIZE),
     parameter MEM_TAG_WIDTH     = UUID_WIDTH + MSHR_ADDR_WIDTH,
@@ -89,6 +90,7 @@ module VX_cache_bank import VX_gpu_pkg::*; #(
 
     // Flush
     input wire                          flush_begin,
+    input wire                          flush_drain,   // a fence's drain, not a walk
     input wire [`UP(UUID_WIDTH)-1:0]    flush_uuid,
     output wire                         flush_end
 );
@@ -167,9 +169,11 @@ module VX_cache_bank import VX_gpu_pkg::*; #(
     // can underflow on a double free. A flush gated on the proxy alone hangs
     // forever once it drifts high, so the gate consults both.
     wire mshr_valid_empty;
+    wire [MSHR_SIZE-1:0] mshr_valid_mask, mshr_free_mask;
     wire mshr_probe_pending_ld, mshr_probe_pending_amo;
     wire mshr_any_ld, mshr_any_amo, mshr_persist_ld, mshr_persist_amo;
     wire mreq_queue_empty, mreq_queue_alm_full;
+    wire [`CLOG2(MREQ_QUEUE_SIZE+1)-1:0] mreq_queue_size;
     wire [`CS_LINE_ADDR_WIDTH-1:0] mem_rsp_addr;
     wire [`UP(`CS_SECTOR_SEL_BITS)-1:0] mem_rsp_sector; // sector this fill installs
     wire [MSHR_ADDR_WIDTH-1:0] mshr_alloc_id, mshr_previd;
@@ -285,6 +289,9 @@ module VX_cache_bank import VX_gpu_pkg::*; #(
     end
     wire no_pending_req = ~pipe_inflight && mreq_queue_empty;
 
+    wire walk_end, drain_end;
+    assign flush_end = walk_end || drain_end;
+
     VX_cache_flush #(
         .BANK_ID    (BANK_ID),
         .CACHE_SIZE (CACHE_SIZE),
@@ -295,8 +302,8 @@ module VX_cache_bank import VX_gpu_pkg::*; #(
     ) cache_flush (
         .clk         (clk),
         .reset       (reset),
-        .flush_begin (flush_begin),
-        .flush_end   (flush_end),
+        .flush_begin (flush_begin && ~flush_drain),
+        .flush_end   (walk_end),
         .flush_init  (init_valid),
         .flush_valid (flush_valid),
         .flush_line  (flush_sel),
@@ -931,7 +938,9 @@ module VX_cache_bank import VX_gpu_pkg::*; #(
         .finalize_is_pending (st1.lk.mshr_pending && ~mshr_release_st1),
         .finalize_id         (st1.req.mshr_id),
         .finalize_previd     (st1.lk.mshr_previd),
-        .empty               (mshr_valid_empty)
+        .empty               (mshr_valid_empty),
+        .valid_mask          (mshr_valid_mask),
+        .free_mask           (mshr_free_mask)
     );
 
     // ========================================================================
@@ -1331,9 +1340,34 @@ module VX_cache_bank import VX_gpu_pkg::*; #(
         .alm_full (mreq_queue_alm_full),
         `UNUSED_PIN (full),
         `UNUSED_PIN (alm_empty),
-        `UNUSED_PIN (size)
+        .size     (mreq_queue_size)
     );
     assign mem_req_valid = ~mreq_queue_empty;
+
+    // A fence at the shared level answers once this bank has retired what it
+    // held when the fence's drain began; no line is walked.
+    if (SHARED_LEVEL != 0) begin : g_drain
+        VX_cache_drain #(
+            .MSHR_SIZE  (MSHR_SIZE),
+            .PIPE_DEPTH (PIPELINE_STAGES + 1),
+            .MREQ_SIZEW (`CLOG2(MREQ_QUEUE_SIZE+1))
+        ) cache_drain (
+            .clk          (clk),
+            .reset        (reset),
+            .drain_begin  (flush_begin && flush_drain),
+            .drain_end    (drain_end),
+            .bank_empty   (no_pending_req && mshr_valid_empty && ~amo_commit_busy),
+            .pipe_advance (~pipe_stall),
+            .mshr_valid   (mshr_valid_mask),
+            .mshr_free    (mshr_free_mask),
+            .amo_busy     (amo_commit_busy),
+            .mreq_size    (mreq_queue_size),
+            .mreq_pop     (mreq_queue_pop)
+        );
+    end else begin : g_no_drain
+        assign drain_end = 1'b0;
+        `UNUSED_VAR ({mshr_valid_mask, mshr_free_mask, mreq_queue_size})
+    end
 
     `UNUSED_VAR (do_lookup_st0)
 

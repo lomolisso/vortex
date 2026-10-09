@@ -456,7 +456,12 @@ struct MemFlags {
       // 16 bits leaves headroom for larger configs.
       uint32_t dxa_notify_done   : 1;   // bit 5
       uint32_t dxa_notify_bar_id : 16;  // bits 6..21
+    #else
+      uint32_t                   : 17;  // bits 5..21
     #endif
+      // LSU fence token: the caches above the device's shared level walk on
+      // it and the shared level drains; the host cache flush never sets it.
+      uint32_t fence             : 1;   // bit 22
     };
   };
 

@@ -31,7 +31,8 @@ public:
     const SimContext& ctx,
     const char* name,
     uint32_t num_inputs,
-    uint32_t delay
+    uint32_t delay,
+    uint32_t port0_fence_delay = 0
   );
 
   LsuMemAdapter(
@@ -47,6 +48,7 @@ protected:
 
 private:
   uint32_t delay_;
+  uint32_t port0_fence_delay_;
   BitVector<uint32_t> pending_mask_;
 
   friend class SimObject<LsuMemAdapter>;

@@ -234,6 +234,9 @@ module VX_cluster import VX_gpu_pkg::*, VX_tlb_pkg::*;
         .NC_ENABLE      (1),
         .PASSTHRU       (!`VX_CFG_L2_ENABLED),
         .IS_LLC         (L2_IS_LLC),
+        // every agent of a one-cluster device without an L3 meets in the L2:
+        // a fence drains it there, and walks it above an L3
+        .SHARED_LEVEL   ((`VX_CFG_L2_ENABLED != 0) && (`VX_CFG_L3_ENABLED == 0) && (`VX_CFG_NUM_CLUSTERS == 1)),
         .AMO_ENABLE     (`VX_CFG_EXT_A_ENABLED)
     ) l2cache (
         .clk            (clk),

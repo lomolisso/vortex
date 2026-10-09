@@ -65,6 +65,17 @@ inline constexpr uint32_t VX_CFG_DCACHE_NUM_REQS	= (VX_CFG_NUM_LSU_BLOCKS * DCAC
 
 inline constexpr uint32_t NUM_SOCKETS     = __UP(VX_CFG_NUM_CORES / VX_CFG_SOCKET_SIZE);
 
+// The dcache is the device's shared level for fences only when no lower cache
+// exists and every writer goes through it: one socket, one dcache, and no
+// engine with a memory port of its own below it.
+inline constexpr bool DCACHE_FENCE_SHARED = (VX_CFG_DCACHE_ENABLED != 0)
+                                         && (VX_CFG_L2_ENABLED == 0) && (VX_CFG_L3_ENABLED == 0)
+                                         && (VX_CFG_NUM_CLUSTERS == 1) && (NUM_SOCKETS == 1)
+                                         && (VX_CFG_NUM_DCACHES == 1)
+                                         && (VX_CFG_EXT_DXA_ENABLED == 0) && (VX_CFG_EXT_TEX_ENABLED == 0)
+                                         && (VX_CFG_EXT_RTU_ENABLED == 0) && (VX_CFG_EXT_RASTER_ENABLED == 0)
+                                         && (VX_CFG_EXT_OM_ENABLED == 0);
+
 // Demand clients of the cluster L2 (sockets and gfx caches), excluding the
 // walker's PTE-fetch slot.
 inline constexpr uint32_t VX_CFG_L2_DEMAND_REQS  = NUM_SOCKETS * VX_CFG_L1_MEM_PORTS;

@@ -126,7 +126,10 @@ module VX_cache_mshr import VX_gpu_pkg::*; #(
     // VX_pending_size counter, but that counter is a proxy fed by separate
     // increment and decrement events and can drift from the entries actually
     // held. A flush gated on the proxy alone hangs forever when it drifts high.
-    output wire                         empty
+    output wire                         empty,
+    // per-entry occupancy, and the entries a dequeue or a release frees this cycle
+    output wire [MSHR_SIZE-1:0]         valid_mask,
+    output wire [MSHR_SIZE-1:0]         free_mask
 );
     `UNUSED_PARAM (BANK_ID)
 
@@ -539,5 +542,7 @@ module VX_cache_mshr import VX_gpu_pkg::*; #(
     // outstanding and must not be blocked forever when none is -- does not have
     // to trust a separately-maintained count.
     assign empty = ~(| valid_table);
+    assign valid_mask = valid_table;
+    assign free_mask  = dequeue_free_oh | finalize_free_oh;
 
 endmodule

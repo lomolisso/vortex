@@ -24,7 +24,8 @@ MemCoalescer::MemCoalescer(
   uint32_t output_size,
   uint32_t line_size,
   uint32_t queue_size,
-  uint32_t delay
+  uint32_t delay,
+  uint32_t port0_fence_delay
 ) : SimObject<MemCoalescer>(ctx, name)
   // Single-entry ingress: one request in build/drain flight at a time; a
   // second request waits upstream rather than in local queue slack.
@@ -39,6 +40,7 @@ MemCoalescer::MemCoalescer(
   , sent_mask_(input_size)
   , line_size_(line_size)
   , delay_(delay)
+  , port0_fence_delay_(port0_fence_delay)
 {}
 
 void MemCoalescer::on_reset() {
@@ -294,7 +296,9 @@ void MemCoalescer::flush_out_round() {
     if (!out_round_.lanes.test(o)) {
       continue;
     }
-    if (ReqOut.at(o).try_send(out_round_.reqs.at(o), delay_)) {
+    auto& req = out_round_.reqs.at(o);
+    uint32_t delay = delay_ + ((o == 0 && req.flags.fence) ? port0_fence_delay_ : 0);
+    if (ReqOut.at(o).try_send(req, delay)) {
       out_round_.lanes.reset(o);
     }
   }

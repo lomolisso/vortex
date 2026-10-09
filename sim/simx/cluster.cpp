@@ -84,6 +84,8 @@ public:
       VX_CFG_L2_LATENCY,             // pipeline latency
       VX_CFG_L2_REPL_POLICY,         // replacement policy
       (VX_CFG_L2_ENABLED != 0) && (VX_CFG_L3_ENABLED == 0), // is_llc
+      // fence_shared: every agent of a single-cluster device meets here.
+      (VX_CFG_L2_ENABLED != 0) && (VX_CFG_L3_ENABLED == 0) && (VX_CFG_NUM_CLUSTERS == 1),
     });
 
 

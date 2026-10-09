@@ -49,6 +49,8 @@ module VX_cache import VX_gpu_pkg::*; #(
 
     parameter IS_LLC                = 0,      // last-level cache: banks own AMO commit + RVA reservation tracking
 
+    parameter SHARED_LEVEL          = IS_LLC, // every memory agent reaches this cache: a fence drains it, never walks it
+
     parameter AMO_ENABLE            = 0       // synthesize atomic-op logic in the banks
  ) (
 `ifdef PERF_ENABLE
@@ -73,7 +75,7 @@ module VX_cache import VX_gpu_pkg::*; #(
     localparam BANK_SEL_BITS   = `CLOG2(NUM_BANKS);
     localparam BANK_SEL_WIDTH  = `UP(BANK_SEL_BITS);
     localparam LINE_ADDR_WIDTH = (`CS_WORD_ADDR_WIDTH - BANK_SEL_BITS - WORD_SEL_BITS);
-    localparam CORE_REQ_DATAW  = LINE_ADDR_WIDTH + 1 + WORD_SEL_WIDTH + WORD_SIZE + WORD_WIDTH + TAG_WIDTH + `UP(MEM_ATTR_WIDTH);
+    localparam CORE_REQ_DATAW  = LINE_ADDR_WIDTH + 1 + WORD_SEL_WIDTH + WORD_SIZE + WORD_WIDTH + TAG_WIDTH + `UP(MEM_ATTR_WIDTH) + 1;
     localparam CORE_RSP_DATAW  = WORD_WIDTH + TAG_WIDTH;
     localparam BANK_MEM_TAG_WIDTH = UUID_WIDTH + MSHR_ADDR_WIDTH;
     localparam MEM_REQ_DATAW   = (`CS_LINE_SECTOR_ADDR_WIDTH + 1 + SECTOR_SIZE + `CS_SECTOR_WIDTH + BANK_MEM_TAG_WIDTH + `UP(MEM_ATTR_WIDTH));
@@ -95,21 +97,28 @@ module VX_cache import VX_gpu_pkg::*; #(
         .TAG_WIDTH (TAG_WIDTH)
     ) core_bus2_if[NUM_REQS]();
     wire [NUM_BANKS-1:0] per_bank_flush_begin;
+    wire flush_drain;
     wire [`UP(UUID_WIDTH)-1:0] flush_uuid;
     wire [NUM_BANKS-1:0] per_bank_flush_end;
     wire [NUM_BANKS-1:0] per_bank_core_req_fire;
+    wire core_req_epoch;
+    wire [NUM_BANKS-1:0] per_bank_core_req_epoch;
     VX_cache_init #(
         .NUM_REQS  (NUM_REQS),
         .NUM_BANKS (NUM_BANKS),
         .TAG_WIDTH (TAG_WIDTH),
-        .BANK_SEL_LATENCY (`TO_OUT_BUF_REG(REQ_XBAR_BUF)) // request xbar latency
+        .BANK_SEL_LATENCY (`TO_OUT_BUF_REG(REQ_XBAR_BUF)), // request xbar latency
+        .SHARED_LEVEL (SHARED_LEVEL)
     ) cache_init (
         .clk             (clk),
         .reset           (reset),
         .core_bus_in_if  (core_bus_if),
         .core_bus_out_if (core_bus2_if),
         .bank_req_fire   (per_bank_core_req_fire),
+        .req_epoch       (core_req_epoch),
+        .bank_req_epoch  (per_bank_core_req_epoch),
         .flush_begin     (per_bank_flush_begin),
+        .flush_drain     (flush_drain),
         .flush_uuid      (flush_uuid),
         .flush_end       (per_bank_flush_end)
     );
@@ -264,10 +273,11 @@ module VX_cache import VX_gpu_pkg::*; #(
             core_req_byteen[i],
             core_req_data[i],
             core_req_tag[i],
-            core_req_attr[i]
+            core_req_attr[i],
+            core_req_epoch
         };
     end
-    assign per_bank_core_req_fire = per_bank_core_req_valid & per_bank_mem_req_ready;
+    assign per_bank_core_req_fire = per_bank_core_req_valid & per_bank_core_req_ready;
 `ifdef PERF_ENABLE
     wire [PERF_CTR_BITS-1:0] perf_collisions;
 `endif
@@ -303,7 +313,8 @@ module VX_cache import VX_gpu_pkg::*; #(
             per_bank_core_req_byteen[i],
             per_bank_core_req_data[i],
             per_bank_core_req_tag[i],
-            per_bank_core_req_attr[i]
+            per_bank_core_req_attr[i],
+            per_bank_core_req_epoch[i]
         } = core_req_data_out[i];
     end
     for (genvar bank_id = 0; bank_id < NUM_BANKS; ++bank_id) begin : g_banks
@@ -330,7 +341,8 @@ module VX_cache import VX_gpu_pkg::*; #(
             .CORE_OUT_BUF (CORE_RSP_BUF_ENABLE ? 3 : 0),
             .MEM_OUT_BUF  (MEM_REQ_BUF_ENABLE ? 3 : 0),
             .IS_LLC       (IS_LLC),
-            .AMO_ENABLE   (AMO_ENABLE)
+            .AMO_ENABLE   (AMO_ENABLE),
+            .SHARED_LEVEL (SHARED_LEVEL)
         ) bank (
             .clk                (clk),
             .reset              (reset),
@@ -368,6 +380,7 @@ module VX_cache import VX_gpu_pkg::*; #(
             .mem_rsp_tag        (per_bank_mem_rsp_tag[bank_id]),
             .mem_rsp_ready      (per_bank_mem_rsp_ready[bank_id]),
             .flush_begin        (per_bank_flush_begin[bank_id]),
+            .flush_drain        (flush_drain),
             .flush_uuid         (flush_uuid),
             .flush_end          (per_bank_flush_end[bank_id])
         );

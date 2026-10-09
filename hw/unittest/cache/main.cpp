@@ -22,9 +22,11 @@
 // (bypass), a load behind an atomic in one chain (chainload), and a load
 // replaying ahead of an atomic's writeback while the response path stalls
 // (settle). A randomized run mixes loads, stores, atomics and LR/SC under
-// random latency and back-pressure. Responses and final contents are checked
-// against a reference memory that applies each word's requests in the order
-// the cache accepted them.
+// random latency and back-pressure. Fence and flush rounds check where each
+// one walks the cache and where a fence only drains (fence), and that a
+// stream of either on one port does not starve the others (fstorm).
+// Responses and final contents are checked against a reference memory that
+// applies each word's requests in the order the cache accepted them.
 
 #include "vl_simulator.h"
 #include "VVX_cache_top.h"
@@ -89,8 +91,15 @@
 #define TB_AMO_ENABLE 1
 #endif
 
-#if (defined(TB_IS_LLC) && !TB_IS_LLC) || (defined(TB_WRITE_ENABLE) && !TB_WRITE_ENABLE)
-#error "the testbench models a writable last-level cache"
+#ifndef TB_IS_LLC
+#define TB_IS_LLC 1
+#endif
+
+// Without atomics a bank's load/store logic does not depend on IS_LLC, which
+// then only selects the cache's level: a last-level instance is the shared
+// level by default, where a fence drains instead of walking.
+#if (!TB_IS_LLC && TB_AMO_ENABLE) || (defined(TB_WRITE_ENABLE) && !TB_WRITE_ENABLE)
+#error "the testbench models a writable cache, and atomics only at the last level"
 #endif
 
 constexpr uint32_t clog2(uint64_t x) {
@@ -115,6 +124,7 @@ constexpr uint32_t MSHR_SIZE   = TB_MSHR_SIZE;
 constexpr uint32_t LATENCY     = TB_LATENCY;
 constexpr bool     WRITEBACK   = (TB_WRITEBACK != 0);
 constexpr bool     AMO_EN      = (TB_AMO_ENABLE != 0);
+constexpr bool     SHARED      = (TB_IS_LLC != 0);
 constexpr bool     CAS_EN      = (VX_CFG_EXT_ZACAS_ENABLED != 0);
 
 constexpr uint32_t WORDS_PER_LINE   = LINE_SIZE / WORD_SIZE;
@@ -140,15 +150,18 @@ constexpr uint32_t TOTAL_CORES  = VX_CFG_NUM_CLUSTERS * NUM_SOCKETS * VX_CFG_SOC
 constexpr uint32_t HART_ID_BITS = std::max<uint32_t>(clog2(TOTAL_CORES) + clog2(VX_CFG_NUM_WARPS) + clog2(VX_CFG_NUM_THREADS), 1);
 constexpr uint32_t NUM_HARTS    = (HART_ID_BITS >= 4) ? 16 : (1u << HART_ID_BITS);
 
-// Bit offsets in the attr field of mem_bus_attr_t {amo, is_addr_om,
-// is_addr_local, is_addr_io, is_flush} with amo_req_t {hart_id, [amo_cmp],
-// amo_unsigned, amo_op, amo_valid} (VX_gpu_pkg.sv, packed MSB first).
+// Bit offsets in the attr field of mem_bus_attr_t {is_fence, amo,
+// is_addr_om, is_addr_local, is_addr_io, is_flush} with amo_req_t {hart_id,
+// [amo_cmp], amo_unsigned, amo_op, amo_valid} (VX_gpu_pkg.sv, packed MSB
+// first).
+constexpr uint32_t ATTR_FLUSH     = 0;
 constexpr uint32_t ATTR_AMO_VALID = 4;
 constexpr uint32_t ATTR_AMO_OP    = ATTR_AMO_VALID + 1;
 constexpr uint32_t ATTR_AMO_UNS   = ATTR_AMO_OP + 4;
 constexpr uint32_t ATTR_AMO_CMP   = ATTR_AMO_UNS + 1;
 constexpr uint32_t ATTR_HART      = ATTR_AMO_CMP + (CAS_EN ? XLEN : 0);
-constexpr uint32_t ATTR_BITS      = ATTR_HART + HART_ID_BITS;
+constexpr uint32_t ATTR_FENCE     = ATTR_HART + HART_ID_BITS;
+constexpr uint32_t ATTR_BITS      = ATTR_FENCE + 1;
 
 static_assert((WORD_SIZE & (WORD_SIZE - 1)) == 0 && WORD_SIZE >= 4 && WORD_SIZE <= 64, "unsupported WORD_SIZE");
 static_assert(SECTOR_SIZE % WORD_SIZE == 0 && LINE_SIZE % SECTOR_SIZE == 0, "unsupported line geometry");
@@ -395,6 +408,8 @@ struct Req {
   bool     uns    = false;
   uint64_t cmp    = 0;
   uint32_t hart   = 0;
+  bool     flush  = false; // is_flush: a fence with `fence`, else a host flush
+  bool     fence  = false;
   uint32_t tag    = 0;
   Role     role   = Role::None;
   std::string label;
@@ -454,6 +469,9 @@ public:
     return mem_writes_;
   }
 
+  // Sectors read and written by memory requests since the last clear.
+  std::set<uint64_t> read_log, write_log;
+
   // Fills for a held sector wait until release().
   void hold(uint64_t sector) {
     holds_.insert(sector);
@@ -500,6 +518,7 @@ public:
       static const Req idle{};
       const Req& r = slot[i] ? *slot[i] : idle;
       uint64_t attr = 0;
+      attr |= static_cast<uint64_t>(r.flush) << ATTR_FLUSH;
       attr |= static_cast<uint64_t>(r.amo) << ATTR_AMO_VALID;
       attr |= static_cast<uint64_t>(r.op & 0xf) << ATTR_AMO_OP;
       attr |= static_cast<uint64_t>(r.uns) << ATTR_AMO_UNS;
@@ -512,6 +531,7 @@ public:
         set_bits(t->core_req_attr[i], ATTR_AMO_CMP, XLEN, r.cmp);
       }
       set_bits(t->core_req_attr[i], ATTR_HART, HART_ID_BITS, r.hart);
+      set_bits(t->core_req_attr[i], ATTR_FENCE, 1, r.fence);
       set_bytes(t->core_req_data[i], r.data.data(), WORD_SIZE);
       set_bits(t->core_req_tag[i], 0, TAG_BITS, r.tag);
       t->core_rsp_ready[i] = rsp_ready[i];
@@ -605,6 +625,7 @@ public:
           }
         }
         ++mem_writes_;
+        write_log.insert(m.sector);
       } else {
         Fill f;
         f.tag = m.tag;
@@ -616,6 +637,7 @@ public:
         f.ready = cycle_ + this->fill_latency();
         fills_[m.port].push_back(f);
         ++mem_reads_;
+        read_log.insert(m.sector);
       }
     }
     return ev;
@@ -679,8 +701,9 @@ struct Options {
   uint32_t max_report    = 20;
   bool     verbose       = false;
   bool     no_assert     = false;
+  uint32_t stress_fence  = 0;     // stress: % of issues that are fences
   uint64_t watch         = ~0ull; // word whose traffic is traced
-  std::string tests      = "race,chain,chainbp,wbqburst,bypass,chainload,settle,stress";
+  std::string tests      = "race,chain,chainbp,wbqburst,bypass,chainload,settle,fence,fstorm,stress";
 };
 
 struct Hang {};
@@ -705,9 +728,9 @@ public:
 
   int run() {
     std::printf("cache: XLEN=%u reqs=%u banks=%u word=%u line=%u sector=%u ways=%u size=%u sets/bank=%u "
-                "latency=%u writeback=%d mshr=%u mem_ports=%u amo=%d zacas=%d harts=%u seed=%u\n",
+                "latency=%u writeback=%d mshr=%u mem_ports=%u amo=%d zacas=%d shared=%d harts=%u seed=%u\n",
                 XLEN, NUM_REQS, NUM_BANKS, WORD_SIZE, LINE_SIZE, SECTOR_SIZE, NUM_WAYS, CACHE_SIZE,
-                SETS_PER_BANK, LATENCY, WRITEBACK, MSHR_SIZE, MEM_PORTS, AMO_EN, CAS_EN, NUM_HARTS, opts_.seed);
+                SETS_PER_BANK, LATENCY, WRITEBACK, MSHR_SIZE, MEM_PORTS, AMO_EN, CAS_EN, SHARED, NUM_HARTS, opts_.seed);
     try {
       if (!this->calibrate()) {
         std::printf("FAILED: calibration\n");
@@ -737,6 +760,12 @@ public:
       }
       if (AMO_EN && this->selected("settle")) {
         this->settle_sweep();
+      }
+      if (this->selected("fence")) {
+        this->fence_rounds();
+      }
+      if (this->selected("fstorm")) {
+        this->fence_storms();
       }
       for (uint32_t s = 0; this->selected("stress") && s < opts_.stress_seeds; ++s) {
         this->stress(opts_.seed * 7919u + s);
@@ -2240,6 +2269,10 @@ private:
     if (this->sc_blocked(w)) {
       return false;
     }
+    if (opts_.stress_fence != 0 && rand_below(100) < opts_.stress_fence) {
+      this->present(port, this->make_flush(w, true, strf("stress fence 0x%" PRIx64, w)));
+      return true;
+    }
     uint32_t roll = AMO_EN ? rand_below(100) : rand_below(55);
     if (roll < 35) {
       Req r = this->make_load(w, strf("stress load 0x%" PRIx64, w));
@@ -2349,10 +2382,233 @@ private:
   }
 
   ///////////////////////////////////////////////////////////////////////////
+  // Fence and flush. A fence (is_flush with is_fence) at the shared level
+  // drains: it answers once every request the cache accepted before it has
+  // left the cache, holds no other port and leaves the lines in place. A
+  // fence above the shared level, and a host flush (is_flush alone) at every
+  // level, walks: it holds every port, writes dirty lines back and
+  // invalidates every line.
+
+  // Cycles one walk spends in a bank: every set, every way of it where dirty
+  // lines are written back.
+  static constexpr uint32_t WALK_CYCLES = SETS_PER_BANK * (WRITEBACK ? NUM_WAYS : 1);
+
+  Req make_flush(uint64_t addr, bool fence, const std::string& label) {
+    Req r = this->make_load(addr, label);
+    r.flush = true;
+    r.fence = fence;
+    return r;
+  }
+
+  bool responded(uint32_t port, uint32_t tag) const {
+    return !(dut_.slot[port] && dut_.slot[port]->tag == tag) && !pending_.count(key(port, tag));
+  }
+
+  // Line i of a round's private group: lines with the same i share a bank and
+  // a set across rounds, and no two lines of one round share a set.
+  uint64_t fence_line(uint64_t round, uint32_t i) const {
+    return FENCE_LINE_BASE + round * (uint64_t(SETS_PER_BANK) * NUM_BANKS) + i;
+  }
+
+  void fence_round(bool fence) {
+    const bool walks = !fence || !SHARED;
+    const std::string what = fence ? "fence" : "host flush";
+    const uint32_t f0 = failures_;
+    const uint64_t a0 = asserts_;
+    const uint32_t pf = 0;
+    const uint32_t po = (NUM_REQS > 1) ? 1 : 0;
+    const uint64_t round = fence_round_++;
+    // F is the fence's own word, W are resident lines, H misses and its fill
+    // is held while the fence waits behind it.
+    const uint32_t nw = 2 * NUM_BANKS;
+    const uint64_t f_addr = this->fence_line(round, 0) * LINE_SIZE;
+    std::vector<uint64_t> w_addr;
+    for (uint32_t i = 1; i <= nw; ++i) {
+      w_addr.push_back(this->fence_line(round, i) * LINE_SIZE);
+    }
+    const uint64_t h_addr = this->fence_line(round, nw + 1) * LINE_SIZE;
+    const uint64_t h_sector = h_addr / SECTOR_SIZE;
+
+    std::vector<uint64_t> warm = w_addr;
+    warm.push_back(f_addr);
+    for (size_t i = 0; i < warm.size(); ++i) {
+      Req st;
+      st.rw = true;
+      st.addr = warm[i];
+      st.byteen = (WORD_SIZE == 64) ? ~0ull : ((1ull << WORD_SIZE) - 1);
+      st.data = this->rand_word();
+      st.label = strf("%s warm store 0x%" PRIx64, what.c_str(), warm[i]);
+      this->blocking(static_cast<uint32_t>(i % NUM_REQS), st);
+      this->blocking(static_cast<uint32_t>((i + 1) % NUM_REQS), this->make_load(warm[i], "warm load"));
+    }
+    this->drain();
+
+    dut_.hold(h_sector);
+    uint32_t th = this->present(pf, this->make_load(h_addr, strf("%s held miss 0x%" PRIx64, what.c_str(), h_addr)));
+    for (uint32_t c = 0; !dut_.fill_waiting(h_sector); ++c) {
+      if (c > 1000) {
+        this->fail(strf("FAIL %s: the held load's fill request never reached memory", what.c_str()));
+        dut_.release(h_sector);
+        this->drain();
+        return;
+      }
+      this->tick();
+    }
+    dut_.read_log.clear();
+    dut_.write_log.clear();
+    const uint64_t c_fence = dut_.cycle();
+    uint32_t tf = this->present(pf, this->make_flush(f_addr, fence, what));
+
+    // A draining fence holds only its own port: hits on another port go on.
+    uint32_t served = 0;
+    if (!walks && NUM_REQS > 1) {
+      for (uint64_t a : w_addr) {
+        uint32_t t = this->present(po, this->make_load(a, strf("load beside a %s", what.c_str())));
+        uint32_t c = 0;
+        while (!this->responded(po, t) && c < 64) {
+          this->tick();
+          ++c;
+        }
+        if (!this->responded(po, t)) {
+          this->fail(strf("FAIL %s: a hit on port %u waited %u cycles behind a draining fence", what.c_str(), po, c));
+          break;
+        }
+        ++served;
+      }
+    }
+    this->idle(128);
+    if (this->responded(pf, tf)) {
+      this->fail(strf("FAIL %s answered while an earlier miss was still waiting for its fill", what.c_str()));
+    }
+    dut_.release(h_sector);
+    while (!this->responded(pf, tf)) {
+      this->tick();
+    }
+    const uint64_t c_done = dut_.cycle();
+    if (!this->responded(pf, th)) {
+      this->fail(strf("FAIL %s answered before the earlier load on its port", what.c_str()));
+    }
+    this->drain();
+
+    uint32_t written = 0;
+    for (uint64_t a : warm) {
+      written += dut_.write_log.count(a / SECTOR_SIZE);
+    }
+    const uint32_t expect_written = (walks && WRITEBACK) ? static_cast<uint32_t>(warm.size()) : 0;
+    if (written != expect_written) {
+      this->fail(strf("FAIL %s wrote back %u of %zu dirty lines, expected %u", what.c_str(), written, warm.size(), expect_written));
+    }
+    dut_.read_log.clear();
+    for (size_t i = 0; i < w_addr.size(); ++i) {
+      this->blocking(static_cast<uint32_t>(i % NUM_REQS), this->make_load(w_addr[i], strf("reload after %s", what.c_str())));
+    }
+    uint32_t refetched = 0;
+    for (uint64_t a : w_addr) {
+      refetched += dut_.read_log.count(a / SECTOR_SIZE);
+    }
+    const uint32_t expect_refetched = walks ? nw : 0;
+    if (refetched != expect_refetched) {
+      this->fail(strf("FAIL after a %s %u of %u resident lines missed, expected %u (%s)", what.c_str(), refetched, nw,
+                      expect_refetched, walks ? "a walk invalidates them" : "a drain keeps them"));
+    }
+    this->drain();
+    std::printf("fence round: %s %s, %" PRIu64 " cycles from issue to answer (held fill included), "
+                "%u hits served beside it, %u/%u lines written back, %u/%u refetched: %s\n",
+                what.c_str(), walks ? "walks" : "drains", c_done - c_fence, served, written,
+                static_cast<uint32_t>(warm.size()), refetched, nw,
+                (failures_ == f0 && asserts_ == a0) ? "ok" : "FAILED");
+  }
+
+  void fence_rounds() {
+    this->fence_round(true);
+    this->fence_round(false);
+  }
+
+  // A stream of fences or host flushes on port 0 while the other ports load
+  // and store: every regular request must be admitted within a bound.
+  void fence_storm(bool fence) {
+    const std::string what = fence ? "fence" : "host flush";
+    if (NUM_REQS < 2) {
+      std::printf("fence storm: %s skipped, one port only\n", what.c_str());
+      return;
+    }
+    const bool walks = !fence || !SHARED;
+    const uint32_t bound = 4 * (WALK_CYCLES + 128) + 512;
+    const uint32_t f0 = failures_;
+    const uint64_t a0 = asserts_;
+    std::vector<uint64_t> words;
+    for (uint32_t i = 0; i < 4 * NUM_BANKS; ++i) {
+      uint64_t line = this->fence_line(fence_round_, i);
+      for (uint32_t w = 0; w < WORDS_PER_LINE; w += std::max<uint32_t>(1, WORDS_PER_LINE / 4)) {
+        words.push_back(line * LINE_SIZE + w * WORD_SIZE);
+      }
+    }
+    ++fence_round_;
+    dut_.lat_min = 1;
+    dut_.lat_max = 24;
+    std::vector<uint64_t> since(NUM_REQS, 0);
+    std::vector<bool> waiting(NUM_REQS, false);
+    const uint32_t target = 16 * (NUM_REQS - 1);
+    uint32_t admitted = 0, flushes = 0, worst = 0;
+    bool starved = false;
+    const uint64_t c0 = dut_.cycle();
+    while ((admitted < target || flushes < 16) && !starved) {
+      if (!dut_.slot[0]) {
+        uint64_t w = words[rand_below(static_cast<uint32_t>(words.size()))];
+        this->present(0, this->make_flush(w, fence, strf("storm %s", what.c_str())));
+        ++flushes;
+      }
+      for (uint32_t p = 1; p < NUM_REQS; ++p) {
+        if (dut_.slot[p]) {
+          continue;
+        }
+        uint64_t w = words[rand_below(static_cast<uint32_t>(words.size()))];
+        Req r = this->make_load(w, strf("storm load 0x%" PRIx64, w));
+        if (rand_below(5) < 2) {
+          r.rw = true;
+          r.label = strf("storm store 0x%" PRIx64, w);
+        }
+        this->present(p, r);
+        since[p] = dut_.cycle();
+        waiting[p] = true;
+      }
+      this->tick();
+      for (uint32_t p = 1; p < NUM_REQS; ++p) {
+        if (!waiting[p]) {
+          continue;
+        }
+        uint32_t waited = static_cast<uint32_t>(dut_.cycle() - since[p]);
+        if (!dut_.slot[p]) {
+          waiting[p] = false;
+          ++admitted;
+          worst = std::max(worst, waited);
+        } else if (waited > bound) {
+          this->fail(strf("FAIL %s storm: port %u waited %u cycles for admission (bound %u)", what.c_str(), p, waited, bound));
+          starved = true;
+          break;
+        }
+      }
+    }
+    const uint64_t cycles = dut_.cycle() - c0;
+    this->drain();
+    dut_.lat_min = dut_.lat_max = 2;
+    std::printf("fence storm: %s stream (%s), %u issued over %" PRIu64 " cycles, %u requests admitted beside it, "
+                "longest wait %u (bound %u): %s\n",
+                what.c_str(), walks ? "walks" : "drains", flushes, cycles, admitted, worst, bound,
+                (failures_ == f0 && asserts_ == a0) ? "ok" : "FAILED");
+  }
+
+  void fence_storms() {
+    this->fence_storm(true);
+    this->fence_storm(false);
+  }
+
+  ///////////////////////////////////////////////////////////////////////////
 
   static constexpr uint64_t RACE_LINE_BASE   = 0x10000000ull / LINE_SIZE;
   static constexpr uint64_t STRESS_LINE_BASE = 0x20000000ull / LINE_SIZE;
   static constexpr uint64_t EVICT_LINE_BASE  = 0x30000000ull / LINE_SIZE;
+  static constexpr uint64_t FENCE_LINE_BASE  = 0x40000000ull / LINE_SIZE;
 
   Options opts_;
   std::mt19937_64 rng_;
@@ -2392,13 +2648,14 @@ private:
   uint32_t chainload_failing_ = 0;
   uint32_t settle_formed_ = 0;
   uint32_t settle_failing_ = 0;
+  uint64_t fence_round_ = 0;
   std::map<uint32_t, std::set<std::string>> chainload_cases_;
 };
 
 static void usage(const char* prog) {
   std::printf("usage: %s [--seed=N] [--window=N] [--stress-seeds=N] [--stress-cycles=N] [--rsp-ready=PCT] "
-              "[--mem-ready=PCT] [--max-report=N] "
-              "[--tests=race,chain,chainbp,wbqburst,bypass,chainload,settle,stress] [--no-assert] [--watch=ADDR] [--verbose]\n", prog);
+              "[--mem-ready=PCT] [--stress-fence=PCT] [--max-report=N] "
+              "[--tests=race,chain,chainbp,wbqburst,bypass,chainload,settle,fence,fstorm,stress] [--no-assert] [--watch=ADDR] [--verbose]\n", prog);
 }
 
 int main(int argc, char** argv) {
@@ -2420,6 +2677,8 @@ int main(int argc, char** argv) {
       opts.stress_cycles = static_cast<uint32_t>(std::strtoul(a + 16, nullptr, 0));
     } else if (std::strncmp(a, "--rsp-ready=", 12) == 0) {
       opts.rsp_ready = static_cast<uint32_t>(std::strtoul(a + 12, nullptr, 0));
+    } else if (std::strncmp(a, "--stress-fence=", 15) == 0) {
+      opts.stress_fence = static_cast<uint32_t>(std::strtoul(a + 15, nullptr, 0));
     } else if (std::strncmp(a, "--mem-ready=", 12) == 0) {
       opts.mem_ready = static_cast<uint32_t>(std::strtoul(a + 12, nullptr, 0));
     } else if (std::strncmp(a, "--max-report=", 13) == 0) {

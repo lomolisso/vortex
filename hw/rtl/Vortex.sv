@@ -174,6 +174,8 @@ module Vortex import VX_gpu_pkg::*, VX_trace_pkg::*, VX_tlb_pkg::*; (
         .NC_ENABLE      (1),
         .PASSTHRU       (!`VX_CFG_L3_ENABLED),
         .IS_LLC         (L3_IS_LLC),
+        // every cluster and the page walker meet in the L3: a fence drains it
+        .SHARED_LEVEL   (`VX_CFG_L3_ENABLED),
         .AMO_ENABLE     (`VX_CFG_EXT_A_ENABLED)
     ) l3cache (
         .clk            (clk),

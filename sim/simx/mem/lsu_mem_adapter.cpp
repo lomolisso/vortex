@@ -19,13 +19,15 @@ LsuMemAdapter::LsuMemAdapter(
   const SimContext& ctx,
   const char* name,
   uint32_t num_inputs,
-  uint32_t delay
+  uint32_t delay,
+  uint32_t port0_fence_delay
 ) : SimObject<LsuMemAdapter>(ctx, name)
   , ReqIn(this)
   , RspOut(this)
   , ReqOut(num_inputs, this)
   , RspIn(num_inputs, this)
   , delay_(delay)
+  , port0_fence_delay_(port0_fence_delay)
   , pending_mask_(num_inputs)
 {
   assert(num_inputs > 0);
@@ -143,7 +145,8 @@ void LsuMemAdapter::on_tick() {
         out_req.flags.local = (t == AddrType::Shared);
       }
 
-      if (ReqOut.at(i).try_send(out_req, delay_)) {
+      uint32_t delay = delay_ + ((i == 0 && out_req.flags.fence) ? port0_fence_delay_ : 0);
+      if (ReqOut.at(i).try_send(out_req, delay)) {
         DT(4, this->name() << " req" << i << ": " << out_req);
         pending_mask_.reset(i);
       }

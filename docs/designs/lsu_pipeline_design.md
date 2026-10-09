@@ -115,6 +115,7 @@ channel and on into the memory fabric:
 | field | set when | consumed by |
 |---|---|---|
 | `is_flush` | the instruction is a fence | the data cache: a flush request |
+| `is_fence` | the instruction is a fence | every cache: the shared level drains it instead of walking (§3.3) |
 | `is_addr_io` | the address is in the IO range, or in the OM aperture | the cache: bypassed, uncached |
 | `is_addr_local` | the address is in the local-memory window | `VX_lmem_switch` |
 | `is_addr_om` | the address is in the OM fragment-export aperture | the cluster's OM steer |
@@ -148,10 +149,41 @@ A fence is a **total barrier on its slice**. The slice sets `fence_lock` when
 a fence's last packet is accepted and clears it when that fence's response
 returns. While locked, the slice accepts nothing.
 
-The fence itself travels to memory as a request with `is_flush`, behind every
-request the slice issued before it, so its response proves they have drained.
-Only the last packet of a multi-packet fence is sent; the earlier packets
-complete immediately.
+The fence itself travels to memory as a request with `is_flush` and
+`is_fence`, behind every request the slice issued before it. Only the last
+packet of a multi-packet fence is sent; the earlier packets complete
+immediately.
+
+What the fence does at each cache level
+([`cache_subsystem.md`](cache_subsystem.md) §6.4):
+
+| level | action |
+|---|---|
+| above the device's shared level, such as a write-through L1 or an L2 under an L3 | locks its inputs, walks the cache to invalidate every line (writing back dirty ones on a write-back level), then forwards the fence behind its earlier requests |
+| the shared level: the L3 if present, else the L2 of a one-cluster device, else a dcache that every memory agent writes through | no lock and no walk: answers once every request it accepted before the fence has drained |
+
+So the response proves that the slice's earlier requests on the fence's own
+path reached the shared level, and the slice's later loads miss above it and
+see what other cores published there. That is device scope, as CUDA's
+`__threadfence()`. An earlier request that left a walking cache on another
+memory port or dcache channel is only known to have left it
+([`cache_subsystem.md`](cache_subsystem.md) §6.9, known gap). A device with no
+shared level (several sockets and no L2 or L3, or several clusters and no L3)
+walks at every level. The host `CACHE_FLUSH` sends `is_flush` alone and walks
+every level.
+
+**Open item: a fence loop can starve its core's other warps at issue.** The
+issue arbiter is greedy (`VX_scoreboard`, `STICKY(1)`), and a fence holds the
+slice until its response returns. On rtlsim at 2 × 2 cores + L3, with every
+warp but one timer warp fencing in a loop, one fencer issued a single fence in
+100K cycles while its three siblings issued about 320 each, and the timer,
+whose siblings were fencing too, took 97K cycles for one load and atomic. With
+a non-sticky arbiter every warp kept pace. SimX's scheduler does not reproduce
+it. Fair admission in the caches does not reach this stage, so the
+`fence:storm*` cases keep fencers off the timer's core whenever there is more
+than one core, and a fencer its siblings hold back still passes once the timer
+is done: the cases do not show it. Fixing it needs a fair or age-bounded issue
+arbiter, in RTL and SimX together.
 
 ### 3.4 Multi-packet tracking
 
@@ -421,7 +453,13 @@ two depths: a staging ring of `VX_CFG_LSU_QUEUE_IN_SIZE` and a pending table
 of `VX_CFG_LSU_PENDING_SIZE` per block, a `FenceController` for the slice
 barrier, and `LsuUopGen` for the packed-load micro-ops. The memory side
 follows the RTL module for module — `local_mem_switch`, `mem_coalescer`,
-`lsu_mem_adapter` ([`sim/simx/mem/`](../../sim/simx/mem/)).
+`lsu_mem_adapter` ([`sim/simx/mem/`](../../sim/simx/mem/)). A fence goes
+down the same path as a request flagged `MemFlags::fence`, and its response
+releases the `FenceController`, so the caches walk or drain it as in the RTL
+(§3.3). The RTL's `VX_dcr_flush` adds a register stage to every request on
+block 0's first dcache channel; SimX adds that cycle to fence tokens only,
+so other requests on that channel reach the dcache a cycle earlier than in the
+RTL.
 
 Perf: MPM class `MEM` — `MEM_READS` (0xB03), `MEM_WRITES` (0xB04), `MEM_LT`
 (0xB05, accumulated latency), `MEM_BANK_ST` (0xB06, bank conflicts),

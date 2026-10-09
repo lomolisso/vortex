@@ -570,6 +570,12 @@ public:
     ++ready_reqs_;
   }
 
+  // The entry still holds the request admitted with stamp `seq`.
+  bool holds(uint32_t id, uint64_t seq) const {
+    const auto &entry = entries_.at(id);
+    return entry.bank_req.type != bank_req_t::None && entry.seq == seq;
+  }
+
   // Peek the entry dequeue() would return next (oldest ready replay), or
   // nullptr. Lets the fill-forward drain inspect the chain head without
   // consuming it.
@@ -685,6 +691,46 @@ public:
     return !flushing_;
   }
 
+  // Fence walk, run while the cache holds every input: once the bank has
+  // drained, invalidate one set per cycle (one set and way on a write-back
+  // bank, which writes the way's dirty sectors back), as the hardware flush
+  // walk does.
+  void fence_walk_begin() {
+    fw_state_ = FenceWalk::Drain;
+    fw_ctr_ = 0;
+    this->tick_wake();
+  }
+
+  bool fence_walk_done() const {
+    return fw_state_ == FenceWalk::Done;
+  }
+
+  void fence_walk_ack() {
+    fw_state_ = FenceWalk::Idle;
+  }
+
+  // Fence drain at the shared level: done once the bank has retired what it
+  // held when the drain began, while it keeps accepting new requests.
+  void fence_drain_begin() {
+    fd_state_ = FenceDrain::Pipe;
+    fd_step_  = 0;
+    fd_count_ = 0;
+    this->tick_wake();
+  }
+
+  bool fence_drain_done() const {
+    return fd_state_ == FenceDrain::Done;
+  }
+
+  void fence_drain_ack() {
+    fd_state_ = FenceDrain::Idle;
+  }
+
+  // Requests this bank has admitted so far.
+  uint64_t admitted() const {
+    return adm_seq_ctr_;
+  }
+
 protected:
   void on_reset() {
     perf_stats_ = Cache::PerfStats();
@@ -711,6 +757,16 @@ protected:
     flush_set_idx_ = 0;
     flush_way_idx_ = 0;
     flush_sector_idx_ = 0;
+    fw_state_ = FenceWalk::Idle;
+    fw_ctr_ = 0;
+    fw_settle_ = 0;
+    fd_state_ = FenceDrain::Idle;
+    fd_step_ = 0;
+    fd_count_ = 0;
+    fd_mshr_.clear();
+    fd_mreq_ = 0;
+    mreq_sent_ = 0;
+    amo_hold_ = 0;
 #if VX_CFG_EXT_A_ENABLED
     amo_unit_.reset();
     for (auto &e : amo_passthru_) {
@@ -723,6 +779,9 @@ protected:
     // The core-response port takes one response per tick; the pipeline has
     // priority and the forward drain yields (crsp_sent_).
     crsp_sent_ = false;
+
+    // An atomic admitted this cycle holds the commit only from next cycle on.
+    const bool amo_busy = (amo_hold_ != 0);
 
     // Process next request at the head of the pipeline.
     if (!pipe_req_->empty()) {
@@ -747,16 +806,32 @@ protected:
       this->processFlush();
     }
 
+    if (fw_state_ != FenceWalk::Idle && fw_state_ != FenceWalk::Done) {
+      this->processFenceWalk();
+    }
+
+    if (fd_state_ != FenceDrain::Idle && fd_state_ != FenceDrain::Done) {
+      this->processFenceDrain(amo_busy);
+    }
+
+    if (amo_hold_ != 0) {
+      --amo_hold_;
+    }
+
     // calculate memory latency
     perf_stats_.mem_latency += pending_fill_reqs_;
 
     // sleep when fully drained: no queued or in-flight input, an empty pipe,
     // and no replay/forward/flush work. pending_fill_reqs_ == 0 also keeps
-    // the mem_latency accumulation exact. flush_begin() re-arms explicitly;
-    // any packet reserved toward core_req_in/mem_rsp_in re-arms on arrival.
+    // the mem_latency accumulation exact. flush_begin() and the fence walk
+    // and drain begins re-arm explicitly; any packet reserved toward
+    // core_req_in/mem_rsp_in re-arms on arrival.
     if (this->core_req_in.size() == 0 && this->mem_rsp_in.size() == 0
      && pipe_req_->size() == 0 && !mshr_.has_ready_reqs()
-     && !fwd_active_ && !flushing_ && pending_fill_reqs_ == 0) {
+     && !fwd_active_ && !flushing_ && pending_fill_reqs_ == 0
+     && (fw_state_ == FenceWalk::Idle || fw_state_ == FenceWalk::Done)
+     && (fd_state_ == FenceDrain::Idle || fd_state_ == FenceDrain::Done)
+     && amo_hold_ == 0) {
       this->tick_sleep();
     }
   }
@@ -781,6 +856,12 @@ private:
     if (mshr_.has_ready_reqs() && !fwd_consumed) {
       bank_req_t bank_req;
       mshr_.dequeue(&bank_req);
+#if VX_CFG_EXT_A_ENABLED
+      // a storing atomic that replays after its fill commits like a hit
+      if (config_.is_llc && memop_is_amo(bank_req.op) && bank_req.op != MemOp::AMO_LR) {
+        amo_hold_ = config_.latency + 3;
+      }
+#endif
       pipe_req_->push(bank_req);
       DT(3, this->name() << " replay-deq: " << bank_req);
       return;
@@ -835,8 +916,9 @@ private:
       return;
     }
 
-    // 3) core request
-    if (!this->core_req_in.empty()) {
+    // 3) core request; a walking bank gives its input slot to the walk, and
+    // a committing atomic holds it
+    if (!this->core_req_in.empty() && fw_state_ != FenceWalk::Walk && amo_hold_ == 0) {
       auto &core_req = this->core_req_in.peek();
       // Conservative MSHR occupancy check: any request that may miss must
       // reserve a slot. Counts both currently-allocated entries and
@@ -1000,6 +1082,12 @@ private:
       }
 #if VX_CFG_EXT_A_ENABLED
       if (is_amo_passthru) ++pending_amo_probes_;
+      // A storing atomic that hits where atomics commit holds core admission
+      // across its commit: the lookup-to-commit stages, the compute stage and
+      // the result's write into the data array.
+      if (is_amo && config_.is_llc && core_req.op != MemOp::AMO_LR && this->sectorResident(core_req.addr)) {
+        amo_hold_ = config_.latency + 3;
+      }
 #endif
       if (core_req.is_write()) ++perf_stats_.writes;
       else                ++perf_stats_.reads;
@@ -1067,7 +1155,7 @@ private:
         wb.uuid   = bank_req.uuid;
         wb.data   = sec.data;
         wb.byteen = sec.dirty_mask;
-        this->mem_req_out.send(wb, MEM_REQ_DELAY);
+        this->memReqSend(wb);
         DT(3, this->name() << " writeback: " << wb);
         ++perf_stats_.evictions;
       }
@@ -1217,7 +1305,7 @@ private:
         w.uuid   = bank_req.uuid;
         w.data   = store_block;
         w.byteen = byteen;
-        this->mem_req_out.send(w, MEM_REQ_DELAY);
+        this->memReqSend(w);
         DT(3, this->name() << " amo-writethrough: " << w);
       }
       // Break other harts' reservations on this line.
@@ -1258,7 +1346,7 @@ private:
     w.uuid    = uuid;
     w.data    = data;
     w.byteen  = byteen;
-    this->mem_req_out.send(w, MEM_REQ_DELAY);
+    this->memReqSend(w);
     DT(3, this->name() << " writethrough: " << w);
 #if VX_CFG_EXT_A_ENABLED
     // Committed write: break other harts' reservations.
@@ -1274,6 +1362,12 @@ private:
       DT(3, this->name() << " core-rsp: " << rsp);
     }
     return true;
+  }
+
+  // A fence's miss carries the fence on to the next level, unless this
+  // cache is the shared level where it ends.
+  bool fence_fill(const bank_req_t &bank_req) const {
+    return bank_req.flags.fence && !config_.fence_shared;
   }
 
   void processRequests() {
@@ -1337,7 +1431,7 @@ private:
         wb.uuid   = bank_req.uuid;
         wb.data   = sec.data;
         wb.byteen = sec.dirty_mask;
-        this->mem_req_out.send(wb, MEM_REQ_DELAY);
+        this->memReqSend(wb);
         DT(3, this->name() << " amo-probe-wb: " << wb);
         ++perf_stats_.evictions;
       }
@@ -1363,7 +1457,7 @@ private:
       amo_fwd.amo_cmp = bank_req.amo_cmp;
       amo_fwd.data    = bank_req.data;    // carries rhs (extracted at LLC)
       amo_fwd.flags   = bank_req.flags;   // carry amo_unsigned (signed vs unsigned MIN/MAX)
-      this->mem_req_out.send(amo_fwd, MEM_REQ_DELAY);
+      this->memReqSend(amo_fwd);
       DT(3, this->name() << " amo-probe-fwd: " << amo_fwd);
       ++pending_fill_reqs_; // counts as an outstanding mem-roundtrip for perf
       --pending_amo_probes_; // reservation transferred to the table entry
@@ -1424,7 +1518,8 @@ private:
           fill.tag     = mshr_id;
           fill.hart_id = bank_req.hart_id;
           fill.uuid    = bank_req.uuid;
-          this->mem_req_out.send(fill, MEM_REQ_DELAY);
+          fill.flags.fence = this->fence_fill(bank_req);
+          this->memReqSend(fill);
           ++pending_fill_reqs_;
         }
         pipe_req_->pop();
@@ -1594,7 +1689,7 @@ private:
             w.uuid   = bank_req.uuid;
             w.data   = bank_req.data;
             w.byteen = bank_req.byteen;
-            this->mem_req_out.send(w, MEM_REQ_DELAY);
+            this->memReqSend(w);
             DT(3, this->name() << " writethrough: " << w);
 #if VX_CFG_EXT_A_ENABLED
             // Writethrough commit: break other harts' reservations.
@@ -1667,7 +1762,8 @@ private:
             fill.tag   = mshr_id; // routes the fill response back here
             fill.hart_id   = bank_req.hart_id;
             fill.uuid  = bank_req.uuid;
-            this->mem_req_out.send(fill, MEM_REQ_DELAY);
+            fill.flags.fence = this->fence_fill(bank_req);
+            this->memReqSend(fill);
             DT(3, this->name() << " fill-req: " << fill);
             ++pending_fill_reqs_;
           }
@@ -1715,7 +1811,7 @@ private:
             mem_req.op   = MemOp::ST;
             mem_req.data = sec.data;
             mem_req.byteen = sec.dirty_mask;
-            this->mem_req_out.send(mem_req, MEM_REQ_DELAY);
+            this->memReqSend(mem_req);
             DT(3, this->name() << " flush-wb: " << mem_req);
             ++perf_stats_.evictions;
             sec.dirty = false;
@@ -1731,6 +1827,168 @@ private:
     }
     flushing_ = false;
     DT(3, this->name() << " flush-done");
+  }
+
+  bool sectorResident(uint64_t addr) const {
+    const auto &set = sets_.at(params_.addr_set_id(addr));
+    int id = set.find_resident(params_.addr_tag(addr));
+    return id != -1 && set.lines.at(id).sectors.at(params_.addr_sector_id(addr)).valid;
+  }
+
+  // Nothing rides the pipe or waits in the memory-request queue.
+  bool bank_empty() const {
+    return pipe_req_->size() == 0 && this->mem_req_out.size() == 0;
+  }
+
+  bool mshr_idle() const {
+    return mshr_.empty() && pending_fill_reqs_ == 0;
+  }
+
+  void processFenceWalk() {
+    switch (fw_state_) {
+    case FenceWalk::Drain:
+      // The walk starts only once every miss has filled and every memory
+      // request has left, so no fill can reinstall a line behind it.
+      if (this->mshr_idle() && this->bank_empty()) {
+        fw_state_ = FenceWalk::Walk;
+      }
+      return;
+
+    case FenceWalk::Walk: {
+      // Way-major on a write-back bank: the hardware counter's low bits pick
+      // the set and its high bits the way.
+      uint32_t num_sets = params_.sets_per_bank;
+      uint32_t steps = num_sets * (config_.write_back ? params_.lines_per_set : 1);
+      uint32_t set_id = fw_ctr_ % num_sets;
+      auto &set = sets_.at(set_id);
+      if (config_.write_back) {
+        auto &line = set.lines.at(fw_ctr_ / num_sets);
+        uint32_t wb_count = 0;
+        for (const auto &sec : line.sectors) {
+          if (sec.valid && sec.dirty) {
+            ++wb_count;
+          }
+        }
+        if (wb_count > 0 && (this->mem_req_out.size() + wb_count) > this->mem_req_out.capacity()) {
+          return; // stall
+        }
+        for (uint32_t i = 0; i < line.sectors.size(); ++i) {
+          auto &sec = line.sectors.at(i);
+          if (!(sec.valid && sec.dirty)) {
+            continue;
+          }
+          MemReq wb;
+          wb.addr   = params_.mem_addr_sector(bank_id_, set_id, line.tag, i);
+          wb.op     = MemOp::ST;
+          wb.data   = sec.data;
+          wb.byteen = sec.dirty_mask;
+          this->memReqSend(wb);
+          DT(3, this->name() << " fence-wb: " << wb);
+          ++perf_stats_.evictions;
+        }
+        line.reset();
+      } else {
+        for (auto &line : set.lines) {
+          line.reset();
+        }
+      }
+      if (++fw_ctr_ == steps) {
+        // Bank 0 reports next cycle; the others first let the walk's last
+        // operation leave their pipeline.
+        fw_settle_ = config_.latency;
+        fw_state_ = (bank_id_ == 0) ? FenceWalk::End : FenceWalk::Settle;
+        DT(3, this->name() << " fence-walk-end");
+      }
+      return;
+    }
+
+    case FenceWalk::Settle:
+      if (fw_settle_ != 0) {
+        --fw_settle_;
+      } else if (this->bank_empty()) {
+        fw_state_ = FenceWalk::End;
+      }
+      return;
+
+    case FenceWalk::End:
+      fw_state_ = FenceWalk::Done;
+      return;
+
+    default:
+      return;
+    }
+  }
+
+  // The hardware drain's sequence: the pipeline's requests commit; the misses
+  // they left in the MSHR fill and leave it; their replays commit; a
+  // committing atomic finishes; the memory requests queued by then are sent.
+  // A bank found empty ends it at once.
+  void processFenceDrain(bool amo_busy) {
+    // The drain counts the pipeline's depth plus its input stage.
+    const uint32_t pipe_depth = config_.latency + 1;
+    FenceDrain next = fd_state_;
+    switch (fd_state_) {
+    case FenceDrain::Pipe:
+      if (fd_count_ + 1 < pipe_depth) {
+        ++fd_count_;
+        break;
+      }
+      fd_count_ = 0;
+      if (fd_step_ == 0) {
+        fd_mshr_.clear();
+        for (uint32_t id = 0; id < mshr_.capacity(); ++id) {
+          const auto &entry = mshr_.peek(id);
+          if (entry.bank_req.type != bank_req_t::None) {
+            fd_mshr_.emplace_back(id, entry.seq);
+          }
+        }
+        next = FenceDrain::Mshr;
+      } else if (fd_step_ == 1) {
+        next = FenceDrain::Amo;
+      } else {
+        fd_mreq_ = mreq_sent_;
+        next = FenceDrain::Mreq;
+      }
+      break;
+    case FenceDrain::Mshr: {
+      bool held = false;
+      for (const auto &e : fd_mshr_) {
+        held = held || mshr_.holds(e.first, e.second);
+      }
+      if (!held) {
+        fd_step_ = 1;
+        next = FenceDrain::Pipe;
+      }
+      break;
+    }
+    case FenceDrain::Amo:
+      if (!amo_busy) {
+        fd_step_ = 2;
+        next = FenceDrain::Pipe;
+      }
+      break;
+    case FenceDrain::Mreq:
+      if (mreq_sent_ - this->mem_req_out.size() >= fd_mreq_) {
+        next = FenceDrain::End;
+      }
+      break;
+    case FenceDrain::End:
+      next = FenceDrain::Done;
+      break;
+    default:
+      break;
+    }
+    if (fd_state_ != FenceDrain::End && this->bank_empty() && this->mshr_idle() && !amo_busy) {
+      next = FenceDrain::End;
+    }
+    fd_state_ = next;
+  }
+
+  // Every memory request leaves through here, so a drain can tell when the
+  // ones queued at a given point have all left.
+  void memReqSend(const MemReq &req) {
+    this->mem_req_out.send(req, MEM_REQ_DELAY);
+    ++mreq_sent_;
   }
 
   Cache::Config config_;
@@ -1817,6 +2075,23 @@ private:
   uint32_t flush_way_idx_;
   uint32_t flush_sector_idx_;
 
+  // Fence walk state.
+  enum class FenceWalk { Idle, Drain, Walk, Settle, End, Done };
+  FenceWalk fw_state_;
+  uint32_t  fw_ctr_;
+  uint32_t  fw_settle_;
+
+  // Fence drain state.
+  enum class FenceDrain { Idle, Pipe, Mshr, Amo, Mreq, End, Done };
+  FenceDrain fd_state_;
+  uint32_t   fd_step_;
+  uint32_t   fd_count_;
+  std::vector<std::pair<uint32_t, uint64_t>> fd_mshr_; // MSHR entries it waits on
+  uint64_t   fd_mreq_;    // memory requests sent before its queue snapshot
+  uint64_t   mreq_sent_;  // memory requests sent so far
+
+  uint32_t   amo_hold_;   // cycles core admission stays held by a committing atomic
+
 #if VX_CFG_EXT_A_ENABLED
   AmoUnit  amo_unit_;
 
@@ -1844,7 +2119,11 @@ private:
 class Cache::Impl {
 public:
   Impl(Cache *simobject, const Config &config)
-      : simobject_(simobject), config_(config), params_(config), banks_(1 << config.B), nc_mem_arbs_(config.mem_ports) {
+      : simobject_(simobject), config_(config), params_(config), banks_(1 << config.B), nc_mem_arbs_(config.mem_ports)
+      , fence_state_(FenceLock::Idle), drain_phase_(DrainPhase::Transit), any_fence_(false)
+      , fence_head_(config.num_inputs, false), admit_(config.num_inputs, true)
+      , fired_(config.num_inputs, false), released_(config.num_inputs, false), grace_(config.num_inputs, false)
+      , fwd_cnt_(config.num_inputs, 0), drain_fwd_(config.num_inputs, 0), drain_adm_(1u << config.B, 0) {
     char sname[100];
 
     uint32_t num_banks = (1 << config.B);
@@ -1913,6 +2192,16 @@ public:
       return;
     // calculate cache initialization cycles
     init_cycles_ = params_.sets_per_bank;
+    fence_state_ = FenceLock::Idle;
+    drain_phase_ = DrainPhase::Transit;
+    for (uint32_t i = 0; i < config_.num_inputs; ++i) {
+      fence_head_.at(i) = false;
+      admit_.at(i)      = true;
+      fired_.at(i)      = false;
+      released_.at(i)   = false;
+      grace_.at(i)      = false;
+      fwd_cnt_.at(i)    = 0;
+    }
   }
 
   void tick() {
@@ -1951,6 +2240,7 @@ public:
     }
 
     // schedule core requests
+    this->fenceInputs();
     for (uint32_t req_id = 0, n = config_.num_inputs; req_id < n; ++req_id) {
       auto &core_req_in = simobject_->core_req_in.at(req_id);
       if (core_req_in.empty())
@@ -1960,12 +2250,15 @@ public:
         if (this->processBypassRequest(core_req, req_id)) {
           core_req_in.pop();
         }
-      } else {
+      } else if (admit_.at(req_id)) {
         if (bank_core_xbar_->ReqIn.at(req_id).try_send(core_req, 0)) {
           core_req_in.pop();
+          fired_.at(req_id) = true;
+          ++fwd_cnt_.at(req_id);
         }
       }
     }
+    this->fenceAdvance();
   }
 
   PerfStats perf_stats() const {
@@ -1995,6 +2288,167 @@ public:
   }
 
 private:
+
+  // Fence admission in front of the banks, the counterpart of the hardware's
+  // cache_init, whose states it follows. Above the shared level a fence at
+  // any input head holds every input while the banks drain and walk, then
+  // only the fences the walk covers go on; inputs whose request waited
+  // through the walk are each admitted once (Grace) before another walk may
+  // start. At the shared level only the fences wait, until the banks have
+  // retired every request accepted before them (Drain), and then go on as
+  // reads of their line (Drel).
+  void fenceInputs() {
+    uint32_t n = config_.num_inputs;
+    any_fence_ = false;
+    for (uint32_t i = 0; i < n; ++i) {
+      auto &in = simobject_->core_req_in.at(i);
+      fence_head_.at(i) = !in.empty() && in.peek().flags.fence && !in.peek().flags.io;
+      any_fence_ = any_fence_ || fence_head_.at(i);
+      fired_.at(i) = false;
+    }
+    const bool walk_req = any_fence_ && !config_.fence_shared;
+    for (uint32_t i = 0; i < n; ++i) {
+      bool enable = false;
+      switch (fence_state_) {
+      case FenceLock::Idle:  enable = !walk_req && !fence_head_.at(i); break;
+      case FenceLock::Done:  enable = !any_fence_ || released_.at(i); break;
+      case FenceLock::Grace:
+      case FenceLock::Drain: enable = !fence_head_.at(i); break;
+      case FenceLock::Drel:  enable = !fence_head_.at(i) || released_.at(i); break;
+      default:               enable = false; break;
+      }
+      admit_.at(i) = enable;
+    }
+  }
+
+  void fenceAdvance() {
+    uint32_t n = config_.num_inputs;
+    auto regular_waiting = [&](uint32_t i) {
+      return !simobject_->core_req_in.at(i).empty() && !fence_head_.at(i) && !fired_.at(i);
+    };
+    auto release_fired = [&]() {
+      bool pending = false;
+      for (uint32_t i = 0; i < n; ++i) {
+        released_.at(i) = released_.at(i) && !fired_.at(i);
+        pending = pending || released_.at(i);
+      }
+      return pending;
+    };
+    switch (fence_state_) {
+    case FenceLock::Idle:
+      if (any_fence_ && !config_.fence_shared) {
+        fence_state_ = FenceLock::Flush;
+        DT(3, simobject_->name() << " fence-walk");
+      } else if (any_fence_) {
+        // Only the fences waiting now: a later fence's earlier requests may
+        // still be accepted while this drain runs.
+        for (uint32_t i = 0; i < n; ++i) {
+          released_.at(i) = fence_head_.at(i);
+          drain_fwd_.at(i) = fwd_cnt_.at(i);
+        }
+        drain_phase_ = DrainPhase::Transit;
+        fence_state_ = FenceLock::Drain;
+        DT(3, simobject_->name() << " fence-drain");
+      }
+      break;
+    case FenceLock::Flush:
+      for (auto &bank : banks_) {
+        bank->fence_walk_begin();
+      }
+      fence_state_ = FenceLock::Wait2;
+      break;
+    case FenceLock::Wait2: {
+      bool done = true;
+      for (auto &bank : banks_) {
+        done = done && bank->fence_walk_done();
+      }
+      if (done) {
+        for (uint32_t b = 0; b < banks_.size(); ++b) {
+          banks_.at(b)->fence_walk_ack();
+        }
+        for (uint32_t i = 0; i < n; ++i) {
+          released_.at(i) = fence_head_.at(i);
+        }
+        fence_state_ = FenceLock::Done;
+      }
+      break;
+    }
+    case FenceLock::Done:
+      if (!release_fired()) {
+        bool any = false;
+        for (uint32_t i = 0; i < n; ++i) {
+          grace_.at(i) = regular_waiting(i);
+          any = any || grace_.at(i);
+        }
+        fence_state_ = any ? FenceLock::Grace : FenceLock::Idle;
+      }
+      break;
+    case FenceLock::Grace: {
+      bool any = false;
+      for (uint32_t i = 0; i < n; ++i) {
+        grace_.at(i) = grace_.at(i) && regular_waiting(i);
+        any = any || grace_.at(i);
+      }
+      if (!any) {
+        fence_state_ = FenceLock::Idle;
+      }
+      break;
+    }
+    case FenceLock::Drain:
+      this->drainAdvance();
+      break;
+    case FenceLock::Drel:
+      if (!release_fired()) {
+        fence_state_ = FenceLock::Idle;
+      }
+      break;
+    }
+  }
+
+  // The banks start draining once every request accepted before the drain
+  // has entered its bank: first those queued in the bank crossbar leave it,
+  // then each bank admits what it had queued by then.
+  void drainAdvance() {
+    uint32_t n = config_.num_inputs;
+    switch (drain_phase_) {
+    case DrainPhase::Transit:
+      for (uint32_t i = 0; i < n; ++i) {
+        uint64_t left = fwd_cnt_.at(i) - bank_core_xbar_->ReqIn.at(i).size();
+        if (left < drain_fwd_.at(i)) {
+          return;
+        }
+      }
+      for (uint32_t b = 0; b < banks_.size(); ++b) {
+        drain_adm_.at(b) = banks_.at(b)->admitted() + banks_.at(b)->core_req_in.size();
+      }
+      drain_phase_ = DrainPhase::Admit;
+      [[fallthrough]];
+    case DrainPhase::Admit:
+      for (uint32_t b = 0; b < banks_.size(); ++b) {
+        if (banks_.at(b)->admitted() < drain_adm_.at(b)) {
+          return;
+        }
+      }
+      for (auto &bank : banks_) {
+        bank->fence_drain_begin();
+      }
+      drain_phase_ = DrainPhase::Banks;
+      return;
+    case DrainPhase::Banks: {
+      bool done = true;
+      for (auto &bank : banks_) {
+        done = done && bank->fence_drain_done();
+      }
+      if (done) {
+        for (auto &bank : banks_) {
+          bank->fence_drain_ack();
+        }
+        fence_state_ = FenceLock::Drel;
+      }
+      return;
+    }
+    }
+  }
 
   bool processBypassResponse(const MemRsp &mem_rsp) {
     // core response backpressure check
@@ -2029,6 +2483,20 @@ private:
   std::vector<MemArbiter::Ptr> nc_mem_arbs_;
   MemCrossBar::Ptr bank_core_xbar_;
   uint32_t init_cycles_;
+
+  enum class FenceLock { Idle, Flush, Wait2, Done, Grace, Drain, Drel };
+  enum class DrainPhase { Transit, Admit, Banks };
+  FenceLock  fence_state_;
+  DrainPhase drain_phase_;
+  bool       any_fence_;
+  std::vector<bool> fence_head_;  // input head is a fence token
+  std::vector<bool> admit_;       // input may pass to the banks this cycle
+  std::vector<bool> fired_;       // input passed to the banks this cycle
+  std::vector<bool> released_;    // fence the walk or drain lets go
+  std::vector<bool> grace_;       // input owed an admission after a walk
+  std::vector<uint64_t> fwd_cnt_;   // per input: requests sent to the banks
+  std::vector<uint64_t> drain_fwd_; // per input: requests sent before the drain
+  std::vector<uint64_t> drain_adm_; // per bank: admissions the drain waits on
 };
 
 ///////////////////////////////////////////////////////////////////////////////

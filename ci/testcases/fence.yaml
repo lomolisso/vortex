@@ -1,0 +1,69 @@
+# FENCE cost and fairness across the cache hierarchy. A fence invalidates the
+# write-through levels above the device's shared level and drains at that
+# level without a walk; cache flush admission is fair, so a stream of fences
+# cannot starve other requests in the caches (fairness at warp issue is an
+# open item, docs/designs/lsu_pipeline_design.md §3.3). The plain fence app
+# runs with the regression make-run cells.
+category: fence
+defaults:
+  configs: "-DVX_CFG_EXT_A_ENABLE"
+  xlen: [32, 64]
+  tier: smoke
+  touches: [hw/rtl/cache, hw/rtl/core/VX_lsu_slice.sv, hw/rtl/core/VX_mem_unit.sv,
+            hw/rtl/core/VX_dcr_flush.sv, hw/rtl/VX_gpu_pkg.sv, hw/rtl/Vortex.sv,
+            hw/rtl/VX_cluster.sv, hw/rtl/VX_socket.sv, sim/simx/lsu_unit.cpp, sim/simx/lsu_unit.h,
+            sim/simx/core.cpp, sim/simx/mem, sim/simx/types.h, sim/simx/constants.h,
+            sim/simx/processor.cpp, sim/simx/cluster.cpp, sim/simx/socket.cpp, tests/regression/fence]
+tests:
+  # The first warp times loads and AMOs while the other cores' warps (on one
+  # core, the timer's siblings) fence in a loop until they see the timer's done
+  # flag through a fence. The timer must finish within a cycle budget, after
+  # which a fencer gives up, so a starved timer, or a done flag a fence leaves
+  # stale in a fencer's cache, fails the run instead of hanging it.
+  # One core: the write-back dcache is the shared level.
+  - id: storm
+    app: fence
+    drivers: [simx, rtlsim]
+    args: "-tstorm"
+  # The L2 is the shared level; the L1s walk.
+  - id: storm-1x4-l2
+    app: fence
+    drivers: [simx, rtlsim]
+    shape: {cores: 4, l2cache: true}
+    args: "-tstorm"
+    tier: full
+  # The L3 is the shared level and the L1s feed it directly.
+  - id: storm-2x2-l3
+    app: fence
+    drivers: [simx, rtlsim]
+    shape: {clusters: 2, cores: 2, l3cache: true}
+    args: "-tstorm"
+  # Write-through L1s and L2s both walk above the L3.
+  - id: storm-2x2-l2-l3
+    app: fence
+    drivers: [simx, rtlsim]
+    configs+: "-DVX_CFG_L2_WRITEBACK=0"
+    shape: {clusters: 2, cores: 2, l2cache: true, l3cache: true}
+    args: "-tstorm"
+    tier: full
+  # SimX<->rtlsim cycle parity on fences in a loop: amomax's seq_cst load
+  # brackets every iteration with two fences, all harts contending.
+  - id: parity-amomax
+    check: model_parity
+    app: amo
+    args: "-n8 -tamomax"
+    touches: [hw/rtl/cache, hw/rtl/core/VX_lsu_slice.sv, hw/rtl/core/VX_mem_unit.sv,
+              hw/rtl/core/VX_dcr_flush.sv, hw/rtl/VX_gpu_pkg.sv, hw/rtl/Vortex.sv,
+              hw/rtl/VX_cluster.sv, hw/rtl/VX_socket.sv, sim/simx/lsu_unit.cpp, sim/simx/lsu_unit.h,
+              sim/simx/core.cpp, sim/simx/mem, sim/simx/types.h, sim/simx/constants.h,
+              sim/simx/processor.cpp, sim/simx/cluster.cpp, sim/simx/socket.cpp, tests/regression/amo]
+  - id: parity-amomax-2x2-l3
+    check: model_parity
+    app: amo
+    shape: {clusters: 2, cores: 2, l3cache: true}
+    args: "-n8 -tamomax"
+    touches: [hw/rtl/cache, hw/rtl/core/VX_lsu_slice.sv, hw/rtl/core/VX_mem_unit.sv,
+              hw/rtl/core/VX_dcr_flush.sv, hw/rtl/VX_gpu_pkg.sv, hw/rtl/Vortex.sv,
+              hw/rtl/VX_cluster.sv, hw/rtl/VX_socket.sv, sim/simx/lsu_unit.cpp, sim/simx/lsu_unit.h,
+              sim/simx/core.cpp, sim/simx/mem, sim/simx/types.h, sim/simx/constants.h,
+              sim/simx/processor.cpp, sim/simx/cluster.cpp, sim/simx/socket.cpp, tests/regression/amo]

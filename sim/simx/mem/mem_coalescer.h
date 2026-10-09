@@ -41,7 +41,8 @@ public:
     uint32_t output_size,
     uint32_t line_size,
     uint32_t queue_size,
-    uint32_t delay
+    uint32_t delay,
+    uint32_t port0_fence_delay = 0
   );
 
   const PerfStats& perf_stats() const;
@@ -76,6 +77,7 @@ private:
   out_round_t out_round_;
   uint32_t line_size_;
   uint32_t delay_;
+  uint32_t port0_fence_delay_;
   PerfStats perf_stats_;
 
   friend class SimObject<MemCoalescer>;

@@ -42,7 +42,8 @@ private:
   PoolAllocator<Instr, 64>& pool_;
 };
 
-// Fence controller
+// Fence controller: the block issues nothing from sending its fence token
+// into the memory hierarchy until the cycle after the token's response.
 class FenceController {
 public:
   bool locked() const { return locked_; }
@@ -50,27 +51,28 @@ public:
   void engage(instr_trace_t* trace) {
     trace_ = trace;
     locked_ = true;
+    returned_ = false;
   }
 
-  // Try to release the lock. Returns true on success (lock cleared,
-  // trace forwarded). Conditions: pending-requests table empty AND
-  // output channel can accept the trace.
-  bool try_release(SimChannel<instr_trace_t*>& out, bool pending_empty) {
-    if (!locked_) return false;
-    if (!pending_empty) return false;
-    if (!out.try_send(trace_)) return false;
-    locked_ = false;
+  void token_returned() { returned_ = true; }
+
+  // Lifts the lock once the token has returned; the caller still skips this
+  // cycle's dispatch.
+  bool try_release() {
+    if (!locked_ || !returned_) return false;
     trace_ = nullptr;
+    locked_ = false;
     return true;
   }
 
   instr_trace_t* trace() const { return trace_; }
 
-  void reset() { trace_ = nullptr; locked_ = false; }
+  void reset() { trace_ = nullptr; locked_ = false; returned_ = false; }
 
 private:
   instr_trace_t* trace_ = nullptr;
   bool locked_ = false;
+  bool returned_ = false;
 };
 
 class LsuUnit : public FuncUnit<VX_CFG_NUM_LSU_BLOCKS> {
@@ -96,6 +98,8 @@ protected:
 private:
 
 	void compute_addrs(uint32_t b, instr_trace_t* trace);
+
+	void issue_fence(uint32_t b, instr_trace_t* trace);
 
 	// Per-cycle handlers.
 	void process_response_step(uint32_t b);
@@ -123,6 +127,7 @@ private:
 		// TcuRspOut with client_tag restored instead of written to registers.
 		bool        is_tcu     = false;
 		uint32_t    client_tag = 0;
+		bool        is_fence   = false;
 	};
 
 	// Per-block LSU state. Each member is a named hardware sub-block.

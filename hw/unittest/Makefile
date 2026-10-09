@@ -171,13 +171,15 @@ endif
 
 # Cache bank in the last-level role: directed fill/replay races around the
 # atomic engine and the MSHR chains plus randomized traffic, checked against a
-# reference memory. Nine sets: the synthesis-gate DUT as configured; the L1
+# reference memory. Ten sets: the synthesis-gate DUT as configured; the L1
 # dcache LLC as built (2 ports and 2 banks, behind an unbuffered request
 # crossbar) with Zacas; one LSU channel into one bank; a deferred data stage
 # (LATENCY=3); write-through, also with two deferred stages (LATENCY=4); the
 # L2/L3 shape (word = sector, 2-sector lines, 2 memory ports); and atomics
 # compiled out, write-back and write-through, as in the default build, whose
-# load/store ordering is the same bank logic.
+# load/store ordering is the same bank logic. Those nine are the device's
+# shared level, where a fence drains; the tenth, write-through above that
+# level (IS_LLC=0, so no atomics), is where a fence walks and invalidates.
 # Each set rebuilds: CONFIGS and CACHE_PARAMS are not make dependencies, so an
 # extra run goes in the call that builds its set.
 CACHE_BASE := -DVX_CFG_EXT_A_ENABLE
@@ -193,16 +195,19 @@ endef
 # replays arrive, and response stalls (85% ready) hold the pipe across an
 # atomic's settling writeback, the case the settle sweep directs.
 CACHE_STALL := --tests=stress --seed=2 --stress-seeds=16 --stress-cycles=40000 --mem-ready=30
+# Randomized traffic with fences mixed in, each draining or walking per set.
+CACHE_FENCE := --tests=stress --seed=3 --stress-seeds=4 --stress-fence=4
 run-cache:
-	$(call cache_case,$(CACHE_BASE),)
+	$(call cache_case,$(CACHE_BASE),,$(CACHE_FENCE))
 	$(call cache_case,$(CACHE_BASE) -DVX_CFG_EXT_ZACAS_ENABLE,NUM_REQS=2 NUM_BANKS=2,$(CACHE_STALL))
 	$(call cache_case,$(CACHE_BASE),NUM_REQS=1 NUM_BANKS=1)
 	$(call cache_case,$(CACHE_BASE) -DVX_CFG_EXT_ZACAS_ENABLE,NUM_BANKS=2 LATENCY=3)
-	$(call cache_case,$(CACHE_BASE),WRITEBACK=0 NUM_REQS=2)
+	$(call cache_case,$(CACHE_BASE),WRITEBACK=0 NUM_REQS=2,$(CACHE_FENCE))
 	$(call cache_case,$(CACHE_BASE),WRITEBACK=0 NUM_REQS=2 LATENCY=4)
 	$(call cache_case,$(CACHE_BASE) -DVX_CFG_EXT_ZACAS_ENABLE,$(CACHE_L2))
 	$(call cache_case,,AMO_ENABLE=0)
 	$(call cache_case,,AMO_ENABLE=0 WRITEBACK=0 NUM_REQS=2)
+	$(call cache_case,,AMO_ENABLE=0 IS_LLC=0 WRITEBACK=0 NUM_REQS=2,$(CACHE_FENCE))
 
 # TCU FEDP datapath — executed per format so a tcu/tfr change is gated by CI.
 # Each format must enable its own RTL datapath (FP16-only is the default). Covers
