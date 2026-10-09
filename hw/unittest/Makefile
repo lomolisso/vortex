@@ -273,10 +273,48 @@ ifeq ($(XLEN),64)
 	$(MAKE) -C dlmem_xlate clean
 endif
 
-# Network endpoints: dlmem_ep.
+# Network endpoints: every core's egress, ingress and store tracker of one
+# cluster, joined by a request and a response network, at each shape (sockets,
+# socket size, LSU blocks, LSU lanes) and once with Zacas. Every traffic mode
+# runs under random stalls, remote LR/SC as the defined hardware behaviour;
+# then the fixed latency schedule, whose CSV must match the SimX endpoints' run
+# of the same schedule packet for packet. The last build has the remote LR/SC
+# assert on and must abort; the final clean keeps a plain `run` from reusing it.
+# $(1)=shape tag of the SimX test (sockets, socket size, LSU blocks, LSU lanes)
+# $(2)=that shape's CONFIGS $(3)=seed
+DLMEM_EP_CFG  := -DVX_CFG_EXT_DLMEM_ENABLE -DVX_CFG_EXT_A_ENABLE
+DLMEM_EP_SIMX := $(ROOT_DIR)/tests/unittest/dlmem_ep
+define dlmem_ep_case
+	$(MAKE) -C dlmem_ep clean
+	$(MAKE) -C dlmem_ep CONFIGS="$(DLMEM_EP_CFG) $(2)"
+	$(MAKE) -C dlmem_ep run CONFIGS="$(DLMEM_EP_CFG) $(2)" OPTS="--mode=random --seed=$(3)"
+	$(MAKE) -C dlmem_ep run CONFIGS="$(DLMEM_EP_CFG) $(2)" OPTS="--mode=hotspot --seed=$(3)"
+	$(MAKE) -C dlmem_ep run CONFIGS="$(DLMEM_EP_CFG) $(2)" OPTS="--mode=storeflood --seed=$(3)"
+	$(MAKE) -C dlmem_ep run CONFIGS="$(DLMEM_EP_CFG) $(2)" OPTS="--mode=loadflood --seed=$(3)"
+	$(MAKE) -C dlmem_ep run CONFIGS="$(DLMEM_EP_CFG) $(2)" OPTS="--mode=backpressure --seed=$(3)"
+	$(MAKE) -C dlmem_ep run CONFIGS="$(DLMEM_EP_CFG) $(2)" OPTS="--mode=lrsc --seed=$(3)"
+	$(MAKE) -C dlmem_ep run CONFIGS="$(DLMEM_EP_CFG) $(2)" OPTS="--mode=latency --csv=latency_$(1).csv"
+	$(MAKE) -C $(DLMEM_EP_SIMX) run SHAPES=$(1) OPTS="--mode=latency --csv=$(CURDIR)/dlmem_ep/simx_latency_$(1).csv"
+	python3 $(VORTEX_HOME)/hw/unittest/dlmem_ep/compare_latency.py \
+		dlmem_ep/latency_$(1).csv dlmem_ep/simx_latency_$(1).csv
+endef
 run-dlmem-ep:
 ifeq ($(XLEN),64)
-	@true
+	$(call dlmem_ep_case,s1214,-DVX_CFG_NUM_CORES=2 -DVX_CFG_SOCKET_SIZE=2 -DVX_CFG_NUM_LSU_LANES=4,1)
+	$(call dlmem_ep_case,s1422,-DVX_CFG_NUM_CORES=4 -DVX_CFG_SOCKET_SIZE=4 -DVX_CFG_ISSUE_WIDTH=2 \
+		-DVX_CFG_NUM_LSU_BLOCKS=2 -DVX_CFG_NUM_LSU_LANES=2,2)
+	$(call dlmem_ep_case,s2114,-DVX_CFG_NUM_CORES=2 -DVX_CFG_SOCKET_SIZE=1 -DVX_CFG_NUM_LSU_LANES=4,3)
+	$(call dlmem_ep_case,s2224,-DVX_CFG_NUM_CORES=4 -DVX_CFG_SOCKET_SIZE=2 -DVX_CFG_ISSUE_WIDTH=2 \
+		-DVX_CFG_NUM_LSU_BLOCKS=2 -DVX_CFG_NUM_LSU_LANES=4,4)
+	$(call dlmem_ep_case,s4112,-DVX_CFG_NUM_CORES=4 -DVX_CFG_SOCKET_SIZE=1 -DVX_CFG_NUM_LSU_LANES=2,5)
+	$(call dlmem_ep_case,s4214,-DVX_CFG_NUM_CORES=8 -DVX_CFG_SOCKET_SIZE=2 -DVX_CFG_NUM_LSU_LANES=4,6)
+	$(call dlmem_ep_case,s2214z,-DVX_CFG_NUM_CORES=4 -DVX_CFG_SOCKET_SIZE=2 -DVX_CFG_NUM_LSU_LANES=4 \
+		-DVX_CFG_EXT_ZACAS_ENABLE,7)
+	$(MAKE) -C dlmem_ep clean
+	$(MAKE) -C dlmem_ep CONFIGS="$(DLMEM_EP_CFG) -DVX_CFG_NUM_CORES=2 -DVX_CFG_SOCKET_SIZE=2" LRSC_ASSERT=1
+	! dlmem_ep/dlmem_ep --mode=lrsc > dlmem_ep/lrsc_assert.log 2>&1
+	grep -q "remote [LS][RC] is not supported" dlmem_ep/lrsc_assert.log
+	$(MAKE) -C dlmem_ep clean
 endif
 
 # Cache bank in the last-level role: directed fill/replay races around the
