@@ -321,6 +321,52 @@ last, so the new occupant would inherit its predecessor's remainder, complete
 on its first beat, and release the slot with lanes still owed. The scheduler
 asserts that the two never coincide on one slot.
 
+### 4.6 The DLMEM translation stage
+
+In a build with `VX_CFG_EXT_DLMEM_ENABLE`, every request of an LSU block
+passes through one registered stage between the slice and the scheduler's
+client 0:
+[`VX_dlmem_lsu_xlate.sv`](../../hw/rtl/dlmem/VX_dlmem_lsu_xlate.sv), one
+[`VX_dlmem_xlate`](../../hw/rtl/dlmem/VX_dlmem_xlate.sv) per block around
+one peer table. It resolves the distributed local-memory window
+([`dlmem_proposal.md`](../proposals/dlmem_proposal.md)), lane by lane:
+
+| lane address | goes to |
+|---|---|
+| outside the window | unchanged |
+| rank `r` of the issuing block's cluster, peer on this core | the peer slot's local memory at the same offset, steered local |
+| rank `r` on another core | marked remote; a runtime assertion (SimX aborts) until the network carries it |
+| a rank at or past the cluster size, or an offset past the block's local-memory footprint | out of bounds: a runtime assertion; the lane is steered into the issuer's own slot, so it never touches another block |
+
+- **Peer rows.** The dispatcher writes a block's row (`K` and each rank's
+  `{core, slot}`) and the launch's footprint into the table one cycle after it
+  admits the block. A same-core cluster's row is its consecutive slots.
+- **Row capture.** The row is selected by the request's CTA slot and
+  registered with the request as it enters the stage, so a request keeps the
+  row of the block that issued it even if the slot is admitted again behind it.
+- **What passes untouched.** The low 6 address bits, byte enables, data and
+  tag. Fences pass through in order, untranslated. The tensor unit's client 1
+  bypasses the stage; its addresses are never window addresses.
+- **Cost.** One cycle per request, fences included, in DLMEM builds only, in
+  both models.
+- **Outstanding reads.** The slice's packet slots (§3.4) never stall on their
+  own: the scheduler refuses a load once its outstanding pool (§4.2) is full. The
+  stage's two-entry buffer sits ahead of that pool, so in a DLMEM build the
+  scheduler's pool is `VX_CFG_LSU_PENDING_SIZE − 2`. The slots then cover every
+  load in the stage or the pool. SimX's pending table already sits before the
+  stage, so it keeps the full `VX_CFG_LSU_PENDING_SIZE`.
+- **The empty fold.** The core ANDs each stage's empty into its scheduler's
+  empty, so the core's busy, the flush gate behind the last store and the
+  barrier drain all see a request still held in the stage.
+- **Warp exit.** A `TMC` that ends a warp waits until the warp has no
+  instruction in flight and no remote store unacknowledged
+  (`warp_pending_alm_empty & dlmem_drained`, the barrier's drain). A store
+  commits when it enters the stage, so by the time an exited warp's slot can be
+  admitted again, every store it issued already holds its row.
+
+[`tests/regression/dlmem_local`](../../tests/regression/dlmem_local) covers
+the stage end to end, and `hw/unittest/dlmem_xlate` the stage alone.
+
 ---
 
 ## 5. Steering and the two memories — `VX_mem_unit`
@@ -388,6 +434,8 @@ The block reports **empty** only when no store is in flight anywhere on the
 global path — not in the coalescer, and not in the adapter's request buffer.
 That signal folds into the core's `busy`, so the end-of-kernel cache flush is
 ordered strictly behind the last store.
+In a DLMEM build the scheduler's empty also covers the translation stage in
+front of it (§4.6).
 
 ---
 
@@ -456,7 +504,12 @@ follows the RTL module for module — `local_mem_switch`, `mem_coalescer`,
 `lsu_mem_adapter` ([`sim/simx/mem/`](../../sim/simx/mem/)). A fence goes
 down the same path as a request flagged `MemFlags::fence`, and its response
 releases the `FenceController`, so the caches walk or drain it as in the RTL
-(§3.3). The RTL's `VX_dcr_flush` adds a register stage to every request on
+(§3.3). In a DLMEM build each block's requests and fences leave on an
+`LsuUnit`-owned channel that `Core` binds to
+[`DlmemXlate`](../../sim/simx/dlmem/dlmem_xlate.h), whose output feeds the
+local-memory switch one cycle later (§4.6); the tensor unit's requests still go
+straight to the switch. `Core` folds the stage's emptiness into its LSU drain
+and its running state. The RTL's `VX_dcr_flush` adds a register stage to every request on
 block 0's first dcache channel; SimX adds that cycle to fence tokens only,
 so other requests on that channel reach the dcache a cycle earlier than in the
 RTL.

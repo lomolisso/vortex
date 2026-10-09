@@ -25,7 +25,8 @@ DlmemXlate::DlmemXlate(const SimContext& ctx,
                        const dlmem_ref::Cfg& cfg,
                        uint32_t core_id,
                        uint32_t num_blocks,
-                       bool abort_on_oob)
+                       bool abort_on_oob,
+                       bool abort_on_remote)
   : SimObject<DlmemXlate>(ctx, name)
   , ReqIn(num_blocks, SimChannel<LsuReq>(this, 2))
   , ReqOut(num_blocks, SimChannel<LsuReq>(this))
@@ -35,6 +36,7 @@ DlmemXlate::DlmemXlate(const SimContext& ctx,
   , my_core_(0)
   , num_blocks_(num_blocks)
   , abort_on_oob_(abort_on_oob)
+  , abort_on_remote_(abort_on_remote)
   , rows_(cfg.nw, std::make_shared<const dlmem_ref::Row>(dlmem_ref::Row{0, {}}))
   , entry_rows_(num_blocks)
   , stride_(0) {
@@ -49,6 +51,15 @@ DlmemXlate::DlmemXlate(const SimContext& ctx,
       entry_rows_.at(b).push_back(rows_.at(req.cta_id));
     });
   }
+}
+
+bool DlmemXlate::empty() const {
+  for (auto& in : ReqIn) {
+    if (in.size() != 0) {
+      return false;
+    }
+  }
+  return true;
 }
 
 void DlmemXlate::on_reset() {
@@ -111,11 +122,15 @@ uint32_t DlmemXlate::translate(LsuReq& req, const dlmem_ref::Row& row) {
   uint32_t remote = 0;
   int oob_lane = -1;
   uint64_t oob_addr = 0;
+  int remote_lane = -1;
+  uint64_t remote_addr = 0;
+  uint32_t remote_core = 0;
   for (uint32_t i = 0; i < req.mask.size(); ++i) {
     req.dlmem_remote.reset(i);
     req.dlmem_oob.reset(i);
     req.dlmem_core.at(i) = 0;
-    if (!req.mask.test(i))
+    // A fence token's lanes carry no address.
+    if (!req.mask.test(i) || req.flags.fence)
       continue;
     uint64_t addr = req.addrs.at(i);
     auto x = dlmem_ref::translate(cfg_, addr, row, my_core_, req.cta_id, stride_);
@@ -126,6 +141,11 @@ uint32_t DlmemXlate::translate(LsuReq& req, const dlmem_ref::Row& row) {
     if (x.kind == dlmem_ref::REMOTE) {
       req.dlmem_remote.set(i);
       ++remote;
+      if (remote_lane < 0) {
+        remote_lane = i;
+        remote_addr = addr & ~uint64_t(LSU_WORD_SIZE - 1);
+        remote_core = x.core;
+      }
     } else if (x.kind == dlmem_ref::OOB) {
       req.dlmem_oob.set(i);
       if (oob_lane < 0) {
@@ -140,6 +160,13 @@ uint32_t DlmemXlate::translate(LsuReq& req, const dlmem_ref::Row& row) {
               << " DLMEM access out of bounds: wid=" << req.wid << " cta=" << req.cta_id
               << " lane=" << oob_lane << " addr=0x" << std::hex << oob_addr << std::dec
               << " (#" << req.uuid << ")" << std::endl;
+    std::abort();
+  }
+  if (remote_lane >= 0 && abort_on_remote_) {
+    std::cerr << SimPlatform::instance().cycles() << ": " << this->name()
+              << " remote DLMEM access is not supported yet: wid=" << req.wid << " cta=" << req.cta_id
+              << " lane=" << remote_lane << " addr=0x" << std::hex << remote_addr << std::dec
+              << " core=" << remote_core << " (#" << req.uuid << ")" << std::endl;
     std::abort();
   }
   return remote;

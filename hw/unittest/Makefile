@@ -248,14 +248,21 @@ endif
 # The shapes span every window size (LMEM_LOG 14..18), MAX_CLUSTER 1, 2, 3, 4
 # and 8, core fields wider than the rank field (NCC 6, 8 and 16 over MAX 3, 4
 # and 8), second-cluster core ids, 1 to 8 lanes, 1 and 2 blocks, and Zacas.
-# NCC 6 has no vectors, so it runs random traffic only. The last build has the
-# bound assert on and must abort on an out-of-bounds lane; the final clean
-# keeps a plain `run` from reusing that binary.
-# $(1)=CONFIGS $(2)=CORE_ID $(3)=OOB_ASSERT $(4)=OPTS
+# NCC 6 has no vectors, so it runs random traffic only. The full runs also feed
+# a model of the LSU scheduler's queue, stressing back-pressure and handoffs.
+# The last two builds have the bound assert and the remote-access assert on
+# and must abort on such a lane; the final clean keeps a plain `run` from
+# reusing that binary. Then the core elaborates and lints with the stages in
+# place, at 1 core and at 8 cores with two LSU blocks.
+# $(1)=CONFIGS $(2)=CORE_ID $(3)=OOB_ASSERT $(4)=OPTS $(5)=OPTS of an extra run
+# $(6)=REMOTE_ASSERT
 define dlmem_xlate_case
 	$(MAKE) -C dlmem_xlate clean
-	$(MAKE) -C dlmem_xlate CONFIGS="-DVX_CFG_EXT_DLMEM_ENABLE $(1)" CORE_ID=$(2) OOB_ASSERT=$(3)
-	$(MAKE) -C dlmem_xlate run CONFIGS="-DVX_CFG_EXT_DLMEM_ENABLE $(1)" CORE_ID=$(2) OOB_ASSERT=$(3) OPTS="$(4)"
+	$(MAKE) -C dlmem_xlate CONFIGS="-DVX_CFG_EXT_DLMEM_ENABLE $(1)" CORE_ID=$(2) OOB_ASSERT=$(3) REMOTE_ASSERT=$(or $(6),0)
+	$(if $(4),$(MAKE) -C dlmem_xlate run CONFIGS="-DVX_CFG_EXT_DLMEM_ENABLE $(1)" CORE_ID=$(2) OOB_ASSERT=$(3) \
+		REMOTE_ASSERT=$(or $(6),0) OPTS="$(4)")
+	$(if $(5),$(MAKE) -C dlmem_xlate run CONFIGS="-DVX_CFG_EXT_DLMEM_ENABLE $(1)" CORE_ID=$(2) OOB_ASSERT=$(3) \
+		REMOTE_ASSERT=$(or $(6),0) OPTS="$(5)")
 endef
 run-dlmem-xlate:
 ifeq ($(XLEN),64)
@@ -264,7 +271,7 @@ ifeq ($(XLEN),64)
 	$(call dlmem_xlate_case,-DVX_CFG_NUM_CLUSTERS=2 -DVX_CFG_NUM_CORES=2 -DVX_CFG_SOCKET_SIZE=1 \
 		-DVX_CFG_NUM_WARPS=4 -DVX_CFG_LMEM_LOG_SIZE=14,3,0,--seed=2)
 	$(call dlmem_xlate_case,-DVX_CFG_NUM_CORES=4 -DVX_CFG_SOCKET_SIZE=2 -DVX_CFG_NUM_WARPS=8 \
-		-DVX_CFG_LMEM_LOG_SIZE=16 -DVX_CFG_ISSUE_WIDTH=2,2,0,--seed=3)
+		-DVX_CFG_LMEM_LOG_SIZE=16 -DVX_CFG_ISSUE_WIDTH=2,2,0,--seed=3,--mode=remote)
 	$(call dlmem_xlate_case,-DVX_CFG_NUM_CORES=8 -DVX_CFG_SOCKET_SIZE=2 -DVX_CFG_NUM_WARPS=8 \
 		-DVX_CFG_NUM_THREADS=8 -DVX_CFG_LMEM_LOG_SIZE=18,5,0,--seed=4)
 	$(call dlmem_xlate_case,-DVX_CFG_NUM_CORES=8 -DVX_CFG_SOCKET_SIZE=4 -DVX_CFG_NUM_WARPS=16 \
@@ -280,7 +287,14 @@ ifeq ($(XLEN),64)
 		-DVX_CFG_LMEM_LOG_SIZE=14,1,1,--mode=random --no-oob --seed=8)
 	! dlmem_xlate/dlmem_xlate --mode=oob > dlmem_xlate/oob.log 2>&1
 	grep -q "DLMEM access out of bounds" dlmem_xlate/oob.log
+	$(call dlmem_xlate_case,-DVX_CFG_NUM_CORES=2 -DVX_CFG_SOCKET_SIZE=1 -DVX_CFG_NUM_WARPS=4 \
+		-DVX_CFG_LMEM_LOG_SIZE=14,0,0,,,1)
+	! dlmem_xlate/dlmem_xlate --mode=remote > dlmem_xlate/remote.log 2>&1
+	grep -q "remote DLMEM access is not supported yet" dlmem_xlate/remote.log
 	$(MAKE) -C dlmem_xlate clean
+	$(MAKE) -C core lint CONFIGS="-DVX_CFG_EXT_DLMEM_ENABLE -DVX_CFG_NUM_CORES=1"
+	$(MAKE) -C core lint CONFIGS="-DVX_CFG_EXT_DLMEM_ENABLE -DVX_CFG_NUM_CORES=8 -DVX_CFG_SOCKET_SIZE=2 \
+		-DVX_CFG_ISSUE_WIDTH=2"
 endif
 
 # Network endpoints: every core's egress, ingress and store tracker of one

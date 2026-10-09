@@ -24,6 +24,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <deque>
+#include <functional>
 #include <iostream>
 #include <random>
 #include <sstream>
@@ -141,7 +142,7 @@ LsuReq expected_out(const std::string& ctx, const dlmem_ref::Cfg& cfg, uint32_t 
     e.dlmem_remote.reset(i);
     e.dlmem_oob.reset(i);
     e.dlmem_core.at(i) = 0;
-    if (!in.mask.test(i)) {
+    if (!in.mask.test(i) || in.flags.fence) {
       continue;
     }
     auto x = dlmem_ref::translate(cfg, in.addrs.at(i), row, my_core, in.cta_id, stride);
@@ -256,12 +257,14 @@ struct Harness {
   TableModel tm;
   std::vector<BlockModel> blocks;
   uint64_t outputs = 0;
+  uint64_t fences = 0;
   uint64_t wt_events = 0;
   uint64_t kinds[4] = {0, 0, 0, 0};  // active lanes per dlmem_ref::Kind
 
-  Harness(const std::string& name, const dlmem_ref::Cfg& c, uint32_t core_id, uint32_t nb)
+  Harness(const std::string& name, const dlmem_ref::Cfg& c, uint32_t core_id, uint32_t nb,
+          bool aborts = false)
     : ctx(name), cfg(c), my_core(core_id % c.ncc), num_blocks(nb), blocks(nb) {
-    dut = DlmemXlate::Create(name.c_str(), cfg, core_id, nb, false);
+    dut = DlmemXlate::Create(name.c_str(), cfg, core_id, nb, aborts, aborts);
     tm.reset(cfg.nw);
     if (dut->ReqIn.size() != nb || dut->ReqOut.size() != nb || dut->WtIncOut.size() != nb) {
       fail(ctx, "one request/output/count channel per block expected");
@@ -296,6 +299,21 @@ struct Harness {
   void send_req(uint64_t cycle, uint32_t b, const LsuReq& req) {
     dut->ReqIn.at(b).send(req, 1);
     blocks[b].in.push_back({req, cycle + 1, false, dlmem_ref::Row{}});
+    if (dut->empty()) {
+      fail(ctx, "empty() with request #" + std::to_string(req.uuid) + " in flight to the stage");
+    }
+  }
+
+  // The core's drain and busy terms: empty() is exactly "no request held or arriving".
+  void check_empty(uint64_t cycle) {
+    bool model_empty = true;
+    for (auto& bm : blocks) {
+      model_empty = model_empty && bm.in.empty();
+    }
+    if (dut->empty() != model_empty) {
+      fail(ctx, "empty()=" + std::to_string(dut->empty()) + ", model " + std::to_string(model_empty)
+                + " (cycle " + std::to_string(cycle) + ")");
+    }
   }
 
   // The model's half of tick `cycle`.
@@ -334,6 +352,7 @@ struct Harness {
 
   // After tick `cycle`: outputs match the model; pop one where ready.
   void check_outputs(uint64_t cycle, const std::vector<bool>& ready, std::vector<OutEntry>* popped) {
+    this->check_empty(cycle);
     for (uint32_t b = 0; b < num_blocks; ++b) {
       auto& bm = blocks[b];
       auto& out = dut->ReqOut.at(b);
@@ -361,6 +380,7 @@ struct Harness {
         continue;
       }
       compare_req(ctx + bctx, out.peek(), bm.out.front().req);
+      fences += bm.out.front().req.flags.fence;
       out.pop();
       if (popped) {
         popped->push_back(bm.out.front());
@@ -472,6 +492,12 @@ LsuReq random_req(const dlmem_ref::Cfg& cfg, const TableModel& tm, uint32_t num_
   LsuReq req(num_lanes);
   uint32_t pick = rng.below(10);
   req.op = (pick < 4) ? MemOp::LD : (pick < 8) ? MemOp::ST : kAmoOps[rng.below(sizeof(kAmoOps) / sizeof(kAmoOps[0]))];
+  // A fence token, given window addresses here, must leave with every lane untouched.
+  bool fence = rng.chance(5);
+  if (fence) {
+    req.op = MemOp::FLUSH;
+    req.flags.fence = 1;
+  }
   req.flags.amo_unsigned = memop_is_atomic(req.op) && rng.chance(50);
   req.wid = uint32_t(rng.below(cfg.nw));
   req.cta_id = uint32_t(rng.below(cfg.nw));
@@ -494,7 +520,7 @@ LsuReq random_req(const dlmem_ref::Cfg& cfg, const TableModel& tm, uint32_t num_
       continue;
     }
     req.mask.set(i);
-    if (req.op != MemOp::LD) {
+    if (req.op != MemOp::LD && !fence) {
       auto block = std::make_shared<mem_block_t>();
       for (auto& byte : *block) {
         byte = uint8_t(rng());
@@ -873,6 +899,7 @@ struct RandomResult {
   uint64_t digest = 0xcbf29ce484222325ull;
   uint64_t cycles = 0;
   uint64_t requests = 0;
+  uint64_t fences = 0;
   uint64_t wt_events = 0;
   uint64_t kinds[4] = {0, 0, 0, 0};
 
@@ -975,6 +1002,7 @@ RandomResult run_random(const RandomShape& rs, Variant variant, uint32_t seed, u
       }
       res.wt_events += h->wt_events;
       res.requests += h->outputs;
+      res.fences += h->fences;
       for (uint32_t k = 0; k < 4; ++k) {
         res.kinds[k] += h->kinds[k];
       }
@@ -1007,51 +1035,104 @@ void run_random_all(uint32_t seed, uint32_t reqs, uint32_t workers) {
     // A one-core cluster has no remote peer.
     bool need_remote = V::kShapes[rs.shape].ncc > 1;
     if (ref.kinds[dlmem_ref::NONE] == 0 || ref.kinds[dlmem_ref::LOCAL] == 0 || ref.kinds[dlmem_ref::OOB] == 0
-     || (need_remote && (ref.kinds[dlmem_ref::REMOTE] == 0 || ref.wt_events == 0))) {
+     || ref.fences == 0 || (need_remote && (ref.kinds[dlmem_ref::REMOTE] == 0 || ref.wt_events == 0))) {
       fail(std::string("random ") + V::kShapes[rs.shape].name, "traffic missed a lane kind");
     }
     std::cout << "random " << V::kShapes[rs.shape].name << " blocks=" << rs.blocks << " lanes=" << rs.lanes
               << ": requests=" << ref.requests << " cycles=" << ref.cycles
               << " local=" << ref.kinds[1] << " remote=" << ref.kinds[2] << " oob=" << ref.kinds[3]
-              << " pass=" << ref.kinds[0] << " wt_inc=" << ref.wt_events
+              << " pass=" << ref.kinds[0] << " fences=" << ref.fences << " wt_inc=" << ref.wt_events
               << " digest=" << std::hex << ref.digest << std::dec
               << " (flat=domains=threads x" << workers << ")" << std::endl;
   }
 }
 
 ///////////////////////////////////////////////////////////////////////////////
-// Out-of-bounds abort, in a child process
+// Fences: untranslated, in order, through a stage that aborts on window lanes
 
-void run_abort() {
+void run_fence() {
+  auto& platform = SimPlatform::instance();
+  platform.set_num_workers(1);
+  auto cfg = make_cfg(2, 4, 2, 14);
+  const uint64_t db = cfg.dlmem_base;
+  const uint64_t sram = uint64_t(1) << cfg.lmem_log;
+  std::string ctx = "fence";
+  Harness h(ctx, cfg, 0, 1, /*aborts*/ true);
+  platform.reset();
+  std::vector<bool> ready = {true};
+  std::vector<OutEntry> popped;
+  uint64_t cycle = 0;
+  auto step = [&]() {
+    h.model_tick(cycle);
+    platform.tick();
+    h.check_outputs(cycle, ready, &popped);
+    ++cycle;
+  };
+  // Slot 2: rank 0 is self, rank 1 is core 1. Slot 3 keeps the empty reset row.
+  h.write_row(cycle, {2, dlmem_ref::Row{2, {{0, 2}, {1, 3}}}, 0x1000});
+  step();
+  // Fence lanes on a remote rank and on the empty row's window would abort if translated.
+  auto fence = [&](uint64_t uuid, uint32_t cta) {
+    LsuReq req = window_req(uuid, cta, db + sram + 0x40, MemOp::FLUSH);
+    req.flags.fence = 1;
+    req.dlmem_remote.set(0);
+    req.dlmem_oob.set(1);
+    req.dlmem_core[1] = 1;
+    return req;
+  };
+  h.send_req(cycle, 0, window_req(1, 2, db + 0x40));
+  step();
+  h.send_req(cycle, 0, fence(2, 2));
+  step();
+  h.send_req(cycle, 0, fence(3, 3));
+  step();
+  h.send_req(cycle, 0, window_req(4, 2, db + 0x80, MemOp::ST));
+  step();
+  for (uint32_t k = 0; k < 4; ++k) {
+    step();
+  }
+  if (popped.size() != 4 || h.fences != 2 || h.wt_events != 0 || !h.drained()) {
+    fail(ctx, std::to_string(popped.size()) + " of 4 requests left, " + std::to_string(h.fences) + " fences");
+  }
+  for (uint32_t k = 0; k < 4; ++k) {
+    auto& e = popped[k];
+    if (e.req.uuid != k + 1 || e.tick != e.sent + 1) {
+      fail(ctx, "request #" + std::to_string(e.req.uuid) + " sent at " + std::to_string(e.sent)
+                + " left at tick " + std::to_string(e.tick) + " in position " + std::to_string(k));
+    }
+  }
+  for (uint32_t k : {1u, 2u}) {
+    auto& r = popped[k].req;
+    if (r.addrs[0] != db + sram + 0x40 || r.addrs[1] != db + sram + 0x48 || r.dlmem_remote.any()
+     || r.dlmem_oob.any() || r.dlmem_core[0] != 0 || r.dlmem_core[1] != 0) {
+      fail(ctx, "fence #" + std::to_string(r.uuid) + " was translated");
+    }
+  }
+  if (popped[0].req.addrs[0] != cfg.lmem_base + 2 * 0x1000 + 0x40) {
+    fail(ctx, "the load ahead of the fences was not translated");
+  }
+  platform.finalize();
+  std::cout << "fence: untranslated, in order, +1 cycle, sideband cleared: ok" << std::endl;
+}
+
+///////////////////////////////////////////////////////////////////////////////
+// Out-of-bounds and remote aborts, each in a child process
+
+std::string run_child(const std::function<void()>& body, const std::string& ctx, bool expect_abort) {
   int fds[2];
   if (pipe(fds) != 0) {
-    fail("abort", "pipe failed");
+    fail(ctx, "pipe failed");
   }
   std::cout.flush();
   std::cerr.flush();
   pid_t pid = fork();
   if (pid < 0) {
-    fail("abort", "fork failed");
+    fail(ctx, "fork failed");
   }
   if (pid == 0) {
     close(fds[0]);
     dup2(fds[1], STDERR_FILENO);
-    auto& platform = SimPlatform::instance();
-    platform.set_num_workers(1);
-    auto cfg = make_cfg(2, 4, 2, 14);
-    auto dut = DlmemXlate::Create("xlate-oob", cfg, 0, 1);
-    platform.reset();
-    dut->PeerWrIn.send({2, dlmem_ref::Row{1, {{0, 2}}}, 0x1000}, 1);
-    platform.tick();
-    dut->ReqIn.at(0).send(window_req(7, 2, cfg.dlmem_base + 0x40), 1);  // in bounds
-    platform.tick();
-    dut->ReqIn.at(0).send(window_req(8, 2, cfg.dlmem_base + 0x4005), 1);  // rank 1 >= k
-    for (int i = 0; i < 4; ++i) {
-      platform.tick();
-      while (!dut->ReqOut.at(0).empty()) {
-        dut->ReqOut.at(0).pop();
-      }
-    }
+    body();
     _exit(0);
   }
   close(fds[1]);
@@ -1064,17 +1145,87 @@ void run_abort() {
   close(fds[0]);
   int status = 0;
   waitpid(pid, &status, 0);
-  if (!WIFSIGNALED(status) || WTERMSIG(status) != SIGABRT) {
-    fail("abort", "an out-of-bounds lane did not abort the simulation");
+  bool aborted = WIFSIGNALED(status) && WTERMSIG(status) == SIGABRT;
+  bool clean = WIFEXITED(status) && WEXITSTATUS(status) == 0;
+  if (expect_abort ? !aborted : !clean) {
+    fail(ctx, std::string(expect_abort ? "the simulation did not abort" : "the simulation did not finish")
+              + ": " + err);
   }
-  if (err.find("DLMEM access out of bounds: wid=2 cta=2 lane=0 addr=0x200004000 (#8)") == std::string::npos) {
-    fail("abort", "unexpected abort message: " + err);
+  return err;
+}
+
+// One in-bounds request, then `bad` on block 0 of core 0, under slot 2's row.
+void abort_body(const char* name, const dlmem_ref::Row& row, const LsuReq& bad, bool abort_on_remote,
+                uint32_t want_wt) {
+  auto& platform = SimPlatform::instance();
+  platform.set_num_workers(1);
+  auto cfg = make_cfg(2, 4, 2, 14);
+  auto dut = abort_on_remote ? DlmemXlate::Create(name, cfg, 0, 1)
+                             : DlmemXlate::Create(name, cfg, 0, 1, true, false);
+  platform.reset();
+  dut->PeerWrIn.send({2, row, 0x1000}, 1);
+  platform.tick();
+  dut->ReqIn.at(0).send(window_req(7, 2, cfg.dlmem_base + 0x40), 1);  // rank 0: self
+  platform.tick();
+  dut->ReqIn.at(0).send(bad, 1);
+  uint32_t wt = 0;
+  for (int i = 0; i < 4; ++i) {
+    platform.tick();
+    while (!dut->ReqOut.at(0).empty()) {
+      dut->ReqOut.at(0).pop();
+    }
+    while (!dut->WtIncOut.at(0).empty()) {
+      auto& w = dut->WtIncOut.at(0).peek();
+      if (w.wid != bad.wid) {
+        _exit(3);
+      }
+      wt += w.cnt;
+      dut->WtIncOut.at(0).pop();
+    }
   }
-  std::cout << "abort: out-of-bounds lane aborts with: " << err.substr(err.find(' ') + 1);
+  _exit(wt == want_wt ? 0 : 4);
+}
+
+void run_abort() {
+  auto cfg = make_cfg(2, 4, 2, 14);
+  const uint64_t db = cfg.dlmem_base;
+  const uint64_t sram = uint64_t(1) << cfg.lmem_log;
+  struct Case {
+    const char* name;
+    dlmem_ref::Row row;
+    uint64_t addr;
+    bool abort_on_remote;
+    bool expect_abort;
+    std::string expect;
+  };
+  // Rank 1 of a one-member row is out of bounds; of a two-member row whose
+  // rank 1 lives on core 1, it is remote.
+  uint64_t oob = db + sram + 5;
+  uint64_t rem = db + sram + 0x40;
+  const Case cases[] = {
+    {"xlate-oob", dlmem_ref::Row{1, {{0, 2}}}, oob, true, true,
+     "DLMEM access out of bounds: wid=2 cta=2 lane=0 addr=" + hex(oob & ~uint64_t(LSU_WORD_SIZE - 1)) + " (#8)"},
+    {"xlate-remote", dlmem_ref::Row{2, {{0, 2}, {1, 3}}}, rem, true, true,
+     "remote DLMEM access is not supported yet: wid=2 cta=2 lane=0 addr=" + hex(rem) + " core=1 (#8)"},
+    {"xlate-remote-count", dlmem_ref::Row{2, {{0, 2}, {1, 3}}}, rem, false, false, ""},
+  };
+  for (auto& c : cases) {
+    LsuReq bad = window_req(8, 2, c.addr, MemOp::ST);
+    std::string err = run_child([&]() { abort_body(c.name, c.row, bad, c.abort_on_remote, 2); },
+                                std::string("abort ") + c.name, c.expect_abort);
+    if (!c.expect_abort) {
+      std::cout << "abort: abort_on_remote=false passes remote lanes and counts them (2 lanes)" << std::endl;
+      continue;
+    }
+    if (err.find(c.expect) == std::string::npos) {
+      fail(std::string("abort ") + c.name, "unexpected abort message: " + err);
+    }
+    std::cout << "abort: " << c.name << " aborts with: " << err.substr(err.find(' ') + 1);
+  }
 }
 
 void usage() {
-  std::cout << "usage: dlmem_xlate_test [--mode=vectors|timing|random|abort|all] [--seed=N]\n"
+  std::cout << "usage: dlmem_xlate_test [--mode=vectors|timing|fence|random|abort|all] [--seed=N]\n"
                "                        [--reqs=N] [--workers=N]\n";
 }
 
@@ -1104,7 +1255,8 @@ int main(int argc, char** argv) {
       return 2;
     }
   }
-  if (mode != "all" && mode != "vectors" && mode != "timing" && mode != "random" && mode != "abort") {
+  if (mode != "all" && mode != "vectors" && mode != "timing" && mode != "fence" && mode != "random"
+   && mode != "abort") {
     usage();
     return 2;
   }
@@ -1117,6 +1269,9 @@ int main(int argc, char** argv) {
   }
   if (mode == "all" || mode == "timing") {
     run_timing();
+  }
+  if (mode == "all" || mode == "fence") {
+    run_fence();
   }
   if (mode == "all" || mode == "random") {
     run_random_all(seed, reqs, workers);

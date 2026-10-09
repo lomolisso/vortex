@@ -41,7 +41,11 @@ public:
              const dlmem_ref::Cfg& cfg,
              uint32_t core_id,
              uint32_t num_blocks,
-             bool abort_on_oob = true);
+             bool abort_on_oob = true,
+             bool abort_on_remote = true);
+
+  // No request held or in flight toward the stage.
+  bool empty() const;
 
 protected:
   void on_reset();
@@ -56,6 +60,7 @@ private:
   uint32_t my_core_;
   uint32_t num_blocks_;
   bool abort_on_oob_;
+  bool abort_on_remote_;
   std::vector<RowPtr> rows_;
   std::vector<std::deque<RowPtr>> entry_rows_;  // per block, one per request in ReqIn
   uint32_t stride_;

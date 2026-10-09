@@ -251,6 +251,165 @@ tests:
     args: "-p -d -k 4 -w 1"
 
   # --- aperture translation, co-located peers ---
+  # A block reaches the local memory of every block of its cluster on its own
+  # core through the window (the A extension needs one shared last-level cache,
+  # hence the L2 on several cores): its own writes read back by every peer, stores
+  # into every peer, an amoadd into rank 0, global, own and window lanes in one
+  # instruction, sub-word stores at the slice and line edges, and the self
+  # window against the plain pointer, each test its own launch. A same-core
+  # cluster syncs on a local barrier of its base slot.
+  # One core: SPREAD K=1 with 1 KB per block, then DEFAULT K=1 (the largest
+  # cluster is 1) with 64 B and with the whole local memory.
+  - id: dlmem_local-1c
+    app: dlmem_local
+    drivers: [simx, rtlsim]
+    configs+: "-DVX_CFG_EXT_A_ENABLE"
+  # SPREAD K=1 with 1 KB, then DEFAULT clusters of 2 with 64 B and of 4 with a
+  # quarter of the local memory, each cluster on one core. The xrt leg
+  # wraps the same RTL in the AFU shell and host stack, so it stands in for
+  # rtlsim here.
+  - id: dlmem_local-4c
+    app: dlmem_local
+    drivers: [simx, xrt]
+    configs+: "-DVX_CFG_EXT_A_ENABLE"
+    shape: {cores: 4, l2cache: true}
+  - id: dlmem_local-k2
+    app: dlmem_local
+    drivers: [simx, rtlsim]
+    configs+: "-DVX_CFG_EXT_A_ENABLE"
+    shape: {cores: 2, l2cache: true}
+    args: "-d -k 2 -n 8"
+  # The local memory split exactly K ways, at 16, 64 and 256 KB: the peers'
+  # slices tile the whole memory and the last word of the last one is its end.
+  - id: dlmem_local-lmem14
+    app: dlmem_local
+    drivers: [simx, rtlsim]
+    configs+: "-DVX_CFG_EXT_A_ENABLE"
+    shape: {cores: 4, l2cache: true}
+    args: "-d -k 4 -l 4096"
+  - id: dlmem_local-lmem16
+    app: dlmem_local
+    drivers: [simx, rtlsim]
+    configs+: "-DVX_CFG_EXT_A_ENABLE -DVX_CFG_LMEM_LOG_SIZE=16"
+    shape: {cores: 4, l2cache: true}
+    args: "-d -k 4 -l 16384"
+  - id: dlmem_local-lmem18
+    app: dlmem_local
+    drivers: [simx, rtlsim]
+    configs+: "-DVX_CFG_EXT_A_ENABLE -DVX_CFG_LMEM_LOG_SIZE=18"
+    shape: {cores: 4, l2cache: true}
+    args: "-d -k 4 -l 65536"
+  # One-line and 1 KB slices: the edges of every peer sit a line apart.
+  - id: dlmem_local-small
+    app: dlmem_local
+    drivers: [simx, rtlsim]
+    configs+: "-DVX_CFG_EXT_A_ENABLE"
+    shape: {cores: 4, l2cache: true}
+    args: "-d -k 4 -l 64 -l 1024"
+  - id: dlmem_local-w4
+    app: dlmem_local
+    drivers: [simx, rtlsim]
+    configs+: "-DVX_CFG_EXT_A_ENABLE"
+    shape: {cores: 4, warps: 8, l2cache: true}
+    args: "-d -k 2 -w 4"
+  # Two packets per warp: each carries its own lanes and hart ids.
+  - id: dlmem_local-simd2
+    app: dlmem_local
+    drivers: [simx, rtlsim]
+    configs+: "-DVX_CFG_EXT_A_ENABLE -DVX_CFG_SIMD_WIDTH=2"
+    shape: {cores: 4, l2cache: true}
+    args: "-d -k 4"
+  # One-thread blocks, each keeping eight one-lane loads in flight: more
+  # single-packet reads than the LSU can tag, so the translation stage must count
+  # against its outstanding-read pool.
+  - id: dlmem_local-burst
+    app: dlmem_local
+    drivers: [simx, rtlsim]
+    configs+: "-DVX_CFG_EXT_A_ENABLE -DVX_CFG_SIMD_WIDTH=2"
+    shape: {cores: 4, l2cache: true}
+    args: "-b"
+  # Two LSU blocks, each with its own translation stage and peer-table port.
+  - id: dlmem_local-blocks2
+    app: dlmem_local
+    drivers: [simx, rtlsim]
+    configs+: "-DVX_CFG_EXT_A_ENABLE -DVX_CFG_ISSUE_WIDTH=2"
+    shape: {cores: 4, warps: 8, l2cache: true}
+    args: "-d -k 4 -w 2 -l 1024"
+  # Many more clusters than slots, each block ending with window stores to its
+  # own rank right before it exits; the slot's next block must find them whole.
+  - id: dlmem_local-exit
+    app: dlmem_local
+    drivers: [simx, rtlsim]
+    configs+: "-DVX_CFG_EXT_A_ENABLE"
+    shape: {cores: 4, l2cache: true}
+    args: "-d -k 2 -e -n 256"
+
+  # Window accesses the core must refuse, each stopping the simulation with the
+  # exact message: a rank past the cluster inside the window, and a peer on
+  # another core. The shape goes in CONFIGS, so the run reuses the prebuilt driver.
+  - id: dlmem_local-oob
+    via: script
+    driver: simx
+    configs+: "-DVX_CFG_NUM_CORES=4"
+    env: {DRIVER: simx, APP: dlmem_local, ARGS: "-x oob", EXPECT: "DLMEM access out of bounds"}
+    run: &expect_fail_run |
+      set -u
+      tmp=$(mktemp -d)
+      if ! make -C sw/runtime/"$DRIVER" > "$tmp/build.log" 2>&1 \
+         || ! make -C tests/regression/"$APP" >> "$tmp/build.log" 2>&1; then
+        echo "FAIL: the build failed with CONFIGS=${CONFIGS:-}"; tail -n 20 "$tmp/build.log"
+        rm -rf "$tmp"; exit 1
+      fi
+      timeout 120 ./ci/blackbox.sh --driver="$DRIVER" --app="$APP" --args="$ARGS" > "$tmp/run.log" 2>&1
+      rc=$?
+      fail=0
+      if [ $rc -eq 0 ]; then
+        echo "FAIL: '$ARGS' ran to completion on $DRIVER"; fail=1
+      elif [ $rc -eq 124 ]; then
+        echo "FAIL: '$ARGS' timed out on $DRIVER"; fail=1
+      elif ! grep -qF "$EXPECT" "$tmp/run.log"; then
+        echo "FAIL: '$ARGS' failed on $DRIVER (exit $rc) without '$EXPECT'"; fail=1
+      else
+        echo "OK: '$ARGS' stops $DRIVER (exit $rc): $(grep -F -m1 "$EXPECT" "$tmp/run.log")"
+      fi
+      [ $fail -eq 0 ] || tail -n 20 "$tmp/run.log"
+      rm -rf "$tmp"
+      exit $fail
+  - id: dlmem_local-oob
+    via: script
+    driver: rtlsim
+    configs+: "-DVX_CFG_NUM_CORES=4"
+    env: {DRIVER: rtlsim, APP: dlmem_local, ARGS: "-x oob", EXPECT: "DLMEM access out of bounds"}
+    run: *expect_fail_run
+  - id: dlmem_local-remote
+    via: script
+    driver: simx
+    configs+: "-DVX_CFG_NUM_CORES=2"
+    env: {DRIVER: simx, APP: dlmem_local, ARGS: "-x remote", EXPECT: "remote DLMEM access is not supported"}
+    run: *expect_fail_run
+  - id: dlmem_local-remote
+    via: script
+    driver: rtlsim
+    configs+: "-DVX_CFG_NUM_CORES=2"
+    env: {DRIVER: rtlsim, APP: dlmem_local, ARGS: "-x remote", EXPECT: "remote DLMEM access is not supported"}
+    run: *expect_fail_run
+
+  # SimX<->rtlsim parity of the translation stage at XLEN 64: fixed loops of
+  # window loads, stores and atomics, at one core on each block's own slice,
+  # and at four cores on the next rank's slice of a same-core cluster of 4.
+  - id: parity-dlmem-local
+    check: model_parity
+    app: dlmem_local
+    xlen: [64]
+    configs+: "-DVX_CFG_EXT_A_ENABLE"
+    args: "-p"
+  - id: parity-dlmem-local-4c
+    check: model_parity
+    app: dlmem_local
+    xlen: [64]
+    configs+: "-DVX_CFG_EXT_A_ENABLE"
+    shape: {cores: 4, l2cache: true}
+    args: "-p -k 4"
 
 
   # Illegal knob combinations must stop the build, in SimX (the processor

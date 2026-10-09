@@ -113,6 +113,22 @@ module VX_core import VX_gpu_pkg::*, VX_tlb_pkg::*; #(
     // LSU client interfaces flow from execute as client 0.
     VX_lsu_sched_if lsu_client_if [`VX_CFG_NUM_LSU_BLOCKS]();
     wire [`VX_CFG_NUM_LSU_BLOCKS-1:0] lsu_sched_empty;
+`ifdef VX_CFG_EXT_DLMEM_ENABLE
+    // Each block's LSU requests reach its scheduler through the aperture translation stage.
+    VX_lsu_sched_if xlate_out_if [`VX_CFG_NUM_LSU_BLOCKS]();
+    wire [`VX_CFG_NUM_LSU_BLOCKS-1:0] lsu_sched_raw_empty;
+    wire [`VX_CFG_NUM_LSU_BLOCKS-1:0] xlate_empty;
+    // The slice's read-tag pool (LSU_PENDING_SIZE) relies on the scheduler to refuse
+    // reads it cannot tag, so the stage's requests come out of the scheduler's share.
+    localparam XLATE_BUF_SIZE = 2;
+    localparam LSU_SCHED_PENDING_SIZE = `VX_CFG_LSU_PENDING_SIZE - XLATE_BUF_SIZE;
+    `STATIC_ASSERT (LSU_SCHED_PENDING_SIZE > 0, ("the LSU pending pool must exceed the translation stage"))
+    // The scheduler's memory tag is sized by its own pool, the dcache port's by LSU_PENDING_SIZE.
+    `STATIC_ASSERT (`CLOG2(LSU_SCHED_PENDING_SIZE) == `CLOG2(`VX_CFG_LSU_PENDING_SIZE),
+        ("LSU_PENDING_SIZE less the translation stage changes the LSU memory tag width"))
+`else
+    localparam LSU_SCHED_PENDING_SIZE = `VX_CFG_LSU_PENDING_SIZE;
+`endif
 
 `ifdef TCU_META_ENABLE
     VX_lsu_sched_if tcu_mem_if();
@@ -225,7 +241,6 @@ module VX_core import VX_gpu_pkg::*, VX_tlb_pkg::*; #(
     wire [NW_WIDTH-1:0]            peer_wr_slot;
     dlmem_row_t                    peer_wr_row;
     wire [`VX_CFG_LMEM_LOG_SIZE:0] peer_wr_stride;
-    `UNUSED_VAR ({peer_wr_valid, peer_wr_slot, peer_wr_row, peer_wr_stride})
 `endif
 
     VX_scheduler #(
@@ -388,6 +403,39 @@ module VX_core import VX_gpu_pkg::*, VX_tlb_pkg::*; #(
         .commit_sched_if(commit_sched_if)
     );
 
+`ifdef VX_CFG_EXT_DLMEM_ENABLE
+    wire [`VX_CFG_NUM_LSU_BLOCKS-1:0][`VX_CFG_NUM_LSU_LANES-1:0] xlate_remote, xlate_oob;
+    wire [`VX_CFG_NUM_LSU_BLOCKS-1:0]                         xlate_wt_inc_valid;
+    wire [`VX_CFG_NUM_LSU_BLOCKS-1:0][NW_WIDTH-1:0]           xlate_wt_inc_wid;
+    wire [`VX_CFG_NUM_LSU_BLOCKS-1:0][`CLOG2(`VX_CFG_NUM_LSU_LANES+1)-1:0] xlate_wt_inc_cnt;
+
+    VX_dlmem_lsu_xlate #(
+        .INSTANCE_ID  (`SFORMATF(("%s-dlmem-xlate", INSTANCE_ID))),
+        .CORE_ID      (CORE_ID),
+        .REQ_BUF_SIZE (XLATE_BUF_SIZE)
+    ) dlmem_xlate (
+        .clk            (clk),
+        .reset          (reset),
+        .peer_wr_valid  (peer_wr_valid),
+        .peer_wr_slot   (peer_wr_slot),
+        .peer_wr_row    (peer_wr_row),
+        .peer_wr_stride (peer_wr_stride),
+        .in_if          (lsu_client_if),
+        .out_if         (xlate_out_if),
+        .out_remote     (xlate_remote),
+        .out_oob        (xlate_oob),
+        .wt_inc_valid   (xlate_wt_inc_valid),
+        .wt_inc_wid     (xlate_wt_inc_wid),
+        .wt_inc_cnt     (xlate_wt_inc_cnt),
+        .empty          (xlate_empty)
+    );
+    // Remote lanes assert until the network endpoints consume them.
+    `UNUSED_VAR ({xlate_remote, xlate_oob, xlate_wt_inc_valid, xlate_wt_inc_wid, xlate_wt_inc_cnt})
+
+    // A request held in a stage keeps the LSU busy and undrained.
+    assign lsu_sched_empty = lsu_sched_raw_empty & xlate_empty;
+`endif
+
     // Per-block VX_lsu_scheduler instances: all parameterized NUM_CLIENTS=2.
     // Block 0 wires client 1 to the warp-level TCU AGU; other blocks tie it off.
     // Symmetric NUM_CLIENTS keeps module generation uniform — tied-off clients
@@ -403,12 +451,21 @@ module VX_core import VX_gpu_pkg::*, VX_tlb_pkg::*; #(
         // Client 0 — LSU (per-block). Forward the per-block lsu_client_if
         // master onto the scheduler's slave port via per-signal assigns
         // (interface arrays can't be wired with a single assign).
+    `ifdef VX_CFG_EXT_DLMEM_ENABLE
+        assign sched_client_if[0].req_valid    = xlate_out_if[block_idx].req_valid;
+        assign sched_client_if[0].req_data     = xlate_out_if[block_idx].req_data;
+        assign xlate_out_if[block_idx].req_ready   = sched_client_if[0].req_ready;
+        assign xlate_out_if[block_idx].rsp_valid   = sched_client_if[0].rsp_valid;
+        assign xlate_out_if[block_idx].rsp_data    = sched_client_if[0].rsp_data;
+        assign sched_client_if[0].rsp_ready    = xlate_out_if[block_idx].rsp_ready;
+    `else
         assign sched_client_if[0].req_valid    = lsu_client_if[block_idx].req_valid;
         assign sched_client_if[0].req_data     = lsu_client_if[block_idx].req_data;
         assign lsu_client_if[block_idx].req_ready  = sched_client_if[0].req_ready;
         assign lsu_client_if[block_idx].rsp_valid  = sched_client_if[0].rsp_valid;
         assign lsu_client_if[block_idx].rsp_data   = sched_client_if[0].rsp_data;
         assign sched_client_if[0].rsp_ready    = lsu_client_if[block_idx].rsp_ready;
+    `endif
 
     `ifdef TCU_META_ENABLE
         // Client 1 — TCU AGU on block 0; tied off on other blocks.
@@ -435,12 +492,16 @@ module VX_core import VX_gpu_pkg::*, VX_tlb_pkg::*; #(
             .NUM_LANES      (`VX_CFG_NUM_LSU_LANES),
             .CORE_QUEUE_SIZE(`VX_CFG_LSU_QUEUE_IN_SIZE),
             .MEM_QUEUE_SIZE (LSU_QUEUE_OUT_SIZE),
-            .PENDING_SIZE   (`VX_CFG_LSU_PENDING_SIZE)
+            .PENDING_SIZE   (LSU_SCHED_PENDING_SIZE)
         ) lsu_scheduler (
             .clk        (clk),
             .reset      (reset),
             .client_if  (sched_client_if),
+        `ifdef VX_CFG_EXT_DLMEM_ENABLE
+            .empty      (lsu_sched_raw_empty[block_idx]),
+        `else
             .empty      (lsu_sched_empty[block_idx]),
+        `endif
             .lsu_mem_if (lsu_mem_if[block_idx])
         );
     end

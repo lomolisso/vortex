@@ -51,6 +51,10 @@
 #include "mem/mmu.h"
 #include <mem.h>
 #endif
+#ifdef VX_CFG_EXT_DLMEM_ENABLE
+#include "cta_gang.h"
+#include "dlmem/dlmem_xlate.h"
+#endif
 
 using namespace vortex;
 
@@ -293,10 +297,22 @@ public:
     }
 
   #ifdef VX_CFG_EXT_DLMEM_ENABLE
-    // The dispatcher's peer rows have no reader until the core translates window
-    // addresses; a sink keeps its channel from filling.
-    peer_wr_sink_ = std::make_unique<SimChannel<dlmem_ref::RowWrite>>(simobject_, 2);
-    scheduler_->peer_wr_out().bind(peer_wr_sink_.get());
+    // Every LSU request and fence crosses the aperture translation on its way
+    // to the switch; the TCU metadata client bypasses it, as no window address
+    // ever reaches it.
+    snprintf(sname, 100, "%s-dlmem_xlate", name.c_str());
+    dlmem_xlate_ = DlmemXlate::Create(sname, dlmem_cfg(), simobject_->id(), VX_CFG_NUM_LSU_BLOCKS,
+                                      /*abort_on_oob*/ true, /*abort_on_remote*/ true);
+    {
+      auto lsu = std::static_pointer_cast<LsuUnit>(func_units_.at((int)FUType::LSU));
+      for (uint32_t b = 0; b < VX_CFG_NUM_LSU_BLOCKS; ++b) {
+        lsu->XlateReqOut.at(b).bind(&dlmem_xlate_->ReqIn.at(b));
+        dlmem_xlate_->ReqOut.at(b).bind(&lmem_switch_.at(b)->ReqIn);
+        wt_inc_sink_.emplace_back(std::make_unique<SimChannel<WtInc>>(simobject_, 2));
+        dlmem_xlate_->WtIncOut.at(b).bind(wt_inc_sink_.back().get());
+      }
+    }
+    scheduler_->peer_wr_out().bind(&dlmem_xlate_->PeerWrIn);
   #endif
 
     this->reset();
@@ -330,8 +346,11 @@ public:
 
   void tick() {
   #ifdef VX_CFG_EXT_DLMEM_ENABLE
-    while (!peer_wr_sink_->empty()) {
-      peer_wr_sink_->pop();
+    // Remote lanes abort until the remote-store tracker consumes these counts.
+    for (auto& sink : wt_inc_sink_) {
+      while (!sink->empty()) {
+        sink->pop();
+      }
     }
   #endif
     this->commit();
@@ -839,6 +858,12 @@ public:
     if (scheduler_->running() || !pending_instrs_.empty()) {
       return true;
     }
+  #ifdef VX_CFG_EXT_DLMEM_ENABLE
+    // A committed store can still wait in the translation stage.
+    if (!dlmem_xlate_->empty()) {
+      return true;
+    }
+  #endif
   #ifdef VX_CFG_VM_ENABLE
     // Parked translations hold no in-flight channel packet, so they are
     // invisible to SimPlatform::idle(); completion must wait for them.
@@ -892,7 +917,11 @@ public:
   }
 
   bool lsu_drained() const {
-    return std::static_pointer_cast<LsuUnit>(func_units_.at((int)FUType::LSU))->drained();
+    bool drained = std::static_pointer_cast<LsuUnit>(func_units_.at((int)FUType::LSU))->drained();
+  #ifdef VX_CFG_EXT_DLMEM_ENABLE
+    drained = drained && dlmem_xlate_->empty();
+  #endif
+    return drained;
   }
 
   int dcr_read(uint32_t addr, uint32_t tag, uint32_t* value) {
@@ -1070,7 +1099,8 @@ private:
   Mmu::Ptr icache_mmu_;
 #endif
 #ifdef VX_CFG_EXT_DLMEM_ENABLE
-  std::unique_ptr<SimChannel<dlmem_ref::RowWrite>> peer_wr_sink_;
+  DlmemXlate::Ptr dlmem_xlate_;
+  std::vector<std::unique_ptr<SimChannel<WtInc>>> wt_inc_sink_;
 #endif
 };
 

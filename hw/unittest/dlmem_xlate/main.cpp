@@ -22,8 +22,14 @@
 // back-pressure phases. Every request must leave once, in order per block,
 // one cycle after it enters while the output is ready, translated with the row
 // current when it entered; untouched fields stay bit-equal.
+// --mode=sched: random traffic into a model of the LSU scheduler's input queue
+// (random acceptance and drain), filling it and handing requests over as the
+// stage empties. The model is ideal, so the empty fold VX_core relies on rests
+// on the exact per-cycle empty checked in every mode.
 // --mode=oob: one out-of-bounds lane; a build with the bound assert must abort.
-// --mode=all: directed, then random.
+// --mode=remote: one lane to a peer on another core; a build with the remote
+// assert must abort.
+// --mode=all: directed, random, then sched.
 
 #include "vl_simulator.h"
 #include "VVX_dlmem_xlate_top.h"
@@ -296,6 +302,10 @@ public:
     rsp_valid_.assign(nb_, false);
     rsp_ready_.assign(nb_, false);
     rsp_data_.assign(nb_, bits_zero(rsp_w_));
+    sched_q_.resize(nb_);
+    sched_phase_.resize(nb_);
+    sched_pop_.assign(nb_, false);
+    fired_prev_.assign(nb_, false);
 
     t->reset = 1;
     this->drive();
@@ -316,8 +326,14 @@ public:
     if (opts_.mode == "random" || opts_.mode == "all") {
       this->run_random();
     }
+    if (opts_.mode == "sched" || opts_.mode == "all") {
+      this->run_sched();
+    }
     if (opts_.mode == "oob") {
       this->run_oob();
+    }
+    if (opts_.mode == "remote") {
+      this->run_remote();
     }
     if (failures_ != 0) {
       std::printf("FAILED: %u check(s) failed\n", failures_);
@@ -721,6 +737,11 @@ private:
       if (empty != q.empty()) {
         this->fail(strf("block %u: empty=%d with %zu request(s) in the stage", b, empty, q.size()));
       }
+      if (sched_) {
+        bool sched_empty = sched_q_[b].empty();
+        n_fold_busy_ += !(q.empty() && sched_empty);
+        n_handoff_ += empty && !sched_empty && fired_prev_[b];
+      }
 
       // Responses are wires.
       if (get_bits(t->core_rsp_valid, b, 1) != rsp_valid_[b]
@@ -771,6 +792,12 @@ private:
           last_remote0_ = get_bits(t->out_remote, b * nl_, 1);
           last_oob0_    = get_bits(t->out_oob, b * nl_, 1);
         }
+        if (sched_) {
+          if (sched_q_[b].size() >= sched_cap_) {
+            this->fail(strf("block %u: output fired into a full scheduler queue", b));
+          }
+          sched_push_.push_back(b);
+        }
         q.pop_front();
         ++n_out_;
         progress = true;
@@ -809,9 +836,23 @@ private:
         this->fail(strf("block %u: %zu requests in a two-entry stage", b, q.size()));
       }
       valid_prev_[b] = valid && !fire;
+      fired_prev_[b] = fire;
       ready_prev_[b] = ready_[b];
       n_stall_ += valid && !ready_[b];
     }
+
+    // The scheduler queue forwards its head and takes the stage's output at the edge.
+    for (uint32_t b = 0; b < nb_ && sched_; ++b) {
+      if (sched_pop_[b] && !sched_q_[b].empty()) {
+        sched_q_[b].pop_front();
+        progress = true;
+      }
+    }
+    for (uint32_t b : sched_push_) {
+      sched_q_[b].push_back(cycle_);
+      sched_max_ = std::max<size_t>(sched_max_, sched_q_[b].size());
+    }
+    sched_push_.clear();
 
     // A write lands at the edge: visible to requests from the next cycle.
     if (wr_) {
@@ -830,7 +871,7 @@ private:
 
   bool busy() const {
     for (uint32_t b = 0; b < nb_; ++b) {
-      if (offer_[b] || !queue_[b].empty()) {
+      if (offer_[b] || !queue_[b].empty() || !sched_q_[b].empty()) {
         return true;
       }
     }
@@ -845,7 +886,27 @@ private:
     return false;
   }
 
+  // The scheduler model accepts while its queue has room, at a random rate,
+  // and drains at another, each held for a random phase.
+  void sched_ready(uint32_t b) {
+    auto& p = sched_phase_[b];
+    if (p.left == 0) {
+      static const uint32_t accept[] = {100, 100, 75, 50};
+      static const uint32_t drain[]  = {0, 25, 50, 100};
+      p.accept = accept[below(4)];
+      p.drain  = drain[below(4)];
+      p.left   = (p.drain == 0) ? 5 + below(40) : 50 + below(300);
+    }
+    --p.left;
+    ready_[b] = sched_q_[b].size() < sched_cap_ && chance(p.accept);
+    sched_pop_[b] = chance(p.drain);
+  }
+
   void next_ready(uint32_t b) {
+    if (sched_) {
+      this->sched_ready(b);
+      return;
+    }
     auto& p = phase_[b];
     if (p.left == 0) {
       uint32_t pick = below(100);
@@ -1035,6 +1096,19 @@ private:
 #endif
   }
 
+  void run_sched() {
+    sched_ = true;
+    uint64_t in0 = n_in_;
+    this->run_random();
+    sched_ = false;
+    std::printf("sched: queue capacity %u, %" PRIu64 " requests, %" PRIu64 " cycles with a request in the stage or "
+                "the queue, %" PRIu64 " handoffs into a non-empty queue with the stage empty, max queue %zu\n",
+                sched_cap_, n_in_ - in0, n_fold_busy_, n_handoff_, sched_max_);
+    if (n_handoff_ == 0 || sched_max_ < sched_cap_) {
+      this->fail("scheduler model never saw a handoff or never filled");
+    }
+  }
+
   void run_oob() {
     TblRow r;
     r.k = 1;
@@ -1045,6 +1119,29 @@ private:
     std::printf("oob: issuing an out-of-bounds lane; a bound-checking build must abort here\n");
     std::fflush(stdout);
     this->one_request(0, cfg_.dlmem_base + 64);
+  }
+
+  void run_remote() {
+    if (ncc_ < 2 || maxc_ < 2) {
+      this->fail("remote mode needs a cluster of at least two cores");
+      return;
+    }
+    TblRow r;
+    r.k = 2;
+    r.peers.assign(maxc_, ref::Peer{my_core_, 0});
+    r.peers[1] = ref::Peer{(my_core_ + 1) % ncc_, 1};
+    wr_stride_ = 64;
+    wr_ = std::make_pair(0u, r);
+    this->clock();
+    std::printf("remote: issuing a lane to rank 1 on core %u; a remote-checking build must abort here\n",
+                r.peers[1].core);
+    std::fflush(stdout);
+    lane0_ = true;
+    this->one_request(0, cfg_.dlmem_base + (uint64_t(1) << lmem_log_) + 8);
+    lane0_ = false;
+    if (!last_remote0_) {
+      this->fail("remote: the lane was not flagged remote");
+    }
   }
 
   ///////////////////////////////////////////////////////////////////////////
@@ -1075,6 +1172,22 @@ private:
   std::vector<std::optional<uint64_t>> entered_prev_;
   std::vector<bool> rsp_valid_, rsp_ready_;
   std::vector<Bits> rsp_data_;
+
+  struct SchedPhase {
+    uint32_t accept = 100;
+    uint32_t drain = 100;
+    uint32_t left = 0;
+  };
+  bool sched_ = false;
+  uint32_t sched_cap_ = VX_CFG_LSU_QUEUE_IN_SIZE;
+  std::vector<std::deque<uint64_t>> sched_q_;
+  std::vector<SchedPhase> sched_phase_;
+  std::vector<bool> sched_pop_;
+  std::vector<uint32_t> sched_push_;
+  std::vector<bool> fired_prev_;
+  uint64_t n_fold_busy_ = 0, n_handoff_ = 0;
+  size_t sched_max_ = 0;
+
   bool     lane0_ = false;
   uint64_t last_addr0_ = 0;
   bool     last_remote0_ = false;
@@ -1090,7 +1203,7 @@ private:
 };
 
 static void usage(const char* prog) {
-  std::printf("usage: %s [--mode=all|directed|random|oob] [--seed=N] [--launches=N] [--cycles=N] "
+  std::printf("usage: %s [--mode=all|directed|random|sched|oob|remote] [--seed=N] [--launches=N] [--cycles=N] "
               "[--watchdog=N] [--no-oob]\n", prog);
 }
 
@@ -1122,7 +1235,8 @@ int main(int argc, char** argv) {
       return 2;
     }
   }
-  if (opts.mode != "all" && opts.mode != "directed" && opts.mode != "random" && opts.mode != "oob") {
+  if (opts.mode != "all" && opts.mode != "directed" && opts.mode != "random" && opts.mode != "sched"
+   && opts.mode != "oob" && opts.mode != "remote") {
     usage(argv[0]);
     return 2;
   }

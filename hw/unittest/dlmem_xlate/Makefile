@@ -13,10 +13,11 @@ ifeq ($(filter -DVX_CFG_EXT_DLMEM_ENABLE,$(CONFIGS)),)
 override CONFIGS += -DVX_CFG_EXT_DLMEM_ENABLE
 endif
 
-# The stage's global core id and its out-of-bounds assert. Neither is a make
-# dependency, so rebuild after changing them.
-CORE_ID    ?= 0
-OOB_ASSERT ?= 0
+# The stage's global core id and its out-of-bounds and remote-access asserts.
+# None is a make dependency, so rebuild after changing them.
+CORE_ID       ?= 0
+OOB_ASSERT    ?= 0
+REMOTE_ASSERT ?= 0
 
 CXXFLAGS := -I$(SRC_DIR) -I$(VORTEX_HOME)/hw/unittest/common -I$(SW_COMMON_DIR)
 CXXFLAGS += -I$(VORTEX_HOME)/tests/unittest/dlmem_xlate
@@ -35,4 +36,4 @@ TOP := VX_dlmem_xlate_top
 
 include ../common.mk
 
-VL_FLAGS += -GCORE_ID=$(CORE_ID) -GOOB_ASSERT=$(OOB_ASSERT)
+VL_FLAGS += -GCORE_ID=$(CORE_ID) -GOOB_ASSERT=$(OOB_ASSERT) -GREMOTE_ASSERT=$(REMOTE_ASSERT)

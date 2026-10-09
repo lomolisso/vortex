@@ -13,15 +13,16 @@
 
 `include "VX_define.vh"
 
-// One core's DLMEM peer table and its per-LSU-block aperture translation, with
-// flat ports. The request header fields the stage reads (wid, cta_id, pid) and
+// The core's DLMEM aperture translation (peer table and per-LSU-block stages),
+// the same wrapper VX_core instantiates, with flat ports. The request header fields the stage reads (wid, cta_id, pid) and
 // the fence bit are driven separately and merged into the raw tag here, so the
 // testbench needs no tag layout; in_tag_eff returns the merged tag. The cfg_*
 // outputs are constants that give the testbench the package-derived widths
 // and the attribute fields the stage may rewrite.
 module VX_dlmem_xlate_top import VX_gpu_pkg::*; #(
-    parameter  CORE_ID    = 0,
-    parameter  OOB_ASSERT = 0,
+    parameter  CORE_ID       = 0,
+    parameter  OOB_ASSERT    = 0,
+    parameter  REMOTE_ASSERT = 0,
 
     localparam NB         = `VX_CFG_NUM_LSU_BLOCKS,
     localparam NL         = `VX_CFG_NUM_LSU_LANES,
@@ -156,32 +157,10 @@ module VX_dlmem_xlate_top import VX_gpu_pkg::*; #(
         assign wr_row.peers[r].slot = wr_pslot[r];
     end
 
-    dlmem_row_t [NB-1:0] rd_row;
-    wire [NW-1:0][LMEM_LOG-1:0] slot_base;
-    wire [LMEM_LOG:0] stride;
-
-    VX_dlmem_peer_tbl #(
-        .NUM_RD (NB)
-    ) peer_tbl (
-        .clk       (clk),
-        .reset     (reset),
-        .wr_valid  (wr_valid),
-        .wr_slot   (wr_slot),
-        .wr_row    (wr_row),
-        .wr_stride (wr_stride),
-        .rd_slot   (row_slot),
-        .rd_row    (rd_row),
-        .slot_base (slot_base),
-        .stride    (stride)
-    );
-
-    assign tbl_slot_base = slot_base;
-    assign tbl_stride    = stride;
+    VX_lsu_sched_if in_if  [NB]();
+    VX_lsu_sched_if out_if [NB]();
 
     for (genvar b = 0; b < NB; ++b) begin : g_blocks
-        VX_lsu_sched_if in_if();
-        VX_lsu_sched_if out_if();
-
         lsu_header_t hdr;
         always @(*) begin
             hdr = in_tag[b][TAG_W-1 -: HDR_W];
@@ -192,54 +171,68 @@ module VX_dlmem_xlate_top import VX_gpu_pkg::*; #(
         assign in_tag_eff[b] = {hdr, in_tag[b][TAG_W-HDR_W-1:1], in_fence[b]};
         `UNUSED_VAR (in_tag[b][0])
 
-        assign in_if.req_valid       = in_valid[b];
-        assign in_if.req_data.rw     = in_rw[b];
-        assign in_if.req_data.mask   = in_mask[b];
-        assign in_if.req_data.byteen = in_byteen[b];
-        assign in_if.req_data.addr   = in_addr[b];
-        assign in_if.req_data.attr   = in_attr[b];
-        assign in_if.req_data.data   = in_data[b];
-        assign in_if.req_data.tag    = in_tag_eff[b];
-        assign in_ready[b]           = in_if.req_ready;
+        assign in_if[b].req_valid       = in_valid[b];
+        assign in_if[b].req_data.rw     = in_rw[b];
+        assign in_if[b].req_data.mask   = in_mask[b];
+        assign in_if[b].req_data.byteen = in_byteen[b];
+        assign in_if[b].req_data.addr   = in_addr[b];
+        assign in_if[b].req_data.attr   = in_attr[b];
+        assign in_if[b].req_data.data   = in_data[b];
+        assign in_if[b].req_data.tag    = in_tag_eff[b];
+        assign in_ready[b]              = in_if[b].req_ready;
 
-        assign core_rsp_valid[b] = in_if.rsp_valid;
-        assign core_rsp_data[b]  = in_if.rsp_data;
-        assign in_if.rsp_ready   = core_rsp_ready[b];
+        assign core_rsp_valid[b] = in_if[b].rsp_valid;
+        assign core_rsp_data[b]  = in_if[b].rsp_data;
+        assign in_if[b].rsp_ready = core_rsp_ready[b];
 
-        assign out_valid[b]  = out_if.req_valid;
-        assign out_rw[b]     = out_if.req_data.rw;
-        assign out_mask[b]   = out_if.req_data.mask;
-        assign out_byteen[b] = out_if.req_data.byteen;
-        assign out_addr[b]   = out_if.req_data.addr;
-        assign out_attr[b]   = out_if.req_data.attr;
-        assign out_data[b]   = out_if.req_data.data;
-        assign out_tag[b]    = out_if.req_data.tag;
-        assign out_if.req_ready = out_ready[b];
+        assign out_valid[b]  = out_if[b].req_valid;
+        assign out_rw[b]     = out_if[b].req_data.rw;
+        assign out_mask[b]   = out_if[b].req_data.mask;
+        assign out_byteen[b] = out_if[b].req_data.byteen;
+        assign out_addr[b]   = out_if[b].req_data.addr;
+        assign out_attr[b]   = out_if[b].req_data.attr;
+        assign out_data[b]   = out_if[b].req_data.data;
+        assign out_tag[b]    = out_if[b].req_data.tag;
+        assign out_if[b].req_ready = out_ready[b];
 
-        assign out_if.rsp_valid = mem_rsp_valid[b];
-        assign out_if.rsp_data  = mem_rsp_data[b];
-        assign mem_rsp_ready[b] = out_if.rsp_ready;
-
-        VX_dlmem_xlate #(
-            .INSTANCE_ID (`SFORMATF(("dlmem-xlate%0d", b))),
-            .CORE_ID     (CORE_ID),
-            .OOB_ASSERT  (OOB_ASSERT)
-        ) xlate (
-            .clk          (clk),
-            .reset        (reset),
-            .in_if        (in_if),
-            .out_if       (out_if),
-            .row_slot     (row_slot[b]),
-            .row          (rd_row[b]),
-            .slot_base    (slot_base),
-            .stride       (stride),
-            .out_remote   (out_remote[b]),
-            .out_oob      (out_oob[b]),
-            .wt_inc_valid (wt_inc_valid[b]),
-            .wt_inc_wid   (wt_inc_wid[b]),
-            .wt_inc_cnt   (wt_inc_cnt[b]),
-            .empty        (empty[b])
-        );
+        assign out_if[b].rsp_valid = mem_rsp_valid[b];
+        assign out_if[b].rsp_data  = mem_rsp_data[b];
+        assign mem_rsp_ready[b]    = out_if[b].rsp_ready;
     end
+
+    VX_dlmem_lsu_xlate #(
+        .INSTANCE_ID   ("dlmem-xlate"),
+        .CORE_ID       (CORE_ID),
+        .OOB_ASSERT    (OOB_ASSERT),
+        .REMOTE_ASSERT (REMOTE_ASSERT)
+    ) lsu_xlate (
+        .clk            (clk),
+        .reset          (reset),
+        .peer_wr_valid  (wr_valid),
+        .peer_wr_slot   (wr_slot),
+        .peer_wr_row    (wr_row),
+        .peer_wr_stride (wr_stride),
+        .in_if          (in_if),
+        .out_if         (out_if),
+        .out_remote     (out_remote),
+        .out_oob        (out_oob),
+        .wt_inc_valid   (wt_inc_valid),
+        .wt_inc_wid     (wt_inc_wid),
+        .wt_inc_cnt     (wt_inc_cnt),
+        .empty          (empty)
+    );
+
+    // Internal table state and row selects, observed by the testbench only.
+`ifdef SYNTHESIS
+    assign tbl_slot_base = '0;
+    assign tbl_stride    = '0;
+    assign row_slot      = '0;
+`else
+    assign tbl_slot_base = lsu_xlate.peer_tbl.slot_base;
+    assign tbl_stride    = lsu_xlate.peer_tbl.stride;
+    for (genvar b = 0; b < NB; ++b) begin : g_row_slot
+        assign row_slot[b] = lsu_xlate.g_blocks[b].xlate.row_slot;
+    end
+`endif
 
 endmodule

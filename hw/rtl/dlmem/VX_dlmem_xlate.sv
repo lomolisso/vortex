@@ -23,8 +23,12 @@
 module VX_dlmem_xlate import VX_gpu_pkg::*, VX_dlmem_pkg::*; #(
     parameter `STRING INSTANCE_ID = "",
     // Global core id (hart id core field); the core's index in its cluster is CORE_ID % DLMEM_NCC.
-    parameter  CORE_ID      = 0,
-    parameter  OOB_ASSERT   = 1,
+    parameter  CORE_ID       = 0,
+    parameter  OOB_ASSERT    = 1,
+    // Until the network endpoints are wired, a remote lane has nowhere to go.
+    parameter  REMOTE_ASSERT = 0,
+    // Requests the stage holds; the core counts them against the LSU's outstanding reads.
+    parameter  REQ_BUF_SIZE  = 2,
 
     localparam NUM_LANES    = `VX_CFG_NUM_LSU_LANES,
     localparam NW           = `VX_CFG_NUM_WARPS,
@@ -94,7 +98,7 @@ module VX_dlmem_xlate import VX_gpu_pkg::*, VX_dlmem_pkg::*; #(
 
     VX_elastic_buffer #(
         .DATAW   (REQ_W + ROW_W),
-        .SIZE    (`TO_OUT_BUF_SIZE(3)),
+        .SIZE    (REQ_BUF_SIZE),
         .OUT_REG (`TO_OUT_BUF_REG(3))
     ) req_buf (
         .clk       (clk),
@@ -117,6 +121,7 @@ module VX_dlmem_xlate import VX_gpu_pkg::*, VX_dlmem_pkg::*; #(
 
     wire [NUM_LANES-1:0][LSU_ADDR_WIDTH-1:0] addr_out;
     wire [NUM_LANES-1:0][MEM_ATTR_WIDTH-1:0] attr_out;
+    wire [NUM_LANES-1:0][DLMEM_CORE_W-1:0]   lane_core;
 
     for (genvar i = 0; i < NUM_LANES; ++i) begin : g_lanes
         wire [LSU_ADDR_WIDTH-1:0] a = req_r.addr[i];
@@ -172,6 +177,7 @@ module VX_dlmem_xlate import VX_gpu_pkg::*, VX_dlmem_pkg::*; #(
 
         assign out_remote[i] = rem;
         assign out_oob[i]    = oob;
+        assign lane_core[i]  = peer.core;
     end
 
     assign out_if.req_valid       = req_valid_r;
@@ -199,20 +205,29 @@ module VX_dlmem_xlate import VX_gpu_pkg::*, VX_dlmem_pkg::*; #(
 
     `UNUSED_VAR (hdr_r)
 
-    // The first out-of-bounds lane, for the bound assert's message only.
-    reg [`LOG2UP(NUM_LANES)-1:0] oob_lane;
+    // The first out-of-bounds and remote lanes, for the asserts' messages only.
+    reg [`LOG2UP(NUM_LANES)-1:0] oob_lane, rem_lane;
     always @(*) begin
         oob_lane = '0;
+        rem_lane = '0;
         for (integer i = NUM_LANES-1; i >= 0; --i) begin
             if (out_oob[i]) begin
                 oob_lane = `LOG2UP(NUM_LANES)'(i);
             end
+            if (out_remote[i]) begin
+                rem_lane = `LOG2UP(NUM_LANES)'(i);
+            end
         end
     end
     wire [LSU_ADDR_WIDTH-1:0] oob_addr = req_r.addr[oob_lane];
+    wire [LSU_ADDR_WIDTH-1:0] rem_win_addr = req_r.addr[rem_lane];
 
     `RUNTIME_ASSERT (~((OOB_ASSERT != 0) && out_fire && (| out_oob)),
         ("%t: %s DLMEM access out of bounds: wid=%0d cta=%0d lane=%0d addr=0x%0h (#%0d)",
             $time, INSTANCE_ID, hdr_r.wid, my_slot, oob_lane, {oob_addr, WA'(0)}, hdr_r.uuid))
+
+    `RUNTIME_ASSERT (~((REMOTE_ASSERT != 0) && out_fire && (| out_remote)),
+        ("%t: %s remote DLMEM access is not supported yet: wid=%0d cta=%0d lane=%0d addr=0x%0h core=%0d (#%0d)",
+            $time, INSTANCE_ID, hdr_r.wid, my_slot, rem_lane, {rem_win_addr, WA'(0)}, lane_core[rem_lane], hdr_r.uuid))
 
 endmodule

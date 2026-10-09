@@ -181,6 +181,52 @@ wait.
   arrived, the gang unit's always-on assertion fires. A second arrival in a
   phase that has not completed is a runtime assertion.
 
+## Window translation in the core
+
+Each core resolves window addresses in one registered stage per LSU block,
+between the slice and its memory scheduler
+([lsu_pipeline_design.md §4.6](../designs/lsu_pipeline_design.md)); SimX
+models it as `DlmemXlate`, behind an `LsuUnit`-owned channel.
+
+- **Peer rows.** The dispatcher writes each admitted block's row (K and every
+  rank's `{core, slot}`) and the launch's footprint into the core's peer
+  table. A same-core (DEFAULT) cluster's row is its consecutive slots; a
+  SPREAD block's row comes from the gang unit.
+- **Same-core peers** are served now: DEFAULT clusters of any K up to
+  `DLMEM_MAX_CLUSTER`, and SPREAD with K = 1. A lane whose peer is on another
+  core is a runtime assertion, `remote DLMEM access is not supported yet`,
+  and SimX aborts with the same text, until the network carries it. On an idle
+  machine every SPREAD peer with K > 1 is on another core (spread first), so
+  SPREAD K > 1 is covered only by that negative case until then.
+- **Out of bounds.** A rank at or past K inside the window, or an offset past
+  the block's footprint, is the runtime assertion `DLMEM access out of
+  bounds`; the lane is steered into the issuer's own slot. A DEFAULT cluster
+  with K above `DLMEM_MAX_CLUSTER` gets a row of `DLMEM_MAX_CLUSTER` ranks;
+  its ranks from `next_pow2(DLMEM_MAX_CLUSTER)` up fall past the window and
+  are ordinary global addresses, as is every address past the window.
+- **Timing.** One cycle per LSU request, fences included, in DLMEM builds, in
+  both models. The stage's empty is folded into the LSU empty that the barrier
+  drain, the flush gate and core busy use.
+- **Warp exit** waits for the warp's earlier instructions (and, with the
+  network, its unacknowledged remote stores) to drain, so a slot admitted
+  again cannot lend its new row to a store of the warp that left it.
+- **The tensor unit's** requests bypass the stage. With `TCU_META` the RTL
+  arbitrates them against the stage round-robin in the scheduler, while SimX
+  orders same-cycle arrivals at the local-memory switch canonically: correct,
+  not cycle-matched, and not tested.
+- **Tests.** [`tests/regression/dlmem_local`](../../tests/regression/dlmem_local)
+  runs six tests, each its own launch, over every rank pair of each cluster:
+  own writes read by every peer, stores into every peer, an `amoadd` into rank
+  0, global, own and window lanes in one store and one load, sub-word stores
+  at the slice and line edges of every peer, and the self window against the
+  plain pointer. It sweeps 64 B, 1 KB and SRAM/K per block, has an exit-stress
+  mode and the two negative modes above, and syncs a same-core cluster on a
+  local barrier of its base slot (`-c` uses `cluster_group::sync()`).
+- **Parity** (`parity-dlmem-local`, `parity-dlmem-local-4c`): fixed loops of
+  window loads, stores and atomics, at one core with K = 1 and at four cores
+  with same-core clusters of 4. Both models retire the same instructions;
+  the cycle gaps are 2.9% (29270 SimX vs 28435 RTL) and 2.8% (30575 vs 29731).
+
 ## Memory-model contract
 
 - **Path.** A per-core translation stage resolves window addresses to

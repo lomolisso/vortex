@@ -88,6 +88,11 @@ public:
 	SimChannel<LsuRsp> TcuRspOut;
 #endif
 
+#ifdef VX_CFG_EXT_DLMEM_ENABLE
+	// Per-block requests and fences toward the aperture translation stage.
+	std::vector<SimChannel<LsuReq>> XlateReqOut;
+#endif
+
 	// Returns true when all LSU blocks have no in-flight requests.
 	bool drained() const;
 
@@ -100,6 +105,8 @@ private:
 	void compute_addrs(uint32_t b, instr_trace_t* trace);
 
 	void issue_fence(uint32_t b, instr_trace_t* trace);
+
+	SimChannel<LsuReq>& req_out(uint32_t b);
 
 	// Per-cycle handlers.
 	void process_response_step(uint32_t b);

@@ -38,3 +38,7 @@ endif
 TOP := VX_core_top
 
 include ../common.mk
+
+# Elaborate and lint the core without building the model.
+lint:
+	$(VERILATOR_PATH)/bin/verilator --lint-only $(VL_FLAGS)

@@ -81,11 +81,22 @@ LsuUnit::LsuUnit(const SimContext& ctx, const char* name, Core* core)
 	, TcuReqIn(this)
 	, TcuRspOut(this)
 #endif
+#ifdef VX_CFG_EXT_DLMEM_ENABLE
+	, XlateReqOut(VX_CFG_NUM_LSU_BLOCKS, SimChannel<LsuReq>(this))
+#endif
 	, pending_loads_(0)
 {}
 
 LsuUnit::~LsuUnit()
 {}
+
+SimChannel<LsuReq>& LsuUnit::req_out(uint32_t b) {
+#ifdef VX_CFG_EXT_DLMEM_ENABLE
+	return XlateReqOut.at(b);
+#else
+	return core_->lmem_switch(b)->ReqIn;
+#endif
+}
 
 // Returns true when all blocks' input queues are empty and no reads are outstanding.
 bool LsuUnit::drained() const {
@@ -344,13 +355,16 @@ void LsuUnit::ingest_inputs(uint32_t b) {
 // one that carries end-of-packet, each addressing line 0.
 void LsuUnit::issue_fence(uint32_t b, instr_trace_t* trace) {
 	auto& state = states_.at(b);
-	if (state.pending_reqs.full() || core_->lmem_switch(b)->ReqIn.full())
+	if (state.pending_reqs.full() || this->req_out(b).full())
 		return; // stall
 
 	LsuReq lsu_req(VX_CFG_NUM_LSU_LANES);
 	lsu_req.op = MemOp::FLUSH;
 	lsu_req.flags.fence = 1;
 	lsu_req.wid = trace->wid;
+#ifdef VX_CFG_EXT_DLMEM_ENABLE
+	lsu_req.cta_id = trace->cta_id;
+#endif
 	uint32_t last = 0;
 	for (uint32_t t = 0; t < VX_CFG_NUM_THREADS; ++t) {
 		if (trace->tmask.test(t))
@@ -371,7 +385,7 @@ void LsuUnit::issue_fence(uint32_t b, instr_trace_t* trace) {
 	lsu_req.tag  = state.pending_reqs.allocate(std::move(entry));
 	lsu_req.cid  = trace->cid;
 	lsu_req.uuid = trace->uuid;
-	core_->lmem_switch(b)->ReqIn.send(lsu_req);
+	this->req_out(b).send(lsu_req);
 	state.fence.engage(trace);
 	state.req_queue.pop();
 	DT(3, this->name() << " fence-lock: " << *trace);
@@ -514,13 +528,16 @@ void LsuUnit::process_request_step(uint32_t b) {
 
 	if (state.remain_addrs != 0) {
 		// check lmem switch backpressure
-		if (core_->lmem_switch(b)->ReqIn.full())
+		if (this->req_out(b).full())
 			return; // stall
 
 		// setup memory request
 		LsuReq lsu_req(VX_CFG_NUM_LSU_LANES);
 		// LsuReq.write is derived from op via is_write(); no separate field.
 		lsu_req.wid = trace->wid;
+#ifdef VX_CFG_EXT_DLMEM_ENABLE
+		lsu_req.cta_id = trace->cta_id;
+#endif
 		// Typed op (warp-uniform). For AMO, amo_to_memop() picks the family
 		// member; for plain stores/loads, it's ST/LD. AMO MIN/MAX collapse
 		// signed/unsigned into one op + flag.
@@ -586,7 +603,7 @@ void LsuUnit::process_request_step(uint32_t b) {
 		lsu_req.uuid = trace->uuid;
 
 		// send memory request
-		core_->lmem_switch(b)->ReqIn.send(lsu_req);
+		this->req_out(b).send(lsu_req);
 		DT(3, this->name() << " mem-req: " << lsu_req);
 
 		// update stats
