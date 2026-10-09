@@ -38,6 +38,9 @@ module VX_cta_dispatch_top import VX_gpu_pkg::*;
     input  wire [CTA_TID_WIDTH-1:0]     in_warp_step_x,
     input  wire [CTA_TID_WIDTH-1:0]     in_warp_step_y,
     input  wire [CTA_TID_WIDTH-1:0]     in_warp_step_z,
+    input  wire [7:0]                   in_ctx_id,
+    input  wire [NW_WIDTH:0]            in_cluster_size,
+    input  wire                         in_is_first,
 
     input  wire [`VX_CFG_NUM_WARPS-1:0]        active_warps,
     input  wire                         warp_done,
@@ -45,7 +48,11 @@ module VX_cta_dispatch_top import VX_gpu_pkg::*;
 
     // Outputs
     output wire                         cta_fire,
-    output wire [NW_WIDTH-1:0]          cta_wid
+    output wire [NW_WIDTH-1:0]          cta_wid,
+
+    // CTA slot (the CTA_ID CSR value) of a launched warp
+    input  wire [NW_WIDTH-1:0]          schedule_wid,
+    output wire [NCTA_WIDTH-1:0]        schedule_cta_id
 );
 
     VX_kmu_bus_if kmu_bus();
@@ -53,8 +60,8 @@ module VX_cta_dispatch_top import VX_gpu_pkg::*;
     // The KMU is not instantiated in this unit test, so the bench supplies the
     // values the dispatcher expects precomputed on the bus:
     //   aligned_lmem_size  — in_lmem_size rounded up to MEM_BLOCK_SIZE.
-    //   cluster_size = 1 — degenerate (1,1,1) cluster, so every block is its own
-    //   cluster and always first-of-cluster.
+    //   ctx_id, cluster_size, is_first_of_cluster — the KMU's launch id and
+    //   cluster walk.
     wire [`VX_CFG_LMEM_LOG_SIZE:0] aligned_lmem_size_w =
         ((`VX_CFG_LMEM_LOG_SIZE+1)'(in_lmem_size) + (`VX_CFG_LMEM_LOG_SIZE+1)'(`VX_CFG_MEM_BLOCK_SIZE-1))
         & ~((`VX_CFG_LMEM_LOG_SIZE+1)'(`VX_CFG_MEM_BLOCK_SIZE-1));
@@ -68,7 +75,7 @@ module VX_cta_dispatch_top import VX_gpu_pkg::*;
         kmu_req.PC                = in_PC;
         kmu_req.entry             = in_PC;
         kmu_req.param             = in_param;
-        kmu_req.ctx_id            = '0;
+        kmu_req.ctx_id            = in_ctx_id;
         kmu_req.aligned_lmem_size = aligned_lmem_size_w;
         kmu_req.args.compute.grid_dim[0]  = in_grid_dim_x;
         kmu_req.args.compute.grid_dim[1]  = in_grid_dim_y;
@@ -83,8 +90,8 @@ module VX_cta_dispatch_top import VX_gpu_pkg::*;
         kmu_req.args.compute.warp_step[0] = in_warp_step_x;
         kmu_req.args.compute.warp_step[1] = in_warp_step_y;
         kmu_req.args.compute.warp_step[2] = in_warp_step_z;
-        kmu_req.args.compute.cluster_size = (NW_WIDTH+1)'(1);
-        kmu_req.args.compute.is_first_of_cluster = 1'b1;
+        kmu_req.args.compute.cluster_size = in_cluster_size;
+        kmu_req.args.compute.is_first_of_cluster = in_is_first;
     end
 
     assign kmu_bus.valid = task_in_valid;
@@ -101,12 +108,10 @@ module VX_cta_dispatch_top import VX_gpu_pkg::*;
     wire                    cta_init;
     wire                    busy;
 
-    // CTA-CSR read-back / schedule lookup ports are unexercised by this bench
-    // (it only checks warp dispatch via cta_fire/cta_wid), so the read indices
-    // are tied off and the read-back outputs are left unused.
+    // CTA-CSR read-back is unexercised by this bench, so its read indices are
+    // tied off and its outputs are left unused.
     cta_csrs_t              cta_rd_csrs;
     cta_lane_t [`VX_CFG_NUM_THREADS-1:0] cta_rd_lane;
-    wire [NCTA_WIDTH-1:0]   schedule_cta_id;
 
     `UNUSED_VAR (cta_PC)
     `UNUSED_VAR (cta_tmask)
@@ -115,7 +120,6 @@ module VX_cta_dispatch_top import VX_gpu_pkg::*;
     `UNUSED_VAR (busy)
     `UNUSED_VAR (cta_rd_csrs)
     `UNUSED_VAR (cta_rd_lane)
-    `UNUSED_VAR (schedule_cta_id)
 
     VX_cta_dispatch cta_dispatch (
         .clk           (clk),
@@ -134,7 +138,7 @@ module VX_cta_dispatch_top import VX_gpu_pkg::*;
         .csr_rd_cta_id ('0),
         .cta_rd_csrs   (cta_rd_csrs),
         .cta_rd_lane   (cta_rd_lane),
-        .schedule_wid  ('0),
+        .schedule_wid  (schedule_wid),
         .schedule_cta_id (schedule_cta_id),
         .busy          (busy)
     );

@@ -34,10 +34,12 @@ public:
   uint32_t num_warps() const { return num_warps_; }
   uint32_t peer_core() const { return peer_core_; }
   uint32_t peer_warp() const { return peer_warp_; }
+  uint64_t isa_flags() const { return isa_flags_; }
 
 private:
   std::vector<ITestCase*> _tests;
   vx_device_h device_;
+  uint64_t isa_flags_ = 0;
   uint32_t num_cores_ = 0;
   uint32_t num_warps_ = 0;
   uint32_t peer_core_ = 0;
@@ -618,8 +620,95 @@ public:
   }
 };
 
+// 18/19) One access whose even lanes hit global memory and odd lanes local
+//     memory (20/21 with Zacas), issued while every lane's adds keep the local
+//     banks busy, so the global side can take the request while the local side
+//     refuses it. Each side must still see it exactly once.
+class Test_MIXED_LMEM : public ITestCase {
+public:
+  Test_MIXED_LMEM(TestSuite* s, const char* name, uint32_t num_threads_per_warp)
+    : ITestCase(s, name), num_threads_(num_threads_per_warp) {}
+  const char* skip_reason() const override {
+    if (!(suite_->isa_flags() & VX_ISA_STD_A))
+      return "no atomics";
+    if (!(suite_->isa_flags() & VX_ISA_EXT_LMEM))
+      return "no local memory";
+    return (num_threads_ > 1) ? nullptr : "one-thread warp";
+  }
+protected:
+  bool is_local_lane(uint32_t h) const { return ((h % num_threads_) & 1) != 0; }
+  uint32_t num_threads_;
+};
+
+// 18) Every hart's global word must end at iters: an even lane's own adds, or
+//     an odd lane's local word copied in. The leaders' hot words sum to n * iters.
+class Test_AMO_MIXED_LMEM : public Test_MIXED_LMEM {
+public:
+  Test_AMO_MIXED_LMEM(TestSuite* s, uint32_t num_threads_per_warp)
+    : Test_MIXED_LMEM(s, "amo_mixed_lmem", num_threads_per_warp) {}
+  void setup(uint32_t n, uint32_t* shared, uint32_t* per_hart) override {
+    for (uint32_t h = 0; h < n; ++h) {
+      shared[h]   = 0;
+      per_hart[h] = 0;
+    }
+  }
+  int verify(uint32_t n, uint32_t iters,
+             const uint32_t* shared, const uint32_t* per_hart) override {
+    int errors = 0;
+    for (uint32_t h = 0; h < n; ++h) {
+      if (shared[h] == iters)
+        continue;
+      if (errors < 8)
+        std::cout << "  hart " << h << " (" << (is_local_lane(h) ? "local" : "global")
+                  << " lane) received " << shared[h] << " adds, expected " << iters
+                  << std::endl;
+      ++errors;
+    }
+    uint64_t hot = 0;
+    for (uint32_t h = 0; h < n; ++h) hot += per_hart[h];
+    if (hot != (uint64_t)n * iters) {
+      std::cout << "  hot word adds=" << hot << " expected=" << (uint64_t)n * iters
+                << std::endl;
+      ++errors;
+    }
+    return errors;
+  }
+};
+
+// 19) Every lane must load its own seeded word on every iteration.
+class Test_LD_MIXED_LMEM : public Test_MIXED_LMEM {
+public:
+  Test_LD_MIXED_LMEM(TestSuite* s, uint32_t num_threads_per_warp)
+    : Test_MIXED_LMEM(s, "ld_mixed_lmem", num_threads_per_warp) {}
+  void setup(uint32_t n, uint32_t* shared, uint32_t* per_hart) override {
+    for (uint32_t h = 0; h < n; ++h) {
+      shared[h]   = MIXED_GLOBAL_SEED + h;
+      per_hart[h] = 0;
+    }
+  }
+  int verify(uint32_t n, uint32_t iters,
+             const uint32_t* /*shared*/, const uint32_t* per_hart) override {
+    int errors = 0;
+    for (uint32_t h = 0; h < n; ++h) {
+      const bool     local    = is_local_lane(h);
+      const uint32_t word     = (local ? MIXED_LOCAL_SEED : MIXED_GLOBAL_SEED) + h;
+      const uint32_t expected = word * iters;
+      if (per_hart[h] == expected)
+        continue;
+      if (errors < 8)
+        std::cout << "  hart " << h << " (" << (local ? "local" : "global")
+                  << " lane) summed 0x" << std::hex << per_hart[h] << ", expected 0x"
+                  << expected << " (" << std::dec << iters << " x 0x" << std::hex
+                  << word << ")" << std::dec << std::endl;
+      ++errors;
+    }
+    return errors;
+  }
+};
+
 inline TestSuite::TestSuite(vx_device_h device) : device_(device) {
   uint64_t num_clusters, num_cores, num_warps, num_threads;
+  RT_CHECK(vx_device_query(device, VX_CAPS_ISA_FLAGS, &isa_flags_));
   RT_CHECK(vx_device_query(device, VX_CAPS_NUM_CLUSTERS, &num_clusters));
   RT_CHECK(vx_device_query(device, VX_CAPS_NUM_CORES, &num_cores));
   RT_CHECK(vx_device_query(device, VX_CAPS_NUM_WARPS, &num_warps));
@@ -665,6 +754,8 @@ inline TestSuite::TestSuite(vx_device_h device) : device_(device) {
   add_test(new Test_LRSC_FOREIGN(this, "lrsc_foreign_lmem", (uint32_t)num_threads,
                                  LRSC_LMEM_STATIONS));
   add_test(new Test_LRSC_PEER(this));
+  add_test(new Test_AMO_MIXED_LMEM(this, (uint32_t)num_threads));
+  add_test(new Test_LD_MIXED_LMEM(this, (uint32_t)num_threads));
 }
 
 inline TestSuite::~TestSuite() {

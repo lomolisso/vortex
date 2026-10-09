@@ -82,6 +82,13 @@ constexpr uint32_t lrsc_bank_stations(uint32_t entries) {
 #define LRSC_PEER_B_CTRL  5  // peer: result of its control SC
 #define LRSC_PEER_B_SEEN  6  // peer: X as its plain load read it after its SC
 
+// Mixed-lane tests: odd lanes of one access hit local memory, even lanes global
+// memory. Thread t's local word is MIXED_LMEM_OWN + t, clear of the hot word 0
+// that every lane hammers; the seeds tell a local word from a global one.
+#define MIXED_LMEM_OWN     16
+#define MIXED_GLOBAL_SEED  0x6d000000u
+#define MIXED_LOCAL_SEED   0x1c000000u
+
 #define LRSC_PEER_X_SEED        0x7e000001u
 #define LRSC_PEER_Y_SEED        0x7e000002u
 #define LRSC_PEER_A_SC_VALUE    0x7e0000a0u

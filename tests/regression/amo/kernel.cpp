@@ -576,6 +576,91 @@ void kernel_lrsc_peer(kernel_arg_t* __UNIFORM__ arg) {
   }
 }
 
+static inline void amo_add(volatile uint32_t* addr, uint32_t value) {
+  uint32_t old;
+  asm volatile ("amoadd.w %0, %2, (%1)" : "=r"(old) : "r"(addr), "r"(value) : "memory");
+}
+
+// Writes no register, so the warp's next access need not wait for its response.
+static inline void amo_add_nr(volatile uint32_t* addr, uint32_t value) {
+  asm volatile ("amoadd.w zero, %1, (%0)" : : "r"(addr), "r"(value) : "memory");
+}
+
+// `local` on odd lanes and `global` on even ones. The empty asm hides that the
+// mask is 0 or all ones, so the choice cannot become a branch that splits the
+// warp: the access stays one request with lanes on both sides.
+static inline volatile uint32_t* mixed_lane_ptr(volatile uint32_t* global,
+                                                volatile uint32_t* local) {
+  uintptr_t mask = -(uintptr_t)(vx_thread_id() & 1);
+  asm volatile ("" : "+r"(mask));
+  return (volatile uint32_t*)((uintptr_t)global
+                              ^ (((uintptr_t)global ^ (uintptr_t)local) & mask));
+}
+
+// 18) Mixed-lane AMO (20 with Zacas). Each iteration, every lane adds to the
+//   hot local word, then one amoadd adds to the hart's global word on even
+//   lanes and its local word on odd lanes, so the mixed access meets the local
+//   side still busy with the hot adds. Odd lanes then copy their local word into
+//   their unused global one: every global word must read iters, and a lane whose
+//   add was executed twice reads more. Leaders publish the hot word.
+void kernel_amo_mixed_lmem(kernel_arg_t* __UNIFORM__ arg) {
+  auto lmem     = (volatile uint32_t*)__local_mem();
+  auto shared   = (volatile uint32_t*)arg->shared_addr;
+  auto per_hart = (uint32_t*)arg->per_hart_addr;
+  const uint32_t hid = hart_id();
+  auto hot   = &lmem[0];
+  auto local = &lmem[MIXED_LMEM_OWN + threadIdx.x];
+
+  *local = 0;
+  if (threadIdx.x == 0) {
+    *hot = 0;
+  }
+  __syncthreads();
+
+  auto target = mixed_lane_ptr(&shared[hid], local);
+  for (uint32_t i = 0; i < arg->iters; ++i) {
+    amo_add_nr(hot, 1);
+    amo_add(target, 1);
+  }
+  // The hot adds return nothing, so the warp can reach the barrier with some
+  // still queued; an atomic read the lane waits on returns only behind its adds.
+  after(hot, amo_read(hot));
+  __syncthreads();
+
+  if (vx_thread_id() & 1) {
+    shared[hid] = *local;
+  }
+  if (threadIdx.x == 0) {
+    per_hart[hid] = *hot;
+  }
+}
+
+// 19) Mixed-lane load (21 with Zacas). The same split and hot-word traffic with
+//   plain loads: each lane sums its own seeded word, so data from another lane
+//   or side, or a response delivered twice, shows in the sum.
+void kernel_ld_mixed_lmem(kernel_arg_t* __UNIFORM__ arg) {
+  auto lmem     = (volatile uint32_t*)__local_mem();
+  auto shared   = (volatile uint32_t*)arg->shared_addr;
+  auto per_hart = (uint32_t*)arg->per_hart_addr;
+  const uint32_t hid = hart_id();
+  auto hot   = &lmem[0];
+  auto local = &lmem[MIXED_LMEM_OWN + threadIdx.x];
+
+  *local = MIXED_LOCAL_SEED + hid;
+  if (threadIdx.x == 0) {
+    *hot = 0;
+  }
+  __syncthreads();
+
+  auto source = mixed_lane_ptr(&shared[hid], local);
+  uint32_t sum = 0;
+  for (uint32_t i = 0; i < arg->iters; ++i) {
+    amo_add_nr(hot, 1);
+    sum += *source;
+  }
+  per_hart[hid] = sum;
+}
+
 static const PFN_Kernel sc_tests[] = {
   kernel_amoadd,             // 0
   kernel_amoor,              // 1
@@ -599,6 +684,8 @@ static const PFN_Kernel sc_tests[] = {
   kernel_lrsc_foreign,       // 15 (17 with Zacas)  SC into another thread's reservation
   kernel_lrsc_foreign_lmem,  // 16 (18 with Zacas)  the same on local memory
   kernel_lrsc_peer,          // 17 (19 with Zacas)  SC by a peer hart
+  kernel_amo_mixed_lmem,     // 18 (20 with Zacas)  one AMO with global and local lanes
+  kernel_ld_mixed_lmem,      // 19 (21 with Zacas)  one load with global and local lanes
 };
 
 __kernel void kernel_main(kernel_arg_t* __UNIFORM__ arg) {

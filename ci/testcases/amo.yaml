@@ -114,6 +114,16 @@ tests:
               hw/rtl/libs/VX_stream_xbar.sv, hw/rtl/libs/VX_stream_arb.sv,
               hw/rtl/libs/VX_generic_arbiter.sv, hw/rtl/libs/VX_rr_arbiter.sv,
               hw/rtl/VX_gpu_pkg.sv, sim/simx/mem, sim/simx/types.h]
+  # One AMO, and one load, whose even lanes are global and odd lanes local,
+  # issued while every lane's adds keep the local banks busy: the switch must
+  # hand each side its lanes exactly once, even when only one side can take them.
+  - id: mixed-lanes
+    app: amo
+    drivers: [simx, rtlsim]
+    args: "-n32 -tamo_mixed_lmem -tld_mixed_lmem"
+    touches: [hw/rtl/mem, hw/rtl/cache, hw/rtl/core/VX_lsu_slice.sv,
+              hw/rtl/core/VX_mem_unit.sv, hw/rtl/VX_gpu_pkg.sv, sim/simx/amo, sim/simx/mem,
+              tests/regression/amo]
   # Write-back D-cache variants (rtlsim only in the legacy suite).
   - id: wb-dirtybytes0
     app: amo

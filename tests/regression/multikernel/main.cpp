@@ -41,17 +41,19 @@
   } while (0)
 
 namespace {
-const char* kernel_file = "kernel.vxbin";
-uint32_t    size        = 256;
+const char* kernel_file  = "kernel.vxbin";
+uint32_t    size         = 256;
+bool        cluster_mode = false;
 
 void parse_args(int argc, char** argv) {
   int c;
-  while ((c = getopt(argc, argv, "n:k:h")) != -1) {
+  while ((c = getopt(argc, argv, "n:k:ch")) != -1) {
     switch (c) {
-      case 'n': size        = (uint32_t)std::atoi(optarg); break;
-      case 'k': kernel_file = optarg;                      break;
+      case 'n': size         = (uint32_t)std::atoi(optarg); break;
+      case 'k': kernel_file  = optarg;                      break;
+      case 'c': cluster_mode = true;                        break;
       default:
-        std::printf("Usage: [-k kernel] [-n size] [-h]\n");
+        std::printf("Usage: [-k kernel] [-n size] [-c: cluster ranks across launches] [-h]\n");
         std::exit(c == 'h' ? 0 : -1);
     }
   }
@@ -62,12 +64,103 @@ int32_t cube(uint32_t idx) {
   int32_t k = (int32_t)((idx & 15) + 1);
   return k * k * k;
 }
+
+// Launches rank_k over `num_ctas` CTAs in clusters of `k` and returns the
+// mismatches between the slot-derived cluster rank and the block-index one.
+int check_cluster_ranks(vx_queue_h q, vx_kernel_h kernel, vx_buffer_h buf,
+                        uint32_t num_ctas, uint32_t k, uint32_t block,
+                        const char* tag) {
+  const uint64_t bytes = (uint64_t)num_ctas * RANK_REC_WORDS * sizeof(uint32_t);
+  // A CTA that never ran leaves the fill, which matches no field it writes.
+  std::vector<uint32_t> recs(num_ctas * RANK_REC_WORDS, 0xffffffffu);
+  CHECK(vx_enqueue_write(q, buf, 0, recs.data(), bytes, 0, nullptr, nullptr));
+
+  rank_arg_t arg = {};
+  arg.cluster_k = k;
+  CHECK(vx_buffer_address(buf, &arg.dst_addr));
+
+  vx_launch_info_t li = {};
+  li.struct_size    = sizeof(li);
+  li.kernel         = kernel;
+  li.args_host      = &arg;
+  li.args_size      = sizeof(arg);
+  li.ndim           = 1;
+  li.grid_dim[0]    = num_ctas;
+  li.block_dim[0]   = block;
+  li.cluster_dim[0] = k;
+
+  vx_event_h launch_ev = nullptr, read_ev = nullptr;
+  CHECK(vx_enqueue_launch(q, &li, 0, nullptr, &launch_ev));
+  CHECK(vx_enqueue_read(q, recs.data(), buf, 0, bytes, 1, &launch_ev, &read_ev));
+  CHECK(vx_event_wait_value(read_ev, 1, VX_TIMEOUT_INFINITE));
+  vx_event_release(read_ev);
+  vx_event_release(launch_ev);
+
+  int errors = 0;
+  for (uint32_t b = 0; b < num_ctas; ++b) {
+    const uint32_t* rec = &recs[b * RANK_REC_WORDS];
+    if (rec[RANK_REC_CLUSTER_RANK] == rec[RANK_REC_INDEX]
+     && rec[RANK_REC_INDEX] == b % k
+     && rec[RANK_REC_CLUSTER_SIZE] == k)
+      continue;
+    if (errors < 8)
+      std::printf("*** %s cta %u: slot %u, cluster rank %u, index %u, cluster size %u;"
+                  " expected rank %u of %u\n",
+                  tag, b, rec[RANK_REC_CTA_ID], rec[RANK_REC_CLUSTER_RANK],
+                  rec[RANK_REC_INDEX], rec[RANK_REC_CLUSTER_SIZE], b % k, k);
+    ++errors;
+  }
+  return errors;
+}
+
+// -c: two launches in one process. The first, one CTA without clusters,
+// moves the dispatcher's round-robin slot pointer to 1. Software takes a CTA's
+// cluster rank from its slot (CTA_ID % K), so each launch must place its first
+// cluster from slot 0 again: a window opening at slot 1 hands rank 1 to the
+// cluster's first CTA.
+int run_cluster_ranks(vx_device_h dev, vx_queue_h q) {
+  const uint32_t k = 2;
+  uint64_t num_cores = 0, num_warps = 0, num_threads = 0;
+  CHECK(vx_device_query(dev, VX_CAPS_NUM_CORES,   &num_cores));
+  CHECK(vx_device_query(dev, VX_CAPS_NUM_WARPS,   &num_warps));
+  CHECK(vx_device_query(dev, VX_CAPS_NUM_THREADS, &num_threads));
+  // With fewer slots the window from slot 1 overruns and wraps to slot 0.
+  if (num_warps < k + 1) {
+    std::printf("Error: cluster ranks need %u warps per core, the device has %u\n",
+                k + 1, (uint32_t)num_warps);
+    return 1;
+  }
+  // Two rounds of clusters per core, so the core that ran the first launch
+  // takes a cluster whatever the distribution.
+  const uint32_t num_ctas = 2 * (uint32_t)(num_cores * num_warps);
+  std::printf("multikernel: cluster ranks, 1 CTA then %u CTAs in clusters of %u\n",
+              num_ctas, k);
+
+  vx_module_h mod = nullptr;
+  CHECK(vx_module_load_file(dev, kernel_file, &mod));
+  vx_kernel_h kernel = nullptr;
+  CHECK(vx_module_get_kernel(mod, "rank_k", &kernel));
+  vx_buffer_h buf = nullptr;
+  CHECK(vx_buffer_create(dev, (uint64_t)num_ctas * RANK_REC_WORDS * sizeof(uint32_t),
+                         VX_MEM_READ_WRITE, &buf));
+
+  int errors = check_cluster_ranks(q, kernel, buf, 1, 1, (uint32_t)num_threads,
+                                   "launch 1");
+  errors += check_cluster_ranks(q, kernel, buf, num_ctas, k, (uint32_t)num_threads,
+                                "launch 2");
+
+  vx_buffer_release(buf);
+  vx_kernel_release(kernel);
+  vx_module_release(mod);
+  return errors;
+}
 } // namespace
 
 int main(int argc, char** argv) {
   parse_args(argc, argv);
   const uint64_t bytes = (uint64_t)size * sizeof(int32_t);
-  std::printf("multikernel: size=%u\n", size);
+  if (!cluster_mode)
+    std::printf("multikernel: size=%u\n", size);
 
   vx_device_h dev = nullptr;
   CHECK(vx_device_open(0, &dev));
@@ -77,6 +170,19 @@ int main(int argc, char** argv) {
   qi.priority    = VX_QUEUE_PRIORITY_NORMAL;
   vx_queue_h q = nullptr;
   CHECK(vx_queue_create(dev, &qi, &q));
+
+  if (cluster_mode) {
+    int errors = run_cluster_ranks(dev, q);
+    vx_queue_release(q);
+    vx_device_dump_perf(dev, stdout);
+    vx_device_release(dev);
+    if (errors) {
+      std::printf("Found %d errors!\nFAILED!\n", errors);
+      return 1;
+    }
+    std::printf("PASSED!\n");
+    return 0;
+  }
 
   vx_buffer_h src_buf = nullptr;
   vx_buffer_h add_buf = nullptr, mul_buf = nullptr, acc_buf = nullptr;

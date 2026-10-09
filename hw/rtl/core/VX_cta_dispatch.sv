@@ -352,12 +352,16 @@ module VX_cta_dispatch import VX_gpu_pkg::*; #(
     `RUNTIME_ASSERT(~kmu_bus_if.valid || (stride == 0) || (PROD_W'(stride) <= PROD_W'(LMEM_SIZE)),
         ("%t: %s CTA shared-memory footprint %0d exceeds the %0d-byte capacity; the CTA overruns its slot", $time, INSTANCE_ID, stride, LMEM_SIZE))
 
+    // A CTA whose ctx_id differs from the last accepted one opens a new launch.
+    wire new_launch = (kmu_req.ctx_id != cur_ctx_id_r);
+
     // Normalize the round-robin pointer to the usable range (covers a kernel
     // transition that shrank usable_slots_r), then apply cluster pre-wrap.
     // Compares are full (NW_WIDTH+2)-bit to admit usable_slots_r == NUM_CTA_SLOTS.
+    // A launch starts at slot 0 so its cluster windows align to K (rank = CTA_ID % K).
     wire [NW_WIDTH+1:0] tail_ext = {2'b0, tail_r};
     wire [NW_WIDTH+1:0] usable_ext = {1'b0, usable_slots_r};
-    wire [CS_BITS-1:0] base_tail = (tail_ext >= usable_ext) ? CS_BITS'(0) : tail_r;
+    wire [CS_BITS-1:0] base_tail = (new_launch || (tail_ext >= usable_ext)) ? CS_BITS'(0) : tail_r;
     wire cluster_prewrap = is_first_of_cluster
         && (({2'b0, base_tail} + {1'b0, cluster_k}) > usable_ext);
     wire [CS_BITS-1:0] base_slot = cluster_prewrap ? CS_BITS'(0) : base_tail;
@@ -473,7 +477,7 @@ module VX_cta_dispatch import VX_gpu_pkg::*; #(
             case (state)
                 IDLE: begin
                     if (kmu_bus_if_fire) begin
-                        if (kmu_req.ctx_id != cur_ctx_id_r) begin
+                        if (new_launch) begin
                             cur_ctx_id_r <= kmu_req.ctx_id;
                             warp_init_lanes_r <= '0;
                         end

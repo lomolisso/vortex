@@ -155,3 +155,17 @@ tests:
   drivers:
   - simx
   app: module_reload
+# Cluster ranks across launches in one process. The first launch leaves the CTA
+# dispatcher's round-robin slot pointer at 1; the second, in clusters of two,
+# must still open its first cluster at slot 0, since software takes a CTA's
+# cluster rank from its slot.
+- id: multikernel-cluster
+  via: blackbox
+  drivers:
+  - simx
+  - rtlsim
+  app: multikernel
+  args: -c
+  touches: [hw/rtl/core/VX_cta_dispatch.sv, hw/rtl/VX_kmu.sv, hw/rtl/core/VX_kmu_bus_arb.sv,
+            sim/simx/cta_dispatcher.cpp, sim/simx/kmu/, sim/simx/processor.cpp,
+            sw/kernel/include/vx_spawn2.h, tests/regression/multikernel]

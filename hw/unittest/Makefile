@@ -5,6 +5,7 @@ all:
 	$(MAKE) -C core
 	$(MAKE) -C issue
 	$(MAKE) -C local_mem
+	$(MAKE) -C lmem_switch
 	$(MAKE) -C mem_unit
 	$(MAKE) -C tcu_fedp
 	$(MAKE) -C cta_dispatcher
@@ -35,6 +36,7 @@ run:
 	$(MAKE) -C core run
 	$(MAKE) -C issue run
 	$(MAKE) -C local_mem run
+	$(MAKE) -C lmem_switch run
 	$(MAKE) -C mem_unit run
 	$(MAKE) -C tcu_fedp run
 	$(MAKE) -C cta_dispatcher run
@@ -77,10 +79,32 @@ define lmem_case
 	$(MAKE) -C local_mem CONFIGS="$(1)"
 	$(MAKE) -C local_mem run CONFIGS="$(1)"
 endef
+# The LSU-side global/local switch, at each LSU lane count: mixed-lane
+# requests under independent port back-pressure (one lane cannot mix, so it
+# covers the single-port paths), and the widest attribute with Zacas.
+define lmem_switch_case
+	$(MAKE) -C lmem_switch clean
+	$(MAKE) -C lmem_switch CONFIGS="$(1)"
+	$(MAKE) -C lmem_switch run CONFIGS="$(1)"
+endef
 run-lmem:
 	$(call lmem_case,$(LMEM_BASE))
 	$(call lmem_case,$(LMEM_BASE) -DVX_CFG_EXT_ZACAS_ENABLE)
 	$(call lmem_case,)
+	$(call lmem_switch_case,-DVX_CFG_NUM_LSU_LANES=1)
+	$(call lmem_switch_case,-DVX_CFG_NUM_LSU_LANES=2)
+	$(call lmem_switch_case,-DVX_CFG_NUM_LSU_LANES=4 $(LMEM_BASE) -DVX_CFG_EXT_ZACAS_ENABLE)
+
+# CTA dispatcher: slot placement across launches checked against SimX's
+# per-launch pointer reset, with 4 and 8 CTA slots.
+define cta_case
+	$(MAKE) -C cta_dispatcher clean
+	$(MAKE) -C cta_dispatcher CONFIGS="$(1)"
+	$(MAKE) -C cta_dispatcher run CONFIGS="$(1)"
+endef
+run-cta:
+	$(call cta_case,)
+	$(call cta_case,-DVX_CFG_NUM_WARPS=8)
 
 # Cache bank in the last-level role: directed fill/replay races around the
 # atomic engine and the MSHR chains plus randomized traffic, checked against a
@@ -182,6 +206,7 @@ clean:
 	$(MAKE) -C core clean
 	$(MAKE) -C issue clean
 	$(MAKE) -C local_mem clean
+	$(MAKE) -C lmem_switch clean
 	$(MAKE) -C mem_unit clean
 	$(MAKE) -C tcu_fedp clean
 	$(MAKE) -C cta_dispatcher clean

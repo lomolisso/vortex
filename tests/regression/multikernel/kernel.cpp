@@ -95,3 +95,15 @@ __kernel void acc_k(kernel_arg_t* __UNIFORM__ arg) {
     tls_add(g_cubes[(i + j) & 15]);
   dst[i] = src[i] + static_cast<int32_t>(t_acc) + tls_tag();
 }
+
+// rank_k (the host's -c mode): the cluster rank software derives from the
+// CTA's slot, next to the rank its block index implies, for the host to compare.
+__kernel void rank_k(rank_arg_t* __UNIFORM__ arg) {
+  if (threadIdx.x != 0)
+    return;
+  auto rec = reinterpret_cast<uint32_t*>(arg->dst_addr) + blockIdx.x * RANK_REC_WORDS;
+  rec[RANK_REC_CTA_ID]       = get_local_group_id();
+  rec[RANK_REC_CLUSTER_RANK] = get_cluster_rank();
+  rec[RANK_REC_INDEX]        = blockIdx.x % arg->cluster_k;
+  rec[RANK_REC_CLUSTER_SIZE] = get_cluster_size();
+}

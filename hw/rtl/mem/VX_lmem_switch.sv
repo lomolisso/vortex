@@ -14,9 +14,9 @@
 `include "VX_define.vh"
 
 // Splits an LSU request into a global-memory part and a local-memory
-// part using each lane's is_addr_local user bit. Both subsets fire
-// independently with masked-out lanes; lsu_in_if.req_ready waits for
-// whichever subset(s) are non-empty.
+// part using each lane's is_addr_local user bit. Each subset carries the
+// other's lanes masked out, and the non-empty subsets are pushed in the same
+// cycle that lsu_in_if.req_ready releases the request.
 //
 // The local path carries the AMOs through to the LMEM banks, which perform the
 // read-modify-write in place and hold the LR/SC reservations.
@@ -55,6 +55,12 @@ module VX_lmem_switch import VX_gpu_pkg::*; #(
     assign lsu_in_if.req_ready = (!is_addr_global || req_global_ready)
                               && (!is_addr_local  || req_local_ready);
 
+    // A side that pushed alone would push again while the request waits on the other.
+    // Each side's valid depends on the other side's ready, so both outputs must be buffered.
+    `STATIC_ASSERT(GLOBAL_OUT_BUF != 0 && LOCAL_OUT_BUF != 0, ("invalid parameter"))
+    wire req_global_valid = lsu_in_if.req_valid && is_addr_global && (!is_addr_local  || req_local_ready);
+    wire req_local_valid  = lsu_in_if.req_valid && is_addr_local  && (!is_addr_global || req_global_ready);
+
     VX_elastic_buffer #(
         .DATAW   (REQ_DATAW),
         .SIZE    (`TO_OUT_BUF_SIZE(GLOBAL_OUT_BUF)),
@@ -62,7 +68,7 @@ module VX_lmem_switch import VX_gpu_pkg::*; #(
     ) req_global_buf (
         .clk       (clk),
         .reset     (reset),
-        .valid_in  (lsu_in_if.req_valid && is_addr_global),
+        .valid_in  (req_global_valid),
         .data_in   ({
             global_mask,
             lsu_in_if.req_data.rw,
@@ -90,7 +96,7 @@ module VX_lmem_switch import VX_gpu_pkg::*; #(
     ) req_local_buf (
         .clk       (clk),
         .reset     (reset),
-        .valid_in  (lsu_in_if.req_valid && is_addr_local),
+        .valid_in  (req_local_valid),
         .data_in   ({
             local_mask,
             lsu_in_if.req_data.rw,
