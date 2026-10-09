@@ -264,9 +264,11 @@ inline Xlate translate(const Cfg& cfg, uint64_t addr, const Row& row,
     return {NONE, 0, 0, addr};
   uint32_t rank = uint32_t((addr >> cfg.lmem_log) & low_mask(rank_bits(cfg)));
   uint64_t off  = addr & low_mask(cfg.lmem_log);
-  // stride == 0 makes every window access out of bounds.
+  // stride == 0 makes every window access out of bounds. The line offset is
+  // kept so the lane's byteen and line-relative data still match its address;
+  // DLMEM requires 64-byte memory blocks, so it stays inside the issuer's slot.
   if (rank >= row.k || off >= stride) {
-    uint64_t lb = uint64_t(my_slot) * stride;
+    uint64_t lb = uint64_t(my_slot) * stride + (addr & 63);
     return {OOB, my_core, lb, cfg.lmem_base + lb};
   }
   const Peer& p = row.peers.at(rank);

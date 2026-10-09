@@ -233,10 +233,44 @@ ifeq ($(XLEN),64)
 	$(MAKE) -C bar_unit clean
 endif
 
-# Aperture translation: dlmem_xlate.
+# Aperture translation: one core's peer table and per-block stages, checked
+# against dlmem_ref::translate on the shared vectors, then on random traffic.
+# The shapes span every window size (LMEM_LOG 14..18), MAX_CLUSTER 1, 2, 3, 4
+# and 8, core fields wider than the rank field (NCC 6, 8 and 16 over MAX 3, 4
+# and 8), second-cluster core ids, 1 to 8 lanes, 1 and 2 blocks, and Zacas.
+# NCC 6 has no vectors, so it runs random traffic only. The last build has the
+# bound assert on and must abort on an out-of-bounds lane; the final clean
+# keeps a plain `run` from reusing that binary.
+# $(1)=CONFIGS $(2)=CORE_ID $(3)=OOB_ASSERT $(4)=OPTS
+define dlmem_xlate_case
+	$(MAKE) -C dlmem_xlate clean
+	$(MAKE) -C dlmem_xlate CONFIGS="-DVX_CFG_EXT_DLMEM_ENABLE $(1)" CORE_ID=$(2) OOB_ASSERT=$(3)
+	$(MAKE) -C dlmem_xlate run CONFIGS="-DVX_CFG_EXT_DLMEM_ENABLE $(1)" CORE_ID=$(2) OOB_ASSERT=$(3) OPTS="$(4)"
+endef
 run-dlmem-xlate:
 ifeq ($(XLEN),64)
-	@true
+	$(call dlmem_xlate_case,-DVX_CFG_NUM_CORES=1 -DVX_CFG_SOCKET_SIZE=1 -DVX_CFG_NUM_WARPS=4 \
+		-DVX_CFG_LMEM_LOG_SIZE=14,0,0,--seed=1)
+	$(call dlmem_xlate_case,-DVX_CFG_NUM_CLUSTERS=2 -DVX_CFG_NUM_CORES=2 -DVX_CFG_SOCKET_SIZE=1 \
+		-DVX_CFG_NUM_WARPS=4 -DVX_CFG_LMEM_LOG_SIZE=14,3,0,--seed=2)
+	$(call dlmem_xlate_case,-DVX_CFG_NUM_CORES=4 -DVX_CFG_SOCKET_SIZE=2 -DVX_CFG_NUM_WARPS=8 \
+		-DVX_CFG_LMEM_LOG_SIZE=16 -DVX_CFG_ISSUE_WIDTH=2,2,0,--seed=3)
+	$(call dlmem_xlate_case,-DVX_CFG_NUM_CORES=8 -DVX_CFG_SOCKET_SIZE=2 -DVX_CFG_NUM_WARPS=8 \
+		-DVX_CFG_NUM_THREADS=8 -DVX_CFG_LMEM_LOG_SIZE=18,5,0,--seed=4)
+	$(call dlmem_xlate_case,-DVX_CFG_NUM_CORES=8 -DVX_CFG_SOCKET_SIZE=4 -DVX_CFG_NUM_WARPS=16 \
+		-DVX_CFG_DLMEM_MAX_CLUSTER=4 -DVX_CFG_LMEM_LOG_SIZE=17 -DVX_CFG_ISSUE_WIDTH=2 \
+		-DVX_CFG_NUM_LSU_LANES=2,6,0,--seed=5)
+	$(call dlmem_xlate_case,-DVX_CFG_NUM_CLUSTERS=2 -DVX_CFG_NUM_CORES=16 -DVX_CFG_SOCKET_SIZE=4 \
+		-DVX_CFG_NUM_WARPS=16 -DVX_CFG_LMEM_LOG_SIZE=18 -DVX_CFG_EXT_A_ENABLE \
+		-DVX_CFG_EXT_ZACAS_ENABLE,25,0,--seed=6)
+	$(call dlmem_xlate_case,-DVX_CFG_NUM_CLUSTERS=2 -DVX_CFG_NUM_CORES=6 -DVX_CFG_SOCKET_SIZE=2 \
+		-DVX_CFG_NUM_WARPS=4 -DVX_CFG_DLMEM_MAX_CLUSTER=3 -DVX_CFG_LMEM_LOG_SIZE=15 \
+		-DVX_CFG_NUM_LSU_LANES=1,10,0,--mode=random --seed=7)
+	$(call dlmem_xlate_case,-DVX_CFG_NUM_CORES=2 -DVX_CFG_SOCKET_SIZE=1 -DVX_CFG_NUM_WARPS=4 \
+		-DVX_CFG_LMEM_LOG_SIZE=14,1,1,--mode=random --no-oob --seed=8)
+	! dlmem_xlate/dlmem_xlate --mode=oob > dlmem_xlate/oob.log 2>&1
+	grep -q "DLMEM access out of bounds" dlmem_xlate/oob.log
+	$(MAKE) -C dlmem_xlate clean
 endif
 
 # Network endpoints: dlmem_ep.

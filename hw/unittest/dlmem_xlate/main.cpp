@@ -1,0 +1,1131 @@
+// Copyright © 2019-2023
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+// DLMEM aperture translation testbench: one core's peer table and its per-block
+// translation stages, checked lane by lane against dlmem_ref::translate.
+//
+// --mode=directed: the shared hand-computed vectors that fit this build's shape
+// and core, one request each, with exact outputs.
+// --mode=random: launches, each a drain, a new stride and a rewrite of every
+// row, then traffic with row rewrites at random cycles. Lanes mix in-window,
+// out-of-bounds and outside addresses, masked lanes and fences, under
+// back-pressure phases. Every request must leave once, in order per block,
+// one cycle after it enters while the output is ready, translated with the row
+// current when it entered; untouched fields stay bit-equal.
+// --mode=oob: one out-of-bounds lane; a build with the bound assert must abort.
+// --mode=all: directed, then random.
+
+#include "vl_simulator.h"
+#include "VVX_dlmem_xlate_top.h"
+#include "VX_config.h"
+#include "VX_types.h"
+#include "dlmem_ref.h"
+
+#if __has_include("vectors.h")
+#include "vectors.h"
+#define XLATE_HAVE_VECTORS 1
+#else
+#define XLATE_HAVE_VECTORS 0
+#endif
+
+#include <algorithm>
+#include <cinttypes>
+#include <cstdarg>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <deque>
+#include <optional>
+#include <random>
+#include <string>
+#include <type_traits>
+#include <vector>
+
+using namespace vortex;
+namespace ref = vortex::dlmem_ref;
+
+///////////////////////////////////////////////////////////////////////////////
+
+using Bits = std::vector<uint32_t>;
+
+// Bit-field access that works on every Verilator port type (CData..QData,
+// VlWide) and on Bits.
+template <typename T>
+static void set_bits(T& sig, uint32_t lsb, uint32_t width, uint64_t value) {
+  if constexpr (std::is_integral_v<T>) {
+    uint64_t mask = (width >= 64) ? ~0ull : ((1ull << width) - 1);
+    uint64_t v = static_cast<uint64_t>(sig);
+    v = (v & ~(mask << lsb)) | ((value & mask) << lsb);
+    sig = static_cast<T>(v);
+  } else {
+    uint32_t i = 0;
+    while (i < width) {
+      uint32_t bit = lsb + i;
+      uint32_t w = bit / 32;
+      uint32_t o = bit % 32;
+      uint32_t n = std::min(32 - o, width - i);
+      uint32_t m = (n == 32) ? 0xffffffffu : ((1u << n) - 1);
+      uint32_t chunk = static_cast<uint32_t>(value >> i) & m;
+      sig[w] = (sig[w] & ~(m << o)) | (chunk << o);
+      i += n;
+    }
+  }
+}
+
+template <typename T>
+static uint64_t get_bits(const T& sig, uint32_t lsb, uint32_t width) {
+  if constexpr (std::is_integral_v<T>) {
+    uint64_t mask = (width >= 64) ? ~0ull : ((1ull << width) - 1);
+    return (static_cast<uint64_t>(sig) >> lsb) & mask;
+  } else {
+    uint64_t value = 0;
+    uint32_t i = 0;
+    while (i < width) {
+      uint32_t bit = lsb + i;
+      uint32_t w = bit / 32;
+      uint32_t o = bit % 32;
+      uint32_t n = std::min(32 - o, width - i);
+      uint32_t m = (n == 32) ? 0xffffffffu : ((1u << n) - 1);
+      value |= static_cast<uint64_t>((sig[w] >> o) & m) << i;
+      i += n;
+    }
+    return value;
+  }
+}
+
+static Bits bits_zero(uint32_t width) {
+  return Bits((width + 31) / 32, 0);
+}
+
+template <typename T>
+static void put_field(T& sig, uint32_t lsb, uint32_t width, const Bits& v) {
+  for (uint32_t i = 0; i < width; i += 32) {
+    set_bits(sig, lsb + i, std::min(32u, width - i), v[i / 32]);
+  }
+}
+
+template <typename T>
+static Bits get_field(const T& sig, uint32_t lsb, uint32_t width) {
+  Bits v = bits_zero(width);
+  for (uint32_t i = 0; i < width; i += 32) {
+    v[i / 32] = static_cast<uint32_t>(get_bits(sig, lsb + i, std::min(32u, width - i)));
+  }
+  return v;
+}
+
+static std::string hex(const Bits& v, uint32_t width) {
+  std::string s;
+  for (uint32_t w = (width + 31) / 32; w-- > 0;) {
+    char buf[16];
+    std::snprintf(buf, sizeof(buf), "%08x", v[w]);
+    s += buf;
+  }
+  return s;
+}
+
+static std::string strf(const char* fmt, ...) {
+  char buf[1024];
+  va_list args;
+  va_start(args, fmt);
+  std::vsnprintf(buf, sizeof(buf), fmt, args);
+  va_end(args);
+  return buf;
+}
+
+static uint32_t popcount(uint64_t x) {
+  return static_cast<uint32_t>(__builtin_popcountll(x));
+}
+
+static const char* kind_name(int k) {
+  switch (k) {
+  case ref::NONE:   return "NONE";
+  case ref::LOCAL:  return "LOCAL";
+  case ref::REMOTE: return "REMOTE";
+  case ref::OOB:    return "OOB";
+  default:          return "masked";
+  }
+}
+
+///////////////////////////////////////////////////////////////////////////////
+
+struct Options {
+  std::string mode = "all";
+  uint32_t seed     = 1;
+  uint32_t launches = 40;
+  uint32_t cycles   = 3000;   // traffic cycles per launch
+  uint32_t watchdog = 2000;
+  bool     oob      = true;   // generate out-of-bounds lanes
+};
+
+// A peer-table row as driven: all MAX_CLUSTER peers, valid or not.
+struct TblRow {
+  uint32_t k = 0;
+  std::vector<ref::Peer> peers;
+};
+
+struct Request {
+  uint64_t seq = 0;
+  bool     rw = false;
+  uint64_t mask = 0;
+  bool     fence = false;
+  uint32_t wid = 0;
+  uint32_t cta = 0;
+  uint32_t pid = 0;
+  std::vector<uint32_t> byteen;
+  std::vector<uint64_t> addr;   // word addresses
+  std::vector<Bits>     attr;
+  std::vector<uint64_t> data;
+  Bits     tag;                 // raw; the top merges wid/cta/pid/fence into it
+
+  // Captured when the stage accepts it.
+  uint64_t entry_cycle = 0;
+  uint32_t row_k = 0;
+  uint32_t stride = 0;
+  Bits     tag_eff;
+  std::vector<uint64_t> exp_addr;
+  std::vector<Bits>     exp_attr;
+  std::vector<int>      kind;   // -1: not translated (masked lane or fence)
+  uint64_t exp_remote = 0;
+  uint64_t exp_oob = 0;
+};
+
+enum class ReadyKind { ALWAYS, RANDOM, STALL };
+
+struct ReadyPhase {
+  ReadyKind kind = ReadyKind::ALWAYS;
+  uint32_t  pct = 100;
+  uint32_t  left = 0;
+};
+
+enum LaneClass {
+  LC_IN, LC_OOB_RANK, LC_OOB_OFF, LC_EDGE,
+  LC_GLOBAL, LC_LMEM, LC_IO, LC_BELOW, LC_END, LC_PAST, LC_ALIAS, LC_FLIP,
+  LC_COUNT
+};
+
+class Testbench {
+public:
+  explicit Testbench(const Options& opts) : opts_(opts), rng_(opts.seed) {
+    auto* t = sim_.operator->();
+    t->eval();
+    ncc_      = t->cfg_ncc;
+    nw_       = t->cfg_nw;
+    maxc_     = t->cfg_max_cluster;
+    lmem_log_ = t->cfg_lmem_log;
+    nb_       = t->cfg_blocks;
+    nl_       = t->cfg_lanes;
+    aw_       = t->cfg_addr_w;
+    attr_w_   = t->cfg_attr_w;
+    tag_w_    = t->cfg_tag_w;
+    rsp_w_    = t->cfg_rsp_w;
+    pid_w_    = t->cfg_pid_w;
+    nw_w_     = t->cfg_nw_w;
+    k_w_      = t->cfg_k_w;
+    core_w_   = t->cfg_core_w;
+    hart_w_   = t->cfg_hart_w;
+    hart_lsb_core_ = t->cfg_hart_core_lsb;
+    nt_bits_  = t->cfg_nt_bits;
+    core_id_  = t->cfg_core_id;
+    cnt_w_    = ref::clog2(nl_ + 1);
+    my_core_  = core_id_ % ncc_;
+    rb_       = ref::clog2(maxc_);
+    pid_bits_ = nt_bits_ - ref::clog2(nl_);
+
+    Bits m_local = get_field(t->cfg_attr_local, 0, attr_w_);
+    Bits m_io    = get_field(t->cfg_attr_io, 0, attr_w_);
+    Bits m_hart  = get_field(t->cfg_attr_hart, 0, attr_w_);
+    attr_local_pos_ = this->single_bit(m_local, "is_addr_local");
+    attr_io_pos_    = this->single_bit(m_io, "is_addr_io");
+    attr_hart_lsb_  = attr_w_;
+    uint32_t hart_bits = 0;
+    for (uint32_t i = 0; i < attr_w_; ++i) {
+      if (get_bits(m_hart, i, 1)) {
+        attr_hart_lsb_ = std::min(attr_hart_lsb_, i);
+        ++hart_bits;
+      }
+    }
+    if (hart_bits != hart_w_ || get_bits(m_hart, attr_hart_lsb_, hart_w_) != ref::low_mask(hart_w_)) {
+      std::printf("FATAL: hart_id attribute field is not %u contiguous bits\n", hart_w_);
+      std::exit(2);
+    }
+
+    // The top's shape must be the one VX_config.h describes.
+    uint32_t sockets = (VX_CFG_NUM_CORES / VX_CFG_SOCKET_SIZE) > 0 ? (VX_CFG_NUM_CORES / VX_CFG_SOCKET_SIZE) : 1;
+    if (ncc_ != sockets * VX_CFG_SOCKET_SIZE || nw_ != VX_CFG_NUM_WARPS || maxc_ != uint32_t(VX_CFG_DLMEM_MAX_CLUSTER)
+     || lmem_log_ != uint32_t(VX_CFG_LMEM_LOG_SIZE) || nl_ != uint32_t(VX_CFG_NUM_LSU_LANES)
+     || aw_ != uint32_t(VX_CFG_MEM_ADDR_WIDTH) - 3 || nt_bits_ != ref::clog2(VX_CFG_NUM_THREADS)) {
+      std::printf("FATAL: top shape differs from VX_config.h\n");
+      std::exit(2);
+    }
+
+    cfg_.ncc         = ncc_;
+    cfg_.nw          = nw_;
+    cfg_.nt          = VX_CFG_NUM_THREADS;
+    cfg_.max_cluster = maxc_;
+    cfg_.lmem_log    = lmem_log_;
+    cfg_.num_gangs   = 0;
+    cfg_.socket_size = VX_CFG_SOCKET_SIZE;
+    cfg_.num_sockets = sockets;
+    cfg_.dlmem_base  = VX_MEM_DLMEM_BASE_ADDR;
+    cfg_.lmem_base   = VX_MEM_LMEM_BASE_ADDR;
+    win_bytes_       = uint64_t(1) << (lmem_log_ + rb_);
+
+    rows_.assign(nw_, TblRow{});
+    for (auto& r : rows_) {
+      r.peers.assign(maxc_, ref::Peer{0, 0});
+    }
+    stride_ = 0;
+    offer_.resize(nb_);
+    queue_.resize(nb_);
+    ready_.assign(nb_, true);
+    ready_prev_.assign(nb_, false);
+    phase_.resize(nb_);
+    entered_prev_.assign(nb_, std::nullopt);
+    valid_prev_.assign(nb_, false);
+    rsp_valid_.assign(nb_, false);
+    rsp_ready_.assign(nb_, false);
+    rsp_data_.assign(nb_, bits_zero(rsp_w_));
+
+    t->reset = 1;
+    this->drive();
+    for (int i = 0; i < 8; ++i) {
+      tick_ = sim_.step(tick_, 2);
+    }
+    t->reset = 0;
+  }
+
+  int run() {
+    std::printf("dlmem_xlate: ncc=%u nw=%u max_cluster=%u lmem_log=%u blocks=%u lanes=%u core_id=%u (core %u) "
+                "rank_bits=%u addr_w=%u attr_w=%u tag_w=%u mode=%s seed=%u oob=%d\n",
+                ncc_, nw_, maxc_, lmem_log_, nb_, nl_, core_id_, my_core_, rb_, aw_, attr_w_, tag_w_,
+                opts_.mode.c_str(), opts_.seed, opts_.oob);
+    if (opts_.mode == "directed" || opts_.mode == "all") {
+      this->run_directed();
+    }
+    if (opts_.mode == "random" || opts_.mode == "all") {
+      this->run_random();
+    }
+    if (opts_.mode == "oob") {
+      this->run_oob();
+    }
+    if (failures_ != 0) {
+      std::printf("FAILED: %u check(s) failed\n", failures_);
+      return 1;
+    }
+    std::printf("PASSED\n");
+    return 0;
+  }
+
+private:
+  ///////////////////////////////////////////////////////////////////////////
+  // helpers
+
+  uint32_t single_bit(const Bits& m, const char* what) {
+    uint32_t pos = attr_w_, n = 0;
+    for (uint32_t i = 0; i < attr_w_; ++i) {
+      if (get_bits(m, i, 1)) {
+        pos = i;
+        ++n;
+      }
+    }
+    if (n != 1) {
+      std::printf("FATAL: attribute field %s is not one bit\n", what);
+      std::exit(2);
+    }
+    return pos;
+  }
+
+  uint64_t rnd() {
+    return rng_();
+  }
+
+  uint32_t below(uint64_t n) {
+    return static_cast<uint32_t>(rng_() % n);
+  }
+
+  bool chance(uint32_t pct) {
+    return below(100) < pct;
+  }
+
+  Bits rand_bits(uint32_t width) {
+    Bits v = bits_zero(width);
+    for (auto& w : v) {
+      w = static_cast<uint32_t>(rng_());
+    }
+    if (width % 32) {
+      v.back() &= (1u << (width % 32)) - 1;
+    }
+    return v;
+  }
+
+  void fail(const std::string& msg) {
+    ++failures_;
+    if (failures_ <= 20) {
+      std::printf("FAIL [cycle %" PRIu64 "] %s\n", cycle_, msg.c_str());
+    } else if (failures_ == 21) {
+      std::printf("... further failure messages suppressed\n");
+    }
+  }
+
+  uint32_t usable(uint32_t stride) const {
+    return ref::usable_slots(cfg_, stride);
+  }
+
+  ref::Row golden_row(const TblRow& r) const {
+    ref::Row g;
+    g.k = r.k;
+    g.peers.assign(r.peers.begin(), r.peers.begin() + r.k);
+    return g;
+  }
+
+  uint64_t hart_id(uint32_t wid, uint32_t pid, uint32_t lane) const {
+    uint64_t tid = (pid_bits_ != 0) ? (uint64_t(pid) * nl_ + lane) : lane;
+    uint64_t h = (uint64_t(core_id_) << hart_lsb_core_) | (uint64_t(wid) << nt_bits_) | tid;
+    return h & ref::low_mask(hart_w_);
+  }
+
+  ///////////////////////////////////////////////////////////////////////////
+  // stimulus
+
+  // Peers name slots that fit the launch's stride.
+  TblRow gen_row(uint32_t stride) {
+    TblRow r;
+    uint32_t u = this->usable(stride);
+    uint32_t pick = below(100);
+    r.k = (pick < 10) ? 0 : (pick < 25) ? maxc_ : 1 + below(maxc_);
+    r.peers.resize(maxc_);
+    bool legacy = chance(20);
+    uint32_t base = below(u);
+    for (uint32_t i = 0; i < maxc_; ++i) {
+      if (legacy) {
+        r.peers[i] = {my_core_, (base + i) % u};
+      } else {
+        r.peers[i] = {chance(30) ? my_core_ : below(ncc_), below(u)};
+      }
+    }
+    return r;
+  }
+
+  uint32_t gen_stride() {
+    uint64_t sram = uint64_t(1) << lmem_log_;
+    uint32_t pick = below(100);
+    if (pick < 5)  return 0;
+    if (pick < 15) return 64;
+    if (pick < 25) return uint32_t(sram);
+    if (pick < 40) return uint32_t(std::max<uint64_t>(64, sram / nw_));
+    return uint32_t(64 * (1 + below(sram / 64)));
+  }
+
+  uint64_t word_off(uint64_t lo, uint64_t hi) {   // byte offset in [lo, hi), 8-aligned
+    uint64_t n = (hi - lo) / 8;
+    return lo + 8 * (rng_() % n);
+  }
+
+  uint64_t gen_lane(LaneClass c, const TblRow& row) {
+    uint64_t sram = uint64_t(1) << lmem_log_;
+    uint64_t ranks = uint64_t(1) << rb_;
+    uint64_t base = cfg_.dlmem_base;
+    if (!opts_.oob && (row.k == 0 || stride_ == 0) && (c == LC_IN || c == LC_EDGE)) {
+      c = LC_GLOBAL;
+    }
+    switch (c) {
+    case LC_OOB_RANK:
+      if (row.k < ranks) {
+        uint64_t rank = row.k + rng_() % (ranks - row.k);
+        return base + (rank << lmem_log_) + word_off(0, sram);
+      }
+      [[fallthrough]];
+    case LC_OOB_OFF:
+      if (stride_ < sram) {
+        uint64_t rank = rng_() % ranks;
+        uint64_t off = chance(30) ? stride_ : word_off(stride_, sram);
+        return base + (rank << lmem_log_) + off;
+      }
+      [[fallthrough]];
+    case LC_IN: {
+      if (row.k == 0 || stride_ == 0) {
+        return base + word_off(0, sram);
+      }
+      uint64_t rank = rng_() % row.k;
+      uint64_t pick = below(10);
+      uint64_t off = (pick == 0) ? 0 : (pick == 1) ? stride_ - 8 : word_off(0, stride_);
+      return base + (rank << lmem_log_) + off;
+    }
+    case LC_EDGE:
+      return chance(50) ? base : base + win_bytes_ - 8;
+    case LC_GLOBAL:
+      return (rng_() & ref::low_mask(aw_)) << 3;
+    case LC_LMEM:
+      return cfg_.lmem_base + word_off(0, sram);
+    case LC_IO:
+      return 0x40 + 8 * below(64);
+    case LC_BELOW:
+      return base - 8 * (1 + below(4));
+    case LC_END:
+      return base + win_bytes_ + 8 * below(4);
+    case LC_FLIP: {
+      // One window-prefix bit flipped: every prefix bit must take part in the decode.
+      uint32_t lo = lmem_log_ + rb_;
+      uint32_t bit = lo + below(aw_ + 3 - lo);
+      return (base ^ (uint64_t(1) << bit)) + word_off(0, win_bytes_);
+    }
+    case LC_ALIAS:
+      // A remote encoding past the window must stay an ordinary address.
+      if (ncc_ > ranks) {
+        uint64_t core = ranks + rng_() % (ncc_ - ranks);
+        return base + (core << lmem_log_) + word_off(0, sram);
+      }
+      [[fallthrough]];
+    case LC_PAST:
+    default:
+      return base + win_bytes_ + word_off(0, uint64_t(1) << (lmem_log_ + 4));
+    }
+  }
+
+  LaneClass pick_class() {
+    static const uint32_t weights_oob[LC_COUNT]   = {40, 7, 7, 4, 10, 8, 3, 4, 5, 4, 6, 5};
+    static const uint32_t weights_nooob[LC_COUNT] = {50, 0, 0, 0, 10, 8, 3, 4, 5, 4, 6, 5};
+    const uint32_t* w = opts_.oob ? weights_oob : weights_nooob;
+    uint32_t total = 0;
+    for (uint32_t i = 0; i < LC_COUNT; ++i) {
+      total += w[i];
+    }
+    uint32_t x = below(total);
+    for (uint32_t i = 0; i < LC_COUNT; ++i) {
+      if (x < w[i]) {
+        return LaneClass(i);
+      }
+      x -= w[i];
+    }
+    return LC_GLOBAL;
+  }
+
+  Request gen_request() {
+    Request q;
+    q.seq   = next_seq_++;
+    q.cta   = below(this->usable(stride_));
+    q.wid   = below(nw_);
+    q.pid   = below(uint64_t(1) << pid_w_);
+    q.fence = chance(4);
+    q.rw    = chance(40);
+    uint32_t mpick = below(100);
+    uint64_t full = ref::low_mask(nl_);
+    q.mask = (mpick < 3) ? 0 : (mpick < 25) ? full : (rnd() & full);
+    q.tag  = this->rand_bits(tag_w_);
+    const TblRow& row = rows_[q.cta];
+    bool uniform = chance(30);
+    LaneClass uc = this->pick_class();
+    for (uint32_t i = 0; i < nl_; ++i) {
+      static const uint32_t sizes[] = {1, 2, 4, 8};
+      uint32_t size = sizes[below(4)];
+      uint32_t at = size * below(8 / size);
+      q.byteen.push_back(((1u << size) - 1) << at);
+      LaneClass c = uniform ? uc : this->pick_class();
+      q.addr.push_back(this->gen_lane(c, row) >> 3);
+      q.attr.push_back(this->rand_bits(attr_w_));
+      q.data.push_back(rnd());
+    }
+    return q;
+  }
+
+  // The expected output, from the row and stride current when the stage accepts it.
+  void expect(Request& q) {
+    const TblRow& row = rows_[q.cta];
+    ref::Row g = this->golden_row(row);
+    uint64_t lmem_end = cfg_.lmem_base + (uint64_t(1) << lmem_log_);
+    q.exp_addr = q.addr;
+    q.exp_attr = q.attr;
+    q.kind.assign(nl_, -1);
+    q.row_k = row.k;
+    q.stride = stride_;
+    q.exp_remote = 0;
+    q.exp_oob = 0;
+    for (uint32_t i = 0; i < nl_; ++i) {
+      if (!((q.mask >> i) & 1) || q.fence) {
+        ++n_untranslated_;
+        continue;
+      }
+      uint64_t a = q.addr[i] << 3;
+      ref::Xlate x = ref::translate(cfg_, a, g, my_core_, q.cta, stride_);
+      q.kind[i] = x.kind;
+      ++n_kind_[x.kind];
+      if ((x.out_addr & 63) != (a & 63)) {
+        this->fail(strf("golden: low six address bits changed (0x%" PRIx64 " -> 0x%" PRIx64 ")", a, x.out_addr));
+      }
+      if (x.kind == ref::LOCAL || x.kind == ref::OOB) {
+        if (x.out_addr < cfg_.lmem_base || x.out_addr >= lmem_end) {
+          this->fail(strf("golden: %s lane 0x%" PRIx64 " -> 0x%" PRIx64 " leaves the local window",
+                          kind_name(x.kind), a, x.out_addr));
+        }
+      }
+      if (x.kind == ref::REMOTE) {
+        uint32_t c;
+        uint64_t lb;
+        ref::decode_remote(cfg_, x.out_addr, &c, &lb);
+        if (c != x.core || lb != x.lmem_byte || (x.out_addr >= cfg_.lmem_base && x.out_addr < lmem_end)) {
+          this->fail(strf("golden: remote 0x%" PRIx64 " does not decode to core %u offset 0x%" PRIx64,
+                          x.out_addr, x.core, x.lmem_byte));
+        }
+      }
+      uint64_t enc_end = cfg_.dlmem_base + (uint64_t(ncc_) << lmem_log_);
+      if (x.kind == ref::REMOTE && x.out_addr >= cfg_.dlmem_base + win_bytes_) {
+        ++n_remote_past_;
+      }
+      if (x.kind == ref::NONE && a >= cfg_.dlmem_base + win_bytes_ && a < enc_end) {
+        ++n_alias_none_;
+      }
+      if (x.kind == ref::NONE) {
+        continue;
+      }
+      q.exp_addr[i] = x.out_addr >> 3;
+      Bits& at = q.exp_attr[i];
+      set_bits(at, attr_local_pos_, 1, x.kind != ref::REMOTE);
+      set_bits(at, attr_io_pos_, 1, 0);
+      if (x.kind == ref::REMOTE) {
+        set_bits(at, attr_hart_lsb_, hart_w_, this->hart_id(q.wid, q.pid, i));
+        q.exp_remote |= uint64_t(1) << i;
+      }
+      if (x.kind == ref::OOB) {
+        q.exp_oob |= uint64_t(1) << i;
+      }
+    }
+  }
+
+  ///////////////////////////////////////////////////////////////////////////
+  // DUT access
+
+  void drive() {
+    auto* t = sim_.operator->();
+    set_bits(t->wr_valid, 0, 1, wr_.has_value());
+    if (wr_) {
+      set_bits(t->wr_slot, 0, nw_w_, wr_->first);
+      set_bits(t->wr_k, 0, k_w_, wr_->second.k);
+      for (uint32_t r = 0; r < maxc_; ++r) {
+        set_bits(t->wr_core, r * core_w_, core_w_, wr_->second.peers[r].core);
+        set_bits(t->wr_pslot, r * nw_w_, nw_w_, wr_->second.peers[r].slot);
+      }
+      set_bits(t->wr_stride, 0, lmem_log_ + 1, wr_stride_);
+    }
+    for (uint32_t b = 0; b < nb_; ++b) {
+      const auto& o = offer_[b];
+      set_bits(t->in_valid, b, 1, o.has_value());
+      set_bits(t->out_ready, b, 1, ready_[b]);
+      set_bits(t->mem_rsp_valid, b, 1, rsp_valid_[b]);
+      put_field(t->mem_rsp_data, b * rsp_w_, rsp_w_, rsp_data_[b]);
+      set_bits(t->core_rsp_ready, b, 1, rsp_ready_[b]);
+      if (!o) {
+        continue;
+      }
+      set_bits(t->in_rw, b, 1, o->rw);
+      set_bits(t->in_mask, b * nl_, nl_, o->mask);
+      set_bits(t->in_fence, b, 1, o->fence);
+      set_bits(t->in_wid, b * nw_w_, nw_w_, o->wid);
+      set_bits(t->in_cta, b * nw_w_, nw_w_, o->cta);
+      set_bits(t->in_pid, b * pid_w_, pid_w_, o->pid);
+      put_field(t->in_tag, b * tag_w_, tag_w_, o->tag);
+      for (uint32_t i = 0; i < nl_; ++i) {
+        uint32_t l = b * nl_ + i;
+        set_bits(t->in_byteen, l * 8, 8, o->byteen[i]);
+        set_bits(t->in_addr, l * aw_, aw_, o->addr[i]);
+        put_field(t->in_attr, l * attr_w_, attr_w_, o->attr[i]);
+        set_bits(t->in_data, l * 64, 64, o->data[i]);
+      }
+    }
+  }
+
+  void check_output(uint32_t b, const Request& q) {
+    auto* t = sim_.operator->();
+    std::string id = strf("block %u seq %" PRIu64, b, q.seq);
+    if (get_bits(t->out_rw, b, 1) != q.rw) {
+      this->fail(id + ": rw changed");
+    }
+    if (get_bits(t->out_mask, b * nl_, nl_) != q.mask) {
+      this->fail(id + ": mask changed");
+    }
+    Bits tag = get_field(t->out_tag, b * tag_w_, tag_w_);
+    if (tag != q.tag_eff) {
+      this->fail(strf("%s: tag changed\n  expected %s\n  got      %s", id.c_str(),
+                      hex(q.tag_eff, tag_w_).c_str(), hex(tag, tag_w_).c_str()));
+    }
+    uint64_t remote = get_bits(t->out_remote, b * nl_, nl_);
+    uint64_t oob = get_bits(t->out_oob, b * nl_, nl_);
+    if (remote != q.exp_remote || oob != q.exp_oob) {
+      this->fail(strf("%s: remote/oob flags 0x%" PRIx64 "/0x%" PRIx64 ", expected 0x%" PRIx64 "/0x%" PRIx64,
+                      id.c_str(), remote, oob, q.exp_remote, q.exp_oob));
+    }
+    for (uint32_t i = 0; i < nl_; ++i) {
+      uint32_t l = b * nl_ + i;
+      uint64_t addr = get_bits(t->out_addr, l * aw_, aw_);
+      if (addr != q.exp_addr[i]) {
+        this->fail(strf("%s lane %u (%s): addr 0x%" PRIx64 " -> 0x%" PRIx64 ", expected 0x%" PRIx64
+                        " (cta %u, k %u, stride %u)",
+                        id.c_str(), i, kind_name(q.kind[i]), q.addr[i] << 3, addr << 3, q.exp_addr[i] << 3,
+                        q.cta, q.row_k, q.stride));
+      }
+      if ((addr & 7) != (q.addr[i] & 7)) {
+        this->fail(strf("%s lane %u: low six address bits changed", id.c_str(), i));
+      }
+      Bits attr = get_field(t->out_attr, l * attr_w_, attr_w_);
+      if (attr != q.exp_attr[i]) {
+        this->fail(strf("%s lane %u (%s): attr\n  expected %s\n  got      %s", id.c_str(), i,
+                        kind_name(q.kind[i]), hex(q.exp_attr[i], attr_w_).c_str(), hex(attr, attr_w_).c_str()));
+      }
+      if (get_bits(t->out_byteen, l * 8, 8) != q.byteen[i]) {
+        this->fail(strf("%s lane %u: byteen changed", id.c_str(), i));
+      }
+      if (get_bits(t->out_data, l * 64, 64) != q.data[i]) {
+        this->fail(strf("%s lane %u: data changed", id.c_str(), i));
+      }
+    }
+  }
+
+  // One cycle: drive, sample every handshake before the edge, update the table model, clock.
+  void clock() {
+    auto* t = sim_.operator->();
+    for (uint32_t b = 0; b < nb_; ++b) {
+      rsp_valid_[b] = chance(50);
+      rsp_ready_[b] = chance(50);
+      rsp_data_[b]  = this->rand_bits(rsp_w_);
+    }
+    this->drive();
+    t->eval();
+
+    bool progress = false;
+
+    // The table as written up to the previous cycle.
+    if (get_bits(t->tbl_stride, 0, lmem_log_ + 1) != stride_) {
+      this->fail(strf("table stride %" PRIu64 ", expected %u", get_bits(t->tbl_stride, 0, lmem_log_ + 1), stride_));
+    }
+    for (uint32_t s = 0; s < nw_; ++s) {
+      uint64_t want = (uint64_t(s) * stride_) & ref::low_mask(lmem_log_);
+      uint64_t got = get_bits(t->tbl_slot_base, s * lmem_log_, lmem_log_);
+      if (got != want) {
+        this->fail(strf("slot_base[%u] = 0x%" PRIx64 ", expected 0x%" PRIx64, s, got, want));
+      }
+    }
+
+    for (uint32_t b = 0; b < nb_; ++b) {
+      auto& q = queue_[b];
+      bool empty = get_bits(t->empty, b, 1);
+      if (empty != q.empty()) {
+        this->fail(strf("block %u: empty=%d with %zu request(s) in the stage", b, empty, q.size()));
+      }
+
+      // Responses are wires.
+      if (get_bits(t->core_rsp_valid, b, 1) != rsp_valid_[b]
+       || get_field(t->core_rsp_data, b * rsp_w_, rsp_w_) != rsp_data_[b]
+       || get_bits(t->mem_rsp_ready, b, 1) != rsp_ready_[b]) {
+        this->fail(strf("block %u: response path is not a passthrough", b));
+      }
+
+      bool valid = get_bits(t->out_valid, b, 1);
+      if (valid_prev_[b] && !ready_prev_[b] && !valid) {
+        this->fail(strf("block %u: output dropped while stalled", b));
+      }
+      if (entered_prev_[b] && ready_prev_[b]) {
+        // Accepted last cycle while the output drained: it is the head now.
+        if (!valid || q.empty() || q.front().seq != *entered_prev_[b]) {
+          this->fail(strf("block %u: seq %" PRIu64 " is not at the output one cycle after entering", b,
+                          *entered_prev_[b]));
+        }
+      }
+      bool fire = false;
+      if (valid) {
+        if (q.empty()) {
+          this->fail(strf("block %u: output valid with nothing in the stage", b));
+        } else {
+          this->check_output(b, q.front());
+          fire = ready_[b];
+        }
+      }
+      bool wt_valid = get_bits(t->wt_inc_valid, b, 1);
+      if (fire) {
+        const Request& r = q.front();
+        bool want = r.rw && (r.exp_remote != 0);
+        if (wt_valid != want) {
+          this->fail(strf("block %u seq %" PRIu64 ": wt_inc_valid=%d, expected %d", b, r.seq, wt_valid, want));
+        }
+        if (want) {
+          uint64_t wid = get_bits(t->wt_inc_wid, b * nw_w_, nw_w_);
+          uint64_t cnt = get_bits(t->wt_inc_cnt, b * cnt_w_, cnt_w_);
+          if (wid != r.wid || cnt != popcount(r.exp_remote)) {
+            this->fail(strf("block %u seq %" PRIu64 ": wt_inc wid %" PRIu64 " cnt %" PRIu64 ", expected %u %u",
+                            b, r.seq, wid, cnt, r.wid, popcount(r.exp_remote)));
+          }
+          ++n_wt_inc_;
+          n_wt_stores_ += popcount(r.exp_remote);
+        }
+        if (lane0_) {
+          last_addr0_   = get_bits(t->out_addr, b * nl_ * aw_, aw_);
+          last_remote0_ = get_bits(t->out_remote, b * nl_, 1);
+          last_oob0_    = get_bits(t->out_oob, b * nl_, 1);
+        }
+        q.pop_front();
+        ++n_out_;
+        progress = true;
+      } else if (wt_valid) {
+        this->fail(strf("block %u: wt_inc_valid without an output handshake", b));
+      }
+
+      // Full throughput: a stage drained last cycle accepts this cycle.
+      bool in_ready = get_bits(t->in_ready, b, 1);
+      if (ready_prev_[b] && !in_ready) {
+        this->fail(strf("block %u: not ready after a cycle with the output ready", b));
+      }
+      auto& o = offer_[b];
+      entered_prev_[b].reset();
+      if (o) {
+        if (get_bits(t->row_slot, b * nw_w_, nw_w_) != o->cta) {
+          this->fail(strf("block %u: row_slot is not the request's cta_id", b));
+        }
+        if (in_ready) {
+          o->entry_cycle = cycle_;
+          o->tag_eff = get_field(t->in_tag_eff, b * tag_w_, tag_w_);
+          if (get_bits(o->tag_eff, 0, 1) != o->fence) {
+            this->fail(strf("block %u: merged tag lost the fence bit", b));
+          }
+          this->expect(*o);
+          ++n_in_;
+          n_fence_ += o->fence;
+          entered_prev_[b] = o->seq;
+          q.push_back(*o);
+          max_occ_ = std::max<size_t>(max_occ_, q.size());
+          o.reset();
+          progress = true;
+        }
+      }
+      if (q.size() > 2) {
+        this->fail(strf("block %u: %zu requests in a two-entry stage", b, q.size()));
+      }
+      valid_prev_[b] = valid && !fire;
+      ready_prev_[b] = ready_[b];
+      n_stall_ += valid && !ready_[b];
+    }
+
+    // A write lands at the edge: visible to requests from the next cycle.
+    if (wr_) {
+      rows_[wr_->first] = wr_->second;
+      stride_ = wr_stride_;
+      ++n_writes_;
+      wr_.reset();
+    }
+
+    tick_ = sim_.step(tick_, 2);
+    ++cycle_;
+    if (progress) {
+      last_progress_ = cycle_;
+    }
+  }
+
+  bool busy() const {
+    for (uint32_t b = 0; b < nb_; ++b) {
+      if (offer_[b] || !queue_[b].empty()) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  bool watchdog() {
+    if (this->busy() && cycle_ - last_progress_ > opts_.watchdog) {
+      this->fail(strf("no progress for %u cycles", opts_.watchdog));
+      return true;
+    }
+    return false;
+  }
+
+  void next_ready(uint32_t b) {
+    auto& p = phase_[b];
+    if (p.left == 0) {
+      uint32_t pick = below(100);
+      if (pick < 35) {
+        p = {ReadyKind::ALWAYS, 100, 50 + below(300)};
+      } else if (pick < 80) {
+        static const uint32_t pcts[] = {25, 50, 75, 90};
+        p = {ReadyKind::RANDOM, pcts[below(4)], 50 + below(300)};
+      } else {
+        p = {ReadyKind::STALL, 0, 10 + below(60)};
+      }
+    }
+    --p.left;
+    ready_[b] = (p.kind == ReadyKind::ALWAYS) || (p.kind == ReadyKind::RANDOM && chance(p.pct));
+  }
+
+  ///////////////////////////////////////////////////////////////////////////
+  // modes
+
+  void drain() {
+    while (this->busy() && !this->watchdog()) {
+      for (uint32_t b = 0; b < nb_; ++b) {
+        this->next_ready(b);
+      }
+      this->clock();
+    }
+  }
+
+  void write_all_rows(uint32_t stride) {
+    for (uint32_t s = 0; s < nw_; ++s) {
+      wr_stride_ = stride;
+      wr_ = std::make_pair(s, this->gen_row(stride));
+      for (uint32_t b = 0; b < nb_; ++b) {
+        this->next_ready(b);
+      }
+      this->clock();
+    }
+  }
+
+  void run_random() {
+    uint32_t offer_pct = 100;
+    for (uint32_t l = 0; l < opts_.launches && failures_ == 0; ++l) {
+      this->drain();
+      this->write_all_rows(this->gen_stride());
+      n_strides_.push_back(stride_);
+      for (uint32_t c = 0; c < opts_.cycles; ++c) {
+        if (c % 200 == 0) {
+          static const uint32_t pcts[] = {100, 100, 60, 25};
+          offer_pct = pcts[below(4)];
+        }
+        for (uint32_t b = 0; b < nb_; ++b) {
+          this->next_ready(b);
+          if (!offer_[b] && chance(offer_pct)) {
+            offer_[b] = this->gen_request();
+          }
+        }
+        // A rewrite between generation and entry could make an in-bounds lane out of bounds.
+        if (opts_.oob && chance(10)) {
+          wr_stride_ = stride_;
+          wr_ = std::make_pair(below(nw_), this->gen_row(stride_));
+        }
+        this->clock();
+        if (this->watchdog()) {
+          break;
+        }
+      }
+    }
+    this->drain();
+    std::printf("random: %" PRIu64 " cycles, %" PRIu64 " requests in, %" PRIu64 " out, %" PRIu64 " fences, "
+                "%" PRIu64 " row writes, %" PRIu64 " stalled output cycles, max occupancy %zu\n",
+                cycle_, n_in_, n_out_, n_fence_, n_writes_, n_stall_, max_occ_);
+    std::printf("random: lanes NONE %" PRIu64 ", LOCAL %" PRIu64 ", REMOTE %" PRIu64 ", OOB %" PRIu64
+                ", untranslated %" PRIu64 "; remote-store events %" PRIu64 " (%" PRIu64 " stores)\n",
+                n_kind_[ref::NONE], n_kind_[ref::LOCAL], n_kind_[ref::REMOTE], n_kind_[ref::OOB],
+                n_untranslated_, n_wt_inc_, n_wt_stores_);
+    std::printf("random: remote lanes encoded past the window %" PRIu64 ", outside lanes inside the remote "
+                "encoding range %" PRIu64 "\n", n_remote_past_, n_alias_none_);
+    std::string s;
+    for (uint32_t v : n_strides_) {
+      s += strf(" %u", v);
+    }
+    std::printf("random: strides%s\n", s.c_str());
+    if (n_in_ != n_out_) {
+      this->fail(strf("%" PRIu64 " requests entered, %" PRIu64 " left", n_in_, n_out_));
+    }
+    if (n_kind_[ref::LOCAL] == 0 || n_kind_[ref::NONE] == 0 || (opts_.oob && n_kind_[ref::OOB] == 0)
+     || (ncc_ > 1 && n_kind_[ref::REMOTE] == 0) || (ncc_ > 1 && n_wt_inc_ == 0)
+     || (ncc_ > (1u << rb_) && (n_remote_past_ == 0 || n_alias_none_ == 0))) {
+      this->fail("random traffic missed a lane kind");
+    }
+  }
+
+  // One request, lane 0 only, through an always-ready stage.
+  void one_request(uint32_t cta, uint64_t byte_addr) {
+    Request q;
+    q.seq = next_seq_++;
+    q.cta = cta;
+    q.wid = below(nw_);
+    q.pid = below(uint64_t(1) << pid_w_);
+    q.rw = chance(50);
+    q.mask = 1;
+    q.tag = this->rand_bits(tag_w_);
+    for (uint32_t i = 0; i < nl_; ++i) {
+      q.byteen.push_back(0xff);
+      q.addr.push_back(i == 0 ? (byte_addr >> 3) : (rnd() & ref::low_mask(aw_)));
+      q.attr.push_back(this->rand_bits(attr_w_));
+      q.data.push_back(rnd());
+    }
+    offer_[0] = q;
+    ready_.assign(nb_, true);
+    for (uint32_t c = 0; c < 4; ++c) {
+      this->clock();
+    }
+    if (this->busy()) {
+      this->fail("directed request did not leave the stage");
+    }
+  }
+
+  void run_directed() {
+#if XLATE_HAVE_VECTORS
+    using namespace dlmem_xlate_vec;
+    if (kDlmemBase != cfg_.dlmem_base || kLmemBase != cfg_.lmem_base) {
+      this->fail("the vector table's DLMEM/LMEM bases differ from VX_types.h");
+      return;
+    }
+    uint32_t ran = 0, skipped = 0;
+    lane0_ = true;
+    for (uint32_t n = 0; n < kNumVectors; ++n) {
+      const Vector& v = kVectors[n];
+      const Shape& sh = kShapes[v.shape];
+      ref::Cfg vc = cfg_;
+      vc.ncc         = sh.ncc;
+      vc.nw          = sh.nw;
+      vc.max_cluster = sh.max_cluster;
+      vc.lmem_log    = sh.lmem_log;
+      ref::Row row;
+      row.k = v.k;
+      for (uint32_t r = 0; r < v.k; ++r) {
+        row.peers.push_back({v.peers[r].core, v.peers[r].slot});
+      }
+      // The hand-computed table must agree with the golden model, whatever the build.
+      ref::Xlate g = ref::translate(vc, v.addr, row, sh.my_core, v.my_slot, v.stride);
+      if (uint32_t(g.kind) != v.kind || g.out_addr != v.out_addr || (v.kind != K_NONE && g.core != v.core)) {
+        this->fail(strf("vector %s: dlmem_ref gives %s core %u 0x%" PRIx64 ", the table %s core %u 0x%" PRIx64,
+                        v.name, kind_name(g.kind), g.core, g.out_addr, kind_name(v.kind), v.core, v.out_addr));
+      }
+      bool fits = sh.ncc == ncc_ && sh.max_cluster == maxc_ && sh.lmem_log == lmem_log_ && sh.my_core == my_core_
+               && v.my_slot < nw_;
+      for (const auto& p : row.peers) {
+        fits = fits && p.slot < nw_;
+      }
+      if (!fits) {
+        ++skipped;
+        continue;
+      }
+      TblRow tr;
+      tr.k = v.k;
+      for (uint32_t r = 0; r < maxc_; ++r) {
+        tr.peers.push_back(r < v.k ? ref::Peer{v.peers[r].core, v.peers[r].slot}
+                                   : ref::Peer{below(ncc_), below(nw_)});
+      }
+      wr_stride_ = v.stride;
+      wr_ = std::make_pair(v.my_slot, tr);
+      ready_.assign(nb_, true);
+      this->clock();
+      uint32_t before = failures_;
+      uint64_t outs = n_out_;
+      this->one_request(v.my_slot, v.addr);
+      if (n_out_ != outs + 1) {
+        this->fail(strf("vector %s: request did not leave the stage", v.name));
+      } else if (last_addr0_ != (v.out_addr >> 3) || last_remote0_ != (v.kind == K_REMOTE)
+              || last_oob0_ != (v.kind == K_OOB)) {
+        this->fail(strf("vector %s: got 0x%" PRIx64 " remote=%d oob=%d, expected %s 0x%" PRIx64,
+                        v.name, last_addr0_ << 3, last_remote0_, last_oob0_, kind_name(v.kind), v.out_addr));
+      }
+      std::printf("  vector %-26s %-6s 0x%09" PRIx64 " -> 0x%09" PRIx64 " %s\n", v.name, kind_name(v.kind),
+                  v.addr, v.out_addr, (failures_ == before) ? "ok" : "FAIL");
+      ++ran;
+    }
+    lane0_ = false;
+    std::printf("directed: %u vector(s) ran, %u belong to other shapes or cores\n", ran, skipped);
+    if (ran == 0) {
+      this->fail("no directed vector fits this build");
+    }
+#else
+    this->fail("directed mode needs tests/unittest/dlmem_xlate/vectors.h");
+#endif
+  }
+
+  void run_oob() {
+    TblRow r;
+    r.k = 1;
+    r.peers.assign(maxc_, ref::Peer{my_core_, 0});
+    wr_stride_ = 64;
+    wr_ = std::make_pair(0u, r);
+    this->clock();
+    std::printf("oob: issuing an out-of-bounds lane; a bound-checking build must abort here\n");
+    std::fflush(stdout);
+    this->one_request(0, cfg_.dlmem_base + 64);
+  }
+
+  ///////////////////////////////////////////////////////////////////////////
+
+  Options opts_;
+  std::mt19937_64 rng_;
+  vl_simulator<VVX_dlmem_xlate_top> sim_;
+  uint64_t tick_ = 0;
+  uint64_t cycle_ = 0;
+  uint64_t last_progress_ = 0;
+  uint32_t failures_ = 0;
+
+  uint32_t ncc_, nw_, maxc_, lmem_log_, nb_, nl_, aw_, attr_w_, tag_w_, rsp_w_, pid_w_, nw_w_, k_w_, core_w_;
+  uint32_t hart_w_, hart_lsb_core_, nt_bits_, core_id_, cnt_w_, my_core_, rb_, pid_bits_;
+  uint32_t attr_local_pos_, attr_io_pos_, attr_hart_lsb_;
+  uint64_t win_bytes_;
+  ref::Cfg cfg_{};
+
+  std::vector<TblRow> rows_;
+  uint32_t stride_ = 0;
+  std::optional<std::pair<uint32_t, TblRow>> wr_;
+  uint32_t wr_stride_ = 0;
+
+  std::vector<std::optional<Request>> offer_;
+  std::vector<std::deque<Request>> queue_;
+  std::vector<bool> ready_, ready_prev_, valid_prev_;
+  std::vector<ReadyPhase> phase_;
+  std::vector<std::optional<uint64_t>> entered_prev_;
+  std::vector<bool> rsp_valid_, rsp_ready_;
+  std::vector<Bits> rsp_data_;
+  bool     lane0_ = false;
+  uint64_t last_addr0_ = 0;
+  bool     last_remote0_ = false;
+  bool     last_oob0_ = false;
+  uint64_t next_seq_ = 0;
+
+  uint64_t n_in_ = 0, n_out_ = 0, n_fence_ = 0, n_writes_ = 0, n_stall_ = 0;
+  uint64_t n_kind_[4] = {0, 0, 0, 0};
+  uint64_t n_untranslated_ = 0, n_wt_inc_ = 0, n_wt_stores_ = 0;
+  uint64_t n_remote_past_ = 0, n_alias_none_ = 0;
+  size_t max_occ_ = 0;
+  std::vector<uint32_t> n_strides_;
+};
+
+static void usage(const char* prog) {
+  std::printf("usage: %s [--mode=all|directed|random|oob] [--seed=N] [--launches=N] [--cycles=N] "
+              "[--watchdog=N] [--no-oob]\n", prog);
+}
+
+int main(int argc, char** argv) {
+  Verilated::commandArgs(argc, argv);
+  Options opts;
+  for (int i = 1; i < argc; ++i) {
+    std::string a = argv[i];
+    auto val = [&](const char* key) -> const char* {
+      size_t n = std::strlen(key);
+      return (a.compare(0, n, key) == 0) ? a.c_str() + n : nullptr;
+    };
+    if (const char* v = val("--mode=")) {
+      opts.mode = v;
+    } else if (const char* v = val("--seed=")) {
+      opts.seed = std::strtoul(v, nullptr, 0);
+    } else if (const char* v = val("--launches=")) {
+      opts.launches = std::strtoul(v, nullptr, 0);
+    } else if (const char* v = val("--cycles=")) {
+      opts.cycles = std::strtoul(v, nullptr, 0);
+    } else if (const char* v = val("--watchdog=")) {
+      opts.watchdog = std::strtoul(v, nullptr, 0);
+    } else if (a == "--no-oob") {
+      opts.oob = false;
+    } else if (a.rfind("+verilator", 0) == 0) {
+      continue;
+    } else {
+      usage(argv[0]);
+      return 2;
+    }
+  }
+  if (opts.mode != "all" && opts.mode != "directed" && opts.mode != "random" && opts.mode != "oob") {
+    usage(argv[0]);
+    return 2;
+  }
+  Testbench tb(opts);
+  return tb.run();
+}
