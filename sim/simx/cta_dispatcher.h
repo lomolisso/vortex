@@ -38,6 +38,9 @@ struct cta_warp_record_t {
   uint64_t   param;
   uint64_t   lmem_addr;
   uint32_t   cluster_size;
+#ifdef VX_CFG_EXT_DLMEM_ENABLE
+  uint32_t   cluster_rank;
+#endif
 };
 
 // CTA dispatcher: consumes CTAs pushed by the KMU and admits one warp rank

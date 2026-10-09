@@ -30,13 +30,15 @@ tests:
     touches: [hw/rtl/mem, hw/rtl/cache/VX_amo_unit.sv, hw/rtl/cache/VX_amo_alu.sv,
               hw/rtl/VX_gpu_pkg.sv, hw/unittest/local_mem, hw/unittest/lmem_switch,
               hw/unittest/Makefile]
-  # CTA dispatcher: slot placement across launches, each launch opening at slot
-  # 0 as SimX's does, with 4 and 8 CTA slots. The `hw` lane only builds it.
+  # CTA dispatcher and KMU: slot placement across launches, each launch opening
+  # at slot 0 as SimX's does, with 4 and 8 CTA slots. In the xlen-64 tree the
+  # same benches also run in DLMEM builds: the cluster rank on every launch beat
+  # and through the dispatcher's CSR port. The `hw` lane only builds them.
   - id: hw-cta
     via: script
     run: "make -C hw/unittest run-cta"
-    touches: [hw/rtl/core/VX_cta_dispatch.sv, hw/rtl/VX_gpu_pkg.sv, hw/unittest/cta_dispatcher,
-              hw/unittest/Makefile]
+    touches: [hw/rtl/core/VX_cta_dispatch.sv, hw/rtl/VX_kmu.sv, hw/rtl/VX_gpu_pkg.sv,
+              hw/unittest/cta_dispatcher, hw/unittest/kmu, hw/unittest/Makefile]
   # Last-level cache bank (VX_cache_top): a held fill released at every cycle
   # offset around a racing atomic, store or load (also with memory refusing
   # requests), loads replaying ahead of an atomic's writeback while responses

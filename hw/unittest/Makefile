@@ -1,3 +1,9 @@
+ROOT_DIR := $(realpath ../..)
+include $(ROOT_DIR)/config.mk
+
+# Distributed local memory units: the feature is RV64 only.
+DLMEM_UNITS :=
+
 all:
 	$(MAKE) -C generic_queue
 	$(MAKE) -C mem_scheduler
@@ -28,6 +34,7 @@ all:
 	$(MAKE) -C fsqrt_unit
 	$(MAKE) -C fcvt_unit
 	$(MAKE) -C fdivsqrt_unit
+	$(foreach u,$(DLMEM_UNITS),$(MAKE) -C $(u) &&) true
 
 run:
 	$(MAKE) -C generic_queue run
@@ -59,6 +66,7 @@ run:
 	$(MAKE) -C fsqrt_unit run
 	$(MAKE) -C fcvt_unit run
 	$(MAKE) -C fdivsqrt_unit run
+	$(foreach u,$(DLMEM_UNITS),$(MAKE) -C $(u) run &&) true
 
 # FPU arithmetic units only — executed (not just built) so CI gates correctness.
 run-fpu:
@@ -95,16 +103,35 @@ run-lmem:
 	$(call lmem_switch_case,-DVX_CFG_NUM_LSU_LANES=2)
 	$(call lmem_switch_case,-DVX_CFG_NUM_LSU_LANES=4 $(LMEM_BASE) -DVX_CFG_EXT_ZACAS_ENABLE)
 
-# CTA dispatcher: slot placement across launches checked against SimX's
-# per-launch pointer reset, with 4 and 8 CTA slots.
+# CTA launch path: the KMU's cluster walk under launch-bus back-pressure, and
+# the dispatcher's slot placement across launches checked against SimX's
+# per-launch pointer reset, with 4 and 8 CTA slots. With DLMEM (RV64 only) both
+# also carry the cluster rank to the CSR read-back, up to the largest cluster
+# (8 cores) and with a 256 KB local memory.
 define cta_case
 	$(MAKE) -C cta_dispatcher clean
 	$(MAKE) -C cta_dispatcher CONFIGS="$(1)"
 	$(MAKE) -C cta_dispatcher run CONFIGS="$(1)"
+	$(MAKE) -C kmu clean
+	$(MAKE) -C kmu CONFIGS="$(1)"
+	$(MAKE) -C kmu run CONFIGS="$(1)"
 endef
 run-cta:
 	$(call cta_case,)
 	$(call cta_case,-DVX_CFG_NUM_WARPS=8)
+ifeq ($(XLEN),64)
+	$(call cta_case,-DVX_CFG_EXT_DLMEM_ENABLE)
+	$(call cta_case,-DVX_CFG_EXT_DLMEM_ENABLE -DVX_CFG_NUM_CORES=8)
+	$(call cta_case,-DVX_CFG_EXT_DLMEM_ENABLE -DVX_CFG_NUM_WARPS=8 -DVX_CFG_LMEM_LOG_SIZE=18)
+endif
+
+# Distributed local memory units, each over its parameter sets (RV64 only).
+run-dlmem:
+ifeq ($(XLEN),64)
+	@true
+else
+	@echo "run-dlmem: distributed local memory is RV64 only; nothing to run at XLEN $(XLEN)"
+endif
 
 # Cache bank in the last-level role: directed fill/replay races around the
 # atomic engine and the MSHR chains plus randomized traffic, checked against a
@@ -227,3 +254,4 @@ clean:
 	$(MAKE) -C fsqrt_unit clean
 	$(MAKE) -C fcvt_unit clean
 	$(MAKE) -C fdivsqrt_unit clean
+	$(foreach u,$(DLMEM_UNITS),$(MAKE) -C $(u) clean &&) true

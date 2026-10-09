@@ -25,22 +25,45 @@ module VX_kmu_top import VX_gpu_pkg::*;
     input  wire [VX_DCR_DATA_WIDTH-1:0]     dcr_req_data,
 
     // Start trigger: pulse high for one cycle to begin CTA dispatch
-    input  wire                             start
+    input  wire                             start,
+    output wire                             busy,
+
+    // Launch bus, with the compute descriptor unpacked for the bench
+    input  wire                             bus_ready,
+    output wire                             bus_valid,
+    output wire                             bus_eop,
+    output wire [7:0]                       bus_ctx_id,
+    output wire [31:0]                      bus_block_idx_x,
+    output wire [31:0]                      bus_block_idx_y,
+    output wire [31:0]                      bus_block_idx_z,
+    output wire [31:0]                      bus_cluster_size,
+`ifdef VX_CFG_EXT_DLMEM_ENABLE
+    output wire [31:0]                      bus_cluster_rank,
+`endif
+    output wire                             bus_is_first
 );
 
     VX_kmu_bus_if kmu_bus_if();
 
-    // Tie off ready so KMU advances through CTAs immediately
-    assign kmu_bus_if.ready = 1'b1;
+    kmu_req_t kmu_req;
+    assign kmu_req = kmu_req_t'(kmu_bus_if.data);
 
-    `UNUSED_VAR (kmu_bus_if.valid)
+    assign kmu_bus_if.ready = bus_ready;
+    assign bus_valid        = kmu_bus_if.valid;
+    assign bus_eop          = kmu_bus_if.eop;
+    assign bus_ctx_id       = kmu_req.ctx_id;
+    assign bus_block_idx_x  = kmu_req.args.compute.block_idx[0];
+    assign bus_block_idx_y  = kmu_req.args.compute.block_idx[1];
+    assign bus_block_idx_z  = kmu_req.args.compute.block_idx[2];
+    assign bus_cluster_size = 32'(kmu_req.args.compute.cluster_size);
+`ifdef VX_CFG_EXT_DLMEM_ENABLE
+    assign bus_cluster_rank = 32'(kmu_req.args.compute.cluster_rank);
+`endif
+    assign bus_is_first     = kmu_req.args.compute.is_first_of_cluster;
+
     `UNUSED_VAR (kmu_bus_if.kind)
-    `UNUSED_VAR (kmu_bus_if.eop)
     `UNUSED_VAR (kmu_bus_if.dest)
-    `UNUSED_VAR (kmu_bus_if.data)
-
-    wire kmu_busy;
-    `UNUSED_VAR (kmu_busy)
+    `UNUSED_VAR (kmu_req)
 
     VX_kmu kmu (
         .clk           (clk),
@@ -50,9 +73,8 @@ module VX_kmu_top import VX_gpu_pkg::*;
         .dcr_req_addr  (dcr_req_addr),
         .dcr_req_data  (dcr_req_data),
         .start         (start),
-        .busy          (kmu_busy),
+        .busy          (busy),
         .kmu_bus_if    (kmu_bus_if)
     );
 
 endmodule
-

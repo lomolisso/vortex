@@ -419,7 +419,8 @@ CP regfile is the only producer on every target.
 | `[33:26]` | 8 | log2 local_mem_size | `VX_CAPS_LOCAL_MEM_SIZE` |
 | `[36:34]` | 3 | log2 num_mem_banks | `VX_CAPS_NUM_MEM_BANKS` |
 | `[41:37]` | 5 | mem_bank_size, biased by 20 | `VX_CAPS_MEM_BANK_SIZE` |
-| `[63:42]` | 22 | reserved | — |
+| `[48:42]` | 7 | largest distributed thread-block cluster (0 without DLMEM) | `VX_CAPS_DLMEM_MAX_CLUSTER` |
+| `[63:49]` | 15 | reserved | — |
 
 `VX_CAPS_NUM_CORES` is derived, not a field:
 `num_clusters × cluster_size × socket_size`. `CACHE_LINE_SIZE`,
@@ -431,7 +432,7 @@ encoded here — `decode_caps` returns false and the backend resolves them.
 `[29:0]` RISC-V MISA standard bits, `[31:30]` an XLEN code
 (`1 << (code + 4)`, produced as `clog2(XLEN) - 4`), `[63:32]` Vortex
 extension bits (ICACHE, DCACHE, L2CACHE, L3CACHE, LMEM, ZICOND, TEX,
-RASTER, OM, TCU, DXA, RTU).
+RASTER, OM, TCU, DXA, RTU, DLMEM).
 
 **Feature bits live in `CP_DEV_CAPS` (`0x008`), not `GPU_DEV_CAPS`** — the
 upper byte of the CP's own caps word is free, and the Emulation CP uses it

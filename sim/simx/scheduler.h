@@ -57,6 +57,9 @@ struct cta_csrs_t {
   uint64_t entry;
   uint64_t lmem_addr;
   uint32_t cluster_size;
+#ifdef VX_CFG_EXT_DLMEM_ENABLE
+  uint32_t cluster_rank;
+#endif
 
   cta_csrs_t()
     : cta_id(0)
@@ -65,6 +68,9 @@ struct cta_csrs_t {
     , entry(0)
     , lmem_addr(0)
     , cluster_size(1)
+#ifdef VX_CFG_EXT_DLMEM_ENABLE
+    , cluster_rank(0)
+#endif
   {
     thread_idx[0] = thread_idx[1] = thread_idx[2] = 0;
     block_idx[0]  = block_idx[1]  = block_idx[2]  = 0;

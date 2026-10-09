@@ -81,6 +81,10 @@ inline bool decode_caps(uint64_t dev_caps, uint64_t isa_caps,
   case VX_CAPS_MEM_BANK_SIZE:
     *out = 1ull << (20 + ((dev_caps >> 37) & 0x1f));
     return true;
+  case VX_CAPS_DLMEM_MAX_CLUSTER:
+    // A plain count, not a log2: the knob need not be a power of two.
+    *out = (dev_caps >> 42) & 0x7f;
+    return true;
   default:
     return false;
   }

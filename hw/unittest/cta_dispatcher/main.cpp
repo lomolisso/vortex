@@ -86,7 +86,12 @@ static uint64_t smoke(Sim& sim, uint64_t tick) {
   sim->in_warp_step_z = 0;
   sim->in_ctx_id      = 0;
   sim->in_cluster_size = 1;
+#if VX_CFG_EXT_DLMEM_ENABLED
+  sim->in_cluster_rank = 0;
+#endif
   sim->in_is_first    = 1;
+  sim->csr_rd_wid     = 0;
+  sim->csr_rd_cta_id  = 0;
   sim->active_warps   = 0;
   sim->warp_done      = 0;
   sim->warp_done_wid  = 0;
@@ -199,6 +204,8 @@ public:
     active_ = 0;
     retire_q_.clear();
     lookup_.reset();
+    csr_read_.reset();
+    csr_checks_ = 0;
     owed_ = 0;
     drained_ = 0;
     size_t next = 0;
@@ -220,6 +227,10 @@ public:
       bool accept = sim_->task_in_valid && sim_->task_in_ready;
       bool fire = sim_->cta_fire;
       uint32_t wid = sim_->cta_wid;
+      if (csr_read_ && !this->check_csrs(ctas[*csr_read_])) {
+        return false;
+      }
+      csr_read_.reset();
       if (lookup_) {
         int slot = sim_->schedule_cta_id;
         int& s = slots.at(lookup_->second);
@@ -229,6 +240,11 @@ public:
           std::printf("FAIL: CTA %d has warps in slots %d and %d\n", lookup_->second, s, slot);
           return false;
         }
+        // The slot's context was written as the warp launched; read it back.
+        sim_->csr_rd_wid    = lookup_->first;
+        sim_->csr_rd_cta_id = slot;
+        sim_->eval();
+        csr_read_ = lookup_->second;
         lookup_.reset();
       }
       if (fire) {
@@ -261,16 +277,38 @@ public:
         std::printf("FAIL: no CTA accepted or warp launched for 2000 cycles (next CTA %zu of %zu)\n", next, ctas.size());
         return false;
       }
-      if (next == ctas.size() && cur >= 0 && !this->busy() && !lookup_) {
+      if (next == ctas.size() && cur >= 0 && !this->busy() && !lookup_ && !csr_read_) {
         break;
       }
+    }
+    if (csr_checks_ == 0) {
+      std::printf("FAIL: no CTA context was read back\n");
+      return false;
     }
     return true;
   }
 
 private:
   bool busy() const {
-    return owed_ != 0 || active_ != 0 || !retire_q_.empty() || lookup_.has_value();
+    return owed_ != 0 || active_ != 0 || !retire_q_.empty() || lookup_.has_value() || csr_read_.has_value();
+  }
+
+  // The CTA CSRs of the slot read last cycle must be the launching CTA's own.
+  bool check_csrs(const Cta& c) {
+    ++csr_checks_;
+    bool ok = (sim_->rd_block_idx_x == c.block_idx) && (sim_->rd_cluster_size == c.k);
+#if VX_CFG_EXT_DLMEM_ENABLED
+    ok = ok && (sim_->rd_cluster_rank == c.rank);
+    uint32_t rank = sim_->rd_cluster_rank;
+#else
+    uint32_t rank = c.rank;
+#endif
+    if (!ok) {
+      std::printf("FAIL: launch %u CTA %u (K=%u, rank %u) reads back block %u, cluster size %u, cluster rank %u from slot %u\n",
+                  c.launch + 1, c.block_idx, c.k, c.rank, (uint32_t)sim_->rd_block_idx_x,
+                  (uint32_t)sim_->rd_cluster_size, rank, (uint32_t)sim_->rd_cta_id);
+    }
+    return ok;
   }
 
   void drive(const Cta* c, bool valid) {
@@ -295,6 +333,9 @@ private:
     sim_->in_warp_step_z = 0;
     sim_->in_ctx_id      = d.ctx_id;
     sim_->in_cluster_size = d.k;
+#if VX_CFG_EXT_DLMEM_ENABLED
+    sim_->in_cluster_rank = d.rank;
+#endif
     sim_->in_is_first    = (d.rank == 0);
     sim_->schedule_wid   = lookup_ ? lookup_->first : 0;
     // One retirement per cycle; the warp leaves active_warps as it retires.
@@ -316,6 +357,8 @@ private:
   uint32_t active_ = 0;
   std::deque<uint32_t> retire_q_;
   std::optional<std::pair<uint32_t, int>> lookup_;
+  std::optional<int> csr_read_;
+  uint32_t csr_checks_ = 0;
   uint32_t owed_ = 0; // warps of accepted CTAs not launched yet
   uint32_t drained_ = 0;
 };
@@ -434,7 +477,8 @@ int main(int argc, char **argv) {
 
   Sim sim;
   uint64_t tick = 0;
-  std::printf("cta_dispatcher: warps=%u threads=%u lmem=%u seed=%u\n", NUM_WARPS, NUM_THREADS, LMEM_SIZE, seed);
+  std::printf("cta_dispatcher: warps=%u threads=%u lmem=%u dlmem=%d seed=%u\n", NUM_WARPS, NUM_THREADS, LMEM_SIZE,
+              VX_CFG_EXT_DLMEM_ENABLED, seed);
 
   tick = smoke(sim, tick);
 

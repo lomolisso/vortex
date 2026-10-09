@@ -34,6 +34,14 @@ package VX_gpu_pkg;
     localparam NCTA_BITS  = `CLOG2(NUM_CTA_MAX);
     localparam NCTA_WIDTH = `UP(NCTA_BITS);
 
+`ifdef VX_CFG_EXT_DLMEM_ENABLE
+    // A same-core cluster holds at most one core's warps; a distributed one
+    // spans up to DLMEM_MAX_CLUSTER cores.
+    localparam MAX_CLUSTER_SIZE = `MAX(`VX_CFG_NUM_WARPS, `VX_CFG_DLMEM_MAX_CLUSTER);
+    localparam RANK_W           = `UP(`CLOG2(MAX_CLUSTER_SIZE));
+    localparam CLUSTER_SIZE_W   = RANK_W + 1;
+`endif
+
     localparam XLENB    = `VX_CFG_XLEN / 8;
     localparam XLENB_W  = `CLOG2(XLENB);
     localparam BYTESEL_BITS = (XLENB_W + XLENB_W);
@@ -723,7 +731,12 @@ package VX_gpu_pkg;
                                 + 3*(CTA_TID_WIDTH+1)     // block_dim
                                 + (CTA_TID_WIDTH+1)       // block_size
                                 + 3*CTA_TID_WIDTH         // warp_step
+                            `ifdef VX_CFG_EXT_DLMEM_ENABLE
+                                + CLUSTER_SIZE_W          // cluster_size
+                                + RANK_W                  // cluster_rank
+                            `else
                                 + (NW_WIDTH+1)            // cluster_size
+                            `endif
                                 + 1;                      // is_first_of_cluster
 
     // The envelope takes whichever variant is wider. Compute dominates up to NT=16;
@@ -741,7 +754,12 @@ package VX_gpu_pkg;
         logic [2:0][CTA_TID_WIDTH:0]   block_dim;
         logic [CTA_TID_WIDTH:0]        block_size;
         logic [2:0][CTA_TID_WIDTH-1:0] warp_step;
+    `ifdef VX_CFG_EXT_DLMEM_ENABLE
+        logic [CLUSTER_SIZE_W-1:0]     cluster_size;
+        logic [RANK_W-1:0]             cluster_rank;   // block index within its cluster
+    `else
         logic [NW_WIDTH:0]             cluster_size;
+    `endif
         logic                          is_first_of_cluster;
     } kmu_compute_args_t;
     `PACKAGE_ASSERT($bits(kmu_compute_args_t) == KMU_ARGS_BITS)
@@ -810,6 +828,9 @@ package VX_gpu_pkg;
         logic [`VX_CFG_MEM_ADDR_WIDTH-1:0] param;
         logic [`VX_CFG_MEM_ADDR_WIDTH-1:0] lmem_addr;
         logic [31:0] cluster_size;
+    `ifdef VX_CFG_EXT_DLMEM_ENABLE
+        logic [RANK_W-1:0] cluster_rank;
+    `endif
     } cta_csrs_t;
 
     typedef struct packed {
@@ -821,6 +842,9 @@ package VX_gpu_pkg;
         logic [`VX_CFG_MEM_ADDR_WIDTH-1:0] param;
         logic [`VX_CFG_MEM_ADDR_WIDTH-1:0] lmem_addr;
         logic [31:0]                    cluster_size;
+    `ifdef VX_CFG_EXT_DLMEM_ENABLE
+        logic [RANK_W-1:0]              cluster_rank;
+    `endif
     } cta_ctx_t;
 
     // ── the per-lane launch record ─────────────────────────────────────────

@@ -261,6 +261,9 @@ bool CtaDispatcher::next_warp(bool do_init, cta_warp_record_t* out) {
 
   out->lmem_addr = lmem_addr_;
   out->cluster_size = cta_.cluster_dim[0] * cta_.cluster_dim[1] * cta_.cluster_dim[2];
+#ifdef VX_CFG_EXT_DLMEM_ENABLE
+  out->cluster_rank = cta_.cluster_rank;
+#endif
 
   // Thread mask: full warp or partial last warp.
   out->tmask.resize(num_threads_);

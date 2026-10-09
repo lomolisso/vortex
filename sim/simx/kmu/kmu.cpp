@@ -200,6 +200,11 @@ bool Kmu::next_cta(kmu_req_t* req, uint32_t core_id) {
   req->is_first_of_cluster = (intra_offset_[0] == 0)
                           && (intra_offset_[1] == 0)
                           && (intra_offset_[2] == 0);
+#ifdef VX_CFG_EXT_DLMEM_ENABLE
+  // Walk position inside the cluster (x fastest), the order the RTL counts ranks in.
+  req->cluster_rank = intra_offset_[0]
+                    + cluster_dim_[0] * (intra_offset_[1] + cluster_dim_[1] * intra_offset_[2]);
+#endif
 
   // Advance the intra-cluster offset first (fills the cluster), then the
   // group_origin in (X, Y, Z) order when the inner loop wraps.

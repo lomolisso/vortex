@@ -13,6 +13,14 @@
 
 `include "VX_define.vh"
 
+// Cluster shape and offsets are sized for the largest cluster: one core's warps,
+// or a DLMEM cluster spanning several cores.
+`ifdef VX_CFG_EXT_DLMEM_ENABLE
+`define KMU_CLUSTER_MSB (CLUSTER_SIZE_W-1)
+`else
+`define KMU_CLUSTER_MSB NW_WIDTH
+`endif
+
 module VX_kmu import VX_gpu_pkg::*; import VX_trace_pkg::*; #(
     parameter `STRING INSTANCE_ID = ""
 ) (
@@ -50,10 +58,10 @@ module VX_kmu import VX_gpu_pkg::*; import VX_trace_pkg::*; #(
     // Cluster shape: CTAs in the same cluster are guaranteed
     // co-resident on the same core. Default (1,1,1) reproduces the
     // pre-cluster (size-1) walk order.
-    // Internal-only (not a CSR, not on the kmu bus) and bounded by NUM_WARPS
-    // (cluster members co-resident on one core), so sized NW_WIDTH+1 at the
-    // source rather than stored 32-bit and sliced at each use.
-    reg [2:0][NW_WIDTH:0] dcr_cluster_dim;
+    // Internal-only (not a CSR, not on the kmu bus) and bounded by the largest
+    // cluster, so sized at the source rather than stored 32-bit and sliced at
+    // each use.
+    reg [2:0][`KMU_CLUSTER_MSB:0] dcr_cluster_dim;
     `UNUSED_VAR(dcr_param)
 
     // Internal counters for CTA distribution.
@@ -65,10 +73,10 @@ module VX_kmu import VX_gpu_pkg::*; import VX_trace_pkg::*; #(
     // Effective block_idx[i] = group_origin[i] + intra_offset[i].
     reg [31:0] cta_id;
     reg [2:0][31:0] group_origin;
-    // intra_offset is bounded by dcr_cluster_dim (≤ NUM_WARPS, since cluster
-    // members are co-resident on one core), so NW_WIDTH+1 bits suffice; this
-    // keeps the nested wrap chain narrow instead of a full 32-bit counter.
-    reg [2:0][NW_WIDTH:0] intra_offset;
+    // intra_offset is bounded by dcr_cluster_dim, so the cluster width
+    // suffices; this keeps the nested wrap chain narrow instead of a full
+    // 32-bit counter.
+    reg [2:0][`KMU_CLUSTER_MSB:0] intra_offset;
     reg running;
     reg [7:0] ctx_id_r;
 
@@ -78,23 +86,27 @@ module VX_kmu import VX_gpu_pkg::*; import VX_trace_pkg::*; #(
     // axis), off the output and the KMU->core route.
     reg [2:0][31:0] block_idx_r;
     reg             is_first_r;
+`ifdef VX_CFG_EXT_DLMEM_ENABLE
+    // The intra-cluster walk is linear (x fastest), so a block's rank in its
+    // cluster counts the beats since the cluster began.
+    reg [RANK_W-1:0] rank_r;
+`endif
 
     // Per-kernel launch constants, computed once here and broadcast to every
     // core's dispatcher (identical for all cores, stable for the whole kernel).
-    //   cluster_size : K = cluster_dim product, bounded by NUM_WARPS (cluster
-    //                  members are co-resident on one core), so NW_WIDTH+1 bits
-    //                  suffice; each dim is sliced to that width.
+    //   cluster_size : K = cluster_dim product, bounded by the largest cluster;
+    //                  each dim is sliced to that width.
     //   aligned_lmem_size : per-CTA LMEM footprint rounded up to MEM_BLOCK_SIZE.
     // Registered so the broadcast path is flop-driven; DCRs are written before
     // `start`, so both values are settled before the first CTA is dispatched.
-    reg [NW_WIDTH:0]                 cluster_size_r;
+    reg [`KMU_CLUSTER_MSB:0]                 cluster_size_r;
     reg [`VX_CFG_LMEM_LOG_SIZE:0]    aligned_lmem_size_r;
     always_ff @(posedge clk) begin
         if (reset) begin
-            cluster_size_r      <= (NW_WIDTH+1)'(1);
+            cluster_size_r      <= (`KMU_CLUSTER_MSB+1)'(1);
             aligned_lmem_size_r <= '0;
         end else begin
-            cluster_size_r <= (NW_WIDTH+1)'(dcr_cluster_dim[0] * dcr_cluster_dim[1]
+            cluster_size_r <= (`KMU_CLUSTER_MSB+1)'(dcr_cluster_dim[0] * dcr_cluster_dim[1]
                                           * dcr_cluster_dim[2]);
             aligned_lmem_size_r <=
                 ((`VX_CFG_LMEM_LOG_SIZE+1)'(dcr_lmem_size) + (`VX_CFG_LMEM_LOG_SIZE+1)'(`VX_CFG_MEM_BLOCK_SIZE - 1))
@@ -109,7 +121,7 @@ module VX_kmu import VX_gpu_pkg::*; import VX_trace_pkg::*; #(
         if (reset) begin
             // Defaults to (1,1,1): the cluster shape sizes the launch message, so
             // a launch that never programs it would otherwise stall the stream.
-            dcr_cluster_dim <= {3{(NW_WIDTH+1)'(1)}};
+            dcr_cluster_dim <= {3{(`KMU_CLUSTER_MSB+1)'(1)}};
         end else if (dcr_req_valid && dcr_req_rw) begin
             case(dcr_req_addr)
                 // Program startup PC
@@ -142,9 +154,9 @@ module VX_kmu import VX_gpu_pkg::*; import VX_trace_pkg::*; #(
                 `VX_DCR_KMU_WARP_STEP_Y: dcr_warp_step[1] <= dcr_req_data[CTA_TID_WIDTH-1:0];
                 `VX_DCR_KMU_WARP_STEP_Z: dcr_warp_step[2] <= dcr_req_data[CTA_TID_WIDTH-1:0];
                 // Cluster dimensions
-                `VX_DCR_KMU_CLUSTER_DIM_X: dcr_cluster_dim[0] <= dcr_req_data[NW_WIDTH:0];
-                `VX_DCR_KMU_CLUSTER_DIM_Y: dcr_cluster_dim[1] <= dcr_req_data[NW_WIDTH:0];
-                `VX_DCR_KMU_CLUSTER_DIM_Z: dcr_cluster_dim[2] <= dcr_req_data[NW_WIDTH:0];
+                `VX_DCR_KMU_CLUSTER_DIM_X: dcr_cluster_dim[0] <= dcr_req_data[`KMU_CLUSTER_MSB:0];
+                `VX_DCR_KMU_CLUSTER_DIM_Y: dcr_cluster_dim[1] <= dcr_req_data[`KMU_CLUSTER_MSB:0];
+                `VX_DCR_KMU_CLUSTER_DIM_Z: dcr_cluster_dim[2] <= dcr_req_data[`KMU_CLUSTER_MSB:0];
                 default: ;
             endcase
         end
@@ -154,9 +166,9 @@ module VX_kmu import VX_gpu_pkg::*; import VX_trace_pkg::*; #(
     // - intra_offset wraps when it reaches dcr_cluster_dim[i]-1.
     // - When intra_offset fully wraps, group_origin advances by
     // dcr_cluster_dim[i] along the appropriate axis.
-    wire [NW_WIDTH:0] intra_x_n = intra_offset[0] + 1'b1;
-    wire [NW_WIDTH:0] intra_y_n = intra_offset[1] + 1'b1;
-    wire [NW_WIDTH:0] intra_z_n = intra_offset[2] + 1'b1;
+    wire [`KMU_CLUSTER_MSB:0] intra_x_n = intra_offset[0] + 1'b1;
+    wire [`KMU_CLUSTER_MSB:0] intra_y_n = intra_offset[1] + 1'b1;
+    wire [`KMU_CLUSTER_MSB:0] intra_z_n = intra_offset[2] + 1'b1;
 
     wire intra_x_wrap = (intra_x_n == dcr_cluster_dim[0]);
     wire intra_y_wrap = intra_x_wrap && (intra_y_n == dcr_cluster_dim[1]);
@@ -210,19 +222,19 @@ module VX_kmu import VX_gpu_pkg::*; import VX_trace_pkg::*; #(
     // `eop` is the walk's own group_complete, one beat early: taken from the same
     // wrap flags the walk latches, so it cannot drift from the CTA it describes,
     // and registered because every field this module drives onto the bus is.
-    wire [NW_WIDTH:0] intra_nx = intra_x_wrap ? '0 : intra_x_n;
-    wire [NW_WIDTH:0] intra_ny = intra_x_wrap ? (intra_y_wrap ? '0 : intra_y_n)
+    wire [`KMU_CLUSTER_MSB:0] intra_nx = intra_x_wrap ? '0 : intra_x_n;
+    wire [`KMU_CLUSTER_MSB:0] intra_ny = intra_x_wrap ? (intra_y_wrap ? '0 : intra_y_n)
                                               : intra_offset[1];
-    wire [NW_WIDTH:0] intra_nz = intra_y_wrap ? (intra_z_wrap ? '0 : intra_z_n)
+    wire [`KMU_CLUSTER_MSB:0] intra_nz = intra_y_wrap ? (intra_z_wrap ? '0 : intra_z_n)
                                               : intra_offset[2];
     wire next_is_last = ((intra_nx + 1'b1) == dcr_cluster_dim[0])
                      && ((intra_ny + 1'b1) == dcr_cluster_dim[1])
                      && ((intra_nz + 1'b1) == dcr_cluster_dim[2]);
     // A launch restarts the walk at offset 0, so its first CTA is also its last
     // exactly when the cluster holds one.
-    wire first_is_last = ((NW_WIDTH+1)'(1) == dcr_cluster_dim[0])
-                      && ((NW_WIDTH+1)'(1) == dcr_cluster_dim[1])
-                      && ((NW_WIDTH+1)'(1) == dcr_cluster_dim[2]);
+    wire first_is_last = ((`KMU_CLUSTER_MSB+1)'(1) == dcr_cluster_dim[0])
+                      && ((`KMU_CLUSTER_MSB+1)'(1) == dcr_cluster_dim[1])
+                      && ((`KMU_CLUSTER_MSB+1)'(1) == dcr_cluster_dim[2]);
 
     reg is_last_r;
     always_ff @(posedge clk) begin
@@ -247,6 +259,9 @@ module VX_kmu import VX_gpu_pkg::*; import VX_trace_pkg::*; #(
             ctx_id_r  <= '0;
             block_idx_r <= '0;
             is_first_r  <= 1'b0;
+        `ifdef VX_CFG_EXT_DLMEM_ENABLE
+            rank_r      <= '0;
+        `endif
         end else if (start) begin
             running   <= grid_nonempty;
             cta_id    <= 0;
@@ -255,6 +270,9 @@ module VX_kmu import VX_gpu_pkg::*; import VX_trace_pkg::*; #(
             ctx_id_r  <= ctx_id_r + 8'(1);
             block_idx_r <= '0;        // CTA0 = (0,0,0)
             is_first_r  <= 1'b1;      // first CTA is the first of its cluster
+        `ifdef VX_CFG_EXT_DLMEM_ENABLE
+            rank_r      <= '0;
+        `endif
         end else if (kmu_bus_if_fire) begin
             cta_id <= cta_id + 1;
 
@@ -304,6 +322,9 @@ module VX_kmu import VX_gpu_pkg::*; import VX_trace_pkg::*; #(
             // block_idx / is_first tracked in lockstep (single 32-bit add/axis).
             // Next intra is all-zero exactly when this fire completes a cluster.
             is_first_r <= group_complete;
+        `ifdef VX_CFG_EXT_DLMEM_ENABLE
+            rank_r     <= group_complete ? '0 : (rank_r + RANK_W'(1));
+        `endif
             if (group_complete) begin
                 // intra resets to 0 -> block_idx follows the next group origin
                 if (origin_x_n == dcr_grid_dim[0]) begin
@@ -346,6 +367,9 @@ module VX_kmu import VX_gpu_pkg::*; import VX_trace_pkg::*; #(
     assign kmu_comp.block_size = dcr_block_size;
     assign kmu_comp.warp_step  = dcr_warp_step;
     assign kmu_comp.cluster_size = cluster_size_r;
+`ifdef VX_CFG_EXT_DLMEM_ENABLE
+    assign kmu_comp.cluster_rank = rank_r;
+`endif
     assign kmu_comp.is_first_of_cluster = is_first_r;
 
     kmu_req_t kmu_req;
@@ -411,3 +435,5 @@ module VX_kmu import VX_gpu_pkg::*; import VX_trace_pkg::*; #(
 `endif
 
 endmodule
+
+`undef KMU_CLUSTER_MSB

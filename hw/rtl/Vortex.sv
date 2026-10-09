@@ -73,6 +73,25 @@ module Vortex import VX_gpu_pkg::*, VX_trace_pkg::*, VX_tlb_pkg::*; (
         ("the A extension needs one shared last-level cache: enable L2 (one cluster) or L3 (several clusters)"));
 `endif
 
+`ifdef VX_CFG_EXT_DLMEM_ENABLE
+`ifndef SYNTHESIS
+    // Rejected at elaboration as a hard error: the simulators build with
+    // non-fatal warnings, which would demote an elaboration $error.
+    function automatic integer dlmem_reject(input logic bad, input string msg);
+        if (bad) begin
+            $fatal(1, "%s", msg);
+        end
+        return 0;
+    endfunction
+    localparam DLMEM_CFG_CHECKED =
+          dlmem_reject((`VX_CFG_DLMEM_MAX_CLUSTER < 1) || (`VX_CFG_DLMEM_MAX_CLUSTER > `VX_CFG_NUM_CORES),
+                       "DLMEM_MAX_CLUSTER must be between 1 and the cores of a cluster")
+        + dlmem_reject(`VX_CFG_SOCKET_SIZE > `VX_CFG_NUM_CORES, "DLMEM requires SOCKET_SIZE <= NUM_CORES")
+        + dlmem_reject(`VX_CFG_LMEM_LOG_SIZE > 18, "DLMEM requires a local memory of at most 256 KB");
+    `UNUSED_PARAM (DLMEM_CFG_CHECKED)
+`endif
+`endif
+
     VX_dcr_bus_if dcr_bus_if();
     assign dcr_bus_if.req_valid = dcr_req_valid;
     assign dcr_bus_if.req_data.rw = dcr_req_rw;

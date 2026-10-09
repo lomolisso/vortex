@@ -132,6 +132,17 @@ ProcessorImpl::ProcessorImpl()
   // L1-only builds keep the dcache as the LLC and never enter this path.
 #endif
 
+#ifdef VX_CFG_EXT_DLMEM_ENABLE
+  static_assert(VX_CFG_XLEN == 64, "DLMEM requires XLEN 64");
+  static_assert(VX_CFG_LMEM_ENABLED, "DLMEM requires the local memory");
+  static_assert(!VX_CFG_EXT_RASTER_ENABLED, "DLMEM does not support the raster extension");
+  static_assert((VX_CFG_DLMEM_MAX_CLUSTER >= 1) && (VX_CFG_DLMEM_MAX_CLUSTER <= VX_CFG_NUM_CORES),
+                "DLMEM_MAX_CLUSTER must be between 1 and the cores of a cluster");
+  // The window stride is the local-memory size, and the RV64 base is only 256 KB aligned.
+  static_assert(VX_CFG_LMEM_LOG_SIZE <= 18, "DLMEM requires a local memory of at most 256 KB");
+  static_assert(VX_CFG_SOCKET_SIZE <= VX_CFG_NUM_CORES, "DLMEM requires SOCKET_SIZE <= NUM_CORES");
+#endif
+
   // connect L3 core interfaces
   for (uint32_t i = 0; i < VX_CFG_NUM_CLUSTERS; ++i) {
     for (uint32_t j = 0; j < VX_CFG_L2_MEM_PORTS; ++j) {

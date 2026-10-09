@@ -39,7 +39,10 @@ module VX_cta_dispatch_top import VX_gpu_pkg::*;
     input  wire [CTA_TID_WIDTH-1:0]     in_warp_step_y,
     input  wire [CTA_TID_WIDTH-1:0]     in_warp_step_z,
     input  wire [7:0]                   in_ctx_id,
-    input  wire [NW_WIDTH:0]            in_cluster_size,
+    input  wire [31:0]                  in_cluster_size,
+`ifdef VX_CFG_EXT_DLMEM_ENABLE
+    input  wire [31:0]                  in_cluster_rank,
+`endif
     input  wire                         in_is_first,
 
     input  wire [`VX_CFG_NUM_WARPS-1:0]        active_warps,
@@ -52,7 +55,17 @@ module VX_cta_dispatch_top import VX_gpu_pkg::*;
 
     // CTA slot (the CTA_ID CSR value) of a launched warp
     input  wire [NW_WIDTH-1:0]          schedule_wid,
-    output wire [NCTA_WIDTH-1:0]        schedule_cta_id
+    output wire [NCTA_WIDTH-1:0]        schedule_cta_id,
+
+    // CTA-CSR read-back of a slot, one cycle after its index
+    input  wire [NW_WIDTH-1:0]          csr_rd_wid,
+    input  wire [NCTA_WIDTH-1:0]        csr_rd_cta_id,
+    output wire [31:0]                  rd_block_idx_x,
+    output wire [31:0]                  rd_cluster_size,
+`ifdef VX_CFG_EXT_DLMEM_ENABLE
+    output wire [31:0]                  rd_cluster_rank,
+`endif
+    output wire [31:0]                  rd_cta_id
 );
 
     VX_kmu_bus_if kmu_bus();
@@ -90,9 +103,18 @@ module VX_cta_dispatch_top import VX_gpu_pkg::*;
         kmu_req.args.compute.warp_step[0] = in_warp_step_x;
         kmu_req.args.compute.warp_step[1] = in_warp_step_y;
         kmu_req.args.compute.warp_step[2] = in_warp_step_z;
-        kmu_req.args.compute.cluster_size = in_cluster_size;
+    `ifdef VX_CFG_EXT_DLMEM_ENABLE
+        kmu_req.args.compute.cluster_size = CLUSTER_SIZE_W'(in_cluster_size);
+        kmu_req.args.compute.cluster_rank = RANK_W'(in_cluster_rank);
+    `else
+        kmu_req.args.compute.cluster_size = (NW_WIDTH+1)'(in_cluster_size);
+    `endif
         kmu_req.args.compute.is_first_of_cluster = in_is_first;
     end
+    `UNUSED_VAR (in_cluster_size)
+`ifdef VX_CFG_EXT_DLMEM_ENABLE
+    `UNUSED_VAR (in_cluster_rank)
+`endif
 
     assign kmu_bus.valid = task_in_valid;
     assign kmu_bus.kind  = KMU_KIND_COMPUTE;
@@ -108,10 +130,15 @@ module VX_cta_dispatch_top import VX_gpu_pkg::*;
     wire                    cta_init;
     wire                    busy;
 
-    // CTA-CSR read-back is unexercised by this bench, so its read indices are
-    // tied off and its outputs are left unused.
     cta_csrs_t              cta_rd_csrs;
     cta_lane_t [`VX_CFG_NUM_THREADS-1:0] cta_rd_lane;
+
+    assign rd_block_idx_x  = cta_rd_csrs.block_idx[0];
+    assign rd_cluster_size = cta_rd_csrs.cluster_size;
+`ifdef VX_CFG_EXT_DLMEM_ENABLE
+    assign rd_cluster_rank = 32'(cta_rd_csrs.cluster_rank);
+`endif
+    assign rd_cta_id       = 32'(cta_rd_csrs.cta_id);
 
     `UNUSED_VAR (cta_PC)
     `UNUSED_VAR (cta_tmask)
@@ -134,8 +161,8 @@ module VX_cta_dispatch_top import VX_gpu_pkg::*;
         .cta_tmask     (cta_tmask),
         .cta_param     (cta_param),
         .cta_init      (cta_init),
-        .csr_rd_wid    ('0),
-        .csr_rd_cta_id ('0),
+        .csr_rd_wid    (csr_rd_wid),
+        .csr_rd_cta_id (csr_rd_cta_id),
         .cta_rd_csrs   (cta_rd_csrs),
         .cta_rd_lane   (cta_rd_lane),
         .schedule_wid  (schedule_wid),

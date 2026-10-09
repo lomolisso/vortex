@@ -74,6 +74,7 @@ typedef struct vx_kernel* vx_kernel_h;
 #define VX_CAPS_VM_SUPPORT          0xF   // 1 if the device has an MMU (VM), else 0
 #define VX_CAPS_VM_PINNED_SIZE      0x10  // pinned-region total size (bytes); 0 if disabled
 #define VX_CAPS_VM_PINNED_FREE      0x11  // pinned-region free  size (bytes); 0 if disabled
+#define VX_CAPS_DLMEM_MAX_CLUSTER   0x12  // largest distributed thread-block cluster; 0 if DLMEM is off
 
 // ============================================================================
 // Device ISA flags  (decode a VX_CAPS_ISA_FLAGS query result)
@@ -109,6 +110,7 @@ typedef struct vx_kernel* vx_kernel_h;
 #define VX_ISA_EXT_TCU              (1ull << (32 + 9))
 #define VX_ISA_EXT_DXA              (1ull << (32 + 10))
 #define VX_ISA_EXT_RTU              (1ull << (32 + 11))
+#define VX_ISA_EXT_DLMEM            (1ull << (32 + 12))
 
 // ============================================================================
 // Device memory access flags  (vx_buffer_create / vx_buffer_access)

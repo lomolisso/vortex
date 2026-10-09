@@ -86,12 +86,15 @@ class Spec:
         # driver (it elaborates the RTL, so build/matrix placement is right) and
         # the runner drives simx as the second leg itself.
         self.check = entry.get("check", "")
-        # model_parity / perf_gate are 32-bit-only gates: the SimX timing model
-        # and the perf baselines are validated against RV32 rtlsim; RV64 is not
-        # gated. Pin the check gates to xlen 32 regardless of the category file's
-        # default (which still governs that file's functional cases), so 64-bit
-        # coverage can't creep back in per-file.
-        if self.check in ("model_parity", "perf_gate"):
+        # The check gates are validated against RV32 rtlsim, so they are pinned
+        # to xlen 32 whatever the category file's default (which still governs
+        # that file's functional cases): 64-bit coverage cannot creep in per file.
+        # A model_parity case may opt in with its OWN `xlen`, for a feature that
+        # exists only at XLEN 64; a file default never un-pins. perf_gate stays
+        # at 32 (lint rejects an entry-level xlen there), its baselines are RV32.
+        self.entry_xlen = "xlen" in entry
+        if self.check == "perf_gate" or (self.check == "model_parity"
+                                         and not self.entry_xlen):
             self.xlens = [32]
         self.tolerance = float(entry.get("tolerance",
                                          defaults.get("tolerance", DEFAULT_PARITY_TOLERANCE)))
@@ -482,6 +485,9 @@ def cmd_lint(args):
                               "(the runner drives simx and rtlsim)".format(c.id))
             if not (0.0 < c.tolerance < 1.0):
                 errors.append("{}: tolerance must be in (0, 1)".format(c.id))
+            if c.check == "perf_gate" and c.entry_xlen:
+                errors.append("{}: perf_gate cases must not set xlen (the gate "
+                              "and its baselines are xlen 32)".format(c.id))
     if errors:
         for e in errors:
             sys.stderr.write("LINT ERROR: " + e + "\n")

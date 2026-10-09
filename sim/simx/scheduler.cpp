@@ -136,6 +136,9 @@ void Scheduler::activate_warp(uint32_t wid, const cta_warp_record_t& rec) {
   warp.cta_csrs.entry         = rec.entry;
   warp.cta_csrs.lmem_addr     = rec.lmem_addr;
   warp.cta_csrs.cluster_size  = rec.cluster_size;
+#ifdef VX_CFG_EXT_DLMEM_ENABLE
+  warp.cta_csrs.cluster_rank  = rec.cluster_rank;
+#endif
 
   while (!warp.ipdom_stack.empty()) warp.ipdom_stack.pop();
 

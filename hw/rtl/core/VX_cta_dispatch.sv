@@ -130,7 +130,12 @@ module VX_cta_dispatch import VX_gpu_pkg::*; #(
     reg [`VX_CFG_MEM_ADDR_WIDTH-1:0] param_r;
     reg [CTA_TID_WIDTH:0]           block_size_r;
     reg [2:0][CTA_TID_WIDTH-1:0]    warp_step_r;
+`ifdef VX_CFG_EXT_DLMEM_ENABLE
+    reg [CLUSTER_SIZE_W-1:0]        cluster_size_r;
+    reg [RANK_W-1:0]                cluster_rank_r;
+`else
     reg [NW_WIDTH:0]                cluster_size_r;
+`endif
     reg                             warp_fire_r;
     reg [NW_WIDTH-1:0]              warp_id_r;
     reg [`VX_CFG_NUM_THREADS-1:0]   warp_tmask_r;
@@ -181,7 +186,11 @@ module VX_cta_dispatch import VX_gpu_pkg::*; #(
     wire                   eff_is_first     = kmu_is_frag ? 1'b1              : kmu_req.args.compute.is_first_of_cluster;
 `else
     wire [CTA_TID_WIDTH:0] eff_block_size   = kmu_req.args.compute.block_size;
+`ifdef VX_CFG_EXT_DLMEM_ENABLE
+    wire [CLUSTER_SIZE_W-1:0] eff_cluster_size = kmu_req.args.compute.cluster_size;
+`else
     wire [NW_WIDTH:0]      eff_cluster_size = kmu_req.args.compute.cluster_size;
+`endif
     wire                   eff_is_first     = kmu_req.args.compute.is_first_of_cluster;
 `endif
 
@@ -318,9 +327,15 @@ module VX_cta_dispatch import VX_gpu_pkg::*; #(
     reg [NW_WIDTH:0] usable_slots_r;
     // Cluster member count K, capped at the slot count (a cluster larger than
     // co-residency degenerates to a clamp).
+`ifdef VX_CFG_EXT_DLMEM_ENABLE
+    wire [CLUSTER_SIZE_W-1:0] cluster_k_raw = eff_cluster_size;
+    wire [NW_WIDTH:0] cluster_k = (cluster_k_raw > CLUSTER_SIZE_W'(usable_slots_r)) ? usable_slots_r
+                                : (cluster_k_raw == 0) ? (NW_WIDTH+1)'(1) : (NW_WIDTH+1)'(cluster_k_raw);
+`else
     wire [NW_WIDTH:0] cluster_k_raw = eff_cluster_size;
     wire [NW_WIDTH:0] cluster_k = (cluster_k_raw > usable_slots_r) ? usable_slots_r
                                 : (cluster_k_raw == 0) ? (NW_WIDTH+1)'(1) : cluster_k_raw;
+`endif
 
     // Occupancy bound, registered (off the ready path). usable = largest m in
     // [1, NUM_WARPS] with m*stride <= LMEM_SIZE; all slots when stride == 0.
@@ -430,7 +445,11 @@ module VX_cta_dispatch import VX_gpu_pkg::*; #(
             done_slot_r     <= '0;
             done_slot_r_dly <= '0;
             cur_slot_r      <= '0;
+        `ifdef VX_CFG_EXT_DLMEM_ENABLE
+            cluster_size_r <= CLUSTER_SIZE_W'(1);  // default: no grouping
+        `else
             cluster_size_r <= (NW_WIDTH+1)'(1);  // default: no grouping
+        `endif
             rem_warps_waddr_r <= '0;
             rem_warps_wdata_r <= '0;
             rem_warps_write_r <= 0;
@@ -490,6 +509,9 @@ module VX_cta_dispatch import VX_gpu_pkg::*; #(
                         block_size_r <= eff_block_size;
                         warp_step_r  <= kmu_req.args.compute.warp_step;
                         cluster_size_r <= eff_cluster_size;
+                    `ifdef VX_CFG_EXT_DLMEM_ENABLE
+                        cluster_rank_r <= kmu_req.args.compute.cluster_rank;
+                    `endif
                         cta_rank_r   <= '0;
                         thread_idx_r <= '0;
 
@@ -575,6 +597,9 @@ module VX_cta_dispatch import VX_gpu_pkg::*; #(
     assign cta_csrs.lmem_addr  = `VX_CFG_MEM_ADDR_WIDTH'(`VX_MEM_LMEM_BASE_ADDR)
                                | `VX_CFG_MEM_ADDR_WIDTH'(cur_lmem_base_r);
     assign cta_csrs.cluster_size = 32'(cluster_size_r);
+`ifdef VX_CFG_EXT_DLMEM_ENABLE
+    assign cta_csrs.cluster_rank = cluster_rank_r;
+`endif
 
     // Busy from the accept cycle (kmu_bus_if_fire), not just while in DISPATCH:
     // the accept->DISPATCH transition is registered, so gating on state alone
@@ -793,6 +818,9 @@ module VX_cta_dispatch import VX_gpu_pkg::*; #(
     assign cta_ctx_wdata.param     = cta_csrs.param;
     assign cta_ctx_wdata.lmem_addr = cta_csrs.lmem_addr;
     assign cta_ctx_wdata.cluster_size = cta_csrs.cluster_size;
+`ifdef VX_CFG_EXT_DLMEM_ENABLE
+    assign cta_ctx_wdata.cluster_rank = cta_csrs.cluster_rank;
+`endif
     assign cta_ctx_wdata.entry     = cta_csrs.entry;
 
     // rdata is valid one cycle after raddr; csr_unit holds its read address
@@ -811,6 +839,9 @@ module VX_cta_dispatch import VX_gpu_pkg::*; #(
     assign cta_rd_csrs.param      = cta_ctx_rdata.param;
     assign cta_rd_csrs.lmem_addr  = cta_ctx_rdata.lmem_addr;
     assign cta_rd_csrs.cluster_size = cta_ctx_rdata.cluster_size;
+`ifdef VX_CFG_EXT_DLMEM_ENABLE
+    assign cta_rd_csrs.cluster_rank = cta_ctx_rdata.cluster_rank;
+`endif
     assign cta_rd_csrs.entry      = cta_ctx_rdata.entry;
 
     // Per-warp -> CTA-id map, latched on launch and indexed by schedule_wid.

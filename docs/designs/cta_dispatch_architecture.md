@@ -31,7 +31,7 @@ and the `start` pulse get there.
 
 ![CTA launch path](../assets/img/cta_dispatch_hierarchy.svg)
 
-There is **one KMU per processor** ([`Vortex.sv:84`](../../hw/rtl/Vortex.sv#L84)),
+There is **one KMU per processor** ([`Vortex.sv:103`](../../hw/rtl/Vortex.sv#L103)),
 and its stream reaches every core through a tree of `VX_kmu_bus_arb` routers.
 Each instance is a **single-stage** router — a merge (N → 1) or a distribute
 (1 → M), never a crossbar
@@ -43,13 +43,13 @@ registered launch link:
 
 | Level | File | Shape | `dest` slice |
 |---|---|---|---|
-| Device | [`Vortex.sv:185`](../../hw/rtl/Vortex.sv#L185) | 1 → `VX_CFG_NUM_CLUSTERS` | `KMU_DEST_LSB_DEVICE` |
+| Device | [`Vortex.sv:204`](../../hw/rtl/Vortex.sv#L204) | 1 → `VX_CFG_NUM_CLUSTERS` | `KMU_DEST_LSB_DEVICE` |
 | Cluster merge | [`VX_cluster.sv:121`](../../hw/rtl/VX_cluster.sv#L121) | 2 → 1 | — |
 | Cluster distribute | [`VX_cluster.sv:133`](../../hw/rtl/VX_cluster.sv#L133) | 1 → `NUM_SOCKETS` | `KMU_DEST_LSB_CLUSTER` |
 | Socket | [`VX_socket.sv:72`](../../hw/rtl/VX_socket.sv#L72) | 1 → `VX_CFG_SOCKET_SIZE` | `KMU_DEST_LSB_SOCKET` |
 
 `NUM_SOCKETS = UP(VX_CFG_NUM_CORES / VX_CFG_SOCKET_SIZE)`
-([`VX_gpu_pkg.sv:149`](../../hw/rtl/VX_gpu_pkg.sv#L149)). The cluster merge is
+([`VX_gpu_pkg.sv:147`](../../hw/rtl/VX_gpu_pkg.sv#L147)). The cluster merge is
 the only fan-in on the trunk: input 0 is the KMU, input 1 is the cluster's
 raster engines — each `VX_raster_launch` is a launch master of its own, and
 `VX_graphics` merges them (`NUM_RASTER_CORES` → 1,
@@ -83,11 +83,11 @@ its input and any beat resident in a per-output skid — into its own `busy`
 combinationally, while the child-busy aggregation stays registered
 ([`VX_socket.sv:901-908`](../../hw/rtl/VX_socket.sv#L901),
 [`VX_cluster.sv:499-510`](../../hw/rtl/VX_cluster.sv#L499),
-[`Vortex.sv:296-302`](../../hw/rtl/Vortex.sv#L296); the raster merge folds its
+[`Vortex.sv:315-321`](../../hw/rtl/Vortex.sv#L315); the raster merge folds its
 own links at [`VX_graphics.sv:213`](../../hw/rtl/VX_graphics.sv#L213)). At the
 source, `kmu_busy` covers the presented cycle; at the sink, the dispatcher's
 `busy` covers the accept cycle and not just `state == DISPATCH`
-([`VX_cta_dispatch.sv:574`](../../hw/rtl/core/VX_cta_dispatch.sv#L574), §5.5);
+([`VX_cta_dispatch.sv:596`](../../hw/rtl/core/VX_cta_dispatch.sv#L596), §5.5);
 between the two, the link-`valid` folds cover every cycle a beat spends in
 flight. The busy tree is
 `VX_cta_dispatch → VX_scheduler:553 → VX_core:483 → VX_socket:908 → VX_cluster:510 → Vortex:302`.
@@ -118,7 +118,7 @@ the host is what lets the dispatcher advance `thread_idx` with three adds and
 two compares instead of a divider (§5.3).
 
 The KMU latches the geometry fields at their natural widths, not at 32 bits
-([`VX_kmu.sv:45-49`](../../hw/rtl/VX_kmu.sv#L45)): `block_dim` and
+([`VX_kmu.sv:53-57`](../../hw/rtl/VX_kmu.sv#L53)): `block_dim` and
 `block_size` are `CTA_TID_WIDTH+1` bits and `warp_step` is `CTA_TID_WIDTH`
 bits, where `CTA_TID_WIDTH = UP(NW_BITS + NT_BITS)` — a CTA maps to a single
 core, so all three are bounded by `NUM_WARPS × NUM_THREADS`, and the runtime
@@ -130,7 +130,17 @@ thread index, and truncating it to `CTA_TID_WIDTH` bits would wrap it to 0.
 `CLUSTER_DIM_{X,Y,Z}` is **internal-only**: not a CSR, and not on the launch
 bus. It is sized `NW_WIDTH+1` at the source rather than stored 32-bit and
 sliced at each use, because cluster members are co-resident on one core and
-therefore bounded by `NUM_WARPS`.
+therefore bounded by `NUM_WARPS`. A DLMEM build (`VX_CFG_EXT_DLMEM_ENABLE`,
+RV64 only) sizes it, `intra_offset` and `cluster_size` by `CLUSTER_SIZE_W =
+RANK_W + 1` instead, where `RANK_W = UP(CLOG2(max(NUM_WARPS,
+VX_CFG_DLMEM_MAX_CLUSTER)))`: a distributed cluster spans up to
+`DLMEM_MAX_CLUSTER` cores.
+
+The host learns what a device supports from two capability ids
+([`caps.h`](../../sw/runtime/common/caps.h)): `VX_ISA_EXT_DLMEM` in
+`VX_CAPS_ISA_FLAGS` (`VX_CFG_MISA_EXT` bit 12), and
+`VX_CAPS_DLMEM_MAX_CLUSTER`, the largest distributed cluster, carried as a
+plain count in device-caps bits [48:42] and 0 in a build without DLMEM.
 
 ### 2.2 `VX_kmu_bus_if` — the wire contract
 
@@ -154,7 +164,7 @@ together*, which differs by kind:
 | FRAGMENT | one wave | always 1 — `VX_raster_launch.sv:158` |
 
 Every launch is a single beat: a fragment carries its stamps in the header
-([`VX_gpu_pkg.sv:776-779`](../../hw/rtl/VX_gpu_pkg.sv#L776)), so nothing on this
+([`VX_gpu_pkg.sv:794-797`](../../hw/rtl/VX_gpu_pkg.sv#L794)), so nothing on this
 bus is multi-beat. A message spans several beats only because a compute
 message is a whole cluster — `eop` delimits it, not the beat count. §4.5 is
 why.
@@ -175,7 +185,7 @@ A launch is either a **compute** launch (a CTA grid: a GPGPU kernel, or a
 graphics geometry stage such as vertex shading or binning, which run as
 compute grids too) or a **fragment** launch (a pixel wave a rasterizer
 pushes). They carry different argument records, so `kmu_req_t`
-([`VX_gpu_pkg.sv:765-773`](../../hw/rtl/VX_gpu_pkg.sv#L765)) is a common
+([`VX_gpu_pkg.sv:783-791`](../../hw/rtl/VX_gpu_pkg.sv#L783)) is a common
 envelope plus a `kind`-discriminated union:
 
 | Envelope | Meaning |
@@ -186,15 +196,16 @@ envelope plus a `kind`-discriminated union:
 | `ctx_id` | 8-bit launch identity, bumped every `start` |
 | `aligned_lmem_size` | per-CTA LMEM footprint, rounded to `MEM_BLOCK_SIZE` |
 
-`args.compute` ([`:735-744`](../../hw/rtl/VX_gpu_pkg.sv#L735)) carries
+`args.compute` ([`:748-761`](../../hw/rtl/VX_gpu_pkg.sv#L748)) carries
 `grid_dim[3]`, `block_idx[3]`, `block_dim[3]`, `block_size`, `warp_step[3]`,
-`cluster_size`, `is_first_of_cluster` — the geometry fields at their
-`CTA_TID_WIDTH`-derived widths (§2.1), not 32 bits. `args.fragment`
-([`:750-756`](../../hw/rtl/VX_gpu_pkg.sv#L750)) carries `stamps[NUM_THREADS]`
+`cluster_size`, `is_first_of_cluster` and, in a DLMEM build, `cluster_rank`
+(`RANK_W` bits) — the geometry fields at their `CTA_TID_WIDTH`-derived widths
+(§2.1), not 32 bits. `args.fragment`
+([`:768-774`](../../hw/rtl/VX_gpu_pkg.sv#L768)) carries `stamps[NUM_THREADS]`
 and `count`, the wave's covered-quad count. The envelope is sized to
 **whichever variant is wider**:
 `KMU_ARGS_BITS = MAX(KMU_COMPUTE_BITS, KMU_FRAG_PAYLOAD_BITS) + 1`
-([`:719-731`](../../hw/rtl/VX_gpu_pkg.sv#L719)). Compute dominates up to
+([`:727-744`](../../hw/rtl/VX_gpu_pkg.sv#L727)). Compute dominates up to
 `NT = 16`; the fragment's per-thread stamps grow with `NT` and overtake it by
 `NT = 32`; the trailing `+1` keeps both variants' `__padding` non-zero-width
 (a zero-width packed field is illegal, and whichever variant is the wider one
@@ -207,13 +218,13 @@ descriptor, whose bits simply read as stamp bits under a fragment `kind`. The
 consumer reconstructs the fragment's degenerate-CTA constants from `kind`
 alone: grid `(1,1,1)`, block index 0, a single warp of
 `count × FRAG_QUAD_LANES` active lanes, cluster size 1
-([`VX_cta_dispatch.sv:167-186`](../../hw/rtl/core/VX_cta_dispatch.sv#L167)).
+([`VX_cta_dispatch.sv:172-195`](../../hw/rtl/core/VX_cta_dispatch.sv#L172)).
 
 Two things are worth noticing about what is *not* here:
 
 - **`cluster_size` is a scalar, not `cluster_dim[3]`.** The KMU computes the
   product once per kernel into `cluster_size_r` and broadcasts that
-  ([`VX_kmu.sv:97-98`](../../hw/rtl/VX_kmu.sv#L97), `:348`).
+  ([`VX_kmu.sv:109-110`](../../hw/rtl/VX_kmu.sv#L109), `:369`).
 - **There is no `cta_id`.** The RTL walk keeps a `cta_id` counter for tracing
   only; it never reaches the bus. A CTA's architectural `VX_CSR_CTA_ID` is
   the *local dispatcher slot* it lands in, assigned on arrival. Two CTAs on
@@ -248,7 +259,7 @@ honour it.
 ![grid walk](../assets/img/cta_grid_walk.svg)
 
 `VX_kmu` walks the grid **two levels deep**
-([`VX_kmu.sv:153-334`](../../hw/rtl/VX_kmu.sv#L153)):
+([`VX_kmu.sv:165-355`](../../hw/rtl/VX_kmu.sv#L165)):
 
 - `intra_offset[i]` advances by 1 and wraps at `dcr_cluster_dim[i]`.
 - When the full intra-cluster volume wraps (`group_complete`),
@@ -263,13 +274,15 @@ reproduces the plain row-major walk.
 
 `intra_offset` is sized `NW_WIDTH+1`, not 32 bits: cluster members are
 co-resident on one core, so the value is bounded by `NUM_WARPS`, and keeping
-it narrow keeps the nested wrap chain narrow.
+it narrow keeps the nested wrap chain narrow. A DLMEM build sizes it
+`CLUSTER_SIZE_W` instead (§2.1), since a distributed cluster can exceed
+`NUM_WARPS`.
 
 ### 3.1 `is_first_of_cluster` is a register
 
 ```systemverilog
-reg is_first_r;                      // VX_kmu.sv:80
-is_first_r <= group_complete;        // VX_kmu.sv:306
+reg is_first_r;                      // VX_kmu.sv:88
+is_first_r <= group_complete;        // VX_kmu.sv:324
 ```
 
 It is **not** a combinational `intra_offset == 0` predicate. The next fire
@@ -300,7 +313,7 @@ CTAs and forwards the frame kick to the raster engines over
 `VX_raster_launch_if`. `raster_start_r` holds `busy` from the start pulse
 until every engine acknowledges, so the launch fence always observes the
 frame; with no raster engines it self-completes. Hence
-`busy = running | raster_start_r` ([`VX_kmu.sv:371`](../../hw/rtl/VX_kmu.sv#L371)).
+`busy = running | raster_start_r` ([`VX_kmu.sv:395`](../../hw/rtl/VX_kmu.sv#L395)).
 
 ---
 
@@ -321,7 +334,7 @@ owns bytes `[i·stride, (i+1)·stride)` **for the whole kernel**.
 
 - **Occupancy bound.** `usable_slots_r` = the largest *m* in `[1, NUM_WARPS]`
   with `m·stride ≤ LMEM_SIZE`, computed by a `NUM_WARPS`-wide comparator tree
-  and **registered** ([`:330-345`](../../hw/rtl/core/VX_cta_dispatch.sv#L330)).
+  and **registered** ([`:345-360`](../../hw/rtl/core/VX_cta_dispatch.sv#L345)).
   `m·stride` is constant-times-variable, so there is no divider. `stride == 0`
   ⇒ all slots usable; a stride exceeding LMEM clamps to 1 rather than 0.
 - **Standalone admission.** Round-robin `tail_r` over `[0, usable_slots_r)`;
@@ -367,6 +380,12 @@ the wrong block.
 
 `get_cluster_rank()` is derived, never sent:
 `CTA_ID % CTA_CLUSTER_SIZE` ([`vx_spawn2.h:133`](../../sw/kernel/include/vx_spawn2.h#L133)).
+A DLMEM build sends it instead, because a distributed cluster's members sit
+on different cores and their slots say nothing about their ranks: the KMU
+counts the beats of each cluster message (`rank_r`, reset at every cluster
+start) into `kmu_compute_args_t.cluster_rank`, the dispatcher latches it per
+CTA into `cta_ctx_ram`, and `VX_CSR_CTA_CLUSTER_RANK` reads it back (§7). For
+a same-core cluster the two agree, since its window opens at a multiple of K.
 
 ### 4.3 Why fixed-stride rather than a byte ring
 
@@ -432,7 +451,7 @@ expressed as message length rather than as a second, parallel lock.
 per-CTA round-robin, bit for bit.
 
 `eop` is the walk's own `group_complete` predicate, registered one beat early
-([`VX_kmu.sv:213-241`](../../hw/rtl/VX_kmu.sv#L213)). Both properties matter:
+([`VX_kmu.sv:225-253`](../../hw/rtl/VX_kmu.sv#L225)). Both properties matter:
 
 - **Derived from the walk**, using the same wrap flags the walk latches, so it
   cannot drift from the CTA it describes. A separate counter over
@@ -505,7 +524,7 @@ free warp; `dispatched_warps` is cleared at accept and prevents offering the
 same warp twice before the scheduler marks it active.
 
 `NUM_THREADS` is a power of two, so every divide is a bit slice
-([`:226-244`](../../hw/rtl/core/VX_cta_dispatch.sv#L226)):
+([`:235-253`](../../hw/rtl/core/VX_cta_dispatch.sv#L235)):
 
 ```systemverilog
 cta_num_warps   = block_size_r[hi] + |block_size_r[lo];   // ceil(block_size / NT)
@@ -525,7 +544,8 @@ in two `VX_dp_ram`s (both `RDW_MODE="R"`, `OUT_REG=1`):
 
 - **`cta_ctx_ram`** — per CTA slot: `cta_size`, `block_idx[3]`,
   `block_dim[3]`, `grid_dim[3]`, `entry`, `param`, `lmem_addr`,
-  `cluster_size`. Written at launch, read by `csr_rd_cta_id`.
+  `cluster_size` and, in a DLMEM build, `cluster_rank`. Written at launch,
+  read by `csr_rd_cta_id`.
 - **`cta_warp_ram`** — per warp: `cta_rank` and `lane_launch[NUM_THREADS]`.
   Written by the TID pipeline, read by `csr_rd_wid`.
 
@@ -539,10 +559,10 @@ launch (fetch/decode/issue ≫ `TID_STAGES`). This has no SimX counterpart.
 The stages carry `block_dim` at its full `CTA_TID_WIDTH+1` width: a dimension
 spans `1..NW·NT` *inclusive*, one bit more than a thread index, and a
 truncated full-width dimension would read as 0 and make every lane wrap
-([`:665-669`](../../hw/rtl/core/VX_cta_dispatch.sv#L665)).
+([`:690-694`](../../hw/rtl/core/VX_cta_dispatch.sv#L690)).
 
 **`lane_launch` is an overlay, not a concatenation** ([`cta_lane_t`,
-`VX_gpu_pkg.sv:838-854`](../../hw/rtl/VX_gpu_pkg.sv#L838)). A warp is
+`VX_gpu_pkg.sv:862-878`](../../hw/rtl/VX_gpu_pkg.sv#L862)). A warp is
 launched *either* as a compute warp (the lane carries its expanded `{x,y,z}`
 thread index, read as `CTA_THREAD_ID_*`) *or* as a fragment warp (the lane
 carries one slice of its quad's stamp, read as `FRAG_*`). They are
@@ -660,7 +680,7 @@ RAM index — one cycle, no reverse lookup, no divider.
 
 ## 7. The CTA CSR surface
 
-Uniform (per-warp / per-CTA) CSRs resolve in `VX_csr_data.sv:210-224` from
+Uniform (per-warp / per-CTA) CSRs resolve in `VX_csr_data.sv:218-232` from
 `sched_csr_if.cta_csrs`; per-lane CSRs resolve in `VX_csr_unit.sv:216-221`
 from `cta_lane`.
 
@@ -677,6 +697,7 @@ from `cta_lane`.
 | `VX_CSR_CTA_CLUSTER_SIZE` | `0xCE0` | `cta_ctx_ram.cluster_size` |
 | `VX_CSR_CTA_ENTRY` | `0xCE1` | `cta_ctx_ram.entry` |
 | `VX_CSR_FRAG_POS` / `VX_CSR_FRAG_PID` | `0xCE2`–`0xCE3` | `cta_lane` low `FRAG_LANE_BITS` slice, quad-gathered (per lane, `EXT_RASTER`) |
+| `VX_CSR_CTA_CLUSTER_RANK` | `0xCE4` | `cta_ctx_ram.cluster_rank`: the block's index in its cluster, x fastest, then y, then z; 0 without clusters (`EXT_DLMEM` only, illegal otherwise) |
 
 `FRAG_*` and `CTA_THREAD_ID_*` read the two views of the same lane bits — the
 CSR unit takes the slice the accessed CSR calls for
@@ -686,12 +707,15 @@ one stamp.
 
 Kernel-side helpers ([`vx_spawn2.h`](../../sw/kernel/include/vx_spawn2.h)):
 `get_local_group_id()` → `CTA_ID`, `get_cluster_size()` → `CTA_CLUSTER_SIZE`,
-`get_cluster_rank()` → `CTA_ID % cluster_size`, `get_sub_group_id()` →
-`CTA_RANK`, `get_num_sub_groups()` → `CTA_SIZE`, `__local_mem()` →
-`CTA_LMEM_ADDR`.
+`get_cluster_rank()` → `CTA_ID % cluster_size` (`CTA_CLUSTER_RANK` in a DLMEM
+build), `get_sub_group_id()` → `CTA_RANK`, `get_num_sub_groups()` →
+`CTA_SIZE`, `__local_mem()` → `CTA_LMEM_ADDR`. A DLMEM kernel also has
+[`vx_dlmem.h`](../../sw/kernel/include/vx_dlmem.h): `vx_cluster_block_rank()`,
+`vx_cluster_num_blocks()`, `vx_cluster_map_shared_rank(p, r)` and the C++
+`vortex::cluster_group`.
 
 Host-side, `cluster_dim[3]` is a field of `vx_launch_info_t`
-([`vortex2.h:202`](../../sw/runtime/include/vortex2.h#L202)).
+([`vortex2.h:204`](../../sw/runtime/include/vortex2.h#L204)).
 
 ---
 
@@ -734,7 +758,7 @@ is cycle-for-cycle identical to it on `vecadd` / `sgemm` / `sgemm_tcu_wg` /
 The KMU→core transport is modelled as per-core **launch lanes**: each lane is
 a registered boundary stage feeding the dispatcher's endpoint, and the KMU
 additionally paces every core with explicit credits — `LAUNCH_CREDITS = 4`
-per core ([`kmu.h:59`](../../sim/simx/kmu/kmu.h#L59)) — spent when a CTA is
+per core ([`kmu.h:62`](../../sim/simx/kmu/kmu.h#L62)) — spent when a CTA is
 sent and returned by the dispatcher one message per admission
 ([`cta_dispatcher.cpp:142`](../../sim/simx/cta_dispatcher.cpp#L142)). The
 bound is the transport's occupancy made explicit — the boundary stage's
@@ -760,7 +784,7 @@ The differences are deliberate, not drift:
 The last row is the significant one: in RTL a fragment wave is a launch that
 traverses the same bus and the same dispatcher as a CTA, whereas SimX's
 per-core Fragment Work Distributor injects fragment warps directly at the
-scheduler ([`scheduler.h:135-160`](../../sim/simx/scheduler.h#L135)). The
+scheduler ([`scheduler.h:141-166`](../../sim/simx/scheduler.h#L141)). The
 `kmu_req_t` union and `lane_launch` overlay exist only on the RTL side.
 
 The `cluster_dim[3]`-vs-`cluster_size` split is a real ABI divergence, though
@@ -805,7 +829,7 @@ a benign one — SimX computes the product where RTL receives it
 
 5. **Retirement RDW cleanup.** `rem_warps_ram` uses `RDW_MODE="R"` with
    two-tier write forwarding
-   ([`:285-288`](../../hw/rtl/core/VX_cta_dispatch.sv#L285)); switching to
+   ([`:294-297`](../../hw/rtl/core/VX_cta_dispatch.sv#L294)); switching to
    `RDW_MODE="W"` collapses the `_rr` shadow and the second compare (§5.4).
 
 6. **PPA quantification.** The fixed-stride allocator's expected −672 flops
@@ -831,6 +855,7 @@ correctly retained for retirement.)
 | [`tests/regression/dxa_copy_mcast/`](../../tests/regression/dxa_copy_mcast/) | multicast against the stride contract (5 CI cells) |
 | [`tests/regression/sgemm2_dxa_mcast/`](../../tests/regression/sgemm2_dxa_mcast/) | multicast under a real GEMM |
 | [`tests/regression/sgemm_tcu_wg_dxa_mcast/`](../../tests/regression/sgemm_tcu_wg_dxa_mcast/) | multicast + TCU workgroup |
+| [`tests/regression/cluster_rank/`](../../tests/regression/cluster_rank/) | DLMEM build: `CTA_CLUSTER_RANK` over 1-, 2- and 3-D cluster shapes, the rank address map, a 256 KB local memory (`dlmem.yaml`) |
 
 ### 11.1 The coverage shape
 

@@ -95,6 +95,19 @@
     `endif
 `endif
 
+// DLMEM's window sits above 4 GB and maps the blocks' local memories; raster launches are unsupported.
+`ifdef VX_CFG_EXT_DLMEM_ENABLE
+    `ifndef VX_CFG_XLEN_64
+        `error "DLMEM requires XLEN 64"
+    `endif
+    `ifndef VX_CFG_LMEM_ENABLE
+        `error "DLMEM requires the local memory"
+    `endif
+    `ifdef VX_CFG_EXT_RASTER_ENABLE
+        `error "DLMEM does not support the raster extension"
+    `endif
+`endif
+
 // Convenience flag: the TCU metadata SRAM is present when any metadata-consuming
 // mode (MX or sparse) is enabled. Internal derived macro — not a VX_CFG_* knob.
 `ifdef VX_CFG_TCU_MX_ENABLE

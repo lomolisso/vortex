@@ -36,6 +36,9 @@ struct kmu_req_t {
   // Launch identity: bumped on every start(), so consecutive launches of the
   // same kernel are still distinct contexts.
   uint8_t  ctx_id;
+#ifdef VX_CFG_EXT_DLMEM_ENABLE
+  uint32_t cluster_rank;
+#endif
 };
 
 // Kernel Management Unit. Holds the in-flight kernel descriptor, walks the

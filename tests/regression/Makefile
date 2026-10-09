@@ -18,6 +18,11 @@ TESTS := \
     occupancy multikernel reopen module_reload single_cta            \
     vm_test vm_fault vm_stress
 
+# Distributed local memory tests: the feature is RV64 only.
+ifeq ($(XLEN),64)
+TESTS += cluster_rank
+endif
+
 # --- common exclude list ---------------------------------------------
 EXCLUDE :=
 

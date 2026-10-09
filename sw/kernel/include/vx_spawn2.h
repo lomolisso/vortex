@@ -131,7 +131,12 @@ static inline __attribute__((always_inline)) uint32_t get_cluster_size() {
 
 // Rank of this CTA within its cluster.
 static inline __attribute__((always_inline)) uint32_t get_cluster_rank() {
+#if VX_CFG_EXT_DLMEM_ENABLED
+  uint32_t __UNIFORM__ v = (uint32_t)csr_read_nv(VX_CSR_CTA_CLUSTER_RANK);
+  return v;
+#else
   return get_local_group_id() % get_cluster_size();
+#endif
 }
 
 static inline __attribute__((always_inline)) uint32_t get_sub_group_id() {

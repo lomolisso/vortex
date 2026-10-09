@@ -121,6 +121,9 @@ Word CsrUnit::get_csr(uint32_t addr, uint32_t wid, uint32_t tid) {
   case VX_CSR_CTA_ENTRY:       return warp.cta_csrs.entry;
   case VX_CSR_CTA_LMEM_ADDR:   return warp.cta_csrs.lmem_addr;
   case VX_CSR_CTA_CLUSTER_SIZE: return warp.cta_csrs.cluster_size;
+#ifdef VX_CFG_EXT_DLMEM_ENABLE
+  case VX_CSR_CTA_CLUSTER_RANK: return warp.cta_csrs.cluster_rank;
+#endif
 
   CSR_READ_64(VX_CSR_MCYCLE, core_perf.cycles);
   CSR_READ_64(VX_CSR_MINSTRET, core_perf.instrs);

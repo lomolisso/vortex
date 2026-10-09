@@ -137,8 +137,8 @@ missing dependency is a real failure.
 
 #### Lint rules
 
-`ci/testcase.py lint` runs in every plan. Two of its rules exist because of
-a specific failure:
+`ci/testcase.py lint` runs in every plan. It also keeps `perf_gate` cases at
+xlen 32 (§3.3). Two of its rules exist because of a specific failure:
 
 | rule | what it prevents |
 |---|---|
@@ -201,6 +201,15 @@ A check is an assertion across runs rather than a clean exit.
 | golden data | none | `ci/baselines/perf/<category>.json` |
 | tier | `full` | `full` |
 | pinned to | the rtlsim driver, which elaborates the RTL | the rtlsim driver |
+| xlen | 32; a case may opt in to 64 with its own `xlen` | 32, always |
+
+**Checks run at XLEN 32.** The SimX timing model and the perf baselines are
+validated against RV32 rtlsim, so the planner pins every check case to xlen
+32 whatever its category file's default, and 64-bit coverage cannot creep in
+per file. A `model_parity` case for a feature that exists only on RV64
+(distributed local memory) opts in with an `xlen` on the **entry itself**; a
+file default never un-pins it. `perf_gate` has no opt-in — its baselines are
+RV32 — and `testcase.py lint` rejects an entry-level `xlen` on a perf case.
 
 **A check is a marker, never a file or a category.** Each check gets its own
 cells — one per suite it has cases in — and every category cell excludes the

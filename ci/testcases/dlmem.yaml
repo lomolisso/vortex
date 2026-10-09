@@ -1,0 +1,107 @@
+# Distributed local memory (DLMEM): the blocks of a thread-block cluster
+# address each other's local memory through one window. RV64 only, so the
+# category runs in the xlen-64 tree; its one xlen-32 case checks the rejection.
+# See docs/proposals/dlmem_proposal.md.
+category: dlmem
+defaults:
+  xlen: [64]
+  configs: "-DVX_CFG_EXT_DLMEM_ENABLE"
+  tier: smoke
+  touches: [hw/rtl/dlmem, hw/rtl/VX_kmu.sv, hw/rtl/VX_gpu_pkg.sv, hw/rtl/VX_define.vh,
+            hw/rtl/Vortex.sv, hw/rtl/core/VX_cta_dispatch.sv, hw/rtl/core/VX_csr_data.sv,
+            hw/rtl/core/VX_mem_unit.sv, hw/rtl/cp/VX_cp_axil_regfile.sv,
+            sim/simx/kmu, sim/simx/cta_dispatcher, sim/simx/scheduler, sim/simx/csr_unit.cpp,
+            sim/simx/processor.cpp, sim/common/cmd_processor.cpp,
+            sw/kernel/include/vx_dlmem.h, sw/kernel/include/vx_spawn2.h,
+            sw/runtime/common/caps.h, tests/regression/cluster_rank,
+            VX_config.toml, VX_types.toml]
+tests:
+  # The cluster-rank CSR over three launches (K = 1, 2 as 1x2x1, 4 as 2x1x2),
+  # each CTA's rank against its intra-cluster index, and the rank address map
+  # against DLMEM_BASE + rank * local-memory size + offset.
+  - id: cluster_rank-1c
+    app: cluster_rank
+    drivers: [simx, rtlsim]
+    args: "-m"
+  # Clusters round-robin across two cores behind an L2. The xrt leg wraps the
+  # same RTL in the AFU shell and host stack, so it stands in for rtlsim here.
+  - id: cluster_rank-mc
+    app: cluster_rank
+    drivers: [simx, xrt]
+    shape: {cores: 2, l2cache: true}
+    args: "-m"
+  # K = NUM_WARPS = 8: the widest same-core cluster, every rank bit set.
+  - id: cluster_rank-w8
+    app: cluster_rank
+    drivers: [simx, rtlsim]
+    shape: {warps: 8}
+    args: "-k 8 -m"
+  # A 256 KB local memory, the largest DLMEM allows: one CTA per core fills and
+  # checks it whole, right below the window, and the rank map strides by it.
+  - id: cluster_rank-lmem18
+    app: cluster_rank
+    drivers: [simx, rtlsim]
+    configs+: "-DVX_CFG_LMEM_LOG_SIZE=18"
+    args: "-l 262144"
+  - id: cluster_rank-lmem17
+    app: cluster_rank
+    drivers: [rtlsim]
+    configs+: "-DVX_CFG_LMEM_LOG_SIZE=17"
+    args: "-m -l 131072"
+
+  # SimX<->rtlsim parity at XLEN 64, which the entry's own xlen opts into. The
+  # rank launches alone are all dispatch, so -l adds a fill of each core's whole
+  # 16 KB local memory to let steady state dominate the gap. The 2-core and
+  # 8-warp shapes are left out: their gaps predate DLMEM (see the proposal).
+  - id: parity-cluster-rank
+    check: model_parity
+    app: cluster_rank
+    xlen: [64]
+    args: "-m -l 16384"
+
+  # Illegal knob combinations must stop the build, in SimX (the processor
+  # object) and in the RTL (a Verilator lint of the processor), each with the
+  # exact message. Tagged simx only for cell placement: a driverless case would
+  # open a host cell, whose `-m dlmem` selects every case of the category.
+  - id: reject-rv32
+    via: script
+    driver: simx
+    xlen: [32]
+    env: {EXPECT: "DLMEM requires XLEN 64"}
+    run: &reject_run |
+      set -u
+      read -r vh vl xl <<< "$(printf 'include config.mk\nall:\n\t@echo $(VORTEX_HOME) $(VERILATOR_PATH) $(XLEN)\n' | make -s -f -)"
+      tmp=$(mktemp -d)
+      make -C sim/simx DESTDIR="$tmp" "$tmp/obj/processor.o" > "$tmp/simx.log" 2>&1; simx_rc=$?
+      r=$vh/hw/rtl
+      "$vl/bin/verilator" --lint-only -Wno-lint -Wno-style -Wno-REDEFMACRO \
+        -DVX_CFG_XLEN="$xl" -DVX_CFG_XLEN_"$xl" -DSIMULATION ${CONFIGS:-} \
+        -Isw -Ihw -I"$r" -I"$r/libs" -I"$r/interfaces" -I"$r/core" -I"$r/mem" \
+        -I"$r/vm" -I"$r/cache" -I"$r/fpu" \
+        "$r/VX_gpu_pkg.sv" "$r/fpu/VX_fpu_pkg.sv" "$r/VX_trace_pkg.sv" "$r/Vortex.sv" \
+        --top-module Vortex > "$tmp/rtl.log" 2>&1; rtl_rc=$?
+      fail=0
+      for side in simx rtl; do
+        rc=simx_rc; [ $side = rtl ] && rc=rtl_rc
+        if [ "${!rc}" -eq 0 ]; then
+          echo "FAIL: the $side build accepted CONFIGS=${CONFIGS:-}"; fail=1
+        elif ! grep -qF "$EXPECT" "$tmp/$side.log"; then
+          echo "FAIL: the $side build failed without '$EXPECT':"; tail -n 20 "$tmp/$side.log"; fail=1
+        else
+          echo "OK: the $side build rejects it: $(grep -F -m1 "$EXPECT" "$tmp/$side.log")"
+        fi
+      done
+      rm -rf "$tmp"
+      exit $fail
+  - id: reject-maxcluster
+    via: script
+    driver: simx
+    configs+: "-DVX_CFG_NUM_CORES=2 -DVX_CFG_DLMEM_MAX_CLUSTER=4"
+    env: {EXPECT: "DLMEM_MAX_CLUSTER must be between 1 and the cores of a cluster"}
+    run: *reject_run
+  - id: reject-lmem19
+    via: script
+    driver: simx
+    configs+: "-DVX_CFG_LMEM_LOG_SIZE=19"
+    env: {EXPECT: "DLMEM requires a local memory of at most 256 KB"}
+    run: *reject_run

@@ -129,7 +129,12 @@ module VX_cp_axil_regfile
                                   - `CLOG2(`VX_CFG_PLATFORM_MEMORY_NUM_BANKS);
 
   wire [63:0] gpu_dev_caps = {
+`ifdef VX_CFG_EXT_DLMEM_ENABLE
+    15'b0,
+    7'(`VX_CFG_DLMEM_MAX_CLUSTER),
+`else
     22'b0,
+`endif
     5'(GPU_BANK_ADDR_W - 20),
     3'($clog2(`VX_CFG_PLATFORM_MEMORY_NUM_BANKS)),
     8'(`VX_CFG_LMEM_ENABLED ? `VX_CFG_LMEM_LOG_SIZE : 0),

@@ -91,7 +91,12 @@ import VX_fpu_pkg::*;
     localparam LIVE_LMEM_ADDR   = 20;
     localparam LIVE_CLUSTER     = 21;
     localparam LIVE_ENTRY       = 22;
+`ifdef VX_CFG_EXT_DLMEM_ENABLE
+    localparam LIVE_CLUSTER_RANK = 23;
+    localparam NUM_LIVE         = 24;
+`else
     localparam NUM_LIVE         = 23;
+`endif
 
     // Writable CSRs
     localparam WR_MSCRATCH      = 0;
@@ -159,6 +164,9 @@ import VX_fpu_pkg::*;
             `VX_CSR_CTA_LMEM_ADDR   : live_sel_w[LIVE_LMEM_ADDR] = 1;
             `VX_CSR_CTA_CLUSTER_SIZE: live_sel_w[LIVE_CLUSTER] = 1;
             `VX_CSR_CTA_ENTRY       : live_sel_w[LIVE_ENTRY] = 1;
+        `ifdef VX_CFG_EXT_DLMEM_ENABLE
+            `VX_CSR_CTA_CLUSTER_RANK: live_sel_w[LIVE_CLUSTER_RANK] = 1;
+        `endif
 
             `VX_CSR_WARP_ID    : stable_w = `VX_CFG_XLEN'(req_wid);
             `VX_CSR_CORE_ID    : stable_w = `VX_CFG_XLEN'(CORE_ID);
@@ -268,6 +276,9 @@ import VX_fpu_pkg::*;
     assign live_src[LIVE_LMEM_ADDR] = `VX_CFG_XLEN'(sched_csr_if.cta_csrs.lmem_addr);
     assign live_src[LIVE_CLUSTER]   = `VX_CFG_XLEN'(sched_csr_if.cta_csrs.cluster_size);
     assign live_src[LIVE_ENTRY]     = `VX_CFG_XLEN'(to_fullPC(sched_csr_if.cta_csrs.entry));
+`ifdef VX_CFG_EXT_DLMEM_ENABLE
+    assign live_src[LIVE_CLUSTER_RANK] = `VX_CFG_XLEN'(sched_csr_if.cta_csrs.cluster_rank);
+`endif
 
     reg [`VX_CFG_XLEN-1:0] live_data;
     always @(*) begin
