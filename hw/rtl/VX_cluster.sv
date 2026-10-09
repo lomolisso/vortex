@@ -153,8 +153,14 @@ module VX_cluster import VX_gpu_pkg::*, VX_tlb_pkg::*;
     // distributor: a SPREAD cluster leaves it as pinned beats, routed by `dest`.
     VX_kmu_bus_if    gang_kmu_bus_if[1]();
     wire             gang_busy;
-    wire             gang_done_valid;
-    dlmem_cta_done_t gang_done_data;
+    wire             gang_evt_valid;
+    wire [1:0]       gang_evt_kind;
+    dlmem_cta_done_t gang_evt_data;
+    wire [NC_WIDTH-1:0] gang_evt_size_m1;
+    wire             gang_rel_valid;
+    wire [GANG_ID_W-1:0] gang_rel_gang;
+    wire             gang_rel_epoch;
+    wire             gang_rel_ready;
 
     VX_cta_gang #(
         .INSTANCE_ID (`SFORMATF(("%s-cta_gang", INSTANCE_ID))),
@@ -165,8 +171,14 @@ module VX_cluster import VX_gpu_pkg::*, VX_tlb_pkg::*;
         .reset      (reset),
         .bus_in_if  (kmu_bus_if[0]),
         .bus_out_if (gang_kmu_bus_if[0]),
-        .done_valid (gang_done_valid),
-        .done_data  (gang_done_data),
+        .evt_valid  (gang_evt_valid),
+        .evt_kind   (gang_evt_kind),
+        .evt_data   (gang_evt_data),
+        .evt_size_m1(gang_evt_size_m1),
+        .rel_valid  (gang_rel_valid),
+        .rel_gang   (gang_rel_gang),
+        .rel_epoch  (gang_rel_epoch),
+        .rel_ready  (gang_rel_ready),
         .busy       (gang_busy)
     );
 
@@ -216,8 +228,14 @@ module VX_cluster import VX_gpu_pkg::*, VX_tlb_pkg::*;
         .reset       (reset),
         .gbar_bus_if (gbar_bus_if)
     `ifdef VX_CFG_EXT_DLMEM_ENABLE
-        , .done_valid (gang_done_valid)
-        , .done_data  (gang_done_data)
+        , .evt_valid   (gang_evt_valid)
+        , .evt_kind    (gang_evt_kind)
+        , .evt_data    (gang_evt_data)
+        , .evt_size_m1 (gang_evt_size_m1)
+        , .rel_valid   (gang_rel_valid)
+        , .rel_gang    (gang_rel_gang)
+        , .rel_epoch   (gang_rel_epoch)
+        , .rel_ready   (gang_rel_ready)
     `endif
     );
 

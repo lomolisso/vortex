@@ -93,6 +93,15 @@ module VX_cta_dispatch_top import VX_gpu_pkg::*;
     output wire [$bits(dlmem_row_t)-1:0] peer_wr_row,
     output wire [`VX_CFG_LMEM_LOG_SIZE:0] peer_wr_stride,
 
+    // cluster-barrier slot records
+    output wire                         cbar_wr_valid,
+    output wire [NW_WIDTH-1:0]          cbar_wr_slot,
+    output wire                         cbar_wr_gang,
+    output wire [GANG_ID_W-1:0]         cbar_wr_gang_id,
+    output wire                         cbar_wr_epoch,
+    output wire [NW_WIDTH-1:0]          cbar_wr_base,
+    output wire [7:0]                   cbar_wr_k,
+
     output wire                         busy_out,
 `endif
     output wire [31:0]                  rd_cta_id
@@ -200,6 +209,13 @@ module VX_cta_dispatch_top import VX_gpu_pkg::*;
     assign cta_done_gang  = cta_done_data.gang_id;
     assign cta_done_epoch = cta_done_data.epoch;
     assign peer_wr_row    = peer_wr_row_s;
+
+    cbar_slot_t cbar_wr_info;
+    assign cbar_wr_gang    = cbar_wr_info.gang;
+    assign cbar_wr_gang_id = cbar_wr_info.gang_id;
+    assign cbar_wr_epoch   = cbar_wr_info.epoch;
+    assign cbar_wr_base    = cbar_wr_info.base;
+    assign cbar_wr_k       = 8'(cbar_wr_info.k);
 `endif
 
     VX_cta_dispatch #(
@@ -234,6 +250,9 @@ module VX_cta_dispatch_top import VX_gpu_pkg::*;
         .peer_wr_slot   (peer_wr_slot),
         .peer_wr_row    (peer_wr_row_s),
         .peer_wr_stride (peer_wr_stride),
+        .cbar_wr_valid  (cbar_wr_valid),
+        .cbar_wr_slot   (cbar_wr_slot),
+        .cbar_wr_info   (cbar_wr_info),
     `endif
         .busy          (busy)
     );

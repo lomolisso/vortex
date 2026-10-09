@@ -623,7 +623,12 @@ module VX_decode import
                                 op_type = INST_OP_BITS'(INST_SFU_BAR);
                                 op_args.wctl.is_sync_bar = 0;
                                 op_args.wctl.is_bar_arrive = ~is_rd_zero;
+                            `ifdef VX_CFG_EXT_DLMEM_ENABLE
+                                // the arrival's drain must see only older instructions of the warp
+                                is_wstall = 1;
+                            `else
                                 is_wstall = is_rd_zero; // do not wati on arrival
+                            `endif
                                 `USED_IREG (rd);
                                 `USED_IREG (rs1);
                                 `USED_IREG (rs2);

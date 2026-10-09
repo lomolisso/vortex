@@ -150,7 +150,13 @@ module VX_wctl_unit import VX_gpu_pkg::*; #(
     assign bar.id       = rs1_data[BAR_ID_SHIFT +: NB_BITS];
     assign bar.is_event = (txbar_bus_if.valid && ~wctl_bar_enable) || is_tx_expect;
     assign bar.is_sync  = execute_if.data.op_args.wctl.is_sync_bar;
+`ifdef VX_CFG_EXT_DLMEM_ENABLE
+    // rs1[30] names the block's cluster barrier; rs1[NW_BITS-1:0] is the block's slot
+    wire is_cbar = rs1_data[30];
+    assign bar.is_global= wctl_bar_enable && rs1_data[31] && ~is_cbar;
+`else
     assign bar.is_global= wctl_bar_enable && rs1_data[31];
+`endif
     // expect_tx is not a normal arrival (it does not advance arrive_count)
     assign bar.is_arrive= (execute_if.data.op_args.wctl.is_bar_arrive && ~rs2_data[31]) || execute_if.data.op_args.wctl.is_sync_bar;
     // expect_tx → phase=1 (attach/increment); txbar release → phase=0
@@ -158,6 +164,14 @@ module VX_wctl_unit import VX_gpu_pkg::*; #(
     // For expect_tx: size_m1 carries (count - 1); for normal arrive: (num_warps - 1).
     // bar_unit will + 1 when consuming on the event path so the actual increment is `count`.
     assign bar.size_m1  = rs2_data[BAR_SIZE_W-1:0] - BAR_SIZE_W'(1);
+`ifdef VX_CFG_EXT_DLMEM_ENABLE
+    assign bar.is_cluster = wctl_bar_enable && is_cbar;
+    assign warp_ctl_if.bar_cluster = wctl_bar_enable && is_cbar;
+
+    // one cluster barrier per block: no id, global or expect_tx bits
+    `RUNTIME_ASSERT(~(wctl_bar_enable && is_cbar) || (~rs1_data[31] && ~is_tx_expect && (bar.id == '0)),
+        ("%t: %s cluster barrier with global, expect_tx or id bits: rs1=0x%0h, rs2=0x%0h", $time, INSTANCE_ID, rs1_data, rs2_data))
+`endif
 
     assign txbar_bus_if.ready = ~wctl_bar_enable;
 
@@ -183,13 +197,31 @@ module VX_wctl_unit import VX_gpu_pkg::*; #(
     wire wsync_drain = execute_if.valid && is_wsync
                     && !warp_ctl_if.warp_pending_alm_empty[execute_if.data.header.wid];
 
+`ifdef VX_CFG_EXT_DLMEM_ENABLE
+    // A warp's barrier arrival counts, and a warp exits, only once its earlier
+    // instructions have committed and none of its remote stores is in flight.
+    wire [`VX_CFG_NUM_WARPS-1:0] warp_drained = warp_ctl_if.warp_pending_alm_empty & warp_ctl_if.dlmem_drained;
+    wire wid_drained = warp_drained[execute_if.data.header.wid];
+
+    // BAR (vx_barrier or vx_barrier_arrive) also drains LSU before continuing.
+    wire bar_drain = execute_if.valid && is_bar && (!warp_ctl_if.lsu_sched_drained || !wid_drained);
+
+    wire exit_drain = execute_if.valid && is_tmc && execute_if.data.header.eop
+                   && (rs1_data[`VX_CFG_NUM_THREADS-1:0] == '0) && !wid_drained;
+`else
     // BAR (vx_barrier or vx_barrier_arrive) drains LSU before continuing.
     wire bar_drain = execute_if.valid && is_bar && !warp_ctl_if.lsu_sched_drained;
+`endif
 
     wire execute_fire = execute_if.valid && execute_if.ready;
     assign wctl_valid = execute_fire && execute_if.data.header.eop;
 
+`ifdef VX_CFG_EXT_DLMEM_ENABLE
+    // an arrive stalls its warp at decode; it resumes here, as WSYNC does
+    assign wsync_valid = wctl_valid && (is_wsync || (is_bar && execute_if.data.op_args.wctl.is_bar_arrive));
+`else
     assign wsync_valid = wctl_valid && is_wsync;
+`endif
 
     VX_pipe_register #(
         .DATAW (6 + NW_WIDTH + WCTL_WIDTH),
@@ -242,14 +274,22 @@ module VX_wctl_unit import VX_gpu_pkg::*; #(
     ) rsp_buf (
         .clk       (clk),
         .reset     (reset),
+    `ifdef VX_CFG_EXT_DLMEM_ENABLE
+        .valid_in  (execute_if.valid && !wsync_drain && !bar_drain && !exit_drain),
+    `else
         .valid_in  (execute_if.valid && !wsync_drain && !bar_drain),
+    `endif
         .ready_in  (rsp_buf_ready),
         .data_in   ({execute_if.data.header, warp_ctl_if.dvstack_ptr, warp_ctl_if.bar_phase, bar_rsp_valid}),
         .data_out  ({result_if.data.header,  dvstack_ptr_r,           bar_phase_r,           bar_rsp_valid_r}),
         .valid_out (result_if.valid),
         .ready_out (result_if.ready)
     );
+`ifdef VX_CFG_EXT_DLMEM_ENABLE
+    assign execute_if.ready = rsp_buf_ready && !wsync_drain && !bar_drain && !exit_drain;
+`else
     assign execute_if.ready = rsp_buf_ready && !wsync_drain && !bar_drain;
+`endif
 
     // Result data
     for (genvar i = 0; i < NUM_LANES; ++i) begin : g_result_if

@@ -51,11 +51,19 @@ module VX_cta_gang_top import VX_gpu_pkg::*; #(
     output wire [NW_WIDTH-1:0]              out_forced_slot,
     output wire [$bits(dlmem_row_t)-1:0]    out_row,
 
-    input  wire                             done_valid,
-    input  wire [DLMEM_CORE_W-1:0]          done_core,
-    input  wire [NW_WIDTH-1:0]              done_slot,
-    input  wire [GANG_ID_W-1:0]             done_gang_id,
-    input  wire                             done_epoch,
+    // events: a CTA_DONE, or a cluster-barrier arrival of one block (CBAR)
+    input  wire                             evt_valid,
+    input  wire [1:0]                       evt_kind,
+    input  wire [DLMEM_CORE_W-1:0]          evt_core,
+    input  wire [NW_WIDTH-1:0]              evt_slot,
+    input  wire [GANG_ID_W-1:0]             evt_gang_id,
+    input  wire                             evt_epoch,
+    input  wire [NC_WIDTH-1:0]              evt_size_m1,
+
+    output wire                             rel_valid,
+    input  wire                             rel_ready,
+    output wire [GANG_ID_W-1:0]             rel_gang,
+    output wire                             rel_epoch,
 
     output wire                             busy,
 
@@ -116,11 +124,11 @@ module VX_cta_gang_top import VX_gpu_pkg::*; #(
     assign out_forced_slot = out_req.args.compute.dlmem.forced_slot;
     assign out_row         = out_req.args.compute.dlmem.row;
 
-    dlmem_cta_done_t done_data;
-    assign done_data.core    = done_core;
-    assign done_data.slot    = done_slot;
-    assign done_data.gang_id = done_gang_id;
-    assign done_data.epoch   = done_epoch;
+    dlmem_cta_done_t evt_data;
+    assign evt_data.core    = evt_core;
+    assign evt_data.slot    = evt_slot;
+    assign evt_data.gang_id = evt_gang_id;
+    assign evt_data.epoch   = evt_epoch;
 
     VX_cta_gang #(
         .INSTANCE_ID ("cta_gang"),
@@ -130,8 +138,14 @@ module VX_cta_gang_top import VX_gpu_pkg::*; #(
         .reset      (reset),
         .bus_in_if  (bus_in_if),
         .bus_out_if (bus_out_if),
-        .done_valid (done_valid),
-        .done_data  (done_data),
+        .evt_valid  (evt_valid),
+        .evt_kind   (evt_kind),
+        .evt_data   (evt_data),
+        .evt_size_m1(evt_size_m1),
+        .rel_valid  (rel_valid),
+        .rel_gang   (rel_gang),
+        .rel_epoch  (rel_epoch),
+        .rel_ready  (rel_ready),
         .busy       (busy)
     );
 

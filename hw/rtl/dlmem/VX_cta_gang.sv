@@ -25,6 +25,11 @@
 // when its block's CTA_DONE event arrives, so a forced slot is always free when
 // its beat reaches the core.
 //
+// The same event port carries the gangs' cluster-barrier arrivals, one per
+// block and phase. The K-th arrival raises the gang's release, which leaves
+// lowest gang id first; the id stays taken until it has left, so a release
+// never reaches a later gang that reuses the id.
+//
 // Timing: a head beat visible in cycle t is placed in cycles t+1..t+K; beat e
 // is taken at the earliest in cycle t+K+1+e and leaves one cycle later.
 module VX_cta_gang import VX_gpu_pkg::*; #(
@@ -38,13 +43,22 @@ module VX_cta_gang import VX_gpu_pkg::*; #(
     VX_kmu_bus_if.slave     bus_in_if,
     VX_kmu_bus_if.master    bus_out_if,
 
-    // CTA completions of SPREAD blocks, always accepted
-    input wire              done_valid,
-    input dlmem_cta_done_t  done_data,
+    // CTA_DONE events and cluster-barrier arrivals of SPREAD blocks, always accepted
+    input wire              evt_valid,
+    input wire [1:0]        evt_kind,
+    input dlmem_cta_done_t  evt_data,
+    input wire [NC_WIDTH-1:0] evt_size_m1,
+
+    // cluster-barrier releases, one per gang and phase
+    output wire             rel_valid,
+    output wire [GANG_ID_W-1:0] rel_gang,
+    output wire             rel_epoch,
+    input wire              rel_ready,
 
     output wire             busy
 );
     `UNUSED_SPARAM (INSTANCE_ID)
+    `UNUSED_VAR (evt_size_m1)
 
     localparam NCC      = DLMEM_NCC;
     localparam NW       = `VX_CFG_NUM_WARPS;
@@ -78,6 +92,11 @@ module VX_cta_gang import VX_gpu_pkg::*; #(
     reg [NG-1:0][DLMEM_K_W-1:0] cnt_r;
     reg [NG-1:0]                epoch_r;
     reg [CORE_W-1:0]            rr_r;
+
+    // cluster barrier: arrivals of the current phase, and a release not yet sent
+    reg [NG-1:0][DLMEM_K_W-1:0] arr_r;
+    reg [NG-1:0]                relp_r;
+    reg [NG-1:0]                rel_ep_r;
 
     // per-launch latches: a launch's done events use its policy, K and W
     reg [7:0]                   ctx_r;
@@ -128,7 +147,12 @@ module VX_cta_gang import VX_gpu_pkg::*; #(
                           || ((PROD_W'(i + 1) * PROD_W'(in_stride)) <= PROD_W'(1 << LMEM_LOG));
     end
 
-    // ---- done events: applied before this cycle's decision ----------------
+    // ---- events: applied before this cycle's decision ---------------------
+
+    wire             done_valid = evt_valid && (evt_kind == GBAR_KIND_CTA_DONE);
+    wire             cbar_valid = evt_valid && (evt_kind == GBAR_KIND_CBAR);
+    dlmem_cta_done_t done_data;
+    assign done_data = evt_data;
 
     wire done_spread = done_valid && (policy_r == KMU_POLICY_SPREAD);
     wire done_gang   = done_spread && (k_r > CLUSTER_SIZE_W'(1));
@@ -155,13 +179,34 @@ module VX_cta_gang import VX_gpu_pkg::*; #(
         end
     end
 
-    // lowest free gang id
-    wire id_free = ~(&live_n);
+    // A phase's K-th arrival raises the gang's release; the release port
+    // sends the lowest pending one.
+    wire [GANG_ID_W-1:0]  cbar_id   = evt_data.gang_id;
+    wire [DLMEM_K_W-1:0]  cbar_next = arr_r[cbar_id] + DLMEM_K_W'(1);
+    wire                  cbar_last = (32'(cbar_next) == 32'(k_r));
+
+    logic [GANG_ID_W-1:0] rel_id;
+    always @(*) begin
+        rel_id = '0;
+        for (integer i = NG - 1; i >= 0; --i) begin
+            if (relp_r[i]) begin
+                rel_id = GANG_ID_W'(i);
+            end
+        end
+    end
+    assign rel_valid = (|relp_r);
+    assign rel_gang  = rel_id;
+    assign rel_epoch = rel_ep_r[rel_id];
+    wire rel_fire = rel_valid && rel_ready;
+
+    // lowest free gang id: neither live nor holding back a release
+    wire [NG-1:0] id_avail = ~live_n & ~relp_r;
+    wire id_free = (|id_avail);
     logic [GANG_ID_W-1:0] free_id;
     always @(*) begin
         free_id = '0;
         for (integer i = NG - 1; i >= 0; --i) begin
-            if (~live_n[i]) begin
+            if (id_avail[i]) begin
                 free_id = GANG_ID_W'(i);
             end
         end
@@ -309,12 +354,28 @@ module VX_cta_gang import VX_gpu_pkg::*; #(
             cur_epoch_r <= 1'b0;
             failed_r    <= 1'b0;
             dirty_r     <= 1'b0;
+            arr_r       <= '0;
+            relp_r      <= '0;
+            rel_ep_r    <= '0;
         end else begin
             free_r  <= free_n;
             used_r  <= used_n;
             live_r  <= live_n;
             cnt_r   <= cnt_n;
             dirty_r <= ~start && (dirty_r || done_valid);
+
+            if (rel_fire) begin
+                relp_r[rel_id] <= 1'b0;
+            end
+            if (cbar_valid) begin
+                if (cbar_last) begin
+                    arr_r[cbar_id]    <= '0;
+                    relp_r[cbar_id]   <= 1'b1;
+                    rel_ep_r[cbar_id] <= evt_data.epoch;
+                end else begin
+                    arr_r[cbar_id] <= cbar_next;
+                end
+            end
 
             case (state)
             S_IDLE: begin
@@ -365,6 +426,7 @@ module VX_cta_gang import VX_gpu_pkg::*; #(
                         if (k_r > CLUSTER_SIZE_W'(1)) begin
                             live_r[free_id]  <= 1'b1;
                             cnt_r[free_id]   <= DLMEM_K_W'(k_r);
+                            arr_r[free_id]   <= '0;
                             epoch_r[free_id] <= ~epoch_r[free_id];
                             cur_gang_r       <= free_id;
                             cur_epoch_r      <= ~epoch_r[free_id];
@@ -395,9 +457,9 @@ module VX_cta_gang import VX_gpu_pkg::*; #(
         end
     end
 
-    // The device stays busy until every placed block has reported done, so the
-    // next launch starts on an empty mirror.
-    assign busy = head_valid | bus_out_if.valid | ~idle | ~(&free_r) | (|live_r);
+    // The device stays busy until every placed block has reported done and
+    // every release has left, so the next launch starts on an empty mirror.
+    assign busy = head_valid | bus_out_if.valid | ~idle | ~(&free_r) | (|live_r) | (|relp_r);
 
     // ---- checks (dlmem_ref's asserts) ---------------------------------------
 
@@ -412,7 +474,16 @@ module VX_cta_gang import VX_gpu_pkg::*; #(
                                     && (cnt_r[done_data.gang_id] != 0)),
         ("%t: %s: CTA_DONE for gang %0d epoch %0d, which is not live", $time, INSTANCE_ID,
          done_data.gang_id, done_data.epoch))
-    `RUNTIME_ASSERT (~is_new || ((&free_n) && ~(|live_n)),
+    `RUNTIME_ASSERT (~done_gang || (cnt_r[done_data.gang_id] != DLMEM_K_W'(1)) || (arr_r[done_data.gang_id] == '0),
+        ("%t: %s: gang ended inside a cluster barrier phase: gang %0d epoch %0d, %0d of %0d blocks arrived", $time,
+         INSTANCE_ID, done_data.gang_id, done_data.epoch, arr_r[done_data.gang_id], k_r))
+    `RUNTIME_ASSERT (~cbar_valid || ((policy_r == KMU_POLICY_SPREAD) && (k_r > CLUSTER_SIZE_W'(1))
+                                     && (32'(cbar_id) < NG) && live_r[cbar_id] && (epoch_r[cbar_id] == evt_data.epoch)
+                                     && ~relp_r[cbar_id] && (32'(arr_r[cbar_id]) < 32'(k_r))
+                                     && ((32'(evt_size_m1) + 1) == 32'(k_r))),
+        ("%t: %s: cluster-barrier arrival for gang %0d epoch %0d (size %0d) that is not live, not waiting for it, or of another size",
+         $time, INSTANCE_ID, cbar_id, evt_data.epoch, 32'(evt_size_m1) + 1))
+    `RUNTIME_ASSERT (~is_new || ((&free_n) && ~(|live_n) && ~(|relp_r)),
         ("%t: %s: a new launch began with blocks of the last one still placed", $time, INSTANCE_ID))
     `RUNTIME_ASSERT (~(idle && head_valid && in_spread)
                   || (in_req.args.compute.is_first_of_cluster && (in_req.args.compute.cluster_rank == '0)

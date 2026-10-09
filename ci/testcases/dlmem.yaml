@@ -15,11 +15,16 @@ defaults:
             hw/rtl/core/VX_mem_unit.sv, hw/rtl/cp/VX_cp_axil_regfile.sv,
             sim/simx/kmu, sim/simx/cta_dispatcher, sim/simx/scheduler, sim/simx/csr_unit.cpp,
             sim/simx/cluster, sim/simx/barrier_unit, sim/simx/processor.cpp,
+            hw/rtl/core/VX_wctl_unit.sv, hw/rtl/core/VX_core.sv,
+            hw/rtl/interfaces/VX_warp_ctl_if.sv,
             sim/common/cmd_processor.cpp, sw/common/dlmem_ref.h,
+            sim/simx/wctl_unit.cpp, sim/simx/sfu_unit.cpp, sim/simx/lsu_unit,
+            sim/simx/core, sim/simx/dlmem,
             sw/kernel/include/vx_dlmem.h, sw/kernel/include/vx_spawn2.h,
             sw/runtime/common/caps.h, sw/runtime/common/queue.cpp,
             sw/runtime/common/legacy_runtime.cpp, tests/regression/cluster_rank,
-            tests/regression/cta_gang, VX_config.toml, VX_types.toml]
+            tests/regression/cta_gang, tests/regression/cluster_sync,
+            tests/regression/dlmem_local, VX_config.toml, VX_types.toml]
 tests:
   # The cluster-rank CSR over three launches (K = 1, 2 as 1x2x1, 4 as 2x1x2),
   # each CTA's rank against its intra-cluster index, and the rank address map
@@ -163,6 +168,90 @@ tests:
     configs+: "-DVX_CFG_SOCKET_SIZE=2"
     shape: {cores: 4}
     args: "-p -k 4 -n 16"
+
+  # --- cluster barrier ---
+  # cluster.sync() and the split barrier_arrive()/barrier_wait(). Each phase,
+  # every warp adds itself to an atomic counter of its cluster before arriving
+  # and must read the whole cluster back after the release; the arrive tokens
+  # must follow the phase. A late rank per phase makes an early release show.
+  # One core: same-core clusters of 4 two-warp blocks, then SPREAD K=1 and the
+  # largest K, in one process, so each launch's slot admissions reset the
+  # barrier state.
+  - id: cluster_sync-1c
+    app: cluster_sync
+    drivers: [simx, rtlsim]
+    configs+: "-DVX_CFG_EXT_A_ENABLE"
+    shape: {warps: 8}
+  - id: cluster_sync-2c
+    app: cluster_sync
+    drivers: [simx, rtlsim]
+    configs+: "-DVX_CFG_EXT_A_ENABLE"
+    shape: {cores: 2, l2cache: true}
+    args: "-s -k 2 -n 8 -i 8"
+  # Split arrive and wait: some waits come before the release, some after.
+  - id: cluster_sync-4c
+    app: cluster_sync
+    drivers: [simx, rtlsim]
+    configs+: "-DVX_CFG_EXT_A_ENABLE"
+    shape: {cores: 4, l2cache: true}
+    args: "-s -k 4 -n 6 -m split"
+  # Two sockets of two cores: the arrivals and releases cross both fork levels,
+  # and rank r arrives r units late. The xrt leg wraps the same RTL in the AFU
+  # shell and host stack, so it stands in for rtlsim here.
+  - id: cluster_sync-4c-s2
+    app: cluster_sync
+    drivers: [simx, xrt]
+    configs+: "-DVX_CFG_EXT_A_ENABLE -DVX_CFG_SOCKET_SIZE=2"
+    shape: {cores: 4, l2cache: true}
+    args: "-s -k 4 -n 6 -m skew"
+  # Two hardware clusters, each with its own gang unit.
+  - id: cluster_sync-2cl
+    app: cluster_sync
+    drivers: [simx, rtlsim]
+    configs+: "-DVX_CFG_EXT_A_ENABLE"
+    shape: {clusters: 2, cores: 2, l3cache: true}
+    args: "-s -k 2 -n 8"
+  # Eight one-warp blocks per core and 64 clusters, so the gang ids recycle many
+  # times; the last phase only arrives before the blocks exit, so releases find
+  # their slots exited or admitted again.
+  - id: cluster_sync-many
+    app: cluster_sync
+    drivers: [simx, rtlsim]
+    configs+: "-DVX_CFG_EXT_A_ENABLE"
+    shape: {cores: 4, warps: 8, l2cache: true}
+    args: "-s -k 2 -w 1 -n 64 -m exit"
+  # Same-core clusters complete inside the core; a __syncthreads() and a block
+  # barrier sit between each arrive and its wait.
+  - id: cluster_sync-legacy
+    app: cluster_sync
+    drivers: [simx, rtlsim]
+    configs+: "-DVX_CFG_EXT_A_ENABLE"
+    shape: {cores: 2, warps: 8, l2cache: true}
+    args: "-d -k 4 -w 2 -m mixed"
+
+  # SimX<->rtlsim parity of the cluster barrier at XLEN 64: 64 phases with fixed
+  # work and no atomics. Sixteen one-warp blocks fill the four cores at once, so
+  # the placement does not depend on the done-event timing. It runs the fence-free
+  # arrive/wait (-r): on several sockets without an L2 the two models still cost
+  # a fence differently (see the proposal's open items).
+  - id: parity-cluster-sync
+    check: model_parity
+    app: cluster_sync
+    xlen: [64]
+    configs+: "-DVX_CFG_SOCKET_SIZE=2"
+    shape: {cores: 4}
+    args: "-p -r -s -k 4 -w 1 -n 4"
+  # The same-core barrier, which never leaves the core: one cluster of four
+  # blocks fills the core. It runs at 4 warps because 8-warp cores already
+  # differ by ~16% without any cluster barrier (see the proposal's open items).
+  - id: parity-cluster-sync-1c
+    check: model_parity
+    app: cluster_sync
+    xlen: [64]
+    args: "-p -d -k 4 -w 1"
+
+  # --- aperture translation, co-located peers ---
+
 
   # Illegal knob combinations must stop the build, in SimX (the processor
   # object) and in the RTL (a Verilator lint of the processor), each with the

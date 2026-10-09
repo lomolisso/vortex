@@ -166,23 +166,29 @@ inline void release(Mirror& m, uint32_t core, uint32_t slot, uint32_t W) {
 
 struct GangIds {
   std::vector<bool>     live;
-  std::vector<uint32_t> cnt;    // done events still expected
+  std::vector<uint32_t> cnt;      // done events still expected
   std::vector<uint8_t>  epoch;
+  std::vector<uint32_t> arrived;  // blocks arrived at the current cluster-barrier phase
+  std::vector<bool>     rel_pend; // a cluster-barrier release not yet sent
 };
 
 inline void reset(const Cfg& cfg, GangIds& g) {
   g.live.assign(cfg.num_gangs, false);
   g.cnt.assign(cfg.num_gangs, 0);
   g.epoch.assign(cfg.num_gangs, 0);
+  g.arrived.assign(cfg.num_gangs, 0);
+  g.rel_pend.assign(cfg.num_gangs, false);
 }
 
-// Lowest free id, or -1 when the pool is exhausted.
+// Lowest free id, or -1 when the pool is exhausted. An id whose release is
+// still pending is not free: the release must leave before the id is reused.
 inline int alloc(GangIds& g, uint32_t K) {
   for (size_t i = 0; i < g.live.size(); ++i) {
-    if (!g.live[i]) {
+    if (!g.live[i] && !g.rel_pend[i]) {
       g.live[i] = true;
       g.cnt[i] = K;
       g.epoch[i] ^= 1;
+      g.arrived[i] = 0;
       return int(i);
     }
   }
@@ -193,8 +199,35 @@ inline void done(GangIds& g, uint32_t id, uint32_t ep) {
   check(id < g.live.size() && g.live[id], "done: gang id not live");
   check(g.epoch[id] == ep, "done: stale epoch");
   check(g.cnt[id] > 0, "done: too many done events");
-  if (--g.cnt[id] == 0)
+  if (--g.cnt[id] == 0) {
+    check(g.arrived[id] == 0, "gang ended inside a cluster barrier phase");
     g.live[id] = false;
+  }
+}
+
+// One block of a K-block gang arrived; true when it completes the phase.
+inline bool cbar_arrive(GangIds& g, uint32_t id, uint32_t ep, uint32_t K) {
+  check(id < g.live.size() && g.live[id], "cbar_arrive: gang id not live");
+  check(g.epoch[id] == ep, "cbar_arrive: stale epoch");
+  check(!g.rel_pend[id], "cbar_arrive: arrival before the previous release left");
+  check(g.arrived[id] < K, "cbar_arrive: too many arrivals");
+  if (++g.arrived[id] == K) {
+    g.arrived[id] = 0;
+    g.rel_pend[id] = true;
+    return true;
+  }
+  return false;
+}
+
+// The lowest gang with a pending release, now sent; -1 when none.
+inline int cbar_pop(GangIds& g) {
+  for (size_t i = 0; i < g.rel_pend.size(); ++i) {
+    if (g.rel_pend[i]) {
+      g.rel_pend[i] = false;
+      return int(i);
+    }
+  }
+  return -1;
 }
 
 // A launch starts with nothing in flight, so rr and the epochs restart.
@@ -204,6 +237,9 @@ inline void new_launch(const Cfg& cfg, Mirror& m, GangIds& g) {
   }
   for (bool l : g.live) {
     check(!l, "new_launch: gang id still live");
+  }
+  for (bool r : g.rel_pend) {
+    check(!r, "new_launch: cluster-barrier release still pending");
   }
   m.rr = 0;
   g.epoch.assign(g.epoch.size(), 0);

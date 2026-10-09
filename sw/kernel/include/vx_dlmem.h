@@ -55,6 +55,34 @@ static inline __attribute__((always_inline)) void* vx_cluster_map_shared_rank(co
                + offset);
 }
 
+// The cluster barrier: one per block, addressed by the block's slot with bit 30
+// set and no barrier id. Every warp of every block of the cluster must make
+// each call exactly once per phase, as with __syncthreads().
+// Arrive releases and wait acquires the cluster's local and window memory;
+// global memory only through sync()'s fences (docs/proposals/dlmem_proposal.md).
+static inline __attribute__((always_inline)) uint32_t vx_cluster_bar_id(void) {
+  uint32_t __UNIFORM__ v = (1u << 30) | (uint32_t)csr_read_nv(VX_CSR_CTA_ID);
+  return v;
+}
+
+// Arrive without waiting; returns the phase token for vx_cluster_wait(). No fence.
+static inline __attribute__((always_inline)) uint32_t vx_cluster_arrive(void) {
+  return (uint32_t)vx_barrier_arrive((int)vx_cluster_bar_id(), (int)csr_read_nv(VX_CSR_CTA_SIZE));
+}
+
+// Wait until the phase of `token` has completed. No fence.
+static inline __attribute__((always_inline)) void vx_cluster_wait(uint32_t token) {
+  vx_barrier_wait((int)vx_cluster_bar_id(), (int)token);
+}
+
+// CUDA's cluster.sync(): the fences extend the barrier's ordering to global
+// memory, whose L1s are not coherent across cores.
+static inline __attribute__((always_inline)) void vx_cluster_sync(void) {
+  vx_fence();
+  vx_barrier((int)vx_cluster_bar_id(), (int)csr_read_nv(VX_CSR_CTA_SIZE));
+  vx_fence();
+}
+
 #ifdef __cplusplus
 }
 
@@ -71,6 +99,15 @@ public:
   T* map_shared_rank(T* p, uint32_t rank) const {
     return static_cast<T*>(vx_cluster_map_shared_rank(p, rank));
   }
+
+  // Arrive and wait for the whole cluster, ordering global memory too.
+  void sync() const { vx_cluster_sync(); }
+
+  // Split arrive and wait, without the fences of sync(): like PTX
+  // barrier.cluster.arrive.relaxed, they order only local and window memory.
+  uint32_t barrier_arrive() const { return vx_cluster_arrive(); }
+
+  void barrier_wait(uint32_t token) const { vx_cluster_wait(token); }
 };
 
 inline cluster_group this_cluster() { return cluster_group(); }

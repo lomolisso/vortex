@@ -63,6 +63,11 @@ module VX_cta_dispatch import VX_gpu_pkg::*; #(
     output wire [NW_WIDTH-1:0]      peer_wr_slot,
     output dlmem_row_t              peer_wr_row,
     output wire [`VX_CFG_LMEM_LOG_SIZE:0] peer_wr_stride,
+
+    // the cluster-barrier record of every admitted compute block
+    output wire                     cbar_wr_valid,
+    output wire [NW_WIDTH-1:0]      cbar_wr_slot,
+    output cbar_slot_t              cbar_wr_info,
 `endif
 
     output wire                     busy
@@ -758,6 +763,49 @@ module VX_cta_dispatch import VX_gpu_pkg::*; #(
     assign peer_wr_slot   = peer_wr_slot_r;
     assign peer_wr_row    = peer_wr_row_r;
     assign peer_wr_stride = peer_wr_stride_r;
+
+    // A gang of K > 1 completes its cluster barrier through the gang unit; any
+    // other block completes it in this core, counted at its cluster's base slot
+    // over the clamped window (a K=1 block is its own base).
+    localparam CK_W = $bits(cbar_wr_info.k);
+
+    wire row_gang;
+    if (MAXC > 1) begin : g_row_gang
+        assign row_gang = is_pinned && (kmu_req.args.compute.dlmem.row.k > DLMEM_K_W'(1));
+    end else begin : g_row_solo
+        assign row_gang = 1'b0;
+    end
+
+    cbar_slot_t cbar_info;
+    assign cbar_info.gang    = row_gang;
+    assign cbar_info.gang_id = kmu_req.args.compute.dlmem.gang_id;
+    assign cbar_info.epoch   = kmu_req.args.compute.dlmem.epoch;
+    assign cbar_info.base    = is_pinned ? base_slot : legacy_base;
+    assign cbar_info.k       = is_pinned ? CK_W'(kmu_req.args.compute.dlmem.row.k) : CK_W'(cluster_k);
+
+    reg                 cbar_wr_valid_r;
+    reg [CS_BITS-1:0]   cbar_wr_slot_r;
+    cbar_slot_t         cbar_wr_info_r;
+
+    always @(posedge clk) begin
+        if (reset) begin
+            cbar_wr_valid_r <= 1'b0;
+        end else begin
+            cbar_wr_valid_r <= admit_fire;
+        end
+        if (admit_fire) begin
+            cbar_wr_slot_r <= base_slot;
+            cbar_wr_info_r <= cbar_info;
+        end
+    end
+
+    assign cbar_wr_valid = cbar_wr_valid_r;
+    assign cbar_wr_slot  = cbar_wr_slot_r;
+    assign cbar_wr_info  = cbar_wr_info_r;
+
+    `RUNTIME_ASSERT (~(admit_fire && is_pinned) || (32'(kmu_req.args.compute.dlmem.row.k) < (1 << CK_W)),
+        ("%t: %s cluster of %0d blocks does not fit the slot record's count", $time, INSTANCE_ID,
+         kmu_req.args.compute.dlmem.row.k))
 `endif
 
     // -------------------------------------------------------------------------

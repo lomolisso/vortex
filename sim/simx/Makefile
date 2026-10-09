@@ -69,9 +69,10 @@ ifneq ($(filter -DVX_CFG_EXT_DXA_ENABLE, $(XCONFIGS)),)
 	SRCS += $(SRC_DIR)/dxa/dxa_unit.cpp
 endif
 
-# Add DLMEM extension sources; the gang unit joins once its source exists.
+# Add DLMEM extension sources; a unit joins once its source exists.
 ifneq ($(filter -DVX_CFG_EXT_DLMEM_ENABLE, $(XCONFIGS)),)
 	SRCS += $(wildcard $(SRC_DIR)/kmu/cta_gang.cpp)
+	SRCS += $(wildcard $(SRC_DIR)/dlmem/dlmem_xlate.cpp)
 endif
 
 # Graphics SW helpers (TextureSampler / DepthTencil / Blender / Rasterizer).
@@ -160,7 +161,7 @@ DLMEM_NOC_TEST     := $(DESTDIR)/dlmem_noc_test
 CTA_GANG_TEST_OBJ := $(OBJ_DIR)/tests/cta_gang_test.o
 CTA_GANG_TEST     := $(DESTDIR)/cta_gang_test
 
-# The DLMEM translation and endpoints link into their unit tests, outside libsimx.
+# The DLMEM translation and endpoints link standalone into their unit tests.
 DLMEM_XLATE_SRCS     := $(SRC_DIR)/dlmem/dlmem_xlate.cpp
 DLMEM_XLATE_OBJS     := $(patsubst $(SRC_DIR)/%.cpp,$(OBJ_DIR)/%.o,$(DLMEM_XLATE_SRCS))
 DLMEM_XLATE_TEST_OBJ := $(OBJ_DIR)/tests/dlmem_xlate_test.o

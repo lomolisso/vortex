@@ -14,8 +14,9 @@
 
 // SimX gang unit (CtaGang) driven from host context the way hw/unittest/cta_gang
 // drives VX_cta_gang, and checked cycle by cycle against a model built on the
-// dlmem_ref placement functions: every cycle the unit's input take, its busy and
-// the beat on each core lane must match the model, field for field. The model
+// dlmem_ref placement functions: every cycle the unit's input take, its busy,
+// the beat on each core lane and the cluster-barrier release it sends must
+// match the model, field for field. The model
 // is the RTL bench's, with SimX's per-core launch lanes (capacity plus launch
 // credits) in place of the RTL's output buffer; with always-ready lanes the two
 // coincide, so the deterministic schedule's placement.csv must equal the RTL
@@ -26,9 +27,21 @@
 //
 // Deterministic schedule (--csv): the RTL bench's, see hw/unittest/cta_gang.
 //   A bench cycle n is SimX cycle n: inputs offered before the tick (a beat as
-//   a held valid on bus_in, a done event through cta_done), a lane beat visible
+//   a held valid on bus_in, an event through cta_event), a lane beat visible
 //   before the tick is taken before it, and the input fired when the tick
-//   consumed it.
+//   consumed it. A release sent in cycle n reaches the bench's sinks at the
+//   start of cycle n + release_delay().
+//
+// Cluster-barrier schedule (--cbar-csv): the RTL bench's, see hw/unittest/cta_gang.
+//   One SPREAD launch, K=MAX, W=1, stride 0, 2*NCC*NW/MAX+2 gangs (none when
+//   MAX=1). Gang s runs 1 + s%3 phases. Block (s, r) leaves the unit in cycle o;
+//   its phase-0 arrival is queued in cycle o + 3 + (5s + 3r) % 11, its phase-i
+//   arrival in cycle R + 2 + (3s + 5r + i) % 7, where R is the cycle the gang's
+//   phase-(i-1) release leaves the unit, and its CTA_DONE in cycle
+//   A + 1 + (7s + 5r) % 9, A the cycle of its last arrival. Events are queued in
+//   the order the blocks left the unit and presented one per cycle.
+//   cbar.csv: gang,epoch,arrive_cycle,release_cycle, one row per phase in
+//   release order; arrive_cycle presents the phase's K-th arrival.
 
 #include <algorithm>
 #include <cstdint>
@@ -41,11 +54,13 @@
 #include <map>
 #include <random>
 #include <string>
+#include <tuple>
 #include <vector>
 
 #include <dlmem_ref.h>
 #include "kmu.h"
 #include "cta_gang.h"
+#include "barrier_unit.h"
 
 using namespace vortex;
 namespace ref = vortex::dlmem_ref;
@@ -143,17 +158,22 @@ struct Expect {
   uint64_t  commit_cycle;
 };
 
+// A CTA_DONE event, or with cbar set a cluster-barrier arrival.
 struct DoneEvt {
   uint32_t core;
   uint32_t slot;
   uint32_t gang;
   uint32_t epoch;
+  bool     cbar = false;
+  uint32_t count = 0;
 };
 
 ///////////////////////////////////////////////////////////////////////////////
-// Cycle model of the gang unit and its core lanes. Within a cycle the CTA_DONE
-// event applies first, then the unit decides. A lane takes a beat while it
-// holds fewer than its capacity and owes fewer than LAUNCH_CREDITS admissions.
+// Cycle model of the gang unit and its core lanes. Within a cycle a CTA_DONE
+// event applies first, then the unit decides, then the lowest pending release
+// leaves, and last a CBAR event counts (its release is a register). A lane takes
+// a beat while it holds fewer than its capacity and owes fewer than
+// LAUNCH_CREDITS admissions.
 
 class GangModel {
 public:
@@ -172,8 +192,8 @@ public:
       used = used || (m_.free[c] != ref::low_mask(cfg_.nw));
     }
     bool live = false;
-    for (bool l : g_.live) {
-      live = live || l;
+    for (size_t i = 0; i < g_.live.size(); ++i) {
+      live = live || g_.live[i] || g_.rel_pend[i];
     }
     return in_valid || (phase_ != IDLE) || used || live;
   }
@@ -193,8 +213,10 @@ public:
     return true;
   }
 
-  // Advances one cycle; returns the lane the head beat leaves on, or -1.
-  int step(uint64_t cycle, const Beat* head, const DoneEvt* done, std::string& err) {
+  // Advances one cycle; returns the lane the head beat leaves on, or -1. *rel
+  // is the gang whose release leaves this cycle, or -1, and *rel_ep its epoch.
+  int step(uint64_t cycle, const Beat* head, const DoneEvt* ev, std::string& err, int* rel, uint32_t* rel_ep) {
+    const DoneEvt* done = (ev && !ev->cbar) ? ev : nullptr;
     if (done && policy_) {
       ref::release(m_, done->core, done->slot, w_);
       if (k_ > 1) {
@@ -230,8 +252,8 @@ public:
           }
         } else {
           bool id_free = (K == 1);
-          for (bool l : g_.live) {
-            id_free = id_free || !l;
+          for (size_t i = 0; i < g_.live.size(); ++i) {
+            id_free = id_free || (!g_.live[i] && !g_.rel_pend[i]);
           }
           if (id_free && (!failed_ || dirty_)) {
             start = true;
@@ -315,6 +337,16 @@ public:
     dirty_ = start ? false : (dirty_ || (done != nullptr));
     phase_ = phase_n;
     idx_ = idx_n;
+
+    *rel = ref::cbar_pop(g_);
+    *rel_ep = (*rel >= 0) ? g_.epoch[*rel] : 0;
+    if (ev && ev->cbar) {
+      if (!policy_ || k_ < 2 || ev->count != k_) {
+        err = "model: cluster-barrier arrival outside a SPREAD gang of its K";
+        return -1;
+      }
+      ref::cbar_arrive(g_, ev->gang, ev->epoch, k_);
+    }
     return fire;
   }
 
@@ -390,7 +422,18 @@ struct GangRec {
   std::vector<ref::Peer> members;   // by rank, as delivered
   std::vector<uint64_t> out_cycle;
   std::vector<uint64_t> done_cycle;
+  std::vector<uint64_t> done_pres;  // the cycle each CTA_DONE was presented
   uint64_t commit_cycle;
+};
+
+// One cluster-barrier phase of a gang, from its last arrival to its release.
+struct CbarRec {
+  int      gang_seq;
+  uint32_t phase;
+  uint32_t gang_id;
+  uint32_t epoch;
+  uint64_t arrive_cycle;
+  uint64_t release_cycle;
 };
 
 struct Resident {
@@ -398,13 +441,45 @@ struct Resident {
   uint32_t rank;
   uint32_t core, slot, gang, epoch, w;
   uint64_t done_at;
+  uint32_t phases;        // cluster-barrier arrivals the block makes
+  uint32_t phase;         // arrivals made
+  uint64_t arrive_at;     // its next arrival, or NEVER while it waits for a release
 };
+
+constexpr uint64_t NEVER = ~0ull;
 
 struct RunOpts {
   uint32_t ready_pct = 100;   // lane ready probability
   uint32_t gap_pct   = 0;     // probability of holding a beat back for a cycle
   // a block's lifetime in cycles, from the cycle it leaves the unit's lane
+  // (blocks without cluster-barrier phases)
   std::function<uint64_t(int gang_seq, uint32_t rank, uint32_t core)> life;
+  // cluster-barrier phases of a SPREAD gang of K > 1 (none by default)
+  std::function<uint32_t(int gang_seq)> phases;
+  // a block's arrival at a phase, in cycles from the cycle it left the unit's
+  // lane (phase 0) or from the cycle the previous release left the unit
+  std::function<uint64_t(int gang_seq, uint32_t rank, uint32_t phase)> gap;
+  // a block's CTA_DONE, in cycles from its last arrival
+  std::function<uint64_t(int gang_seq, uint32_t rank)> done_gap;
+};
+
+// A core's end of the gang unit's release link.
+class ReleaseSink : public SimObject<ReleaseSink> {
+public:
+  SimEventLink<GbarResume> in;
+  std::vector<std::pair<uint64_t, GbarResume>> log;
+
+  ReleaseSink(const SimContext& ctx, const char* name)
+    : SimObject<ReleaseSink>(ctx, name)
+    , in(this) {
+    in.bind(this, &ReleaseSink::on_release);
+  }
+
+  void on_release(const GbarResume& msg) {
+    log.push_back({SimPlatform::instance().cycles(), msg});
+  }
+
+  friend class SimObject<ReleaseSink>;
 };
 
 class Bench {
@@ -412,6 +487,7 @@ public:
   Bench(const ref::Cfg& cfg, uint32_t seed) : cfg_(cfg), rng_(seed) {}
 
   std::vector<GangRec> gangs;
+  std::vector<CbarRec> cbars;   // in release order
   std::vector<std::pair<uint64_t, uint64_t>> legacy_lat;   // (in fire, lane take)
   uint64_t cycles = 0;
   uint32_t errors = 0;
@@ -422,14 +498,35 @@ public:
     bool ok;
     {
       auto gang = CtaGang::Create("cta-gang", cfg_);
+      std::vector<ReleaseSink::Ptr> sinks;
+      for (uint32_t c = 0; c < cfg_.ncc; ++c) {
+        std::string name = "release-sink" + std::to_string(c);
+        sinks.push_back(ReleaseSink::Create(name.c_str()));
+        gang->release_out.at(c).bind(&sinks.back()->in);
+      }
       platform.reset();
-      ok = this->loop(*gang, launches, o);
+      ok = this->loop(*gang, sinks, launches, o);
     }
     platform.finalize();
     return ok;
   }
 
 private:
+  // The cluster-barrier progress of a gang.
+  struct Phase {
+    uint32_t k;
+    uint32_t gang_id;
+    uint32_t epoch;
+    uint32_t phases;
+    uint32_t phase = 0;       // releases received
+    uint32_t left = 0;        // releases that left the unit
+    uint32_t arrived = 0;     // arrivals presented at the current phase
+    uint64_t arrive_cycle = 0;
+    bool     pending = false; // all arrived, the release has not left
+    // releases that left and have not reached the cores: {arrive, leave} cycles
+    std::deque<std::pair<uint64_t, uint64_t>> inflight;
+  };
+
   template <typename... Args>
   void fail(const char* fmt, Args... args) {
     if (++errors <= 10) {
@@ -489,9 +586,72 @@ private:
     }
   }
 
-  bool loop(CtaGang& gang, const std::vector<Launch>& launches, const RunOpts& o) {
+  // Every core receives the release once, in the cycle the model predicts.
+  void check_releases(std::vector<ReleaseSink::Ptr>& sinks, std::map<uint64_t, std::pair<uint32_t, uint32_t>>& expect,
+                      std::map<int, Phase>& phases, uint64_t delay, bool* progress) {
+    auto it = expect.find(cycles);
+    for (uint32_t c = 0; c < cfg_.ncc; ++c) {
+      auto& log = sinks[c]->log;
+      uint32_t n = 0;
+      for (const auto& e : log) {
+        if (e.first != cycles) {
+          this->fail("core %u got a release in cycle %lu, read in cycle %lu", c, (unsigned long)e.first,
+                     (unsigned long)cycles);
+          continue;
+        }
+        ++n;
+        if (it == expect.end()) {
+          this->fail("core %u got release {gang %u, epoch %u}, the model sent none", c, e.second.gang_id,
+                     e.second.epoch);
+        } else if (e.second.kind != GBAR_KIND_CBAR || e.second.gang_id != it->second.first
+                || e.second.epoch != it->second.second) {
+          this->fail("core %u got release {kind %u, gang %u, epoch %u}, the model sent {gang %u, epoch %u}", c,
+                     e.second.kind, e.second.gang_id, e.second.epoch, it->second.first, it->second.second);
+        }
+      }
+      if (it != expect.end() && n != 1) {
+        this->fail("core %u got %u copies of release {gang %u, epoch %u}", c, n, it->second.first, it->second.second);
+      }
+      log.clear();
+    }
+    if (it == expect.end())
+      return;
+    *progress = true;
+    uint32_t id = it->second.first, ep = it->second.second;
+    expect.erase(it);
+    int seq = -1;
+    for (auto& p : phases) {
+      if (!p.second.inflight.empty() && p.second.gang_id == id && p.second.epoch == ep) {
+        seq = p.first;
+      }
+    }
+    if (seq < 0) {
+      this->fail("release {gang %u, epoch %u} for no gang with a released phase", id, ep);
+      return;
+    }
+    Phase& ph = phases[seq];
+    auto rel = ph.inflight.front();
+    ph.inflight.pop_front();
+    if (rel.second + delay != cycles) {
+      this->fail("release {gang %u, epoch %u} left in cycle %lu, reached the cores in cycle %lu", id, ep,
+                 (unsigned long)rel.second, (unsigned long)cycles);
+    }
+    cbars.push_back({seq, ph.phase, id, ep, rel.first, rel.second});
+    cbars_left_[seq] = rel.second;
+    ++ph.phase;
+  }
+
+  bool loop(CtaGang& gang, std::vector<ReleaseSink::Ptr>& sinks, const std::vector<Launch>& launches,
+            const RunOpts& o) {
     auto& platform = SimPlatform::instance();
     const uint32_t NCC = cfg_.ncc;
+    // the gbar unit's response register, then one fork stage per fan-out level
+    const uint64_t delay = 1 + (cfg_.num_sockets > 1 ? 1 : 0) + (cfg_.socket_size > 1 ? 1 : 0);
+    if (gang.release_delay() != delay) {
+      this->fail("release delay %lu cycles, the RTL path takes %lu", (unsigned long)gang.release_delay(),
+                 (unsigned long)delay);
+      return false;
+    }
     GangModel model(cfg_, gang.bus_out.at(0).capacity());
     std::vector<std::deque<Beat>> beats(launches.size());
     int gang_seq = 0;
@@ -505,12 +665,20 @@ private:
       }
     }
 
+    struct Evt {
+      DoneEvt  ev;
+      int      seq;
+      uint32_t rank;
+    };
     std::map<int, size_t> gang_index;
+    std::map<int, Phase> phases;
     std::vector<Resident> res;
-    std::deque<DoneEvt> done_q;
+    std::deque<Evt> done_q;
     std::vector<uint64_t> occ(NCC, 0);
     std::vector<uint32_t> warps(NCC, 0);
     std::map<uint32_t, std::pair<int, uint32_t>> live_ids;   // id -> (gang_seq, members left)
+    std::map<uint32_t, int> id_holder;                       // id -> its last gang
+    std::map<uint64_t, std::pair<uint32_t, uint32_t>> rel_expect;   // delivery cycle -> {id, epoch}
     uint32_t cur_launch = 0;
     bool head_valid = false;
     Beat head{};
@@ -522,17 +690,29 @@ private:
       // the launch in progress has drained: present the next one
       bool launch_open = (cur_launch < launches.size()) && !beats[cur_launch].empty();
       if (!launch_open && !head_valid && cur_launch < launches.size()) {
-        bool drained = res.empty() && done_q.empty() && !busy_prev;
+        bool drained = res.empty() && done_q.empty() && rel_expect.empty() && !busy_prev;
         if (drained) {
           ++cur_launch;
           if (cur_launch >= launches.size())
             break;
         }
       }
-      // CTA completions due this cycle, one presented per cycle
+      // events due this cycle, in the order the blocks left the unit; one
+      // presented per cycle
       for (auto it = res.begin(); it != res.end();) {
-        if (it->done_at <= cycles) {
-          done_q.push_back({it->core, it->slot, it->gang, it->epoch});
+        if (it->phase < it->phases && it->arrive_at <= cycles) {
+          DoneEvt a{it->core, it->slot, it->gang, it->epoch, true, this->k_of(it->gang_seq)};
+          done_q.push_back({a, it->gang_seq, it->rank});
+          ++it->phase;
+          it->arrive_at = NEVER;
+          if (it->phase == it->phases) {
+            it->done_at = cycles + o.done_gap(it->gang_seq, it->rank);
+          }
+          ++it;
+          continue;
+        }
+        if (it->phase == it->phases && it->done_at <= cycles) {
+          done_q.push_back({DoneEvt{it->core, it->slot, it->gang, it->epoch}, it->gang_seq, it->rank});
           uint32_t c = it->core;
           occ[c] &= ~(uint64_t(1) << it->slot);
           warps[c] -= it->w;
@@ -551,9 +731,30 @@ private:
       DoneEvt dev{};
       bool dvalid = !done_q.empty();
       if (dvalid) {
-        dev = done_q.front();
+        Evt e = done_q.front();
         done_q.pop_front();
-        gang.cta_done(dev.core, dev.slot, dev.gang, dev.epoch);
+        dev = e.ev;
+        GangEvent ge;
+        ge.kind    = dev.cbar ? GangEvent::CBAR : GangEvent::CTA_DONE;
+        ge.core    = dev.core;
+        ge.slot    = dev.slot;
+        ge.gang_id = dev.gang;
+        ge.epoch   = dev.epoch;
+        ge.count   = dev.count;
+        gang.cta_event(ge);
+        if (dev.cbar) {
+          Phase& ph = phases.at(e.seq);
+          if (ph.pending) {
+            this->fail("gang %d rank %u arrived before its phase %u was released", e.seq, e.rank, ph.left);
+          }
+          if (++ph.arrived == ph.k) {
+            ph.arrived = 0;
+            ph.arrive_cycle = cycles;
+            ph.pending = true;
+          }
+        } else {
+          gangs[gang_index[e.seq]].done_pres[e.rank] = cycles;
+        }
       }
 
       if (!head_valid && cur_launch < launches.size() && !beats[cur_launch].empty()
@@ -617,17 +818,39 @@ private:
             g.members.assign(e.req.row.k, ref::Peer{0, 0});
             g.out_cycle.assign(e.req.row.k, 0);
             g.done_cycle.assign(e.req.row.k, 0);
+            g.done_pres.assign(e.req.row.k, 0);
             g.commit_cycle = e.commit_cycle;
             gang_index[e.gang_seq] = gangs.size();
             gangs.push_back(g);
             git = gang_index.find(e.gang_seq);
+            if (g.k > 1) {
+              // an id is handed out again only once its last release left
+              auto hit = id_holder.find(g.gang_id);
+              if (hit != id_holder.end()) {
+                const Phase& old = phases.at(hit->second);
+                uint64_t left = old.inflight.empty() ? (old.phase ? cbars_left_[hit->second] : 0) : old.inflight.back().second;
+                if (old.pending || ((old.phase || !old.inflight.empty()) && g.commit_cycle <= left)) {
+                  this->fail("gang id %u handed to gang %d (commit %lu) before the release of gang %d left", g.gang_id,
+                             e.gang_seq, (unsigned long)g.commit_cycle, hit->second);
+                }
+              }
+              id_holder[g.gang_id] = e.gang_seq;
+              Phase ph;
+              ph.k = g.k;
+              ph.gang_id = g.gang_id;
+              ph.epoch = g.epoch;
+              ph.phases = o.phases ? o.phases(e.gang_seq) : 0;
+              phases[e.gang_seq] = ph;
+            }
           }
           GangRec& g = gangs[git->second];
           g.members[e.rank] = {c, s};
           g.out_cycle[e.rank] = cycles;
           ks_[e.gang_seq] = e.req.row.k;
+          uint32_t P = (g.k > 1) ? phases.at(e.gang_seq).phases : 0;
           res.push_back({e.gang_seq, e.rank, c, s, e.req.gang_id, e.req.epoch, e.w,
-                         cycles + o.life(e.gang_seq, e.rank, c)});
+                         (P > 0) ? NEVER : cycles + o.life(e.gang_seq, e.rank, c), P, 0,
+                         (P > 0) ? cycles + o.gap(e.gang_seq, e.rank, 0) : NEVER});
         } else {
           legacy_lat.push_back({e.in_cycle, cycles});
         }
@@ -640,13 +863,40 @@ private:
       busy_prev = busy || any_had;
 
       std::string err;
-      int want = model.step(cycles, head_valid ? &head : nullptr, dvalid ? &dev : nullptr, err);
+      int rel = -1;
+      uint32_t rel_ep = 0;
+      int want = model.step(cycles, head_valid ? &head : nullptr, dvalid ? &dev : nullptr, err, &rel, &rel_ep);
       if (!err.empty()) {
         this->fail("%s", err.c_str());
         return false;
       }
+      if (rel >= 0) {
+        rel_expect[cycles + delay] = {uint32_t(rel), rel_ep};
+        // the blocks' next arrivals count from the cycle the release leaves;
+        // the cycle it reaches the cores is checked against this one
+        bool found = false;
+        for (auto& p : phases) {
+          if (p.second.pending && p.second.gang_id == uint32_t(rel) && p.second.epoch == rel_ep) {
+            p.second.pending = false;
+            p.second.inflight.push_back({p.second.arrive_cycle, cycles});
+            found = true;
+            uint32_t next = ++p.second.left;
+            for (auto& r : res) {
+              if (r.gang_seq == p.first && r.phase == next && r.phase < r.phases) {
+                r.arrive_at = cycles + o.gap(p.first, r.rank, r.phase);
+              }
+            }
+          }
+        }
+        if (!found) {
+          this->fail("the model releases {gang %d, epoch %u}, which no gang completed", rel, rel_ep);
+        }
+      }
 
       platform.tick();
+      // the releases the sinks took at the start of this cycle's tick
+      bool rel_progress = false;
+      this->check_releases(sinks, rel_expect, phases, delay, &rel_progress);
 
       bool in_fire = head_valid && (gang.bus_in.size() == 0);
       if (head_valid && in_fire != (want >= 0)) {
@@ -666,7 +916,7 @@ private:
       }
       ++cycles;
 
-      idle = (in_fire || out_fire || dvalid) ? 0 : idle + 1;
+      idle = (in_fire || out_fire || dvalid || rel_progress) ? 0 : idle + 1;
       if (idle > 5000) {
         this->fail("no progress for 5000 cycles (launch %u)", cur_launch + 1);
         return false;
@@ -678,6 +928,14 @@ private:
     if (!live_ids.empty()) {
       this->fail("%zu gang ids still live at the end", live_ids.size());
     }
+    for (const auto& p : phases) {
+      if (p.second.pending || !p.second.inflight.empty() || p.second.phase != p.second.phases) {
+        this->fail("gang %d passed %u of its %u cluster-barrier phases", p.first, p.second.phase, p.second.phases);
+      }
+    }
+    if (!rel_expect.empty()) {
+      this->fail("%zu releases never reached the cores", rel_expect.size());
+    }
     if (gang.busy()) {
       this->fail("%s", "the unit is still busy at the end");
     }
@@ -687,6 +945,7 @@ private:
   ref::Cfg cfg_;
   std::mt19937 rng_;
   std::map<int, uint32_t> ks_;
+  std::map<int, uint64_t> cbars_left_;   // gang -> the cycle its last delivered release left
 };
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -1007,10 +1266,88 @@ bool t_random(const ref::Cfg& cfg, uint32_t seed, uint32_t num_launches) {
   o.gap_pct = rng() % 30;
   std::mt19937 lrng(seed * 7 + 1);
   o.life = [&lrng](int, uint32_t, uint32_t) { return uint64_t(1 + lrng() % 60); };
+  // cluster-barrier phases, so arrivals, releases and done events interleave
+  o.phases = [seed](int seq) { return uint32_t((uint32_t(seq) * 2654435761u + seed) >> 7) % 4; };
+  std::mt19937 grng(seed * 13 + 5);
+  o.gap = [&grng](int, uint32_t, uint32_t) { return uint64_t(1 + grng() % 8); };
+  o.done_gap = [&grng](int, uint32_t) { return uint64_t(1 + grng() % 30); };
   bool ok = b.run(ls, o);
-  std::printf("random: %u launches, %zu gangs, %lu cycles, ready %u%%, gaps %u%%\n", num_launches, b.gangs.size(),
-              (unsigned long)b.cycles, o.ready_pct, o.gap_pct);
+  std::printf("random: %u launches, %zu gangs, %zu cluster-barrier phases, %lu cycles, ready %u%%, gaps %u%%\n",
+              num_launches, b.gangs.size(), b.cbars.size(), (unsigned long)b.cycles, o.ready_pct, o.gap_pct);
   return report("random", ok);
+}
+
+// Gangs pass three cluster-barrier phases each; with the release port always
+// ready, every release leaves in the cycle after the phase's last arrival.
+bool t_cbar_phases(const ref::Cfg& cfg) {
+  if (cfg.max_cluster < 2) {
+    std::printf("cluster-barrier phases: needs MAX_CLUSTER >= 2, skipped\n");
+    return true;
+  }
+  uint32_t K = cfg.max_cluster;
+  uint32_t G = 2 * cfg.ncc * cfg.nw / K + 2;   // more gangs than fit: ids are reused
+  Bench b(cfg, 91);
+  RunOpts o = fixed_life(4);
+  o.phases = [](int) { return 3u; };
+  o.gap = [](int seq, uint32_t rank, uint32_t phase) { return uint64_t(1 + (seq + 3 * rank + 5 * phase) % 7); };
+  o.done_gap = [](int seq, uint32_t rank) { return uint64_t(1 + (seq + rank) % 4); };
+  bool ok = b.run({{true, K, 1, 0, G}}, o);
+  ok = ok && (b.cbars.size() == 3 * G);
+  std::map<int, uint32_t> next;
+  for (const auto& c : b.cbars) {
+    const GangRec* g = nullptr;
+    for (const auto& r : b.gangs) {
+      if (r.gang_seq == c.gang_seq)
+        g = &r;
+    }
+    if (!g || c.phase != next[c.gang_seq]++ || c.gang_id != g->gang_id || c.epoch != g->epoch
+     || c.release_cycle != c.arrive_cycle + 1) {
+      std::printf("FAIL cbar-phases: gang %d phase %u {id %u epoch %u} arrived %lu, released %lu\n", c.gang_seq,
+                  c.phase, c.gang_id, c.epoch, (unsigned long)c.arrive_cycle, (unsigned long)c.release_cycle);
+      ok = false;
+      break;
+    }
+  }
+  return report("cluster-barrier phases", ok);
+}
+
+// A gang's last done event lands in the cycle its release leaves: its id is
+// not free in that cycle, so the gang waiting for an id starts one cycle later.
+bool t_cbar_id_hold(const ref::Cfg& cfg) {
+  if (cfg.max_cluster < 2 || 2 * cfg.num_gangs > cfg.ncc * cfg.nw) {
+    std::printf("gang id held by a pending release: needs MAX_CLUSTER >= 2 and 2 slots per gang id, skipped\n");
+    return true;
+  }
+  const uint32_t K = 2;
+  const int G = int(cfg.num_gangs);   // gangs 0..G-1 hold every id; gang G waits for one
+  Bench b(cfg, 95);
+  RunOpts o;
+  // gang 0's two blocks arrive late, after every gang is placed, and the last
+  // done follows the last arrival; the others hold their ids
+  o.life = [G](int seq, uint32_t, uint32_t) { return uint64_t(seq == G ? 10 : 2000); };
+  o.phases = [](int seq) { return seq == 0 ? 1u : 0u; };
+  o.gap = [](int, uint32_t rank, uint32_t) { return uint64_t(rank == 0 ? 204 : 208); };
+  o.done_gap = [](int, uint32_t rank) { return uint64_t(rank == 0 ? 3 : 1); };
+  bool ok = b.run({{true, K, 1, 0, uint32_t(G) + 1}}, o);
+  ok = ok && (b.gangs.size() == uint32_t(G) + 1) && (b.cbars.size() == 1);
+  if (ok) {
+    const CbarRec& c = b.cbars[0];
+    const GangRec& g0 = b.gangs[0];
+    const GangRec& w = b.gangs[G];
+    uint64_t last_done = std::max(g0.done_pres[0], g0.done_pres[1]);
+    if (last_done != c.release_cycle) {
+      std::printf("FAIL id-hold: gang 0's last done presented in cycle %lu, its release left in cycle %lu\n",
+                  (unsigned long)last_done, (unsigned long)c.release_cycle);
+      ok = false;
+    }
+    if (w.gang_id != g0.gang_id || w.out_cycle[0] != c.release_cycle + 1 + K + 2) {
+      std::printf("FAIL id-hold: gang %d got id %u, first beat in cycle %lu; want id %u in cycle %lu\n", G,
+                  w.gang_id, (unsigned long)w.out_cycle[0], g0.gang_id,
+                  (unsigned long)(c.release_cycle + 1 + K + 2));
+      ok = false;
+    }
+  }
+  return report("gang id held by a pending release", ok);
 }
 
 bool t_schedule(const ref::Cfg& cfg, const std::string& csv) {
@@ -1052,6 +1389,42 @@ bool t_schedule(const ref::Cfg& cfg, const std::string& csv) {
   return report("deterministic schedule", ok);
 }
 
+// The RTL bench's cluster-barrier schedule.
+bool t_schedule_cbar(const ref::Cfg& cfg, const std::string& csv) {
+  const uint32_t MAXC = cfg.max_cluster;
+  uint32_t G = (MAXC > 1) ? 2 * cfg.ncc * cfg.nw / MAXC + 2 : 0;
+  Bench b(cfg, 94);
+  RunOpts o;
+  o.life = [](int, uint32_t, uint32_t) { return uint64_t(1); };
+  o.phases = [](int s) { return uint32_t(1 + s % 3); };
+  o.gap = [](int s, uint32_t r, uint32_t i) {
+    return (i == 0) ? uint64_t(3 + (5 * s + 3 * r) % 11) : uint64_t(2 + (3 * s + 5 * r + i) % 7);
+  };
+  o.done_gap = [](int s, uint32_t r) { return uint64_t(1 + (7 * s + 5 * r) % 9); };
+  bool ok = (G == 0) || b.run({{true, MAXC, 1, 0, G}}, o);
+  std::vector<CbarRec> rows = b.cbars;
+  std::sort(rows.begin(), rows.end(), [](const CbarRec& x, const CbarRec& y) {
+    return std::make_tuple(x.release_cycle, x.gang_id, x.epoch, x.arrive_cycle)
+         < std::make_tuple(y.release_cycle, y.gang_id, y.epoch, y.arrive_cycle);
+  });
+  if (ok && !csv.empty()) {
+    FILE* f = std::fopen(csv.c_str(), "w");
+    if (!f) {
+      std::printf("FAIL cbar schedule: cannot write %s\n", csv.c_str());
+      return false;
+    }
+    std::fprintf(f, "gang,epoch,arrive_cycle,release_cycle\n");
+    for (const auto& c : rows) {
+      std::fprintf(f, "%u,%u,%lu,%lu\n", c.gang_id, c.epoch, (unsigned long)c.arrive_cycle,
+                   (unsigned long)c.release_cycle);
+    }
+    std::fclose(f);
+    std::printf("cbar schedule: %u gangs, %zu releases, %lu cycles, wrote %s\n", G, rows.size(),
+                (unsigned long)b.cycles, csv.c_str());
+  }
+  return report("deterministic cluster-barrier schedule", ok);
+}
+
 bool parse_shape(const char* s, ref::Cfg* cfg) {
   unsigned ncc = 0, ss = 0, nw = 0, maxc = 0, lmem_log = 0;
   int n = std::sscanf(s, "%u,%u,%u,%u,%u", &ncc, &ss, &nw, &maxc, &lmem_log);
@@ -1074,6 +1447,7 @@ int main(int argc, char** argv) {
   uint32_t seed = 1;
   uint32_t launches = 30;
   std::string csv;
+  std::string cbar_csv;
   ref::Cfg cfg = dlmem_cfg();
   for (int i = 1; i < argc; ++i) {
     if (std::strncmp(argv[i], "--seed=", 7) == 0) {
@@ -1082,10 +1456,12 @@ int main(int argc, char** argv) {
       launches = uint32_t(std::strtoul(argv[i] + 11, nullptr, 0));
     } else if (std::strncmp(argv[i], "--csv=", 6) == 0) {
       csv = argv[i] + 6;
+    } else if (std::strncmp(argv[i], "--cbar-csv=", 11) == 0) {
+      cbar_csv = argv[i] + 11;
     } else if (std::strncmp(argv[i], "--shape=", 8) == 0 && parse_shape(argv[i] + 8, &cfg)) {
       continue;
     } else {
-      std::printf("usage: %s [--seed=N] [--launches=N] [--csv=FILE] [--shape=CORES,SOCKET_SIZE,WARPS,MAX_CLUSTER[,LMEM_LOG]]\n",
+      std::printf("usage: %s [--seed=N] [--launches=N] [--csv=FILE] [--cbar-csv=FILE] [--shape=CORES,SOCKET_SIZE,WARPS,MAX_CLUSTER[,LMEM_LOG]]\n",
                   argv[0]);
       return 2;
     }
@@ -1103,8 +1479,11 @@ int main(int argc, char** argv) {
   ok = t_new_launch(cfg) && ok;
   ok = t_epoch(cfg) && ok;
   ok = t_ids(cfg) && ok;
+  ok = t_cbar_phases(cfg) && ok;
+  ok = t_cbar_id_hold(cfg) && ok;
   ok = t_random(cfg, seed, launches) && ok;
   ok = t_schedule(cfg, csv) && ok;
+  ok = t_schedule_cbar(cfg, cbar_csv) && ok;
 
   if (!ok) {
     std::cout << "FAILED!" << std::endl;

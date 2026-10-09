@@ -168,6 +168,13 @@ instr_trace_t* Scheduler::schedule(const WarpMask& warp_mask) {
     if (cta_dispatcher_->step(active_warps_, &wid, &rec)) {
       activate_warp(wid, rec);
     }
+#ifdef VX_CFG_EXT_DLMEM_ENABLE
+    uint32_t slot;
+    CbarSlot info;
+    if (cta_dispatcher_->take_cbar_wr(&slot, &info)) {
+      barrier_unit_->slot_admit(slot, info);
+    }
+#endif
   }
 
 #ifdef VX_CFG_EXT_RASTER_ENABLE

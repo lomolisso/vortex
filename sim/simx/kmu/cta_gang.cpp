@@ -15,6 +15,7 @@
 #include <algorithm>
 #include <VX_config.h>
 #include <VX_types.h>
+#include "barrier_unit.h"
 #include "debug.h"
 
 using namespace vortex;
@@ -57,6 +58,7 @@ CtaGang::CtaGang(const SimContext& ctx, const char* name, const dlmem_ref::Cfg& 
   , credit_out(this)
   , bus_out(cfg.ncc, this)
   , credit_in(cfg.ncc, this)
+  , release_out(cfg.ncc, this)
   , cfg_(cfg)
   , blocks_(0)
   , state_(State::IDLE)
@@ -74,6 +76,9 @@ CtaGang::CtaGang(const SimContext& ctx, const char* name, const dlmem_ref::Cfg& 
   , locked_(false)
   , lock_core_(0)
   , inflight_(cfg.ncc, 0)
+  // From the cycle a release leaves: the gbar unit's response register, then
+  // one response-fork stage per fan-out level that exists.
+  , rel_delay_(1 + (cfg.num_sockets > 1 ? 1 : 0) + (cfg.socket_size > 1 ? 1 : 0))
 {
   dlmem_ref::reset(cfg_, mirror_);
   dlmem_ref::reset(cfg_, gids_);
@@ -93,20 +98,30 @@ void CtaGang::on_reset() {
   members_.clear();
   failed_    = false;
   dirty_     = false;
-  done_q_.clear();
+  evt_q_.clear();
   rr_core_   = 0;
   locked_    = false;
   lock_core_ = 0;
   inflight_.assign(inflight_.size(), 0);
 }
 
-void CtaGang::cta_done(uint32_t core, uint32_t slot, uint32_t gang_id, uint32_t epoch) {
-  done_q_.push_back({core, slot, gang_id, epoch});
+void CtaGang::cta_event(const GangEvent& evt) {
+  evt_q_.push_back(evt);
   this->tick_wake();
 }
 
 bool CtaGang::busy() const {
-  return (state_ != State::IDLE) || (blocks_ != 0) || !done_q_.empty() || (bus_in.size() != 0);
+  bool rel_pend = std::find(gids_.rel_pend.begin(), gids_.rel_pend.end(), true) != gids_.rel_pend.end();
+  return (state_ != State::IDLE) || (blocks_ != 0) || !evt_q_.empty() || (bus_in.size() != 0) || rel_pend;
+}
+
+// An id is reusable only once its last release left.
+bool CtaGang::id_free() const {
+  for (size_t i = 0; i < gids_.live.size(); ++i) {
+    if (!gids_.live[i] && !gids_.rel_pend[i])
+      return true;
+  }
+  return false;
 }
 
 bool CtaGang::lane_ready(uint32_t core) const {
@@ -122,7 +137,7 @@ void CtaGang::send_beat(uint32_t core, const kmu_req_t& beat) {
   credit_out.send(1, 1);
 }
 
-void CtaGang::apply_done(const Done& d) {
+void CtaGang::apply_done(const GangEvent& d) {
   // Same-core clusters emit no done events, so every event is a SPREAD block's.
   check(policy_ == KMU_POLICY_SPREAD, "cta_gang: done event outside a SPREAD launch");
   check(d.core < cfg_.ncc && blocks_ != 0, "cta_gang: done event for no placed block");
@@ -133,6 +148,13 @@ void CtaGang::apply_done(const Done& d) {
   if (k_ > 1) {
     dlmem_ref::done(gids_, d.gang_id, d.epoch);
   }
+}
+
+void CtaGang::apply_cbar(const GangEvent& a) {
+  check(policy_ == KMU_POLICY_SPREAD && k_ > 1, "cta_gang: cluster-barrier arrival outside a SPREAD gang");
+  check(a.count == k_, "cta_gang: cluster-barrier arrival with a block count other than the gang's");
+  DT(2, this->name() << " cbar-arrive: core_id=" << a.core << ", gang=" << a.gang_id << ", epoch=" << a.epoch);
+  dlmem_ref::cbar_arrive(gids_, a.gang_id, a.epoch, k_);
 }
 
 void CtaGang::forward_legacy() {
@@ -244,9 +266,15 @@ void CtaGang::on_tick() {
   // dirty_ is a register: an event lands in this cycle's placement snapshot,
   // but the retry gate sees it only from the next cycle.
   bool dirty_q = dirty_;
-  if (!done_q_.empty()) {
-    this->apply_done(done_q_.front());
-    done_q_.pop_front();
+  bool has_evt = !evt_q_.empty();
+  GangEvent evt{};
+  if (has_evt) {
+    evt = evt_q_.front();
+    evt_q_.pop_front();
+  }
+  // a cluster-barrier arrival frees nothing, so it cannot wake a failed placement
+  if (has_evt && evt.kind == GangEvent::CTA_DONE) {
+    this->apply_done(evt);
     dirty_ = true;
   }
 
@@ -267,8 +295,7 @@ void CtaGang::on_tick() {
       this->forward_legacy();
       break;
     }
-    bool id_free = (k_ == 1)
-                || (std::find(gids_.live.begin(), gids_.live.end(), false) != gids_.live.end());
+    bool id_free = (k_ == 1) || this->id_free();
     if (id_free && (!failed_ || dirty_q)) {
       this->start_attempt(head);
     }
@@ -288,7 +315,27 @@ void CtaGang::on_tick() {
     break;
   }
 
-  if (state_ == State::IDLE && done_q_.empty() && bus_in.size() == 0) {
+  // The pending releases are a register: the lowest leaves this cycle, after
+  // this cycle's placement saw it pending, and an arrival that completes a
+  // phase now sets its release for the next cycle.
+  int rel = dlmem_ref::cbar_pop(gids_);
+  if (rel >= 0) {
+    GbarResume msg{0};
+    msg.kind    = GBAR_KIND_CBAR;
+    msg.gang_id = uint32_t(rel);
+    msg.epoch   = gids_.epoch[rel];
+    DT(2, this->name() << " cbar-release: gang=" << rel << ", epoch=" << msg.epoch);
+    // RTL also holds a release while a global barrier response occupies gbar_unit's register; not modelled.
+    for (auto& link : release_out) {
+      link.send(msg, rel_delay_);
+    }
+  }
+  if (has_evt && evt.kind == GangEvent::CBAR) {
+    this->apply_cbar(evt);
+  }
+
+  bool rel_pend = std::find(gids_.rel_pend.begin(), gids_.rel_pend.end(), true) != gids_.rel_pend.end();
+  if (state_ == State::IDLE && evt_q_.empty() && bus_in.size() == 0 && !rel_pend) {
     this->tick_sleep();
   }
 }

@@ -97,6 +97,11 @@ module VX_core_top import VX_gpu_pkg::*;
     assign gbar_bus_if.req_ready    = gbar_req_ready;
     assign gbar_bus_if.rsp_valid    = gbar_rsp_valid;
     assign gbar_bus_if.rsp_data.id  = gbar_rsp_id;
+`ifdef VX_CFG_EXT_DLMEM_ENABLE
+    assign gbar_bus_if.rsp_data.kind    = 1'b0;
+    assign gbar_bus_if.rsp_data.gang_id = '0;
+    assign gbar_bus_if.rsp_data.epoch   = 1'b0;
+`endif
     assign gbar_rsp_ready = gbar_bus_if.rsp_ready;
 
 `ifdef VX_CFG_EXT_DXA_ENABLE

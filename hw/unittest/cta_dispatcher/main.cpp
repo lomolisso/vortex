@@ -318,6 +318,8 @@ public:
   // Results of the last run (DLMEM).
   uint32_t events = 0;
   uint64_t pend_blocked = 0;   // cycles a presented block waited on a pending done event
+  uint32_t cbar_records = 0;   // cluster-barrier records checked
+  uint32_t cbar_gangs = 0;     // of them, gangs that complete through the gang unit
   std::vector<uint64_t> accept_cycle;
   std::map<uint32_t, uint64_t> last_event_cycle;   // slot -> cycle its last event left
 
@@ -336,6 +338,8 @@ public:
     drained_ = 0;
     events = 0;
     pend_blocked = 0;
+    cbar_records = 0;
+    cbar_gangs = 0;
     accept_cycle.assign(ctas.size(), 0);
     last_event_cycle.clear();
     warp_cta_.assign(NUM_WARPS, -1);
@@ -512,9 +516,11 @@ private:
       std::printf("FAIL: peer-row write %d, %s\n", int(sim_->peer_wr_valid), want_wr ? "a block was admitted" : "no block was admitted");
       return false;
     }
+    uint32_t wr_slot = 0;
     if (want_wr) {
       const Cta& c = ctas[prev_accept_];
       uint32_t slot = model_.place(c);
+      wr_slot = slot;
       std::vector<uint32_t> row = c.pinned ? c.row
           : legacy_row_words(model_.window(), std::min(c.k, usable_slots(stride_of(c.lmem_size))));
       std::vector<uint32_t> got = words_of(sim_->peer_wr_row);
@@ -525,6 +531,35 @@ private:
                     same_bits(got, row, ROW_W) ? "" : ", row differs");
         return false;
       }
+    }
+    // and its cluster-barrier record: a gang of K > 1 completes through the gang
+    // unit, any other block in this core at its cluster's base slot
+    if (bool(sim_->cbar_wr_valid) != want_wr) {
+      std::printf("FAIL: cluster-barrier record write %d, %s\n", int(sim_->cbar_wr_valid),
+                  want_wr ? "a block was admitted" : "no block was admitted");
+      return false;
+    }
+    if (want_wr) {
+      const Cta& c = ctas[prev_accept_];
+      uint32_t slot = wr_slot;
+      uint32_t k = c.pinned ? std::min(c.k, MAXC) : std::min(c.k, usable_slots(stride_of(c.lmem_size)));
+      bool gang = c.pinned && k > 1;
+      uint32_t base = c.pinned ? slot : model_.window();
+      bool ok = (sim_->cbar_wr_slot == slot) && (bool(sim_->cbar_wr_gang) == gang) && (sim_->cbar_wr_k == k)
+             && (sim_->cbar_wr_base == base);
+      if (c.pinned) {
+        ok = ok && (sim_->cbar_wr_gang_id == c.gang) && (sim_->cbar_wr_epoch == c.epoch);
+      }
+      if (!ok) {
+        std::printf("FAIL: launch %u CTA %u (%s, K=%u): cluster-barrier record slot %u gang %d id %u epoch %u base %u"
+                    " k %u, want slot %u gang %d id %u epoch %u base %u k %u\n", c.launch + 1, c.block_idx,
+                    c.pinned ? "pinned" : "legacy", c.k, (uint32_t)sim_->cbar_wr_slot, int(sim_->cbar_wr_gang),
+                    (uint32_t)sim_->cbar_wr_gang_id, (uint32_t)sim_->cbar_wr_epoch, (uint32_t)sim_->cbar_wr_base,
+                    (uint32_t)sim_->cbar_wr_k, slot, int(gang), c.gang, c.epoch, base, k);
+        return false;
+      }
+      ++cbar_records;
+      cbar_gangs += gang;
     }
     // a presented block whose slot still owes a done event must wait
     if (presented >= 0 && !ctas[presented].pinned) {
@@ -795,8 +830,9 @@ static bool multi_launch(Sim& sim, uint64_t& tick, uint32_t seed, uint32_t num_l
   tick = bench.tick();
   ok = ok && check_slots("multi-launch", ctas, slots);
 #if VX_CFG_EXT_DLMEM_ENABLED
-  std::printf("multi-launch: %u launches, %zu CTAs, %u done events, %lu cycles a block waited on one: %s\n",
-              num_launches, ctas.size(), bench.events, (unsigned long)bench.pend_blocked, ok ? "ok" : "FAILED");
+  std::printf("multi-launch: %u launches, %zu CTAs, %u done events, %lu cycles a block waited on one,"
+              " %u cluster-barrier records (%u gangs): %s\n", num_launches, ctas.size(), bench.events,
+              (unsigned long)bench.pend_blocked, bench.cbar_records, bench.cbar_gangs, ok ? "ok" : "FAILED");
 #else
   std::printf("multi-launch: %u launches, %zu CTAs: %s\n", num_launches, ctas.size(), ok ? "ok" : "FAILED");
 #endif

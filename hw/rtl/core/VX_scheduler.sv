@@ -96,6 +96,10 @@ module VX_scheduler import VX_gpu_pkg::*; #(
     wire             cta_done_valid;
     dlmem_cta_done_t cta_done_data;
     wire             cta_done_ready;
+    // cluster-barrier slot records, from the dispatcher to the barrier unit
+    wire                cbar_wr_valid;
+    wire [NW_WIDTH-1:0] cbar_wr_slot;
+    cbar_slot_t         cbar_wr_info;
 `endif
 
     VX_cta_dispatch #(
@@ -130,6 +134,9 @@ module VX_scheduler import VX_gpu_pkg::*; #(
         .peer_wr_slot   (peer_wr_slot),
         .peer_wr_row    (peer_wr_row),
         .peer_wr_stride (peer_wr_stride),
+        .cbar_wr_valid  (cbar_wr_valid),
+        .cbar_wr_slot   (cbar_wr_slot),
+        .cbar_wr_info   (cbar_wr_info),
     `endif
         .busy       (cta_dispatcher_busy)
     );
@@ -419,6 +426,10 @@ module VX_scheduler import VX_gpu_pkg::*; #(
         .active_warps(active_warps),
         .gbar_bus_if(gbar_bus_if),
     `ifdef VX_CFG_EXT_DLMEM_ENABLE
+        .read_cluster   (warp_ctl_if.bar_cluster),
+        .cbar_wr_valid  (cbar_wr_valid),
+        .cbar_wr_slot   (cbar_wr_slot),
+        .cbar_wr_info   (cbar_wr_info),
         .cta_done_valid (cta_done_valid),
         .cta_done_data  (cta_done_data),
         .cta_done_ready (cta_done_ready),

@@ -592,6 +592,59 @@ is written on a DLMEM device only, in every launch with `ndim > 0` and in the
 QMD; legacy `vx_start` writes DEFAULT, because the register keeps the last
 launch's value.
 
+### 4.7 The cluster barrier (DLMEM)
+
+`cluster.sync()` is one hardware barrier per block, addressed by the block's
+slot: the `BAR` instructions with `rs1 = (1 << 30) | CTA_ID` and no barrier
+id ([`vx_dlmem.h`](../../sw/kernel/include/vx_dlmem.h); the contract is in
+the [proposal](../proposals/dlmem_proposal.md#cluster-barrier)). Its state
+sits in `VX_bar_unit` beside the barrier store, per slot, because `{slot, 0}`
+in the store belongs to `__syncthreads()`, which a block may call between an
+arrive and its wait.
+
+**Slot records.** At admission the dispatcher writes the block's record into
+the barrier unit through a registered port, `cbar_wr_*` (`cbar_slot_t`):
+whether it belongs to a gang (pinned, K > 1), the gang id and epoch, the
+cluster's base slot and its K. A same-core cluster records the base slot of
+its window and the K the window was clamped to; any other block is its own
+base with K = 1. The write also clears the slot's counters, waiting mask,
+pending bit and phase, long before any warp of the block can execute.
+
+**Completion.**
+
+| Cluster | When its last block's last warp arrives |
+|---|---|
+| same-core, or K = 1 | the base slot's block count reaches K: release slots `base .. base+K−1` in that cycle |
+| SPREAD, K > 1 | the core pushes `CBAR{gang_id, epoch, K−1}` into its global-barrier queue and marks the slot pending; the gang unit counts K and sends one release `{gang_id, epoch}` |
+
+A release unlocks every waiting warp of the matching pending slots (OR-ed
+with any other unlock of the cycle) and flips their phase. A CBAR shares the
+done events' path ([§4.6](#46-distributed-clusters-gang-admission-dlmem)), so
+a block's arrival always reaches the gang before its done event. The gang
+unit's release goes out through `VX_gbar_unit`'s response register
+(`gbar_rsp_t.kind = 1`) whenever it is free, and the cores take it in any
+cycle. SimX does not model that hold: its release leaves the cycle after the
+K-th arrival even when a global barrier response holds the register, so the
+two models can drift when global barriers and cluster releases overlap (the
+parity cells use no global barrier). A gang id is free only when it is
+neither live nor holding a release, and its epoch flips on reuse, so a stale
+release finds no pending slot and does nothing; so does a release whose
+blocks already exited.
+
+**Queue bound.** Barrier arrivals (at most NB), CBARs (one per slot) and done
+events (admitted only below NUM_WARPS entries) bound the per-core request
+FIFO at NB + 2 × NUM_WARPS.
+
+**Drains.** A cluster arrive, a plain `BAR` and a warp exit wait in DLMEM
+builds until the warp's earlier instructions have committed (and, for the
+barriers, the LSU queues are empty). A per-warp `dlmem_drained` input of the
+same hook will add the warp's unacknowledged remote stores.
+
+**Co-residency.** A same-core cluster whose K blocks do not all fit at once
+(K above the usable slots, or K × W above NUM_WARPS) is admitted a few blocks
+at a time (§4.2), so its cluster barrier never completes. That launch is
+documented as unsupported rather than rejected.
+
 ---
 
 ## 5. Dispatcher microarchitecture
@@ -962,7 +1015,8 @@ correctly retained for retirement.)
 | [`tests/regression/cluster_rank/`](../../tests/regression/cluster_rank/) | DLMEM build: `CTA_CLUSTER_RANK` over 1-, 2- and 3-D cluster shapes, the rank address map, a 256 KB local memory (`dlmem.yaml`) |
 | [`tests/regression/cta_gang/`](../../tests/regression/cta_gang/) | SPREAD launches (§4.6): every block once, a cluster inside one hardware cluster, ranks, the first cluster of a launch on cores 0..K−1, slot bases, an atomic rendezvous proving co-residency; the runtime's rejections and the version-1 struct; `parity-cta-gang` (`dlmem.yaml`) |
 | [`hw/unittest/cta_gang/`](../../hw/unittest/cta_gang/), [`tests/unittest/cta_gang/`](../../tests/unittest/cta_gang/) | `VX_cta_gang` and the SimX `CtaGang` against `dlmem_ref.h`, directed and random, with the same placement trace |
-| [`hw/unittest/bar_unit/`](../../hw/unittest/bar_unit/) | done events and barrier arrivals sharing the gbar queue |
+| [`tests/regression/cluster_sync/`](../../tests/regression/cluster_sync/) | the cluster barrier (§4.7) on same-core and SPREAD clusters: an atomic count per cluster and phase before the arrive, read back after the release; sync, split arrive/wait, rank skew, `__syncthreads()` in between, and blocks exiting after an arrive while gang ids recycle; `parity-cluster-sync` and `parity-cluster-sync-1c` (`dlmem.yaml`) |
+| [`hw/unittest/bar_unit/`](../../hw/unittest/bar_unit/) | done events and barrier arrivals sharing the gbar queue; the cluster barrier's local and gang completion, releases, stale releases and queue bound |
 
 ### 11.1 The coverage shape
 

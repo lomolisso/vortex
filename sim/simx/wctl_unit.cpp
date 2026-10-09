@@ -113,11 +113,34 @@ bool WctlUnit::process(instr_trace_t* trace) {
   case WctlType::BAR: {
     uint32_t arg1 = rs1_data[thread_last].u;
     uint32_t arg2 = rs2_data[thread_last].u;
+#ifdef VX_CFG_EXT_DLMEM_ENABLE
+    // Decoded before bar_decode_id, which would fold bit 30 into the barrier number.
+    bool is_cluster = (arg1 & BAR_CLUSTER_BIT) != 0;
+    uint32_t bar_id = is_cluster ? (BAR_CLUSTER_BIT | (arg1 & 0xffu))
+                                 : bar_decode_id(arg1, VX_CFG_NUM_BARRIERS);
+#else
     uint32_t bar_id = bar_decode_id(arg1, VX_CFG_NUM_BARRIERS);
+#endif
     bool is_sync_bar = (bool)wctlArgs.is_sync_bar;
     // rs2[31] flags expect_tx semantics on the same opcode as barrier_arrive.
     // Lower bits carry the count of pending transactions to register.
     bool is_tx_expect = wctlArgs.is_bar_arrive && ((arg2 >> 31) & 0x1);
+#ifdef VX_CFG_EXT_DLMEM_ENABLE
+    if (is_cluster) {
+      const char* err = nullptr;
+      if (arg1 >> 31) {
+        err = "a barrier cannot be both global and cluster";
+      } else if (arg1 & 0x3fffff00u) {
+        err = "a block has one cluster barrier, its id bits must be 0";
+      } else if (is_tx_expect) {
+        err = "a cluster barrier takes no expect_tx";
+      }
+      if (err) {
+        std::cout << "Error: " << err << ": core=" << core_->id() << " wid=" << trace->wid << " rs1=0x" << std::hex << arg1 << std::dec << " (#" << trace->uuid << ")" << std::endl;
+        std::abort();
+      }
+    }
+#endif
     if (wctlArgs.is_bar_arrive) {
       // BAR.ARRIVE writes back the current barrier phase (sampled before this op modifies it).
       uint32_t phase = core_->scheduler().barrier_unit().get_phase(bar_id) & 0x1u;

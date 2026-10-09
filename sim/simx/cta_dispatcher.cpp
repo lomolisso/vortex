@@ -25,6 +25,9 @@ CtaDispatcher::CtaDispatcher(const SimContext& ctx, const char* name, Core* core
   : SimObject<CtaDispatcher>(ctx, name)
   , bus_in(this, 1)
   , credit_out(this)
+#ifdef VX_CFG_EXT_DLMEM_ENABLE
+  , PeerWrOut(this)
+#endif
   , core_(core)
   , num_threads_(VX_CFG_NUM_THREADS)
   , num_warps_(VX_CFG_NUM_WARPS)
@@ -51,6 +54,8 @@ CtaDispatcher::CtaDispatcher(const SimContext& ctx, const char* name, Core* core
   , done_pend_until_(num_warps_, 0)
   , peer_row_(num_warps_)
   , legacy_base_(0)
+  , cbar_wr_valid_(false)
+  , cbar_wr_slot_(0)
 #endif
 {
   thread_idx_[0] = thread_idx_[1] = thread_idx_[2] = 0;
@@ -75,6 +80,7 @@ void CtaDispatcher::on_reset() {
     done_pend_until_[i] = 0;
   }
   legacy_base_ = 0;
+  cbar_wr_valid_ = false;
 #endif
   // warp_init_lanes_ and cur_ctx_id_ are excluded: which lanes of a slot have
   // already run the startup is keyed on the context, and a launch is not a
@@ -212,8 +218,16 @@ bool CtaDispatcher::step(const WarpMask& active_warps, uint32_t* wid_out, cta_wa
     evt_[base]   = is_pinned;
     gang_[base]  = cta_.gang_id;
     epoch_[base] = cta_.epoch;
+    cbar_wr_valid_ = true;
+    cbar_wr_slot_  = base;
+    cbar_wr_info_  = CbarSlot{};
     if (is_pinned) {
       peer_row_[base] = cta_.row;
+      cbar_wr_info_.gang    = (cta_.row.k > 1);
+      cbar_wr_info_.gang_id = cta_.gang_id;
+      cbar_wr_info_.epoch   = cta_.epoch;
+      cbar_wr_info_.base    = base;
+      cbar_wr_info_.k       = cta_.row.k;
     } else {
       if (cta_.is_first_of_cluster) {
         legacy_base_ = base;
@@ -222,7 +236,11 @@ bool CtaDispatcher::step(const WarpMask& active_warps, uint32_t* wid_out, cta_wa
       uint32_t K = cta_.cluster_dim[0] * cta_.cluster_dim[1] * cta_.cluster_dim[2];
       K = std::min((K == 0) ? 1u : K, max_slots);
       peer_row_[base] = dlmem_ref::legacy_row(my_core_, legacy_base_, K, VX_CFG_DLMEM_MAX_CLUSTER);
+      cbar_wr_info_.base = legacy_base_;
+      cbar_wr_info_.k    = K;
     }
+    // The RTL registers the row write one cycle after admission.
+    PeerWrOut.send({base, peer_row_[base], stride}, 1);
 #else
     tail_slot_ = (base + 1) % max_slots;
 #endif
@@ -286,6 +304,17 @@ void CtaDispatcher::warp_done(uint32_t wid) {
   return CtaDone{slot, gang_[slot], epoch_[slot]};
 #endif
 }
+
+#ifdef VX_CFG_EXT_DLMEM_ENABLE
+bool CtaDispatcher::take_cbar_wr(uint32_t* slot, CbarSlot* info) {
+  if (!cbar_wr_valid_)
+    return false;
+  cbar_wr_valid_ = false;
+  *slot = cbar_wr_slot_;
+  *info = cbar_wr_info_;
+  return true;
+}
+#endif
 
 bool CtaDispatcher::slot_needs_init(uint32_t wid, const ThreadMask& tmask) const {
   const auto& inited = warp_init_lanes_[wid];

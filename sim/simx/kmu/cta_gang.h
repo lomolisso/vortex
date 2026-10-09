@@ -25,6 +25,17 @@ namespace vortex {
 // The build's hardware-cluster shape, as the placement model sees it.
 dlmem_ref::Cfg dlmem_cfg();
 
+// An event of a SPREAD block toward its gang unit, in its core's queue order.
+struct GangEvent {
+  enum Kind { CTA_DONE, CBAR };
+  Kind     kind;
+  uint32_t core;
+  uint32_t slot;      // CTA_DONE: the freed slot
+  uint32_t gang_id;
+  uint32_t epoch;
+  uint32_t count;     // CBAR: the gang's block count
+};
+
 // Gang unit of one hardware cluster (VX_cta_gang): it sits between the
 // cluster's launch lane and its cores.
 //
@@ -34,6 +45,9 @@ dlmem_ref::Cfg dlmem_cfg();
 // cycle, and then leave as K pinned beats, one per cycle. A slot returns to
 // the mirror only when its block's CTA_DONE event arrives, so the slot a beat
 // forces is always free when the beat reaches its core.
+//
+// It also counts the gang's cluster-barrier arrivals (CBAR events) and, when
+// all K blocks arrived, broadcasts the phase's release to every core.
 class CtaGang : public SimObject<CtaGang> {
 public:
   // The cluster's launch-lane endpoint, and its admission credit to the KMU.
@@ -45,15 +59,20 @@ public:
   std::vector<SimChannel<kmu_req_t>> bus_out;
   std::vector<SimChannel<uint8_t>>   credit_in;
 
+  // Cluster-barrier releases, one link per core.
+  std::vector<SimEventLink<GbarResume>> release_out;
+
   CtaGang(const SimContext& ctx, const char* name, const dlmem_ref::Cfg& cfg);
 
-  // A SPREAD block's CTA_DONE event; always accepted, applied at most one per
-  // cycle like the RTL's single done port.
-  void cta_done(uint32_t core, uint32_t slot, uint32_t gang_id, uint32_t epoch);
+  // Always accepted, applied at most one per cycle like the RTL's single event port.
+  void cta_event(const GangEvent& evt);
 
-  // Busy until every placed block has reported done, so the next launch
-  // starts on an empty mirror.
+  // Busy until every placed block has reported done and every release has
+  // left, so the next launch starts on an empty mirror.
   bool busy() const;
+
+  // Cycles from the release leaving this unit to its arrival at a core's barrier unit.
+  uint64_t release_delay() const { return rel_delay_; }
 
 protected:
   void on_reset();
@@ -62,16 +81,11 @@ protected:
 private:
   enum class State { IDLE, PLACE, EMIT };
 
-  struct Done {
-    uint32_t core;
-    uint32_t slot;
-    uint32_t gang_id;
-    uint32_t epoch;
-  };
-
   bool lane_ready(uint32_t core) const;
   void send_beat(uint32_t core, const kmu_req_t& beat);
-  void apply_done(const Done& d);
+  void apply_done(const GangEvent& d);
+  void apply_cbar(const GangEvent& a);
+  bool id_free() const;
   void forward_legacy();
   void start_attempt(const kmu_req_t& head);
   void commit();
@@ -100,7 +114,7 @@ private:
   uint32_t k_;
   uint32_t w_;
 
-  std::deque<Done> done_q_;
+  std::deque<GangEvent> evt_q_;
 
   // Legacy steering, as the KMU does it per core: round robin, a message
   // locked to the core that took its first beat.
@@ -108,6 +122,8 @@ private:
   bool     locked_;
   uint32_t lock_core_;
   std::vector<uint32_t> inflight_;
+
+  uint64_t rel_delay_;
 
   friend class SimObject<CtaGang>;
 };

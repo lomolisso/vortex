@@ -40,6 +40,13 @@ interface VX_warp_ctl_if import VX_gpu_pkg::*; ();
     // the CUDA __syncthreads / OpenCL barrier(CLK_LOCAL_MEM_FENCE) contract.
     wire lsu_sched_drained;
 
+`ifdef VX_CFG_EXT_DLMEM_ENABLE
+    // Valid with bar_addr: the phase read targets the slot's cluster barrier.
+    wire bar_cluster;
+    // Per warp: no remote DLMEM store still in flight.
+    wire [`VX_CFG_NUM_WARPS-1:0] dlmem_drained;
+`endif
+
     // Return IPDOM stack address
     wire [NW_WIDTH-1:0] dvstack_wid;
     wire [DV_STACK_SIZEW-1:0] dvstack_ptr;
@@ -69,6 +76,10 @@ interface VX_warp_ctl_if import VX_gpu_pkg::*; ();
 
         input  warp_pending_alm_empty,
         input  lsu_sched_drained,
+    `ifdef VX_CFG_EXT_DLMEM_ENABLE
+        output bar_cluster,
+        input  dlmem_drained,
+    `endif
 
         output dvstack_wid,
         input  dvstack_ptr
@@ -95,6 +106,10 @@ interface VX_warp_ctl_if import VX_gpu_pkg::*; ();
 
         output warp_pending_alm_empty,
         output lsu_sched_drained,
+    `ifdef VX_CFG_EXT_DLMEM_ENABLE
+        input  bar_cluster,
+        output dlmem_drained,
+    `endif
 
         input dvstack_wid,
         output dvstack_ptr

@@ -401,7 +401,27 @@ void SfuUnit::on_tick() {
 				} else if (*wctl_p == WctlType::BAR) {
 					if (!core_->lsu_drained())
 						continue; // drain LSU before the barrier
+				#ifdef VX_CFG_EXT_DLMEM_ENABLE
+					// an arrival counts only once the warp's earlier instructions committed
+					if (core_->has_pending_instrs(trace->wid))
+						continue;
+				#endif
 				}
+			#ifdef VX_CFG_EXT_DLMEM_ENABLE
+				else if (*wctl_p == WctlType::TMC) {
+					// a warp leaves its slot only with nothing of it still in flight
+					auto& rs1 = trace->src_data[0];
+					int last = VX_CFG_NUM_THREADS - 1;
+					while (last > 0 && !trace->tmask.test(last))
+						--last;
+					bool is_exit = true;
+					for (uint32_t t = 0; t < VX_CFG_NUM_THREADS; ++t) {
+						is_exit = is_exit && !((rs1.at(last).u >> t) & 1);
+					}
+					if (is_exit && core_->has_pending_instrs(trace->wid))
+						continue;
+				}
+			#endif
 			}
 		}
 

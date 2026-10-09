@@ -850,7 +850,12 @@ Instr::Ptr Decoder::decode(uint32_t code, uint64_t uuid) {
         instr->set_src_reg(1, rs2, RegType::Integer);
         wctlArgs.is_sync_bar = 0;
         wctlArgs.is_bar_arrive = (rd != 0);
+#ifdef VX_CFG_EXT_DLMEM_ENABLE
+        // the arrival's drain must see only older instructions of the warp
+        instr->set_wstall(true);
+#else
         instr->set_wstall(rd == 0); // stall on wait, not on arrive
+#endif
         break;
       case 7: // WSYNC
         instr->set_op_type(WctlType::WSYNC);

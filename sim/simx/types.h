@@ -2047,6 +2047,11 @@ struct GbarArrive {
 
 struct GbarResume {
   uint32_t bar_id;
+#ifdef VX_CFG_EXT_DLMEM_ENABLE
+  uint32_t kind = 0;     // GBAR_KIND_BAR or GBAR_KIND_CBAR
+  uint32_t gang_id = 0;  // CBAR: the released gang and its epoch
+  uint32_t epoch = 0;
+#endif
 };
 
 // Fragment-work-distributor control messages, carried on raster-core <-> core

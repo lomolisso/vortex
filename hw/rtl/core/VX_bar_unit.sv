@@ -31,6 +31,14 @@ module VX_bar_unit import VX_gpu_pkg::*; #(
     VX_gbar_bus_if.master gbar_bus_if,
 
 `ifdef VX_CFG_EXT_DLMEM_ENABLE
+    // with read_addr: the read targets the slot's cluster barrier
+    input wire                read_cluster,
+
+    // a CTA slot's cluster-barrier record, written when its block is admitted
+    input wire                cbar_wr_valid,
+    input wire [NW_WIDTH-1:0] cbar_wr_slot,
+    input cbar_slot_t         cbar_wr_info,
+
     // CTA_DONE events of this core's SPREAD blocks, toward the gang unit
     input wire                cta_done_valid,
     input dlmem_cta_done_t    cta_done_data,
@@ -68,9 +76,16 @@ module VX_bar_unit import VX_gpu_pkg::*; #(
     logic [NB_WIDTH-1:0] gbar_enqueue_id;
     logic [NC_WIDTH-1:0] gbar_enqueue_size_m1;
 
+`ifdef VX_CFG_EXT_DLMEM_ENABLE
+    // A cluster-barrier release touches no store port, so it is taken in any cycle.
+    wire gbar_rsp_ready = ~req_valid | gbar_bus_if.rsp_data.kind;
+    wire gbar_rsp_fire = gbar_bus_if.rsp_valid && gbar_rsp_ready;
+    wire gbar_rsp_apply = USE_GBAR && gbar_rsp_fire && ~gbar_bus_if.rsp_data.kind && gbar_pending_r[gbar_bus_if.rsp_data.id];
+`else
     wire gbar_rsp_ready = ~req_valid;
     wire gbar_rsp_fire = gbar_bus_if.rsp_valid && gbar_rsp_ready;
     wire gbar_rsp_apply = USE_GBAR && gbar_rsp_fire && gbar_pending_r[gbar_bus_if.rsp_data.id];
+`endif
 
     wire [`VX_CFG_NUM_WARPS-1:0] wait_mask = ((`VX_CFG_NUM_WARPS)'(1) << req_wid) | mask_r;
     wire [NW_WIDTH-1:0] next_count  = count_r + NW_WIDTH'(1);
@@ -91,7 +106,11 @@ module VX_bar_unit import VX_gpu_pkg::*; #(
         gbar_enqueue_size_m1 = 'x;
 
         // local barrier scheduling
+    `ifdef VX_CFG_EXT_DLMEM_ENABLE
+        if (req_valid && ~req_data.is_global && ~req_data.is_cluster) begin
+    `else
         if (req_valid && ~req_data.is_global) begin
+    `endif
             if (req_data.is_event) begin
                 // event tracking
                 if (req_data.phase) begin
@@ -267,6 +286,147 @@ module VX_bar_unit import VX_gpu_pkg::*; #(
 
     wire phase_async = is_phase_rdw_hazard ? store_phase_wdata : store_phase_rdata_v;
 
+`ifdef VX_CFG_EXT_DLMEM_ENABLE
+    // Cluster barriers: one per CTA slot, in flops beside the store, whose
+    // {slot, id 0} entry belongs to __syncthreads, which a block may run between
+    // a cluster arrive and its wait. A block's arrival counts once all of its
+    // warps arrived. A gang's block then sends one CBAR to the gang unit and
+    // waits for its release; a cluster inside this core (legacy, or K=1) counts
+    // its blocks at the base slot and releases all of them with the last.
+    localparam CK_W = $bits(cbar_wr_info.k);
+
+    cbar_slot_t [`VX_CFG_NUM_WARPS-1:0]                cinfo_r;
+    reg [`VX_CFG_NUM_WARPS-1:0][NW_WIDTH-1:0]          ccount_r, ccount_n;   // warps arrived, per block
+    reg [`VX_CFG_NUM_WARPS-1:0][CK_W-1:0]              cblk_r, cblk_n;       // blocks arrived, at a base slot
+    reg [`VX_CFG_NUM_WARPS-1:0][`VX_CFG_NUM_WARPS-1:0] cwait_r, cwait_n;     // suspended warps
+    reg [`VX_CFG_NUM_WARPS-1:0]                        cpend_r, cpend_n;     // arrived, waiting for the gang
+    reg [`VX_CFG_NUM_WARPS-1:0]                        cphase_r, cphase_n;
+
+    // the slot is the high half of a barrier address
+    wire [NW_WIDTH-1:0] creq_slot, crd_slot;
+    if (NW_BITS != 0) begin : g_cslot
+        assign creq_slot = store_waddr[NB_BITS +: NW_BITS];
+        assign crd_slot  = read_addr[NB_BITS +: NW_BITS];
+    end else begin : g_cslot0
+        assign creq_slot = '0;
+        assign crd_slot  = '0;
+    end
+
+    wire creq = req_valid && req_data.is_cluster;
+    wire crsp = gbar_bus_if.rsp_valid && gbar_bus_if.rsp_ready && gbar_bus_if.rsp_data.kind;
+    // the request slot's record, and the block count of its cluster's base slot
+    cbar_slot_t cinfo_s;
+    assign cinfo_s = cinfo_r[creq_slot];
+    wire [CK_W-1:0] cbase_k = cinfo_r[cinfo_s.base].k;
+    wire cblk_last = (32'(cblk_r[cinfo_s.base]) + 1) == 32'(cbase_k);
+
+    logic                              cbar_push;
+    logic [`VX_CFG_NUM_WARPS-1:0]      crel_mask;
+    logic [`VX_CFG_NUM_WARPS-1:0]      cunlock_mask;
+
+    always @(*) begin
+        ccount_n     = ccount_r;
+        cblk_n       = cblk_r;
+        cwait_n      = cwait_r;
+        cpend_n      = cpend_r;
+        cphase_n     = cphase_r;
+        cbar_push    = 0;
+        crel_mask    = '0;
+        cunlock_mask = '0;
+        if (creq) begin
+            if (req_data.is_arrive) begin
+                if (req_data.is_sync) begin
+                    cwait_n[creq_slot][req_wid] = 1;
+                end
+                if (ccount_r[creq_slot] != NW_WIDTH'(req_data.size_m1)) begin
+                    ccount_n[creq_slot] = ccount_r[creq_slot] + NW_WIDTH'(1);
+                end else begin
+                    ccount_n[creq_slot] = '0;
+                    if (cinfo_s.gang) begin
+                        cbar_push = 1;
+                        cpend_n[creq_slot] = 1;
+                    end else if (cblk_last) begin
+                        cblk_n[cinfo_s.base] = '0;
+                        for (integer i = 0; i < `VX_CFG_NUM_WARPS; ++i) begin
+                            crel_mask[i] = (32'(i) >= 32'(cinfo_s.base)) && (32'(i) < (32'(cinfo_s.base) + 32'(cbase_k)));
+                        end
+                    end else begin
+                        cblk_n[cinfo_s.base] = cblk_r[cinfo_s.base] + CK_W'(1);
+                    end
+                end
+            end else if (req_data.phase != cphase_r[creq_slot]) begin
+                cunlock_mask[req_wid] = 1;
+            end else begin
+                cwait_n[creq_slot][req_wid] = 1;
+            end
+        end
+        // a gang's release frees its pending slots; one for an exited or re-admitted slot matches nothing
+        if (crsp) begin
+            for (integer i = 0; i < `VX_CFG_NUM_WARPS; ++i) begin
+                if (cpend_r[i] && cinfo_r[i].gang && (cinfo_r[i].gang_id == gbar_bus_if.rsp_data.gang_id)
+                 && (cinfo_r[i].epoch == gbar_bus_if.rsp_data.epoch)) begin
+                    crel_mask[i] = 1;
+                end
+            end
+        end
+        for (integer i = 0; i < `VX_CFG_NUM_WARPS; ++i) begin
+            if (crel_mask[i]) begin
+                cunlock_mask |= cwait_n[i];
+                cwait_n[i]  = '0;
+                cpend_n[i]  = 0;
+                cphase_n[i] = ~cphase_r[i];
+            end
+        end
+        // a newly admitted block starts on fresh state
+        if (cbar_wr_valid) begin
+            ccount_n[cbar_wr_slot] = '0;
+            cblk_n[cbar_wr_slot]   = '0;
+            cwait_n[cbar_wr_slot]  = '0;
+            cpend_n[cbar_wr_slot]  = 0;
+            cphase_n[cbar_wr_slot] = 0;
+        end
+    end
+
+    always @(posedge clk) begin
+        if (reset) begin
+            ccount_r <= '0;
+            cblk_r   <= '0;
+            cwait_r  <= '0;
+            cpend_r  <= '0;
+            cphase_r <= '0;
+        end else begin
+            ccount_r <= ccount_n;
+            cblk_r   <= cblk_n;
+            cwait_r  <= cwait_n;
+            cpend_r  <= cpend_n;
+            cphase_r <= cphase_n;
+        end
+        if (cbar_wr_valid) begin
+            cinfo_r[cbar_wr_slot] <= cbar_wr_info;
+        end
+    end
+
+    `RUNTIME_ASSERT(~creq || (~req_data.is_event && ~req_data.is_global && (req_data.id == '0)),
+        ("%t: %s cluster barrier request with event, global or id bits set: id=%0d", $time, INSTANCE_ID, req_data.id))
+    `RUNTIME_ASSERT(~(creq && req_data.is_arrive) || ~cpend_r[creq_slot],
+        ("%t: %s cluster barrier arrival before its phase completed: slot=%0d, wid=%0d", $time, INSTANCE_ID, creq_slot, req_wid))
+
+    reg unlock_valid_r;
+    reg [`VX_CFG_NUM_WARPS-1:0] unlock_mask_r;
+
+    // cluster unlocks join the local or global unlock of the same cycle
+    always @(posedge clk) begin
+        if (reset) begin
+            unlock_valid_r <= 0;
+        end else begin
+            unlock_valid_r <= unlock_valid_n || (cunlock_mask != '0);
+        end
+        unlock_mask_r <= (unlock_valid_n ? unlock_mask_n : '0) | cunlock_mask;
+    end
+
+    // same timing as the store's read, with the same-cycle write visible
+    assign read_phase   = read_cluster ? cphase_n[crd_slot] : phase_async;
+`else
     reg unlock_valid_r;
     reg [`VX_CFG_NUM_WARPS-1:0] unlock_mask_r;
 
@@ -280,6 +440,7 @@ module VX_bar_unit import VX_gpu_pkg::*; #(
     end
 
     assign read_phase   = phase_async;
+`endif
     assign unlock_valid = unlock_valid_r;
     assign unlock_mask  = unlock_mask_r;
 
@@ -296,21 +457,24 @@ module VX_bar_unit import VX_gpu_pkg::*; #(
     end
 
 `ifdef VX_CFG_EXT_DLMEM_ENABLE
-    // CTA_DONE events share the global-barrier request queue, so it exists even
-    // at one core and each core's events leave in order. A barrier holds at most
-    // one entry per id and an event enters only below NUM_WARPS entries, so the
-    // queue never overflows.
+    // CTA_DONE events and cluster-barrier arrivals share the global-barrier
+    // request queue, so it exists even at one core and each core's events leave
+    // in order. A barrier holds at most one entry per id, a slot at most one
+    // cluster-barrier arrival, and a done event enters only below NUM_WARPS
+    // entries, so the queue never overflows.
     if (1) begin : g_gbar
 
         localparam GQ_DATAW = 2 + GANG_ID_W + 1 + NW_WIDTH + GBAR_REQW;
-        localparam GQ_DEPTH = 1 << `CLOG2((1 << NB_WIDTH) + `VX_CFG_NUM_WARPS);
+        localparam GQ_DEPTH = 1 << `CLOG2((1 << NB_WIDTH) + 2 * `VX_CFG_NUM_WARPS);
         localparam GQ_SIZEW = `CLOG2(GQ_DEPTH + 1);
 
         wire done_push = cta_done_valid && cta_done_ready;
-        wire req_push  = gbar_enqueue || done_push;
+        wire req_push  = gbar_enqueue || cbar_push || done_push;
 
         wire [GQ_DATAW-1:0] req_queue_in = gbar_enqueue
             ? {GBAR_KIND_BAR, GANG_ID_W'(0), 1'b0, NW_WIDTH'(0), gbar_enqueue_id, gbar_enqueue_size_m1}
+            : cbar_push
+            ? {GBAR_KIND_CBAR, cinfo_s.gang_id, cinfo_s.epoch, creq_slot, NB_WIDTH'(0), NC_WIDTH'(cinfo_s.k - CK_W'(1))}
             : {GBAR_KIND_CTA_DONE, cta_done_data.gang_id, cta_done_data.epoch, cta_done_data.slot,
                NB_WIDTH'(0), NC_WIDTH'(0)};
         wire [GQ_DATAW-1:0] req_queue_data;
@@ -337,7 +501,7 @@ module VX_bar_unit import VX_gpu_pkg::*; #(
         );
 
         // a barrier arrival takes the queue's write port first
-        assign cta_done_ready = ~gbar_enqueue && (req_size < GQ_SIZEW'(`VX_CFG_NUM_WARPS));
+        assign cta_done_ready = ~(gbar_enqueue || cbar_push) && (req_size < GQ_SIZEW'(`VX_CFG_NUM_WARPS));
 
         // Same registered valid as without DLMEM: one cycle after the push.
         reg gbar_req_valid_r;
@@ -440,6 +604,19 @@ module VX_bar_unit import VX_gpu_pkg::*; #(
             `TRACE(2, ("%t: %s unlock: mask=%b\n",
                 $time, INSTANCE_ID, unlock_mask_n))
         end
+    `ifdef VX_CFG_EXT_DLMEM_ENABLE
+        if (creq) begin
+            `TRACE(2, ("%t: %s cluster-req: wid=%0d, slot=%0d, is_arrive=%b, is_sync=%b, phase=%b, push=%b, local_release=%b\n",
+                $time, INSTANCE_ID, req_wid, creq_slot, req_data.is_arrive, req_data.is_sync, req_data.phase, cbar_push, |crel_mask))
+        end
+        if (crsp) begin
+            `TRACE(2, ("%t: %s cluster-rsp: gang=%0d, epoch=%0d, slots=%b\n",
+                $time, INSTANCE_ID, gbar_bus_if.rsp_data.gang_id, gbar_bus_if.rsp_data.epoch, crel_mask))
+        end
+        if (cunlock_mask != '0) begin
+            `TRACE(2, ("%t: %s cluster-unlock: mask=%b\n", $time, INSTANCE_ID, cunlock_mask))
+        end
+    `endif
     end
 `endif
 

@@ -29,6 +29,18 @@ struct CtaDone;
 constexpr uint32_t GBAR_KIND_BAR      = 0;
 constexpr uint32_t GBAR_KIND_CTA_DONE = 1;
 constexpr uint32_t GBAR_KIND_CBAR     = 2;
+
+// rs1 bit 30 of a BAR names the block's cluster barrier; the low bits are its CTA slot.
+constexpr uint32_t BAR_CLUSTER_BIT = 1u << 30;
+
+// A CTA slot's cluster-barrier record, written by the dispatcher at admission.
+struct CbarSlot {
+  bool     gang    = false;  // a SPREAD gang of K > 1 completes through the gang unit
+  uint32_t gang_id = 0;
+  uint32_t epoch   = 0;
+  uint32_t base    = 0;      // otherwise the cluster's first slot on this core
+  uint32_t k       = 1;      // and its block count
+};
 #endif
 
 // Owns per-warp barrier state; resumes waiting warps via the parent Scheduler;
@@ -48,6 +60,10 @@ public:
   // Sends a SPREAD block's done event to the cluster's gang unit, through the
   // same request queue the global barrier arrivals use.
   void send_cta_done(const CtaDone& done);
+  // The gang unit released a cluster barrier phase.
+  void cluster_release(uint32_t gang_id, uint32_t epoch);
+  // A block was admitted into the slot: its cluster-barrier state restarts.
+  void slot_admit(uint32_t slot, const CbarSlot& info);
 #endif
 
 protected:
@@ -65,6 +81,24 @@ private:
   void gbar_send(uint32_t bar_id, uint32_t count);
 
 #ifdef VX_CFG_EXT_DLMEM_ENABLE
+  // Books a request queue departure; returns its cycle.
+  uint64_t gbar_book(uint64_t now);
+  void cbar_send(const CbarSlot& info);
+
+  uint32_t cluster_phase(uint32_t bar_id) const;
+  void cluster_arrive(uint32_t bar_id, uint32_t count, uint32_t wid, bool is_sync_bar);
+  bool cluster_wait(uint32_t bar_id, uint32_t phase, uint32_t wid);
+  void cluster_complete(uint32_t first, uint32_t count);
+
+  // Per-slot cluster-barrier state, apart from the barrier store: the slot's
+  // __syncthreads barrier stays usable between a cluster arrive and its wait.
+  std::vector<CbarSlot> cinfo_;
+  std::vector<uint32_t> ccount_;   // warps of the block arrived
+  std::vector<uint32_t> cblk_;     // blocks arrived, at a same-core cluster's base slot
+  std::vector<WarpMask> cwait_;    // suspended warps
+  std::vector<bool>     cpend_;    // arrived, waiting for the gang unit's release
+  std::vector<uint32_t> cphase_;
+
   // A done event enters the RTL queue only cycles after the warp exit, and a
   // barrier arrival in between enters first, so its departure is booked only
   // once its push cycle has passed.

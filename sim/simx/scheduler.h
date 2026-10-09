@@ -136,6 +136,11 @@ public:
 
   CtaDispatcher* cta_dispatcher() const { return cta_dispatcher_.get(); }
 
+#ifdef VX_CFG_EXT_DLMEM_ENABLE
+  // The dispatcher's peer-row output, passed up for the core to bind.
+  SimChannel<dlmem_ref::RowWrite>& peer_wr_out() { return cta_dispatcher_->PeerWrOut; }
+#endif
+
 #ifdef VX_CFG_EXT_RASTER_ENABLE
   // ----- Fragment Work Distributor (FWD) -----
   // The per-core FWD turns rasterized quad-waves into launched fragment warps.

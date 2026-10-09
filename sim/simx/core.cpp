@@ -292,6 +292,13 @@ public:
       }
     }
 
+  #ifdef VX_CFG_EXT_DLMEM_ENABLE
+    // The dispatcher's peer rows have no reader until the core translates window
+    // addresses; a sink keeps its channel from filling.
+    peer_wr_sink_ = std::make_unique<SimChannel<dlmem_ref::RowWrite>>(simobject_, 2);
+    scheduler_->peer_wr_out().bind(peer_wr_sink_.get());
+  #endif
+
     this->reset();
   }
 
@@ -322,6 +329,11 @@ public:
   }
 
   void tick() {
+  #ifdef VX_CFG_EXT_DLMEM_ENABLE
+    while (!peer_wr_sink_->empty()) {
+      peer_wr_sink_->pop();
+    }
+  #endif
     this->commit();
     this->execute();
     this->issue();
@@ -1057,6 +1069,9 @@ private:
   Mmu::Ptr dcache_mmu_;
   Mmu::Ptr icache_mmu_;
 #endif
+#ifdef VX_CFG_EXT_DLMEM_ENABLE
+  std::unique_ptr<SimChannel<dlmem_ref::RowWrite>> peer_wr_sink_;
+#endif
 };
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -1132,6 +1147,12 @@ void Core::global_barrier_resume(uint32_t bar_id) {
 }
 
 void Core::on_gbar_resume(const GbarResume& msg) {
+#ifdef VX_CFG_EXT_DLMEM_ENABLE
+  if (msg.kind == GBAR_KIND_CBAR) {
+    impl_->scheduler()->barrier_unit().cluster_release(msg.gang_id, msg.epoch);
+    return;
+  }
+#endif
   this->global_barrier_resume(msg.bar_id);
 }
 

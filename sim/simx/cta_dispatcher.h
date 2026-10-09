@@ -20,6 +20,7 @@
 #ifdef VX_CFG_EXT_DLMEM_ENABLE
 #include <optional>
 #include <dlmem_ref.h>
+#include "barrier_unit.h"
 #endif
 
 namespace vortex {
@@ -68,6 +69,11 @@ public:
   // rests on explicit slot accounting rather than transport back-pressure.
   SimChannel<uint8_t> credit_out;
 
+#ifdef VX_CFG_EXT_DLMEM_ENABLE
+  // The admitted block's peer row, for the core's aperture translation table.
+  SimChannel<dlmem_ref::RowWrite> PeerWrOut;
+#endif
+
   CtaDispatcher(const SimContext& ctx, const char* name, Core* core);
   ~CtaDispatcher();
 
@@ -82,6 +88,9 @@ public:
 
   // The peer row recorded when the slot's block was admitted.
   const dlmem_ref::Row& peer_row(uint32_t slot) const { return peer_row_.at(slot); }
+
+  // The cluster-barrier record of the block admitted by the last step(), once.
+  bool take_cbar_wr(uint32_t* slot, CbarSlot* info);
 #else
   void warp_done(uint32_t wid);
 #endif
@@ -160,6 +169,9 @@ private:
   std::vector<uint64_t> done_pend_until_;
   std::vector<dlmem_ref::Row> peer_row_;
   uint32_t legacy_base_;                   // first slot of the same-core cluster being admitted
+  bool     cbar_wr_valid_;
+  uint32_t cbar_wr_slot_;
+  CbarSlot cbar_wr_info_;
 #endif
 
   // Cluster co-residency: the first CTA of a cluster reserves K consecutive

@@ -500,6 +500,10 @@ module VX_core import VX_gpu_pkg::*, VX_tlb_pkg::*; #(
 
     // BAR (vx_barrier / vx_barrier_arrive) drains LSU + MMU before suspending or registering arrival.
     assign warp_ctl_if.lsu_sched_drained = (&lsu_sched_empty) && mmu_empty;
+`ifdef VX_CFG_EXT_DLMEM_ENABLE
+    // No remote stores exist until the egress write tracker is wired in.
+    assign warp_ctl_if.dlmem_drained = '1;
+`endif
 
 `ifdef PERF_ENABLE
 

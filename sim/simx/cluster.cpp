@@ -90,6 +90,8 @@ public:
         }
         dispatcher->credit_out.bind(&cslice->In);
         cslice->Out.bind(&cta_gang_->credit_in.at(lane));
+        // cluster-barrier releases share the core's global-barrier resume end
+        cta_gang_->release_out.at(lane).bind(&core->gbar_resume_in);
       }
     }
 #endif
@@ -394,9 +396,17 @@ public:
   }
 
 #ifdef VX_CFG_EXT_DLMEM_ENABLE
-  void cta_done(const GbarArrive& msg) {
+  // CTA_DONE and CBAR share one gang-unit queue, which keeps each core's order.
+  void gang_event(const GbarArrive& msg) {
     uint32_t cores_per_cluster = sockets_.size() * cores_per_socket_;
-    cta_gang_->cta_done(msg.core_id % cores_per_cluster, msg.slot, msg.gang_id, msg.epoch);
+    GangEvent evt;
+    evt.kind    = (msg.kind == GBAR_KIND_CBAR) ? GangEvent::CBAR : GangEvent::CTA_DONE;
+    evt.core    = msg.core_id % cores_per_cluster;
+    evt.slot    = msg.slot;
+    evt.gang_id = msg.gang_id;
+    evt.epoch   = msg.epoch;
+    evt.count   = msg.count;
+    cta_gang_->cta_event(evt);
   }
 
   SimChannel<kmu_req_t>& kmu_bus_in() {
@@ -674,8 +684,8 @@ int Cluster::get_exitcode() const {
 
 void Cluster::on_gbar_arrive(const GbarArrive& msg) {
 #ifdef VX_CFG_EXT_DLMEM_ENABLE
-  if (msg.kind == GBAR_KIND_CTA_DONE) {
-    impl_->cta_done(msg);
+  if (msg.kind == GBAR_KIND_CTA_DONE || msg.kind == GBAR_KIND_CBAR) {
+    impl_->gang_event(msg);
     return;
   }
 #endif

@@ -674,6 +674,9 @@ package VX_gpu_pkg;
     } join_t;
 
     typedef struct packed {
+    `ifdef VX_CFG_EXT_DLMEM_ENABLE
+        logic                   is_cluster;
+    `endif
         logic [NB_WIDTH-1:0]    id;
         logic                   is_event;
         logic                   is_global;
@@ -708,6 +711,15 @@ package VX_gpu_pkg;
         logic [GANG_ID_W-1:0]    gang_id;
         logic                    epoch;
     } dlmem_cta_done_t;
+
+    // A CTA slot's cluster-barrier record, written at admission.
+    typedef struct packed {
+        logic                    gang;     // completes through the gang unit, else locally
+        logic [GANG_ID_W-1:0]    gang_id;
+        logic                    epoch;
+        logic [NW_WIDTH-1:0]     base;     // the cluster's base slot, for local completion
+        logic [`MAX(NW_WIDTH+1, DLMEM_K_W)-1:0] k;
+    } cbar_slot_t;
 `endif
 
     typedef struct packed {
@@ -723,6 +735,11 @@ package VX_gpu_pkg;
     } gbar_req_t;
 
     typedef struct packed {
+    `ifdef VX_CFG_EXT_DLMEM_ENABLE
+        logic                 kind;     // 0: barrier release, 1: cluster-barrier release
+        logic [GANG_ID_W-1:0] gang_id;
+        logic                 epoch;
+    `endif
         logic [NB_WIDTH-1:0] id;
     } gbar_rsp_t;
 

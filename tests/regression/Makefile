@@ -20,8 +20,9 @@ TESTS := \
 
 # Distributed local memory tests: the feature is RV64 only. cta_gang builds
 # without DLMEM too, so it runs first and shares the default-config driver.
+# The others are listed once their directory exists.
 ifeq ($(XLEN),64)
-TESTS += cta_gang cluster_rank
+TESTS += cta_gang cluster_rank $(patsubst %/Makefile,%,$(wildcard cluster_sync/Makefile dlmem_local/Makefile))
 endif
 
 # --- common exclude list ---------------------------------------------
