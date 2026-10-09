@@ -292,7 +292,13 @@ bool Scheduler::setTmask(uint32_t wid, const ThreadMask& tmask) {
       ++fwd_retired_;
     }
 #endif
+#ifdef VX_CFG_EXT_DLMEM_ENABLE
+    if (auto done = cta_dispatcher_->warp_done(wid)) {
+      barrier_unit_->send_cta_done(*done);
+    }
+#else
     cta_dispatcher_->warp_done(wid);
+#endif
     return false;
   }
   return true;

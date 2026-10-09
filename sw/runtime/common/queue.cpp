@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cstddef>
 #include <cstring>
 
 namespace vx {
@@ -262,14 +263,78 @@ vx_result_t Queue::enqueue_copy(Buffer* dst, uint64_t do_, Buffer* src,
     return r;
 }
 
+namespace {
+
+// A struct that ends before cluster_policy means DEFAULT. Only a DLMEM device
+// has the policy register (*policy_dcr), and every launch writes it, since it
+// is sticky and SPREAD cannot be validated against pre-programmed geometry.
+vx_result_t launch_policy(Device* dev, const vx_launch_info_t* info,
+                          uint32_t* policy, bool* policy_dcr) {
+    uint32_t p = VX_CLUSTER_POLICY_DEFAULT;
+    if (info->struct_size >= offsetof(vx_launch_info_t, cluster_policy)
+                           + sizeof(info->cluster_policy))
+        p = static_cast<uint32_t>(info->cluster_policy);
+    if (p > VX_CLUSTER_POLICY_SPREAD) return VX_ERR_INVALID_VALUE;
+
+    uint64_t isa = 0;
+    auto r = dev->query_caps(VX_CAPS_ISA_FLAGS, &isa);
+    if (r != VX_SUCCESS) return r;
+    const bool dlmem = (isa & VX_ISA_EXT_DLMEM) != 0;
+    if (p == VX_CLUSTER_POLICY_SPREAD && !dlmem) return VX_ERR_NOT_SUPPORTED;
+    *policy = p;
+    *policy_dcr = dlmem;
+    if (!dlmem) return VX_SUCCESS;
+    if (info->ndim == 0)
+        return (p == VX_CLUSTER_POLICY_SPREAD) ? VX_ERR_INVALID_VALUE : VX_SUCCESS;
+
+    uint64_t k = 1, block_size = 1;
+    for (uint32_t i = 0; i < info->ndim; ++i) {
+        k *= std::max<uint32_t>(info->cluster_dim[i], 1);
+        block_size *= info->block_dim[i];
+    }
+    uint64_t nw = 0, max_cluster = 0;
+    r = dev->query_caps(VX_CAPS_NUM_WARPS, &nw);
+    if (r == VX_SUCCESS) r = dev->query_caps(VX_CAPS_DLMEM_MAX_CLUSTER, &max_cluster);
+    if (r != VX_SUCCESS) return r;
+    // The KMU's rank counter holds the largest cluster of either policy.
+    if (k > std::max(nw, max_cluster)) return VX_ERR_INVALID_VALUE;
+    if (p != VX_CLUSTER_POLICY_SPREAD) return VX_SUCCESS;
+    if (k > max_cluster) return VX_ERR_INVALID_VALUE;
+
+    // Each member needs a free slot and W free warps on a core of one hardware cluster.
+    uint64_t nt = 0, lmem_cap = 0, line = 0, cores = 0, clusters = 0;
+    r = dev->query_caps(VX_CAPS_NUM_THREADS, &nt);
+    if (r == VX_SUCCESS) r = dev->query_caps(VX_CAPS_LOCAL_MEM_SIZE, &lmem_cap);
+    if (r == VX_SUCCESS) r = dev->query_caps(VX_CAPS_CACHE_LINE_SIZE, &line);
+    if (r == VX_SUCCESS) r = dev->query_caps(VX_CAPS_NUM_CORES, &cores);
+    if (r == VX_SUCCESS) r = dev->query_caps(VX_CAPS_NUM_CLUSTERS, &clusters);
+    if (r != VX_SUCCESS) return r;
+    const uint64_t warps  = std::max<uint64_t>((block_size + nt - 1) / nt, 1);
+    const uint64_t stride = (info->lmem_size + line - 1) / line * line;
+    const uint64_t slots  = (stride == 0) ? nw : std::min(nw, lmem_cap / stride);
+    const uint64_t ncc    = cores / clusters;
+    if (k > ncc * std::min(slots, nw / warps)) return VX_ERR_INVALID_VALUE;
+    return VX_SUCCESS;
+}
+
+} // namespace
+
 vx_result_t Queue::enqueue_launch(const vx_launch_info_t* info,
                                   uint32_t nw, const vx_event_h* w,
                                   vx_event_h* out) {
     if (!info) return VX_ERR_INVALID_VALUE;
-    if (info->struct_size < sizeof(vx_launch_info_t))
+    // Callers built before cluster_policy pass the shorter struct; the fields
+    // past their struct_size read as defaults.
+    if (info->struct_size < offsetof(vx_launch_info_t, reserved0))
         return VX_ERR_INVALID_INFO;
     if (info->ndim > 3) return VX_ERR_INVALID_VALUE;
     if (info->args_size != 0 && !info->args_host) return VX_ERR_INVALID_VALUE;
+    uint32_t policy = VX_CLUSTER_POLICY_DEFAULT;
+    bool policy_dcr = false;
+    {
+        auto rp = launch_policy(device_, info, &policy, &policy_dcr);
+        if (rp != VX_SUCCESS) return rp;
+    }
 
     // info->kernel is a vx_kernel_h (vx_module_get_kernel). NULL is the legacy
     // escape hatch — the caller pre-programmed the PC DCRs itself. Retain the
@@ -354,6 +419,7 @@ vx_result_t Queue::enqueue_launch(const vx_launch_info_t* info,
     Command cmd;
     cmd.queued_ns = now_ns();
     cmd.work = [this, kernel, ndim, lmem_size, grid_in, block_in, lg_in,
+                policy, policy_dcr,
                 args_blob = std::move(args_blob)](uint64_t* s, uint64_t* e) {
         // Launch PCs, derived from the retained kernel handle. has_kernel is
         // false on the legacy escape hatch (caller pre-programmed the DCRs).
@@ -459,6 +525,8 @@ vx_result_t Queue::enqueue_launch(const vx_launch_info_t* info,
                 WR(VX_DCR_KMU_CLUSTER_DIM_Y, lg_in[1]);
                 WR(VX_DCR_KMU_CLUSTER_DIM_Z, lg_in[2]);
             }
+            if (policy_dcr)
+                WR(VX_DCR_KMU_CLUSTER_POLICY, policy);
             #undef WR
 
             *s = now_ns();
@@ -508,6 +576,8 @@ struct CmdRec {
     std::array<uint32_t,3> grid      = {1, 1, 1};
     std::array<uint32_t,3> block     = {1, 1, 1};
     std::array<uint32_t,3> cluster   = {1, 1, 1};
+    uint32_t               policy    = VX_CLUSTER_POLICY_DEFAULT;
+    bool                   policy_dcr = false;
 };
 
 // Per-launch device-scratch staging: args blob + QMD launch descriptor.
@@ -522,8 +592,8 @@ struct CmdStaged {
 // Validate `commands`, copy into `recs`, retaining launched kernels (recorded
 // in `retained`). On any validation error the retained kernels are released and
 // the error is returned; on success the caller owns `retained`.
-vx_result_t cmd_build_recs(const vx_command_t* commands, uint32_t count,
-                           std::vector<CmdRec>& recs,
+vx_result_t cmd_build_recs(Device* device_, const vx_command_t* commands,
+                           uint32_t count, std::vector<CmdRec>& recs,
                            std::vector<Kernel*>& retained) {
     recs.reserve(count);
     auto fail = [&](vx_result_t e) -> vx_result_t {
@@ -540,11 +610,13 @@ vx_result_t cmd_build_recs(const vx_command_t* commands, uint32_t count,
         } else if (c.type == VX_COMMAND_LAUNCH) {
             const vx_launch_info_t* info = c.data.launch;
             if (!info) return fail(VX_ERR_INVALID_VALUE);
-            if (info->struct_size < sizeof(vx_launch_info_t))
+            if (info->struct_size < offsetof(vx_launch_info_t, reserved0))
                 return fail(VX_ERR_INVALID_INFO);
             if (info->ndim > 3) return fail(VX_ERR_INVALID_VALUE);
             if (info->args_size != 0 && !info->args_host)
                 return fail(VX_ERR_INVALID_VALUE);
+            auto rp = launch_policy(device_, info, &r.policy, &r.policy_dcr);
+            if (rp != VX_SUCCESS) return fail(rp);
             r.is_launch = true;
             r.kernel = (info->kernel != nullptr) ? to_kernel(info->kernel) : nullptr;
             if (r.kernel) { r.kernel->retain(); retained.push_back(r.kernel); }
@@ -646,6 +718,8 @@ vx_result_t cmd_stage_qmds(Device* device_, const std::vector<CmdRec>& recs,
             put(VX_DCR_KMU_CLUSTER_DIM_Y, rec.cluster[1]);
             put(VX_DCR_KMU_CLUSTER_DIM_Z, rec.cluster[2]);
         }
+        if (rec.policy_dcr)
+            put(VX_DCR_KMU_CLUSTER_POLICY, rec.policy);
         qmd[0] = uint32_t((qmd.size() - 1) / 2);   // pair count
 
         // 4) Stage the QMD into device memory when the CP decodes
@@ -689,7 +763,7 @@ vx_result_t Queue::enqueue_commands(const vx_command_t* commands,
 
     std::vector<CmdRec>  recs;
     std::vector<Kernel*> retained;   // released if enqueue() fails (work won't run)
-    auto rb = cmd_build_recs(commands, count, recs, retained);
+    auto rb = cmd_build_recs(device_, commands, count, recs, retained);
     if (rb != VX_SUCCESS) return rb;
 
     Command cmd;
@@ -760,7 +834,7 @@ vx_result_t Queue::enqueue_draw(const vx_command_t* commands,
 
     std::vector<CmdRec>  recs;
     std::vector<Kernel*> retained;
-    auto rb = cmd_build_recs(commands, count, recs, retained);
+    auto rb = cmd_build_recs(device_, commands, count, recs, retained);
     if (rb != VX_SUCCESS) return rb;
 
     Command cmd;

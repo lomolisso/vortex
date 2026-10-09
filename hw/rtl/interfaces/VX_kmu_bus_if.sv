@@ -39,6 +39,8 @@
 // correct — so a fragment message cannot be load-balanced the way a compute CTA
 // can. Each fan-out level consumes its own slice of `dest` (KMU_DEST_LSB_*);
 // compute launches ignore it and go to any ready output.
+//
+// `pin` (DLMEM): routed by `dest` at every fan-out level; a pinned beat is a whole message (`eop=1`).
 
 interface VX_kmu_bus_if import VX_gpu_pkg::*; ();
     logic                   valid;
@@ -46,6 +48,9 @@ interface VX_kmu_bus_if import VX_gpu_pkg::*; ();
     logic                   eop;    // last beat of the message
     logic [KMU_DEST_W-1:0]  dest;   // placement hint (fragment only)
     logic [KMU_DATAW-1:0]   data;   // beat 0 = kmu_req_t; payload beats = packed stamps
+`ifdef VX_CFG_EXT_DLMEM_ENABLE
+    logic                   pin;
+`endif
     logic                   ready;
 
     modport master (
@@ -54,6 +59,9 @@ interface VX_kmu_bus_if import VX_gpu_pkg::*; ();
         output eop,
         output dest,
         output data,
+    `ifdef VX_CFG_EXT_DLMEM_ENABLE
+        output pin,
+    `endif
         input  ready
     );
 
@@ -63,6 +71,9 @@ interface VX_kmu_bus_if import VX_gpu_pkg::*; ();
         input  eop,
         input  dest,
         input  data,
+    `ifdef VX_CFG_EXT_DLMEM_ENABLE
+        input  pin,
+    `endif
         output ready
     );
 

@@ -20,6 +20,11 @@ module VX_gbar_unit import VX_gpu_pkg::*; #(
     input wire reset,
 
     VX_gbar_bus_if.slave gbar_bus_if
+`ifdef VX_CFG_EXT_DLMEM_ENABLE
+    // CTA_DONE events, forwarded to the cluster's gang unit, which always takes them
+    , output wire           done_valid
+    , output dlmem_cta_done_t done_data
+`endif
 );
     `UNUSED_SPARAM (INSTANCE_ID)
 
@@ -46,7 +51,11 @@ module VX_gbar_unit import VX_gpu_pkg::*; #(
             if (rsp_fire) begin
                 rsp_valid <= 0;
             end
+        `ifdef VX_CFG_EXT_DLMEM_ENABLE
+            if (req_file && (gbar_bus_if.req_data.kind == GBAR_KIND_BAR)) begin
+        `else
             if (req_file) begin
+        `endif
                 if (active_barrier_count[NC_WIDTH-1:0] == gbar_bus_if.req_data.size_m1) begin
                     barrier_masks[req_id] <= '0;
                     rsp_valid  <= 1;
@@ -65,9 +74,41 @@ module VX_gbar_unit import VX_gpu_pkg::*; #(
     assign gbar_bus_if.rsp_valid = rsp_valid;
     assign gbar_bus_if.rsp_data.id = rsp_bar_id;
 
+`ifdef VX_CFG_EXT_DLMEM_ENABLE
+    reg              done_valid_r;
+    dlmem_cta_done_t done_data_r;
+
+    always @(posedge clk) begin
+        if (reset) begin
+            done_valid_r <= 1'b0;
+        end else begin
+            done_valid_r <= req_file && (gbar_bus_if.req_data.kind == GBAR_KIND_CTA_DONE);
+        end
+        done_data_r.core    <= DLMEM_CORE_W'(gbar_bus_if.req_data.core_id);
+        done_data_r.slot    <= gbar_bus_if.req_data.slot;
+        done_data_r.gang_id <= gbar_bus_if.req_data.gang_id;
+        done_data_r.epoch   <= gbar_bus_if.req_data.epoch;
+    end
+
+    assign done_valid = done_valid_r;
+    assign done_data  = done_data_r;
+
+    `RUNTIME_ASSERT(~req_file || (gbar_bus_if.req_data.kind == GBAR_KIND_BAR) || (gbar_bus_if.req_data.kind == GBAR_KIND_CTA_DONE),
+        ("%t: %s unknown request kind %0d", $time, INSTANCE_ID, gbar_bus_if.req_data.kind))
+`endif
+
 `ifdef DBG_TRACE_GBAR
     always @(posedge clk) begin
+    `ifdef VX_CFG_EXT_DLMEM_ENABLE
+        if (req_file && (gbar_bus_if.req_data.kind == GBAR_KIND_CTA_DONE)) begin
+            `TRACE(2, ("%t: %s cta-done: core_id=%0d, slot=%0d, gang=%0d, epoch=%0d\n",
+                $time, INSTANCE_ID, gbar_bus_if.req_data.core_id, gbar_bus_if.req_data.slot,
+                gbar_bus_if.req_data.gang_id, gbar_bus_if.req_data.epoch))
+        end
+        if (req_file && (gbar_bus_if.req_data.kind == GBAR_KIND_BAR)) begin
+    `else
         if (req_file) begin
+    `endif
             `TRACE(2, ("%t: %s arrive: bar_id=%0d, size=%0d, core_id=%0d\n",
                 $time, INSTANCE_ID, gbar_bus_if.req_data.id, gbar_bus_if.req_data.size_m1, gbar_bus_if.req_data.core_id))
         end

@@ -29,6 +29,12 @@ RTL_PKGS := $(RTL_DIR)/VX_gpu_pkg.sv $(RTL_DIR)/fpu/VX_fpu_pkg.sv
 RTL_INCLUDE := -I$(ROOT_DIR)/sw -I$(ROOT_DIR)/hw -I$(RTL_DIR) -I$(DPI_DIR) -I$(RTL_DIR)/libs
 RTL_INCLUDE += -I$(RTL_DIR)/interfaces -I$(RTL_DIR)/mem -I$(RTL_DIR)/vm -I$(RTL_DIR)/cache -I$(RTL_DIR)/fpu -I$(RTL_DIR)/core -I$(SRC_DIR)
 
+# DLMEM builds compile the hw/rtl/dlmem units and their package.
+ifneq (,$(filter -DVX_CFG_EXT_DLMEM_ENABLE,$(CONFIGS)))
+RTL_PKGS += $(RTL_DIR)/dlmem/VX_dlmem_pkg.sv
+RTL_INCLUDE += -I$(RTL_DIR)/dlmem
+endif
+
 TOP := VX_core_top
 
 include ../common.mk

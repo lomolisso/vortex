@@ -159,6 +159,11 @@ typedef enum {
     VX_QUEUE_PRIORITY_HIGH   = 2
 } vx_queue_priority_e;
 
+typedef enum {
+    VX_CLUSTER_POLICY_DEFAULT = 0,   // a cluster's blocks share one core
+    VX_CLUSTER_POLICY_SPREAD  = 1    // blocks spread over one hardware cluster's cores (VX_ISA_EXT_DLMEM)
+} vx_cluster_policy_e;
+
 // ============================================================================
 // Macros
 // ============================================================================
@@ -202,6 +207,9 @@ typedef struct {
     uint32_t     block_dim[3];
     uint32_t     lmem_size;
     uint32_t     cluster_dim[3];
+    // Moves cluster_policy past the version-1 struct's tail padding, so its size tells the versions apart.
+    uint32_t     reserved0;
+    vx_cluster_policy_e cluster_policy;
 } vx_launch_info_t;
 
 // 3D-strided DMA descriptor for the rect enqueue ops. Mirrors OpenCL 1.2's

@@ -1,8 +1,10 @@
 ROOT_DIR := $(realpath ../..)
 include $(ROOT_DIR)/config.mk
 
-# Distributed local memory units: the feature is RV64 only.
-DLMEM_UNITS := $(if $(filter 64,$(XLEN)),dlmem_noc)
+# Distributed local memory units: the feature is RV64 only. A unit is listed
+# once its directory exists, so its bench can land without touching the lists.
+DLMEM_UNIT_DIRS := dlmem_noc cta_gang bar_unit dlmem_xlate dlmem_ep
+DLMEM_UNITS := $(if $(filter 64,$(XLEN)),$(patsubst %/Makefile,%,$(wildcard $(addsuffix /Makefile,$(DLMEM_UNIT_DIRS)))))
 
 all:
 	$(MAKE) -C generic_queue
@@ -107,7 +109,10 @@ run-lmem:
 # the dispatcher's slot placement across launches checked against SimX's
 # per-launch pointer reset, with 4 and 8 CTA slots. With DLMEM (RV64 only) both
 # also carry the cluster rank to the CSR read-back, up to the largest cluster
-# (8 cores) and with a 256 KB local memory.
+# (8 cores) and with a 256 KB local memory; the KMU carries the sticky cluster
+# policy, and the dispatcher takes pinned blocks into their forced slots, writes
+# every block's peer row, and reports each pinned block's CTA_DONE event once,
+# holding its slot until the event leaves.
 define cta_case
 	$(MAKE) -C cta_dispatcher clean
 	$(MAKE) -C cta_dispatcher CONFIGS="$(1)"
@@ -126,6 +131,16 @@ ifeq ($(XLEN),64)
 endif
 
 # Distributed local memory units, each over its parameter sets (RV64 only).
+run-dlmem:
+ifeq ($(XLEN),64)
+	$(MAKE) run-dlmem-noc
+	$(MAKE) run-dlmem-gang
+	$(MAKE) run-dlmem-xlate
+	$(MAKE) run-dlmem-ep
+else
+	@echo "run-dlmem: distributed local memory is RV64 only; nothing to run at XLEN $(XLEN)"
+endif
+
 # The network at every cluster shape (sockets x socket size) and two packet
 # widths: random traffic, then the fixed latency schedule, whose CSV must match
 # the SimX model's run of the same schedule packet for packet (fabric parity).
@@ -146,7 +161,7 @@ define dlmem_noc_case
 	python3 $(VORTEX_HOME)/hw/unittest/dlmem_noc/compare_latency.py --socket-size=$(2) \
 		dlmem_noc/latency_c$(1)_s$(2)_w$(3).csv dlmem_noc/simx_latency_c$(1)_s$(2)_w$(3).csv
 endef
-run-dlmem:
+run-dlmem-noc:
 ifeq ($(XLEN),64)
 	$(MAKE) -C $(ROOT_DIR)/tests/unittest/dlmem_noc
 	$(call dlmem_noc_case,1,1,160)
@@ -167,6 +182,67 @@ ifeq ($(XLEN),64)
 	$(call dlmem_noc_case,32,16,48)
 else
 	@echo "run-dlmem: distributed local memory is RV64 only; nothing to run at XLEN $(XLEN)"
+endif
+
+# Gang admission. The gang unit at every placement shape, also as a second
+# cluster, over 6 cores (3 sockets, MAX_CLUSTER 3) and with 16 warps: directed
+# scenarios and random traffic against dlmem_ref, then the deterministic
+# schedule, whose placement CSV must match the SimX model's run of the same
+# schedule row for row, commit cycles included (placement parity). Then the
+# barrier units' shared request queue: CTA_DONE events against global barrier
+# rounds under response stalls, and the done latency, at 1 core, 2x2 and 4x2.
+# $(1)=NUM_CORES $(2)=SOCKET_SIZE $(3)=NUM_WARPS $(4)=DLMEM_MAX_CLUSTER
+# $(5)=LMEM_LOG_SIZE $(6)=CLUSTER_ID $(7)=seed $(8)=other CONFIGS
+CTA_GANG_SIMX := cta_gang/simx/cta_gang_test
+define cta_gang_case
+	$(MAKE) -C cta_gang clean
+	$(MAKE) -C cta_gang CLUSTER_ID=$(6) CONFIGS="-DVX_CFG_EXT_DLMEM_ENABLE -DVX_CFG_NUM_CORES=$(1) \
+		-DVX_CFG_SOCKET_SIZE=$(2) -DVX_CFG_NUM_WARPS=$(3) -DVX_CFG_DLMEM_MAX_CLUSTER=$(4) -DVX_CFG_LMEM_LOG_SIZE=$(5) $(8)"
+	$(MAKE) -C cta_gang run CLUSTER_ID=$(6) CONFIGS="-DVX_CFG_EXT_DLMEM_ENABLE -DVX_CFG_NUM_CORES=$(1) \
+		-DVX_CFG_SOCKET_SIZE=$(2) -DVX_CFG_NUM_WARPS=$(3) -DVX_CFG_DLMEM_MAX_CLUSTER=$(4) -DVX_CFG_LMEM_LOG_SIZE=$(5) $(8)" \
+		OPTS="--seed=$(7) --csv=placement_c$(1)s$(2)w$(3)m$(4)k$(6).csv"
+	$(CTA_GANG_SIMX) --shape=$(1),$(2),$(3),$(4),$(5) --csv=cta_gang/simx_placement_c$(1)s$(2)w$(3)m$(4)k$(6).csv
+	python3 $(VORTEX_HOME)/hw/unittest/cta_gang/compare_placement.py \
+		cta_gang/placement_c$(1)s$(2)w$(3)m$(4)k$(6).csv cta_gang/simx_placement_c$(1)s$(2)w$(3)m$(4)k$(6).csv
+endef
+# $(1)=CONFIGS $(2)=seed
+define bar_unit_case
+	$(MAKE) -C bar_unit clean
+	$(MAKE) -C bar_unit CONFIGS="-DVX_CFG_EXT_DLMEM_ENABLE $(1)"
+	$(MAKE) -C bar_unit run CONFIGS="-DVX_CFG_EXT_DLMEM_ENABLE $(1)" OPTS="--seed=$(2)"
+endef
+run-dlmem-gang:
+ifeq ($(XLEN),64)
+	$(MAKE) -C $(ROOT_DIR)/sim/simx DESTDIR=$(CURDIR)/cta_gang/simx $(CURDIR)/$(CTA_GANG_SIMX) \
+		CONFIGS="-DVX_CFG_EXT_DLMEM_ENABLE"
+	$(call cta_gang_case,1,1,4,1,14,0,1,)
+	$(call cta_gang_case,2,1,4,2,14,0,2,)
+	$(call cta_gang_case,2,2,8,2,14,0,3,)
+	$(call cta_gang_case,4,2,4,2,14,0,4,)
+	$(call cta_gang_case,4,4,8,4,14,0,5,)
+	$(call cta_gang_case,8,2,4,8,14,0,6,)
+	$(call cta_gang_case,8,4,8,4,14,0,7,)
+	$(call cta_gang_case,8,1,8,8,14,0,8,)
+	$(call cta_gang_case,4,2,4,4,14,1,9,-DVX_CFG_NUM_CLUSTERS=2)
+	$(call cta_gang_case,6,2,4,3,14,0,10,)
+	$(call cta_gang_case,4,2,16,4,17,0,11,-DVX_CFG_NUM_THREADS=8)
+	$(call bar_unit_case,-DVX_CFG_NUM_CORES=1 -DVX_CFG_SOCKET_SIZE=1,1)
+	$(call bar_unit_case,-DVX_CFG_NUM_CORES=4 -DVX_CFG_SOCKET_SIZE=2,2)
+	$(call bar_unit_case,-DVX_CFG_NUM_CORES=8 -DVX_CFG_SOCKET_SIZE=2 -DVX_CFG_NUM_WARPS=8,3)
+	$(MAKE) -C cta_gang clean
+	$(MAKE) -C bar_unit clean
+endif
+
+# Aperture translation: dlmem_xlate.
+run-dlmem-xlate:
+ifeq ($(XLEN),64)
+	@true
+endif
+
+# Network endpoints: dlmem_ep.
+run-dlmem-ep:
+ifeq ($(XLEN),64)
+	@true
 endif
 
 # Cache bank in the last-level role: directed fill/replay races around the

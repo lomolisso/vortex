@@ -98,8 +98,10 @@ flight. The busy tree is
 
 ### 2.1 The programming surface
 
-The host writes the KMU's DCRs (`0x010`–`0x023`, spanning
+The host writes the KMU's DCRs (`0x010`–`0x024`, spanning
 `VX_DCR_KMU_STATE_BEGIN`..`VX_DCR_KMU_STATE_END`) and then pulses `start`.
+`VX_DCR_KMU_CLUSTER_POLICY` (`0x024`) exists only on a DLMEM device, and the
+runtime writes it only there (§4.6).
 `VX_kmu` latches them and never reads them back, so they must all settle
 before `start` — which the command processor's ordered DCR-write path
 guarantees.
@@ -148,7 +150,8 @@ plain count in device-caps bits [48:42] and 0 in a build without DLMEM.
 logic                   valid;
 logic                   kind;   // KMU_KIND_COMPUTE | KMU_KIND_FRAGMENT
 logic                   eop;    // last beat of the message
-logic [KMU_DEST_W-1:0]  dest;   // placement hint (fragment only)
+logic [KMU_DEST_W-1:0]  dest;   // placement hint (fragment, or a pinned beat)
+logic                   pin;    // DLMEM only: route by dest; always a whole message
 logic [KMU_DATAW-1:0]   data;   // beat 0 = kmu_req_t
 logic                   ready;
 ```
@@ -251,6 +254,12 @@ clusters, not CTAs, are the unit of load balancing.
 Both rules are the same idea: affinity that must not be load-balanced is
 expressed as message length, and the arb never has to unpack `data` to
 honour it.
+
+A DLMEM build adds a third case: a **pinned** compute beat (`pin = 1`) is
+routed by `dest` like a fragment, at every level
+(`sel = (kind == FRAGMENT || pin) ? dest_sel : rr_sel`). Only `VX_cta_gang`
+pins beats, after it has chosen the member's core (§4.6), and each pinned beat
+is a whole message (`eop = 1`), so it never takes the lock.
 
 ---
 
@@ -500,6 +509,89 @@ multicast is issued.
 Verified on `cta_cluster` (K = `NUM_WARPS` = 4), which hangs at `--cores=2`
 without the message lock and passes with it, on both SimX and rtlsim. §11.
 
+### 4.6 Distributed clusters: gang admission (DLMEM)
+
+A DLMEM build (`VX_CFG_EXT_DLMEM_ENABLE`, RV64) adds a second cluster policy,
+chosen per launch by `vx_launch_info_t.cluster_policy`. The KMU latches
+`VX_DCR_KMU_CLUSTER_POLICY` and sends it in `kmu_compute_args_t.dlmem.policy`;
+its walk is the same for both policies, one message of K beats per cluster.
+
+| Policy | The K blocks of a cluster | Placed by |
+|---|---|---|
+| `VX_CLUSTER_POLICY_DEFAULT` | share one core (§4.2–§4.5) | the message lock |
+| `VX_CLUSTER_POLICY_SPREAD` | spread over the cores of one hardware cluster | `VX_cta_gang` |
+
+**The gang unit.** One [`VX_cta_gang`](../../hw/rtl/dlmem/VX_cta_gang.sv) per
+hardware cluster sits between the cluster's launch input and its socket
+distributor. It keeps an exact mirror of every core's free slots and reserved
+warps, counting SPREAD blocks only. A DEFAULT beat passes through unchanged
+(`pin = 0`), one register later. For a SPREAD cluster the unit:
+
+1. holds `ready` low on the first beat and places one member per cycle
+   ([`dlmem_ref.h`](../../sw/common/dlmem_ref.h) `place()` is the golden
+   model): starting at a round-robin core, a member takes the first core not
+   yet visited that has a usable slot and W = ceil(block_size / NUM_THREADS)
+   warps free, and that core's lowest free slot. The visited set clears only
+   when every capable core holds a member, so K blocks land on K distinct
+   cores whenever K cores have room;
+2. reserves nothing if a member does not fit, and tries again after the next
+   done event (all or nothing: a partial gang could deadlock on its own
+   cluster barrier);
+3. otherwise commits the K reservations at once and, for K > 1, allocates a
+   gang id from a pool of `max(2, NCC × NUM_WARPS / 2)`, flipping that id's
+   epoch bit;
+4. emits the K beats with `pin = 1`, `eop = 1`, `dest` = the member's core and
+   `dlmem = {policy, epoch, gang_id, forced_slot, row}`, where `row` lists
+   every member's `{core, slot}` by rank and is the same in all K beats.
+
+The round-robin pointer and the epochs restart when a new `ctx_id` arrives.
+Launches never overlap (the command processor drains one before starting the
+next, and the unit's `busy` holds the device busy until its mirror is empty),
+so nothing is in flight then.
+
+**Pinned admission.** The dispatcher trusts the payload, not the sideband: a
+beat whose `dlmem.policy` is SPREAD is admitted into `forced_slot`, skips the
+cluster window and the pre-wrap, and leaves `tail_r` alone, so DEFAULT
+placement is unaffected. The gang guarantees that the slot and W warps are
+free on arrival (asserted): it reserves at commit and releases only after the
+block's done event has crossed back, and a core's launch path is FIFO.
+
+**Done events.** When a pinned block's last warp exits, its dispatcher raises
+`CTA_DONE{core, slot, gang_id, epoch}`. The event rides the core's
+global-barrier request queue (one FIFO shared with barrier arrivals,
+`gbar_req_t.kind = GBAR_KIND_CTA_DONE`) to `VX_gbar_unit`, which forwards it
+to the gang unit; the unit always accepts it. The unit frees the slot and W
+warps, and retires the gang id at the K-th event. The dispatcher holds the
+slot (`done_pend_r`) until its event has left, so the slot's record cannot be
+overwritten first.
+
+**Peer rows.** Every admitted compute beat also writes the block's peer row
+through a registered port: the gang's row for a pinned beat, and
+`{my_core, base_slot + r}` by rank for a same-core cluster. The aperture
+translation consumes it.
+
+**Same-core clusters in a DLMEM build** get no gang id and send no done
+events; they keep the window admission (§4.2) and the message lock (§4.5).
+
+**Head-of-line blocking.** A SPREAD cluster that does not fit holds its gang
+unit's input, and the device distributor's message lock and skid keep the
+rest of the launch stream behind it, until enough blocks finish. That is
+correct (the cluster always fits an empty mirror), but a CUDA scheduler would
+place a later cluster that fits first.
+
+**Host validation** ([`queue.cpp`](../../sw/runtime/common/queue.cpp)
+`launch_policy()`, on both the single-launch and the batch path). A
+descriptor whose `struct_size` ends before `cluster_policy` (the 88-byte
+version-1 struct) is DEFAULT. SPREAD without `VX_ISA_EXT_DLMEM` returns
+`VX_ERR_NOT_SUPPORTED`. Otherwise `VX_ERR_INVALID_VALUE` for a policy above
+SPREAD; on a DLMEM device for any cluster larger than
+`max(NUM_WARPS, VX_CAPS_DLMEM_MAX_CLUSTER)`, which the KMU's rank counter
+holds; and for SPREAD with K above `VX_CAPS_DLMEM_MAX_CLUSTER` or above
+`cores per cluster × min(usable slots, NUM_WARPS / W)`. The policy register
+is written on a DLMEM device only, in every launch with `ndim > 0` and in the
+QMD; legacy `vx_start` writes DEFAULT, because the register keeps the last
+launch's value.
+
 ---
 
 ## 5. Dispatcher microarchitecture
@@ -604,6 +696,9 @@ write stays invisible for two cycles. `_r` covers the 1-cycle gap, `_rr` the
 ```systemverilog
 assign busy = (state == DISPATCH) || kmu_bus_if_fire;
 ```
+
+In a DLMEM build `busy` also covers a pending done event (`|done_pend_r`,
+§4.6), so a launch is not complete until every pinned block has reported.
 
 The accept→DISPATCH transition is registered, so gating on `state` alone
 leaves the accept cycle un-busy. At `SOCKET_SIZE > 1` the socket busy
@@ -791,6 +886,15 @@ The `cluster_dim[3]`-vs-`cluster_size` split is a real ABI divergence, though
 a benign one — SimX computes the product where RTL receives it
 ([`cta_dispatcher.cpp:108-111`](../../sim/simx/cta_dispatcher.cpp#L108)).
 
+A DLMEM build launches hop by hop, as the RTL does: the `Kmu` has one lane per
+hardware cluster, each feeding that cluster's
+[`CtaGang`](../../sim/simx/kmu/cta_gang.h) through a register stage; the gang
+holds the per-core lanes and credits that the `Kmu` holds otherwise, and runs
+the same cycle table as `VX_cta_gang` (K placement cycles, then one beat per
+cycle) on `dlmem_ref.h`. Done events travel on the global-barrier event link
+(`GbarArrive.kind = CTA_DONE`) with the RTL's delay. Without DLMEM the topology
+is unchanged.
+
 ---
 
 ## 10. Open items
@@ -856,6 +960,9 @@ correctly retained for retirement.)
 | [`tests/regression/sgemm2_dxa_mcast/`](../../tests/regression/sgemm2_dxa_mcast/) | multicast under a real GEMM |
 | [`tests/regression/sgemm_tcu_wg_dxa_mcast/`](../../tests/regression/sgemm_tcu_wg_dxa_mcast/) | multicast + TCU workgroup |
 | [`tests/regression/cluster_rank/`](../../tests/regression/cluster_rank/) | DLMEM build: `CTA_CLUSTER_RANK` over 1-, 2- and 3-D cluster shapes, the rank address map, a 256 KB local memory (`dlmem.yaml`) |
+| [`tests/regression/cta_gang/`](../../tests/regression/cta_gang/) | SPREAD launches (§4.6): every block once, a cluster inside one hardware cluster, ranks, the first cluster of a launch on cores 0..K−1, slot bases, an atomic rendezvous proving co-residency; the runtime's rejections and the version-1 struct; `parity-cta-gang` (`dlmem.yaml`) |
+| [`hw/unittest/cta_gang/`](../../hw/unittest/cta_gang/), [`tests/unittest/cta_gang/`](../../tests/unittest/cta_gang/) | `VX_cta_gang` and the SimX `CtaGang` against `dlmem_ref.h`, directed and random, with the same placement trace |
+| [`hw/unittest/bar_unit/`](../../hw/unittest/bar_unit/) | done events and barrier arrivals sharing the gbar queue |
 
 ### 11.1 The coverage shape
 

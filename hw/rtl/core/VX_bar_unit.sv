@@ -30,6 +30,13 @@ module VX_bar_unit import VX_gpu_pkg::*; #(
     // global barrier interface
     VX_gbar_bus_if.master gbar_bus_if,
 
+`ifdef VX_CFG_EXT_DLMEM_ENABLE
+    // CTA_DONE events of this core's SPREAD blocks, toward the gang unit
+    input wire                cta_done_valid,
+    input dlmem_cta_done_t    cta_done_data,
+    output wire               cta_done_ready,
+`endif
+
     // scheduler interface
     input wire [`VX_CFG_NUM_WARPS-1:0] active_warps,
     output wire               unlock_valid, // unlock stalled warps
@@ -288,6 +295,75 @@ module VX_bar_unit import VX_gpu_pkg::*; #(
         end
     end
 
+`ifdef VX_CFG_EXT_DLMEM_ENABLE
+    // CTA_DONE events share the global-barrier request queue, so it exists even
+    // at one core and each core's events leave in order. A barrier holds at most
+    // one entry per id and an event enters only below NUM_WARPS entries, so the
+    // queue never overflows.
+    if (1) begin : g_gbar
+
+        localparam GQ_DATAW = 2 + GANG_ID_W + 1 + NW_WIDTH + GBAR_REQW;
+        localparam GQ_DEPTH = 1 << `CLOG2((1 << NB_WIDTH) + `VX_CFG_NUM_WARPS);
+        localparam GQ_SIZEW = `CLOG2(GQ_DEPTH + 1);
+
+        wire done_push = cta_done_valid && cta_done_ready;
+        wire req_push  = gbar_enqueue || done_push;
+
+        wire [GQ_DATAW-1:0] req_queue_in = gbar_enqueue
+            ? {GBAR_KIND_BAR, GANG_ID_W'(0), 1'b0, NW_WIDTH'(0), gbar_enqueue_id, gbar_enqueue_size_m1}
+            : {GBAR_KIND_CTA_DONE, cta_done_data.gang_id, cta_done_data.epoch, cta_done_data.slot,
+               NB_WIDTH'(0), NC_WIDTH'(0)};
+        wire [GQ_DATAW-1:0] req_queue_data;
+        wire [GQ_SIZEW-1:0] req_size;
+        wire req_empty, req_alm_empty, req_full;
+        wire req_pop = ~req_empty && gbar_bus_if.req_ready;
+
+        VX_fifo_queue #(
+            .DATAW  (GQ_DATAW),
+            .DEPTH  (GQ_DEPTH),
+            .LUTRAM (1)
+        ) req_queue (
+            .clk     (clk),
+            .reset   (reset),
+            .push    (req_push),
+            .pop     (req_pop),
+            .data_in (req_queue_in),
+            .data_out(req_queue_data),
+            .empty   (req_empty),
+            .alm_empty(req_alm_empty),
+            .full    (req_full),
+            `UNUSED_PIN (alm_full),
+            .size    (req_size)
+        );
+
+        // a barrier arrival takes the queue's write port first
+        assign cta_done_ready = ~gbar_enqueue && (req_size < GQ_SIZEW'(`VX_CFG_NUM_WARPS));
+
+        // Same registered valid as without DLMEM: one cycle after the push.
+        reg gbar_req_valid_r;
+
+        always @(posedge clk) begin
+            if (reset) begin
+                gbar_req_valid_r <= 0;
+            end else begin
+                gbar_req_valid_r <= req_push | (req_pop ? ~req_alm_empty : ~req_empty);
+            end
+        end
+
+        assign gbar_bus_if.req_valid        = gbar_req_valid_r;
+        assign {gbar_bus_if.req_data.kind, gbar_bus_if.req_data.gang_id, gbar_bus_if.req_data.epoch,
+                gbar_bus_if.req_data.slot, gbar_bus_if.req_data.id, gbar_bus_if.req_data.size_m1} = req_queue_data;
+        assign gbar_bus_if.req_data.core_id = NC_WIDTH'(CORE_ID % `VX_CFG_NUM_CORES);
+        // at one core no global barrier ever answers
+        assign gbar_bus_if.rsp_ready        = USE_GBAR ? gbar_rsp_ready : 1'b1;
+        // the event's core is this one, sent as core_id
+        `UNUSED_VAR (cta_done_data.core)
+
+        `RUNTIME_ASSERT(~req_push || ~req_full, ("%s global barrier request queue overflow", INSTANCE_ID))
+        `RUNTIME_ASSERT(~gbar_enqueue || ~gbar_pending_r[gbar_enqueue_id], ("%s duplicate global barrier generation: id=%0d", INSTANCE_ID, gbar_enqueue_id))
+        `RUNTIME_ASSERT(~gbar_enqueue || (store_waddr == BAR_ADDR_W'(gbar_enqueue_id)), ("%s invalid global barrier slot: id=%0d, slot=%0d", INSTANCE_ID, gbar_enqueue_id, store_waddr))
+    end
+`else
     if (USE_GBAR) begin : g_gbar
 
         wire [GBAR_REQW-1:0] req_queue_data;
@@ -344,6 +420,7 @@ module VX_bar_unit import VX_gpu_pkg::*; #(
         `UNUSED_VAR (gbar_enqueue_size_m1)
 
     end
+`endif
 
 `ifdef DBG_TRACE_PIPELINE
     always @(posedge clk) begin

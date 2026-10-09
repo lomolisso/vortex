@@ -17,6 +17,10 @@
 #include <vector>
 #include "types.h"
 #include "kmu.h"
+#ifdef VX_CFG_EXT_DLMEM_ENABLE
+#include <optional>
+#include <dlmem_ref.h>
+#endif
 
 namespace vortex {
 
@@ -43,6 +47,15 @@ struct cta_warp_record_t {
 #endif
 };
 
+#ifdef VX_CFG_EXT_DLMEM_ENABLE
+// A SPREAD block left its slot: the event its gang unit releases the slot on.
+struct CtaDone {
+  uint32_t slot;
+  uint32_t gang_id;
+  uint32_t epoch;
+};
+#endif
+
 // CTA dispatcher: consumes CTAs pushed by the KMU and admits one warp rank
 // per step() into a free warp slot.
 class CtaDispatcher : public SimObject<CtaDispatcher> {
@@ -63,7 +76,15 @@ public:
   bool step(const WarpMask& active_warps, uint32_t* wid_out, cta_warp_record_t* rec_out);
 
   // Notify that a warp has exited; frees its lmem slot when all warps of the CTA are done.
+#ifdef VX_CFG_EXT_DLMEM_ENABLE
+  // A SPREAD block's last warp also returns the block's done event.
+  std::optional<CtaDone> warp_done(uint32_t wid);
+
+  // The peer row recorded when the slot's block was admitted.
+  const dlmem_ref::Row& peer_row(uint32_t slot) const { return peer_row_.at(slot); }
+#else
   void warp_done(uint32_t wid);
+#endif
 
   // Startup-stub bookkeeping for launches that do not come through step().
   // A fragment warp lands in the same slots as a compute CTA and owes the same
@@ -129,6 +150,17 @@ private:
   // warp: the stub derives a lane's stack from its hart id, so a slot relaunched
   // with lanes it has not run before must run it again.
   std::vector<ThreadMask> warp_init_lanes_;
+
+#ifdef VX_CFG_EXT_DLMEM_ENABLE
+  uint32_t my_core_;                       // index within the hardware cluster
+  std::vector<bool>     evt_;              // the slot's block owes a done event
+  std::vector<uint32_t> gang_;
+  std::vector<uint32_t> epoch_;
+  // A slot whose done event is still leaving is not re-admitted before this cycle.
+  std::vector<uint64_t> done_pend_until_;
+  std::vector<dlmem_ref::Row> peer_row_;
+  uint32_t legacy_base_;                   // first slot of the same-core cluster being admitted
+#endif
 
   // Cluster co-residency: the first CTA of a cluster reserves K consecutive
   // usable slots (pre-wrapping the tail to 0 if the window would overrun the

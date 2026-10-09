@@ -25,6 +25,9 @@ Kmu::Kmu(const SimContext& ctx, const char* name, uint32_t num_cores)
   , param_(0)
   , lmem_size_(0)
   , block_size_(0)
+#ifdef VX_CFG_EXT_DLMEM_ENABLE
+  , policy_(KMU_POLICY_DEFAULT)
+#endif
   , running_(false)
   , cta_id_(0)
   , rr_ptr_(0)
@@ -82,6 +85,9 @@ void Kmu::dcr_write(uint32_t addr, uint32_t value) {
   case VX_DCR_KMU_CLUSTER_DIM_X: cluster_dim_[0] = value; break;
   case VX_DCR_KMU_CLUSTER_DIM_Y: cluster_dim_[1] = value; break;
   case VX_DCR_KMU_CLUSTER_DIM_Z: cluster_dim_[2] = value; break;
+#ifdef VX_CFG_EXT_DLMEM_ENABLE
+  case VX_DCR_KMU_CLUSTER_POLICY: policy_ = value & 1; break;
+#endif
   default: break;
   }
 }
@@ -204,6 +210,7 @@ bool Kmu::next_cta(kmu_req_t* req, uint32_t core_id) {
   // Walk position inside the cluster (x fastest), the order the RTL counts ranks in.
   req->cluster_rank = intra_offset_[0]
                     + cluster_dim_[0] * (intra_offset_[1] + cluster_dim_[1] * intra_offset_[2]);
+  req->policy       = policy_;
 #endif
 
   // Advance the intra-cluster offset first (fills the cluster), then the

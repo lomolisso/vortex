@@ -39,6 +39,10 @@ module VX_kmu_top import VX_gpu_pkg::*;
     output wire [31:0]                      bus_cluster_size,
 `ifdef VX_CFG_EXT_DLMEM_ENABLE
     output wire [31:0]                      bus_cluster_rank,
+    output wire                             bus_policy,
+    output wire                             bus_pin,
+    // any gang-unit field set (the KMU leaves them all to the gang)
+    output wire                             bus_gang_fields,
 `endif
     output wire                             bus_is_first
 );
@@ -58,6 +62,14 @@ module VX_kmu_top import VX_gpu_pkg::*;
     assign bus_cluster_size = 32'(kmu_req.args.compute.cluster_size);
 `ifdef VX_CFG_EXT_DLMEM_ENABLE
     assign bus_cluster_rank = 32'(kmu_req.args.compute.cluster_rank);
+    assign bus_policy       = kmu_req.args.compute.dlmem.policy;
+    assign bus_pin          = kmu_bus_if.pin;
+    kmu_dlmem_t gang_fields;
+    always @(*) begin
+        gang_fields = kmu_req.args.compute.dlmem;
+        gang_fields.policy = 1'b0;
+    end
+    assign bus_gang_fields  = (|gang_fields);
 `endif
     assign bus_is_first     = kmu_req.args.compute.is_first_of_cluster;
 

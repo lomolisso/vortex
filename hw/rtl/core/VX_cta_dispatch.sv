@@ -16,6 +16,9 @@
 // Dispatches warps for incoming CTAs from the KMU.
 module VX_cta_dispatch import VX_gpu_pkg::*; #(
     parameter `STRING INSTANCE_ID = ""
+`ifdef VX_CFG_EXT_DLMEM_ENABLE
+    , parameter CORE_ID = 0
+`endif
 ) (
     input wire                      clk,
     input wire                      reset,
@@ -48,6 +51,19 @@ module VX_cta_dispatch import VX_gpu_pkg::*; #(
     // CTA id of the scheduled warp
     input wire [NW_WIDTH-1:0]       schedule_wid,
     output wire [NCTA_WIDTH-1:0]    schedule_cta_id,
+
+`ifdef VX_CFG_EXT_DLMEM_ENABLE
+    // CTA_DONE events of SPREAD blocks, toward the cluster's gang unit
+    output wire                     cta_done_valid,
+    output dlmem_cta_done_t         cta_done_data,
+    input  wire                     cta_done_ready,
+
+    // the peer row of every admitted compute block, for the aperture table
+    output wire                     peer_wr_valid,
+    output wire [NW_WIDTH-1:0]      peer_wr_slot,
+    output dlmem_row_t              peer_wr_row,
+    output wire [`VX_CFG_LMEM_LOG_SIZE:0] peer_wr_stride,
+`endif
 
     output wire                     busy
 );
@@ -168,6 +184,13 @@ module VX_cta_dispatch import VX_gpu_pkg::*; #(
     `UNUSED_VAR (kmu_bus_if.kind)
     `UNUSED_VAR (kmu_bus_if.dest)
     `UNUSED_VAR (kmu_bus_if.eop)
+`ifdef VX_CFG_EXT_DLMEM_ENABLE
+    // A SPREAD block lands in the slot its gang unit reserved. The payload
+    // decides; `pin` only routed it here.
+    wire is_pinned = (kmu_req.args.compute.dlmem.policy == KMU_POLICY_SPREAD);
+    `RUNTIME_ASSERT (~kmu_bus_if.valid || (kmu_bus_if.pin == is_pinned),
+        ("%t: %s launch beat pin=%b disagrees with its policy", $time, INSTANCE_ID, kmu_bus_if.pin))
+`endif
 
     // A fragment is not a CTA: it carries only args.fragment, and the compute-descriptor
     // fields (grid geometry, cluster, block_size) read as stamp bits for a fragment. So the
@@ -379,7 +402,13 @@ module VX_cta_dispatch import VX_gpu_pkg::*; #(
     wire [CS_BITS-1:0] base_tail = (new_launch || (tail_ext >= usable_ext)) ? CS_BITS'(0) : tail_r;
     wire cluster_prewrap = is_first_of_cluster
         && (({2'b0, base_tail} + {1'b0, cluster_k}) > usable_ext);
+`ifdef VX_CFG_EXT_DLMEM_ENABLE
+    // A pinned block skips the cluster window and the pre-wrap.
+    wire [CS_BITS-1:0] base_slot = is_pinned ? CS_BITS'(kmu_req.args.compute.dlmem.forced_slot)
+                                 : cluster_prewrap ? CS_BITS'(0) : base_tail;
+`else
     wire [CS_BITS-1:0] base_slot = cluster_prewrap ? CS_BITS'(0) : base_tail;
+`endif
 
     // Round-robin advance: next slot wraps to 0 at usable_slots_r.
     wire [NW_WIDTH+1:0] next_tail_raw = {2'b0, base_slot} + (NW_WIDTH+2)'(1);
@@ -399,7 +428,20 @@ module VX_cta_dispatch import VX_gpu_pkg::*; #(
     wire [NUM_CTA_SLOTS-1:0] window_ones = (NUM_CTA_SLOTS'(1) << cluster_k) - NUM_CTA_SLOTS'(1);
     wire [NUM_CTA_SLOTS-1:0] cluster_window = window_ones << base_slot;
     wire cluster_window_free = ((slot_valid_r & cluster_window) == '0);
+`ifdef VX_CFG_EXT_DLMEM_ENABLE
+    // A slot whose CTA_DONE event has not left yet is still taken: its record
+    // must survive until the event does.
+    reg  [NUM_CTA_SLOTS-1:0] done_pend_r;
+    wire [NUM_CTA_SLOTS-1:0] base_onehot  = NUM_CTA_SLOTS'(1) << base_slot;
+    wire [NUM_CTA_SLOTS-1:0] needed_slots = (is_first_of_cluster && ~is_pinned) ? cluster_window : base_onehot;
+    wire admit_ok = ((is_first_of_cluster && ~is_pinned) ? cluster_window_free : ~slot_valid_r[base_slot])
+                 && ((done_pend_r & needed_slots) == '0);
+    // the gang unit frees a slot only after its done event has reached it
+    `RUNTIME_ASSERT (~(kmu_bus_if.valid && (state == IDLE) && is_pinned) || (~slot_valid_r[base_slot] && ~done_pend_r[base_slot]),
+        ("%t: %s pinned block forced into busy slot %0d", $time, INSTANCE_ID, base_slot))
+`else
     wire admit_ok = is_first_of_cluster ? cluster_window_free : ~slot_valid_r[base_slot];
+`endif
     // A fragment launch's stamps land in the warp record TID_STAGES cycles after the
     // warp fires (the thread-index ripple), but frag_stamps_r is a single bank. So a
     // new launch must not overwrite it while an earlier fragment warp is still in that
@@ -524,7 +566,14 @@ module VX_cta_dispatch import VX_gpu_pkg::*; #(
                         // in order.
                         cur_lmem_base_r <= base_lmem;
                         slot_valid_r[base_slot] <= 1'b1;
+                    `ifdef VX_CFG_EXT_DLMEM_ENABLE
+                        // a pinned block leaves the round-robin tail alone
+                        if (~is_pinned) begin
+                            tail_r <= (`VX_CFG_NUM_WARPS > 1) ? next_tail : CS_BITS'(0);
+                        end
+                    `else
                         tail_r     <= (`VX_CFG_NUM_WARPS > 1) ? next_tail : CS_BITS'(0);
+                    `endif
                         cur_slot_r <= base_slot;
                         dispatched_warps <= '0;
                         state <= DISPATCH;
@@ -608,7 +657,108 @@ module VX_cta_dispatch import VX_gpu_pkg::*; #(
     // buffered per-core busy rises, opening a 1-cycle device-busy gap the host's
     // edge-sensitive idle-wait latches as premature completion (cores>1 launch
     // failure). Covering the accept cycle closes the gap.
+`ifdef VX_CFG_EXT_DLMEM_ENABLE
+    assign busy = (state == DISPATCH) || kmu_bus_if_fire || (|done_pend_r);
+`else
     assign busy = (state == DISPATCH) || kmu_bus_if_fire;
+`endif
+
+`ifdef VX_CFG_EXT_DLMEM_ENABLE
+    // -------------------------------------------------------------------------
+    // DLMEM: CTA_DONE events and peer rows
+    // -------------------------------------------------------------------------
+    localparam MY_CORE = CORE_ID % DLMEM_NCC;
+    localparam MAXC    = DLMEM_MAX_CLUSTER;
+
+    wire admit_fire = kmu_bus_if_fire && (state == IDLE);
+
+    // Per-slot records, written at admission and read when the CTA finishes.
+    reg [NUM_CTA_SLOTS-1:0]                evt_r;
+    reg [NUM_CTA_SLOTS-1:0][GANG_ID_W-1:0] gang_r;
+    reg [NUM_CTA_SLOTS-1:0]                gepoch_r;
+    reg [CS_BITS-1:0]                      legacy_base_r;
+
+    wire [CS_BITS-1:0] done_pend_slot;
+    VX_priority_encoder #(
+        .N (NUM_CTA_SLOTS)
+    ) done_pend_enc (
+        .data_in   (done_pend_r),
+        `UNUSED_PIN (onehot_out),
+        .index_out (done_pend_slot),
+        .valid_out (cta_done_valid)
+    );
+
+    assign cta_done_data.core    = DLMEM_CORE_W'(MY_CORE);
+    assign cta_done_data.slot    = done_pend_slot;
+    assign cta_done_data.gang_id = gang_r[done_pend_slot];
+    assign cta_done_data.epoch   = gepoch_r[done_pend_slot];
+
+    wire cta_done_fire = cta_done_valid && cta_done_ready;
+
+    always @(posedge clk) begin
+        if (reset) begin
+            evt_r         <= '0;
+            done_pend_r   <= '0;
+            legacy_base_r <= '0;
+        end else begin
+            if (cta_done_fire) begin
+                done_pend_r[done_pend_slot] <= 1'b0;
+            end
+            if (cta_done && evt_r[done_slot_r_dly]) begin
+                done_pend_r[done_slot_r_dly] <= 1'b1;
+            end
+            if (admit_fire) begin
+                evt_r[base_slot] <= is_pinned;
+                if (~is_pinned && is_first_of_cluster) begin
+                    legacy_base_r <= base_slot;
+                end
+            end
+        end
+        if (admit_fire) begin
+            gang_r[base_slot]   <= kmu_req.args.compute.dlmem.gang_id;
+            gepoch_r[base_slot] <= kmu_req.args.compute.dlmem.epoch;
+        end
+    end
+
+    // A same-core cluster's row: its members hold consecutive slots of this
+    // core, so it spans the clamped window and never names a slot past it.
+    wire [DLMEM_K_W-1:0]      legacy_k     = (32'(cluster_k) > MAXC) ? DLMEM_K_W'(MAXC) : DLMEM_K_W'(cluster_k);
+    wire [CS_BITS-1:0]        legacy_base  = is_first_of_cluster ? base_slot : legacy_base_r;
+    dlmem_row_t legacy_row;
+    always @(*) begin
+        legacy_row   = '0;
+        legacy_row.k = legacy_k;
+        for (integer r = 0; r < MAXC; ++r) begin
+            if (DLMEM_K_W'(r) < legacy_k) begin
+                legacy_row.peers[r].core = DLMEM_CORE_W'(MY_CORE);
+                legacy_row.peers[r].slot = legacy_base + NW_WIDTH'(r);
+            end
+        end
+    end
+
+    reg                 peer_wr_valid_r;
+    reg [CS_BITS-1:0]   peer_wr_slot_r;
+    dlmem_row_t         peer_wr_row_r;
+    reg [LMEM_LOG:0]    peer_wr_stride_r;
+
+    always @(posedge clk) begin
+        if (reset) begin
+            peer_wr_valid_r <= 1'b0;
+        end else begin
+            peer_wr_valid_r <= admit_fire;
+        end
+        if (admit_fire) begin
+            peer_wr_slot_r   <= base_slot;
+            peer_wr_row_r    <= is_pinned ? kmu_req.args.compute.dlmem.row : legacy_row;
+            peer_wr_stride_r <= stride;
+        end
+    end
+
+    assign peer_wr_valid  = peer_wr_valid_r;
+    assign peer_wr_slot   = peer_wr_slot_r;
+    assign peer_wr_row    = peer_wr_row_r;
+    assign peer_wr_stride = peer_wr_stride_r;
+`endif
 
     // -------------------------------------------------------------------------
     // CTA context storage + per-thread coordinate expansion

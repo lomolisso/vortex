@@ -13,6 +13,7 @@
 
 #pragma once
 
+#include <deque>
 #include <vector>
 #include "types.h"
 
@@ -20,6 +21,15 @@ namespace vortex {
 
 class Core;
 class Scheduler;
+
+#ifdef VX_CFG_EXT_DLMEM_ENABLE
+struct CtaDone;
+
+// GbarArrive kinds, the GBAR_KIND_* of VX_gpu_pkg.
+constexpr uint32_t GBAR_KIND_BAR      = 0;
+constexpr uint32_t GBAR_KIND_CTA_DONE = 1;
+constexpr uint32_t GBAR_KIND_CBAR     = 2;
+#endif
 
 // Owns per-warp barrier state; resumes waiting warps via the parent Scheduler;
 // participates in cross-core global barriers via Socket.
@@ -34,9 +44,17 @@ public:
   void global_resume(uint32_t bar_id);
   void event_attach(uint32_t bar_id, uint32_t count = 1);
   void event_release(uint32_t bar_id);
+#ifdef VX_CFG_EXT_DLMEM_ENABLE
+  // Sends a SPREAD block's done event to the cluster's gang unit, through the
+  // same request queue the global barrier arrivals use.
+  void send_cta_done(const CtaDone& done);
+#endif
 
 protected:
   void on_reset();
+#ifdef VX_CFG_EXT_DLMEM_ENABLE
+  void on_tick();
+#endif
 
 private:
   // RTL holds completed global arrivals in a depth-VX_CFG_NUM_BARRIERS queue
@@ -45,6 +63,21 @@ private:
   uint64_t gbar_send_next_;
 
   void gbar_send(uint32_t bar_id, uint32_t count);
+
+#ifdef VX_CFG_EXT_DLMEM_ENABLE
+  // A done event enters the RTL queue only cycles after the warp exit, and a
+  // barrier arrival in between enters first, so its departure is booked only
+  // once its push cycle has passed.
+  struct PendingDone {
+    uint64_t push;
+    uint32_t slot;
+    uint32_t gang_id;
+    uint32_t epoch;
+  };
+  std::deque<PendingDone> done_q_;
+
+  void book_dones(uint64_t now);
+#endif
 
   Core*       core_;
   Scheduler*  scheduler_;

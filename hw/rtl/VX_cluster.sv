@@ -103,6 +103,9 @@ module VX_cluster import VX_gpu_pkg::*, VX_tlb_pkg::*;
     assign kmu_arb_in_if[0].kind  = kmu_bus_if[0].kind;
     assign kmu_arb_in_if[0].eop   = kmu_bus_if[0].eop;
     assign kmu_arb_in_if[0].dest  = kmu_bus_if[0].dest;
+`ifdef VX_CFG_EXT_DLMEM_ENABLE
+    assign kmu_arb_in_if[0].pin   = kmu_bus_if[0].pin;
+`endif
     assign kmu_bus_if[0].ready    = kmu_arb_in_if[0].ready;
 
     assign kmu_arb_in_if[1].valid = raster_kmu_bus_if[0].valid;
@@ -110,6 +113,9 @@ module VX_cluster import VX_gpu_pkg::*, VX_tlb_pkg::*;
     assign kmu_arb_in_if[1].kind  = raster_kmu_bus_if[0].kind;
     assign kmu_arb_in_if[1].eop   = raster_kmu_bus_if[0].eop;
     assign kmu_arb_in_if[1].dest  = raster_kmu_bus_if[0].dest;
+`ifdef VX_CFG_EXT_DLMEM_ENABLE
+    assign kmu_arb_in_if[1].pin   = raster_kmu_bus_if[0].pin;
+`endif
     assign raster_kmu_bus_if[0].ready = kmu_arb_in_if[1].ready;
 
     // Merge {compute, raster} onto one launch stream (fan-in message lock), then
@@ -140,6 +146,39 @@ module VX_cluster import VX_gpu_pkg::*, VX_tlb_pkg::*;
         .clk        (clk),
         .reset      (reset),
         .bus_in_if  (cluster_merged_kmu_if),
+        .bus_out_if (per_socket_kmu_bus_if)
+    );
+`elsif VX_CFG_EXT_DLMEM_ENABLE
+    // Gang admission sits between the cluster's launch input and its socket
+    // distributor: a SPREAD cluster leaves it as pinned beats, routed by `dest`.
+    VX_kmu_bus_if    gang_kmu_bus_if[1]();
+    wire             gang_busy;
+    wire             gang_done_valid;
+    dlmem_cta_done_t gang_done_data;
+
+    VX_cta_gang #(
+        .INSTANCE_ID (`SFORMATF(("%s-cta_gang", INSTANCE_ID))),
+        .CLUSTER_ID  (CLUSTER_ID),
+        .OUT_BUF     (3)
+    ) cta_gang (
+        .clk        (clk),
+        .reset      (reset),
+        .bus_in_if  (kmu_bus_if[0]),
+        .bus_out_if (gang_kmu_bus_if[0]),
+        .done_valid (gang_done_valid),
+        .done_data  (gang_done_data),
+        .busy       (gang_busy)
+    );
+
+    VX_kmu_bus_arb #(
+        .NUM_INPUTS (1),
+        .NUM_OUTPUTS (NUM_SOCKETS),
+        .DEST_LSB   (KMU_DEST_LSB_CLUSTER),
+        .OUT_BUF    ((NUM_SOCKETS > 1) ? 3 : 0)
+    ) kmu_arb (
+        .clk        (clk),
+        .reset      (reset),
+        .bus_in_if  (gang_kmu_bus_if),
         .bus_out_if (per_socket_kmu_bus_if)
     );
 `else
@@ -176,6 +215,10 @@ module VX_cluster import VX_gpu_pkg::*, VX_tlb_pkg::*;
         .clk         (clk),
         .reset       (reset),
         .gbar_bus_if (gbar_bus_if)
+    `ifdef VX_CFG_EXT_DLMEM_ENABLE
+        , .done_valid (gang_done_valid)
+        , .done_data  (gang_done_data)
+    `endif
     );
 
     // L2 input buses (socket ports + cluster-resident gfx cache ports)
@@ -483,6 +526,9 @@ module VX_cluster import VX_gpu_pkg::*, VX_tlb_pkg::*;
     // The merge->distribute link is a registered cluster-internal launch bus; a beat
     // resident in it is covered here just like the input and per-socket links.
     wire launch_link_busy = kmu_bus_if[0].valid | cluster_merged_kmu_if[0].valid | (|per_socket_kmu_valid);
+`elsif VX_CFG_EXT_DLMEM_ENABLE
+    // the gang's output link is a registered cluster-internal launch bus too
+    wire launch_link_busy = kmu_bus_if[0].valid | gang_kmu_bus_if[0].valid | (|per_socket_kmu_valid);
 `else
     wire launch_link_busy = kmu_bus_if[0].valid | (|per_socket_kmu_valid);
 `endif
@@ -493,6 +539,11 @@ module VX_cluster import VX_gpu_pkg::*, VX_tlb_pkg::*;
 `else
     `BUFFER_EX(busy_r, dcr_bus_if.req_valid | (|per_socket_busy) | mmu_busy, 1'b1, 1, (NUM_SOCKETS > 1));
 `endif
+`ifdef VX_CFG_EXT_DLMEM_ENABLE
+    // The gang stays busy until every placed block has reported done.
+    assign busy = busy_r | dcr_bus_if.req_valid | launch_link_busy | gang_busy;
+`else
     assign busy = busy_r | dcr_bus_if.req_valid | launch_link_busy;
+`endif
 
 endmodule

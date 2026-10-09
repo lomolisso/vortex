@@ -1143,6 +1143,12 @@ struct LsuReq {
   uint32_t cid;
   uint32_t wid;
   uint64_t uuid;
+#ifdef VX_CFG_EXT_DLMEM_ENABLE
+  uint32_t cta_id;                   // selects the issuing CTA's peer row
+  BitVector<> dlmem_remote;          // per lane, set by the aperture translation
+  BitVector<> dlmem_oob;
+  std::vector<uint32_t> dlmem_core;  // target core of a remote lane
+#endif
 
   LsuReq(uint32_t size)
     : op(MemOp::LD)
@@ -1157,6 +1163,12 @@ struct LsuReq {
     , cid(0)
     , wid(0)
     , uuid(0)
+#ifdef VX_CFG_EXT_DLMEM_ENABLE
+    , cta_id(0)
+    , dlmem_remote(size)
+    , dlmem_oob(size)
+    , dlmem_core(size, 0)
+#endif
   {}
 
   bool is_write() const { return memop_is_write(op); }
@@ -1179,6 +1191,14 @@ struct LsuReq {
     return os;
   }
 };
+
+#ifdef VX_CFG_EXT_DLMEM_ENABLE
+// Remote stores a request issued for one warp, counted until their acks return.
+struct WtInc {
+  uint32_t wid;
+  uint32_t cnt;
+};
+#endif
 
 ///////////////////////////////////////////////////////////////////////////////
 
@@ -2017,6 +2037,12 @@ struct GbarArrive {
   uint32_t bar_id;
   uint32_t count;
   uint32_t core_id;
+#ifdef VX_CFG_EXT_DLMEM_ENABLE
+  uint32_t kind = 0;     // GBAR_KIND_* of VX_gpu_pkg; 0 is a barrier arrival
+  uint32_t gang_id = 0;  // gang_id and epoch: valid only for a SPREAD gang of K > 1
+  uint32_t epoch = 0;
+  uint32_t slot = 0;     // CTA_DONE: the freed CTA slot
+#endif
 };
 
 struct GbarResume {

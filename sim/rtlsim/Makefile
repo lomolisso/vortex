@@ -98,6 +98,12 @@ ifneq (,$(filter -DVX_CFG_EXT_DXA_ENABLE, $(XCONFIGS)))
 	RTL_INCLUDE += -I$(RTL_DIR)/dxa
 endif
 
+# Add DLMEM extension sources
+ifneq (,$(filter -DVX_CFG_EXT_DLMEM_ENABLE, $(XCONFIGS)))
+	RTL_PKGS += $(RTL_DIR)/dlmem/VX_dlmem_pkg.sv
+	RTL_INCLUDE += -I$(RTL_DIR)/dlmem
+endif
+
 # Add TEX extension sources
 ifneq (,$(filter -DVX_CFG_EXT_TEX_ENABLE, $(XCONFIGS)))
 	RTL_PKGS += $(RTL_DIR)/tex/VX_tex_pkg.sv

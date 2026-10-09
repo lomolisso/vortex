@@ -1,8 +1,10 @@
 ROOT_DIR := $(realpath ../..)
 include $(ROOT_DIR)/config.mk
 
-# Distributed local memory units: the feature is RV64 only.
-DLMEM_UNITS := $(if $(filter 64,$(XLEN)),dlmem_noc)
+# Distributed local memory units: the feature is RV64 only. A unit is listed
+# once its directory exists, so its test can land without touching the list.
+DLMEM_UNIT_DIRS := dlmem_noc cta_gang dlmem_xlate dlmem_ep
+DLMEM_UNITS := $(if $(filter 64,$(XLEN)),$(patsubst %/Makefile,%,$(wildcard $(addsuffix /Makefile,$(DLMEM_UNIT_DIRS)))))
 
 PROJECTS := vx_malloc dxa_ooo rvc_decompress gfx_binsort gfx_tex_sw gfx_rast_sw gfx_msaa gfx_om_mrt $(DLMEM_UNITS)
 

@@ -491,6 +491,9 @@ package VX_trace_pkg;
             `VX_DCR_KMU_WARP_STEP_X:   `TRACE(level, ("WARP_STEP_X"))
             `VX_DCR_KMU_WARP_STEP_Y:   `TRACE(level, ("WARP_STEP_Y"))
             `VX_DCR_KMU_WARP_STEP_Z:   `TRACE(level, ("WARP_STEP_Z"))
+        `ifdef VX_CFG_EXT_DLMEM_ENABLE
+            `VX_DCR_KMU_CLUSTER_POLICY: `TRACE(level, ("CLUSTER_POLICY"))
+        `endif
             default:                   `TRACE(level, ("?"))
         endcase
     endtask

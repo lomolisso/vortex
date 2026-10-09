@@ -13,6 +13,12 @@ CXXFLAGS += -I$(ROOT_DIR)/sw -I$(ROOT_DIR)/hw
 
 SRCS := $(SRC_DIR)/main.cpp
 
+# The core the dispatcher sits on (DLMEM builds): its index in the hardware
+# cluster lands in the CTA_DONE events and the legacy peer rows.
+CORE_ID ?= 3
+CXXFLAGS += -DTB_CORE_ID=$(CORE_ID)
+VL_FLAGS += -DTB_CORE_ID=$(CORE_ID)
+
 DBG_TRACE_FLAGS :=
 
 RTL_PKGS := $(RTL_DIR)/VX_gpu_pkg.sv
@@ -20,6 +26,12 @@ RTL_PKGS := $(RTL_DIR)/VX_gpu_pkg.sv
 
 RTL_INCLUDE := -I$(ROOT_DIR)/sw -I$(ROOT_DIR)/hw -I$(RTL_DIR) -I$(DPI_DIR) -I$(RTL_DIR)/libs -I$(VORTEX_HOME)/hw/unittest/cta_dispatcher
 RTL_INCLUDE += -I$(RTL_DIR)/interfaces -I$(RTL_DIR)/mem -I$(RTL_DIR)/vm -I$(RTL_DIR)/fpu -I$(RTL_DIR)/core
+
+# DLMEM builds compile the hw/rtl/dlmem units and their package.
+ifneq (,$(filter -DVX_CFG_EXT_DLMEM_ENABLE,$(CONFIGS)))
+RTL_PKGS += $(RTL_DIR)/dlmem/VX_dlmem_pkg.sv
+RTL_INCLUDE += -I$(RTL_DIR)/dlmem
+endif
 
 TOP := VX_cta_dispatch_top
 

@@ -39,6 +39,16 @@ tests:
     run: "make -C hw/unittest run-cta"
     touches: [hw/rtl/core/VX_cta_dispatch.sv, hw/rtl/VX_kmu.sv, hw/rtl/VX_gpu_pkg.sv,
               hw/unittest/cta_dispatcher, hw/unittest/kmu, hw/unittest/Makefile]
+  # Distributed local memory units (RV64 only): the cluster network at every
+  # socket shape, checked packet for packet against the SimX model, then the
+  # units the later steps add.
+  - id: hw-dlmem
+    via: script
+    xlen: [64]
+    run: "make -C hw/unittest run-dlmem"
+    touches: [hw/rtl/dlmem, hw/rtl/VX_gpu_pkg.sv, hw/rtl/libs/VX_stream_xbar.sv,
+              hw/unittest/dlmem_noc, hw/unittest/Makefile, sim/simx/dlmem,
+              tests/unittest/dlmem_noc]
   # Last-level cache bank (VX_cache_top): a held fill released at every cycle
   # offset around a racing atomic, store or load (also with memory refusing
   # requests), loads replaying ahead of an atomic's writeback while responses

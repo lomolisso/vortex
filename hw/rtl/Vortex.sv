@@ -87,7 +87,13 @@ module Vortex import VX_gpu_pkg::*, VX_trace_pkg::*, VX_tlb_pkg::*; (
           dlmem_reject((`VX_CFG_DLMEM_MAX_CLUSTER < 1) || (`VX_CFG_DLMEM_MAX_CLUSTER > `VX_CFG_NUM_CORES),
                        "DLMEM_MAX_CLUSTER must be between 1 and the cores of a cluster")
         + dlmem_reject(`VX_CFG_SOCKET_SIZE > `VX_CFG_NUM_CORES, "DLMEM requires SOCKET_SIZE <= NUM_CORES")
-        + dlmem_reject(`VX_CFG_LMEM_LOG_SIZE > 18, "DLMEM requires a local memory of at most 256 KB");
+        + dlmem_reject(`VX_CFG_LMEM_LOG_SIZE > 18, "DLMEM requires a local memory of at most 256 KB")
+        + dlmem_reject((`VX_CFG_NUM_CORES % `VX_CFG_SOCKET_SIZE) != 0,
+                       "DLMEM requires NUM_CORES to be a multiple of SOCKET_SIZE")
+        // a pinned launch names its core field by field: cluster, socket, core in socket
+        + dlmem_reject((((((`VX_CFG_NUM_CLUSTERS - 1) << KMU_DEST_LSB_DEVICE) | ((NUM_SOCKETS - 1) << KMU_DEST_LSB_CLUSTER)
+                         | (`VX_CFG_SOCKET_SIZE - 1)) >> KMU_DEST_W) != 0),
+                       "DLMEM requires the launch dest field to name every core of every cluster");
     `UNUSED_PARAM (DLMEM_CFG_CHECKED)
 `endif
 `endif

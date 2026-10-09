@@ -155,6 +155,9 @@ module VX_raster_launch import VX_gpu_pkg::*, VX_raster_pkg::*; #(
     assign kmu_bus_if.eop   = 1'b1;
     assign kmu_bus_if.dest  = KMU_DEST_W'(owner_r);
     assign kmu_bus_if.data  = KMU_DATAW'(frag_req);
+`ifdef VX_CFG_EXT_DLMEM_ENABLE
+    assign kmu_bus_if.pin   = 1'b0;
+`endif
 
     wire out_fire = kmu_bus_if.valid && kmu_bus_if.ready;
 

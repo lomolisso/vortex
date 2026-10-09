@@ -68,6 +68,7 @@ Illegal combinations stop the build in the RTL (`` `error`` or an elaboration
 - `DLMEM does not support the raster extension`
 - `DLMEM_MAX_CLUSTER must be between 1 and the cores of a cluster`
 - `DLMEM requires SOCKET_SIZE <= NUM_CORES`
+- `DLMEM requires NUM_CORES to be a multiple of SOCKET_SIZE`
 - `DLMEM requires a local memory of at most 256 KB`
 
 With the knob off, RTL and SimX behaviour and cycles are unchanged.
@@ -76,21 +77,48 @@ With the knob off, RTL and SimX behaviour and cycles are unchanged.
 
 - **Opt-in per launch.** `vx_launch_info_t.cluster_policy` is
   `VX_CLUSTER_POLICY_DEFAULT` (today's same-core clusters) or
-  `VX_CLUSTER_POLICY_SPREAD` (CUDA's spread policy), written to the KMU
-  through `VX_DCR_KMU_CLUSTER_POLICY`. `struct_size` versioning keeps old
-  clients working.
+  `VX_CLUSTER_POLICY_SPREAD` (CUDA's spread policy). The runtime writes it to
+  `VX_DCR_KMU_CLUSTER_POLICY` (`0x024`; `VX_DCR_KMU_STATE_END` moves to
+  `0x025`) on a DLMEM device only, also in the QMD. A `reserved0` word in
+  front of the field grows the struct from 88 to 96 bytes, so `struct_size`
+  tells the versions apart: an 88-byte caller (prebuilt POCL or Mesa) gets
+  DEFAULT.
+- **The gang unit.** `VX_cta_gang`, one per hardware cluster in front of its
+  socket distributor (SimX: `CtaGang`), mirrors every core's free slots and
+  reserved warps for SPREAD blocks. It places a SPREAD cluster in K cycles,
+  then sends K beats pinned to their cores, each carrying the forced slot,
+  the gang id and the cluster's peer row. Design:
+  [cta_dispatch_architecture.md §4.6](../designs/cta_dispatch_architecture.md).
 - **All or nothing.** A gang is admitted only when all K blocks fit; a
   partial gang could deadlock on its own cluster barrier.
 - **Spread first.** Blocks go to distinct cores of one hardware cluster. Two
   blocks of a gang share a core only when that is the only room, and a core
   may host blocks of several gangs.
-- **Limits.** K ≤ `DLMEM_MAX_CLUSTER` and K fits the hardware cluster,
-  otherwise the launch fails with `VX_ERR_INVALID_VALUE`. A same-core
-  cluster must fit one core (K × warps per block ≤ `NUM_WARPS`) and fails
-  the same way.
-- **Freeing.** Slots free per block. A gang id is recycled only after all K
-  blocks are done. As in CUDA, a block must not be accessed after it exits,
-  so a cluster syncs before its blocks exit.
+- **Limits.** SPREAD on a device without `VX_ISA_EXT_DLMEM` fails with
+  `VX_ERR_NOT_SUPPORTED` (CUDA's `cudaErrorNotSupported`). These fail with
+  `VX_ERR_INVALID_VALUE`: a policy above SPREAD; SPREAD with K above
+  `DLMEM_MAX_CLUSTER` or more than the hardware cluster's cores can hold;
+  and, on a DLMEM device, any cluster larger than
+  `max(NUM_WARPS, DLMEM_MAX_CLUSTER)`, the range of the KMU's rank counter.
+  An empty hardware cluster always holds a valid gang, since
+  K ≤ `DLMEM_MAX_CLUSTER` ≤ its cores.
+- **Same-core clusters** keep today's admission and get no gang id and no
+  done events; their cluster barrier completes inside the core. A DLMEM
+  launch with DEFAULT therefore stays as close as possible to a build
+  without DLMEM.
+- **Freeing.** Slots free per block: a block's done event travels through
+  the global-barrier path to the gang unit. A gang id is recycled only after
+  all K blocks are done, and its epoch bit flips on every allocation, so a
+  late event cannot match a reused id. As in CUDA, a block must not be
+  accessed after it exits, so a cluster syncs before its blocks exit.
+- **One launch at a time.** The command processor drains a launch before the
+  next starts, and the gang unit keeps the device busy until its mirror is
+  empty, so every launch starts with an empty mirror, its round-robin
+  pointer and epochs reset.
+- **Head-of-line blocking.** A SPREAD cluster that does not fit holds the
+  device's launch stream (the device distributor's message lock and skid sit
+  behind it) until enough blocks finish. It is correct but not what CUDA
+  does (a later cluster that fits would go first); accepted for Feature 1.
 
 ## Memory-model contract
 
@@ -121,12 +149,6 @@ RV32; `EXT_RASTER`; DXA multicast into a spread gang (until DXA × DLMEM).
 
 ## Open items
 
-- **Cluster-size check.** The runtime rejects a grid that is not a multiple
-  of the cluster, but not a cluster too large. The RTL sizes the rank and
-  cluster size for `max(NUM_WARPS, DLMEM_MAX_CLUSTER)` and wraps above it,
-  while SimX does not, so such a launch reads different ranks on the two
-  models. Step 3's launch validation (`queue.cpp`) adds the limits above,
-  with a negative app case.
 - **Parity on wider shapes.** SimX and the RTL already disagree with the
   knob off, at XLEN 64 before DLMEM: 2 cores with an L2 on clustered
   launches (`multikernel -c`: 5907 SimX vs 5371 RTL cycles, 10%) and 8 warps

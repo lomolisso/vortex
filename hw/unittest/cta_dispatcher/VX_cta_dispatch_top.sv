@@ -13,6 +13,10 @@
 
 `include "VX_define.vh"
 
+`ifndef TB_CORE_ID
+`define TB_CORE_ID 0
+`endif
+
 module VX_cta_dispatch_top import VX_gpu_pkg::*;
 (
     input wire                          clk,
@@ -44,6 +48,15 @@ module VX_cta_dispatch_top import VX_gpu_pkg::*;
     input  wire [31:0]                  in_cluster_rank,
 `endif
     input  wire                         in_is_first,
+`ifdef VX_CFG_EXT_DLMEM_ENABLE
+    // the gang unit's placement fields of a pinned (SPREAD) beat
+    input  wire                         in_policy,
+    input  wire                         in_pin,
+    input  wire [NW_WIDTH-1:0]          in_forced_slot,
+    input  wire [GANG_ID_W-1:0]         in_gang_id,
+    input  wire                         in_epoch,
+    input  wire [$bits(dlmem_row_t)-1:0] in_row,
+`endif
 
     input  wire [`VX_CFG_NUM_WARPS-1:0]        active_warps,
     input  wire                         warp_done,
@@ -64,6 +77,23 @@ module VX_cta_dispatch_top import VX_gpu_pkg::*;
     output wire [31:0]                  rd_cluster_size,
 `ifdef VX_CFG_EXT_DLMEM_ENABLE
     output wire [31:0]                  rd_cluster_rank,
+    output wire [`VX_CFG_MEM_ADDR_WIDTH-1:0] rd_lmem_addr,
+
+    // CTA_DONE events
+    output wire                         cta_done_valid,
+    input  wire                         cta_done_ready,
+    output wire [DLMEM_CORE_W-1:0]      cta_done_core,
+    output wire [NW_WIDTH-1:0]          cta_done_slot,
+    output wire [GANG_ID_W-1:0]         cta_done_gang,
+    output wire                         cta_done_epoch,
+
+    // peer-row writes
+    output wire                         peer_wr_valid,
+    output wire [NW_WIDTH-1:0]          peer_wr_slot,
+    output wire [$bits(dlmem_row_t)-1:0] peer_wr_row,
+    output wire [`VX_CFG_LMEM_LOG_SIZE:0] peer_wr_stride,
+
+    output wire                         busy_out,
 `endif
     output wire [31:0]                  rd_cta_id
 );
@@ -110,6 +140,13 @@ module VX_cta_dispatch_top import VX_gpu_pkg::*;
         kmu_req.args.compute.cluster_size = (NW_WIDTH+1)'(in_cluster_size);
     `endif
         kmu_req.args.compute.is_first_of_cluster = in_is_first;
+    `ifdef VX_CFG_EXT_DLMEM_ENABLE
+        kmu_req.args.compute.dlmem.policy      = in_policy;
+        kmu_req.args.compute.dlmem.forced_slot = in_forced_slot;
+        kmu_req.args.compute.dlmem.gang_id     = in_gang_id;
+        kmu_req.args.compute.dlmem.epoch       = in_epoch;
+        kmu_req.args.compute.dlmem.row         = dlmem_row_t'(in_row);
+    `endif
     end
     `UNUSED_VAR (in_cluster_size)
 `ifdef VX_CFG_EXT_DLMEM_ENABLE
@@ -121,6 +158,9 @@ module VX_cta_dispatch_top import VX_gpu_pkg::*;
     assign kmu_bus.eop   = 1'b1;
     assign kmu_bus.dest  = '0;
     assign kmu_bus.data  = kmu_req;
+`ifdef VX_CFG_EXT_DLMEM_ENABLE
+    assign kmu_bus.pin   = in_pin;
+`endif
     assign task_in_ready = kmu_bus.ready;
     `UNUSED_VAR (in_cta_id)
 
@@ -137,6 +177,8 @@ module VX_cta_dispatch_top import VX_gpu_pkg::*;
     assign rd_cluster_size = cta_rd_csrs.cluster_size;
 `ifdef VX_CFG_EXT_DLMEM_ENABLE
     assign rd_cluster_rank = 32'(cta_rd_csrs.cluster_rank);
+    assign rd_lmem_addr    = cta_rd_csrs.lmem_addr;
+    assign busy_out        = busy;
 `endif
     assign rd_cta_id       = 32'(cta_rd_csrs.cta_id);
 
@@ -144,11 +186,28 @@ module VX_cta_dispatch_top import VX_gpu_pkg::*;
     `UNUSED_VAR (cta_tmask)
     `UNUSED_VAR (cta_param)
     `UNUSED_VAR (cta_init)
+`ifndef VX_CFG_EXT_DLMEM_ENABLE
     `UNUSED_VAR (busy)
+`endif
     `UNUSED_VAR (cta_rd_csrs)
     `UNUSED_VAR (cta_rd_lane)
 
-    VX_cta_dispatch cta_dispatch (
+`ifdef VX_CFG_EXT_DLMEM_ENABLE
+    dlmem_cta_done_t cta_done_data;
+    dlmem_row_t      peer_wr_row_s;
+    assign cta_done_core  = cta_done_data.core;
+    assign cta_done_slot  = cta_done_data.slot;
+    assign cta_done_gang  = cta_done_data.gang_id;
+    assign cta_done_epoch = cta_done_data.epoch;
+    assign peer_wr_row    = peer_wr_row_s;
+`endif
+
+    VX_cta_dispatch #(
+        .INSTANCE_ID ("cta_dispatch")
+    `ifdef VX_CFG_EXT_DLMEM_ENABLE
+        , .CORE_ID   (`TB_CORE_ID)
+    `endif
+    ) cta_dispatch (
         .clk           (clk),
         .reset         (reset),
         .kmu_bus_if    (kmu_bus),
@@ -167,6 +226,15 @@ module VX_cta_dispatch_top import VX_gpu_pkg::*;
         .cta_rd_lane   (cta_rd_lane),
         .schedule_wid  (schedule_wid),
         .schedule_cta_id (schedule_cta_id),
+    `ifdef VX_CFG_EXT_DLMEM_ENABLE
+        .cta_done_valid (cta_done_valid),
+        .cta_done_data  (cta_done_data),
+        .cta_done_ready (cta_done_ready),
+        .peer_wr_valid  (peer_wr_valid),
+        .peer_wr_slot   (peer_wr_slot),
+        .peer_wr_row    (peer_wr_row_s),
+        .peer_wr_stride (peer_wr_stride),
+    `endif
         .busy          (busy)
     );
 

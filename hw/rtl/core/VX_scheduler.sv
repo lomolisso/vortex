@@ -42,6 +42,14 @@ module VX_scheduler import VX_gpu_pkg::*; #(
     VX_sched_csr_if.master  sched_csr_if,
     VX_gbar_bus_if.master   gbar_bus_if,
 
+`ifdef VX_CFG_EXT_DLMEM_ENABLE
+    // the peer row of every admitted block, for the aperture table
+    output wire             peer_wr_valid,
+    output wire [NW_WIDTH-1:0] peer_wr_slot,
+    output dlmem_row_t      peer_wr_row,
+    output wire [`VX_CFG_LMEM_LOG_SIZE:0] peer_wr_stride,
+`endif
+
     // status
     output wire             busy
 );
@@ -83,8 +91,18 @@ module VX_scheduler import VX_gpu_pkg::*; #(
     // Warp retirement: TMC with tmask==0 permanently deactivates the warp
     wire cta_warp_done = warp_ctl_if.tmc_valid && (warp_ctl_if.tmc.tmask == 0);
 
+`ifdef VX_CFG_EXT_DLMEM_ENABLE
+    // CTA_DONE events, from the dispatcher to the barrier unit's request queue
+    wire             cta_done_valid;
+    dlmem_cta_done_t cta_done_data;
+    wire             cta_done_ready;
+`endif
+
     VX_cta_dispatch #(
         .INSTANCE_ID (`SFORMATF(("%s-cta_dispatch", INSTANCE_ID)))
+    `ifdef VX_CFG_EXT_DLMEM_ENABLE
+        , .CORE_ID   (CORE_ID)
+    `endif
     ) cta_dispatcher (
         .clk        (clk),
         .reset      (reset),
@@ -104,6 +122,15 @@ module VX_scheduler import VX_gpu_pkg::*; #(
         .cta_rd_lane(cta_rd_lane),
         .schedule_wid(schedule_wid),
         .schedule_cta_id(schedule_cta_id),
+    `ifdef VX_CFG_EXT_DLMEM_ENABLE
+        .cta_done_valid (cta_done_valid),
+        .cta_done_data  (cta_done_data),
+        .cta_done_ready (cta_done_ready),
+        .peer_wr_valid  (peer_wr_valid),
+        .peer_wr_slot   (peer_wr_slot),
+        .peer_wr_row    (peer_wr_row),
+        .peer_wr_stride (peer_wr_stride),
+    `endif
         .busy       (cta_dispatcher_busy)
     );
 
@@ -391,6 +418,11 @@ module VX_scheduler import VX_gpu_pkg::*; #(
         .read_phase (warp_ctl_if.bar_phase),
         .active_warps(active_warps),
         .gbar_bus_if(gbar_bus_if),
+    `ifdef VX_CFG_EXT_DLMEM_ENABLE
+        .cta_done_valid (cta_done_valid),
+        .cta_done_data  (cta_done_data),
+        .cta_done_ready (cta_done_ready),
+    `endif
         .unlock_valid(bar_unlock_valid),
         .unlock_mask(bar_unlock_mask)
     );

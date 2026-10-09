@@ -162,16 +162,17 @@
 
   <rect x="804" y="136" width="330" height="256" rx="5" class="kmu"/>
   <text x="816" y="156" class="cm">STARTUP_ADDR0/1   0x010  program image PC</text>
-  <text x="816" y="176" class="cm">KERNEL_ENTRY0/1   0x012  kernel entry PC</text>
-  <text x="816" y="196" class="cm">STARTUP_ARG0/1    0x014  kargs pointer</text>
-  <text x="816" y="216" class="cm">BLOCK_DIM_X/Y/Z   0x016  threads per CTA axis</text>
-  <text x="816" y="236" class="cm">GRID_DIM_X/Y/Z    0x019  CTAs per grid axis</text>
-  <text x="816" y="256" class="cm">LMEM_SIZE         0x01C  per-CTA LMEM bytes</text>
-  <text x="816" y="276" class="cm">BLOCK_SIZE        0x01D  total threads per CTA</text>
-  <text x="816" y="296" class="cm">WARP_STEP_X/Y/Z   0x01E  thread-index delta</text>
-  <text x="816" y="316" class="cm">CLUSTER_DIM_X/Y/Z 0x021  cluster shape</text>
+  <text x="816" y="174" class="cm">KERNEL_ENTRY0/1   0x012  kernel entry PC</text>
+  <text x="816" y="192" class="cm">STARTUP_ARG0/1    0x014  kargs pointer</text>
+  <text x="816" y="210" class="cm">BLOCK_DIM_X/Y/Z   0x016  threads per CTA axis</text>
+  <text x="816" y="228" class="cm">GRID_DIM_X/Y/Z    0x019  CTAs per grid axis</text>
+  <text x="816" y="246" class="cm">LMEM_SIZE         0x01C  per-CTA LMEM bytes</text>
+  <text x="816" y="264" class="cm">BLOCK_SIZE        0x01D  total threads per CTA</text>
+  <text x="816" y="282" class="cm">WARP_STEP_X/Y/Z   0x01E  thread-index delta</text>
+  <text x="816" y="300" class="cm">CLUSTER_DIM_X/Y/Z 0x021  cluster shape</text>
+  <text x="816" y="318" class="cm">CLUSTER_POLICY    0x024  DEFAULT / SPREAD (DLMEM)</text>
   <text x="816" y="342" class="tt">VX_DCR_KMU_STATE_BEGIN = 0x010</text>
-  <text x="816" y="358" class="tt">VX_DCR_KMU_STATE_END   = 0x024</text>
+  <text x="816" y="358" class="tt">VX_DCR_KMU_STATE_END   = 0x025</text>
   <text x="816" y="380" class="tt">CLUSTER_DIM is internal-only: not a CSR, not on the bus.</text>
 
   <rect x="1146" y="136" width="316" height="118" rx="5" class="arb"/>

@@ -28,6 +28,10 @@
 #include "raster_unit.h"
 #include "sfu_unit.h"
 #endif
+#ifdef VX_CFG_EXT_DLMEM_ENABLE
+#include "scheduler.h"
+#include "cta_gang.h"
+#endif
 
 using namespace vortex;
 
@@ -62,6 +66,33 @@ public:
         simobject_->gbar_resume_out.at(i * cores_per_socket_ + c).bind(&core->gbar_resume_in);
       }
     }
+
+#ifdef VX_CFG_EXT_DLMEM_ENABLE
+    // Gang unit on the cluster's launch input. Its per-core lanes are the
+    // KMU's launch-lane pattern: a registered stage into the core's domain,
+    // and the admission credits back through a stage the core owns.
+    snprintf(sname, 100, "%s-cta-gang", name.c_str());
+    cta_gang_ = CtaGang::Create(sname, dlmem_cfg());
+    for (uint32_t i = 0; i < sockets_per_cluster; ++i) {
+      for (uint32_t c = 0; c < cores_per_socket_; ++c) {
+        uint32_t lane = i * cores_per_socket_ + c;
+        auto* core = sockets_.at(i)->core(c).get();
+        auto* dispatcher = core->scheduler().cta_dispatcher();
+        snprintf(sname, 100, "%s-gang-lane%d", name.c_str(), lane);
+        auto slice = RegSlice<kmu_req_t>::Create(sname, 1);
+        cta_gang_->bus_out.at(lane).bind(&slice->In);
+        slice->Out.bind(&dispatcher->bus_in);
+        snprintf(sname, 100, "%s-gang-credit%d", name.c_str(), lane);
+        RegSlice<uint8_t>::Ptr cslice;
+        {
+          SimPlatform::DomainScope core_scope(core);
+          cslice = RegSlice<uint8_t>::Create(sname, 1);
+        }
+        dispatcher->credit_out.bind(&cslice->In);
+        cslice->Out.bind(&cta_gang_->credit_in.at(lane));
+      }
+    }
+#endif
 
     // Create l2cache
 
@@ -309,6 +340,11 @@ public:
       if (socket->running())
         return true;
     }
+  #ifdef VX_CFG_EXT_DLMEM_ENABLE
+    if (cta_gang_->busy()) {
+      return true;
+    }
+  #endif
   #ifdef VX_CFG_VM_ENABLE
     // A parked fill holds no channel packet while it waits, so completion
     // must ask the TLB directly. (The device walker is the processor's.)
@@ -356,6 +392,21 @@ public:
       gbar.mask.reset();
     }
   }
+
+#ifdef VX_CFG_EXT_DLMEM_ENABLE
+  void cta_done(const GbarArrive& msg) {
+    uint32_t cores_per_cluster = sockets_.size() * cores_per_socket_;
+    cta_gang_->cta_done(msg.core_id % cores_per_cluster, msg.slot, msg.gang_id, msg.epoch);
+  }
+
+  SimChannel<kmu_req_t>& kmu_bus_in() {
+    return cta_gang_->bus_in;
+  }
+
+  SimChannel<uint8_t>& kmu_credit_out() {
+    return cta_gang_->credit_out;
+  }
+#endif
 
   Cluster::PerfStats perf_stats() const {
     Cluster::PerfStats perf_stats;
@@ -570,6 +621,9 @@ private:
 #ifdef VX_CFG_VM_ENABLE
   L2Tlb::Ptr                  l2tlb_;
 #endif
+#ifdef VX_CFG_EXT_DLMEM_ENABLE
+  CtaGang::Ptr                cta_gang_;
+#endif
 #ifdef VX_CFG_EXT_OM_ENABLE
   OmCore::Ptr                 om_core_;
   Cache::Ptr                  ocache_;
@@ -619,6 +673,12 @@ int Cluster::get_exitcode() const {
 }
 
 void Cluster::on_gbar_arrive(const GbarArrive& msg) {
+#ifdef VX_CFG_EXT_DLMEM_ENABLE
+  if (msg.kind == GBAR_KIND_CTA_DONE) {
+    impl_->cta_done(msg);
+    return;
+  }
+#endif
   impl_->global_barrier_arrive(msg.bar_id, msg.count, msg.core_id);
 }
 
@@ -655,6 +715,16 @@ int Cluster::dcr_write(uint32_t addr, uint32_t value) {
 int Cluster::dcr_read(uint32_t addr, uint32_t tag, uint32_t* value) {
   return impl_->dcr_read(addr, tag, value);
 }
+
+#ifdef VX_CFG_EXT_DLMEM_ENABLE
+SimChannel<kmu_req_t>& Cluster::kmu_bus_in() {
+  return impl_->kmu_bus_in();
+}
+
+SimChannel<uint8_t>& Cluster::kmu_credit_out() {
+  return impl_->kmu_credit_out();
+}
+#endif
 
 Core* Cluster::get_core(uint32_t idx) const {
   return impl_->get_core(idx);

@@ -69,6 +69,11 @@ ifneq ($(filter -DVX_CFG_EXT_DXA_ENABLE, $(XCONFIGS)),)
 	SRCS += $(SRC_DIR)/dxa/dxa_unit.cpp
 endif
 
+# Add DLMEM extension sources; the gang unit joins once its source exists.
+ifneq ($(filter -DVX_CFG_EXT_DLMEM_ENABLE, $(XCONFIGS)),)
+	SRCS += $(wildcard $(SRC_DIR)/kmu/cta_gang.cpp)
+endif
+
 # Graphics SW helpers (TextureSampler / DepthTencil / Blender / Rasterizer).
 # Added once if any of TEX/OM/RASTER is enabled.
 ifneq ($(or $(filter -DVX_CFG_EXT_TEX_ENABLE, $(XCONFIGS)),$(filter -DVX_CFG_EXT_OM_ENABLE, $(XCONFIGS)),$(filter -DVX_CFG_EXT_RASTER_ENABLE, $(XCONFIGS))),)
@@ -151,8 +156,26 @@ DLMEM_NOC_OBJS     := $(patsubst $(SRC_DIR)/%.cpp,$(OBJ_DIR)/%.o,$(DLMEM_NOC_SRC
 DLMEM_NOC_TEST_OBJ := $(OBJ_DIR)/tests/dlmem_noc_test.o
 DLMEM_NOC_TEST     := $(DESTDIR)/dlmem_noc_test
 
+# The gang unit test links libsimx, which carries the gang in DLMEM builds.
+CTA_GANG_TEST_OBJ := $(OBJ_DIR)/tests/cta_gang_test.o
+CTA_GANG_TEST     := $(DESTDIR)/cta_gang_test
+
+# The DLMEM translation and endpoints link into their unit tests, outside libsimx.
+DLMEM_XLATE_SRCS     := $(SRC_DIR)/dlmem/dlmem_xlate.cpp
+DLMEM_XLATE_OBJS     := $(patsubst $(SRC_DIR)/%.cpp,$(OBJ_DIR)/%.o,$(DLMEM_XLATE_SRCS))
+DLMEM_XLATE_TEST_OBJ := $(OBJ_DIR)/tests/dlmem_xlate_test.o
+DLMEM_XLATE_TEST     := $(DESTDIR)/dlmem_xlate_test
+
+DLMEM_EP_SRCS     := $(SRC_DIR)/dlmem/dlmem_egress.cpp $(SRC_DIR)/dlmem/dlmem_ingress.cpp $(SRC_DIR)/dlmem/dlmem_wtrack.cpp $(DLMEM_NOC_SRCS)
+DLMEM_EP_OBJS     := $(patsubst $(SRC_DIR)/%.cpp,$(OBJ_DIR)/%.o,$(DLMEM_EP_SRCS))
+DLMEM_EP_TEST_OBJ := $(OBJ_DIR)/tests/dlmem_ep_test.o
+DLMEM_EP_TEST     := $(DESTDIR)/dlmem_ep_test
+
 DEPS := $(OBJS:.o=.d) $(MAIN_OBJ:.o=.d) $(DXA_OOO_TEST_OBJ:.o=.d) $(RVC_TEST_OBJ:.o=.d)
 DEPS += $(DLMEM_NOC_OBJS:.o=.d) $(DLMEM_NOC_TEST_OBJ:.o=.d)
+DEPS += $(CTA_GANG_TEST_OBJ:.o=.d)
+DEPS += $(DLMEM_XLATE_OBJS:.o=.d) $(DLMEM_XLATE_TEST_OBJ:.o=.d)
+DEPS += $(DLMEM_EP_OBJS:.o=.d) $(DLMEM_EP_TEST_OBJ:.o=.d)
 
 # generate .d files alongside .o files
 CXXFLAGS += -MMD -MP -MF $(@:.o=.d)
@@ -175,7 +198,7 @@ PROJECT := simx
 VORTEX_LIB := libvortex.so
 VORTEX_GEM5_LIB := libvortex-gem5.so
 
-.PHONY: all force test-dxa-ooo test-rvc-decompress test-dlmem-noc clean clean-lib clean-exe clean-obj libvortex clean-libvortex libvortex-gem5 clean-libvortex-gem5
+.PHONY: all force test-dxa-ooo test-rvc-decompress test-dlmem-noc test-cta-gang test-dlmem-xlate test-dlmem-ep clean clean-lib clean-exe clean-obj libvortex clean-libvortex libvortex-gem5 clean-libvortex-gem5
 
 ifeq ($(USE_SST), 1)
 all: $(DESTDIR)/$(PROJECT) $(DESTDIR)/$(VORTEX_LIB)
@@ -222,6 +245,18 @@ $(DLMEM_NOC_TEST_OBJ): $(VORTEX_HOME)/tests/unittest/dlmem_noc/main.cpp $(CONFIG
 	@mkdir -p $(@D)
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
+$(CTA_GANG_TEST_OBJ): $(VORTEX_HOME)/tests/unittest/cta_gang/main.cpp $(CONFIG_FILE)
+	@mkdir -p $(@D)
+	$(CXX) $(CXXFLAGS) -c $< -o $@
+
+$(DLMEM_XLATE_TEST_OBJ): $(VORTEX_HOME)/tests/unittest/dlmem_xlate/main.cpp $(CONFIG_FILE)
+	@mkdir -p $(@D)
+	$(CXX) $(CXXFLAGS) -c $< -o $@
+
+$(DLMEM_EP_TEST_OBJ): $(VORTEX_HOME)/tests/unittest/dlmem_ep/main.cpp $(CONFIG_FILE)
+	@mkdir -p $(@D)
+	$(CXX) $(CXXFLAGS) -c $< -o $@
+
 # Main executable
 $(DESTDIR)/$(PROJECT): $(OBJS) $(MAIN_OBJ)
 	$(CXX) $(CXXFLAGS) $^ $(LDFLAGS) -o $@
@@ -242,6 +277,24 @@ test-dlmem-noc: $(DLMEM_NOC_TEST)
 	$(DLMEM_NOC_TEST) $(DLMEM_NOC_OPTS)
 
 $(DLMEM_NOC_TEST): $(DLMEM_NOC_OBJS) $(DLMEM_NOC_TEST_OBJ)
+	$(CXX) $(CXXFLAGS) $^ $(LDFLAGS) -o $@
+
+test-cta-gang: $(CTA_GANG_TEST)
+	$(CTA_GANG_TEST) $(CTA_GANG_OPTS)
+
+$(CTA_GANG_TEST): $(OBJS) $(CTA_GANG_TEST_OBJ)
+	$(CXX) $(CXXFLAGS) $^ $(LDFLAGS) -o $@
+
+test-dlmem-xlate: $(DLMEM_XLATE_TEST)
+	$(DLMEM_XLATE_TEST) $(DLMEM_XLATE_OPTS)
+
+$(DLMEM_XLATE_TEST): $(OBJS) $(DLMEM_XLATE_OBJS) $(DLMEM_XLATE_TEST_OBJ)
+	$(CXX) $(CXXFLAGS) $^ $(LDFLAGS) -o $@
+
+test-dlmem-ep: $(DLMEM_EP_TEST)
+	$(DLMEM_EP_TEST) $(DLMEM_EP_OPTS)
+
+$(DLMEM_EP_TEST): $(OBJS) $(DLMEM_EP_OBJS) $(DLMEM_EP_TEST_OBJ)
 	$(CXX) $(CXXFLAGS) $^ $(LDFLAGS) -o $@
 
 # Shared library
@@ -288,7 +341,7 @@ clean-libvortex-gem5:
 	rm -f $(DESTDIR)/$(VORTEX_GEM5_LIB)
 
 clean-exe:
-	rm -f $(DESTDIR)/$(PROJECT) $(DXA_OOO_TEST) $(DLMEM_NOC_TEST)
+	rm -f $(DESTDIR)/$(PROJECT) $(DXA_OOO_TEST) $(DLMEM_NOC_TEST) $(CTA_GANG_TEST) $(DLMEM_XLATE_TEST) $(DLMEM_EP_TEST)
 
 clean-obj:
 	rm -rf $(OBJ_DIR)

@@ -18,9 +18,10 @@ TESTS := \
     occupancy multikernel reopen module_reload single_cta            \
     vm_test vm_fault vm_stress
 
-# Distributed local memory tests: the feature is RV64 only.
+# Distributed local memory tests: the feature is RV64 only. cta_gang builds
+# without DLMEM too, so it runs first and shares the default-config driver.
 ifeq ($(XLEN),64)
-TESTS += cluster_rank
+TESTS += cta_gang cluster_rank
 endif
 
 # --- common exclude list ---------------------------------------------

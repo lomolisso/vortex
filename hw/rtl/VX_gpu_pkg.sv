@@ -148,6 +148,24 @@ package VX_gpu_pkg;
     // Cores actually built: SOCKET_SIZE > NUM_CORES still fills a whole socket.
     localparam NUM_TOTAL_CORES = `VX_CFG_NUM_CLUSTERS * NUM_SOCKETS * `VX_CFG_SOCKET_SIZE;
 
+`ifdef VX_CFG_EXT_DLMEM_ENABLE
+    // Cores of one hardware cluster: the DLMEM network's endpoints and a gang's placement domain.
+    localparam DLMEM_NCC          = NUM_SOCKETS * `VX_CFG_SOCKET_SIZE;
+    localparam DLMEM_CORE_W       = `UP(`CLOG2(DLMEM_NCC));
+    localparam DLMEM_MAX_CLUSTER  = `VX_CFG_DLMEM_MAX_CLUSTER;
+    // The aperture decodes a power-of-two rank field: window = 2^(LMEM_LOG + RANK_BITS).
+    localparam DLMEM_RANK_BITS    = `CLOG2(DLMEM_MAX_CLUSTER);
+    localparam DLMEM_K_W          = `CLOG2(DLMEM_MAX_CLUSTER + 1);
+    // Only a gang of two or more blocks holds an id, so NCC*NW/2 ids never stall placement.
+    localparam DLMEM_NUM_GANGS    = `MAX(2, (DLMEM_NCC * `VX_CFG_NUM_WARPS) / 2);
+    localparam GANG_ID_W          = `CLOG2(DLMEM_NUM_GANGS);
+    localparam KMU_POLICY_DEFAULT = 1'b0;
+    localparam KMU_POLICY_SPREAD  = 1'b1;
+    localparam [1:0] GBAR_KIND_BAR      = 2'd0;
+    localparam [1:0] GBAR_KIND_CTA_DONE = 2'd1;
+    localparam [1:0] GBAR_KIND_CBAR     = 2'd2;
+`endif
+
     // Per-thread stack window: one stack per hardware thread below the stack base.
     localparam NUM_STACKS = NUM_TOTAL_CORES * `VX_CFG_NUM_WARPS * `VX_CFG_NUM_THREADS;
     localparam [`VX_CFG_XLEN-1:0] STACK_WINDOW_TOP    = `VX_CFG_XLEN'(`VX_MEM_STACK_BASE_ADDR);
@@ -665,7 +683,40 @@ package VX_gpu_pkg;
         logic [BAR_SIZE_W-1:0]  size_m1;
     } barrier_t;
 
+`ifdef VX_CFG_EXT_DLMEM_ENABLE
     typedef struct packed {
+        logic [DLMEM_CORE_W-1:0] core;     // core index within the hardware cluster
+        logic [NW_WIDTH-1:0]     slot;     // CTA slot on that core
+    } dlmem_peer_t;
+
+    typedef struct packed {
+        logic [DLMEM_K_W-1:0]                k;        // valid peers
+        dlmem_peer_t [DLMEM_MAX_CLUSTER-1:0] peers;    // indexed by rank
+    } dlmem_row_t;
+
+    typedef struct packed {
+        logic                    policy;       // KMU_POLICY_*
+        logic                    epoch;        // gang-id generation
+        logic [GANG_ID_W-1:0]    gang_id;      // gang_id and epoch: valid only for a SPREAD gang of K > 1
+        logic [NW_WIDTH-1:0]     forced_slot;  // SPREAD: the slot the gang reserved on its core
+        dlmem_row_t              row;          // SPREAD: the gang's peer row, the same in all K beats
+    } kmu_dlmem_t;
+
+    typedef struct packed {
+        logic [DLMEM_CORE_W-1:0] core;
+        logic [NW_WIDTH-1:0]     slot;
+        logic [GANG_ID_W-1:0]    gang_id;
+        logic                    epoch;
+    } dlmem_cta_done_t;
+`endif
+
+    typedef struct packed {
+    `ifdef VX_CFG_EXT_DLMEM_ENABLE
+        logic [1:0]           kind;     // GBAR_KIND_*
+        logic [GANG_ID_W-1:0] gang_id;  // gang_id and epoch: valid only for a SPREAD gang of K > 1
+        logic                 epoch;
+        logic [NW_WIDTH-1:0]  slot;     // CTA_DONE: the freed CTA slot
+    `endif
         logic [NB_WIDTH-1:0] id;
         logic [NC_WIDTH-1:0] size_m1;
         logic [NC_WIDTH-1:0] core_id;
@@ -738,6 +789,7 @@ package VX_gpu_pkg;
                             `ifdef VX_CFG_EXT_DLMEM_ENABLE
                                 + CLUSTER_SIZE_W          // cluster_size
                                 + RANK_W                  // cluster_rank
+                                + $bits(kmu_dlmem_t)      // dlmem
                             `else
                                 + (NW_WIDTH+1)            // cluster_size
                             `endif
@@ -761,6 +813,7 @@ package VX_gpu_pkg;
     `ifdef VX_CFG_EXT_DLMEM_ENABLE
         logic [CLUSTER_SIZE_W-1:0]     cluster_size;
         logic [RANK_W-1:0]             cluster_rank;   // block index within its cluster
+        kmu_dlmem_t                    dlmem;
     `else
         logic [NW_WIDTH:0]             cluster_size;
     `endif

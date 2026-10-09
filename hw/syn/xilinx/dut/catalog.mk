@@ -10,8 +10,8 @@
 # Add a DUT: append its name to DUTS and define the five variables. No new
 # directory, no dispatcher edit.
 
-DUTS := cache core cp dlmem dxa fpu gfx issue lmem mem_unit om raster rtu \
-        scope tcu tensor tex top unittest vm vortex
+DUTS := cache core cp cta_gang dlmem dlmem_ep dlmem_xlate dxa fpu gfx issue lmem \
+        mem_unit om raster rtu scope tcu tensor tex top unittest vm vortex
 
 # ---------------------------------------------------------------------------
 # shared include fragments
@@ -52,10 +52,26 @@ core_INC   = $(BASE_INC) -I$(RTL_DIR)/core -I$(RTL_DIR)/mem -I$(RTL_DIR)/vm -I$(
 cp_PRJ := VX_cp_core_top
 cp_INC  = $(BASE_INC) -I$(RTL_DIR)/core -I$(RTL_DIR)/mem -I$(RTL_DIR)/vm -I$(RTL_DIR)/cache -I$(RTL_DIR)/fpu -I$(RTL_DIR)/cp -I$(UNITTEST_DIR)/cp_core
 
+cta_gang_PRJ := VX_cta_gang_top
+cta_gang_CFG := -DVX_CFG_EXT_DLMEM_ENABLE -DVX_CFG_NUM_CORES=8 -DVX_CFG_SOCKET_SIZE=2 -DVX_CFG_NUM_WARPS=8
+cta_gang_INC  = $(BASE_INC) -I$(RTL_DIR)/dlmem -I$(UNITTEST_DIR)/cta_gang
+cta_gang_PKG  = $(RTL_DIR)/dlmem/VX_dlmem_pkg.sv
+
 dlmem_PRJ := VX_dlmem_noc_top
 dlmem_CFG := -DVX_CFG_EXT_DLMEM_ENABLE -DVX_CFG_NUM_CORES=8 -DVX_CFG_SOCKET_SIZE=2
 dlmem_INC  = $(BASE_INC) -I$(RTL_DIR)/dlmem -I$(UNITTEST_DIR)/dlmem_noc
 dlmem_PKG  = $(RTL_DIR)/dlmem/VX_dlmem_pkg.sv
+
+dlmem_ep_PRJ := VX_dlmem_ep_top
+dlmem_ep_CFG := -DVX_CFG_EXT_DLMEM_ENABLE -DVX_CFG_EXT_A_ENABLE -DVX_CFG_NUM_CORES=8 -DVX_CFG_SOCKET_SIZE=2
+dlmem_ep_INC  = $(BASE_INC) -I$(RTL_DIR)/mem -I$(RTL_DIR)/dlmem -I$(UNITTEST_DIR)/dlmem_ep -I$(UNITTEST_DIR)/dlmem_noc
+dlmem_ep_PKG  = $(RTL_DIR)/dlmem/VX_dlmem_pkg.sv
+
+dlmem_xlate_PRJ := VX_dlmem_xlate_top
+dlmem_xlate_CFG := -DVX_CFG_EXT_DLMEM_ENABLE -DVX_CFG_NUM_CORES=8 -DVX_CFG_SOCKET_SIZE=2 \
+                   -DVX_CFG_NUM_WARPS=16 -DVX_CFG_LMEM_LOG_SIZE=18
+dlmem_xlate_INC  = $(BASE_INC) -I$(RTL_DIR)/dlmem -I$(UNITTEST_DIR)/dlmem_xlate
+dlmem_xlate_PKG  = $(RTL_DIR)/dlmem/VX_dlmem_pkg.sv
 
 dxa_PRJ := VX_dxa_core_top
 dxa_CFG := -DVX_CFG_EXT_DXA_ENABLE

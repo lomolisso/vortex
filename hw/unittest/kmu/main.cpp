@@ -68,11 +68,13 @@ struct Beat {
   bool     first;
   bool     eop;
   uint32_t ctx_id;
+  uint32_t policy = 0;   // DLMEM: the cluster policy DCR; pin and the gang fields stay 0
 };
 
 struct Launch {
   uint32_t grid[3];
   uint32_t cluster[3];
+  int      policy = -1;   // DLMEM: the policy DCR to write, or -1 to keep the last one
 };
 
 static uint64_t write_dcr(Sim& sim, uint32_t addr, uint32_t value, uint64_t tick) {
@@ -130,14 +132,21 @@ static Beat sample(Sim& sim) {
   b.first  = sim->bus_is_first;
   b.eop    = sim->bus_eop;
   b.ctx_id = sim->bus_ctx_id;
+#if VX_CFG_EXT_DLMEM_ENABLED
+  // a pinned beat or a gang field would come from the KMU, not the gang unit
+  b.policy = sim->bus_policy | (sim->bus_pin << 1) | (sim->bus_gang_fields << 2);
+#endif
   return b;
 }
 
 static bool same_beat(const Beat& a, const Beat& b) {
   return a.idx[0] == b.idx[0] && a.idx[1] == b.idx[1] && a.idx[2] == b.idx[2]
       && a.size == b.size && a.rank == b.rank && a.first == b.first
-      && a.eop == b.eop && a.ctx_id == b.ctx_id;
+      && a.eop == b.eop && a.ctx_id == b.ctx_id && a.policy == b.policy;
 }
+
+// The policy register resets to DEFAULT and holds its value across launches.
+static uint32_t policy_r = 0;
 
 // Programs one launch, pulses start, and takes its beats under random
 // back-pressure; every beat must match the reference walk, and a stalled beat
@@ -155,6 +164,12 @@ static bool run_launch(Sim& sim, uint64_t& tick, std::mt19937& rng, const Launch
   tick = write_dcr(sim, VX_DCR_KMU_BLOCK_DIM_Z, 1, tick);
   tick = write_dcr(sim, VX_DCR_KMU_BLOCK_SIZE, VX_CFG_NUM_THREADS, tick);
   tick = write_dcr(sim, VX_DCR_KMU_WARP_STEP_X, VX_CFG_NUM_THREADS, tick);
+#if VX_CFG_EXT_DLMEM_ENABLED
+  if (l.policy >= 0) {
+    tick = write_dcr(sim, VX_DCR_KMU_CLUSTER_POLICY, uint32_t(l.policy), tick);
+    policy_r = uint32_t(l.policy) & 1;
+  }
+#endif
 
   sim->bus_ready = 0;
   sim->start = 1;
@@ -165,6 +180,7 @@ static bool run_launch(Sim& sim, uint64_t& tick, std::mt19937& rng, const Launch
   std::vector<Beat> want = reference_walk(l);
   for (auto& b : want) {
     b.ctx_id = ctx_id;
+    b.policy = policy_r;
   #if !VX_CFG_EXT_DLMEM_ENABLED
     b.rank = 0; // the launch message carries no rank
   #endif
@@ -203,10 +219,10 @@ static bool run_launch(Sim& sim, uint64_t& tick, std::mt19937& rng, const Launch
     if (ready) {
       const Beat& w = want[got];
       if (!same_beat(b, w) && ++errors <= 10) {
-        std::printf("FAIL %s (K=%u): beat %zu block (%u,%u,%u) size %u rank %u first %d eop %d ctx %u;"
-                    " want block (%u,%u,%u) size %u rank %u first %d eop %d ctx %u\n",
-                    name, k, got, b.idx[0], b.idx[1], b.idx[2], b.size, b.rank, b.first, b.eop, b.ctx_id,
-                    w.idx[0], w.idx[1], w.idx[2], w.size, w.rank, w.first, w.eop, w.ctx_id);
+        std::printf("FAIL %s (K=%u): beat %zu block (%u,%u,%u) size %u rank %u first %d eop %d ctx %u policy %u;"
+                    " want block (%u,%u,%u) size %u rank %u first %d eop %d ctx %u policy %u\n",
+                    name, k, got, b.idx[0], b.idx[1], b.idx[2], b.size, b.rank, b.first, b.eop, b.ctx_id, b.policy,
+                    w.idx[0], w.idx[1], w.idx[2], w.size, w.rank, w.first, w.eop, w.ctx_id, w.policy);
       }
       ++got;
       held = false;
@@ -232,7 +248,8 @@ static bool run_launch(Sim& sim, uint64_t& tick, std::mt19937& rng, const Launch
   }
   sim->bus_ready = 0;
 
-  std::printf("%s (K=%u, ready %u%%): %zu beats %s\n", name, k, ready_pct, want.size(), errors ? "FAILED" : "ok");
+  std::printf("%s (K=%u, ready %u%%, policy %u): %zu beats %s\n", name, k, ready_pct, policy_r, want.size(),
+              errors ? "FAILED" : "ok");
   return errors == 0;
 }
 
@@ -281,6 +298,13 @@ int main(int argc, char **argv) {
   // Rank restarts with each launch: end on a single-block cluster, then reuse K = 2.
   launches.push_back({{3, 1, 1}, {1, 1, 1}});
   launches.push_back({{2, 2, 1}, {2, 1, 1}});
+#if VX_CFG_EXT_DLMEM_ENABLED
+  // The first launch keeps the reset policy; then SPREAD, kept, DEFAULT, kept, SPREAD.
+  for (size_t i = 1; i < launches.size(); ++i) {
+    const int seq[] = {1, -1, 0, -1, 1};
+    launches[i].policy = seq[(i - 1) % 5];
+  }
+#endif
 
   std::mt19937 rng(seed);
   uint32_t ctx_id = 0;

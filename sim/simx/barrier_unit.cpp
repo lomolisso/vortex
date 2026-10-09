@@ -36,13 +36,70 @@ BarrierUnit::~BarrierUnit() {}
 // immediately. Mirrors the RTL request FIFO's drain rate.
 void BarrierUnit::gbar_send(uint32_t bar_id, uint32_t count) {
   uint64_t now = SimPlatform::instance().cycles();
+#ifdef VX_CFG_EXT_DLMEM_ENABLE
+  this->book_dones(now);
+  // the arrival takes the queue's write port: a done event due to enter this
+  // cycle, and those behind it, enter a cycle later
+  uint64_t next_push = now + 1;
+  for (auto& d : done_q_) {
+    d.push = std::max(d.push, next_push);
+    next_push = d.push + 1;
+  }
+#endif
   uint64_t due = std::max(now + 1, gbar_send_next_);
   gbar_send_next_ = due + 1;
   core_->gbar_arrive_out.send({bar_id, count, core_->id()}, due - now);
 }
 
+#ifdef VX_CFG_EXT_DLMEM_ENABLE
+// RTL path of a done event, from the last warp's exit: the dispatcher's
+// retirement pipe (2) and its pending register (1) push it into the request
+// queue; after the queue, one arbiter stage per fan-in level that exists, and
+// the gbar unit's output register.
+static constexpr uint64_t CTA_DONE_PUSH_DELAY = 3;
+static constexpr uint64_t CTA_DONE_LINK_DELAY = 1 + (VX_CFG_SOCKET_SIZE > 1 ? 1 : 0) + (NUM_SOCKETS > 1 ? 1 : 0);
+
+void BarrierUnit::send_cta_done(const CtaDone& done) {
+  uint64_t now  = SimPlatform::instance().cycles();
+  uint64_t push = now + CTA_DONE_PUSH_DELAY;
+  if (!done_q_.empty()) {
+    push = std::max(push, done_q_.back().push + 1);
+  }
+  done_q_.push_back({push, done.slot, done.gang_id, done.epoch});
+  this->tick_wake();
+}
+
+// Books, in push order, the done events whose push cycle has passed: every
+// arrival that could have entered the queue ahead of them is known by now.
+void BarrierUnit::book_dones(uint64_t now) {
+  while (!done_q_.empty() && done_q_.front().push < now) {
+    const auto& d = done_q_.front();
+    uint64_t due = std::max(d.push + 1, gbar_send_next_);
+    assert(due >= now);
+    gbar_send_next_ = due + 1;
+    GbarArrive msg{0, 0, core_->id()};
+    msg.kind    = GBAR_KIND_CTA_DONE;
+    msg.gang_id = d.gang_id;
+    msg.epoch   = d.epoch;
+    msg.slot    = d.slot;
+    core_->gbar_arrive_out.send(msg, (due - now) + CTA_DONE_LINK_DELAY);
+    done_q_.pop_front();
+  }
+}
+
+void BarrierUnit::on_tick() {
+  this->book_dones(SimPlatform::instance().cycles());
+  if (done_q_.empty()) {
+    this->tick_sleep();
+  }
+}
+#endif
+
 void BarrierUnit::on_reset() {
   gbar_send_next_ = 0;
+#ifdef VX_CFG_EXT_DLMEM_ENABLE
+  done_q_.clear();
+#endif
   for (auto& barrier : barriers_) {
     barrier.reset();
   }

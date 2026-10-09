@@ -8,13 +8,18 @@ defaults:
   configs: "-DVX_CFG_EXT_DLMEM_ENABLE"
   tier: smoke
   touches: [hw/rtl/dlmem, hw/rtl/VX_kmu.sv, hw/rtl/VX_gpu_pkg.sv, hw/rtl/VX_define.vh,
-            hw/rtl/Vortex.sv, hw/rtl/core/VX_cta_dispatch.sv, hw/rtl/core/VX_csr_data.sv,
+            hw/rtl/Vortex.sv, hw/rtl/VX_cluster.sv, hw/rtl/interfaces/VX_kmu_bus_if.sv,
+            hw/rtl/core/VX_cta_dispatch.sv, hw/rtl/core/VX_csr_data.sv,
+            hw/rtl/core/VX_kmu_bus_arb.sv, hw/rtl/core/VX_bar_unit.sv,
+            hw/rtl/core/VX_scheduler.sv, hw/rtl/mem/VX_gbar_unit.sv,
             hw/rtl/core/VX_mem_unit.sv, hw/rtl/cp/VX_cp_axil_regfile.sv,
             sim/simx/kmu, sim/simx/cta_dispatcher, sim/simx/scheduler, sim/simx/csr_unit.cpp,
-            sim/simx/processor.cpp, sim/common/cmd_processor.cpp,
+            sim/simx/cluster, sim/simx/barrier_unit, sim/simx/processor.cpp,
+            sim/common/cmd_processor.cpp, sw/common/dlmem_ref.h,
             sw/kernel/include/vx_dlmem.h, sw/kernel/include/vx_spawn2.h,
-            sw/runtime/common/caps.h, tests/regression/cluster_rank,
-            VX_config.toml, VX_types.toml]
+            sw/runtime/common/caps.h, sw/runtime/common/queue.cpp,
+            sw/runtime/common/legacy_runtime.cpp, tests/regression/cluster_rank,
+            tests/regression/cta_gang, VX_config.toml, VX_types.toml]
 tests:
   # The cluster-rank CSR over three launches (K = 1, 2 as 1x2x1, 4 as 2x1x2),
   # each CTA's rank against its intra-cluster index, and the rank address map
@@ -59,6 +64,106 @@ tests:
     xlen: [64]
     args: "-m -l 16384"
 
+  # Distributed launch (VX_CLUSTER_POLICY_SPREAD): each cluster's blocks are
+  # placed all at once on the cores of one hardware cluster, spread first. The
+  # app checks every block ran once, ranks follow the walk, a cluster stays in
+  # one hardware cluster, and the first cluster of each launch, placed on an
+  # idle machine, puts rank r on core r. The A extension adds an atomic
+  # rendezvous per cluster that only completes if its blocks are co-resident;
+  # it needs one shared last-level cache, hence the L2 or L3 on these shapes.
+  # One core: SPREAD of the largest K (1 here), SPREAD K=1, then DEFAULT
+  # clusters of 2, in one process, so each launch restarts the placement.
+  - id: cta_gang-1c
+    app: cta_gang
+    drivers: [simx, rtlsim]
+    configs+: "-DVX_CFG_EXT_A_ENABLE"
+  - id: cta_gang-2c
+    app: cta_gang
+    drivers: [simx, rtlsim]
+    configs+: "-DVX_CFG_EXT_A_ENABLE"
+    shape: {cores: 2, l2cache: true}
+    args: "-k 2 -n 8"
+  # Four sockets of one core.
+  - id: cta_gang-4c
+    app: cta_gang
+    drivers: [simx, rtlsim]
+    configs+: "-DVX_CFG_EXT_A_ENABLE"
+    shape: {cores: 4, l2cache: true}
+    args: "-k 4 -n 6"
+  # Two sockets of two cores: the pinned beats cross both distributor levels.
+  # The xrt leg wraps the same RTL in the AFU shell and host stack.
+  - id: cta_gang-4c-s2
+    app: cta_gang
+    drivers: [simx, xrt]
+    configs+: "-DVX_CFG_EXT_A_ENABLE -DVX_CFG_SOCKET_SIZE=2"
+    shape: {cores: 4, l2cache: true}
+    args: "-k 4 -n 6"
+  # One socket of four cores, whose shared dcache is the last level.
+  - id: cta_gang-4c-s4
+    app: cta_gang
+    drivers: [simx, rtlsim]
+    configs+: "-DVX_CFG_EXT_A_ENABLE -DVX_CFG_SOCKET_SIZE=4"
+    shape: {cores: 4}
+    args: "-k 2 -n 12"
+  # Two hardware clusters, each with its own gang unit and mirror.
+  - id: cta_gang-2cl
+    app: cta_gang
+    drivers: [simx, rtlsim]
+    configs+: "-DVX_CFG_EXT_A_ENABLE"
+    shape: {clusters: 2, cores: 2, l3cache: true}
+    args: "-k 2 -n 8"
+  # Multi-warp blocks: a core holds several blocks, of one or more clusters.
+  - id: cta_gang-w2
+    app: cta_gang
+    drivers: [simx, rtlsim]
+    configs+: "-DVX_CFG_EXT_A_ENABLE"
+    shape: {cores: 4, warps: 8, l2cache: true}
+    args: "-k 4 -w 2"
+  - id: cta_gang-w4
+    app: cta_gang
+    drivers: [simx, rtlsim]
+    configs+: "-DVX_CFG_EXT_A_ENABLE"
+    shape: {cores: 4, warps: 8, l2cache: true}
+    args: "-k 4 -w 4"
+  # A block takes a core's whole 16 KB local memory, so each core has one usable
+  # slot and the clusters run one after another.
+  - id: cta_gang-lfull
+    app: cta_gang
+    drivers: [simx, rtlsim]
+    configs+: "-DVX_CFG_EXT_A_ENABLE"
+    shape: {cores: 4, l2cache: true}
+    args: "-k 4 -l 16384"
+  # The runtime refuses SPREAD past VX_CAPS_DLMEM_MAX_CLUSTER, a cluster past
+  # what the rank counter holds, policy 2 and a struct_size below version 1, on
+  # both the single-launch and the batch path; it runs a version-1-sized
+  # descriptor as DEFAULT, and a SPREAD batch launch spreads.
+  - id: cta_gang-reject
+    app: cta_gang
+    drivers: [simx]
+    shape: {cores: 2}
+    args: "-r"
+  # Without DLMEM, SPREAD is VX_ERR_NOT_SUPPORTED and no policy register is written.
+  - id: cta_gang-reject-nodlmem
+    app: cta_gang
+    drivers: [simx]
+    configs: ""
+    shape: {cores: 2}
+    args: "-r"
+
+  # SimX<->rtlsim parity of the gang unit's placement and done-event timing, at
+  # XLEN 64. Fixed ALU work and no rendezvous keep the instruction count exact.
+  # Most of the ~4.6% cycle gap is not the gang: on this shape the RTL's socket
+  # 1 finishes each wave's record stores ~500 cycles after socket 0 (SimX has no
+  # such skew; DEFAULT already shows 4.2%), so later gangs share cores in rtlsim.
+  # The done events reach the gang in the same order, one per cycle, in both.
+  - id: parity-cta-gang
+    check: model_parity
+    app: cta_gang
+    xlen: [64]
+    configs+: "-DVX_CFG_SOCKET_SIZE=2"
+    shape: {cores: 4}
+    args: "-p -k 4 -n 16"
+
   # Illegal knob combinations must stop the build, in SimX (the processor
   # object) and in the RTL (a Verilator lint of the processor), each with the
   # exact message. Tagged simx only for cell placement: a driverless case would
@@ -77,8 +182,9 @@ tests:
       "$vl/bin/verilator" --lint-only -Wno-lint -Wno-style -Wno-REDEFMACRO \
         -DVX_CFG_XLEN="$xl" -DVX_CFG_XLEN_"$xl" -DSIMULATION ${CONFIGS:-} \
         -Isw -Ihw -I"$r" -I"$r/libs" -I"$r/interfaces" -I"$r/core" -I"$r/mem" \
-        -I"$r/vm" -I"$r/cache" -I"$r/fpu" \
-        "$r/VX_gpu_pkg.sv" "$r/fpu/VX_fpu_pkg.sv" "$r/VX_trace_pkg.sv" "$r/Vortex.sv" \
+        -I"$r/vm" -I"$r/cache" -I"$r/fpu" -I"$r/dlmem" \
+        "$r/VX_gpu_pkg.sv" "$r/fpu/VX_fpu_pkg.sv" "$r/dlmem/VX_dlmem_pkg.sv" \
+        "$r/VX_trace_pkg.sv" "$r/Vortex.sv" \
         --top-module Vortex > "$tmp/rtl.log" 2>&1; rtl_rc=$?
       fail=0
       for side in simx rtl; do
@@ -104,4 +210,10 @@ tests:
     driver: simx
     configs+: "-DVX_CFG_LMEM_LOG_SIZE=19"
     env: {EXPECT: "DLMEM requires a local memory of at most 256 KB"}
+    run: *reject_run
+  - id: reject-socketmult
+    via: script
+    driver: simx
+    configs+: "-DVX_CFG_NUM_CORES=3 -DVX_CFG_SOCKET_SIZE=2"
+    env: {EXPECT: "DLMEM requires NUM_CORES to be a multiple of SOCKET_SIZE"}
     run: *reject_run

@@ -67,6 +67,12 @@ ifneq (,$(filter -DVX_CFG_EXT_DXA_ENABLE -DVX_CFG_EXT_DXA_ENABLE=1 -DVX_CFG_EXT_
 	RTL_INCLUDE += -I$(RTL_DIR)/dxa
 endif
 
+# Add DLMEM extension sources
+ifneq (,$(filter -DVX_CFG_EXT_DLMEM_ENABLE -DVX_CFG_EXT_DLMEM_ENABLE=1 -DVX_CFG_EXT_DLMEM_ENABLED=1, $(XCONFIGS)))
+	RTL_PKGS += $(RTL_DIR)/dlmem/VX_dlmem_pkg.sv
+	RTL_INCLUDE += -I$(RTL_DIR)/dlmem
+endif
+
 # Add RTU extension sources
 ifneq (,$(filter -DVX_CFG_EXT_RTU_ENABLE -DVX_CFG_EXT_RTU_ENABLE=1 -DVX_CFG_EXT_RTU_ENABLED=1, $(XCONFIGS)))
 	RTL_PKGS += $(RTL_DIR)/rtu/VX_rtu_pkg.sv

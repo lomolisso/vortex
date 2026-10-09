@@ -32,6 +32,8 @@
 //              order.
 //   COMPUTE  — round-robin over the ready outputs, which is what the plain
 //              stream arbiter did before and what keeps CTAs spread across cores.
+//   pinned   — (DLMEM) routed by `dest` like a fragment: the gang unit already
+//              placed the block on its core.
 
 module VX_kmu_bus_arb import VX_gpu_pkg::*; #(
     parameter NUM_INPUTS  = 1,
@@ -59,8 +61,13 @@ module VX_kmu_bus_arb import VX_gpu_pkg::*; #(
     `STATIC_ASSERT((NUM_INPUTS == 1) || (NUM_OUTPUTS == 1),
         ("VX_kmu_bus_arb is single-stage (N->1 or 1->M); compose two for N->M"))
 
+`ifdef VX_CFG_EXT_DLMEM_ENABLE
+    // packed beat: {pin, kind, eop, dest, data}
+    localparam PW    = 1 + 1 + 1 + KMU_DEST_W + KMU_DATAW;
+`else
     // packed beat: {kind, eop, dest, data}
     localparam PW    = 1 + 1 + KMU_DEST_W + KMU_DATAW;
+`endif
     localparam LOG_I = `CLOG2(NUM_INPUTS);
     localparam LOG_O = `CLOG2(NUM_OUTPUTS);
     localparam SEL_I = `UP(LOG_I);
@@ -70,6 +77,9 @@ module VX_kmu_bus_arb import VX_gpu_pkg::*; #(
     localparam PW_DEST = KMU_DATAW;
     localparam PW_EOP  = KMU_DATAW + KMU_DEST_W;
     localparam PW_KIND = KMU_DATAW + KMU_DEST_W + 1;
+`ifdef VX_CFG_EXT_DLMEM_ENABLE
+    localparam PW_PIN  = KMU_DATAW + KMU_DEST_W + 2;
+`endif
 
     wire [NUM_INPUTS-1:0]           bus_valid;
     wire [NUM_INPUTS-1:0][PW-1:0]   bus_data;
@@ -81,10 +91,18 @@ module VX_kmu_bus_arb import VX_gpu_pkg::*; #(
 
     for (genvar i = 0; i < NUM_INPUTS; ++i) begin : g_in
         assign bus_valid[i] = bus_in_if[i].valid;
+    `ifdef VX_CFG_EXT_DLMEM_ENABLE
+        assign bus_data[i]  = {bus_in_if[i].pin,
+                               bus_in_if[i].kind,
+                               bus_in_if[i].eop,
+                               bus_in_if[i].dest,
+                               bus_in_if[i].data};
+    `else
         assign bus_data[i]  = {bus_in_if[i].kind,
                                bus_in_if[i].eop,
                                bus_in_if[i].dest,
                                bus_in_if[i].data};
+    `endif
         assign bus_in_if[i].ready = bus_ready[i];
     end
 
@@ -184,8 +202,14 @@ module VX_kmu_bus_arb import VX_gpu_pkg::*; #(
             end
         end
 
+    `ifdef VX_CFG_EXT_DLMEM_ENABLE
+        // A pinned beat is a whole message (eop=1), so it never engages the lock.
+        wire [SEL_O-1:0] sel_new = ((m_data[PW_KIND] == KMU_KIND_FRAGMENT) || m_data[PW_PIN])
+                                 ? dest_sel : rr_sel;
+    `else
         wire [SEL_O-1:0] sel_new = (m_data[PW_KIND] == KMU_KIND_FRAGMENT)
                                  ? dest_sel : rr_sel;
+    `endif
         wire [SEL_O-1:0] sel = lock_v ? lock_sel : sel_new;
 
         for (genvar o = 0; o < NUM_OUTPUTS; ++o) begin : g_sel
@@ -245,6 +269,9 @@ module VX_kmu_bus_arb import VX_gpu_pkg::*; #(
         assign bus_out_if[o].eop  = buf_data[PW_EOP];
         assign bus_out_if[o].dest = buf_data[PW_DEST +: KMU_DEST_W];
         assign bus_out_if[o].data = buf_data[KMU_DATAW-1:0];
+    `ifdef VX_CFG_EXT_DLMEM_ENABLE
+        assign bus_out_if[o].pin  = buf_data[PW_PIN];
+    `endif
     end
 
 endmodule

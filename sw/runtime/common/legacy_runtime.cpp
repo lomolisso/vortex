@@ -170,10 +170,11 @@ extern "C" int vx_start(vx_device_h hdevice, vx_buffer_h hkernel,
         prev->release();
     }
 
-    uint64_t num_cores = 0, num_threads = 0, num_warps = 0;
+    uint64_t num_cores = 0, num_threads = 0, num_warps = 0, isa = 0;
     if (vx_device_query(hdevice, VX_CAPS_NUM_CORES,   &num_cores)   != VX_SUCCESS) return -1;
     if (vx_device_query(hdevice, VX_CAPS_NUM_THREADS, &num_threads) != VX_SUCCESS) return -1;
     if (vx_device_query(hdevice, VX_CAPS_NUM_WARPS,   &num_warps)   != VX_SUCCESS) return -1;
+    if (vx_device_query(hdevice, VX_CAPS_ISA_FLAGS,   &isa)         != VX_SUCCESS) return -1;
 
     uint32_t eff_block_dim[3];
     uint32_t block_size = 0;
@@ -216,6 +217,12 @@ extern "C" int vx_start(vx_device_h hdevice, vx_buffer_h hkernel,
     for (auto& w : kmu_writes) {
         auto r = vx_enqueue_dcr_write(to_handle(q), w.addr, w.value,
                                       0, nullptr, /*out_event=*/nullptr);
+        if (r != VX_SUCCESS) return -1;
+    }
+    // The policy register keeps the last launch's value, and only a DLMEM device has it.
+    if (isa & VX_ISA_EXT_DLMEM) {
+        auto r = vx_enqueue_dcr_write(to_handle(q), VX_DCR_KMU_CLUSTER_POLICY,
+                                      VX_CLUSTER_POLICY_DEFAULT, 0, nullptr, nullptr);
         if (r != VX_SUCCESS) return -1;
     }
 

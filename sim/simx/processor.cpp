@@ -44,8 +44,13 @@ ProcessorImpl::ProcessorImpl()
 	assert(VX_CFG_PLATFORM_MEMORY_DATA_SIZE == VX_CFG_MEM_BLOCK_SIZE);
 
   // create kernel management unit (SimObject)
+#ifdef VX_CFG_EXT_DLMEM_ENABLE
+  // One launch lane per hardware cluster, into its gang unit.
+  kmu_ = Kmu::Create("kmu", VX_CFG_NUM_CLUSTERS);
+#else
   constexpr uint32_t total_cores = VX_CFG_NUM_CLUSTERS * NUM_SOCKETS * VX_CFG_SOCKET_SIZE;
   kmu_ = Kmu::Create("kmu", total_cores);
+#endif
 
   // create memory simulator
   memsim_ = Memory::Create("dram", Memory::Config{
@@ -63,6 +68,17 @@ ProcessorImpl::ProcessorImpl()
     clusters_.at(i) = Cluster::Create(sname, i, this);
   }
 
+#ifdef VX_CFG_EXT_DLMEM_ENABLE
+  // Launch bus: a registered, credit-gated lane from the KMU to each
+  // cluster's gang unit, which owns the lanes to its cores.
+  for (uint32_t i = 0; i < VX_CFG_NUM_CLUSTERS; ++i) {
+    snprintf(sname, 100, "kmu-lane%d", i);
+    auto slice = RegSlice<kmu_req_t>::Create(sname, 1);
+    kmu_->bus_out.at(i).bind(&slice->In);
+    slice->Out.bind(&clusters_.at(i)->kmu_bus_in());
+    clusters_.at(i)->kmu_credit_out().bind(&kmu_->credit_in.at(i));
+  }
+#else
   // Launch bus: a registered, credit-gated lane from the KMU to each core's
   // dispatcher; CTAs cross into the core's domain through the slice, and
   // admission credits return to the KMU through a slice of their own.
@@ -84,6 +100,7 @@ ProcessorImpl::ProcessorImpl()
     core->scheduler().cta_dispatcher()->credit_out.bind(&cslice->In);
     cslice->Out.bind(&kmu_->credit_in.at(i));
   }
+#endif
 
   // create L3 cache; when L3 is enabled it is the LLC, otherwise it is a
   // transparent bypass arbiter and the L2 (or L1) is the LLC.
@@ -142,6 +159,13 @@ ProcessorImpl::ProcessorImpl()
   // The window stride is the local-memory size, and the RV64 base is only 256 KB aligned.
   static_assert(VX_CFG_LMEM_LOG_SIZE <= 18, "DLMEM requires a local memory of at most 256 KB");
   static_assert(VX_CFG_SOCKET_SIZE <= VX_CFG_NUM_CORES, "DLMEM requires SOCKET_SIZE <= NUM_CORES");
+  // The gang unit's mirror and done events index a hardware cluster's cores
+  // by the same number the global-barrier path does.
+  static_assert((VX_CFG_NUM_CORES % VX_CFG_SOCKET_SIZE) == 0, "DLMEM requires NUM_CORES to be a multiple of SOCKET_SIZE");
+  // A pinned beat's dest is built field-wise (cluster, socket, core), as KMU_DEST_LSB_* slice it.
+  static_assert((log2ceil(VX_CFG_NUM_CLUSTERS) + log2ceil(NUM_SOCKETS) + log2ceil(VX_CFG_SOCKET_SIZE))
+                  <= std::max<uint32_t>(1, log2ceil(VX_CFG_NUM_CLUSTERS * VX_CFG_NUM_CORES)),
+                "DLMEM requires the KMU dest field to hold every core's field-wise dest");
 #endif
 
   // connect L3 core interfaces

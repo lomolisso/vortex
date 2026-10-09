@@ -59,6 +59,13 @@ module VX_core_top import VX_gpu_pkg::*;
     output wire [NB_WIDTH-1:0]              gbar_req_id,
     output wire [NC_WIDTH-1:0]              gbar_req_size_m1,
     output wire [NC_WIDTH-1:0]              gbar_req_core_id,
+`ifdef VX_CFG_EXT_DLMEM_ENABLE
+    // CTA_DONE events ride the same request bus
+    output wire [1:0]                       gbar_req_kind,
+    output wire [GANG_ID_W-1:0]             gbar_req_gang_id,
+    output wire                             gbar_req_epoch,
+    output wire [NW_WIDTH-1:0]              gbar_req_slot,
+`endif
     input wire                              gbar_req_ready,
     input wire                              gbar_rsp_valid,
     input wire [NB_WIDTH-1:0]               gbar_rsp_id,
@@ -81,6 +88,12 @@ module VX_core_top import VX_gpu_pkg::*;
     assign gbar_req_id              = gbar_bus_if.req_data.id;
     assign gbar_req_size_m1         = gbar_bus_if.req_data.size_m1;
     assign gbar_req_core_id         = gbar_bus_if.req_data.core_id;
+`ifdef VX_CFG_EXT_DLMEM_ENABLE
+    assign gbar_req_kind            = gbar_bus_if.req_data.kind;
+    assign gbar_req_gang_id         = gbar_bus_if.req_data.gang_id;
+    assign gbar_req_epoch           = gbar_bus_if.req_data.epoch;
+    assign gbar_req_slot            = gbar_bus_if.req_data.slot;
+`endif
     assign gbar_bus_if.req_ready    = gbar_req_ready;
     assign gbar_bus_if.rsp_valid    = gbar_rsp_valid;
     assign gbar_bus_if.rsp_data.id  = gbar_rsp_id;
@@ -141,6 +154,9 @@ module VX_core_top import VX_gpu_pkg::*;
     assign kmu_bus_if.eop   = 1'b0;
     assign kmu_bus_if.dest  = '0;
     assign kmu_bus_if.data  = '0;
+`ifdef VX_CFG_EXT_DLMEM_ENABLE
+    assign kmu_bus_if.pin   = 1'b0;
+`endif
 
     VX_dcr_bus_if dcr_bus_if();
 

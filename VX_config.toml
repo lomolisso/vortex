@@ -310,6 +310,10 @@ VX_CFG_DXA_MAX_INFLIGHT = 8
 # Largest thread-block cluster a distributed launch may place across the
 # cores of one hardware cluster (CUDA's portable limit is 8).
 VX_CFG_DLMEM_MAX_CLUSTER = "expr: min(8, $VX_CFG_NUM_CORES)"
+# Remote stores a core may have unacknowledged; bounds the per-warp store counters.
+VX_CFG_DLMEM_STORE_CREDITS = 8
+# Remote loads and AMOs a core may have outstanding; sizes the egress response table.
+VX_CFG_DLMEM_PENDING_SIZE = 8
 
 [rtu]
 # RTU (Ray-Tracing Unit)

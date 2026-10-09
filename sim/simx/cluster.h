@@ -34,6 +34,9 @@
 #include "mem/tlb_l2.h"
 #include "mem/ptw.h"
 #endif
+#ifdef VX_CFG_EXT_DLMEM_ENABLE
+#include "kmu.h"
+#endif
 
 namespace vortex {
 
@@ -110,6 +113,13 @@ public:
 #endif
 
   int dcr_read(uint32_t addr, uint32_t tag, uint32_t* value);
+
+#ifdef VX_CFG_EXT_DLMEM_ENABLE
+  // The cluster's launch lane (its gang unit's input), exported for the
+  // processor to bind to the KMU.
+  SimChannel<kmu_req_t>& kmu_bus_in();
+  SimChannel<uint8_t>&   kmu_credit_out();
+#endif
 
   class Core* get_core(uint32_t idx) const;
 

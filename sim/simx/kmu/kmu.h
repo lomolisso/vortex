@@ -17,6 +17,9 @@
 #include <vector>
 #include "types.h"
 #include "VX_types.h"
+#ifdef VX_CFG_EXT_DLMEM_ENABLE
+#include <dlmem_ref.h>
+#endif
 
 namespace vortex {
 
@@ -38,8 +41,22 @@ struct kmu_req_t {
   uint8_t  ctx_id;
 #ifdef VX_CFG_EXT_DLMEM_ENABLE
   uint32_t cluster_rank;
+  uint32_t policy;          // KMU_POLICY_* from the launch's cluster-policy DCR
+  // Stamped by the cluster's gang unit on a SPREAD block.
+  bool     pinned;          // routed to dest_core, not balanced
+  uint32_t dest_core;       // core within the hardware cluster
+  uint32_t forced_slot;     // the CTA slot the gang reserved on dest_core
+  uint32_t gang_id;         // gang_id and epoch: valid only for K > 1
+  uint32_t epoch;
+  dlmem_ref::Row row;       // the gang's peer row, the same in all K beats
 #endif
 };
+
+#ifdef VX_CFG_EXT_DLMEM_ENABLE
+// Same encodings as VX_gpu_pkg.
+constexpr uint32_t KMU_POLICY_DEFAULT = 0;
+constexpr uint32_t KMU_POLICY_SPREAD  = 1;
+#endif
 
 // Kernel Management Unit. Holds the in-flight kernel descriptor, walks the
 // grid, and pushes one CTA per cycle onto a ready core's launch lane.
@@ -102,6 +119,9 @@ private:
   uint32_t block_size_;
   uint32_t warp_step_[3];
   uint32_t cluster_dim_[3];
+#ifdef VX_CFG_EXT_DLMEM_ENABLE
+  uint32_t policy_;
+#endif
   bool     running_;
   uint32_t cta_id_;
   // Round-robin pointer over launch lanes; advances past the granted core

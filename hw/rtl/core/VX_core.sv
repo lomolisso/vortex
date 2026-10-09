@@ -219,6 +219,15 @@ module VX_core import VX_gpu_pkg::*, VX_tlb_pkg::*; #(
 
 
     wire sched_busy;
+`ifdef VX_CFG_EXT_DLMEM_ENABLE
+    // Peer rows of admitted blocks, for the aperture translation table.
+    wire                           peer_wr_valid;
+    wire [NW_WIDTH-1:0]            peer_wr_slot;
+    dlmem_row_t                    peer_wr_row;
+    wire [`VX_CFG_LMEM_LOG_SIZE:0] peer_wr_stride;
+    `UNUSED_VAR ({peer_wr_valid, peer_wr_slot, peer_wr_row, peer_wr_stride})
+`endif
+
     VX_scheduler #(
         .INSTANCE_ID (`SFORMATF(("%s-scheduler", INSTANCE_ID))),
         .CORE_ID (CORE_ID)
@@ -245,6 +254,13 @@ module VX_core import VX_gpu_pkg::*, VX_tlb_pkg::*; #(
         .schedule_if    (schedule_if),
         .sched_csr_if   (sched_csr_if),
         .gbar_bus_if    (gbar_bus_if),
+
+    `ifdef VX_CFG_EXT_DLMEM_ENABLE
+        .peer_wr_valid  (peer_wr_valid),
+        .peer_wr_slot   (peer_wr_slot),
+        .peer_wr_row    (peer_wr_row),
+        .peer_wr_stride (peer_wr_stride),
+    `endif
 
         .busy           (sched_busy)
     );

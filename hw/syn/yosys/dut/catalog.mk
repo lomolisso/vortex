@@ -9,7 +9,7 @@
 # synthesizes, so both gates measure the same modules and a divergence between
 # them is meaningful rather than an artefact of two DUT lists.
 
-DUTS := cache core tcu gfx tex raster om rtu dxa vm tensor dlmem vortex
+DUTS := cache core tcu gfx tex raster om rtu dxa vm tensor dlmem cta_gang dlmem_xlate dlmem_ep vortex
 
 UNITTEST_DIR ?= $(VORTEX_HOME)/hw/unittest
 
@@ -85,6 +85,24 @@ tensor_CFG := -DVX_CFG_NUM_THREADS=16 -DVX_CFG_NUM_WARPS=16 -DVX_CFG_EXT_TCU_ENA
 dlmem_TOP := VX_dlmem_noc_top
 dlmem_INC := -I$(VORTEX_HOME)/hw/rtl/dlmem -I$(UNITTEST_DIR)/dlmem_noc
 dlmem_CFG := -DVX_CFG_EXT_DLMEM_ENABLE -DVX_CFG_NUM_CORES=8 -DVX_CFG_SOCKET_SIZE=2
+
+# One hardware cluster's gang admission unit: 4 sockets of 2 cores, 8 warps each.
+cta_gang_TOP := VX_cta_gang_top
+cta_gang_INC := -I$(VORTEX_HOME)/hw/rtl/dlmem -I$(UNITTEST_DIR)/cta_gang
+cta_gang_CFG := -DVX_CFG_EXT_DLMEM_ENABLE -DVX_CFG_NUM_CORES=8 -DVX_CFG_SOCKET_SIZE=2 -DVX_CFG_NUM_WARPS=8
+
+# One core's peer table and aperture translation, at the largest window
+# (8-block clusters over 256 KB local memories) and 16 CTA slots.
+dlmem_xlate_TOP := VX_dlmem_xlate_top
+dlmem_xlate_INC := -I$(VORTEX_HOME)/hw/rtl/dlmem -I$(UNITTEST_DIR)/dlmem_xlate
+dlmem_xlate_CFG := -DVX_CFG_EXT_DLMEM_ENABLE -DVX_CFG_NUM_CORES=8 -DVX_CFG_SOCKET_SIZE=2 \
+                   -DVX_CFG_NUM_WARPS=16 -DVX_CFG_LMEM_LOG_SIZE=18
+
+# Every core's network endpoints (egress, ingress, store tracker) of one
+# 8-core cluster, with the request and response networks between them.
+dlmem_ep_TOP := VX_dlmem_ep_top
+dlmem_ep_INC := -I$(VORTEX_HOME)/hw/rtl/dlmem -I$(UNITTEST_DIR)/dlmem_ep -I$(UNITTEST_DIR)/dlmem_noc
+dlmem_ep_CFG := -DVX_CFG_EXT_DLMEM_ENABLE -DVX_CFG_EXT_A_ENABLE -DVX_CFG_NUM_CORES=8 -DVX_CFG_SOCKET_SIZE=2
 
 # The whole GPU. Hours-long; nightly only, never a PR gate.
 vortex_TOP := Vortex
