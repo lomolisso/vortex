@@ -19,7 +19,10 @@
 // granted round-robin and held until its last lane issues; a store needs a
 // credit, a load or AMO a pending entry that its response fills and the LSU
 // delivery frees. Remote LR is sent as a load; remote SC fails locally without
-// a packet (both assert unless LRSC_ASSERT=0).
+// a packet, never in a cycle a response arrives (both assert unless
+// LRSC_ASSERT=0). ack reports each committed store and done each load, AMO or
+// SC that returned its data, both by warp, so the core's tracker sees every
+// remote access performed.
 //
 // Deadlock freedom. Requests and responses use two separate network
 // instances. The egress issue waits on a credit or a pending entry and on the
@@ -41,8 +44,9 @@
 // local-memory input in arrival order, and the local memory keeps each input's
 // order per bank with its read-after-write stall. Same-address accesses from
 // one hart therefore execute in program order; different addresses may
-// complete out of order (RVWMO), and fences order them through the store
-// acknowledgements, which are sent only after the bank committed the store.
+// complete out of order (RVWMO), and fences order them through ack and done:
+// a store is acknowledged only after the bank committed it, and a load's or
+// AMO's data exists only once the bank performed it.
 // Responses are matched by tag, so their arrival order does not matter.
 module VX_dlmem_egress import VX_gpu_pkg::*, VX_dlmem_pkg::*; #(
     parameter `STRING INSTANCE_ID = "",
@@ -64,6 +68,8 @@ module VX_dlmem_egress import VX_gpu_pkg::*, VX_dlmem_pkg::*; #(
 
     output wire                 ack_valid,
     output wire [NW_WIDTH-1:0]  ack_wid,
+    output wire                 done_valid,
+    output wire [NW_WIDTH-1:0]  done_wid,
 
     output wire             empty
 );
@@ -196,9 +202,10 @@ module VX_dlmem_egress import VX_gpu_pkg::*, VX_dlmem_pkg::*; #(
     wire req_buf_ready;
 
     // An SC needs only its pending entry; everything else also needs the network.
+    // An SC yields to an arriving response so that ack and done never coincide.
     wire pkt_valid = cur_valid && ~is_sc && res_ok;
     wire pkt_fire  = pkt_valid && req_buf_ready;
-    wire sc_fire   = cur_valid && is_sc && free_valid;
+    wire sc_fire   = cur_valid && is_sc && free_valid && ~rsp_in_if.valid;
     wire lane_fire = pkt_fire || sc_fire;
     wire st_fire   = pkt_fire && is_st;
     wire alloc     = lane_fire && ~is_st;
@@ -282,22 +289,31 @@ module VX_dlmem_egress import VX_gpu_pkg::*, VX_dlmem_pkg::*; #(
     wire rsp_fill = rsp_in_if.valid && ~rsp_pkt.ack;
     wire [PEND_W-1:0] rsp_idx = rsp_pkt.tag[PEND_W-1:0];
 
+    reg [PENDING_SIZE-1:0][NW_WIDTH-1:0] pend_wid_r;
+
     reg                ack_valid_r;
     reg [NW_WIDTH-1:0] ack_wid_r;
+    reg                done_valid_r;
+    reg [NW_WIDTH-1:0] done_wid_r;
 
     always @(posedge clk) begin
         if (reset) begin
-            credits_r   <= CRED_W'(STORE_CREDITS);
-            ack_valid_r <= 1'b0;
+            credits_r    <= CRED_W'(STORE_CREDITS);
+            ack_valid_r  <= 1'b0;
+            done_valid_r <= 1'b0;
         end else begin
-            credits_r   <= credits_r - CRED_W'(st_fire) + CRED_W'(rsp_ack);
-            ack_valid_r <= rsp_ack;
+            credits_r    <= credits_r - CRED_W'(st_fire) + CRED_W'(rsp_ack);
+            ack_valid_r  <= rsp_ack;
+            done_valid_r <= rsp_fill || sc_fire;
         end
-        ack_wid_r <= rsp_pkt.tag[NW_WIDTH-1:0];
+        ack_wid_r  <= rsp_pkt.tag[NW_WIDTH-1:0];
+        done_wid_r <= rsp_fill ? pend_wid_r[rsp_idx] : cur_wid;
     end
 
-    assign ack_valid = ack_valid_r;
-    assign ack_wid   = ack_wid_r;
+    assign ack_valid  = ack_valid_r;
+    assign ack_wid    = ack_wid_r;
+    assign done_valid = done_valid_r;
+    assign done_wid   = done_wid_r;
 
     // Pending table and delivery: each block returns its lowest filled entry,
     // one lane per response; the entry frees when the response is buffered.
@@ -383,6 +399,7 @@ module VX_dlmem_egress import VX_gpu_pkg::*, VX_dlmem_pkg::*; #(
             if (alloc_i) begin
                 pend_blk_r[i]  <= cur_blk;
                 pend_lane_r[i] <= cur_lane;
+                pend_wid_r[i]  <= cur_wid;
                 pend_tag_r[i]  <= in_tag[cur_blk];
                 pend_data_r[i] <= sc_fail_word;
             end else if (fill_i) begin
@@ -396,7 +413,8 @@ module VX_dlmem_egress import VX_gpu_pkg::*, VX_dlmem_pkg::*; #(
                 && ~(|pend_valid_r)
                 && ~req_out_if.valid
                 && ~(|rsp_buf_valid)
-                && ~ack_valid_r;
+                && ~ack_valid_r
+                && ~done_valid_r;
 
     `UNUSED_VAR (rsp_in_if.dst)
 
@@ -415,9 +433,9 @@ module VX_dlmem_egress import VX_gpu_pkg::*, VX_dlmem_pkg::*; #(
     `RUNTIME_ASSERT (~(cur_valid && is_st && cur_amo),
         ("%t: *** %s remote lane is both a store and an AMO", $time, INSTANCE_ID))
     `RUNTIME_ASSERT (~(LRSC_ASSERT != 0 && lane_fire && is_lr),
-        ("%t: *** %s remote LR is not supported: addr=0x%0h", $time, INSTANCE_ID, {cur_addr, DLMEM_WA'(0)}))
+        ("%t: *** %s remote LR/SC is not supported: LR addr=0x%0h", $time, INSTANCE_ID, {cur_addr, DLMEM_WA'(0)}))
     `RUNTIME_ASSERT (~(LRSC_ASSERT != 0 && lane_fire && is_sc),
-        ("%t: *** %s remote SC is not supported: addr=0x%0h", $time, INSTANCE_ID, {cur_addr, DLMEM_WA'(0)}))
+        ("%t: *** %s remote LR/SC is not supported: SC addr=0x%0h", $time, INSTANCE_ID, {cur_addr, DLMEM_WA'(0)}))
     `RUNTIME_ASSERT (~(rsp_ack && (credits_r == CRED_W'(STORE_CREDITS))),
         ("%t: *** %s store ack without an outstanding store: wid=%0d", $time, INSTANCE_ID, rsp_pkt.tag))
     `RUNTIME_ASSERT (~(rsp_fill && ((32'(rsp_pkt.tag) >= PENDING_SIZE) || ~pend_valid_r[rsp_idx] || pend_data_valid_r[rsp_idx])),

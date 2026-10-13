@@ -13,9 +13,10 @@
 
 `include "VX_define.vh"
 
-// A core's remote-store tracker: per warp, the remote stores counted at
-// translation and not yet acknowledged. drained[w] means every earlier remote
-// store of warp w has committed in its target bank.
+// A core's remote-access tracker: per warp, the remote accesses counted at
+// translation and not yet performed. drained[w] means every earlier remote
+// store of warp w has committed in its target bank and every earlier remote
+// load or AMO has returned its data.
 module VX_dlmem_wtrack import VX_gpu_pkg::*, VX_dlmem_pkg::*; #(
     parameter NUM_INC = `VX_CFG_NUM_LSU_BLOCKS,
 
@@ -71,7 +72,7 @@ module VX_dlmem_wtrack import VX_gpu_pkg::*, VX_dlmem_pkg::*; #(
         `RUNTIME_ASSERT (cnt_inc < (SUM_W'(1) << DLMEM_WT_W),
             ("%t: *** dlmem wtrack counter overflow: wid=%0d count=%0d", $time, w, cnt_inc))
         `RUNTIME_ASSERT (~(dec_w && (cnt_r[w] == '0) && (inc_sum == '0)),
-            ("%t: *** dlmem wtrack store ack without a counted store: wid=%0d", $time, w))
+            ("%t: *** dlmem wtrack completion without a counted access: wid=%0d", $time, w))
     end
 
     assign drained = drained_r;

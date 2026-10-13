@@ -402,8 +402,9 @@ void SfuUnit::on_tick() {
 					if (!core_->lsu_drained())
 						continue; // drain LSU before the barrier
 				#ifdef VX_CFG_EXT_DLMEM_ENABLE
-					// an arrival counts only once the warp's earlier instructions committed
-					if (core_->has_pending_instrs(trace->wid))
+					// an arrival counts only once the warp's earlier instructions
+					// committed and its remote stores are acknowledged
+					if (core_->has_pending_instrs(trace->wid) || !core_->dlmem_drained(trace->wid))
 						continue;
 				#endif
 				}
@@ -418,7 +419,7 @@ void SfuUnit::on_tick() {
 					for (uint32_t t = 0; t < VX_CFG_NUM_THREADS; ++t) {
 						is_exit = is_exit && !((rs1.at(last).u >> t) & 1);
 					}
-					if (is_exit && core_->has_pending_instrs(trace->wid))
+					if (is_exit && (core_->has_pending_instrs(trace->wid) || !core_->dlmem_drained(trace->wid)))
 						continue;
 				}
 			#endif

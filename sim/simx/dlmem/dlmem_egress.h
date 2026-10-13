@@ -24,7 +24,8 @@ namespace vortex {
 // VX_dlmem_egress: serialises the remote lanes of the LSU blocks into request
 // packets, one per cycle, and returns their responses. Loads and atomics hold
 // a pending entry from issue to LSU delivery, stores a credit until their ack,
-// so the response sink never refuses a packet.
+// so the response sink never refuses a packet. AckOut reports each committed
+// store and DoneOut each load, AMO or SC that returned its data, by warp.
 //
 // NetReqOut feeds the request switch, which must tick after this object so a
 // slot it frees is seen here the cycle after, as the buffer's registered
@@ -50,6 +51,7 @@ public:
   SimChannel<DlmemReqPkt> NetReqOut;
   SimChannel<DlmemRspPkt> NetRspIn;         // never refused
   SimChannel<uint32_t>    AckOut;           // warp id of each store ack
+  SimChannel<uint32_t>    DoneOut;          // warp id of each load/AMO/SC answer
 
   DlmemEgress(const SimContext& ctx, const char* name, const Config& config);
 
@@ -71,6 +73,7 @@ private:
     bool data_valid = false;
     uint32_t block = 0;
     uint32_t lane = 0;
+    uint32_t wid = 0;
     uint64_t lsu_tag = 0;
     uint32_t cid = 0;
     uint64_t uuid = 0;

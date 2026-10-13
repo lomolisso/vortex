@@ -34,6 +34,7 @@
 #include <unistd.h>
 
 #include "dlmem/dlmem_xlate.h"
+#include "dlmem/dlmem_wtrack.h"
 #include "vectors.h"
 
 using namespace vortex;
@@ -342,7 +343,7 @@ struct Harness {
       auto& ie = bm.in.front();
       uint32_t remote = 0;
       LsuReq e = expected_out(ctx, cfg, my_core, ie.row, tm.stride, ie.req, &remote, kinds);
-      if (remote != 0 && ie.req.op == MemOp::ST) {
+      if (remote != 0) {
         bm.wt.push_back(WtInc{ie.req.wid, remote});
       }
       bm.out.push_back({std::move(e), cycle, ie.avail - 1});
@@ -363,13 +364,13 @@ struct Harness {
       }
       auto& wt = dut->WtIncOut.at(b);
       if (wt.size() != bm.wt.size()) {
-        fail(ctx, "remote-store count events " + std::to_string(wt.size()) + ", expected "
+        fail(ctx, "remote-access count events " + std::to_string(wt.size()) + ", expected "
                   + std::to_string(bm.wt.size()) + bctx);
       }
       for (auto& w : bm.wt) {
         auto& g = wt.peek();
         if (g.wid != w.wid || g.cnt != w.cnt) {
-          fail(ctx, "remote-store count {wid=" + std::to_string(g.wid) + ", cnt=" + std::to_string(g.cnt)
+          fail(ctx, "remote-access count {wid=" + std::to_string(g.wid) + ", cnt=" + std::to_string(g.cnt)
                     + "}, expected {" + std::to_string(w.wid) + ", " + std::to_string(w.cnt) + "}" + bctx);
         }
         wt.pop();
@@ -646,8 +647,9 @@ void run_vectors() {
         platform.tick();
         h.check_outputs(cycle, ready, nullptr);
       }
+      // Every remote request counts, whatever its op.
       uint32_t lanes = (v.kind == V::K_REMOTE) ? 2 : 0;
-      if (h.outputs != 3 || h.wt_events != (lanes ? 1u : 0u) || !h.drained()) {
+      if (h.outputs != 3 || h.wt_events != (lanes ? 3u : 0u) || !h.drained()) {
         fail(ctx, "stage emitted " + std::to_string(h.outputs) + " requests and "
                   + std::to_string(h.wt_events) + " count events");
       }
@@ -1115,6 +1117,96 @@ void run_fence() {
   std::cout << "fence: untranslated, in order, +1 cycle, sideband cleared: ok" << std::endl;
 }
 
+// The fence hold against the real access tracker, created after the stage as
+// in the core: a fence right behind its warp's remote store, load or AMO waits
+// for the tracker's registered drain, holds the block behind it, and leaves the
+// cycle after the last completion is counted; another warp's fence on another
+// block does not wait.
+void run_fence_hold(MemOp op) {
+  auto& platform = SimPlatform::instance();
+  platform.set_num_workers(1);
+  auto cfg = make_cfg(2, 4, 2, 14);
+  const uint64_t db = cfg.dlmem_base;
+  const uint64_t sram = uint64_t(1) << cfg.lmem_log;
+  std::string ctx = std::string("fence-hold-") + (op == MemOp::ST ? "st" : (op == MemOp::LD ? "ld" : "amo"));
+  auto dut = DlmemXlate::Create("fence-hold", cfg, 0, 2, true, false);
+  auto wt = DlmemWTrack::Create("fence-hold-wtrack", 2, cfg.nw, 255);
+  for (uint32_t b = 0; b < 2; ++b) {
+    dut->WtIncOut.at(b).bind(&wt->IncIn.at(b));
+  }
+  dut->set_drained_query([w = wt.get()](uint32_t wid) { return w->drained(wid); });
+  platform.reset();
+
+  uint64_t cycle = 0;
+  std::vector<int64_t> left(8, -1);  // tick each uuid left the stage
+  int64_t zero_tick = -1;            // tick the tracker's count of warp 2 returned to zero
+  auto step = [&]() {
+    platform.tick();
+    for (uint32_t b = 0; b < 2; ++b) {
+      auto& out = dut->ReqOut.at(b);
+      while (!out.empty()) {
+        left.at(out.peek().uuid) = cycle;
+        out.pop();
+      }
+    }
+    if (zero_tick < 0 && left[1] >= 0 && wt->count(2) == 0) {
+      zero_tick = cycle;
+    }
+    ++cycle;
+  };
+  auto fence = [&](uint64_t uuid, uint32_t wid) {
+    LsuReq req = window_req(uuid, wid, 0, MemOp::FLUSH);
+    req.flags.fence = 1;
+    return req;
+  };
+
+  // Slot 2: rank 1 lives on core 1, so both lanes of the access are remote.
+  dut->PeerWrIn.send({2, dlmem_ref::Row{2, {{0, 2}, {1, 3}}}, 0x1000}, 1);
+  step();
+  dut->ReqIn.at(0).send(window_req(1, 2, db + sram + 0x40, op), 1);
+  step();
+  dut->ReqIn.at(0).send(fence(2, 2), 1);
+  dut->ReqIn.at(1).send(fence(3, 1), 1);
+  step();
+  if (left[1] != 2 || wt->count(2) != 2 || wt->drained(2)) {
+    fail(ctx, "the remote access left at tick " + std::to_string(left[1]) + " counting "
+              + std::to_string(wt->count(2)) + " (drained=" + std::to_string(wt->drained(2)) + ")");
+  }
+  dut->ReqIn.at(0).send(window_req(4, 2, db + 0x80), 1);
+  for (uint32_t k = 0; k < 6; ++k) {
+    step();
+  }
+  auto check_held = [&]() {
+    if (left[2] >= 0 || left[4] >= 0) {
+      fail(ctx, "the fence of warp 2 left at tick " + std::to_string(left[2]) + " and the load behind it at "
+                + std::to_string(left[4]) + " with " + std::to_string(wt->count(2)) + " accesses unperformed");
+    }
+  };
+  check_held();
+  if (left[3] != 3) {
+    fail(ctx, "the fence of warp 1 left at tick " + std::to_string(left[3]) + ", expected 3");
+  }
+  // The egress reports one completion per cycle: a store's ack, a load's or AMO's done.
+  for (uint32_t k = 0; k < 2; ++k) {
+    (op == MemOp::ST ? wt->DecIn : wt->DoneIn).send(2, 1);
+    step();
+    check_held();
+  }
+  for (uint32_t k = 0; k < 4; ++k) {
+    step();
+  }
+  if (zero_tick < 0 || left[2] != zero_tick + 1 || left[4] != zero_tick + 2) {
+    fail(ctx, "the last completion was counted at tick " + std::to_string(zero_tick) + ", the fence left at "
+              + std::to_string(left[2]) + " and the load at " + std::to_string(left[4]));
+  }
+  if (!dut->empty() || !wt->empty() || !platform.idle()) {
+    fail(ctx, "stage or tracker not empty at the end");
+  }
+  platform.finalize();
+  std::cout << ctx << ": held behind its warp's remote accesses until the registered drain (+1 cycle): ok"
+            << std::endl;
+}
+
 ///////////////////////////////////////////////////////////////////////////////
 // Out-of-bounds and remote aborts, each in a child process
 
@@ -1272,6 +1364,9 @@ int main(int argc, char** argv) {
   }
   if (mode == "all" || mode == "fence") {
     run_fence();
+    for (MemOp op : {MemOp::ST, MemOp::LD, MemOp::AMO_ADD}) {
+      run_fence_hold(op);
+    }
   }
   if (mode == "all" || mode == "random") {
     run_random_all(seed, reqs, workers);

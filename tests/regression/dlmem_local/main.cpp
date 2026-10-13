@@ -1,6 +1,6 @@
-// dlmem_local: the distributed local memory window between blocks of a cluster
-// that share a core (DEFAULT clusters, and SPREAD clusters of one block), on a
-// DLMEM device (RV64).
+// dlmem_local: the distributed local memory window between the blocks of a
+// cluster, on a DLMEM device (RV64): same-core peers (DEFAULT clusters) and,
+// with -s and K > 1, peers on other cores (SPREAD clusters).
 //
 //   default  three launches in one process: SPREAD K = 1 with 1 KB of local
 //            memory per block, DEFAULT K = min(2, MAX) with 64 B and DEFAULT
@@ -23,16 +23,17 @@
 //   -e       exit stress: many clusters, each block ending with window stores
 //            to its own rank, read back by the slot's next block
 //   -p       parity mode: one launch of fixed window loops on the next rank's
-//            slice (K = 1, or -k), no spin and no data-dependent trip count
+//            slice (K = 1, or -k; -s for SPREAD), no spin and no data-dependent
+//            trip count
 //   -b       burst mode: one-thread blocks (K = 1), each keeping eight one-lane
 //            global loads in flight, more than the LSU holds at once
-//   -x mode  a run that must stop the simulator: oob (rank 2 of a 2-block
-//            cluster, needs MAX >= 3) or remote (SPREAD K = 2, rank 0 storing to
-//            rank 1 on another core)
+//   -x oob   a run that must stop the simulator: rank 0 stores to rank 2 of a
+//            2-block cluster (needs MAX >= 3)
 //   -v       print every cluster's placement (core:slot by rank)
 //
 // Until the hardware cluster barrier is used (-c), a DEFAULT cluster syncs on a
 // local barrier of its base slot: its blocks sit in consecutive slots of one core.
+// A SPREAD cluster of more than one block always uses the cluster barrier.
 // A default launch the device cannot hold prints SKIPPED; a requested one fails.
 
 #include <vortex2.h>
@@ -97,7 +98,7 @@ struct Launch {
 
 void usage() {
   std::printf("Usage: [-k K] [-s | -d] [-n clusters] [-w warps per block] [-l bytes]..."
-              " [-t mask] [-c] [-e] [-p] [-b] [-x oob|remote] [-v] [-h]\n");
+              " [-t mask] [-c] [-e] [-p] [-b] [-x oob] [-v] [-h]\n");
 }
 
 void parse_args(int argc, char** argv) {
@@ -118,8 +119,6 @@ void parse_args(int argc, char** argv) {
       case 'x':
         if (!std::strcmp(optarg, "oob")) {
           neg_mode = NEG_OOB;
-        } else if (!std::strcmp(optarg, "remote")) {
-          neg_mode = NEG_REMOTE;
         } else {
           usage();
           std::exit(-1);
@@ -175,12 +174,10 @@ std::string infeasible(const Caps& caps, const Launch& L) {
   if (L.kind == Kind::Parity && L.lmem < 2 * L.k * nt * sizeof(uint32_t))
     return "the parity loops need two words per thread of the cluster";
   if (L.kind == Kind::Neg) {
-    if (neg_mode == NEG_OOB && caps.max_cluster < 3)
+    if (caps.max_cluster < 3)
       return "rank 2 lies past the window unless MAX >= 3";
     return "";
   }
-  if (L.policy == VX_CLUSTER_POLICY_SPREAD && L.k > 1)
-    return "SPREAD with K > 1 places peers on other cores (remote access)";
   // A same-core cluster syncs on one core, so all its blocks must fit there.
   if (L.policy == VX_CLUSTER_POLICY_DEFAULT && slots_per_core(caps, L) < L.k) {
     std::snprintf(buf, sizeof(buf), "a core holds %u such blocks, the cluster needs %u",
@@ -214,9 +211,11 @@ int run_launch(vx_device_h dev, vx_queue_h q, vx_module_h mod, const Caps& caps,
   r.num_blocks = L.g * L.k;
   r.nt = block_threads(caps, L);
   const uint32_t tests = (L.kind == Kind::Neg) ? neg_mode : (1u << (test - 1));
+  // A local barrier cannot reach blocks on other cores.
+  const bool cbar = use_cbar || (L.policy == VX_CLUSTER_POLICY_SPREAD && L.k > 1);
   std::printf("dlmem_local: %s, %s K=%u, %u clusters, %u warps and %u bytes of local memory"
               " per block, seed %#x%s\n", kname, policy_name(L.policy), L.k, L.g,
-              L.w, L.lmem, seed, use_cbar ? ", cluster_group::sync()" : "");
+              L.w, L.lmem, seed, cbar ? ", cluster_group::sync()" : "");
 
   vx_kernel_h kernel = nullptr;
   CHECK(vx_module_get_kernel(mod, kname, &kernel));
@@ -255,7 +254,7 @@ int run_launch(vx_device_h dev, vx_queue_h q, vx_module_h mod, const Caps& caps,
   arg.lmem_bytes = L.lmem;
   arg.seed       = seed;
   arg.tests      = tests;
-  arg.flags      = (caps.atomics() ? FLAG_ATOMICS : 0) | (use_cbar ? FLAG_CBAR : 0);
+  arg.flags      = (caps.atomics() ? FLAG_ATOMICS : 0) | (cbar ? FLAG_CBAR : 0);
 
   vx_launch_info_t li = {};
   li.struct_size    = sizeof(li);
@@ -297,8 +296,7 @@ int run_launch(vx_device_h dev, vx_queue_h q, vx_module_h mod, const Caps& caps,
   };
 
   if (L.kind == Kind::Neg) {
-    std::printf("Error: the %s window store did not stop the simulation\n",
-                neg_mode == NEG_OOB ? "out-of-bounds" : "remote");
+    std::printf("Error: the out-of-bounds window store did not stop the simulation\n");
     return 1;
   }
 
@@ -459,12 +457,9 @@ int main(int argc, char** argv) {
     }
   };
   if (neg_mode != 0) {
-    if (neg_mode == NEG_OOB)
-      add(Kind::Neg, D, 2, 64, true);
-    else
-      add(Kind::Neg, S, 2, 64, true);
+    add(Kind::Neg, D, 2, 64, true);
   } else if (parity) {
-    add(Kind::Parity, D, req_k ? req_k : 1, kParityLmem, true);
+    add(Kind::Parity, (req_policy < 0) ? D : (uint32_t)req_policy, req_k ? req_k : 1, kParityLmem, true);
   } else if (burst) {
     add(Kind::Burst, D, 1, 64, true);
   } else if (exit_mode) {

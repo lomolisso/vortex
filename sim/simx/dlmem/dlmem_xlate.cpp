@@ -97,14 +97,18 @@ void DlmemXlate::on_tick() {
   for (uint32_t b = 0; b < num_blocks_; ++b) {
     auto& in = ReqIn.at(b);
     auto& out = ReqOut.at(b);
-    if (!in.empty() && !out.full()) {
+    // The fence waits at the stage output, so the requests behind it wait too.
+    bool hold = !in.empty() && in.peek().flags.fence && drained_ && !drained_(in.peek().wid);
+    if (!in.empty() && !out.full() && !hold) {
       auto& entry_rows = entry_rows_.at(b);
       __assert(!entry_rows.empty(), "block " << b << " request without its entry row");
       LsuReq req = in.peek();
       uint32_t remote = this->translate(req, *entry_rows.front());
-      // AMOs return data, so only plain stores need a remote-ack count.
-      if (remote != 0 && req.op == MemOp::ST) {
-        WtIncOut.at(b).send(WtInc{req.wid, remote}, 1);
+      // A fence does not wait for responses, so loads and AMOs are tracked
+      // as stores are. The tracker counts it in this cycle, as the RTL's
+      // combinational increment, and must tick after this stage.
+      if (remote != 0) {
+        WtIncOut.at(b).send(WtInc{req.wid, remote}, 0);
       }
       DT(3, this->name() << " block" << b << " xlate: " << req);
       out.send(std::move(req), 1);

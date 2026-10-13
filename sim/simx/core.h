@@ -125,8 +125,15 @@ public:
     return socket_;
   }
 
+#ifdef VX_CFG_EXT_DLMEM_ENABLE
+  // LocalMem ports: the LSU's, the DLMEM ingress in their round-robin class,
+  // then the DXA's from here, then the TCU tile buffer.
+  static constexpr uint32_t LMEM_INGRESS_PORT = LSU_NUM_REQS;
+  static constexpr uint32_t LMEM_DXA_PORT = LSU_NUM_REQS + 1;
+#else
   // LocalMem ports: the LSU's, then the DXA's from here, then the TCU tile buffer.
   static constexpr uint32_t LMEM_DXA_PORT = LSU_NUM_REQS;
+#endif
 
   const std::shared_ptr<LocalMem>& local_mem() const;
 
@@ -153,6 +160,15 @@ public:
 
   // Used by LsuUnit to drive the per-block load/store switch.
   const std::shared_ptr<LocalMemSwitch>& lmem_switch(uint32_t idx) const;
+
+#ifdef VX_CFG_EXT_DLMEM_ENABLE
+  // The access tracker's registered drained[wid]: no remote access of the warp unperformed.
+  bool dlmem_drained(uint32_t wid) const;
+
+  // Store acks and load/AMO/SC answers from the socket's DLMEM egress, as warp ids.
+  SimChannel<uint32_t>& dlmem_ack_in();
+  SimChannel<uint32_t>& dlmem_done_in();
+#endif
 
   ProcessorImpl* processor() const;
 

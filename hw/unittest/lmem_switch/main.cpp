@@ -11,11 +11,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// VX_lmem_switch testbench: LSU requests with all-global, all-local and mixed
-// lane masks (loads, stores, AMOs) under independent random back-pressure on
-// the two memory ports. Each port must see every request that has lanes for it
-// exactly once, in order, with its lane subset and an unchanged payload, and
-// every port response must reach the LSU exactly once.
+// VX_lmem_switch testbench: LSU requests with single-side and mixed lane
+// masks (loads, stores, AMOs) under independent random back-pressure on the
+// memory ports: global and local, plus remote in DLMEM builds. Each port must
+// see every request that has lanes for it exactly once, in order, with its
+// lane subset and an unchanged payload, and every port response must reach the
+// LSU exactly once. In DLMEM builds the round-robin response merge is also
+// checked: a waiting port response is passed over at most NUM_SIDES-1 times.
 
 #include "vl_simulator.h"
 #include "VVX_lmem_switch_top.h"
@@ -53,7 +55,17 @@ constexpr uint32_t TAG_MASK  = (1u << TAG_BITS) - 1;
 
 constexpr int GLOBAL = 0;
 constexpr int LOCAL  = 1;
-static const char* const side_name[2] = {"global", "local"};
+#ifdef VX_CFG_EXT_DLMEM_ENABLE
+constexpr int REMOTE    = 2;
+constexpr int NUM_SIDES = 3;
+// The top's DLMEM default: round-robin merge, so fairness is checkable.
+constexpr bool RR_MERGE = true;
+#else
+constexpr int REMOTE    = -1;
+constexpr int NUM_SIDES = 2;
+constexpr bool RR_MERGE = false;
+#endif
+static const char* const side_name[3] = {"global", "local", "remote"};
 
 static_assert(NUM_LANES >= 1 && NUM_LANES <= 32, "unsupported lane count");
 static_assert(WORD_SIZE == 4 || WORD_SIZE == 8, "unsupported XLEN");
@@ -121,6 +133,7 @@ struct Req {
   bool     rw     = false;
   uint32_t mask   = 0;
   uint32_t local  = 0; // per-lane is_addr_local, also on inactive lanes
+  uint32_t remote = 0; // per-lane is_addr_remote, also on inactive lanes
   uint32_t amo    = 0; // per-lane amo_valid
   uint32_t tag    = 0;
   std::array<uint64_t, NUM_LANES> addr{};
@@ -128,8 +141,19 @@ struct Req {
   std::array<uint32_t, NUM_LANES> byteen{};
   std::array<uint32_t, NUM_LANES> amo_op{};
 
+  // A remote lane goes remote whatever its local bit says.
   uint32_t side_mask(int side) const {
-    return (side == LOCAL) ? (mask & local) : (mask & ~local & LANE_MASK);
+    if (side == REMOTE) {
+      return mask & remote;
+    }
+    return (side == LOCAL) ? (mask & local & ~remote) : (mask & ~local & ~remote & LANE_MASK);
+  }
+  int num_sides() const {
+    int n = 0;
+    for (int s = 0; s < NUM_SIDES; ++s) {
+      n += (side_mask(s) != 0);
+    }
+    return n;
   }
   bool expects_rsp() const {
     return !rw;
@@ -145,7 +169,7 @@ struct Rsp {
 };
 
 static bool same_payload(const Req& a, const Req& b) {
-  return a.rw == b.rw && a.mask == b.mask && a.local == b.local && a.amo == b.amo
+  return a.rw == b.rw && a.mask == b.mask && a.local == b.local && a.remote == b.remote && a.amo == b.amo
       && a.tag == b.tag && a.addr == b.addr && a.data == b.data
       && a.byteen == b.byteen && a.amo_op == b.amo_op;
 }
@@ -155,8 +179,8 @@ static bool same_payload(const Rsp& a, const Rsp& b) {
 }
 
 static std::string to_string(const Req& r) {
-  std::string s = strf("{%s mask=0x%x local=0x%x amo=0x%x tag=0x%x", r.rw ? "st" : (r.amo ? "amo" : "ld"),
-                       r.mask, r.local, r.amo, r.tag);
+  std::string s = strf("{%s mask=0x%x local=0x%x remote=0x%x amo=0x%x tag=0x%x", r.rw ? "st" : (r.amo ? "amo" : "ld"),
+                       r.mask, r.local, r.remote, r.amo, r.tag);
   for (uint32_t i = 0; i < NUM_LANES; ++i) {
     s += strf(" [%u]a=0x%" PRIx64 ",d=0x%" PRIx64 ",be=0x%x,op=%u", i, r.addr[i], r.data[i], r.byteen[i], r.amo_op[i]);
   }
@@ -202,17 +226,29 @@ public:
   }
 
   int run() {
-    std::printf("lmem_switch: XLEN=%u lanes=%u addr_bits=%u tag_bits=%u seed=%u requests=%u\n",
-                XLEN, NUM_LANES, ADDR_BITS, TAG_BITS, opts_.seed, opts_.requests);
+    std::printf("lmem_switch: XLEN=%u lanes=%u sides=%d addr_bits=%u tag_bits=%u seed=%u requests=%u\n",
+                XLEN, NUM_LANES, NUM_SIDES, ADDR_BITS, TAG_BITS, opts_.seed, opts_.requests);
     this->directed();
+    if (RR_MERGE && failures_ == 0) {
+      this->merge_fairness();
+    }
     if (failures_ == 0) {
       this->random();
     }
     this->drain("final");
     this->final_check();
-    std::printf("total cycles: %" PRIu64 ", requests: %" PRIu64 " (mixed %" PRIu64 "), "
-                "port requests: global %" PRIu64 " local %" PRIu64 ", responses: %" PRIu64 "\n",
-                cycle_, n_in_, n_mixed_, n_out_[GLOBAL], n_out_[LOCAL], n_rsp_);
+    std::string ports;
+    for (int s = 0; s < NUM_SIDES; ++s) {
+      ports += strf(" %s %" PRIu64, side_name[s], n_out_[s]);
+    }
+    std::printf("total cycles: %" PRIu64 ", requests: %" PRIu64 " (mixed %" PRIu64 ", all sides %" PRIu64 "), "
+                "port requests:%s, responses: %" PRIu64 "\n",
+                cycle_, n_in_, n_mixed_, n_all_sides_, ports.c_str(), n_rsp_);
+    if (RR_MERGE) {
+      std::printf("response merge: most times a waiting response was passed over: global %u local %u remote %u "
+                  "(bound %d), cycles with all port responses waiting: %" PRIu64 "\n",
+                  max_bypass_[GLOBAL], max_bypass_[LOCAL], max_bypass_[NUM_SIDES - 1], NUM_SIDES - 1, n_all_rsp_);
+    }
     if (failures_ != 0) {
       std::printf("FAILED: %u check(s) failed\n", failures_);
       return 1;
@@ -233,25 +269,37 @@ private:
     return rand_below(100) < pct;
   }
 
-  // kind: 0 = all lanes global, 1 = all lanes local, 2 = both
-  Req make_req(int kind) {
+  // A request whose active lanes cover exactly the sides in `sides`.
+  Req make_req_sides(uint32_t op, const std::vector<int>& sides) {
     Req r;
-    uint32_t op = rand_below(3); // load, store, AMO
     r.rw = (op == 1);
+    const uint32_t need = static_cast<uint32_t>(sides.size());
     do {
       r.mask = static_cast<uint32_t>(rng_()) & LANE_MASK;
-    } while (r.mask == 0 || (kind == 2 && __builtin_popcount(r.mask) < 2));
-    uint32_t junk = static_cast<uint32_t>(rng_()) & ~r.mask & LANE_MASK;
-    if (kind == 0) {
-      r.local = junk;
-    } else if (kind == 1) {
-      r.local = r.mask | junk;
-    } else {
-      uint32_t lsel;
-      do {
-        lsel = static_cast<uint32_t>(rng_()) & r.mask;
-      } while (lsel == 0 || lsel == r.mask);
-      r.local = lsel | junk;
+    } while (static_cast<uint32_t>(__builtin_popcount(r.mask)) < need);
+    std::vector<uint32_t> lanes;
+    for (uint32_t i = 0; i < NUM_LANES; ++i) {
+      if ((r.mask >> i) & 1) {
+        lanes.push_back(i);
+      }
+    }
+    std::shuffle(lanes.begin(), lanes.end(), rng_);
+    for (size_t k = 0; k < lanes.size(); ++k) {
+      int side = (k < need) ? sides[k] : sides[this->rand_below(need)];
+      uint32_t bit = 1u << lanes[k];
+      if (side == LOCAL) {
+        r.local |= bit;
+      } else if (side == REMOTE) {
+        r.remote |= bit;
+        if (this->chance(50)) {
+          r.local |= bit;
+        }
+      }
+    }
+    uint32_t inactive = ~r.mask & LANE_MASK;
+    r.local |= static_cast<uint32_t>(rng_()) & inactive;
+    if (NUM_SIDES > 2) {
+      r.remote |= static_cast<uint32_t>(rng_()) & inactive;
     }
     r.amo = (op == 2) ? LANE_MASK : 0;
     r.tag = static_cast<uint32_t>(rng_()) & TAG_MASK;
@@ -265,12 +313,33 @@ private:
     return r;
   }
 
+  // kind: a side index for a single-side request, or MIXED for two or more sides
+  static constexpr int MIXED = NUM_SIDES;
+
+  Req make_req(int kind) {
+    uint32_t op = rand_below(3); // load, store, AMO
+    if (kind != MIXED) {
+      return this->make_req_sides(op, {kind});
+    }
+    std::vector<int> sides;
+    do {
+      sides.clear();
+      for (int s = 0; s < NUM_SIDES; ++s) {
+        if (this->chance(60)) {
+          sides.push_back(s);
+        }
+      }
+    } while (sides.size() < 2 || sides.size() > NUM_LANES);
+    return this->make_req_sides(op, sides);
+  }
+
   int rand_kind() {
     if (NUM_LANES < 2) {
-      return rand_below(2);
+      return rand_below(NUM_SIDES);
     }
-    uint32_t p = rand_below(100);
-    return (p < 20) ? 0 : (p < 40) ? 1 : 2;
+    // 40% single-side requests, split evenly over the sides
+    uint32_t p = rand_below(100 * NUM_SIDES);
+    return (p < 40u * NUM_SIDES) ? static_cast<int>(p / 40u) : MIXED;
   }
 
   // Response words carry the request sequence and side, so a misrouted or
@@ -282,7 +351,7 @@ private:
     p.mask = r.side_mask(side);
     p.tag  = r.tag;
     for (uint32_t i = 0; i < NUM_LANES; ++i) {
-      uint64_t id = (r.seq << 6) | (static_cast<uint64_t>(side) << 5) | i;
+      uint64_t id = (r.seq << 7) | (static_cast<uint64_t>(side) << 5) | i;
       p.data[i] = ((p.mask >> i) & 1) ? ((id * 0x9e3779b97f4a7c15ull) & WORD_MASK) : (rng_() & WORD_MASK);
     }
     return p;
@@ -298,6 +367,9 @@ private:
     t->in_req_rw    = r.rw;
     set_bits(t->in_req_mask, 0, NUM_LANES, r.mask);
     set_bits(t->in_req_local, 0, NUM_LANES, r.local);
+#ifdef VX_CFG_EXT_DLMEM_ENABLE
+    set_bits(t->in_req_remote, 0, NUM_LANES, r.remote);
+#endif
     set_bits(t->in_req_amo, 0, NUM_LANES, r.amo);
     set_bits(t->in_req_tag, 0, TAG_BITS, r.tag);
     for (uint32_t i = 0; i < NUM_LANES; ++i) {
@@ -307,7 +379,7 @@ private:
       set_bits(t->in_req_amo_op, i * AMO_OP_BITS, AMO_OP_BITS, r.amo_op[i]);
     }
     t->in_rsp_ready = in_rsp_ready_;
-    for (int s = 0; s < 2; ++s) {
+    for (int s = 0; s < NUM_SIDES; ++s) {
       Rsp p = out_rsp_[s].value_or(Rsp{});
       set_bits(t->out_req_ready, s, 1, out_req_ready_[s]);
       set_bits(t->out_rsp_valid, s, 1, out_rsp_[s].has_value());
@@ -325,6 +397,9 @@ private:
     r.rw    = get_bits(t->out_req_rw, s, 1);
     r.mask  = static_cast<uint32_t>(get_bits(t->out_req_mask, s * NUM_LANES, NUM_LANES));
     r.local = static_cast<uint32_t>(get_bits(t->out_req_local, s * NUM_LANES, NUM_LANES));
+#ifdef VX_CFG_EXT_DLMEM_ENABLE
+    r.remote = static_cast<uint32_t>(get_bits(t->out_req_remote, s * NUM_LANES, NUM_LANES));
+#endif
     r.amo   = static_cast<uint32_t>(get_bits(t->out_req_amo, s * NUM_LANES, NUM_LANES));
     r.tag   = static_cast<uint32_t>(get_bits(t->out_req_tag, s * TAG_BITS, TAG_BITS));
     for (uint32_t i = 0; i < NUM_LANES; ++i) {
@@ -360,7 +435,7 @@ private:
   // One cycle: drive, sample every handshake before the edge, check, clock.
   void clock() {
     auto* t = sim_.operator->();
-    for (int s = 0; s < 2; ++s) {
+    for (int s = 0; s < NUM_SIDES; ++s) {
       if (pressure_[s].req_ready_force) {
         out_req_ready_[s] = *pressure_[s].req_ready_force;
       } else {
@@ -380,15 +455,18 @@ private:
 
     if (in_req_ && t->in_req_ready) {
       const Req& r = *in_req_;
-      for (int s = 0; s < 2; ++s) {
+      for (int s = 0; s < NUM_SIDES; ++s) {
         if (r.side_mask(s) != 0) {
           Req e = r;
           e.mask = r.side_mask(s);
           exp_req_[s].push_back(e);
         }
       }
-      if (r.side_mask(GLOBAL) != 0 && r.side_mask(LOCAL) != 0) {
+      if (r.num_sides() >= 2) {
         ++n_mixed_;
+      }
+      if (r.num_sides() == NUM_SIDES) {
+        ++n_all_sides_;
       }
       issued_.push_back(r);
       ++n_in_;
@@ -396,7 +474,15 @@ private:
       progress = true;
     }
 
-    for (int s = 0; s < 2; ++s) {
+    int n_rsp_taken = 0;
+    bool all_rsp_waiting = true;
+    std::array<bool, NUM_SIDES> rsp_waiting{};
+    std::array<bool, NUM_SIDES> rsp_taken{};
+    for (int s = 0; s < NUM_SIDES; ++s) {
+      rsp_waiting[s] = out_rsp_[s].has_value();
+      all_rsp_waiting = all_rsp_waiting && rsp_waiting[s];
+    }
+    for (int s = 0; s < NUM_SIDES; ++s) {
       if (get_bits(t->out_req_valid, s, 1) && out_req_ready_[s]) {
         Req got = this->sample_out_req(s);
         ++n_out_[s];
@@ -421,7 +507,26 @@ private:
       if (out_rsp_[s] && get_bits(t->out_rsp_ready, s, 1)) {
         exp_rsp_[s].push_back(*out_rsp_[s]);
         out_rsp_[s].reset();
+        rsp_taken[s] = true;
+        ++n_rsp_taken;
         progress = true;
+      }
+    }
+    if (n_rsp_taken > 1) {
+      this->fail(strf("%d port responses accepted in one cycle, the merge takes one", n_rsp_taken));
+    }
+    if (RR_MERGE) {
+      n_all_rsp_ += all_rsp_waiting;
+      for (int s = 0; s < NUM_SIDES; ++s) {
+        if (rsp_taken[s]) {
+          bypass_[s] = 0;
+        } else if (rsp_waiting[s] && n_rsp_taken != 0) {
+          max_bypass_[s] = std::max(max_bypass_[s], ++bypass_[s]);
+          if (bypass_[s] == NUM_SIDES) {
+            this->fail(strf("%s port response passed over %d times in a row by the round-robin merge",
+                            side_name[s], NUM_SIDES));
+          }
+        }
       }
     }
 
@@ -430,7 +535,7 @@ private:
       ++n_rsp_;
       progress = true;
       bool matched = false;
-      for (int s = 0; s < 2 && !matched; ++s) {
+      for (int s = 0; s < NUM_SIDES && !matched; ++s) {
         if (!exp_rsp_[s].empty() && same_payload(got, exp_rsp_[s].front())) {
           ++rsp_count_[s].at(exp_rsp_[s].front().seq);
           exp_rsp_[s].pop_front();
@@ -439,7 +544,7 @@ private:
       }
       if (!matched) {
         std::string heads;
-        for (int s = 0; s < 2; ++s) {
+        for (int s = 0; s < NUM_SIDES; ++s) {
           heads += strf("\n  %s head: %s", side_name[s],
                         exp_rsp_[s].empty() ? "(none)" : to_string(exp_rsp_[s].front()).c_str());
         }
@@ -456,35 +561,37 @@ private:
   }
 
   bool outstanding() const {
-    return in_req_.has_value()
-        || !exp_req_[0].empty() || !exp_req_[1].empty()
-        || !mem_q_[0].empty() || !mem_q_[1].empty()
-        || out_rsp_[0].has_value() || out_rsp_[1].has_value()
-        || !exp_rsp_[0].empty() || !exp_rsp_[1].empty();
+    bool any = in_req_.has_value();
+    for (int s = 0; s < NUM_SIDES; ++s) {
+      any = any || !exp_req_[s].empty() || !mem_q_[s].empty() || out_rsp_[s].has_value() || !exp_rsp_[s].empty();
+    }
+    return any;
   }
 
   bool watchdog() {
     if (cycle_ - last_progress_ <= opts_.watchdog) {
       return true;
     }
-    this->fail(strf("no progress for %u cycles: input %s, port requests owed global %zu local %zu, "
-                    "responses owed to the LSU global %zu local %zu",
-                    opts_.watchdog, in_req_ ? "pending" : "idle",
-                    exp_req_[0].size(), exp_req_[1].size(),
-                    exp_rsp_[0].size() + mem_q_[0].size() + out_rsp_[0].has_value(),
-                    exp_rsp_[1].size() + mem_q_[1].size() + out_rsp_[1].has_value()));
+    std::string owed;
+    for (int s = 0; s < NUM_SIDES; ++s) {
+      owed += strf(", %s: %zu port request(s), %zu response(s) owed to the LSU", side_name[s], exp_req_[s].size(),
+                   exp_rsp_[s].size() + mem_q_[s].size() + out_rsp_[s].has_value());
+    }
+    this->fail(strf("no progress for %u cycles: input %s%s",
+                    opts_.watchdog, in_req_ ? "pending" : "idle", owed.c_str()));
     return false;
   }
 
   void submit(Req r) {
     r.seq = rsp_count_[0].size();
     in_req_ = r;
-    rsp_count_[0].push_back(0);
-    rsp_count_[1].push_back(0);
+    for (int s = 0; s < NUM_SIDES; ++s) {
+      rsp_count_[s].push_back(0);
+    }
   }
 
   void drain(const char* ctx) {
-    for (int s = 0; s < 2; ++s) {
+    for (int s = 0; s < NUM_SIDES; ++s) {
       pressure_[s] = Pressure{};
     }
     lsu_rsp_ready_pct_ = 100;
@@ -503,8 +610,8 @@ private:
 
   ///////////////////////////////////////////////////////////////////////////
   // directed: a single-port request fills the stalled port's output buffer,
-  // then a mixed request waits on it for several cycles while the other port
-  // is ready the whole time; the ready port must take the mixed request once.
+  // then a mixed request waits on it for several cycles while the other ports
+  // are ready the whole time; each ready port must take the mixed request once.
 
   void wait_accept() {
     last_progress_ = cycle_;
@@ -519,43 +626,97 @@ private:
 
   void directed() {
     if (NUM_LANES < 2) {
-      std::printf("directed: one lane cannot mix global and local, skipped\n");
+      std::printf("directed: one lane cannot mix sides, skipped\n");
       return;
     }
-    for (int stalled = 0; stalled < 2; ++stalled) {
-      for (int op = 0; op < 3; ++op) {
-        uint32_t before = failures_;
-        uint64_t n_before[2] = {n_out_[0], n_out_[1]};
-        int other = 1 - stalled;
-        pressure_[stalled].req_ready_force = false;
-        pressure_[other].req_ready_force = true;
-        this->submit(this->make_req(stalled == GLOBAL ? 0 : 1));
-        this->wait_accept();
-        Req r;
-        do {
-          r = this->make_req(2);
-        } while ((op == 1) != r.rw || (op == 2) != (r.amo != 0));
-        this->submit(r);
-        for (int i = 0; i < 8; ++i) {
-          this->clock();
+    for (int stalled = 0; stalled < NUM_SIDES; ++stalled) {
+      // Every other side when the lanes allow it, else one other side in turn.
+      std::vector<std::vector<int>> mixes;
+      if (NUM_LANES >= static_cast<uint32_t>(NUM_SIDES)) {
+        std::vector<int> all;
+        for (int s = 0; s < NUM_SIDES; ++s) {
+          all.push_back(s);
         }
-        pressure_[stalled].req_ready_force = true;
-        this->wait_accept();
-        this->drain("directed");
-        const char* kind = (op == 0) ? "load" : (op == 1) ? "store" : "AMO";
-        uint64_t got[2] = {n_out_[0] - n_before[0], n_out_[1] - n_before[1]};
-        uint64_t want[2];
-        want[stalled] = 2;
-        want[other] = 1;
-        if (got[0] != want[0] || got[1] != want[1]) {
-          this->fail(strf("directed %s, %s port stalled: global port took %" PRIu64 " request(s), local %" PRIu64
-                          ", expected %" PRIu64 " and %" PRIu64,
-                          kind, side_name[stalled], got[0], got[1], want[0], want[1]));
+        mixes.push_back(all);
+      } else {
+        for (int s = 0; s < NUM_SIDES; ++s) {
+          if (s != stalled) {
+            mixes.push_back({stalled, s});
+          }
         }
-        std::printf("directed: mixed %s, %s port stalled 8 cycles: %s\n", kind, side_name[stalled],
-                    (failures_ == before) ? "ok" : "FAILED");
+      }
+      for (const auto& sides : mixes) {
+        for (uint32_t op = 0; op < 3; ++op) {
+          uint32_t before = failures_;
+          std::array<uint64_t, NUM_SIDES> n_before = n_out_;
+          for (int s = 0; s < NUM_SIDES; ++s) {
+            pressure_[s].req_ready_force = (s != stalled);
+          }
+          this->submit(this->make_req_sides(rand_below(3), {stalled}));
+          this->wait_accept();
+          this->submit(this->make_req_sides(op, sides));
+          for (int i = 0; i < 8; ++i) {
+            this->clock();
+          }
+          pressure_[stalled].req_ready_force = true;
+          this->wait_accept();
+          this->drain("directed");
+          const char* kind = (op == 0) ? "load" : (op == 1) ? "store" : "AMO";
+          std::string got_s, want_s, mix_s;
+          bool bad = false;
+          for (int s = 0; s < NUM_SIDES; ++s) {
+            bool in_mix = std::find(sides.begin(), sides.end(), s) != sides.end();
+            uint64_t want = (s == stalled) ? 2 : (in_mix ? 1 : 0);
+            uint64_t got = n_out_[s] - n_before[s];
+            bad = bad || (got != want);
+            got_s += strf(" %s %" PRIu64, side_name[s], got);
+            want_s += strf(" %s %" PRIu64, side_name[s], want);
+            if (in_mix) {
+              mix_s += strf("%s%s", mix_s.empty() ? "" : "+", side_name[s]);
+            }
+          }
+          if (bad) {
+            this->fail(strf("directed %s over %s, %s port stalled: ports took%s request(s), expected%s",
+                            kind, mix_s.c_str(), side_name[stalled], got_s.c_str(), want_s.c_str()));
+          }
+          std::printf("directed: %s over %s, %s port stalled 8 cycles: %s\n", kind, mix_s.c_str(),
+                      side_name[stalled], (failures_ == before) ? "ok" : "FAILED");
+        }
       }
     }
+  }
+
+  // Every port holds responses while the LSU takes one per cycle: the merge
+  // must rotate over the ports (the per-cycle bound is checked in clock()).
+  void merge_fairness() {
+    const uint32_t per_side = 24;
+    uint32_t before = failures_;
+    uint64_t all_before = n_all_rsp_;
+    for (int s = 0; s < NUM_SIDES; ++s) {
+      pressure_[s].req_ready_force = true;
+      pressure_[s].rsp_valid_pct = 0;
+    }
+    lsu_rsp_ready_pct_ = 100;
+    max_lat_ = 1;
+    for (uint32_t n = 0; n < per_side; ++n) {
+      for (int s = 0; s < NUM_SIDES; ++s) {
+        this->submit(this->make_req_sides(0, {s}));
+        this->wait_accept();
+      }
+    }
+    for (int i = 0; i < 4; ++i) {
+      this->clock();
+    }
+    for (int s = 0; s < NUM_SIDES; ++s) {
+      pressure_[s].rsp_valid_pct = 100;
+    }
+    this->drain("merge fairness");
+    uint64_t all_waiting = n_all_rsp_ - all_before;
+    if (all_waiting < per_side) {
+      this->fail(strf("merge fairness: every port had a response waiting on only %" PRIu64 " cycle(s)", all_waiting));
+    }
+    std::printf("merge fairness: %u loads per port, every port waiting on %" PRIu64 " cycle(s): %s\n",
+                per_side, all_waiting, (failures_ == before) ? "ok" : "FAILED");
   }
 
   ///////////////////////////////////////////////////////////////////////////
@@ -564,7 +725,7 @@ private:
 
   void new_phase() {
     static const uint32_t levels[] = {0, 10, 30, 50, 80, 100};
-    for (int s = 0; s < 2; ++s) {
+    for (int s = 0; s < NUM_SIDES; ++s) {
       pressure_[s].req_ready_force.reset();
       pressure_[s].req_ready_pct = levels[this->rand_below(6)];
       pressure_[s].rsp_valid_pct = levels[1 + this->rand_below(5)];
@@ -601,7 +762,7 @@ private:
   ///////////////////////////////////////////////////////////////////////////
 
   void final_check() {
-    for (int s = 0; s < 2; ++s) {
+    for (int s = 0; s < NUM_SIDES; ++s) {
       if (!exp_req_[s].empty()) {
         this->fail(strf("%s port: %zu request(s) never arrived (first seq %" PRIu64 ")",
                         side_name[s], exp_req_[s].size(), exp_req_[s].front().seq));
@@ -609,7 +770,7 @@ private:
     }
     uint32_t bad = 0;
     for (const Req& r : issued_) {
-      for (int s = 0; s < 2; ++s) {
+      for (int s = 0; s < NUM_SIDES; ++s) {
         uint32_t want = (r.expects_rsp() && r.side_mask(s) != 0) ? 1 : 0;
         uint32_t got = rsp_count_[s].at(r.seq);
         if (got != want && ++bad <= 10) {
@@ -629,23 +790,28 @@ private:
 
   std::optional<Req> in_req_;
   bool in_rsp_ready_ = true;
-  std::array<bool, 2> out_req_ready_{};
-  std::array<std::optional<Rsp>, 2> out_rsp_;
-  std::array<Pressure, 2> pressure_;
+  std::array<bool, NUM_SIDES> out_req_ready_{};
+  std::array<std::optional<Rsp>, NUM_SIDES> out_rsp_;
+  std::array<Pressure, NUM_SIDES> pressure_;
   uint32_t lsu_rsp_ready_pct_ = 100;
   uint32_t gap_pct_ = 0;
   uint32_t max_lat_ = 4;
   uint64_t phase_end_ = 0;
 
-  std::array<std::deque<Req>, 2> exp_req_;
-  std::array<std::deque<std::pair<uint64_t, Rsp>>, 2> mem_q_;
-  std::array<std::deque<Rsp>, 2> exp_rsp_;
-  std::array<std::vector<uint32_t>, 2> rsp_count_;
+  std::array<std::deque<Req>, NUM_SIDES> exp_req_;
+  std::array<std::deque<std::pair<uint64_t, Rsp>>, NUM_SIDES> mem_q_;
+  std::array<std::deque<Rsp>, NUM_SIDES> exp_rsp_;
+  std::array<std::vector<uint32_t>, NUM_SIDES> rsp_count_;
   std::vector<Req> issued_;
+
+  std::array<uint32_t, NUM_SIDES> bypass_{};
+  std::array<uint32_t, NUM_SIDES> max_bypass_{};
+  uint64_t n_all_rsp_ = 0;
 
   uint64_t n_in_ = 0;
   uint64_t n_mixed_ = 0;
-  std::array<uint64_t, 2> n_out_{};
+  uint64_t n_all_sides_ = 0;
+  std::array<uint64_t, NUM_SIDES> n_out_{};
   uint64_t n_rsp_ = 0;
   uint32_t failures_ = 0;
 };

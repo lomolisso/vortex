@@ -44,7 +44,6 @@ typedef struct {
 #define REC_WORDS     5
 
 #define NEG_OOB       1   // rank 0 stores to rank 2 of a 2-block cluster
-#define NEG_REMOTE    2   // rank 0 stores to rank 1 on another core
 
 // Words a test touches per peer: every word up to this many, then a spread sample.
 #define CHECK_WORDS   64

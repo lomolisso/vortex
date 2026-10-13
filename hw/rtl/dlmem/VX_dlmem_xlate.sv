@@ -19,13 +19,15 @@
 // to DLMEM_BASE | core << LMEM_LOG | offset, flagged on out_remote because that
 // encoding can alias a global address once the core field outgrows the rank
 // field. Out-of-bounds lanes go to the issuer's own slot base, keeping their
-// 64-byte line offset like every other lane.
+// 64-byte line offset like every other lane. A fence waits at the stage output
+// until its warp's remote accesses are performed (stores acknowledged, loads
+// and AMOs answered), so it orders them before every later access of the warp.
 module VX_dlmem_xlate import VX_gpu_pkg::*, VX_dlmem_pkg::*; #(
     parameter `STRING INSTANCE_ID = "",
     // Global core id (hart id core field); the core's index in its cluster is CORE_ID % DLMEM_NCC.
     parameter  CORE_ID       = 0,
     parameter  OOB_ASSERT    = 1,
-    // Until the network endpoints are wired, a remote lane has nowhere to go.
+    // For a core without the DLMEM network, where a remote lane has nowhere to go.
     parameter  REMOTE_ASSERT = 0,
     // Requests the stage holds; the core counts them against the LSU's outstanding reads.
     parameter  REQ_BUF_SIZE  = 2,
@@ -47,11 +49,14 @@ module VX_dlmem_xlate import VX_gpu_pkg::*, VX_dlmem_pkg::*; #(
     input  wire [NW-1:0][LMEM_LOG-1:0]      slot_base,
     input  wire [LMEM_LOG:0]                stride,
 
+    // Per warp, every remote access counted on wt_inc has been performed.
+    input  wire [NW-1:0]                    drained,
+
     // Per-lane flags, qualified by out_if.req_valid.
     output wire [NUM_LANES-1:0]             out_remote,
     output wire [NUM_LANES-1:0]             out_oob,
 
-    // Remote stores leaving the stage, per warp.
+    // Remote accesses leaving the stage, per warp.
     output wire                             wt_inc_valid,
     output wire [NW_WIDTH-1:0]              wt_inc_wid,
     output wire [CNT_W-1:0]                 wt_inc_cnt,
@@ -164,6 +169,7 @@ module VX_dlmem_xlate import VX_gpu_pkg::*, VX_dlmem_pkg::*; #(
         mem_bus_attr_t attr;
         always @(*) begin
             attr = mem_bus_attr_t'(req_r.attr[i]);
+            attr.is_addr_remote = rem;
             if (win) begin
                 attr.is_addr_local = ~rem;
                 attr.is_addr_io    = 1'b0;
@@ -180,7 +186,11 @@ module VX_dlmem_xlate import VX_gpu_pkg::*, VX_dlmem_pkg::*; #(
         assign lane_core[i]  = peer.core;
     end
 
-    assign out_if.req_valid       = req_valid_r;
+    // drained is registered after the count, so an access leaving in the cycle
+    // before its fence is already visible to it.
+    wire fence_hold = is_fence_r && ~drained[hdr_r.wid];
+
+    assign out_if.req_valid       = req_valid_r && ~fence_hold;
     assign out_if.req_data.rw     = req_r.rw;
     assign out_if.req_data.mask   = req_r.mask;
     assign out_if.req_data.byteen = req_r.byteen;
@@ -188,16 +198,16 @@ module VX_dlmem_xlate import VX_gpu_pkg::*, VX_dlmem_pkg::*; #(
     assign out_if.req_data.attr   = attr_out;
     assign out_if.req_data.data   = req_r.data;
     assign out_if.req_data.tag    = req_r.tag;
-    assign req_ready_r            = out_if.req_ready;
+    assign req_ready_r            = out_if.req_ready && ~fence_hold;
 
     assign in_if.rsp_valid  = out_if.rsp_valid;
     assign in_if.rsp_data   = out_if.rsp_data;
     assign out_if.rsp_ready = in_if.rsp_ready;
 
-    wire out_fire = req_valid_r && out_if.req_ready;
+    wire out_fire = out_if.req_valid && out_if.req_ready;
 
-    // Only stores complete without a response, so only they are tracked.
-    assign wt_inc_valid = out_fire && req_r.rw && (| out_remote);
+    // A fence does not wait for responses, so loads and AMOs are tracked as stores are.
+    assign wt_inc_valid = out_fire && (| out_remote);
     assign wt_inc_wid   = hdr_r.wid;
     `POP_COUNT(wt_inc_cnt, out_remote);
 

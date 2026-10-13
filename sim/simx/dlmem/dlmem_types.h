@@ -20,6 +20,22 @@
 
 namespace vortex {
 
+// VX_dlmem_pkg's endpoint sizes.
+constexpr uint32_t DLMEM_INGRESS_SLOTS = 4;
+constexpr uint32_t DLMEM_WT_MAX = VX_CFG_DLMEM_STORE_CREDITS + VX_CFG_DLMEM_PENDING_SIZE
+                                + (VX_CFG_LSU_QUEUE_IN_SIZE + 3) * VX_CFG_NUM_LSU_LANES;
+
+constexpr uint32_t dlmem_clog2(uint64_t x) {
+  uint32_t n = 0;
+  while ((uint64_t(1) << n) < x) {
+    ++n;
+  }
+  return n;
+}
+
+// The access tracker's largest count, 2^DLMEM_WT_W - 1.
+constexpr uint32_t DLMEM_WT_LIMIT = (1u << dlmem_clog2(uint64_t(DLMEM_WT_MAX) + 1)) - 1;
+
 // Request network packet (VX_dlmem_pkg dlmem_req_pkt_t); the fabric routes it
 // to `dst`, the target core.
 struct DlmemReqPkt {

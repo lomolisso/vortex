@@ -58,6 +58,14 @@ module VX_socket import VX_gpu_pkg::*, VX_tlb_pkg::*;
     // Global barrier
     VX_gbar_bus_if.master   gbar_bus_if,
 
+`ifdef VX_CFG_EXT_DLMEM_ENABLE
+    // DLMEM networks: uplinks to the cluster crossbar
+    VX_dlmem_bus_if.master  dlmem_req_up_if,
+    VX_dlmem_bus_if.slave   dlmem_req_down_if,
+    VX_dlmem_bus_if.master  dlmem_rsp_up_if,
+    VX_dlmem_bus_if.slave   dlmem_rsp_down_if,
+`endif
+
     // Status
     output wire             busy
 );
@@ -840,6 +848,52 @@ module VX_socket import VX_gpu_pkg::*, VX_tlb_pkg::*;
     end
 `endif
 
+`ifdef VX_CFG_EXT_DLMEM_ENABLE
+    // One switch per DLMEM network; requests and responses never share one.
+
+    VX_dlmem_bus_if #(
+        .DATAW (VX_dlmem_pkg::DLMEM_REQ_DATAW),
+        .DST_W (DLMEM_CORE_W)
+    ) per_core_dlmem_req_out_if[`VX_CFG_SOCKET_SIZE](), per_core_dlmem_req_in_if[`VX_CFG_SOCKET_SIZE]();
+
+    VX_dlmem_bus_if #(
+        .DATAW (VX_dlmem_pkg::DLMEM_RSP_DATAW),
+        .DST_W (DLMEM_CORE_W)
+    ) per_core_dlmem_rsp_out_if[`VX_CFG_SOCKET_SIZE](), per_core_dlmem_rsp_in_if[`VX_CFG_SOCKET_SIZE]();
+
+    VX_dlmem_socket_switch #(
+        .SOCKET_SIZE (`VX_CFG_SOCKET_SIZE),
+        .NUM_SOCKETS (NUM_SOCKETS),
+        .SOCKET_IDX  (SOCKET_ID % NUM_SOCKETS),
+        .DATAW       (VX_dlmem_pkg::DLMEM_REQ_DATAW),
+        .DST_W       (DLMEM_CORE_W),
+        .OUT_BUF     (3)
+    ) dlmem_req_switch (
+        .clk           (clk),
+        .reset         (reset),
+        .core_in_if    (per_core_dlmem_req_out_if),
+        .core_out_if   (per_core_dlmem_req_in_if),
+        .uplink_in_if  (dlmem_req_down_if),
+        .uplink_out_if (dlmem_req_up_if)
+    );
+
+    VX_dlmem_socket_switch #(
+        .SOCKET_SIZE (`VX_CFG_SOCKET_SIZE),
+        .NUM_SOCKETS (NUM_SOCKETS),
+        .SOCKET_IDX  (SOCKET_ID % NUM_SOCKETS),
+        .DATAW       (VX_dlmem_pkg::DLMEM_RSP_DATAW),
+        .DST_W       (DLMEM_CORE_W),
+        .OUT_BUF     (3)
+    ) dlmem_rsp_switch (
+        .clk           (clk),
+        .reset         (reset),
+        .core_in_if    (per_core_dlmem_rsp_out_if),
+        .core_out_if   (per_core_dlmem_rsp_in_if),
+        .uplink_in_if  (dlmem_rsp_down_if),
+        .uplink_out_if (dlmem_rsp_up_if)
+    );
+`endif
+
     // Generate all cores
     for (genvar core_id = 0; core_id < `VX_CFG_SOCKET_SIZE; ++core_id) begin : g_cores
         /*
@@ -903,6 +957,13 @@ module VX_socket import VX_gpu_pkg::*, VX_tlb_pkg::*;
             .kmu_bus_if     (per_core_kmu_bus_if[core_id]),
 
             .gbar_bus_if    (per_core_gbar_bus_if[core_id]),
+
+        `ifdef VX_CFG_EXT_DLMEM_ENABLE
+            .dlmem_req_out_if (per_core_dlmem_req_out_if[core_id]),
+            .dlmem_req_in_if  (per_core_dlmem_req_in_if[core_id]),
+            .dlmem_rsp_out_if (per_core_dlmem_rsp_out_if[core_id]),
+            .dlmem_rsp_in_if  (per_core_dlmem_rsp_in_if[core_id]),
+        `endif
 
             .busy           (per_core_busy[core_id])
         );

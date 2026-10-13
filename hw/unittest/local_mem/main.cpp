@@ -15,7 +15,8 @@
 // SRAMs. Directed runs inject one DMA access at every cycle offset of an
 // atomic's bank occupancy and across an LR/SC window; a randomized run mixes
 // atomics, loads, stores and DMA traffic. Everything is checked against a
-// golden memory model.
+// golden memory model. DLMEM builds add an input whose stores are
+// acknowledged once committed, as the DLMEM ingress uses it.
 
 #include "vl_simulator.h"
 #include "VVX_local_mem_top.h"
@@ -39,7 +40,14 @@
 
 constexpr uint32_t XLEN       = VX_CFG_XLEN;
 constexpr uint32_t WORD_SIZE  = XLEN / 8;
+#ifdef VX_CFG_EXT_DLMEM_ENABLE
+// The top's last input acknowledges its stores (STORE_ACK_MASK).
+constexpr uint32_t NUM_REQS   = VX_CFG_NUM_LSU_BLOCKS * VX_CFG_NUM_LSU_LANES + 1;
+constexpr int      ACK_LANE   = NUM_REQS - 1;
+#else
 constexpr uint32_t NUM_REQS   = VX_CFG_NUM_LSU_BLOCKS * VX_CFG_NUM_LSU_LANES;
+constexpr int      ACK_LANE   = -1;
+#endif
 constexpr uint32_t NUM_BANKS  = VX_CFG_LMEM_NUM_BANKS;
 constexpr uint32_t LMEM_SIZE  = 1u << VX_CFG_LMEM_LOG_SIZE;
 constexpr uint32_t NUM_ROWS   = LMEM_SIZE / (NUM_BANKS * WORD_SIZE);
@@ -60,6 +68,10 @@ constexpr uint64_t MASK32    = 0xffffffffull;
 constexpr uint32_t FULL_BE   = (1u << WORD_SIZE) - 1;
 
 static_assert((NUM_BANKS & (NUM_BANKS - 1)) == 0, "NUM_BANKS must be a power of two");
+
+static bool acks_stores(uint32_t lane) {
+  return static_cast<int>(lane) == ACK_LANE;
+}
 static_assert(WORD_SIZE == 4 || WORD_SIZE == 8, "unsupported XLEN");
 
 // VX_gpu_pkg amo_op_e
@@ -373,6 +385,9 @@ public:
     if (!this->calibrate()) {
       return 1;
     }
+    if (ACK_LANE >= 0) {
+      this->store_ack();
+    }
     if (AMO_EN) {
       this->directed();
       this->lrsc_window();
@@ -482,7 +497,7 @@ private:
   std::optional<uint64_t> lsu_access(uint32_t lane, LsuReq req) {
     req.tag = this->next_tag();
     dut_.lane[lane] = req;
-    bool expects_rsp = !req.rw;
+    bool expects_rsp = !req.rw || acks_stores(lane);
     bool accepted = false;
     for (uint32_t i = 0; i < 64; ++i) {
       Events ev = dut_.clock();
@@ -641,6 +656,279 @@ private:
     std::printf("calibrate: load responds at port+%d -> response leaves the bank %d cycle(s) after acceptance\n",
                 ld_rsp, rsp_lat_);
     return true;
+  }
+
+  ///////////////////////////////////////////////////////////////////////////
+  // Store-ack input (the DLMEM ingress): a store's acknowledgement must not
+  // come before its write is visible, it keeps its place among the input's
+  // responses, it breaks other harts' reservations, and atomics run as on any
+  // other input.
+
+  // Issues `first` on `lane_a` at relative cycle 0 and `second` on `lane_b`
+  // from relative cycle `off` on; returns the handshake cycles and data.
+  struct PairRun {
+    int acc[2] = {-1, -1};
+    int rsp[2] = {-1, -1};
+    uint64_t data[2] = {0, 0};
+    int rsp_order = 0; // 1: first answered before second, 2: second before first
+    bool ok = true;
+  };
+
+  PairRun pair_run(uint32_t lane_a, LsuReq first, uint32_t lane_b, LsuReq second, int off, uint32_t rsp_ready_pct) {
+    PairRun pr;
+    first.tag = this->next_tag();
+    second.tag = this->next_tag();
+    const LsuReq* reqs[2] = {&first, &second};
+    const uint32_t lanes[2] = {lane_a, lane_b};
+    bool sent = false;
+    dut_.lane[lane_a] = first;
+    for (int rel = 0; rel < 128 && (pr.rsp[0] < 0 || pr.rsp[1] < 0); ++rel) {
+      if (!sent && rel >= off && !dut_.lane[lane_b]) {
+        dut_.lane[lane_b] = second;
+        sent = true;
+      }
+      for (uint32_t l = 0; l < NUM_REQS; ++l) {
+        dut_.rsp_ready[l] = this->rand_below(100) < rsp_ready_pct;
+      }
+      Events ev = dut_.clock();
+      // On a shared lane the second request is staged only once the first left it.
+      if (ev.lsu_acc[lane_a] && pr.acc[0] < 0) {
+        pr.acc[0] = rel;
+      } else if (sent && ev.lsu_acc[lane_b] && pr.acc[1] < 0) {
+        pr.acc[1] = rel;
+      }
+      if (lane_a != lane_b && sent && ev.lsu_acc[lane_b] && pr.acc[1] < 0) {
+        pr.acc[1] = rel;
+      }
+      for (uint32_t l = 0; l < NUM_REQS; ++l) {
+        if (!ev.lsu_rsp[l]) {
+          continue;
+        }
+        int k = -1;
+        for (int j = 0; j < 2; ++j) {
+          if (l == lanes[j] && ev.rsp_tag[l] == reqs[j]->tag && pr.rsp[j] < 0) {
+            k = j;
+          }
+        }
+        if (k < 0) {
+          this->fail(strf("FAIL store-ack [cycle %" PRIu64 "] stray or repeated response lane=%u tag=0x%x",
+                          dut_.cycle(), l, ev.rsp_tag[l]));
+          pr.ok = false;
+          continue;
+        }
+        pr.rsp[k] = rel;
+        pr.data[k] = ev.rsp_data[l];
+        if (pr.rsp_order == 0) {
+          pr.rsp_order = k + 1;
+        }
+      }
+    }
+    dut_.rsp_ready.fill(true);
+    if (pr.rsp[0] < 0 || pr.rsp[1] < 0) {
+      this->fail(strf("FAIL store-ack [cycle %" PRIu64 "] responses did not arrive within 128 cycles "
+                      "(lane %u: acc %d rsp %d, lane %u: acc %d rsp %d)",
+                      dut_.cycle(), lane_a, pr.acc[0], pr.rsp[0], lane_b, pr.acc[1], pr.rsp[1]));
+      dut_.lane[lane_a].reset();
+      dut_.lane[lane_b].reset();
+      pr.ok = false;
+    }
+    this->idle(2);
+    return pr;
+  }
+
+  void store_ack() {
+    const uint32_t ack = static_cast<uint32_t>(ACK_LANE);
+    const uint32_t other = 0;
+    const int ld_lat = bank_lat_ + rsp_lat_;
+    const uint32_t before = failures_;
+
+    // A load on another input to the stored word, issued at every offset
+    // around the acknowledgement.
+    uint32_t runs = 0, at_ack = 0, after_ack = 0;
+    std::vector<uint32_t> rows;
+    for (uint32_t bank = 0; bank < NUM_BANKS; ++bank) {
+      for (int off = 0; off <= ld_lat + 2; ++off) {
+        uint32_t row = this->rand_below(NUM_ROWS);
+        rows.push_back(row);
+        uint64_t old_val = this->gold(row, bank);
+        uint64_t new_val;
+        do {
+          new_val = this->rand_word();
+        } while (new_val == old_val);
+        LsuReq st;
+        st.rw = true;
+        st.byteen = FULL_BE;
+        st.addr = word_addr(row, bank);
+        st.data = new_val;
+        LsuReq ld;
+        ld.byteen = FULL_BE;
+        ld.addr = st.addr;
+        PairRun pr = this->pair_run(ack, st, other, ld, off, 100);
+        this->gold(row, bank) = new_val;
+        ++runs;
+        if (!pr.ok) {
+          continue;
+        }
+        const int st_acc = pr.acc[0], ack_rel = pr.rsp[0], ld_acc = pr.acc[1];
+        std::string ctx = strf("bank %u, load from +%d: store accepted +%d, ack +%d, load accepted +%d, load returned %s",
+                               bank, off, st_acc, ack_rel, ld_acc, hex(pr.data[1]).c_str());
+        if (ack_rel - st_acc != ld_lat) {
+          this->fail(strf("FAIL store-ack %s: the ack took %d cycle(s) from acceptance, a load response takes %d",
+                          ctx.c_str(), ack_rel - st_acc, ld_lat));
+        }
+        if (ld_acc >= ack_rel && pr.data[1] != new_val) {
+          this->fail(strf("FAIL store-ack %s: a load accepted in or after the ack cycle missed the store (expected %s)",
+                          ctx.c_str(), hex(new_val).c_str()));
+        }
+        if (ld_acc < st_acc && pr.data[1] != old_val) {
+          this->fail(strf("FAIL store-ack %s: a load accepted before the store saw it (expected %s)",
+                          ctx.c_str(), hex(old_val).c_str()));
+        }
+        if (pr.data[1] != old_val && pr.data[1] != new_val) {
+          this->fail(strf("FAIL store-ack %s: neither old %s nor new %s",
+                          ctx.c_str(), hex(old_val).c_str(), hex(new_val).c_str()));
+        }
+        at_ack += (ld_acc == ack_rel);
+        after_ack += (ld_acc > ack_rel);
+      }
+    }
+    if (at_ack == 0) {
+      this->fail("FAIL store-ack: no load was accepted in the ack cycle, so commit-before-ack went untested");
+    }
+    std::printf("store-ack: ack at store acceptance +%d (= load response latency); %u runs, loads accepted in the "
+                "ack cycle %u, after it %u\n", ld_lat, runs, at_ack, after_ack);
+
+    // A load from the same input, right behind the store and under response
+    // back-pressure: the ack comes first and the load sees the store.
+    uint32_t order_runs = 0;
+    for (uint32_t bank = 0; bank < NUM_BANKS; ++bank) {
+      for (uint32_t pct : {100u, 50u, 20u}) {
+        uint32_t row = this->rand_below(NUM_ROWS);
+        rows.push_back(row);
+        uint64_t new_val = this->rand_word();
+        uint32_t be = (pct == 100) ? FULL_BE : (1 + this->rand_below(FULL_BE));
+        LsuReq st;
+        st.rw = true;
+        st.byteen = be;
+        st.addr = word_addr(row, bank);
+        st.data = new_val;
+        LsuReq ld;
+        ld.byteen = FULL_BE;
+        ld.addr = st.addr;
+        uint64_t expect = merge(this->gold(row, bank), new_val, be);
+        PairRun pr = this->pair_run(ack, st, ack, ld, 1, pct);
+        this->gold(row, bank) = expect;
+        ++order_runs;
+        if (!pr.ok) {
+          continue;
+        }
+        if (pr.rsp_order != 1) {
+          this->fail(strf("FAIL store-ack bank %u, rsp ready %u%%: the load behind the store was answered before "
+                          "the store's ack (ack +%d, load +%d)", bank, pct, pr.rsp[0], pr.rsp[1]));
+        }
+        if (pr.data[1] != expect) {
+          this->fail(strf("FAIL store-ack bank %u, rsp ready %u%%: the load behind the store returned %s, expected %s",
+                          bank, pct, hex(pr.data[1]).c_str(), hex(expect).c_str()));
+        }
+      }
+    }
+    std::printf("store-ack: store then load on the ack input, %u runs under response back-pressure\n", order_runs);
+
+    if (AMO_EN) {
+      // LR on another hart's input; an acknowledged store to the reserved
+      // word must fail its SC, one to another word of the bank must not.
+      uint32_t lr_runs = 0;
+      for (uint32_t bank = 0; bank < NUM_BANKS; ++bank) {
+        for (int width = 0; width < NUM_WIDTHS; ++width) {
+          for (int hit = 0; hit < 2; ++hit) {
+            uint32_t row = this->rand_below(NUM_ROWS);
+            uint32_t row2 = this->other_row(row);
+            rows.push_back(row);
+            rows.push_back(row2);
+            uint32_t be = lane_byteen(width);
+            LsuReq lr;
+            lr.amo = true;
+            lr.op = AMO_LR;
+            lr.byteen = be;
+            lr.addr = word_addr(row, bank);
+            std::optional<uint64_t> lr_ret = this->lsu_access(other, lr);
+            if (lr_ret && *lr_ret != this->gold(row, bank)) {
+              this->fail(strf("FAIL store-ack LR bank %u %s: returned %s, expected %s", bank, width_name(width),
+                              hex(*lr_ret).c_str(), hex(this->gold(row, bank)).c_str()));
+            }
+            uint32_t st_row = hit ? row : row2;
+            LsuReq st;
+            st.rw = true;
+            st.byteen = FULL_BE;
+            st.addr = word_addr(st_row, bank);
+            st.data = this->rand_word();
+            this->lsu_access(ack, st);
+            this->gold(st_row, bank) = st.data;
+            LsuReq sc;
+            sc.amo = true;
+            sc.op = AMO_SC;
+            sc.byteen = be;
+            sc.addr = word_addr(row, bank);
+            sc.data = lane_position(width, this->rand_word());
+            std::optional<uint64_t> sc_ret = this->lsu_access(other, sc);
+            bool want_fail = (hit != 0);
+            if (!sc_ret || *sc_ret != sc_rsp_word(sc, want_fail)) {
+              this->fail(strf("FAIL store-ack SC bank %u %s after an ack-input store to %s: returned %s, expected %s",
+                              bank, width_name(width), hit ? "the reserved word" : "another word of the bank",
+                              sc_ret ? hex(*sc_ret).c_str() : "nothing", hex(sc_rsp_word(sc, want_fail)).c_str()));
+            }
+            if (!want_fail) {
+              this->gold(row, bank) = merge(this->gold(row, bank), sc.data, be);
+            }
+            ++lr_runs;
+          }
+        }
+      }
+      std::printf("store-ack: LR/SC across an ack-input store, %u runs\n", lr_runs);
+
+      // Every private atomic on the ack input, checked against the model.
+      static const uint8_t ops[] = {AMO_ADD, AMO_SWAP, AMO_XOR, AMO_OR, AMO_AND, AMO_MIN, AMO_MAX, AMO_CAS};
+      const uint32_t num_ops = CAS_EN ? 8 : 7;
+      uint32_t amo_runs = 0;
+      for (uint32_t k = 0; k < num_ops; ++k) {
+        for (int width = 0; width < NUM_WIDTHS; ++width) {
+          for (int uns = 0; uns < ((ops[k] == AMO_MIN || ops[k] == AMO_MAX) ? 2 : 1); ++uns) {
+            uint32_t row = this->rand_below(NUM_ROWS);
+            uint32_t bank = this->rand_below(NUM_BANKS);
+            rows.push_back(row);
+            LsuReq r;
+            r.amo = true;
+            r.op = ops[k];
+            r.uns = (uns != 0);
+            r.byteen = lane_byteen(width);
+            r.addr = word_addr(row, bank);
+            r.data = lane_position(width, this->rand_word());
+            uint64_t& g = this->gold(row, bank);
+            if (r.op == AMO_CAS) {
+              uint64_t cur = (XLEN == 64 && width == W_HI) ? (g >> 32) : g;
+              if (XLEN == 32 || width != W_D) {
+                cur &= MASK32;
+              }
+              r.cmp = (amo_runs & 1) ? cur : this->rand_word();
+            }
+            std::optional<uint64_t> ret = this->lsu_access(ack, r);
+            if (!ret || *ret != g) {
+              this->fail(strf("FAIL store-ack %s.%s on the ack input (row 0x%x, bank %u): returned %s, expected %s",
+                              amo_name(r.op, r.uns), width_name(width), row, bank,
+                              ret ? hex(*ret).c_str() : "nothing", hex(g).c_str()));
+            }
+            g = amo_new_word(r, g);
+            ++amo_runs;
+          }
+        }
+      }
+      std::printf("store-ack: %u atomics on the ack input\n", amo_runs);
+    }
+
+    std::sort(rows.begin(), rows.end());
+    rows.erase(std::unique(rows.begin(), rows.end()), rows.end());
+    this->check_rows("store-ack", rows);
+    std::printf("store-ack: %s\n\n", (failures_ == before) ? "ok" : "FAILED");
   }
 
   ///////////////////////////////////////////////////////////////////////////
@@ -1772,6 +2060,7 @@ private:
     uint64_t expect;
     uint64_t issued;
     std::string desc;
+    bool     ack = false; // a store acknowledgement: the data is don't-care
   };
 
   struct DmaPending {
@@ -1824,6 +2113,7 @@ private:
     std::array<uint32_t, NUM_REQS> outstanding{};
     uint32_t errors = 0;
     uint64_t n_amo = 0, n_shared = 0, n_ld = 0, n_st = 0, n_dma_rd = 0, n_dma_wr = 0;
+    uint64_t n_ack_lane_amo = 0, n_ack_lane_st = 0;
     uint64_t dma_stalls = 0, dma_wr_stalls = 0;
     uint32_t wr_stall_run = 0, wr_stall_max = 0;
     const uint64_t start = dut_.cycle();
@@ -1884,6 +2174,7 @@ private:
                         w / NUM_BANKS, w % NUM_BANKS);
           g = amo_new_word(r, g);
           ++n_amo;
+          n_ack_lane_amo += acks_stores(l);
         } else if (kind < 82) {
           r.byteen = FULL_BE;
           p.expect = g;
@@ -1895,9 +2186,14 @@ private:
           r.data = rng() & WORD_MASK;
           g = merge(g, r.data, r.byteen);
           ++n_st;
+          n_ack_lane_st += acks_stores(l);
         }
       }
-      if (!r.rw) {
+      if (!r.rw || acks_stores(l)) {
+        p.ack = r.rw;
+        if (p.ack) {
+          p.desc = strf("store ack (row 0x%x, bank %u)", r.addr >> BANK_BITS, r.addr & (NUM_BANKS - 1));
+        }
         pend[r.tag] = p;
         ++outstanding[l];
       }
@@ -2016,6 +2312,9 @@ private:
         if (p.lane != l) {
           report(strf("tag 0x%x issued on lane %u answered on lane %u", ev.rsp_tag[l], p.lane, l));
         }
+        if (p.ack) {
+          continue;
+        }
         if (p.counter >= 0) {
           sh_olds[p.counter].push_back(ev.rsp_data[l]);
         } else if (ev.rsp_data[l] != p.expect) {
@@ -2068,6 +2367,13 @@ private:
                 " (writes %" PRIu64 ", longest %u), %u error(s)\n",
                 seed, dut_.cycle() - start, n_amo, n_shared, n_ld, n_st, n_dma_rd, n_dma_wr,
                 dma_stalls, dma_wr_stalls, wr_stall_max, errors);
+    if (ACK_LANE >= 0) {
+      std::printf("stress seed=%u: store-ack lane %d: %" PRIu64 " acknowledged stores, %" PRIu64 " private atomics\n",
+                  seed, ACK_LANE, n_ack_lane_st, n_ack_lane_amo);
+      if (n_ack_lane_st == 0) {
+        report("the store-ack lane issued no store");
+      }
+    }
   }
 
   void final_check() {

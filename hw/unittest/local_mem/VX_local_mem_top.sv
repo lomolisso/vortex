@@ -20,7 +20,12 @@ module VX_local_mem_top import VX_gpu_pkg::*; #(
     parameter SIZE              = (1 << `VX_CFG_LMEM_LOG_SIZE),
 
     // Number of Word requests per cycle
+`ifdef VX_CFG_EXT_DLMEM_ENABLE
+    // The last input stands in for the DLMEM ingress, as in VX_mem_unit.
+    parameter NUM_REQS          = LSU_NUM_REQS + 1,
+`else
     parameter NUM_REQS          = LSU_NUM_REQS,
+`endif
     // Number of banks
     parameter NUM_BANKS         = `VX_CFG_LMEM_NUM_BANKS,
 
@@ -162,6 +167,9 @@ module VX_local_mem_top import VX_gpu_pkg::*; #(
         .DMA_ENABLE   (1),
         .DMA_TAG_WIDTH(DMA_TAG_WIDTH),
         .AMO_ENABLE   (`VX_CFG_EXT_A_ENABLED),
+    `ifdef VX_CFG_EXT_DLMEM_ENABLE
+        .STORE_ACK_MASK (NUM_REQS'(1) << (NUM_REQS - 1)),
+    `endif
         .OUT_BUF      (3)
     ) local_mem (
         .clk        (clk),

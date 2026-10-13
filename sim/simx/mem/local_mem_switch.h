@@ -30,6 +30,11 @@ public:
   SimChannel<LsuReq> ReqOutDC;
   SimChannel<LsuRsp> RspInDC;
 
+#ifdef VX_CFG_EXT_DLMEM_ENABLE
+  SimChannel<LsuReq> ReqOutRemote;
+  SimChannel<LsuRsp> RspInRemote;
+#endif
+
   LocalMemSwitch(
     const SimContext& ctx,
     const char* name,
@@ -37,10 +42,16 @@ public:
   );
 
 protected:
+#ifdef VX_CFG_EXT_DLMEM_ENABLE
+  void on_reset();
+#endif
   void on_tick();
 
 private:
   uint32_t delay_;
+#ifdef VX_CFG_EXT_DLMEM_ENABLE
+  uint32_t rsp_rr_last_;
+#endif
 
   friend class SimObject<LocalMemSwitch>;
 };

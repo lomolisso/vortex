@@ -25,6 +25,7 @@ DlmemEgress::DlmemEgress(const SimContext& ctx, const char* name, const Config& 
   , NetReqOut(this)
   , NetRspIn(this)
   , AckOut(this)
+  , DoneOut(this)
   , config_(config)
   , entries_(config.pending_size)
   , credits_(config.store_credits)
@@ -61,7 +62,7 @@ bool DlmemEgress::empty() const {
   if (locked_ || credits_ != config_.store_credits || this->pending() != 0) {
     return false;
   }
-  if (NetReqOut.size() != 0 || AckOut.size() != 0) {
+  if (NetReqOut.size() != 0 || AckOut.size() != 0 || DoneOut.size() != 0) {
     return false;
   }
   for (auto& out : RspOut) {
@@ -190,6 +191,10 @@ void DlmemEgress::issue() {
   if (!is_sc && NetReqOut.full()) {
     return;
   }
+  // An SC yields to an arriving response so that an ack and a done never coincide.
+  if (is_sc && !NetRspIn.empty()) {
+    return;
+  }
 
   if (is_lr || is_sc) {
     __assert(!config_.lrsc_assert, "remote LR/SC is not supported");
@@ -211,10 +216,12 @@ void DlmemEgress::issue() {
     ent.data_valid = true;
     ent.block = b;
     ent.lane = l;
+    ent.wid = req.wid;
     ent.lsu_tag = req.tag;
     ent.cid = req.cid;
     ent.uuid = req.uuid;
     ent.data = data;
+    DoneOut.send(req.wid, 1);
   } else {
     DlmemReqPkt pkt;
     pkt.dst = dst;
@@ -237,6 +244,7 @@ void DlmemEgress::issue() {
       ent.data_valid = false;
       ent.block = b;
       ent.lane = l;
+      ent.wid = req.wid;
       ent.lsu_tag = req.tag;
       ent.cid = req.cid;
       ent.uuid = req.uuid;
@@ -270,6 +278,7 @@ void DlmemEgress::sink() {
     __assert(e.valid && !e.data_valid, "egress: response for an idle entry");
     e.data = rsp.data;
     e.data_valid = true;
+    DoneOut.send(e.wid, 1);
   }
   DT(4, this->name() << " response: " << rsp);
   NetRspIn.pop();

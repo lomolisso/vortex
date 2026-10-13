@@ -20,15 +20,18 @@
 
 namespace vortex {
 
-// VX_dlmem_wtrack: per-warp count of remote stores not yet acknowledged.
+// VX_dlmem_wtrack: per-warp count of remote accesses not yet performed.
 // Increments come from each LSU block's translation, decrements from the
-// egress acks; drained(w) is the registered cnt[w] == 0 of the cycle after.
+// egress: DecIn for store acks, DoneIn for answered loads, AMOs and SCs, never
+// both in one cycle (the core merges them into the RTL's one decrement port).
+// drained(w) is the registered cnt[w] == 0 of the cycle after.
 class DlmemWTrack : public SimObject<DlmemWTrack> {
 public:
   using Ptr = std::shared_ptr<DlmemWTrack>;
 
   std::vector<SimChannel<WtInc>> IncIn;
   SimChannel<uint32_t> DecIn;
+  SimChannel<uint32_t> DoneIn;
 
   DlmemWTrack(const SimContext& ctx,
               const char* name,

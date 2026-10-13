@@ -34,6 +34,12 @@ module VX_mem_unit import VX_gpu_pkg::*; #(
     VX_mem_bus_if.slave     tcu_lmem_if,
 `endif
 
+`ifdef VX_CFG_EXT_DLMEM_ENABLE
+    // Remote lanes toward the DLMEM egress, and the ingress's local-memory port
+    VX_lsu_mem_if.master    dlmem_remote_if [`VX_CFG_NUM_LSU_BLOCKS],
+    VX_mem_bus_if.slave     dlmem_lmem_if,
+`endif
+
     output wire             empty,
 
     VX_lsu_mem_if.slave     lsu_mem_if [`VX_CFG_NUM_LSU_BLOCKS],
@@ -63,6 +69,10 @@ module VX_mem_unit import VX_gpu_pkg::*; #(
     `STATIC_ASSERT(`VX_CFG_LMEM_LOG_SIZE <= 16, ("LMEM exceeds the 16-bit smem descriptor offset field"))
 `endif
 
+`ifdef VX_CFG_EXT_DLMEM_ENABLE
+    `STATIC_ASSERT(`VX_CFG_LMEM_ENABLED, ("DLMEM_ENABLE requires LMEM_ENABLE"))
+`endif
+
 `ifdef VX_CFG_LMEM_ENABLE
 
     `STATIC_ASSERT(`IS_DIVISBLE((1 << `VX_CFG_LMEM_LOG_SIZE), `VX_CFG_MEM_BLOCK_SIZE), ("invalid parameter"))
@@ -77,6 +87,23 @@ module VX_mem_unit import VX_gpu_pkg::*; #(
     ) lsu_lmem_if[`VX_CFG_NUM_LSU_BLOCKS]();
 
     for (genvar i = 0; i < `VX_CFG_NUM_LSU_BLOCKS; ++i) begin : g_lmem_switches
+    `ifdef VX_CFG_EXT_DLMEM_ENABLE
+        // Round-robin response merge, so no leg waits behind the other two.
+        VX_lmem_switch #(
+            .GLOBAL_OUT_BUF(1),
+            .LOCAL_OUT_BUF(1),
+            .REMOTE_OUT_BUF(1),
+            .RSP_OUT_BUF  (1),
+            .ARBITER      ("R")
+        ) lmem_switch (
+            .clk          (clk),
+            .reset        (reset),
+            .lsu_in_if    (lsu_mem_if[i]),
+            .global_out_if(lsu_dcache_if[i]),
+            .remote_out_if(dlmem_remote_if[i]),
+            .local_out_if (lsu_lmem_if[i])
+        );
+    `else
         VX_lmem_switch #(
             .GLOBAL_OUT_BUF(1),
             .LOCAL_OUT_BUF(1),
@@ -89,16 +116,43 @@ module VX_mem_unit import VX_gpu_pkg::*; #(
             .global_out_if(lsu_dcache_if[i]),
             .local_out_if (lsu_lmem_if[i])
         );
+    `endif
     end
 
     // Per-block local memory adapters to avoid deadlock when NUM_LSU_BLOCKS > 1.
     // Each block gets dedicated ports into local memory, eliminating the circular
     // dependency that arises from sharing a single adapter's unpack/pack buffers.
 
+`ifdef VX_CFG_EXT_DLMEM_ENABLE
+    // The DLMEM ingress is one more input after the LSU lanes, in their round-robin.
+    localparam LMEM_INGRESS_IDX = LSU_NUM_REQS;
+
+    VX_mem_bus_if #(
+        .DATA_SIZE (LSU_WORD_SIZE),
+        .TAG_WIDTH (LSU_TAG_WIDTH)
+    ) lmem_adapt_if[LSU_NUM_REQS + 1]();
+
+    `STATIC_ASSERT($bits(dlmem_lmem_if.req_data.addr) == LMEM_ADDR_WIDTH, ("invalid parameter"))
+    `STATIC_ASSERT($bits(dlmem_lmem_if.req_data.tag) == LSU_TAG_WIDTH, ("invalid parameter"))
+
+    assign lmem_adapt_if[LMEM_INGRESS_IDX].req_valid       = dlmem_lmem_if.req_valid;
+    assign lmem_adapt_if[LMEM_INGRESS_IDX].req_data.rw     = dlmem_lmem_if.req_data.rw;
+    assign lmem_adapt_if[LMEM_INGRESS_IDX].req_data.addr   = LSU_ADDR_WIDTH'(dlmem_lmem_if.req_data.addr);
+    assign lmem_adapt_if[LMEM_INGRESS_IDX].req_data.data   = dlmem_lmem_if.req_data.data;
+    assign lmem_adapt_if[LMEM_INGRESS_IDX].req_data.byteen = dlmem_lmem_if.req_data.byteen;
+    assign lmem_adapt_if[LMEM_INGRESS_IDX].req_data.attr   = dlmem_lmem_if.req_data.attr;
+    assign lmem_adapt_if[LMEM_INGRESS_IDX].req_data.tag    = dlmem_lmem_if.req_data.tag;
+    assign dlmem_lmem_if.req_ready = lmem_adapt_if[LMEM_INGRESS_IDX].req_ready;
+
+    assign dlmem_lmem_if.rsp_valid = lmem_adapt_if[LMEM_INGRESS_IDX].rsp_valid;
+    assign dlmem_lmem_if.rsp_data  = lmem_adapt_if[LMEM_INGRESS_IDX].rsp_data;
+    assign lmem_adapt_if[LMEM_INGRESS_IDX].rsp_ready = dlmem_lmem_if.rsp_ready;
+`else
     VX_mem_bus_if #(
         .DATA_SIZE (LSU_WORD_SIZE),
         .TAG_WIDTH (LSU_TAG_WIDTH)
     ) lmem_adapt_if[LSU_NUM_REQS]();
+`endif
 
     for (genvar i = 0; i < `VX_CFG_NUM_LSU_BLOCKS; ++i) begin : g_lmem_adapters
 
@@ -229,7 +283,12 @@ module VX_mem_unit import VX_gpu_pkg::*; #(
     VX_local_mem #(
         .INSTANCE_ID (`SFORMATF(("%s-lmem", INSTANCE_ID))),
         .SIZE        (1 << `VX_CFG_LMEM_LOG_SIZE),
+    `ifdef VX_CFG_EXT_DLMEM_ENABLE
+        .NUM_REQS    (LSU_NUM_REQS + 1),
+        .STORE_ACK_MASK ((LSU_NUM_REQS + 1)'(1) << LMEM_INGRESS_IDX),
+    `else
         .NUM_REQS    (LSU_NUM_REQS),
+    `endif
         .NUM_BANKS   (`VX_CFG_LMEM_NUM_BANKS),
         .WORD_SIZE   (LSU_WORD_SIZE),
         .ADDR_WIDTH  (LMEM_ADDR_WIDTH),

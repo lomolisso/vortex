@@ -54,6 +54,7 @@
 #ifdef VX_CFG_EXT_DLMEM_ENABLE
 #include "cta_gang.h"
 #include "dlmem/dlmem_xlate.h"
+#include "dlmem/dlmem_wtrack.h"
 #endif
 
 using namespace vortex;
@@ -302,16 +303,22 @@ public:
     // ever reaches it.
     snprintf(sname, 100, "%s-dlmem_xlate", name.c_str());
     dlmem_xlate_ = DlmemXlate::Create(sname, dlmem_cfg(), simobject_->id(), VX_CFG_NUM_LSU_BLOCKS,
-                                      /*abort_on_oob*/ true, /*abort_on_remote*/ true);
+                                      /*abort_on_oob*/ true, /*abort_on_remote*/ false);
+    // Created after the translation and the SFU: both read drained() as the
+    // RTL's registered value, before this cycle's counts land.
+    snprintf(sname, 100, "%s-dlmem_wtrack", name.c_str());
+    dlmem_wtrack_ = DlmemWTrack::Create(sname, VX_CFG_NUM_LSU_BLOCKS, VX_CFG_NUM_WARPS, DLMEM_WT_LIMIT);
     {
       auto lsu = std::static_pointer_cast<LsuUnit>(func_units_.at((int)FUType::LSU));
       for (uint32_t b = 0; b < VX_CFG_NUM_LSU_BLOCKS; ++b) {
         lsu->XlateReqOut.at(b).bind(&dlmem_xlate_->ReqIn.at(b));
         dlmem_xlate_->ReqOut.at(b).bind(&lmem_switch_.at(b)->ReqIn);
-        wt_inc_sink_.emplace_back(std::make_unique<SimChannel<WtInc>>(simobject_, 2));
-        dlmem_xlate_->WtIncOut.at(b).bind(wt_inc_sink_.back().get());
+        dlmem_xlate_->WtIncOut.at(b).bind(&dlmem_wtrack_->IncIn.at(b));
       }
     }
+    dlmem_xlate_->set_drained_query([wtrack = dlmem_wtrack_.get()](uint32_t wid) {
+      return wtrack->drained(wid);
+    });
     scheduler_->peer_wr_out().bind(&dlmem_xlate_->PeerWrIn);
   #endif
 
@@ -345,14 +352,6 @@ public:
   }
 
   void tick() {
-  #ifdef VX_CFG_EXT_DLMEM_ENABLE
-    // Remote lanes abort until the remote-store tracker consumes these counts.
-    for (auto& sink : wt_inc_sink_) {
-      while (!sink->empty()) {
-        sink->pop();
-      }
-    }
-  #endif
     this->commit();
     this->execute();
     this->issue();
@@ -859,8 +858,8 @@ public:
       return true;
     }
   #ifdef VX_CFG_EXT_DLMEM_ENABLE
-    // A committed store can still wait in the translation stage.
-    if (!dlmem_xlate_->empty()) {
+    // A committed store can still wait in the translation stage or for its remote ack.
+    if (!dlmem_xlate_->empty() || !dlmem_wtrack_->empty()) {
       return true;
     }
   #endif
@@ -1012,6 +1011,12 @@ public:
   const std::shared_ptr<MemCoalescer>& mem_coalescer(uint32_t idx) const { return mem_coalescers_.at(idx); }
   const std::shared_ptr<LocalMemSwitch>& lmem_switch(uint32_t idx) const { return lmem_switch_.at(idx); }
 
+#ifdef VX_CFG_EXT_DLMEM_ENABLE
+  bool dlmem_drained(uint32_t wid) const { return dlmem_wtrack_->drained(wid); }
+  SimChannel<uint32_t>& dlmem_ack_in() { return dlmem_wtrack_->DecIn; }
+  SimChannel<uint32_t>& dlmem_done_in() { return dlmem_wtrack_->DoneIn; }
+#endif
+
 #ifdef VX_CFG_VM_ENABLE
   // Device satp (from the DCR, via Cluster::set_mmu_satp) fans out to both
   // per-core MMUs (dcache + icache). They each maintain an independent TLB
@@ -1100,7 +1105,7 @@ private:
 #endif
 #ifdef VX_CFG_EXT_DLMEM_ENABLE
   DlmemXlate::Ptr dlmem_xlate_;
-  std::vector<std::unique_ptr<SimChannel<WtInc>>> wt_inc_sink_;
+  DlmemWTrack::Ptr dlmem_wtrack_;
 #endif
 };
 
@@ -1262,6 +1267,20 @@ const std::shared_ptr<MemCoalescer>& Core::mem_coalescer(uint32_t idx) const {
 const std::shared_ptr<LocalMemSwitch>& Core::lmem_switch(uint32_t idx) const {
   return impl_->lmem_switch(idx);
 }
+
+#ifdef VX_CFG_EXT_DLMEM_ENABLE
+bool Core::dlmem_drained(uint32_t wid) const {
+  return impl_->dlmem_drained(wid);
+}
+
+SimChannel<uint32_t>& Core::dlmem_ack_in() {
+  return impl_->dlmem_ack_in();
+}
+
+SimChannel<uint32_t>& Core::dlmem_done_in() {
+  return impl_->dlmem_done_in();
+}
+#endif
 
 #ifdef VX_CFG_VM_ENABLE
 Core::MmuPerfStats Core::mmu_perf_stats() const {

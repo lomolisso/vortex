@@ -13,13 +13,21 @@
 
 `include "VX_define.vh"
 
-// Output side 0 is the global (dcache) port, side 1 the local-memory port.
+// Output side 0 is the global (dcache) port, side 1 the local-memory port,
+// and with DLMEM side 2 the remote (DLMEM egress) port.
 module VX_lmem_switch_top import VX_gpu_pkg::*; #(
     // Defaults match the VX_mem_unit instance.
     parameter GLOBAL_OUT_BUF    = 1,
     parameter LOCAL_OUT_BUF     = 1,
     parameter RSP_OUT_BUF       = 1,
+`ifdef VX_CFG_EXT_DLMEM_ENABLE
+    parameter REMOTE_OUT_BUF    = 1,
+    parameter `STRING ARBITER   = "R",
+    localparam NUM_SIDES        = 3,
+`else
     parameter `STRING ARBITER   = "P",
+    localparam NUM_SIDES        = 2,
+`endif
 
     localparam NUM_LANES        = `VX_CFG_NUM_LSU_LANES,
     localparam WORD_SIZE        = LSU_WORD_SIZE,
@@ -39,6 +47,9 @@ module VX_lmem_switch_top import VX_gpu_pkg::*; #(
     input  wire [NUM_LANES-1:0][WORD_WIDTH-1:0]     in_req_data,
     input  wire [NUM_LANES-1:0][WORD_SIZE-1:0]      in_req_byteen,
     input  wire [NUM_LANES-1:0]                     in_req_local,
+`ifdef VX_CFG_EXT_DLMEM_ENABLE
+    input  wire [NUM_LANES-1:0]                     in_req_remote,
+`endif
     input  wire [NUM_LANES-1:0]                     in_req_amo,
     input  wire [NUM_LANES-1:0][AMO_OP_WIDTH-1:0]   in_req_amo_op,
     input  wire [TAG_VALUE_WIDTH-1:0]               in_req_tag,
@@ -52,24 +63,27 @@ module VX_lmem_switch_top import VX_gpu_pkg::*; #(
     input  wire                                     in_rsp_ready,
 
     // Memory-side requests
-    output wire [1:0]                                   out_req_valid,
-    output wire [1:0]                                   out_req_rw,
-    output wire [1:0][NUM_LANES-1:0]                    out_req_mask,
-    output wire [1:0][NUM_LANES-1:0][ADDR_WIDTH-1:0]    out_req_addr,
-    output wire [1:0][NUM_LANES-1:0][WORD_WIDTH-1:0]    out_req_data,
-    output wire [1:0][NUM_LANES-1:0][WORD_SIZE-1:0]     out_req_byteen,
-    output wire [1:0][NUM_LANES-1:0]                    out_req_local,
-    output wire [1:0][NUM_LANES-1:0]                    out_req_amo,
-    output wire [1:0][NUM_LANES-1:0][AMO_OP_WIDTH-1:0]  out_req_amo_op,
-    output wire [1:0][TAG_VALUE_WIDTH-1:0]              out_req_tag,
-    input  wire [1:0]                                   out_req_ready,
+    output wire [NUM_SIDES-1:0]                           out_req_valid,
+    output wire [NUM_SIDES-1:0]                           out_req_rw,
+    output wire [NUM_SIDES-1:0][NUM_LANES-1:0]            out_req_mask,
+    output wire [NUM_SIDES-1:0][NUM_LANES-1:0][ADDR_WIDTH-1:0] out_req_addr,
+    output wire [NUM_SIDES-1:0][NUM_LANES-1:0][WORD_WIDTH-1:0] out_req_data,
+    output wire [NUM_SIDES-1:0][NUM_LANES-1:0][WORD_SIZE-1:0] out_req_byteen,
+    output wire [NUM_SIDES-1:0][NUM_LANES-1:0]            out_req_local,
+`ifdef VX_CFG_EXT_DLMEM_ENABLE
+    output wire [NUM_SIDES-1:0][NUM_LANES-1:0]            out_req_remote,
+`endif
+    output wire [NUM_SIDES-1:0][NUM_LANES-1:0]            out_req_amo,
+    output wire [NUM_SIDES-1:0][NUM_LANES-1:0][AMO_OP_WIDTH-1:0] out_req_amo_op,
+    output wire [NUM_SIDES-1:0][TAG_VALUE_WIDTH-1:0]      out_req_tag,
+    input  wire [NUM_SIDES-1:0]                           out_req_ready,
 
     // Memory-side responses
-    input  wire [1:0]                                   out_rsp_valid,
-    input  wire [1:0][NUM_LANES-1:0]                    out_rsp_mask,
-    input  wire [1:0][NUM_LANES-1:0][WORD_WIDTH-1:0]    out_rsp_data,
-    input  wire [1:0][TAG_VALUE_WIDTH-1:0]              out_rsp_tag,
-    output wire [1:0]                                   out_rsp_ready
+    input  wire [NUM_SIDES-1:0]                           out_rsp_valid,
+    input  wire [NUM_SIDES-1:0][NUM_LANES-1:0]            out_rsp_mask,
+    input  wire [NUM_SIDES-1:0][NUM_LANES-1:0][WORD_WIDTH-1:0] out_rsp_data,
+    input  wire [NUM_SIDES-1:0][TAG_VALUE_WIDTH-1:0]      out_rsp_tag,
+    output wire [NUM_SIDES-1:0]                           out_rsp_ready
 );
     // main.cpp derives these widths from VX_config.h.
     `STATIC_ASSERT (ADDR_WIDTH == `VX_CFG_MEM_ADDR_WIDTH - `CLOG2(`VX_CFG_XLEN / 8),
@@ -89,13 +103,16 @@ module VX_lmem_switch_top import VX_gpu_pkg::*; #(
         .NUM_LANES (NUM_LANES),
         .DATA_SIZE (WORD_SIZE),
         .TAG_WIDTH (LSU_TAG_WIDTH)
-    ) out_if[2]();
+    ) out_if[NUM_SIDES]();
 
     for (genvar i = 0; i < NUM_LANES; ++i) begin : g_in_user
         mem_bus_attr_t attr;
         always @(*) begin
             attr = '0;
             attr.is_addr_local = in_req_local[i];
+        `ifdef VX_CFG_EXT_DLMEM_ENABLE
+            attr.is_addr_remote = in_req_remote[i];
+        `endif
             attr.amo.amo_valid = in_req_amo[i];
             attr.amo.amo_op    = amo_op_e'(in_req_amo_op[i]);
             attr.amo.hart_id   = HART_ID_WIDTH'(i);
@@ -119,7 +136,7 @@ module VX_lmem_switch_top import VX_gpu_pkg::*; #(
     assign lsu_in_if.rsp_ready = in_rsp_ready;
     `UNUSED_VAR (lsu_in_if.rsp_data.tag.uuid)
 
-    for (genvar s = 0; s < 2; ++s) begin : g_out
+    for (genvar s = 0; s < NUM_SIDES; ++s) begin : g_out
         assign out_req_valid[s]  = out_if[s].req_valid;
         assign out_req_rw[s]     = out_if[s].req_data.rw;
         assign out_req_mask[s]   = out_if[s].req_data.mask;
@@ -134,6 +151,9 @@ module VX_lmem_switch_top import VX_gpu_pkg::*; #(
             mem_bus_attr_t attr;
             assign attr = mem_bus_attr_t'(out_if[s].req_data.user[i]);
             assign out_req_local[s][i]  = attr.is_addr_local;
+        `ifdef VX_CFG_EXT_DLMEM_ENABLE
+            assign out_req_remote[s][i] = attr.is_addr_remote;
+        `endif
             assign out_req_amo[s][i]    = attr.amo.amo_valid;
             assign out_req_amo_op[s][i] = attr.amo.amo_op;
             `UNUSED_VAR (attr)
@@ -150,12 +170,18 @@ module VX_lmem_switch_top import VX_gpu_pkg::*; #(
         .GLOBAL_OUT_BUF (GLOBAL_OUT_BUF),
         .LOCAL_OUT_BUF  (LOCAL_OUT_BUF),
         .RSP_OUT_BUF    (RSP_OUT_BUF),
+    `ifdef VX_CFG_EXT_DLMEM_ENABLE
+        .REMOTE_OUT_BUF (REMOTE_OUT_BUF),
+    `endif
         .ARBITER        (ARBITER)
     ) lmem_switch (
         .clk           (clk),
         .reset         (reset),
         .lsu_in_if     (lsu_in_if),
         .global_out_if (out_if[0]),
+    `ifdef VX_CFG_EXT_DLMEM_ENABLE
+        .remote_out_if (out_if[2]),
+    `endif
         .local_out_if  (out_if[1])
     );
 

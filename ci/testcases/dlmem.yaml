@@ -13,18 +13,20 @@ defaults:
             hw/rtl/core/VX_kmu_bus_arb.sv, hw/rtl/core/VX_bar_unit.sv,
             hw/rtl/core/VX_scheduler.sv, hw/rtl/mem/VX_gbar_unit.sv,
             hw/rtl/core/VX_mem_unit.sv, hw/rtl/cp/VX_cp_axil_regfile.sv,
+            hw/rtl/mem/VX_lmem_switch.sv, hw/rtl/mem/VX_local_mem.sv, hw/rtl/VX_socket.sv,
             sim/simx/kmu, sim/simx/cta_dispatcher, sim/simx/scheduler, sim/simx/csr_unit.cpp,
             sim/simx/cluster, sim/simx/barrier_unit, sim/simx/processor.cpp,
             hw/rtl/core/VX_wctl_unit.sv, hw/rtl/core/VX_core.sv,
             hw/rtl/interfaces/VX_warp_ctl_if.sv,
             sim/common/cmd_processor.cpp, sw/common/dlmem_ref.h,
             sim/simx/wctl_unit.cpp, sim/simx/sfu_unit.cpp, sim/simx/lsu_unit,
-            sim/simx/core, sim/simx/dlmem,
+            sim/simx/core, sim/simx/dlmem, sim/simx/socket, sim/simx/mem/local_mem,
             sw/kernel/include/vx_dlmem.h, sw/kernel/include/vx_spawn2.h,
             sw/runtime/common/caps.h, sw/runtime/common/queue.cpp,
             sw/runtime/common/legacy_runtime.cpp, tests/regression/cluster_rank,
             tests/regression/cta_gang, tests/regression/cluster_sync,
-            tests/regression/dlmem_local, VX_config.toml, VX_types.toml]
+            tests/regression/dlmem_local, tests/regression/dlmem_store,
+            tests/regression/dlmem_stress, VX_config.toml, VX_types.toml]
 tests:
   # The cluster-rank CSR over three launches (K = 1, 2 as 1x2x1, 4 as 2x1x2),
   # each CTA's rank against its intra-cluster index, and the rank address map
@@ -250,10 +252,10 @@ tests:
     xlen: [64]
     args: "-p -d -k 4 -w 1"
 
-  # --- aperture translation, co-located peers ---
-  # A block reaches the local memory of every block of its cluster on its own
-  # core through the window (the A extension needs one shared last-level cache,
-  # hence the L2 on several cores): its own writes read back by every peer, stores
+  # --- aperture translation ---
+  # A block reaches the local memory of every block of its cluster through the
+  # window (the A extension needs one shared last-level cache, hence the L2 on
+  # several cores): its own writes read back by every peer, stores
   # into every peer, an amoadd into rank 0, global, own and window lanes in one
   # instruction, sub-word stores at the slice and line edges, and the self
   # window against the plain pointer, each test its own launch. A same-core
@@ -344,9 +346,39 @@ tests:
     shape: {cores: 4, l2cache: true}
     args: "-d -k 2 -e -n 256"
 
-  # Window accesses the core must refuse, each stopping the simulation with the
-  # exact message: a rank past the cluster inside the window, and a peer on
-  # another core. The shape goes in CONFIGS, so the run reuses the prebuilt driver.
+  # SPREAD clusters, whose peers sit on other cores: the same six tests over
+  # the network, the cluster syncing on cluster_group::sync().
+  - id: dlmem_local-spread-2c
+    app: dlmem_local
+    drivers: [simx, rtlsim]
+    configs+: "-DVX_CFG_EXT_A_ENABLE"
+    shape: {cores: 2, l2cache: true}
+    args: "-s -k 2 -l 64 -l 1024 -n 3"
+  - id: dlmem_local-spread-4c-s2
+    app: dlmem_local
+    drivers: [simx, rtlsim]
+    configs+: "-DVX_CFG_EXT_A_ENABLE -DVX_CFG_SOCKET_SIZE=2"
+    shape: {cores: 4, l2cache: true}
+    args: "-s -k 4 -l 4096 -n 3"
+  # The parity loops on the next rank's slice, which is on another core.
+  - id: dlmem_local-spread-p
+    app: dlmem_local
+    drivers: [simx, rtlsim]
+    configs+: "-DVX_CFG_EXT_A_ENABLE"
+    shape: {cores: 4, l2cache: true}
+    args: "-p -s -k 4"
+  # One store credit and one pending entry: the egress holds the LSU back, and
+  # a fence waits at the translation stage for acks its warp's stores still owe.
+  - id: dlmem_local-spread-p-credit1
+    app: dlmem_local
+    drivers: [simx, rtlsim]
+    configs+: "-DVX_CFG_EXT_A_ENABLE -DVX_CFG_DLMEM_STORE_CREDITS=1 -DVX_CFG_DLMEM_PENDING_SIZE=1"
+    shape: {cores: 4, l2cache: true}
+    args: "-p -s -k 4"
+
+  # A window access the core must refuse, stopping the simulation with the
+  # exact message: a rank past the cluster inside the window. The shape goes in
+  # CONFIGS, so the run reuses the prebuilt driver.
   - id: dlmem_local-oob
     via: script
     driver: simx
@@ -381,18 +413,6 @@ tests:
     configs+: "-DVX_CFG_NUM_CORES=4"
     env: {DRIVER: rtlsim, APP: dlmem_local, ARGS: "-x oob", EXPECT: "DLMEM access out of bounds"}
     run: *expect_fail_run
-  - id: dlmem_local-remote
-    via: script
-    driver: simx
-    configs+: "-DVX_CFG_NUM_CORES=2"
-    env: {DRIVER: simx, APP: dlmem_local, ARGS: "-x remote", EXPECT: "remote DLMEM access is not supported"}
-    run: *expect_fail_run
-  - id: dlmem_local-remote
-    via: script
-    driver: rtlsim
-    configs+: "-DVX_CFG_NUM_CORES=2"
-    env: {DRIVER: rtlsim, APP: dlmem_local, ARGS: "-x remote", EXPECT: "remote DLMEM access is not supported"}
-    run: *expect_fail_run
 
   # SimX<->rtlsim parity of the translation stage at XLEN 64: fixed loops of
   # window loads, stores and atomics, at one core on each block's own slice,
@@ -410,6 +430,127 @@ tests:
     configs+: "-DVX_CFG_EXT_A_ENABLE"
     shape: {cores: 4, l2cache: true}
     args: "-p -k 4"
+
+  # --- remote stores ---
+  # SPREAD clusters store into the local memory of blocks on other cores. Every
+  # block stores sampled doublewords of every slice as one doubleword, two words,
+  # four halves or eight bytes, cluster.sync(), and checks its own slice (the
+  # rest still holds its fill); then a ring of producers and consumers, each
+  # storing data into the next rank, vx_fence(), and a flag store, the consumer
+  # polling its own flag (bounded) and acking back. 64 B, 1 KB and SRAM / K per
+  # block unless -l says otherwise. Each app fails a launch in which no cluster
+  # spans two cores.
+  - id: dlmem_store-2c
+    app: dlmem_store
+    drivers: [simx, rtlsim]
+    shape: {cores: 2, l2cache: true}
+    args: "-k 2 -l 64 -l 1024 -n 3"
+  # Every default launch: K = 2 and 4 at 64 B, 1 KB and SRAM / K, too long for the RTL.
+  - id: dlmem_store-4c-full
+    app: dlmem_store
+    drivers: [simx]
+    shape: {cores: 4, l2cache: true}
+  - id: dlmem_store-4c
+    app: dlmem_store
+    drivers: [simx, rtlsim]
+    shape: {cores: 4, l2cache: true}
+    args: "-k 4 -l 4096 -n 2"
+  # Two sockets of two cores: the requests and acks cross the socket crossbar.
+  # The xrt leg wraps the same RTL in the AFU shell and host stack, so it stands
+  # in for rtlsim here.
+  - id: dlmem_store-4c-s2
+    app: dlmem_store
+    drivers: [simx, xrt]
+    configs+: "-DVX_CFG_SOCKET_SIZE=2"
+    shape: {cores: 4, l2cache: true}
+    args: "-k 4 -l 1024 -n 2"
+  # One socket of four cores: only the socket switch, no crossbar.
+  - id: dlmem_store-4c-s4
+    app: dlmem_store
+    drivers: [simx, rtlsim]
+    configs+: "-DVX_CFG_SOCKET_SIZE=4"
+    shape: {cores: 4, l2cache: true}
+    args: "-k 2 -l 64 -l 1024 -n 2"
+  # Two hardware clusters, each with its own networks.
+  - id: dlmem_store-2cl
+    app: dlmem_store
+    drivers: [simx, rtlsim]
+    shape: {clusters: 2, cores: 2, l3cache: true}
+    args: "-k 2 -l 1024 -n 3"
+  # Two packets per warp: each carries its own lanes.
+  - id: dlmem_store-simd2
+    app: dlmem_store
+    drivers: [simx, rtlsim]
+    configs+: "-DVX_CFG_SIMD_WIDTH=2"
+    shape: {cores: 4, l2cache: true}
+    args: "-k 4 -l 1024 -n 2"
+  # Two-warp blocks on 8-warp cores: the ring's warps meet at a block barrier.
+  - id: dlmem_store-w8
+    app: dlmem_store
+    drivers: [simx, rtlsim]
+    shape: {cores: 4, warps: 8, l2cache: true}
+    args: "-k 4 -w 2 -l 1024 -n 2"
+  # One store credit and one pending entry, as dlmem_local-spread-p-credit1.
+  - id: dlmem_store-credit1
+    app: dlmem_store
+    drivers: [simx]
+    configs+: "-DVX_CFG_DLMEM_STORE_CREDITS=1 -DVX_CFG_DLMEM_PENDING_SIZE=1"
+    shape: {cores: 2, l2cache: true}
+    args: "-k 2 -l 64 -l 1024 -n 3"
+  # Seeded random window loads, stores (1-8 bytes) and atomics on cells each
+  # thread owns, spread over every slice, checked against the thread's own model,
+  # plus adds into shared counters; each phase ends with cluster.sync(), the
+  # fence-free arrive/wait or a ring of flags with a bounded spin. The host
+  # checks every cell and counter against its model.
+  - id: dlmem_stress-2c
+    app: dlmem_stress
+    drivers: [simx, rtlsim]
+    configs+: "-DVX_CFG_EXT_A_ENABLE"
+    shape: {cores: 2, l2cache: true}
+    args: "-k 2 -n 3 -i 4 -s 16"
+  - id: dlmem_stress-4c-s2
+    app: dlmem_stress
+    drivers: [simx, rtlsim]
+    configs+: "-DVX_CFG_EXT_A_ENABLE -DVX_CFG_SOCKET_SIZE=2"
+    shape: {cores: 4, l2cache: true}
+    args: "-k 4 -n 2 -i 4 -s 16 -r 3"
+  # The full default mix (8 phases of 32 steps, K = 2 and 4), too long for the RTL.
+  - id: dlmem_stress-4c-long
+    app: dlmem_stress
+    drivers: [simx]
+    configs+: "-DVX_CFG_EXT_A_ENABLE -DVX_CFG_SOCKET_SIZE=2"
+    shape: {cores: 4, l2cache: true}
+    args: "-r 11"
+  # A DXA copy into each block's own local memory every phase, beside the
+  # ingress writes (no multicast: never with SPREAD).
+  - id: dlmem_stress-dxa
+    app: dlmem_stress
+    drivers: [simx, rtlsim]
+    configs+: "-DVX_CFG_EXT_A_ENABLE -DVX_CFG_EXT_DXA_ENABLE"
+    shape: {cores: 4, l2cache: true}
+    args: "-k 4 -n 2 -i 4 -s 16 -d -r 5"
+  - id: dlmem_stress-2cl-w2
+    app: dlmem_stress
+    drivers: [simx, rtlsim]
+    configs+: "-DVX_CFG_EXT_A_ENABLE"
+    shape: {clusters: 2, cores: 2, warps: 8, l3cache: true}
+    args: "-k 2 -w 2 -n 2 -i 4 -s 16 -r 9"
+
+  # SimX<->rtlsim parity of the network at XLEN 64: fixed loops of window
+  # stores into the next rank's slice, on another core, with
+  # no spin and no data-dependent trip count, between fence-free cluster
+  # barriers. Four clusters of four one-warp blocks fill the four cores at once,
+  # so the placement does not depend on the done-event timing. The stores run
+  # on two sockets (the crossbar).
+  # Eight lanes per store outrun the store credits and the ingress slots, so
+  # the store cell is bound by the network and holds its fences.
+  - id: parity-dlmem-store
+    check: model_parity
+    app: dlmem_store
+    xlen: [64]
+    configs+: "-DVX_CFG_SOCKET_SIZE=2"
+    shape: {cores: 4, threads: 8, l2cache: true}
+    args: "-p -k 4 -n 4"
 
 
   # Illegal knob combinations must stop the build, in SimX (the processor

@@ -1193,7 +1193,7 @@ struct LsuReq {
 };
 
 #ifdef VX_CFG_EXT_DLMEM_ENABLE
-// Remote stores a request issued for one warp, counted until their acks return.
+// Remote lanes a request issued for one warp, counted until each is performed.
 struct WtInc {
   uint32_t wid;
   uint32_t cnt;

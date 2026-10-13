@@ -97,6 +97,10 @@ define lmem_switch_case
 	$(MAKE) -C lmem_switch CONFIGS="$(1)"
 	$(MAKE) -C lmem_switch run CONFIGS="$(1)"
 endef
+# With DLMEM (RV64 only) the switch gains its remote leg and round-robin
+# response merge, the local memory a store-acknowledging ingress input, and
+# the memory unit is linted with both wired.
+DLMEM_LMEM := -DVX_CFG_EXT_DLMEM_ENABLE
 run-lmem:
 	$(call lmem_case,$(LMEM_BASE))
 	$(call lmem_case,$(LMEM_BASE) -DVX_CFG_EXT_ZACAS_ENABLE)
@@ -104,6 +108,16 @@ run-lmem:
 	$(call lmem_switch_case,-DVX_CFG_NUM_LSU_LANES=1)
 	$(call lmem_switch_case,-DVX_CFG_NUM_LSU_LANES=2)
 	$(call lmem_switch_case,-DVX_CFG_NUM_LSU_LANES=4 $(LMEM_BASE) -DVX_CFG_EXT_ZACAS_ENABLE)
+ifeq ($(XLEN),64)
+	$(call lmem_case,$(DLMEM_LMEM) $(LMEM_BASE))
+	$(call lmem_case,$(DLMEM_LMEM) $(LMEM_BASE) -DVX_CFG_EXT_ZACAS_ENABLE)
+	$(call lmem_case,$(DLMEM_LMEM))
+	$(call lmem_switch_case,$(DLMEM_LMEM) -DVX_CFG_NUM_LSU_LANES=1)
+	$(call lmem_switch_case,$(DLMEM_LMEM) -DVX_CFG_NUM_LSU_LANES=2)
+	$(call lmem_switch_case,$(DLMEM_LMEM) -DVX_CFG_NUM_LSU_LANES=4 $(LMEM_BASE) -DVX_CFG_EXT_ZACAS_ENABLE)
+	$(MAKE) -C mem_unit lint CONFIGS="$(DLMEM_LMEM) $(LMEM_BASE)"
+	$(MAKE) -C mem_unit lint CONFIGS="$(DLMEM_LMEM) $(LMEM_BASE) -DVX_CFG_ISSUE_WIDTH=2"
+endif
 
 # CTA launch path: the KMU's cluster walk under launch-bus back-pressure, and
 # the dispatcher's slot placement across launches checked against SimX's
@@ -249,20 +263,22 @@ endif
 # and 8, core fields wider than the rank field (NCC 6, 8 and 16 over MAX 3, 4
 # and 8), second-cluster core ids, 1 to 8 lanes, 1 and 2 blocks, and Zacas.
 # NCC 6 has no vectors, so it runs random traffic only. The full runs also feed
-# a model of the LSU scheduler's queue, stressing back-pressure and handoffs.
-# The last two builds have the bound assert and the remote-access assert on
-# and must abort on such a lane; the final clean keeps a plain `run` from
-# reusing that binary. Then the core elaborates and lints with the stages in
-# place, at 1 core and at 8 cores with two LSU blocks.
+# a model of the LSU scheduler's queue, stressing back-pressure and handoffs,
+# and every run models the core's store tracker, so fences wait for their
+# warp's remote stores. The bound-assert build must abort on an out-of-bounds
+# lane; the last build sends a remote lane and holds a fence until its store
+# is acknowledged, and the final clean keeps a plain `run` from reusing it.
+# Then the core elaborates and lints with the stages and the DLMEM endpoints in
+# place, at 1 core, at 8 cores with two LSU blocks and two cores per socket,
+# and at 4 cores in one socket.
 # $(1)=CONFIGS $(2)=CORE_ID $(3)=OOB_ASSERT $(4)=OPTS $(5)=OPTS of an extra run
-# $(6)=REMOTE_ASSERT
 define dlmem_xlate_case
 	$(MAKE) -C dlmem_xlate clean
-	$(MAKE) -C dlmem_xlate CONFIGS="-DVX_CFG_EXT_DLMEM_ENABLE $(1)" CORE_ID=$(2) OOB_ASSERT=$(3) REMOTE_ASSERT=$(or $(6),0)
+	$(MAKE) -C dlmem_xlate CONFIGS="-DVX_CFG_EXT_DLMEM_ENABLE $(1)" CORE_ID=$(2) OOB_ASSERT=$(3)
 	$(if $(4),$(MAKE) -C dlmem_xlate run CONFIGS="-DVX_CFG_EXT_DLMEM_ENABLE $(1)" CORE_ID=$(2) OOB_ASSERT=$(3) \
-		REMOTE_ASSERT=$(or $(6),0) OPTS="$(4)")
+		OPTS="$(4)")
 	$(if $(5),$(MAKE) -C dlmem_xlate run CONFIGS="-DVX_CFG_EXT_DLMEM_ENABLE $(1)" CORE_ID=$(2) OOB_ASSERT=$(3) \
-		REMOTE_ASSERT=$(or $(6),0) OPTS="$(5)")
+		OPTS="$(5)")
 endef
 run-dlmem-xlate:
 ifeq ($(XLEN),64)
@@ -288,13 +304,12 @@ ifeq ($(XLEN),64)
 	! dlmem_xlate/dlmem_xlate --mode=oob > dlmem_xlate/oob.log 2>&1
 	grep -q "DLMEM access out of bounds" dlmem_xlate/oob.log
 	$(call dlmem_xlate_case,-DVX_CFG_NUM_CORES=2 -DVX_CFG_SOCKET_SIZE=1 -DVX_CFG_NUM_WARPS=4 \
-		-DVX_CFG_LMEM_LOG_SIZE=14,0,0,,,1)
-	! dlmem_xlate/dlmem_xlate --mode=remote > dlmem_xlate/remote.log 2>&1
-	grep -q "remote DLMEM access is not supported yet" dlmem_xlate/remote.log
+		-DVX_CFG_LMEM_LOG_SIZE=14,0,0,--mode=remote,--mode=fence)
 	$(MAKE) -C dlmem_xlate clean
 	$(MAKE) -C core lint CONFIGS="-DVX_CFG_EXT_DLMEM_ENABLE -DVX_CFG_NUM_CORES=1"
 	$(MAKE) -C core lint CONFIGS="-DVX_CFG_EXT_DLMEM_ENABLE -DVX_CFG_NUM_CORES=8 -DVX_CFG_SOCKET_SIZE=2 \
 		-DVX_CFG_ISSUE_WIDTH=2"
+	$(MAKE) -C core lint CONFIGS="-DVX_CFG_EXT_DLMEM_ENABLE -DVX_CFG_NUM_CORES=4 -DVX_CFG_SOCKET_SIZE=4"
 endif
 
 # Network endpoints: every core's egress, ingress and store tracker of one
@@ -337,7 +352,7 @@ ifeq ($(XLEN),64)
 	$(MAKE) -C dlmem_ep clean
 	$(MAKE) -C dlmem_ep CONFIGS="$(DLMEM_EP_CFG) -DVX_CFG_NUM_CORES=2 -DVX_CFG_SOCKET_SIZE=2" LRSC_ASSERT=1
 	! dlmem_ep/dlmem_ep --mode=lrsc > dlmem_ep/lrsc_assert.log 2>&1
-	grep -q "remote [LS][RC] is not supported" dlmem_ep/lrsc_assert.log
+	grep -q "remote LR/SC is not supported" dlmem_ep/lrsc_assert.log
 	$(MAKE) -C dlmem_ep clean
 endif
 

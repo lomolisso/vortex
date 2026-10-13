@@ -74,6 +74,14 @@ module VX_core import VX_gpu_pkg::*, VX_tlb_pkg::*; #(
     // Global barrier
     VX_gbar_bus_if.master   gbar_bus_if,
 
+`ifdef VX_CFG_EXT_DLMEM_ENABLE
+    // DLMEM request and response networks
+    VX_dlmem_bus_if.master  dlmem_req_out_if,
+    VX_dlmem_bus_if.slave   dlmem_req_in_if,
+    VX_dlmem_bus_if.master  dlmem_rsp_out_if,
+    VX_dlmem_bus_if.slave   dlmem_rsp_in_if,
+`endif
+
     // Status
     output wire             busy
 );
@@ -409,10 +417,13 @@ module VX_core import VX_gpu_pkg::*, VX_tlb_pkg::*; #(
     wire [`VX_CFG_NUM_LSU_BLOCKS-1:0][NW_WIDTH-1:0]           xlate_wt_inc_wid;
     wire [`VX_CFG_NUM_LSU_BLOCKS-1:0][`CLOG2(`VX_CFG_NUM_LSU_LANES+1)-1:0] xlate_wt_inc_cnt;
 
+    wire [`VX_CFG_NUM_WARPS-1:0] dlmem_drained;
+
     VX_dlmem_lsu_xlate #(
-        .INSTANCE_ID  (`SFORMATF(("%s-dlmem-xlate", INSTANCE_ID))),
-        .CORE_ID      (CORE_ID),
-        .REQ_BUF_SIZE (XLATE_BUF_SIZE)
+        .INSTANCE_ID   (`SFORMATF(("%s-dlmem-xlate", INSTANCE_ID))),
+        .CORE_ID       (CORE_ID),
+        .REMOTE_ASSERT (0),
+        .REQ_BUF_SIZE  (XLATE_BUF_SIZE)
     ) dlmem_xlate (
         .clk            (clk),
         .reset          (reset),
@@ -420,6 +431,7 @@ module VX_core import VX_gpu_pkg::*, VX_tlb_pkg::*; #(
         .peer_wr_slot   (peer_wr_slot),
         .peer_wr_row    (peer_wr_row),
         .peer_wr_stride (peer_wr_stride),
+        .drained        (dlmem_drained),
         .in_if          (lsu_client_if),
         .out_if         (xlate_out_if),
         .out_remote     (xlate_remote),
@@ -429,8 +441,8 @@ module VX_core import VX_gpu_pkg::*, VX_tlb_pkg::*; #(
         .wt_inc_cnt     (xlate_wt_inc_cnt),
         .empty          (xlate_empty)
     );
-    // Remote lanes assert until the network endpoints consume them.
-    `UNUSED_VAR ({xlate_remote, xlate_oob, xlate_wt_inc_valid, xlate_wt_inc_wid, xlate_wt_inc_cnt})
+    // The remote lanes reach the egress through the local-memory switches, flagged in their attributes.
+    `UNUSED_VAR ({xlate_remote, xlate_oob})
 
     // A request held in a stage keeps the LSU busy and undrained.
     assign lsu_sched_empty = lsu_sched_raw_empty & xlate_empty;
@@ -506,6 +518,20 @@ module VX_core import VX_gpu_pkg::*, VX_tlb_pkg::*; #(
         );
     end
 
+`ifdef VX_CFG_EXT_DLMEM_ENABLE
+    VX_lsu_mem_if #(
+        .NUM_LANES (`VX_CFG_NUM_LSU_LANES),
+        .DATA_SIZE (LSU_WORD_SIZE),
+        .TAG_WIDTH (LSU_TAG_WIDTH)
+    ) dlmem_remote_if[`VX_CFG_NUM_LSU_BLOCKS]();
+
+    VX_mem_bus_if #(
+        .DATA_SIZE  (LSU_WORD_SIZE),
+        .TAG_WIDTH  (LSU_TAG_WIDTH),
+        .ADDR_WIDTH (VX_dlmem_pkg::DLMEM_LMEM_AW)
+    ) dlmem_lmem_if();
+`endif
+
     VX_mem_unit #(
         .INSTANCE_ID (INSTANCE_ID)
     ) mem_unit (
@@ -522,11 +548,68 @@ module VX_core import VX_gpu_pkg::*, VX_tlb_pkg::*; #(
         .dxa_lmem_bus_if(dxa_lmem_bus_if),
         .dxa_txbar_bus_if(dxa_txbar_bus_if),
     `endif
+    `ifdef VX_CFG_EXT_DLMEM_ENABLE
+        .dlmem_remote_if(dlmem_remote_if),
+        .dlmem_lmem_if (dlmem_lmem_if),
+    `endif
         .empty         (mem_unit_empty),
         .lsu_mem_if    (lsu_mem_if),
         .dcr_flush_if  (dcr_flush_dcache_if),
         .dcache_bus_if (mmu_dcache_if)
     );
+
+`ifdef VX_CFG_EXT_DLMEM_ENABLE
+    wire                dlmem_ack_valid;
+    wire [NW_WIDTH-1:0] dlmem_ack_wid;
+    wire                dlmem_done_valid;
+    wire [NW_WIDTH-1:0] dlmem_done_wid;
+    wire                dlmem_egress_empty;
+    wire                dlmem_ingress_empty;
+    wire                dlmem_wtrack_empty;
+
+    VX_dlmem_egress #(
+        .INSTANCE_ID (`SFORMATF(("%s-dlmem-egress", INSTANCE_ID))),
+        .CORE_ID     (CORE_ID),
+        .LRSC_ASSERT (1)
+    ) dlmem_egress (
+        .clk        (clk),
+        .reset      (reset),
+        .lsu_in_if  (dlmem_remote_if),
+        .req_out_if (dlmem_req_out_if),
+        .rsp_in_if  (dlmem_rsp_in_if),
+        .ack_valid  (dlmem_ack_valid),
+        .ack_wid    (dlmem_ack_wid),
+        .done_valid (dlmem_done_valid),
+        .done_wid   (dlmem_done_wid),
+        .empty      (dlmem_egress_empty)
+    );
+
+    VX_dlmem_ingress #(
+        .INSTANCE_ID (`SFORMATF(("%s-dlmem-ingress", INSTANCE_ID)))
+    ) dlmem_ingress (
+        .clk         (clk),
+        .reset       (reset),
+        .req_in_if   (dlmem_req_in_if),
+        .lmem_bus_if (dlmem_lmem_if),
+        .rsp_out_if  (dlmem_rsp_out_if),
+        .empty       (dlmem_ingress_empty)
+    );
+
+    VX_dlmem_wtrack dlmem_wtrack (
+        .clk       (clk),
+        .reset     (reset),
+        .inc_valid (xlate_wt_inc_valid),
+        .inc_wid   (xlate_wt_inc_wid),
+        .inc_cnt   (xlate_wt_inc_cnt),
+        // The egress never raises ack and done in one cycle.
+        .dec_valid (dlmem_ack_valid || dlmem_done_valid),
+        .dec_wid   (dlmem_ack_valid ? dlmem_ack_wid : dlmem_done_wid),
+        .drained   (dlmem_drained),
+        .empty     (dlmem_wtrack_empty)
+    );
+
+    wire dlmem_empty = dlmem_egress_empty && dlmem_ingress_empty && dlmem_wtrack_empty;
+`endif
 
     // Address translation is relocated to the socket (one MMU per L1 cache).
     // The core's dcache/icache buses carry the addresses the mem_unit and fetch
@@ -557,13 +640,17 @@ module VX_core import VX_gpu_pkg::*, VX_tlb_pkg::*; #(
     // busy tracks only kernel execution: warps resident or stores not yet at L1.
     // ~mmu_empty also keeps the core busy while a translation or parked store is
     // still in flight, so kernel completion cannot race un-drained accesses.
+`ifdef VX_CFG_EXT_DLMEM_ENABLE
+    // A remote access in flight, or a peer's access to this core's local memory.
+    assign busy = sched_busy || ~(&lsu_sched_empty) || ~mem_unit_empty || ~mmu_empty || ~dlmem_empty;
+`else
     assign busy = sched_busy || ~(&lsu_sched_empty) || ~mem_unit_empty || ~mmu_empty;
+`endif
 
     // BAR (vx_barrier / vx_barrier_arrive) drains LSU + MMU before suspending or registering arrival.
     assign warp_ctl_if.lsu_sched_drained = (&lsu_sched_empty) && mmu_empty;
 `ifdef VX_CFG_EXT_DLMEM_ENABLE
-    // No remote stores exist until the egress write tracker is wired in.
-    assign warp_ctl_if.dlmem_drained = '1;
+    assign warp_ctl_if.dlmem_drained = dlmem_drained;
 `endif
 
 `ifdef PERF_ENABLE

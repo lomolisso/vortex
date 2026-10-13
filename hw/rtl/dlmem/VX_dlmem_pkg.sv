@@ -28,8 +28,9 @@ package VX_dlmem_pkg;
     localparam DLMEM_TAG_W         = `MAX(DLMEM_PEND_W, NW_WIDTH);
     localparam DLMEM_INGRESS_SLOTS = 4;
     localparam DLMEM_SLOT_W        = `UP(`CLOG2(DLMEM_INGRESS_SLOTS));
-    // A warp's unacknowledged remote stores: the egress credits plus what the LSU queues can still hold.
-    localparam DLMEM_WT_MAX        = `VX_CFG_DLMEM_STORE_CREDITS + (`VX_CFG_LSU_QUEUE_IN_SIZE + 3) * `VX_CFG_NUM_LSU_LANES;
+    // A warp's unperformed remote accesses: the egress credits and pending entries plus what the LSU queues can still hold.
+    localparam DLMEM_WT_MAX        = `VX_CFG_DLMEM_STORE_CREDITS + `VX_CFG_DLMEM_PENDING_SIZE
+                                   + (`VX_CFG_LSU_QUEUE_IN_SIZE + 3) * `VX_CFG_NUM_LSU_LANES;
     localparam DLMEM_WT_W          = `CLOG2(DLMEM_WT_MAX + 1);
 
     localparam [1:0] DLMEM_OP_LD  = 2'd0;

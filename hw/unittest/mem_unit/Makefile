@@ -23,3 +23,6 @@ RTL_INCLUDE += -I$(RTL_DIR)/interfaces -I$(RTL_DIR)/mem -I$(RTL_DIR)/vm -I$(RTL_
 TOP := VX_mem_unit_top
 
 include ../common.mk
+# Elaborate and lint the memory unit without building the model.
+lint:
+	$(VERILATOR_PATH)/bin/verilator --lint-only $(VL_FLAGS)

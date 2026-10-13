@@ -237,6 +237,9 @@ package VX_gpu_pkg;
     // is_fence marks an LSU fence's is_flush: the device's shared cache level
     // drains it instead of walking. A host flush carries is_flush alone.
     typedef struct packed {
+    `ifdef VX_CFG_EXT_DLMEM_ENABLE
+        logic                        is_addr_remote; // MEM_ATTR_REMOTE_OFFS = MEM_ATTR_FENCE_OFFS + 1
+    `endif
         logic                        is_fence;      // MEM_ATTR_FENCE_OFFS = MEM_ATTR_AMO_OFFS + AMO_REQ_BITS
         amo_req_t                    amo;           // MEM_ATTR_AMO_OFFS   = 4
         logic                        is_addr_om;    // MEM_ATTR_OM_OFFS    = 3
@@ -251,6 +254,9 @@ package VX_gpu_pkg;
     localparam MEM_ATTR_OM_OFFS     = 3;
     localparam MEM_ATTR_AMO_OFFS    = 4;
     localparam MEM_ATTR_FENCE_OFFS  = MEM_ATTR_AMO_OFFS + AMO_REQ_BITS;
+`ifdef VX_CFG_EXT_DLMEM_ENABLE
+    localparam MEM_ATTR_REMOTE_OFFS = MEM_ATTR_FENCE_OFFS + 1;
+`endif
 
     // Total width of the mem-bus attr field. Use this as the parameter
     // default for VX_mem_bus_if's ATTR_WIDTH parameter and as the

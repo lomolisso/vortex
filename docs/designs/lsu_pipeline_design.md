@@ -118,6 +118,7 @@ channel and on into the memory fabric:
 | `is_fence` | the instruction is a fence | every cache: the shared level drains it instead of walking (§3.3) |
 | `is_addr_io` | the address is in the IO range, or in the OM aperture | the cache: bypassed, uncached |
 | `is_addr_local` | the address is in the local-memory window | `VX_lmem_switch` |
+| `is_addr_remote` | DLMEM builds only: the translation stage (§4.6) found the lane's peer on another core | `VX_lmem_switch`'s remote leg |
 | `is_addr_om` | the address is in the OM fragment-export aperture | the cluster's OM steer |
 | `amo` | the instruction is an atomic | the commit point |
 
@@ -335,7 +336,7 @@ one peer table. It resolves the distributed local-memory window
 |---|---|
 | outside the window | unchanged |
 | rank `r` of the issuing block's cluster, peer on this core | the peer slot's local memory at the same offset, steered local |
-| rank `r` on another core | marked remote; a runtime assertion (SimX aborts) until the network carries it |
+| rank `r` on another core | marked remote (`is_addr_remote`), the address rewritten to the peer's core and local-memory byte and the hart id to the issuer's; it leaves through the switch's remote leg (§5.1) |
 | a rank at or past the cluster size, or an offset past the block's local-memory footprint | out of bounds: a runtime assertion; the lane is steered into the issuer's own slot, so it never touches another block |
 
 - **Peer rows.** The dispatcher writes a block's row (`K` and each rank's
@@ -349,6 +350,14 @@ one peer table. It resolves the distributed local-memory window
   bypasses the stage; its addresses are never window addresses.
 - **Cost.** One cycle per request, fences included, in DLMEM builds only, in
   both models.
+- **Fence hold.** A fence waits at the stage output until its warp has no
+  remote access left to perform. Each block reports the remote lanes it lets
+  out per warp, loads and atomics as well as stores, to the core's access
+  tracker. The egress decrements it per store acknowledgement and per load,
+  atomic or SC whose data has returned, since a fence does not wait for
+  responses. The tracker's per-warp drained flag is registered, so a fence
+  right behind a remote access of its warp always sees that access counted.
+  Requests of the block behind the fence wait with it.
 - **Outstanding reads.** The slice's packet slots (§3.4) never stall on their
   own: the scheduler refuses a load once its outstanding pool (§4.2) is full. The
   stage's two-entry buffer sits ahead of that pool, so in a DLMEM build the
@@ -379,6 +388,14 @@ Splits the lanes of **one** request by `is_addr_local`. Both subsets may be
 non-empty: a request is accepted when whichever subsets exist are accepted.
 The attribute passes through untouched on both paths.
 
+In a DLMEM build a third, remote leg takes the lanes with `is_addr_remote`
+to the core's DLMEM egress
+([`dlmem_proposal.md`](../proposals/dlmem_proposal.md)). The rule stays all
+or nothing: each present side is offered the request only when every other
+present side is ready, so a lane is never sent twice. The remote leg
+back-pressures only the request path. The responses of the three sides merge
+into one stream, the remote side never starved.
+
 ### 5.2 Local path
 
 Each LSU block has its **own** adapter into
@@ -387,7 +404,10 @@ close a loop through its pack and unpack buffers and deadlock with more than
 one block.
 
 Local memory is a banked SRAM, so lanes addressing different banks are served
-in the same cycle. Its second port is shared by the direct-memory clients —
+in the same cycle. In a DLMEM build the core's DLMEM ingress adds one more
+input, in the same round-robin as the LSU lanes; a store from it is answered
+the cycle after its bank write, which is the acknowledgement the remote
+issuer counts. Its second port is shared by the direct-memory clients —
 the DXA writes and the tensor unit's reads.
 
 Lanes that address the same bank are granted **round-robin** across every
@@ -508,7 +528,9 @@ releases the `FenceController`, so the caches walk or drain it as in the RTL
 `LsuUnit`-owned channel that `Core` binds to
 [`DlmemXlate`](../../sim/simx/dlmem/dlmem_xlate.h), whose output feeds the
 local-memory switch one cycle later (§4.6); the tensor unit's requests still go
-straight to the switch. `Core` folds the stage's emptiness into its LSU drain
+straight to the switch. The switch's remote lanes leave on its
+`ReqOutRemote` channel to the socket's egress and come back on
+`RspInRemote`. `Core` folds the stage's emptiness into its LSU drain
 and its running state. The RTL's `VX_dcr_flush` adds a register stage to every request on
 block 0's first dcache channel; SimX adds that cycle to fence tokens only,
 so other requests on that channel reach the dcache a cycle earlier than in the

@@ -31,6 +31,7 @@
 #ifdef VX_CFG_EXT_DLMEM_ENABLE
 #include "scheduler.h"
 #include "cta_gang.h"
+#include "dlmem/dlmem_xbar.h"
 #endif
 
 using namespace vortex;
@@ -92,6 +93,18 @@ public:
         cslice->Out.bind(&cta_gang_->credit_in.at(lane));
         // cluster-barrier releases share the core's global-barrier resume end
         cta_gang_->release_out.at(lane).bind(&core->gbar_resume_in);
+      }
+    }
+
+    // One crossbar per DLMEM network joins the sockets' switch uplinks.
+    if (sockets_per_cluster > 1) {
+      snprintf(sname, 100, "%s-dlmem_req_xbar", name.c_str());
+      dlmem_req_xbar_ = DlmemXbar<DlmemReqPkt>::Create(sname, cores_per_socket_, sockets_per_cluster);
+      snprintf(sname, 100, "%s-dlmem_rsp_xbar", name.c_str());
+      dlmem_rsp_xbar_ = DlmemXbar<DlmemRspPkt>::Create(sname, cores_per_socket_, sockets_per_cluster);
+      for (uint32_t i = 0; i < sockets_per_cluster; ++i) {
+        dlmem_connect(sockets_.at(i)->dlmem_req_switch(), dlmem_req_xbar_.get(), i);
+        dlmem_connect(sockets_.at(i)->dlmem_rsp_switch(), dlmem_rsp_xbar_.get(), i);
       }
     }
 #endif
@@ -633,6 +646,8 @@ private:
 #endif
 #ifdef VX_CFG_EXT_DLMEM_ENABLE
   CtaGang::Ptr                cta_gang_;
+  DlmemXbar<DlmemReqPkt>::Ptr dlmem_req_xbar_;
+  DlmemXbar<DlmemRspPkt>::Ptr dlmem_rsp_xbar_;
 #endif
 #ifdef VX_CFG_EXT_OM_ENABLE
   OmCore::Ptr                 om_core_;

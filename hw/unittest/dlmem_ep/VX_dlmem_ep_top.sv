@@ -275,6 +275,9 @@ module VX_dlmem_ep_top import VX_gpu_pkg::*, VX_dlmem_pkg::*; #(
             .rsp_in_if  (rsp_in_if),
             .ack_valid  (ack_valid_w),
             .ack_wid    (ack_wid_w),
+            // The bench counts stores only, so the tracker takes acks alone.
+            `UNUSED_PIN (done_valid),
+            `UNUSED_PIN (done_wid),
             .empty      (egress_empty[c])
         );
 

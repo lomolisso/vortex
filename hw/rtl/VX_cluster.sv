@@ -431,6 +431,60 @@ module VX_cluster import VX_gpu_pkg::*, VX_tlb_pkg::*;
     wire mmu_busy = 1'b0;
 `endif
 
+`ifdef VX_CFG_EXT_DLMEM_ENABLE
+    VX_dlmem_bus_if #(
+        .DATAW (VX_dlmem_pkg::DLMEM_REQ_DATAW),
+        .DST_W (DLMEM_CORE_W)
+    ) per_socket_dlmem_req_up_if[NUM_SOCKETS](), per_socket_dlmem_req_down_if[NUM_SOCKETS]();
+
+    VX_dlmem_bus_if #(
+        .DATAW (VX_dlmem_pkg::DLMEM_RSP_DATAW),
+        .DST_W (DLMEM_CORE_W)
+    ) per_socket_dlmem_rsp_up_if[NUM_SOCKETS](), per_socket_dlmem_rsp_down_if[NUM_SOCKETS]();
+
+    if (NUM_SOCKETS > 1) begin : g_dlmem_xbar
+        VX_dlmem_xbar #(
+            .SOCKET_SIZE (`VX_CFG_SOCKET_SIZE),
+            .NUM_SOCKETS (NUM_SOCKETS),
+            .DATAW       (VX_dlmem_pkg::DLMEM_REQ_DATAW),
+            .DST_W       (DLMEM_CORE_W),
+            .OUT_BUF     (3)
+        ) dlmem_req_xbar (
+            .clk        (clk),
+            .reset      (reset),
+            .bus_in_if  (per_socket_dlmem_req_up_if),
+            .bus_out_if (per_socket_dlmem_req_down_if)
+        );
+
+        VX_dlmem_xbar #(
+            .SOCKET_SIZE (`VX_CFG_SOCKET_SIZE),
+            .NUM_SOCKETS (NUM_SOCKETS),
+            .DATAW       (VX_dlmem_pkg::DLMEM_RSP_DATAW),
+            .DST_W       (DLMEM_CORE_W),
+            .OUT_BUF     (3)
+        ) dlmem_rsp_xbar (
+            .clk        (clk),
+            .reset      (reset),
+            .bus_in_if  (per_socket_dlmem_rsp_up_if),
+            .bus_out_if (per_socket_dlmem_rsp_down_if)
+        );
+    end else begin : g_no_dlmem_xbar
+        // A single socket's switch delivers every packet itself.
+        assign per_socket_dlmem_req_down_if[0].valid = 1'b0;
+        assign per_socket_dlmem_req_down_if[0].data  = '0;
+        assign per_socket_dlmem_req_down_if[0].dst   = '0;
+        assign per_socket_dlmem_req_up_if[0].ready   = 1'b0;
+        assign per_socket_dlmem_rsp_down_if[0].valid = 1'b0;
+        assign per_socket_dlmem_rsp_down_if[0].data  = '0;
+        assign per_socket_dlmem_rsp_down_if[0].dst   = '0;
+        assign per_socket_dlmem_rsp_up_if[0].ready   = 1'b0;
+        `UNUSED_VAR (per_socket_dlmem_req_down_if[0].ready)
+        `UNUSED_VAR ({per_socket_dlmem_req_up_if[0].valid, per_socket_dlmem_req_up_if[0].data, per_socket_dlmem_req_up_if[0].dst})
+        `UNUSED_VAR (per_socket_dlmem_rsp_down_if[0].ready)
+        `UNUSED_VAR ({per_socket_dlmem_rsp_up_if[0].valid, per_socket_dlmem_rsp_up_if[0].data, per_socket_dlmem_rsp_up_if[0].dst})
+    end
+`endif
+
     for (genvar socket_id = 0; socket_id < NUM_SOCKETS; ++socket_id) begin : g_sockets
 
         VX_socket #(
@@ -464,6 +518,13 @@ module VX_cluster import VX_gpu_pkg::*, VX_tlb_pkg::*;
             .kmu_bus_if     (per_socket_kmu_bus_if[socket_id +: 1]),
 
             .gbar_bus_if    (per_socket_gbar_bus_if[socket_id]),
+
+        `ifdef VX_CFG_EXT_DLMEM_ENABLE
+            .dlmem_req_up_if   (per_socket_dlmem_req_up_if[socket_id]),
+            .dlmem_req_down_if (per_socket_dlmem_req_down_if[socket_id]),
+            .dlmem_rsp_up_if   (per_socket_dlmem_rsp_up_if[socket_id]),
+            .dlmem_rsp_down_if (per_socket_dlmem_rsp_down_if[socket_id]),
+        `endif
 
             .busy           (per_socket_busy[socket_id])
         );

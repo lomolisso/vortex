@@ -15,6 +15,7 @@
 
 #include <cstdint>
 #include <deque>
+#include <functional>
 #include <memory>
 #include <vector>
 #include "types.h"
@@ -26,7 +27,8 @@ namespace vortex {
 // stage that rewrites the lanes of a request falling in the DLMEM window.
 // As in the RTL, a request keeps the peer row current when it entered, since
 // its slot may be re-admitted while a committed store waits here; the stride
-// is read when it leaves.
+// is read when it leaves. A fence leaves only once its warp's remote accesses
+// are performed (stores acknowledged, loads and AMOs answered).
 class DlmemXlate : public SimObject<DlmemXlate> {
 public:
   using Ptr = std::shared_ptr<DlmemXlate>;
@@ -34,7 +36,10 @@ public:
   std::vector<SimChannel<LsuReq>> ReqIn;    // capacity 2: the RTL skid buffer
   std::vector<SimChannel<LsuReq>> ReqOut;
   SimChannel<dlmem_ref::RowWrite> PeerWrIn;
-  std::vector<SimChannel<WtInc>>  WtIncOut; // remote plain stores, at the output fire
+  std::vector<SimChannel<WtInc>>  WtIncOut; // remote lanes, in the cycle of the output fire
+
+  // drained(wid): the access tracker's registered drained[wid] as the RTL stage reads it.
+  using DrainedQuery = std::function<bool(uint32_t)>;
 
   DlmemXlate(const SimContext& ctx,
              const char* name,
@@ -46,6 +51,12 @@ public:
 
   // No request held or in flight toward the stage.
   bool empty() const;
+
+  // Installed by the owning core: the tracker is a same-domain sibling whose
+  // per-warp state the RTL reads as a wire, too wide and too frequent for a channel.
+  void set_drained_query(DrainedQuery query) {
+    drained_ = std::move(query);
+  }
 
 protected:
   void on_reset();
@@ -64,6 +75,7 @@ private:
   std::vector<RowPtr> rows_;
   std::vector<std::deque<RowPtr>> entry_rows_;  // per block, one per request in ReqIn
   uint32_t stride_;
+  DrainedQuery drained_;
 
   friend class SimObject<DlmemXlate>;
 };

@@ -14,9 +14,10 @@
 `include "VX_define.vh"
 
 // Splits an LSU request into a global-memory part and a local-memory
-// part using each lane's is_addr_local user bit. Each subset carries the
-// other's lanes masked out, and the non-empty subsets are pushed in the same
-// cycle that lsu_in_if.req_ready releases the request.
+// part using each lane's is_addr_local user bit, and with DLMEM a third part
+// for the lanes whose is_addr_remote bit sends them to a peer core. Each subset
+// carries the others' lanes masked out, and the non-empty subsets are pushed in
+// the same cycle that lsu_in_if.req_ready releases the request.
 //
 // The local path carries the AMOs through to the LMEM banks, which perform the
 // read-modify-write in place and hold the LR/SC reservations.
@@ -24,6 +25,9 @@
 module VX_lmem_switch import VX_gpu_pkg::*; #(
     parameter GLOBAL_OUT_BUF = 0,
     parameter LOCAL_OUT_BUF = 0,
+`ifdef VX_CFG_EXT_DLMEM_ENABLE
+    parameter REMOTE_OUT_BUF = 0,
+`endif
     parameter RSP_OUT_BUF = 0,
     parameter `STRING ARBITER = "R"
 ) (
@@ -31,6 +35,9 @@ module VX_lmem_switch import VX_gpu_pkg::*; #(
     input wire              reset,
     VX_lsu_mem_if.slave     lsu_in_if,
     VX_lsu_mem_if.master    global_out_if,
+`ifdef VX_CFG_EXT_DLMEM_ENABLE
+    VX_lsu_mem_if.master    remote_out_if,
+`endif
     VX_lsu_mem_if.master    local_out_if
 );
     localparam REQ_DATAW = `VX_CFG_NUM_LSU_LANES + 1 + `VX_CFG_NUM_LSU_LANES * (LSU_WORD_SIZE + LSU_ADDR_WIDTH + MEM_ATTR_WIDTH + LSU_WORD_SIZE * 8) + LSU_TAG_WIDTH;
@@ -42,6 +49,39 @@ module VX_lmem_switch import VX_gpu_pkg::*; #(
         assign is_addr_local_mask[i] = lsu_in_if.req_data.user[i][MEM_ATTR_LOCAL_OFFS];
     end
 
+`ifdef VX_CFG_EXT_DLMEM_ENABLE
+    wire [`VX_CFG_NUM_LSU_LANES-1:0] is_addr_remote_mask;
+    for (genvar i = 0; i < `VX_CFG_NUM_LSU_LANES; ++i) begin : g_is_addr_remote_mask
+        assign is_addr_remote_mask[i] = lsu_in_if.req_data.user[i][MEM_ATTR_REMOTE_OFFS];
+    end
+
+    wire [`VX_CFG_NUM_LSU_LANES-1:0] remote_mask = lsu_in_if.req_data.mask &  is_addr_remote_mask;
+    wire [`VX_CFG_NUM_LSU_LANES-1:0] global_mask = lsu_in_if.req_data.mask & ~is_addr_local_mask & ~is_addr_remote_mask;
+    wire [`VX_CFG_NUM_LSU_LANES-1:0] local_mask  = lsu_in_if.req_data.mask &  is_addr_local_mask & ~is_addr_remote_mask;
+
+    wire is_addr_global = |global_mask;
+    wire is_addr_local  = |local_mask;
+    wire is_addr_remote = |remote_mask;
+
+    wire req_global_ready;
+    wire req_local_ready;
+    wire req_remote_ready;
+
+    // Every non-empty subset must be accepted before we release the LSU input.
+    assign lsu_in_if.req_ready = (!is_addr_global || req_global_ready)
+                              && (!is_addr_local  || req_local_ready)
+                              && (!is_addr_remote || req_remote_ready);
+
+    // A side that pushed alone would push again while the request waits on the others.
+    // Each side's valid depends on the other sides' ready, so every output must be buffered.
+    `STATIC_ASSERT(GLOBAL_OUT_BUF != 0 && LOCAL_OUT_BUF != 0 && REMOTE_OUT_BUF != 0, ("invalid parameter"))
+    wire req_global_valid = lsu_in_if.req_valid && is_addr_global && (!is_addr_local  || req_local_ready)
+                                                                  && (!is_addr_remote || req_remote_ready);
+    wire req_local_valid  = lsu_in_if.req_valid && is_addr_local  && (!is_addr_global || req_global_ready)
+                                                                  && (!is_addr_remote || req_remote_ready);
+    wire req_remote_valid = lsu_in_if.req_valid && is_addr_remote && (!is_addr_global || req_global_ready)
+                                                                  && (!is_addr_local  || req_local_ready);
+`else
     wire [`VX_CFG_NUM_LSU_LANES-1:0] global_mask = lsu_in_if.req_data.mask & ~is_addr_local_mask;
     wire [`VX_CFG_NUM_LSU_LANES-1:0] local_mask  = lsu_in_if.req_data.mask &  is_addr_local_mask;
 
@@ -60,6 +100,7 @@ module VX_lmem_switch import VX_gpu_pkg::*; #(
     `STATIC_ASSERT(GLOBAL_OUT_BUF != 0 && LOCAL_OUT_BUF != 0, ("invalid parameter"))
     wire req_global_valid = lsu_in_if.req_valid && is_addr_global && (!is_addr_local  || req_local_ready);
     wire req_local_valid  = lsu_in_if.req_valid && is_addr_local  && (!is_addr_global || req_global_ready);
+`endif
 
     VX_elastic_buffer #(
         .DATAW   (REQ_DATAW),
@@ -112,6 +153,61 @@ module VX_lmem_switch import VX_gpu_pkg::*; #(
         .ready_out (local_out_if.req_ready)
     );
 
+`ifdef VX_CFG_EXT_DLMEM_ENABLE
+    VX_elastic_buffer #(
+        .DATAW   (REQ_DATAW),
+        .SIZE    (`TO_OUT_BUF_SIZE(REMOTE_OUT_BUF)),
+        .OUT_REG (`TO_OUT_BUF_REG(REMOTE_OUT_BUF))
+    ) req_remote_buf (
+        .clk       (clk),
+        .reset     (reset),
+        .valid_in  (req_remote_valid),
+        .data_in   ({
+            remote_mask,
+            lsu_in_if.req_data.rw,
+            lsu_in_if.req_data.addr,
+            lsu_in_if.req_data.data,
+            lsu_in_if.req_data.byteen,
+            lsu_in_if.req_data.user,
+            lsu_in_if.req_data.tag
+        }),
+        .ready_in  (req_remote_ready),
+        .valid_out (remote_out_if.req_valid),
+        .data_out  (remote_out_if.req_data),
+        .ready_out (remote_out_if.req_ready)
+    );
+
+    // One response per cycle; the remote leg is input 0, so neither a
+    // round-robin nor a priority ARBITER can starve it.
+    VX_stream_arb #(
+        .NUM_INPUTS (3),
+        .DATAW      (RSP_DATAW),
+        .ARBITER    (ARBITER),
+        .OUT_BUF    (RSP_OUT_BUF)
+    ) rsp_arb (
+        .clk       (clk),
+        .reset     (reset),
+        .valid_in  ({
+            local_out_if.rsp_valid,
+            global_out_if.rsp_valid,
+            remote_out_if.rsp_valid
+        }),
+        .ready_in  ({
+            local_out_if.rsp_ready,
+            global_out_if.rsp_ready,
+            remote_out_if.rsp_ready
+        }),
+        .data_in   ({
+            local_out_if.rsp_data,
+            global_out_if.rsp_data,
+            remote_out_if.rsp_data
+        }),
+        .data_out  (lsu_in_if.rsp_data),
+        .valid_out (lsu_in_if.rsp_valid),
+        .ready_out (lsu_in_if.rsp_ready),
+        `UNUSED_PIN (sel_out)
+    );
+`else
     VX_stream_arb #(
         .NUM_INPUTS (2),
         .DATAW      (RSP_DATAW),
@@ -137,5 +233,6 @@ module VX_lmem_switch import VX_gpu_pkg::*; #(
         .ready_out (lsu_in_if.rsp_ready),
         `UNUSED_PIN (sel_out)
     );
+`endif
 
 endmodule

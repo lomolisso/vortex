@@ -21,11 +21,12 @@ module VX_dlmem_lsu_xlate import VX_gpu_pkg::*; #(
     parameter `STRING INSTANCE_ID = "",
     parameter  CORE_ID       = 0,
     parameter  OOB_ASSERT    = 1,
-    parameter  REMOTE_ASSERT = 1,
+    parameter  REMOTE_ASSERT = 0,
     parameter  REQ_BUF_SIZE  = 2,
 
     localparam NB            = `VX_CFG_NUM_LSU_BLOCKS,
     localparam NUM_LANES     = `VX_CFG_NUM_LSU_LANES,
+    localparam NW            = `VX_CFG_NUM_WARPS,
     localparam LMEM_LOG      = `VX_CFG_LMEM_LOG_SIZE,
     localparam CNT_W         = `CLOG2(NUM_LANES + 1)
 ) (
@@ -37,6 +38,9 @@ module VX_dlmem_lsu_xlate import VX_gpu_pkg::*; #(
     input  dlmem_row_t                      peer_wr_row,
     input  wire [LMEM_LOG:0]                peer_wr_stride,
 
+    // Per warp, no remote access awaits its completion; fences wait for it.
+    input  wire [NW-1:0]                    drained,
+
     VX_lsu_sched_if.slave                   in_if  [NB],
     VX_lsu_sched_if.master                  out_if [NB],
 
@@ -44,7 +48,7 @@ module VX_dlmem_lsu_xlate import VX_gpu_pkg::*; #(
     output wire [NB-1:0][NUM_LANES-1:0]     out_remote,
     output wire [NB-1:0][NUM_LANES-1:0]     out_oob,
 
-    // Remote stores leaving each stage, per warp.
+    // Remote accesses leaving each stage, per warp.
     output wire [NB-1:0]                    wt_inc_valid,
     output wire [NB-1:0][NW_WIDTH-1:0]      wt_inc_wid,
     output wire [NB-1:0][CNT_W-1:0]         wt_inc_cnt,
@@ -87,6 +91,7 @@ module VX_dlmem_lsu_xlate import VX_gpu_pkg::*; #(
             .row          (row[b]),
             .slot_base    (slot_base),
             .stride       (stride),
+            .drained      (drained),
             .out_remote   (out_remote[b]),
             .out_oob      (out_oob[b]),
             .wt_inc_valid (wt_inc_valid[b]),

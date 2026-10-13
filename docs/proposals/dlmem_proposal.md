@@ -57,8 +57,8 @@ the programming model is CUDA's: a generic address window,
 |---|---|---|
 | `VX_CFG_EXT_DLMEM_ENABLE` | off | the feature |
 | `VX_CFG_DLMEM_MAX_CLUSTER` | `min(8, NUM_CORES)` | largest distributed cluster (CUDA's portable limit is 8) |
-| `VX_CFG_DLMEM_STORE_CREDITS` | 8 | remote-store credits (arrives with the network) |
-| `VX_CFG_DLMEM_PENDING_SIZE` | 8 | remote loads in flight per core (arrives with remote loads) |
+| `VX_CFG_DLMEM_STORE_CREDITS` | 8 | remote stores in flight per core, unacknowledged |
+| `VX_CFG_DLMEM_PENDING_SIZE` | 8 | remote loads and atomics in flight per core |
 
 Illegal combinations stop the build in the RTL (`` `error`` or an elaboration
 `$fatal`), in SimX (`static_assert`) and, for XLEN, in `vx_dlmem.h`
@@ -162,14 +162,15 @@ wait.
   wait, which gives CUDA's cluster scope for global memory too. The raw
   `barrier_arrive()` and `barrier_wait()` have no fence (like PTX
   `.relaxed`) and order only local and window memory.
+- **Remote stores.** An arrival also waits until every remote store of the
+  warp is acknowledged, i.e. committed in the destination bank (see the
+  network below), so the barrier orders them with no change to its own logic.
 - **Not covered yet.** A local-memory store still queued past the LSU (in the
   local-memory switch or bank queues) can in principle be overtaken by a
-  peer's later load of the same word; `__syncthreads()` has the same gap
-  today. Remote stores are ordered once the network counts their
-  acknowledgements, with no change to the barrier.
+  peer's later load of the same word; `__syncthreads()` has the same gap.
 - **Exit hold and plain `BAR`.** In a DLMEM build a warp cannot exit, and a
-  plain `BAR` cannot arrive, while the warp has instructions in flight; the
-  same hook later also waits for its unacknowledged remote stores.
+  plain `BAR` cannot arrive, while the warp has instructions in flight or
+  unacknowledged remote stores.
 - **Co-residency of same-core clusters.** A DEFAULT cluster is resident all
   at once only if `K <= usable slots` and `K * W <= NUM_WARPS`. Otherwise the
   dispatcher clamps its window and admits blocks as slots free, so a cluster
@@ -192,12 +193,19 @@ models it as `DlmemXlate`, behind an `LsuUnit`-owned channel.
   rank's `{core, slot}`) and the launch's footprint into the core's peer
   table. A same-core (DEFAULT) cluster's row is its consecutive slots; a
   SPREAD block's row comes from the gang unit.
-- **Same-core peers** are served now: DEFAULT clusters of any K up to
-  `DLMEM_MAX_CLUSTER`, and SPREAD with K = 1. A lane whose peer is on another
-  core is a runtime assertion, `remote DLMEM access is not supported yet`,
-  and SimX aborts with the same text, until the network carries it. On an idle
-  machine every SPREAD peer with K > 1 is on another core (spread first), so
-  SPREAD K > 1 is covered only by that negative case until then.
+- **Same-core peers** stay in the core: the lane is steered into the peer
+  slot's local memory at the same offset.
+- **Remote peers.** A lane whose peer is on another core is marked remote
+  (`is_addr_remote`, never `is_addr_local`), its address rewritten to
+  `{core, local-memory byte}` inside the window and its hart id to the
+  issuer's; it leaves through the local-memory switch's remote leg to the
+  core's egress (next section). On an idle machine every SPREAD peer with
+  K > 1 is on another core (spread first).
+- **Fence hold.** A fence is held at the stage output until its warp has no
+  remote access left to perform: every remote store acknowledged, and every
+  remote load, atomic and SC answered. The warp's counter rises when the
+  access leaves the stage and its drained flag is registered, so a fence right
+  behind an access of the same warp always waits for its completion.
 - **Out of bounds.** A rank at or past K inside the window, or an offset past
   the block's footprint, is the runtime assertion `DLMEM access out of
   bounds`; the lane is steered into the issuer's own slot. A DEFAULT cluster
@@ -207,9 +215,9 @@ models it as `DlmemXlate`, behind an `LsuUnit`-owned channel.
 - **Timing.** One cycle per LSU request, fences included, in DLMEM builds, in
   both models. The stage's empty is folded into the LSU empty that the barrier
   drain, the flush gate and core busy use.
-- **Warp exit** waits for the warp's earlier instructions (and, with the
-  network, its unacknowledged remote stores) to drain, so a slot admitted
-  again cannot lend its new row to a store of the warp that left it.
+- **Warp exit** waits for the warp's earlier instructions and its
+  unacknowledged remote stores to drain, so a slot admitted again cannot lend
+  its new row to a store of the warp that left it.
 - **The tensor unit's** requests bypass the stage. With `TCU_META` the RTL
   arbitrates them against the stage round-robin in the scheduler, while SimX
   orders same-cycle arrivals at the local-memory switch canonically: correct,
@@ -220,12 +228,63 @@ models it as `DlmemXlate`, behind an `LsuUnit`-owned channel.
   0, global, own and window lanes in one store and one load, sub-word stores
   at the slice and line edges of every peer, and the self window against the
   plain pointer. It sweeps 64 B, 1 KB and SRAM/K per block, has an exit-stress
-  mode and the two negative modes above, and syncs a same-core cluster on a
-  local barrier of its base slot (`-c` uses `cluster_group::sync()`).
+  mode and the out-of-bounds negative mode, and syncs a same-core cluster on a
+  local barrier of its base slot (`-c` uses `cluster_group::sync()`). With
+  `-s` and K > 1 the same tests run between cores, on `cluster_group::sync()`.
 - **Parity** (`parity-dlmem-local`, `parity-dlmem-local-4c`): fixed loops of
   window loads, stores and atomics, at one core with K = 1 and at four cores
   with same-core clusters of 4. Both models retire the same instructions;
   the cycle gaps are 2.9% (29270 SimX vs 28435 RTL) and 2.8% (30575 vs 29731).
+
+## Network, remote stores, loads and atomics
+
+Each core of a hardware cluster has one egress, one ingress and one store
+tracker; two separate networks (requests and responses), each a switch per
+socket and a crossbar across sockets, connect them
+(`hw/rtl/dlmem/`, SimX `sim/simx/dlmem/`).
+
+- **Path.** A remote lane leaves the translation stage, takes the
+  local-memory switch's third (remote) leg, and reaches the egress, which
+  sends one packet per lane on the request network. The destination's
+  ingress reserves a response slot, then writes its own input of the local
+  memory, which round-robins with the core's LSU lanes. A load's or atomic's
+  data, or a store's acknowledgement, returns on the response network to the
+  egress, which hands loads and atomics back to the LSU as partial responses.
+- **The switch is all or nothing** across its local, global and remote sides,
+  as with two; its response merge takes the three sides with no side starved.
+- **Store acknowledgements.** The local memory answers a store from the
+  ingress input the cycle after the bank write, so an acknowledgement means
+  committed and visible to every core. The access tracker counts each warp's
+  remote accesses from the translation stage on until a store's
+  acknowledgement or a load's or atomic's data returns; FENCE, `BAR`,
+  cluster arrive and warp exit wait for the count to be zero.
+- **Credits.** The egress holds `VX_CFG_DLMEM_STORE_CREDITS` stores and
+  `VX_CFG_DLMEM_PENDING_SIZE` loads and atomics in flight; its response sink
+  never refuses.
+- **Atomics** (and the Zacas CAS) execute at the destination bank, carrying
+  the issuer's hart id, so a remote store or atomic breaks other harts'
+  reservations there. Remote LR/SC is a runtime assertion,
+  `remote LR/SC is not supported`, in both models; in hardware without the
+  assertion LR acts as a load and SC always fails.
+- **Deadlock.** Responses always drain: response space is reserved before a
+  request is accepted, the ingress' local-memory responses are never refused,
+  and the remote leg back-pressures only the LSU request path. A held fence
+  waits only on its warp's earlier remote accesses, which already left the
+  stage and need other cores' ingress and local memory, the networks, this
+  core's always-ready response sink, and egress pending entries that free as
+  the LSU drains its responses.
+- **Tests.** [`dlmem_store`](../../tests/regression/dlmem_store) (all-to-all
+  stores of every width, and a producer/consumer ring on `vx_fence()` and a
+  flag), [`dlmem_load`](../../tests/regression/dlmem_load) (every slice at
+  every width, ping-pong, mixed global/local/remote lanes, a thread's store
+  then load), [`dlmem_atomic`](../../tests/regression/dlmem_atomic)
+  (histogram and tickets, an `amoswap` lock, every AMO at both widths, CAS,
+  and the `-x lrsc` negative) and
+  [`dlmem_stress`](../../tests/regression/dlmem_stress) (a seeded random mix
+  against a model, with optional DXA copies), all SPREAD; and
+  `dlmem_local -s`. Each fails a launch in which no cluster spans two cores.
+  Parity: `parity-dlmem-store`, `parity-dlmem-load`, `parity-dlmem-atomic`,
+  and `parity-dlmem-atomic-fence` (a fence after each iteration's atomics).
 
 ## Memory-model contract
 
@@ -239,11 +298,12 @@ models it as `DlmemXlate`, behind an `LsuUnit`-owned channel.
 - **Order.** Accesses from one warp to one destination stay in order (fixed
   routes, FIFO buffers). A thread's store and later load to the same remote
   address are ordered.
-- **Visibility.** Each warp counts its remote stores that are not yet
-  acknowledged; a store is acknowledged once committed at the destination
-  bank. FENCE, barriers, cluster arrive and warp exit wait for the count to
-  reach zero, so `cluster.sync()` orders all earlier remote stores before the
-  peers' later accesses.
+- **Visibility.** Each warp counts its remote accesses not yet performed; a
+  load or atomic is performed once its data returns, and a store once it is
+  acknowledged, i.e. committed at the destination bank. FENCE, barriers,
+  cluster arrive and warp exit wait for the count to reach zero, so a fence
+  orders every earlier remote access before the warp's later ones, and
+  `cluster.sync()` orders them before the peers' later accesses.
 - **Atomics.** Remote AMOs (and the Zacas CAS) execute at the destination
   bank. Remote LR/SC is unsupported: a runtime assertion in simulation; in
   hardware LR acts as a load and SC always fails.
@@ -277,7 +337,8 @@ RV32; `EXT_RASTER`; DXA multicast into a spread gang (until DXA × DLMEM).
 
 Each step lands RTL and SimX together, test-first: a unit testbench, a SimX
 unit test where the model has a unit of its own, a regression app, CI cases
-in `ci/testcases/dlmem.yaml` and a `model_parity` case at XLEN 64.
+in `ci/testcases/dlmem.yaml` and a `model_parity` case at XLEN 64. All nine
+have landed.
 
 1. Upstream fixes DLMEM depends on: the local-memory switch's duplicate push,
    and the dispatcher's slot pointer at each launch.

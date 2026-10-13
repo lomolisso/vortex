@@ -39,6 +39,11 @@ module VX_local_mem import VX_gpu_pkg::*; #(
     // Synthesize atomic-op + LR/SC logic in the banks
     parameter AMO_ENABLE        = 0,
 
+`ifdef VX_CFG_EXT_DLMEM_ENABLE
+    // Inputs whose stores return a response once the bank has committed them
+    parameter [NUM_REQS-1:0] STORE_ACK_MASK = '0,
+`endif
+
     // Response buffer
     parameter OUT_BUF           = 0
  ) (
@@ -629,6 +634,22 @@ module VX_local_mem import VX_gpu_pkg::*; #(
 
         // LSU response valid / request ready — blocked by DMA and RDW hazards
 
+    `ifdef VX_CFG_EXT_DLMEM_ENABLE
+        // The acknowledgement leaves through the read response pipe, so it
+        // trails the SRAM write by the same cycle a read trails its access.
+        wire req_store_ack = per_bank_req_rw[i] && STORE_ACK_MASK[per_bank_req_idx[i]];
+
+        assign bank_rsp_valid = per_bank_req_valid[i]
+                             && ~dma_pending
+                             && ~amo_busy
+                             && (~per_bank_req_rw[i] || req_store_ack)
+                             && ~is_rdw_hazard;
+
+        assign per_bank_req_ready[i] = ~dma_pending
+                                    && ~amo_busy
+                                    && (bank_rsp_ready || (per_bank_req_rw[i] && ~req_store_ack))
+                                    && ~is_rdw_hazard;
+    `else
         assign bank_rsp_valid = per_bank_req_valid[i]
                              && ~dma_pending
                              && ~amo_busy
@@ -639,6 +660,7 @@ module VX_local_mem import VX_gpu_pkg::*; #(
                                     && ~amo_busy
                                     && (bank_rsp_ready || per_bank_req_rw[i])
                                     && ~is_rdw_hazard;
+    `endif
 
         // Delay tag/idx to align with SRAM 1-cycle output latency
         VX_pipe_buffer #(

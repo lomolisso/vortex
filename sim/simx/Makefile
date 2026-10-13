@@ -73,6 +73,8 @@ endif
 ifneq ($(filter -DVX_CFG_EXT_DLMEM_ENABLE, $(XCONFIGS)),)
 	SRCS += $(wildcard $(SRC_DIR)/kmu/cta_gang.cpp)
 	SRCS += $(wildcard $(SRC_DIR)/dlmem/dlmem_xlate.cpp)
+	SRCS += $(SRC_DIR)/dlmem/dlmem_egress.cpp $(SRC_DIR)/dlmem/dlmem_ingress.cpp $(SRC_DIR)/dlmem/dlmem_wtrack.cpp
+	SRCS += $(SRC_DIR)/dlmem/dlmem_switch.cpp $(SRC_DIR)/dlmem/dlmem_xbar.cpp
 endif
 
 # Graphics SW helpers (TextureSampler / DepthTencil / Blender / Rasterizer).
@@ -162,7 +164,7 @@ CTA_GANG_TEST_OBJ := $(OBJ_DIR)/tests/cta_gang_test.o
 CTA_GANG_TEST     := $(DESTDIR)/cta_gang_test
 
 # The DLMEM translation and endpoints link standalone into their unit tests.
-DLMEM_XLATE_SRCS     := $(SRC_DIR)/dlmem/dlmem_xlate.cpp
+DLMEM_XLATE_SRCS     := $(SRC_DIR)/dlmem/dlmem_xlate.cpp $(SRC_DIR)/dlmem/dlmem_wtrack.cpp
 DLMEM_XLATE_OBJS     := $(patsubst $(SRC_DIR)/%.cpp,$(OBJ_DIR)/%.o,$(DLMEM_XLATE_SRCS))
 DLMEM_XLATE_TEST_OBJ := $(OBJ_DIR)/tests/dlmem_xlate_test.o
 DLMEM_XLATE_TEST     := $(DESTDIR)/dlmem_xlate_test
@@ -172,11 +174,16 @@ DLMEM_EP_OBJS     := $(patsubst $(SRC_DIR)/%.cpp,$(OBJ_DIR)/%.o,$(DLMEM_EP_SRCS)
 DLMEM_EP_TEST_OBJ := $(OBJ_DIR)/tests/dlmem_ep_test.o
 DLMEM_EP_TEST     := $(DESTDIR)/dlmem_ep_test
 
+# The local-memory switch test links libsimx, whose switch has the remote leg in DLMEM builds.
+LMEM_SWITCH_TEST_OBJ := $(OBJ_DIR)/tests/lmem_switch_test.o
+LMEM_SWITCH_TEST     := $(DESTDIR)/lmem_switch_test
+
 DEPS := $(OBJS:.o=.d) $(MAIN_OBJ:.o=.d) $(DXA_OOO_TEST_OBJ:.o=.d) $(RVC_TEST_OBJ:.o=.d)
 DEPS += $(DLMEM_NOC_OBJS:.o=.d) $(DLMEM_NOC_TEST_OBJ:.o=.d)
 DEPS += $(CTA_GANG_TEST_OBJ:.o=.d)
 DEPS += $(DLMEM_XLATE_OBJS:.o=.d) $(DLMEM_XLATE_TEST_OBJ:.o=.d)
 DEPS += $(DLMEM_EP_OBJS:.o=.d) $(DLMEM_EP_TEST_OBJ:.o=.d)
+DEPS += $(LMEM_SWITCH_TEST_OBJ:.o=.d)
 
 # generate .d files alongside .o files
 CXXFLAGS += -MMD -MP -MF $(@:.o=.d)
@@ -199,7 +206,7 @@ PROJECT := simx
 VORTEX_LIB := libvortex.so
 VORTEX_GEM5_LIB := libvortex-gem5.so
 
-.PHONY: all force test-dxa-ooo test-rvc-decompress test-dlmem-noc test-cta-gang test-dlmem-xlate test-dlmem-ep clean clean-lib clean-exe clean-obj libvortex clean-libvortex libvortex-gem5 clean-libvortex-gem5
+.PHONY: all force test-dxa-ooo test-rvc-decompress test-dlmem-noc test-cta-gang test-dlmem-xlate test-dlmem-ep test-lmem-switch clean clean-lib clean-exe clean-obj libvortex clean-libvortex libvortex-gem5 clean-libvortex-gem5
 
 ifeq ($(USE_SST), 1)
 all: $(DESTDIR)/$(PROJECT) $(DESTDIR)/$(VORTEX_LIB)
@@ -258,6 +265,10 @@ $(DLMEM_EP_TEST_OBJ): $(VORTEX_HOME)/tests/unittest/dlmem_ep/main.cpp $(CONFIG_F
 	@mkdir -p $(@D)
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
+$(LMEM_SWITCH_TEST_OBJ): $(VORTEX_HOME)/tests/unittest/lmem_switch/main.cpp $(CONFIG_FILE)
+	@mkdir -p $(@D)
+	$(CXX) $(CXXFLAGS) -c $< -o $@
+
 # Main executable
 $(DESTDIR)/$(PROJECT): $(OBJS) $(MAIN_OBJ)
 	$(CXX) $(CXXFLAGS) $^ $(LDFLAGS) -o $@
@@ -296,6 +307,12 @@ test-dlmem-ep: $(DLMEM_EP_TEST)
 	$(DLMEM_EP_TEST) $(DLMEM_EP_OPTS)
 
 $(DLMEM_EP_TEST): $(DLMEM_EP_OBJS) $(DLMEM_EP_TEST_OBJ)
+	$(CXX) $(CXXFLAGS) $^ $(LDFLAGS) -o $@
+
+test-lmem-switch: $(LMEM_SWITCH_TEST)
+	$(LMEM_SWITCH_TEST) $(LMEM_SWITCH_OPTS)
+
+$(LMEM_SWITCH_TEST): $(OBJS) $(LMEM_SWITCH_TEST_OBJ)
 	$(CXX) $(CXXFLAGS) $^ $(LDFLAGS) -o $@
 
 # Shared library
@@ -342,7 +359,7 @@ clean-libvortex-gem5:
 	rm -f $(DESTDIR)/$(VORTEX_GEM5_LIB)
 
 clean-exe:
-	rm -f $(DESTDIR)/$(PROJECT) $(DXA_OOO_TEST) $(DLMEM_NOC_TEST) $(CTA_GANG_TEST) $(DLMEM_XLATE_TEST) $(DLMEM_EP_TEST)
+	rm -f $(DESTDIR)/$(PROJECT) $(DXA_OOO_TEST) $(DLMEM_NOC_TEST) $(CTA_GANG_TEST) $(DLMEM_XLATE_TEST) $(DLMEM_EP_TEST) $(LMEM_SWITCH_TEST)
 
 clean-obj:
 	rm -rf $(OBJ_DIR)

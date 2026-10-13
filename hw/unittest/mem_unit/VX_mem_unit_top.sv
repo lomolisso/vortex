@@ -119,6 +119,37 @@ module VX_mem_unit_top import VX_gpu_pkg::*; #(
     wire mem_unit_empty;
     `UNUSED_VAR (mem_unit_empty)
 
+`ifdef VX_CFG_EXT_DLMEM_ENABLE
+    // Idle DLMEM endpoints: the egress takes every remote request, the ingress sends none.
+    VX_lsu_mem_if #(
+        .NUM_LANES (`VX_CFG_NUM_LSU_LANES),
+        .DATA_SIZE (LSU_WORD_SIZE),
+        .TAG_WIDTH (LSU_TAG_WIDTH)
+    ) dlmem_remote_if[`VX_CFG_NUM_LSU_BLOCKS]();
+
+    for (genvar i = 0; i < `VX_CFG_NUM_LSU_BLOCKS; ++i) begin : g_dlmem_remote
+        assign dlmem_remote_if[i].req_ready = 1'b1;
+        assign dlmem_remote_if[i].rsp_valid = 1'b0;
+        assign dlmem_remote_if[i].rsp_data  = '0;
+        `UNUSED_VAR (dlmem_remote_if[i].req_valid)
+        `UNUSED_VAR (dlmem_remote_if[i].req_data)
+        `UNUSED_VAR (dlmem_remote_if[i].rsp_ready)
+    end
+
+    VX_mem_bus_if #(
+        .DATA_SIZE  (LSU_WORD_SIZE),
+        .TAG_WIDTH  (LSU_TAG_WIDTH),
+        .ADDR_WIDTH (`VX_CFG_LMEM_LOG_SIZE - `CLOG2(LSU_WORD_SIZE))
+    ) dlmem_lmem_if();
+
+    assign dlmem_lmem_if.req_valid = 1'b0;
+    assign dlmem_lmem_if.req_data  = '0;
+    assign dlmem_lmem_if.rsp_ready = 1'b1;
+    `UNUSED_VAR (dlmem_lmem_if.req_ready)
+    `UNUSED_VAR (dlmem_lmem_if.rsp_valid)
+    `UNUSED_VAR (dlmem_lmem_if.rsp_data)
+`endif
+
     VX_mem_unit #(
         .INSTANCE_ID (INSTANCE_ID)
     ) mem_unit (
@@ -126,6 +157,10 @@ module VX_mem_unit_top import VX_gpu_pkg::*; #(
         .reset         (reset),
     `ifdef PERF_ENABLE
         .lmem_perf     (lmem_perf),
+    `endif
+    `ifdef VX_CFG_EXT_DLMEM_ENABLE
+        .dlmem_remote_if (dlmem_remote_if),
+        .dlmem_lmem_if (dlmem_lmem_if),
     `endif
         .empty         (mem_unit_empty),
         .lsu_mem_if    (lsu_mem_if),

@@ -29,10 +29,42 @@ LocalMemSwitch::LocalMemSwitch(
   , RspInLmem(this)
   , ReqOutDC(this)
   , RspInDC(this)
+#ifdef VX_CFG_EXT_DLMEM_ENABLE
+  , ReqOutRemote(this)
+  , RspInRemote(this)
+#endif
   , delay_(delay)
+#ifdef VX_CFG_EXT_DLMEM_ENABLE
+  , rsp_rr_last_(2)
+#endif
 {}
 
+#ifdef VX_CFG_EXT_DLMEM_ENABLE
+void LocalMemSwitch::on_reset() {
+  // VX_rr_arbiter starts with its last grant at the top input.
+  rsp_rr_last_ = 2;
+}
+#endif
+
 void LocalMemSwitch::on_tick() {
+#ifdef VX_CFG_EXT_DLMEM_ENABLE
+  // One response per cycle, round-robin over {remote, global, local}: the RTL's ARBITER "R" merge.
+  {
+    SimChannel<LsuRsp>* rsp_in[3] = {&RspInRemote, &RspInDC, &RspInLmem};
+    for (uint32_t k = 1; k <= 3; ++k) {
+      uint32_t i = (rsp_rr_last_ + k) % 3;
+      if (rsp_in[i]->empty())
+        continue;
+      auto& out_rsp = rsp_in[i]->peek();
+      if (RspOut.try_send(out_rsp, 1)) {
+        DT(4, this->name() << (i == 0 ? " remote" : (i == 1 ? " dc" : " lmem")) << "-rsp: " << out_rsp);
+        rsp_in[i]->pop();
+        rsp_rr_last_ = i;
+      }
+      break;
+    }
+  }
+#else
   // process outgoing responses
   if (!RspInLmem.empty()) {
     auto& out_rsp = RspInLmem.peek();
@@ -48,6 +80,7 @@ void LocalMemSwitch::on_tick() {
       RspInDC.pop();
     }
   }
+#endif
 
   // process incoming requests
   if (!ReqIn.empty()) {
@@ -76,8 +109,34 @@ void LocalMemSwitch::on_tick() {
     out_lmem_req.flags = in_req.flags;
     out_lmem_req.tids  = in_req.tids;
 
+#ifdef VX_CFG_EXT_DLMEM_ENABLE
+    LsuReq out_remote_req(in_req.mask.size());
+    out_remote_req.tag    = in_req.tag;
+    out_remote_req.cid    = in_req.cid;
+    out_remote_req.uuid   = in_req.uuid;
+    out_remote_req.wid    = in_req.wid;
+    out_remote_req.op     = in_req.op;
+    out_remote_req.flags  = in_req.flags;
+    out_remote_req.tids   = in_req.tids;
+    out_remote_req.cta_id = in_req.cta_id;
+#endif
+
     for (uint32_t i = 0; i < in_req.mask.size(); ++i) {
       if (in_req.mask.test(i)) {
+#ifdef VX_CFG_EXT_DLMEM_ENABLE
+        // A remote lane keeps its window address, which must not be taken for
+        // this core's own memory.
+        if (in_req.dlmem_remote.test(i)) {
+          out_remote_req.mask.set(i);
+          out_remote_req.dlmem_remote.set(i);
+          out_remote_req.addrs.at(i)      = in_req.addrs.at(i);
+          out_remote_req.data.at(i)       = in_req.data.at(i);
+          out_remote_req.byteen.at(i)     = in_req.byteen.at(i);
+          out_remote_req.amo_cmp.at(i)    = in_req.amo_cmp.at(i);
+          out_remote_req.dlmem_core.at(i) = in_req.dlmem_core.at(i);
+          continue;
+        }
+#endif
         auto type = get_addr_type(in_req.addrs.at(i));
         // An AMO whose address is Shared is executed by the LMEM bank here.
         // The RTL has no such path -- VX_lmem_switch strips the AMO bits and
@@ -88,6 +147,10 @@ void LocalMemSwitch::on_tick() {
           out_lmem_req.addrs.at(i)  = in_req.addrs.at(i);
           out_lmem_req.data.at(i)   = in_req.data.at(i);
           out_lmem_req.byteen.at(i) = in_req.byteen.at(i);
+#ifdef VX_CFG_EXT_DLMEM_ENABLE
+          // A window CAS to a same-core peer executes in this core's local memory.
+          out_lmem_req.amo_cmp.at(i) = in_req.amo_cmp.at(i);
+#endif
         } else {
           out_dc_req.mask.set(i);
           out_dc_req.addrs.at(i)  = in_req.addrs.at(i);
@@ -108,6 +171,12 @@ void LocalMemSwitch::on_tick() {
     if (send_to_lmem && ReqOutLmem.full())
       return; // stall
 
+#ifdef VX_CFG_EXT_DLMEM_ENABLE
+    bool send_to_remote = !out_remote_req.mask.none();
+    if (send_to_remote && ReqOutRemote.full())
+      return; // stall
+#endif
+
     if (send_to_dc) {
       ReqOutDC.send(out_dc_req, delay_);
       DT(4, this->name() << " dc-req: " << out_dc_req);
@@ -117,11 +186,24 @@ void LocalMemSwitch::on_tick() {
       ReqOutLmem.send(out_lmem_req, delay_);
       DT(4, this->name() << " lmem-req: " << out_lmem_req);
     }
+
+#ifdef VX_CFG_EXT_DLMEM_ENABLE
+    if (send_to_remote) {
+      ReqOutRemote.send(out_remote_req, delay_);
+      DT(4, this->name() << " remote-req: " << out_remote_req);
+    }
+#endif
     ReqIn.pop();
   }
 
-  // sleep when nothing is queued or in flight toward us (no cross-tick state).
+  // sleep when nothing is queued or in flight toward us; no state moves while idle.
+#ifdef VX_CFG_EXT_DLMEM_ENABLE
+  if (ReqIn.size() == 0 && RspInLmem.size() == 0 && RspInDC.size() == 0 && RspInRemote.size() == 0) {
+    this->tick_sleep();
+  }
+#else
   if (ReqIn.size() == 0 && RspInLmem.size() == 0 && RspInDC.size() == 0) {
     this->tick_sleep();
   }
+#endif
 }

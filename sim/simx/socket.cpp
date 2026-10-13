@@ -32,6 +32,12 @@
 #include "rtu_unit.h"
 #include "sfu_unit.h"
 #endif
+#ifdef VX_CFG_EXT_DLMEM_ENABLE
+#include "local_mem.h"
+#include "local_mem_switch.h"
+#include "dlmem/dlmem_egress.h"
+#include "dlmem/dlmem_ingress.h"
+#endif
 
 using namespace vortex;
 
@@ -265,6 +271,49 @@ public:
     }
 #endif
 
+#ifdef VX_CFG_EXT_DLMEM_ENABLE
+    // The DLMEM endpoints and switches tick in the order their models need:
+    // each egress before the request switch it feeds, each ingress after it
+    // and before the response switch. All tick before the cores, so a slot their
+    // buffers free in a load/store switch or a local memory shows the cycle after.
+    {
+      uint32_t ncc = NUM_SOCKETS * cores_per_socket;
+      uint32_t socket_idx = simobject_->id() % NUM_SOCKETS;
+      for (uint32_t i = 0; i < cores_per_socket; ++i) {
+        uint32_t core_id = simobject_->id() * cores_per_socket + i;
+        DlmemEgress::Config cfg;
+        cfg.core_id       = core_id % ncc;
+        cfg.ncc           = ncc;
+        cfg.lmem_log      = VX_CFG_LMEM_LOG_SIZE;
+        cfg.dlmem_base    = VX_MEM_DLMEM_BASE_ADDR;
+        cfg.num_blocks    = VX_CFG_NUM_LSU_BLOCKS;
+        cfg.num_lanes     = VX_CFG_NUM_LSU_LANES;
+        cfg.store_credits = VX_CFG_DLMEM_STORE_CREDITS;
+        cfg.pending_size  = VX_CFG_DLMEM_PENDING_SIZE;
+        cfg.lrsc_assert   = true;
+        snprintf(sname, 100, "%s-dlmem_egress%d", name.c_str(), i);
+        dlmem_egress_.push_back(DlmemEgress::Create(sname, cfg));
+      }
+      snprintf(sname, 100, "%s-dlmem_req_switch", name.c_str());
+      dlmem_req_switch_ = Socket::DlmemReqSwitch::Create(sname, socket_idx, cores_per_socket, NUM_SOCKETS);
+      for (uint32_t i = 0; i < cores_per_socket; ++i) {
+        DlmemIngress::Config cfg;
+        cfg.num_slots = DLMEM_INGRESS_SLOTS;
+        cfg.lmem_base = VX_MEM_LMEM_BASE_ADDR;
+        snprintf(sname, 100, "%s-dlmem_ingress%d", name.c_str(), i);
+        dlmem_ingress_.push_back(DlmemIngress::Create(sname, cfg));
+      }
+      snprintf(sname, 100, "%s-dlmem_rsp_switch", name.c_str());
+      dlmem_rsp_switch_ = Socket::DlmemRspSwitch::Create(sname, socket_idx, cores_per_socket, NUM_SOCKETS);
+      for (uint32_t i = 0; i < cores_per_socket; ++i) {
+        dlmem_egress_.at(i)->NetReqOut.bind(&dlmem_req_switch_->CoreIn.at(i));
+        dlmem_req_switch_->CoreOut.at(i).bind(&dlmem_ingress_.at(i)->NetReqIn);
+        dlmem_ingress_.at(i)->NetRspOut.bind(&dlmem_rsp_switch_->CoreIn.at(i));
+        dlmem_rsp_switch_->CoreOut.at(i).bind(&dlmem_egress_.at(i)->NetRspIn);
+      }
+    }
+#endif
+
     // create cores
     for (uint32_t i = 0; i < cores_per_socket; ++i) {
       uint32_t core_id = simobject_->id() * cores_per_socket + i;
@@ -282,6 +331,25 @@ public:
         dcaches_->core_rsp_out.at(i).at(j).bind(&cores_.at(i)->dcache_rsp_in.at(j));
       }
     }
+
+#ifdef VX_CFG_EXT_DLMEM_ENABLE
+    // Each core's endpoints: the egress takes the load/store switches' remote
+    // legs and reports completions to the core's access tracker, the ingress
+    // drives its local-memory port.
+    for (uint32_t i = 0; i < cores_per_socket; ++i) {
+      auto& core = cores_.at(i);
+      auto& egress = dlmem_egress_.at(i);
+      auto& ingress = dlmem_ingress_.at(i);
+      for (uint32_t b = 0; b < VX_CFG_NUM_LSU_BLOCKS; ++b) {
+        core->lmem_switch(b)->ReqOutRemote.bind(&egress->ReqIn.at(b));
+        egress->RspOut.at(b).bind(&core->lmem_switch(b)->RspInRemote);
+      }
+      egress->AckOut.bind(&core->dlmem_ack_in());
+      egress->DoneOut.bind(&core->dlmem_done_in());
+      ingress->LmemReqOut.bind(&core->local_mem()->Inputs.at(Core::LMEM_INGRESS_PORT));
+      core->local_mem()->Outputs.at(Core::LMEM_INGRESS_PORT).bind(&ingress->LmemRspIn);
+    }
+#endif
 
 #ifdef VX_CFG_EXT_TEX_ENABLE
     // Socket-level TexBus arbiter: one input per core's SfuUnit → 1 TEX core.
@@ -351,6 +419,17 @@ public:
       if (core->running())
         return true;
     }
+  #ifdef VX_CFG_EXT_DLMEM_ENABLE
+    // Credits, pending entries and slots hold no channel packet while they wait.
+    for (auto& egress : dlmem_egress_) {
+      if (!egress->empty())
+        return true;
+    }
+    for (auto& ingress : dlmem_ingress_) {
+      if (!ingress->empty())
+        return true;
+    }
+  #endif
     return false;
   }
 
@@ -437,6 +516,11 @@ public:
   RtuCore::Ptr& rtu_core() { return rtu_core_; }
 #endif
 
+#ifdef VX_CFG_EXT_DLMEM_ENABLE
+  Socket::DlmemReqSwitch* dlmem_req_switch() const { return dlmem_req_switch_.get(); }
+  Socket::DlmemRspSwitch* dlmem_rsp_switch() const { return dlmem_rsp_switch_.get(); }
+#endif
+
 private:
   Socket*                 simobject_;
   std::vector<Core::Ptr>  cores_;
@@ -455,6 +539,12 @@ private:
   RtuCore::Ptr            rtu_core_;
   Cache::Ptr              rtcache_;
   RtuBusArbiter::Ptr      rtu_bus_arb_;
+#endif
+#ifdef VX_CFG_EXT_DLMEM_ENABLE
+  std::vector<DlmemEgress::Ptr>  dlmem_egress_;
+  std::vector<DlmemIngress::Ptr> dlmem_ingress_;
+  Socket::DlmemReqSwitch::Ptr    dlmem_req_switch_;
+  Socket::DlmemRspSwitch::Ptr    dlmem_rsp_switch_;
 #endif
 };
 
@@ -539,5 +629,15 @@ DxaCore::Ptr& Socket::dxa_core() {
 #ifdef VX_CFG_EXT_RTU_ENABLE
 RtuCore::Ptr& Socket::rtu_core() {
   return impl_->rtu_core();
+}
+#endif
+
+#ifdef VX_CFG_EXT_DLMEM_ENABLE
+Socket::DlmemReqSwitch* Socket::dlmem_req_switch() const {
+  return impl_->dlmem_req_switch();
+}
+
+Socket::DlmemRspSwitch* Socket::dlmem_rsp_switch() const {
+  return impl_->dlmem_rsp_switch();
 }
 #endif

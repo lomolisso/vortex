@@ -361,13 +361,11 @@ __kernel void burst_k(local_arg_t* __UNIFORM__ arg) {
   ctx_done(x, arg);
 }
 
-// One window store that must stop the simulation.
+// One window store past the cluster, which must stop the simulation.
 __kernel void neg_k(local_arg_t* __UNIFORM__ arg) {
   Ctx x;
   ctx_init(x, arg);
-  if (x.rank == 0 && x.tid == 0) {
-    const uint32_t target = (arg->tests == NEG_OOB) ? 2 : 1;
-    x.window(target)[0] = 0x0BADu;
-  }
+  if (x.rank == 0 && x.tid == 0)
+    x.window(2)[0] = 0x0BADu;
   ctx_done(x, arg);
 }

@@ -218,6 +218,10 @@ public:
         out.ack_wid[c] = wid;
         wtrack_[c]->DecIn.send(wid, 0);
       }
+      // The bench counts stores only, as the RTL harness leaves done unconnected.
+      if (!egress_[c]->DoneOut.empty()) {
+        egress_[c]->DoneOut.pop();
+      }
     }
 
     platform.tick();

@@ -24,6 +24,10 @@
 #ifdef VX_CFG_EXT_RTU_ENABLE
 #include "rtu_core.h"
 #endif
+#ifdef VX_CFG_EXT_DLMEM_ENABLE
+#include "dlmem/dlmem_types.h"
+#include "dlmem/dlmem_switch.h"
+#endif
 
 namespace vortex {
 
@@ -96,6 +100,15 @@ public:
 
 #ifdef VX_CFG_EXT_RTU_ENABLE
   RtuCore::Ptr& rtu_core();
+#endif
+
+#ifdef VX_CFG_EXT_DLMEM_ENABLE
+  using DlmemReqSwitch = DlmemSocketSwitch<DlmemReqPkt>;
+  using DlmemRspSwitch = DlmemSocketSwitch<DlmemRspPkt>;
+
+  // The DLMEM network switches, whose uplinks the cluster joins to its crossbars.
+  DlmemReqSwitch* dlmem_req_switch() const;
+  DlmemRspSwitch* dlmem_rsp_switch() const;
 #endif
 
 protected:

@@ -23,6 +23,7 @@ DlmemWTrack::DlmemWTrack(const SimContext& ctx,
   : SimObject<DlmemWTrack>(ctx, name)
   , IncIn(num_inc, this)
   , DecIn(this)
+  , DoneIn(this)
   , max_count_(max_count)
   , cnt_(num_warps, 0)
   , drained_(num_warps, true) {
@@ -62,17 +63,23 @@ void DlmemWTrack::on_tick() {
     __assert(uint32_t(dec_wid) < NW, "store tracker: ack warp id out of range");
     DecIn.pop();
   }
+  if (!DoneIn.empty()) {
+    __assert(dec_wid < 0, "store tracker: an ack and a done in one cycle");
+    dec_wid = DoneIn.peek();
+    __assert(uint32_t(dec_wid) < NW, "store tracker: done warp id out of range");
+    DoneIn.pop();
+  }
   for (uint32_t w = 0; w < NW; ++w) {
     uint64_t n = cnt_[w] + inc[w];
     __assert(n <= max_count_, "store tracker: counter overflow");
     if (int32_t(w) == dec_wid) {
-      __assert(n != 0, "store tracker: ack for a warp with no remote store");
+      __assert(n != 0, "store tracker: completion for a warp with no remote access");
       --n;
     }
     cnt_[w] = uint32_t(n);
     drained_[w] = (n == 0);
   }
-  bool idle = (DecIn.size() == 0);
+  bool idle = (DecIn.size() == 0) && (DoneIn.size() == 0);
   for (auto& in : IncIn) {
     idle = idle && (in.size() == 0);
   }

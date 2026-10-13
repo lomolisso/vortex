@@ -163,6 +163,33 @@ module VX_core_top import VX_gpu_pkg::*;
     assign kmu_bus_if.pin   = 1'b0;
 `endif
 
+`ifdef VX_CFG_EXT_DLMEM_ENABLE
+    // A lone core has no DLMEM peers: the networks stay idle.
+    VX_dlmem_bus_if #(
+        .DATAW (VX_dlmem_pkg::DLMEM_REQ_DATAW),
+        .DST_W (DLMEM_CORE_W)
+    ) dlmem_req_out_if(), dlmem_req_in_if();
+
+    VX_dlmem_bus_if #(
+        .DATAW (VX_dlmem_pkg::DLMEM_RSP_DATAW),
+        .DST_W (DLMEM_CORE_W)
+    ) dlmem_rsp_out_if(), dlmem_rsp_in_if();
+
+    assign dlmem_req_out_if.ready = 1'b1;
+    assign dlmem_rsp_out_if.ready = 1'b1;
+    `UNUSED_VAR ({dlmem_req_out_if.valid, dlmem_req_out_if.data, dlmem_req_out_if.dst})
+    `UNUSED_VAR ({dlmem_rsp_out_if.valid, dlmem_rsp_out_if.data, dlmem_rsp_out_if.dst})
+
+    assign dlmem_req_in_if.valid = 1'b0;
+    assign dlmem_req_in_if.data  = '0;
+    assign dlmem_req_in_if.dst   = '0;
+    assign dlmem_rsp_in_if.valid = 1'b0;
+    assign dlmem_rsp_in_if.data  = '0;
+    assign dlmem_rsp_in_if.dst   = '0;
+    `UNUSED_VAR (dlmem_req_in_if.ready)
+    `UNUSED_VAR (dlmem_rsp_in_if.ready)
+`endif
+
     VX_dcr_bus_if dcr_bus_if();
 
     assign dcr_bus_if.req_valid = dcr_req_valid;
@@ -264,6 +291,12 @@ module VX_core_top import VX_gpu_pkg::*;
     `endif
 
         .kmu_bus_if     (kmu_bus_if),
+    `ifdef VX_CFG_EXT_DLMEM_ENABLE
+        .dlmem_req_out_if (dlmem_req_out_if),
+        .dlmem_req_in_if  (dlmem_req_in_if),
+        .dlmem_rsp_out_if (dlmem_rsp_out_if),
+        .dlmem_rsp_in_if  (dlmem_rsp_in_if),
+    `endif
         .busy           (busy)
     );
 

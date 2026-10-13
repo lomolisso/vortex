@@ -21,15 +21,24 @@
 // out-of-bounds and outside addresses, masked lanes and fences, under
 // back-pressure phases. Every request must leave once, in order per block,
 // one cycle after it enters while the output is ready, translated with the row
-// current when it entered; untouched fields stay bit-equal.
+// current when it entered; untouched fields stay bit-equal. A model of the
+// core's access tracker counts the remote lanes leaving the stage and drives
+// drained, registered like the tracker, with acknowledgements at random rates:
+// a fence must not leave while its warp is undrained, and one right behind a
+// remote access of its warp must be held. Each warp uses one block, as in the
+// core.
 // --mode=sched: random traffic into a model of the LSU scheduler's input queue
 // (random acceptance and drain), filling it and handing requests over as the
 // stage empties. The model is ideal, so the empty fold VX_core relies on rests
 // on the exact per-cycle empty checked in every mode.
 // --mode=oob: one out-of-bounds lane; a build with the bound assert must abort.
-// --mode=remote: one lane to a peer on another core; a build with the remote
-// assert must abort.
-// --mode=all: directed, random, then sched.
+// --mode=remote: one lane to a peer on another core leaves flagged remote.
+// --mode=fence: a remote store, then a remote load, each with its warp's fence
+// right behind it and a later request of the block: the fence is held with
+// drained low from its first cycle, the later request waits behind it, and the
+// fence leaves in the cycle the completion makes drained high; a drained
+// warp's fence is not held.
+// --mode=all: directed, random, sched, then fence.
 
 #include "vl_simulator.h"
 #include "VVX_dlmem_xlate_top.h"
@@ -52,6 +61,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <deque>
+#include <map>
 #include <optional>
 #include <random>
 #include <string>
@@ -251,8 +261,10 @@ public:
     Bits m_local = get_field(t->cfg_attr_local, 0, attr_w_);
     Bits m_io    = get_field(t->cfg_attr_io, 0, attr_w_);
     Bits m_hart  = get_field(t->cfg_attr_hart, 0, attr_w_);
-    attr_local_pos_ = this->single_bit(m_local, "is_addr_local");
-    attr_io_pos_    = this->single_bit(m_io, "is_addr_io");
+    Bits m_remote = get_field(t->cfg_attr_remote, 0, attr_w_);
+    attr_local_pos_  = this->single_bit(m_local, "is_addr_local");
+    attr_io_pos_     = this->single_bit(m_io, "is_addr_io");
+    attr_remote_pos_ = this->single_bit(m_remote, "is_addr_remote");
     attr_hart_lsb_  = attr_w_;
     uint32_t hart_bits = 0;
     for (uint32_t i = 0; i < attr_w_; ++i) {
@@ -306,6 +318,9 @@ public:
     sched_phase_.resize(nb_);
     sched_pop_.assign(nb_, false);
     fired_prev_.assign(nb_, false);
+    wt_cnt_.assign(nw_, 0);
+    drained_.assign(nw_, true);
+    rem_st_prev_.assign(nb_, std::nullopt);
 
     t->reset = 1;
     this->drive();
@@ -334,6 +349,9 @@ public:
     }
     if (opts_.mode == "remote") {
       this->run_remote();
+    }
+    if (opts_.mode == "fence" || opts_.mode == "all") {
+      this->run_fence();
     }
     if (failures_ != 0) {
       std::printf("FAILED: %u check(s) failed\n", failures_);
@@ -527,11 +545,16 @@ private:
     return LC_GLOBAL;
   }
 
-  Request gen_request() {
+  // A warp of block b, as the core assigns them.
+  uint32_t block_wid(uint32_t b) {
+    return (b + nb_ * below((nw_ - b + nb_ - 1) / nb_)) % nw_;
+  }
+
+  Request gen_request(uint32_t b) {
     Request q;
     q.seq   = next_seq_++;
     q.cta   = below(this->usable(stride_));
-    q.wid   = below(nw_);
+    q.wid   = this->block_wid(b);
     q.pid   = below(uint64_t(1) << pid_w_);
     q.fence = chance(4);
     q.rw    = chance(40);
@@ -568,6 +591,7 @@ private:
     q.exp_remote = 0;
     q.exp_oob = 0;
     for (uint32_t i = 0; i < nl_; ++i) {
+      set_bits(q.exp_attr[i], attr_remote_pos_, 1, 0);
       if (!((q.mask >> i) & 1) || q.fence) {
         ++n_untranslated_;
         continue;
@@ -610,6 +634,7 @@ private:
       set_bits(at, attr_io_pos_, 1, 0);
       if (x.kind == ref::REMOTE) {
         set_bits(at, attr_hart_lsb_, hart_w_, this->hart_id(q.wid, q.pid, i));
+        set_bits(at, attr_remote_pos_, 1, 1);
         q.exp_remote |= uint64_t(1) << i;
       }
       if (x.kind == ref::OOB) {
@@ -632,6 +657,9 @@ private:
         set_bits(t->wr_pslot, r * nw_w_, nw_w_, wr_->second.peers[r].slot);
       }
       set_bits(t->wr_stride, 0, lmem_log_ + 1, wr_stride_);
+    }
+    for (uint32_t w = 0; w < nw_; ++w) {
+      set_bits(t->drained, w, 1, drained_[w]);
     }
     for (uint32_t b = 0; b < nb_; ++b) {
       const auto& o = offer_[b];
@@ -714,6 +742,20 @@ private:
       rsp_ready_[b] = chance(50);
       rsp_data_[b]  = this->rand_bits(rsp_w_);
     }
+    // The tracker takes at most one acknowledgement per cycle.
+    std::optional<uint32_t> ack;
+    if (chance(ack_pct_)) {
+      std::vector<uint32_t> pend;
+      for (uint32_t w = 0; w < nw_; ++w) {
+        if (wt_cnt_[w] != 0) {
+          pend.push_back(w);
+        }
+      }
+      if (!pend.empty()) {
+        ack = pend[below(pend.size())];
+      }
+    }
+    std::vector<uint64_t> wt_inc(nw_, 0);
     this->drive();
     t->eval();
 
@@ -751,16 +793,37 @@ private:
       }
 
       bool valid = get_bits(t->out_valid, b, 1);
+      bool held = !q.empty() && q.front().fence && !drained_[q.front().wid];
       if (valid_prev_[b] && !ready_prev_[b] && !valid) {
         this->fail(strf("block %u: output dropped while stalled", b));
       }
       if (entered_prev_[b] && ready_prev_[b]) {
         // Accepted last cycle while the output drained: it is the head now.
-        if (!valid || q.empty() || q.front().seq != *entered_prev_[b]) {
+        if (valid == held || q.empty() || q.front().seq != *entered_prev_[b]) {
           this->fail(strf("block %u: seq %" PRIu64 " is not at the output one cycle after entering", b,
                           *entered_prev_[b]));
         }
       }
+      if (held) {
+        const Request& h = q.front();
+        if (valid) {
+          this->fail(strf("block %u seq %" PRIu64 ": fence of warp %u left with the warp undrained", b, h.seq, h.wid));
+        }
+        ++n_held_cycles_;
+        auto& fo = fobs_[h.seq];
+        if (fo.held_cycles++ == 0) {
+          ++n_fence_held_;
+        }
+      }
+      if (!q.empty() && q.front().fence && rem_st_prev_[b] == q.front().wid) {
+        // The fence right behind its warp's remote access sees that access counted.
+        if (!held) {
+          this->fail(strf("block %u seq %" PRIu64 ": fence behind a remote access of warp %u not held", b,
+                          q.front().seq, q.front().wid));
+        }
+        ++n_b2b_;
+      }
+      rem_st_prev_[b].reset();
       bool fire = false;
       if (valid) {
         if (q.empty()) {
@@ -773,7 +836,7 @@ private:
       bool wt_valid = get_bits(t->wt_inc_valid, b, 1);
       if (fire) {
         const Request& r = q.front();
-        bool want = r.rw && (r.exp_remote != 0);
+        bool want = (r.exp_remote != 0);
         if (wt_valid != want) {
           this->fail(strf("block %u seq %" PRIu64 ": wt_inc_valid=%d, expected %d", b, r.seq, wt_valid, want));
         }
@@ -785,7 +848,12 @@ private:
                             b, r.seq, wid, cnt, r.wid, popcount(r.exp_remote)));
           }
           ++n_wt_inc_;
-          n_wt_stores_ += popcount(r.exp_remote);
+          (r.rw ? n_wt_stores_ : n_wt_reads_) += popcount(r.exp_remote);
+          wt_inc[r.wid] += popcount(r.exp_remote);
+          rem_st_prev_[b] = r.wid;
+        }
+        if (r.fence) {
+          fobs_[r.seq].fire_cycle = cycle_;
         }
         if (lane0_) {
           last_addr0_   = get_bits(t->out_addr, b * nl_ * aw_, aw_);
@@ -837,7 +905,8 @@ private:
       }
       valid_prev_[b] = valid && !fire;
       fired_prev_[b] = fire;
-      ready_prev_[b] = ready_[b];
+      // What the stage's buffer sees: a held fence keeps it from draining.
+      ready_prev_[b] = ready_[b] && !held;
       n_stall_ += valid && !ready_[b];
     }
 
@@ -853,6 +922,17 @@ private:
       sched_max_ = std::max<size_t>(sched_max_, sched_q_[b].size());
     }
     sched_push_.clear();
+
+    // The tracker's count and its registered drained update at the edge.
+    for (uint32_t w = 0; w < nw_; ++w) {
+      wt_cnt_[w] += wt_inc[w];
+      if (ack == w) {
+        --wt_cnt_[w];
+        ++n_acks_;
+        progress = true;
+      }
+      drained_[w] = (wt_cnt_[w] == 0);
+    }
 
     // A write lands at the edge: visible to requests from the next cycle.
     if (wr_) {
@@ -926,8 +1006,14 @@ private:
   ///////////////////////////////////////////////////////////////////////////
   // modes
 
+  // Until the stages are empty and every counted access has completed.
   void drain() {
-    while (this->busy() && !this->watchdog()) {
+    ack_pct_ = 100;
+    auto undrained = [&]() {
+      return std::any_of(wt_cnt_.begin(), wt_cnt_.end(), [](auto n) { return n != 0; })
+          || std::any_of(drained_.begin(), drained_.end(), [](bool d) { return !d; });
+    };
+    while ((this->busy() || undrained()) && !this->watchdog()) {
       for (uint32_t b = 0; b < nb_; ++b) {
         this->next_ready(b);
       }
@@ -956,11 +1042,13 @@ private:
         if (c % 200 == 0) {
           static const uint32_t pcts[] = {100, 100, 60, 25};
           offer_pct = pcts[below(4)];
+          static const uint32_t acks[] = {0, 10, 50, 100};
+          ack_pct_ = acks[below(4)];
         }
         for (uint32_t b = 0; b < nb_; ++b) {
           this->next_ready(b);
           if (!offer_[b] && chance(offer_pct)) {
-            offer_[b] = this->gen_request();
+            offer_[b] = this->gen_request(b);
           }
         }
         // A rewrite between generation and entry could make an in-bounds lane out of bounds.
@@ -978,10 +1066,12 @@ private:
     std::printf("random: %" PRIu64 " cycles, %" PRIu64 " requests in, %" PRIu64 " out, %" PRIu64 " fences, "
                 "%" PRIu64 " row writes, %" PRIu64 " stalled output cycles, max occupancy %zu\n",
                 cycle_, n_in_, n_out_, n_fence_, n_writes_, n_stall_, max_occ_);
+    std::printf("random: %" PRIu64 " fences held for %" PRIu64 " cycles, %" PRIu64 " right behind their warp's "
+                "remote access, %" PRIu64 " acknowledgements\n", n_fence_held_, n_held_cycles_, n_b2b_, n_acks_);
     std::printf("random: lanes NONE %" PRIu64 ", LOCAL %" PRIu64 ", REMOTE %" PRIu64 ", OOB %" PRIu64
-                ", untranslated %" PRIu64 "; remote-store events %" PRIu64 " (%" PRIu64 " stores)\n",
+                ", untranslated %" PRIu64 "; remote-access events %" PRIu64 " (%" PRIu64 " store, %" PRIu64 " load/AMO lanes)\n",
                 n_kind_[ref::NONE], n_kind_[ref::LOCAL], n_kind_[ref::REMOTE], n_kind_[ref::OOB],
-                n_untranslated_, n_wt_inc_, n_wt_stores_);
+                n_untranslated_, n_wt_inc_, n_wt_stores_, n_wt_reads_);
     std::printf("random: remote lanes encoded past the window %" PRIu64 ", outside lanes inside the remote "
                 "encoding range %" PRIu64 "\n", n_remote_past_, n_alias_none_);
     std::string s;
@@ -993,9 +1083,12 @@ private:
       this->fail(strf("%" PRIu64 " requests entered, %" PRIu64 " left", n_in_, n_out_));
     }
     if (n_kind_[ref::LOCAL] == 0 || n_kind_[ref::NONE] == 0 || (opts_.oob && n_kind_[ref::OOB] == 0)
-     || (ncc_ > 1 && n_kind_[ref::REMOTE] == 0) || (ncc_ > 1 && n_wt_inc_ == 0)
+     || (ncc_ > 1 && n_kind_[ref::REMOTE] == 0) || (ncc_ > 1 && (n_wt_stores_ == 0 || n_wt_reads_ == 0))
      || (ncc_ > (1u << rb_) && (n_remote_past_ == 0 || n_alias_none_ == 0))) {
       this->fail("random traffic missed a lane kind");
+    }
+    if (ncc_ > 1 && (n_fence_held_ == 0 || n_b2b_ == 0)) {
+      this->fail("random traffic never held a fence, or never put one right behind its warp's remote access");
     }
   }
 
@@ -1004,7 +1097,7 @@ private:
     Request q;
     q.seq = next_seq_++;
     q.cta = cta;
-    q.wid = below(nw_);
+    q.wid = this->block_wid(0);
     q.pid = below(uint64_t(1) << pid_w_);
     q.rw = chance(50);
     q.mask = 1;
@@ -1133,14 +1226,107 @@ private:
     wr_stride_ = 64;
     wr_ = std::make_pair(0u, r);
     this->clock();
-    std::printf("remote: issuing a lane to rank 1 on core %u; a remote-checking build must abort here\n",
-                r.peers[1].core);
+    std::printf("remote: issuing a lane to rank 1 on core %u\n", r.peers[1].core);
     std::fflush(stdout);
     lane0_ = true;
     this->one_request(0, cfg_.dlmem_base + (uint64_t(1) << lmem_log_) + 8);
     lane0_ = false;
     if (!last_remote0_) {
       this->fail("remote: the lane was not flagged remote");
+    }
+  }
+
+  Request fence_req(uint32_t wid, bool fence, bool rw, uint64_t byte_addr) {
+    Request q;
+    q.seq   = next_seq_++;
+    q.cta   = 0;
+    q.wid   = wid;
+    q.pid   = 0;
+    q.fence = fence;
+    q.rw    = rw;
+    q.mask  = 1;
+    q.tag   = this->rand_bits(tag_w_);
+    for (uint32_t i = 0; i < nl_; ++i) {
+      q.byteen.push_back(0xff);
+      q.addr.push_back(byte_addr >> 3);
+      q.attr.push_back(this->rand_bits(attr_w_));
+      q.data.push_back(rnd());
+    }
+    return q;
+  }
+
+  // Offers each request on block 0 as soon as the previous one is taken, output always ready.
+  void offer_all(std::deque<Request> reqs, uint32_t cycles) {
+    ready_.assign(nb_, true);
+    for (uint32_t c = 0; c < cycles; ++c) {
+      if (!offer_[0] && !reqs.empty()) {
+        offer_[0] = reqs.front();
+        reqs.pop_front();
+      }
+      this->clock();
+    }
+  }
+
+  void run_fence() {
+    if (ncc_ < 2 || maxc_ < 2) {
+      std::printf("fence: needs a cluster of at least two cores, skipped\n");
+      return;
+    }
+    this->drain();
+    TblRow r;
+    r.k = 2;
+    r.peers.assign(maxc_, ref::Peer{my_core_, 0});
+    r.peers[1] = ref::Peer{(my_core_ + 1) % ncc_, 1};
+    wr_stride_ = 64;
+    wr_ = std::make_pair(0u, r);
+    this->clock();
+    uint64_t remote = cfg_.dlmem_base + (uint64_t(1) << lmem_log_) + 8;
+    uint64_t local  = cfg_.dlmem_base + 16;
+    uint32_t w  = 0;
+    uint32_t w2 = (nw_ > nb_) ? nb_ : 0;
+    const uint32_t hold = 20;
+
+    // A remote store, then a remote load: each with its warp's fence and a
+    // later local load of block 0 behind it, every completion withheld.
+    for (bool rw : {true, false}) {
+      const char* what = rw ? "store" : "load";
+      ack_pct_ = 0;
+      Request ac = this->fence_req(w, false, rw, remote);
+      Request fe = this->fence_req(w, true, false, 0);
+      Request ld = this->fence_req(w2, false, false, local);
+      uint64_t c0 = cycle_;
+      this->offer_all({ac, fe, ld}, hold);
+      const FenceObs& fo = fobs_[fe.seq];
+      if (fo.fire_cycle != ~uint64_t(0) || fo.held_cycles + 3 < hold || queue_[0].size() != 2
+       || queue_[0].front().seq != fe.seq) {
+        this->fail(strf("fence after a remote %s: held %" PRIu64 " of %u cycles, fired at %" PRId64
+                        ", %zu request(s) in the stage", what, fo.held_cycles, hold, int64_t(fo.fire_cycle),
+                        queue_[0].size()));
+      }
+      if (wt_cnt_[w] != 1) {
+        this->fail(strf("fence: tracker model counts %" PRIu64 " accesses for warp %u after a remote %s, expected 1",
+                        wt_cnt_[w], w, what));
+      }
+      // One completion: drained rises at the edge, and the fence leaves in that cycle.
+      ack_pct_ = 100;
+      uint64_t c_ack = cycle_;
+      this->offer_all({}, 4);
+      if (fo.fire_cycle != c_ack + 1 || this->busy()) {
+        this->fail(strf("fence after a remote %s: completed in cycle %" PRIu64 ", fired in %" PRId64
+                        " (expected %" PRIu64 ")", what, c_ack - c0, int64_t(fo.fire_cycle - c0), c_ack + 1 - c0));
+      }
+      std::printf("fence: remote %s fired, fence held %" PRIu64 " cycles with the completion withheld and the "
+                  "load behind it, then left %" PRId64 " cycle(s) after the completion\n",
+                  what, fo.held_cycles, int64_t(fo.fire_cycle - c_ack));
+    }
+    // A drained warp's fence goes straight through.
+    Request f2 = this->fence_req(w2, true, false, 0);
+    uint64_t c2 = cycle_;
+    this->offer_all({f2}, 4);
+    const FenceObs& fo2 = fobs_[f2.seq];
+    if (fo2.held_cycles != 0 || fo2.fire_cycle != c2 + 1) {
+      this->fail(strf("fence: a drained warp's fence held %" PRIu64 " cycles, fired in %" PRId64 " (expected %" PRIu64 ")",
+                      fo2.held_cycles, int64_t(fo2.fire_cycle - c2), uint64_t(1)));
     }
   }
 
@@ -1156,7 +1342,7 @@ private:
 
   uint32_t ncc_, nw_, maxc_, lmem_log_, nb_, nl_, aw_, attr_w_, tag_w_, rsp_w_, pid_w_, nw_w_, k_w_, core_w_;
   uint32_t hart_w_, hart_lsb_core_, nt_bits_, core_id_, cnt_w_, my_core_, rb_, pid_bits_;
-  uint32_t attr_local_pos_, attr_io_pos_, attr_hart_lsb_;
+  uint32_t attr_local_pos_, attr_io_pos_, attr_hart_lsb_, attr_remote_pos_;
   uint64_t win_bytes_;
   ref::Cfg cfg_{};
 
@@ -1188,6 +1374,19 @@ private:
   uint64_t n_fold_busy_ = 0, n_handoff_ = 0;
   size_t sched_max_ = 0;
 
+  // Store tracker model.
+  std::vector<uint64_t> wt_cnt_;
+  std::vector<bool> drained_;
+  std::vector<std::optional<uint32_t>> rem_st_prev_;
+  uint32_t ack_pct_ = 100;
+
+  struct FenceObs {
+    uint64_t held_cycles = 0;
+    uint64_t fire_cycle = ~uint64_t(0);
+  };
+  std::map<uint64_t, FenceObs> fobs_;
+  uint64_t n_fence_held_ = 0, n_held_cycles_ = 0, n_b2b_ = 0, n_acks_ = 0;
+
   bool     lane0_ = false;
   uint64_t last_addr0_ = 0;
   bool     last_remote0_ = false;
@@ -1196,14 +1395,14 @@ private:
 
   uint64_t n_in_ = 0, n_out_ = 0, n_fence_ = 0, n_writes_ = 0, n_stall_ = 0;
   uint64_t n_kind_[4] = {0, 0, 0, 0};
-  uint64_t n_untranslated_ = 0, n_wt_inc_ = 0, n_wt_stores_ = 0;
+  uint64_t n_untranslated_ = 0, n_wt_inc_ = 0, n_wt_stores_ = 0, n_wt_reads_ = 0;
   uint64_t n_remote_past_ = 0, n_alias_none_ = 0;
   size_t max_occ_ = 0;
   std::vector<uint32_t> n_strides_;
 };
 
 static void usage(const char* prog) {
-  std::printf("usage: %s [--mode=all|directed|random|sched|oob|remote] [--seed=N] [--launches=N] [--cycles=N] "
+  std::printf("usage: %s [--mode=all|directed|random|sched|oob|remote|fence] [--seed=N] [--launches=N] [--cycles=N] "
               "[--watchdog=N] [--no-oob]\n", prog);
 }
 
@@ -1236,7 +1435,7 @@ int main(int argc, char** argv) {
     }
   }
   if (opts.mode != "all" && opts.mode != "directed" && opts.mode != "random" && opts.mode != "sched"
-   && opts.mode != "oob" && opts.mode != "remote") {
+   && opts.mode != "oob" && opts.mode != "remote" && opts.mode != "fence") {
     usage(argv[0]);
     return 2;
   }

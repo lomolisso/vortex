@@ -18,7 +18,8 @@
 // the fence bit are driven separately and merged into the raw tag here, so the
 // testbench needs no tag layout; in_tag_eff returns the merged tag. The cfg_*
 // outputs are constants that give the testbench the package-derived widths
-// and the attribute fields the stage may rewrite.
+// and the attribute fields the stage may rewrite. drained stands in for the
+// core's store tracker.
 module VX_dlmem_xlate_top import VX_gpu_pkg::*; #(
     parameter  CORE_ID       = 0,
     parameter  OOB_ASSERT    = 0,
@@ -90,6 +91,9 @@ module VX_dlmem_xlate_top import VX_gpu_pkg::*; #(
     output wire [NB-1:0][CNT_W-1:0]             wt_inc_cnt,
     output wire [NB-1:0]                        empty,
 
+    // Per-warp store tracker state; a fence waits at the output until set.
+    input  wire [NW-1:0]                        drained,
+
     // Responses, scheduler side in, LSU side out.
     input  wire [NB-1:0]                        mem_rsp_valid,
     input  wire [NB-1:0][RSP_W-1:0]             mem_rsp_data,
@@ -118,7 +122,8 @@ module VX_dlmem_xlate_top import VX_gpu_pkg::*; #(
     output wire [31:0]                          cfg_core_id,
     output wire [ATTR_W-1:0]                    cfg_attr_local,
     output wire [ATTR_W-1:0]                    cfg_attr_io,
-    output wire [ATTR_W-1:0]                    cfg_attr_hart
+    output wire [ATTR_W-1:0]                    cfg_attr_hart,
+    output wire [ATTR_W-1:0]                    cfg_attr_remote
 );
     assign cfg_ncc           = 32'(DLMEM_NCC);
     assign cfg_nw            = 32'(NW);
@@ -139,16 +144,19 @@ module VX_dlmem_xlate_top import VX_gpu_pkg::*; #(
     assign cfg_nt_bits       = 32'(NT_BITS);
     assign cfg_core_id       = 32'(CORE_ID);
 
-    function automatic mem_bus_attr_t attr_mask(input logic local_f, input logic io_f, input logic hart_f);
+    function automatic mem_bus_attr_t attr_mask(input logic local_f, input logic io_f, input logic hart_f,
+                                                input logic remote_f);
         attr_mask = '0;
-        attr_mask.is_addr_local = local_f;
-        attr_mask.is_addr_io    = io_f;
-        attr_mask.amo.hart_id   = {HART_ID_WIDTH{hart_f}};
+        attr_mask.is_addr_local  = local_f;
+        attr_mask.is_addr_io     = io_f;
+        attr_mask.amo.hart_id    = {HART_ID_WIDTH{hart_f}};
+        attr_mask.is_addr_remote = remote_f;
     endfunction
 
-    assign cfg_attr_local = attr_mask(1'b1, 1'b0, 1'b0);
-    assign cfg_attr_io    = attr_mask(1'b0, 1'b1, 1'b0);
-    assign cfg_attr_hart  = attr_mask(1'b0, 1'b0, 1'b1);
+    assign cfg_attr_local  = attr_mask(1'b1, 1'b0, 1'b0, 1'b0);
+    assign cfg_attr_io     = attr_mask(1'b0, 1'b1, 1'b0, 1'b0);
+    assign cfg_attr_hart   = attr_mask(1'b0, 1'b0, 1'b1, 1'b0);
+    assign cfg_attr_remote = attr_mask(1'b0, 1'b0, 1'b0, 1'b1);
 
     dlmem_row_t wr_row;
     assign wr_row.k = wr_k;
@@ -212,6 +220,7 @@ module VX_dlmem_xlate_top import VX_gpu_pkg::*; #(
         .peer_wr_slot   (wr_slot),
         .peer_wr_row    (wr_row),
         .peer_wr_stride (wr_stride),
+        .drained        (drained),
         .in_if          (in_if),
         .out_if         (out_if),
         .out_remote     (out_remote),
