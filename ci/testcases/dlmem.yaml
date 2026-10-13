@@ -26,7 +26,7 @@ defaults:
             sw/runtime/common/legacy_runtime.cpp, tests/regression/cluster_rank,
             tests/regression/cta_gang, tests/regression/cluster_sync,
             tests/regression/dlmem_local, tests/regression/dlmem_store,
-            tests/regression/dlmem_load,
+            tests/regression/dlmem_load, tests/regression/dlmem_atomic,
             tests/regression/dlmem_stress, VX_config.toml, VX_types.toml]
 tests:
   # The cluster-rank CSR over three launches (K = 1, 2 as 1x2x1, 4 as 2x1x2),
@@ -585,12 +585,88 @@ tests:
     shape: {cores: 4, warps: 8, l2cache: true}
     args: "-k 2 -w 4 -l 1024 -n 3"
 
+  # --- remote atomics ---
+  # An amoadd.w/.d histogram into rank 0 from every block, and one amoadd
+  # ticket of each width per thread from rank K-1 (each value once, the word
+  # tickets crossing the sign bit and the doubleword ones the low-word carry);
+  # an amoswap spinlock in rank K-1 around a plain window read-modify-write of
+  # a counter in rank 0, with a holder word in rank 1; and every amo{add,xor,
+  # and,or,min,max,minu,maxu}.{w,d} into every slice with no destination
+  # register, against the host's fold.
+  - id: dlmem_atomic-2c
+    app: dlmem_atomic
+    drivers: [simx, rtlsim]
+    configs+: "-DVX_CFG_EXT_A_ENABLE"
+    shape: {cores: 2, l2cache: true}
+    args: "-k 2 -n 3"
+  - id: dlmem_atomic-4c
+    app: dlmem_atomic
+    drivers: [simx, rtlsim]
+    configs+: "-DVX_CFG_EXT_A_ENABLE"
+    shape: {cores: 4, l2cache: true}
+    args: "-k 4 -n 3"
+  - id: dlmem_atomic-4c-s2
+    app: dlmem_atomic
+    drivers: [simx, rtlsim]
+    configs+: "-DVX_CFG_EXT_A_ENABLE -DVX_CFG_SOCKET_SIZE=2"
+    shape: {cores: 4, l2cache: true}
+    args: "-k 4 -n 3"
+  - id: dlmem_atomic-4c-s4
+    app: dlmem_atomic
+    drivers: [simx, rtlsim]
+    configs+: "-DVX_CFG_EXT_A_ENABLE -DVX_CFG_SOCKET_SIZE=4"
+    shape: {cores: 4, l2cache: true}
+    args: "-k 4 -n 3"
+  # Two hardware clusters. The xrt leg wraps the same RTL in the AFU shell and
+  # host stack, so it stands in for rtlsim here.
+  - id: dlmem_atomic-2cl
+    app: dlmem_atomic
+    drivers: [simx, xrt]
+    configs+: "-DVX_CFG_EXT_A_ENABLE"
+    shape: {clusters: 2, cores: 2, l3cache: true}
+    args: "-k 2 -n 3"
+  - id: dlmem_atomic-simd2
+    app: dlmem_atomic
+    drivers: [simx, rtlsim]
+    configs+: "-DVX_CFG_EXT_A_ENABLE -DVX_CFG_SIMD_WIDTH=2"
+    shape: {cores: 4, l2cache: true}
+    args: "-k 4 -n 2"
+  - id: dlmem_atomic-w8
+    app: dlmem_atomic
+    drivers: [simx, rtlsim]
+    configs+: "-DVX_CFG_EXT_A_ENABLE"
+    shape: {cores: 4, warps: 8, l2cache: true}
+    args: "-k 4 -w 2 -i 2 -n 2"
+  # Compare-and-swap retry loops on a word and a doubleword counter, starting
+  # just below the sign bit and the low-word carry; the compare value travels
+  # in the request.
+  - id: dlmem_atomic-zacas
+    app: dlmem_atomic
+    drivers: [simx, rtlsim]
+    configs+: "-DVX_CFG_EXT_A_ENABLE -DVX_CFG_EXT_ZACAS_ENABLE"
+    shape: {cores: 4, l2cache: true}
+    args: "-k 4 -t 8 -n 2"
+  # A reservation on another core's local memory must stop the simulation:
+  # the network carries no LR/SC.
+  - id: dlmem_atomic-lrsc
+    via: script
+    driver: simx
+    configs+: "-DVX_CFG_EXT_A_ENABLE -DVX_CFG_NUM_CORES=2 -DVX_CFG_L2_ENABLE"
+    env: {DRIVER: simx, APP: dlmem_atomic, ARGS: "-x lrsc", EXPECT: "remote LR/SC is not supported"}
+    run: *expect_fail_run
+  - id: dlmem_atomic-lrsc
+    via: script
+    driver: rtlsim
+    configs+: "-DVX_CFG_EXT_A_ENABLE -DVX_CFG_NUM_CORES=2 -DVX_CFG_L2_ENABLE"
+    env: {DRIVER: rtlsim, APP: dlmem_atomic, ARGS: "-x lrsc", EXPECT: "remote LR/SC is not supported"}
+    run: *expect_fail_run
+
   # SimX<->rtlsim parity of the network at XLEN 64: fixed loops of window
-  # stores and loads into the next rank's slice, on another core, with
+  # stores, loads and atomics into the next rank's slice, on another core, with
   # no spin and no data-dependent trip count, between fence-free cluster
   # barriers. Four clusters of four one-warp blocks fill the four cores at once,
   # so the placement does not depend on the done-event timing. The stores run
-  # on two sockets (the crossbar), the loads on four.
+  # on two sockets (the crossbar), the loads on four, the atomics on one socket.
   # Eight lanes per store outrun the store credits and the ingress slots, so
   # the store cell is bound by the network and holds its fences.
   - id: parity-dlmem-store
@@ -606,6 +682,25 @@ tests:
     xlen: [64]
     shape: {cores: 4, l2cache: true}
     args: "-p -k 4 -n 4"
+  - id: parity-dlmem-atomic
+    check: model_parity
+    app: dlmem_atomic
+    xlen: [64]
+    configs+: "-DVX_CFG_EXT_A_ENABLE -DVX_CFG_SOCKET_SIZE=4"
+    shape: {cores: 4, l2cache: true}
+    args: "-p -k 4 -n 4"
+  # The same loops with a fence per iteration: the fence waits at the
+  # translation stage until the atomics' answers reach the egress. No L2, so
+  # the socket's dcache is the shared level and drains a fence: the two models
+  # cost a walking fence differently even with the knob off (amo -tamomax at
+  # 4 cores + L2: 26492 SimX vs 29900 RTL cycles).
+  - id: parity-dlmem-atomic-fence
+    check: model_parity
+    app: dlmem_atomic
+    xlen: [64]
+    configs+: "-DVX_CFG_EXT_A_ENABLE -DVX_CFG_SOCKET_SIZE=4"
+    shape: {cores: 4}
+    args: "-p -f -k 4 -n 4"
 
 
   # Illegal knob combinations must stop the build, in SimX (the processor
