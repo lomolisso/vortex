@@ -337,9 +337,12 @@ $(DESTDIR)/$(VORTEX_GEM5_LIB): $(OBJS) $(VORTEX_GEM5_OBJS)
 	$(CXX) $(CXXFLAGS) $^ -shared $(LDFLAGS) -Wl,-soname,$(VORTEX_GEM5_LIB) -o $@
 
 # updates the timestamp when flags changed.
+# `-MF $@` names the stamp itself, and callers spell DESTDIR differently
+# (`.../sw/runtime/simx/..` vs `.../sw/runtime`); keeping it would make the
+# stamp differ between callers and rebuild the simulator on every switch.
 $(CONFIG_FILE): force
 	@mkdir -p $(@D)
-	@printf '%s\n' "$(CXXFLAGS)" > $@.tmp
+	@printf '%s\n' "$(filter-out -MF $@,$(CXXFLAGS))" > $@.tmp
 	@if ! cmp -s $@.tmp $@; then \
 	  mv $@.tmp $@; \
 	else \
