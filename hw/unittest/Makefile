@@ -98,8 +98,9 @@ define lmem_switch_case
 	$(MAKE) -C lmem_switch run CONFIGS="$(1)"
 endef
 # With DLMEM (RV64 only) the switch gains its remote leg and round-robin
-# response merge, the local memory a store-acknowledging ingress input, and
-# the memory unit is linted with both wired.
+# response merge, the local memory a store-acknowledging ingress input and
+# per-bank commit reports of the LSU inputs' plain stores, and the memory unit
+# is linted with all of them wired.
 DLMEM_LMEM := -DVX_CFG_EXT_DLMEM_ENABLE
 run-lmem:
 	$(call lmem_case,$(LMEM_BASE))
@@ -264,10 +265,12 @@ endif
 # and 8), second-cluster core ids, 1 to 8 lanes, 1 and 2 blocks, and Zacas.
 # NCC 6 has no vectors, so it runs random traffic only. The full runs also feed
 # a model of the LSU scheduler's queue, stressing back-pressure and handoffs,
-# and every run models the core's store tracker, so fences wait for their
-# warp's remote stores. The bound-assert build must abort on an out-of-bounds
-# lane; the last build sends a remote lane and holds a fence until its store
-# is acknowledged, and the final clean keeps a plain `run` from reusing it.
+# and every run models the core's remote-access and local-store trackers, so
+# fences wait for their warp's remote accesses and local stores. The
+# bound-assert build must abort on an out-of-bounds lane; the last build sends
+# a remote lane and holds a fence until its store is acknowledged, and a local
+# store's fence until its bank commit; the final clean keeps a plain `run`
+# from reusing it.
 # Then the core elaborates and lints with the stages and the DLMEM endpoints in
 # place, at 1 core, at 8 cores with two LSU blocks and two cores per socket,
 # and at 4 cores in one socket.

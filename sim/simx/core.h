@@ -162,7 +162,8 @@ public:
   const std::shared_ptr<LocalMemSwitch>& lmem_switch(uint32_t idx) const;
 
 #ifdef VX_CFG_EXT_DLMEM_ENABLE
-  // The access tracker's registered drained[wid]: no remote access of the warp unperformed.
+  // Both trackers' registered drained[wid]: no remote access of the warp
+  // unperformed and no local plain store of it unwritten.
   bool dlmem_drained(uint32_t wid) const;
 
   // Store acks and load/AMO/SC answers from the socket's DLMEM egress, as warp ids.

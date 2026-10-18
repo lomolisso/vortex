@@ -21,12 +21,14 @@
 // out-of-bounds and outside addresses, masked lanes and fences, under
 // back-pressure phases. Every request must leave once, in order per block,
 // one cycle after it enters while the output is ready, translated with the row
-// current when it entered; untouched fields stay bit-equal. A model of the
-// core's access tracker counts the remote lanes leaving the stage and drives
-// drained, registered like the tracker, with acknowledgements at random rates:
-// a fence must not leave while its warp is undrained, and one right behind a
-// remote access of its warp must be held. Each warp uses one block, as in the
-// core.
+// current when it entered; untouched fields stay bit-equal, except the hart id
+// of every local lane, which becomes the issuer's. Models of the core's two
+// trackers count the remote lanes and the local plain-store lanes leaving the
+// stage and drive drained and lmem_st_drained, registered like the trackers,
+// with acknowledgements and bank commits (several per cycle) at random rates:
+// a fence must not leave while its warp is undrained on either, and one right
+// behind a remote access or a local store of its warp must be held. Each warp
+// uses one block, as in the core.
 // --mode=sched: random traffic into a model of the LSU scheduler's input queue
 // (random acceptance and drain), filling it and handing requests over as the
 // stage empties. The model is ideal, so the empty fold VX_core relies on rests
@@ -36,8 +38,10 @@
 // --mode=fence: a remote store, then a remote load, each with its warp's fence
 // right behind it and a later request of the block: the fence is held with
 // drained low from its first cycle, the later request waits behind it, and the
-// fence leaves in the cycle the completion makes drained high; a drained
-// warp's fence is not held.
+// fence leaves in the cycle the completion makes drained high. Then a local
+// store through the window (own rank) and a plain local-memory store, each
+// held the same way on lmem_st_drained until its bank commit; a local load,
+// a local AMO and a fence count nothing; a drained warp's fence is not held.
 // --mode=all: directed, random, sched, then fence.
 
 #include "vl_simulator.h"
@@ -214,6 +218,7 @@ struct Request {
   std::vector<int>      kind;   // -1: not translated (masked lane or fence)
   uint64_t exp_remote = 0;
   uint64_t exp_oob = 0;
+  uint32_t exp_lst = 0;          // local plain-store lanes
 };
 
 enum class ReadyKind { ALWAYS, RANDOM, STALL };
@@ -320,6 +325,8 @@ public:
     fired_prev_.assign(nb_, false);
     wt_cnt_.assign(nw_, 0);
     drained_.assign(nw_, true);
+    lst_cnt_.assign(nw_, 0);
+    lst_drained_.assign(nw_, true);
     rem_st_prev_.assign(nb_, std::nullopt);
 
     t->reset = 1;
@@ -590,6 +597,12 @@ private:
     q.stride = stride_;
     q.exp_remote = 0;
     q.exp_oob = 0;
+    q.exp_lst = 0;
+    // A local lane carries the issuer's hart id, and a local store is counted.
+    auto local_lane = [&](uint32_t i) {
+      set_bits(q.exp_attr[i], attr_hart_lsb_, hart_w_, this->hart_id(q.wid, q.pid, i));
+      q.exp_lst += q.rw;
+    };
     for (uint32_t i = 0; i < nl_; ++i) {
       set_bits(q.exp_attr[i], attr_remote_pos_, 1, 0);
       if (!((q.mask >> i) & 1) || q.fence) {
@@ -626,6 +639,9 @@ private:
         ++n_alias_none_;
       }
       if (x.kind == ref::NONE) {
+        if (get_bits(q.exp_attr[i], attr_local_pos_, 1)) {
+          local_lane(i);
+        }
         continue;
       }
       q.exp_addr[i] = x.out_addr >> 3;
@@ -639,6 +655,9 @@ private:
       }
       if (x.kind == ref::OOB) {
         q.exp_oob |= uint64_t(1) << i;
+      }
+      if (x.kind != ref::REMOTE) {
+        local_lane(i);
       }
     }
   }
@@ -660,6 +679,7 @@ private:
     }
     for (uint32_t w = 0; w < nw_; ++w) {
       set_bits(t->drained, w, 1, drained_[w]);
+      set_bits(t->lmem_st_drained, w, 1, lst_drained_[w]);
     }
     for (uint32_t b = 0; b < nb_; ++b) {
       const auto& o = offer_[b];
@@ -756,6 +776,22 @@ private:
       }
     }
     std::vector<uint64_t> wt_inc(nw_, 0);
+    // Up to one bank commit per local-memory bank per cycle.
+    std::vector<uint64_t> lst_inc(nw_, 0), lst_dec(nw_, 0);
+    for (uint32_t k = 0; k < VX_CFG_LMEM_NUM_BANKS; ++k) {
+      if (!chance(commit_pct_)) {
+        continue;
+      }
+      std::vector<uint32_t> pend;
+      for (uint32_t w = 0; w < nw_; ++w) {
+        if (lst_cnt_[w] > lst_dec[w]) {
+          pend.push_back(w);
+        }
+      }
+      if (!pend.empty()) {
+        ++lst_dec[pend[below(pend.size())]];
+      }
+    }
     this->drive();
     t->eval();
 
@@ -793,7 +829,7 @@ private:
       }
 
       bool valid = get_bits(t->out_valid, b, 1);
-      bool held = !q.empty() && q.front().fence && !drained_[q.front().wid];
+      bool held = !q.empty() && q.front().fence && !(drained_[q.front().wid] && lst_drained_[q.front().wid]);
       if (valid_prev_[b] && !ready_prev_[b] && !valid) {
         this->fail(strf("block %u: output dropped while stalled", b));
       }
@@ -823,7 +859,16 @@ private:
         }
         ++n_b2b_;
       }
+      if (!q.empty() && q.front().fence && lst_prev_[b] == q.front().wid) {
+        // The same for a local store.
+        if (!held) {
+          this->fail(strf("block %u seq %" PRIu64 ": fence behind a local store of warp %u not held", b,
+                          q.front().seq, q.front().wid));
+        }
+        ++n_b2b_lst_;
+      }
       rem_st_prev_[b].reset();
+      lst_prev_[b].reset();
       bool fire = false;
       if (valid) {
         if (q.empty()) {
@@ -834,6 +879,7 @@ private:
         }
       }
       bool wt_valid = get_bits(t->wt_inc_valid, b, 1);
+      bool lst_valid = get_bits(t->lst_inc_valid, b, 1);
       if (fire) {
         const Request& r = q.front();
         bool want = (r.exp_remote != 0);
@@ -852,6 +898,22 @@ private:
           wt_inc[r.wid] += popcount(r.exp_remote);
           rem_st_prev_[b] = r.wid;
         }
+        bool want_lst = (r.exp_lst != 0);
+        if (lst_valid != want_lst) {
+          this->fail(strf("block %u seq %" PRIu64 ": lst_inc_valid=%d, expected %d", b, r.seq, lst_valid, want_lst));
+        }
+        if (want_lst) {
+          uint64_t wid = get_bits(t->lst_inc_wid, b * nw_w_, nw_w_);
+          uint64_t cnt = get_bits(t->lst_inc_cnt, b * cnt_w_, cnt_w_);
+          if (wid != r.wid || cnt != r.exp_lst) {
+            this->fail(strf("block %u seq %" PRIu64 ": lst_inc wid %" PRIu64 " cnt %" PRIu64 ", expected %u %u",
+                            b, r.seq, wid, cnt, r.wid, r.exp_lst));
+          }
+          ++n_lst_inc_;
+          n_lst_lanes_ += r.exp_lst;
+          lst_inc[r.wid] += r.exp_lst;
+          lst_prev_[b] = r.wid;
+        }
         if (r.fence) {
           fobs_[r.seq].fire_cycle = cycle_;
         }
@@ -869,8 +931,8 @@ private:
         q.pop_front();
         ++n_out_;
         progress = true;
-      } else if (wt_valid) {
-        this->fail(strf("block %u: wt_inc_valid without an output handshake", b));
+      } else if (wt_valid || lst_valid) {
+        this->fail(strf("block %u: wt_inc_valid or lst_inc_valid without an output handshake", b));
       }
 
       // Full throughput: a stage drained last cycle accepts this cycle.
@@ -932,6 +994,14 @@ private:
         progress = true;
       }
       drained_[w] = (wt_cnt_[w] == 0);
+      if (!lst_drained_[w] && lst_dec[w] == lst_cnt_[w] && lst_inc[w] == 0) {
+        lst_rise_[w] = cycle_ + 1;
+      }
+      lst_cnt_[w] += lst_inc[w];
+      lst_cnt_[w] -= lst_dec[w];
+      n_commits_ += lst_dec[w];
+      progress |= (lst_dec[w] != 0);
+      lst_drained_[w] = (lst_cnt_[w] == 0);
     }
 
     // A write lands at the edge: visible to requests from the next cycle.
@@ -1009,9 +1079,12 @@ private:
   // Until the stages are empty and every counted access has completed.
   void drain() {
     ack_pct_ = 100;
+    commit_pct_ = 100;
     auto undrained = [&]() {
       return std::any_of(wt_cnt_.begin(), wt_cnt_.end(), [](auto n) { return n != 0; })
-          || std::any_of(drained_.begin(), drained_.end(), [](bool d) { return !d; });
+          || std::any_of(drained_.begin(), drained_.end(), [](bool d) { return !d; })
+          || std::any_of(lst_cnt_.begin(), lst_cnt_.end(), [](auto n) { return n != 0; })
+          || std::any_of(lst_drained_.begin(), lst_drained_.end(), [](bool d) { return !d; });
     };
     while ((this->busy() || undrained()) && !this->watchdog()) {
       for (uint32_t b = 0; b < nb_; ++b) {
@@ -1044,6 +1117,7 @@ private:
           offer_pct = pcts[below(4)];
           static const uint32_t acks[] = {0, 10, 50, 100};
           ack_pct_ = acks[below(4)];
+          commit_pct_ = acks[below(4)];
         }
         for (uint32_t b = 0; b < nb_; ++b) {
           this->next_ready(b);
@@ -1074,6 +1148,8 @@ private:
                 n_untranslated_, n_wt_inc_, n_wt_stores_, n_wt_reads_);
     std::printf("random: remote lanes encoded past the window %" PRIu64 ", outside lanes inside the remote "
                 "encoding range %" PRIu64 "\n", n_remote_past_, n_alias_none_);
+    std::printf("random: %" PRIu64 " local-store events (%" PRIu64 " lanes), %" PRIu64 " bank commits, %" PRIu64
+                " fences right behind their warp's local store\n", n_lst_inc_, n_lst_lanes_, n_commits_, n_b2b_lst_);
     std::string s;
     for (uint32_t v : n_strides_) {
       s += strf(" %u", v);
@@ -1089,6 +1165,9 @@ private:
     }
     if (ncc_ > 1 && (n_fence_held_ == 0 || n_b2b_ == 0)) {
       this->fail("random traffic never held a fence, or never put one right behind its warp's remote access");
+    }
+    if (n_lst_lanes_ == 0 || n_b2b_lst_ == 0 || n_fence_held_ == 0) {
+      this->fail("random traffic never counted a local store, or never held a fence right behind one");
     }
   }
 
@@ -1268,15 +1347,14 @@ private:
   }
 
   void run_fence() {
-    if (ncc_ < 2 || maxc_ < 2) {
-      std::printf("fence: needs a cluster of at least two cores, skipped\n");
-      return;
-    }
     this->drain();
+    const bool two = (ncc_ >= 2 && maxc_ >= 2);
     TblRow r;
-    r.k = 2;
+    r.k = two ? 2 : 1;
     r.peers.assign(maxc_, ref::Peer{my_core_, 0});
-    r.peers[1] = ref::Peer{(my_core_ + 1) % ncc_, 1};
+    if (two) {
+      r.peers[1] = ref::Peer{(my_core_ + 1) % ncc_, 1};
+    }
     wr_stride_ = 64;
     wr_ = std::make_pair(0u, r);
     this->clock();
@@ -1285,6 +1363,77 @@ private:
     uint32_t w  = 0;
     uint32_t w2 = (nw_ > nb_) ? nb_ : 0;
     const uint32_t hold = 20;
+
+    // A local store through the window (own rank), then a plain local-memory
+    // store: each with its warp's fence and a later local load behind it,
+    // every bank commit withheld.
+    for (bool plain : {false, true}) {
+      const char* what = plain ? "plain local-memory store" : "window store to the own rank";
+      ack_pct_ = 100;
+      commit_pct_ = 0;
+      Request st = this->fence_req(w, false, true, plain ? cfg_.lmem_base + 16 : local);
+      if (plain) {
+        for (auto& at : st.attr) {
+          set_bits(at, attr_local_pos_, 1, 1);
+        }
+      }
+      Request fe = this->fence_req(w, true, false, 0);
+      Request ld = this->fence_req(w2, false, false, local);
+      uint64_t c0 = cycle_;
+      this->offer_all({st, fe, ld}, hold);
+      const FenceObs& fo = fobs_[fe.seq];
+      if (fo.fire_cycle != ~uint64_t(0) || fo.held_cycles + 3 < hold || queue_[0].size() != 2
+       || queue_[0].front().seq != fe.seq) {
+        this->fail(strf("fence after a %s: held %" PRIu64 " of %u cycles, fired at %" PRId64
+                        ", %zu request(s) in the stage", what, fo.held_cycles, hold, int64_t(fo.fire_cycle),
+                        queue_[0].size()));
+      }
+      if (lst_cnt_[w] != 1 || wt_cnt_[w] != 0) {
+        this->fail(strf("fence: tracker models count %" PRIu64 " local stores and %" PRIu64 " remote accesses for "
+                        "warp %u after a %s, expected 1 and 0", lst_cnt_[w], wt_cnt_[w], w, what));
+      }
+      // One bank commit: lmem_st_drained rises at the edge, and the fence leaves in that cycle.
+      commit_pct_ = 100;
+      uint64_t c_commit = cycle_;
+      this->offer_all({}, 4);
+      if (fo.fire_cycle != c_commit + 1 || lst_rise_[w] != fo.fire_cycle || this->busy()) {
+        this->fail(strf("fence after a %s: committed in cycle %" PRIu64 ", lmem_st_drained rose in %" PRId64
+                        ", fired in %" PRId64 " (expected %" PRIu64 ")", what, c_commit - c0,
+                        int64_t(lst_rise_[w] - c0), int64_t(fo.fire_cycle - c0), c_commit + 1 - c0));
+      }
+      std::printf("fence: %s, fence held %" PRIu64 " cycles with the commit withheld and the load behind it, "
+                  "then left %" PRId64 " cycle(s) after the commit (the cycle lmem_st_drained rose)\n",
+                  what, fo.held_cycles, int64_t(fo.fire_cycle - c_commit));
+    }
+
+    // A local load, a local AMO and a store-flagged fence count nothing: the fence behind them is not held.
+    {
+      commit_pct_ = 0;
+      uint64_t lanes0 = n_lst_lanes_;
+      Request ld = this->fence_req(w, false, false, local);
+      Request amo = this->fence_req(w, false, false, cfg_.lmem_base + 24);
+      for (auto& at : amo.attr) {
+        set_bits(at, attr_local_pos_, 1, 1);
+        set_bits(at, 4, 1, 1);   // amo_valid (MEM_ATTR_AMO_OFFS); the LSU sends an AMO with rw=0
+      }
+      Request fs = this->fence_req(w, true, true, local);
+      Request fe = this->fence_req(w, true, false, 0);
+      uint64_t c3 = cycle_;
+      this->offer_all({ld, amo, fs, fe}, 8);
+      const FenceObs& fo3 = fobs_[fe.seq];
+      if (n_lst_lanes_ != lanes0 || lst_cnt_[w] != 0 || fo3.held_cycles != 0 || fo3.fire_cycle == ~uint64_t(0)) {
+        this->fail(strf("fence: a local load, AMO and store-flagged fence counted %" PRIu64 " local stores; the "
+                        "fence behind them held %" PRIu64 " cycles, fired in %" PRId64, n_lst_lanes_ - lanes0,
+                        fo3.held_cycles, int64_t(fo3.fire_cycle - c3)));
+      }
+      commit_pct_ = 100;
+      std::printf("fence: a local load, a local AMO and a store-flagged fence counted no local store\n");
+    }
+
+    if (!two) {
+      std::printf("fence: the remote cases need a cluster of at least two cores, skipped\n");
+      return;
+    }
 
     // A remote store, then a remote load: each with its warp's fence and a
     // later local load of block 0 behind it, every completion withheld.
@@ -1379,6 +1528,14 @@ private:
   std::vector<bool> drained_;
   std::vector<std::optional<uint32_t>> rem_st_prev_;
   uint32_t ack_pct_ = 100;
+
+  // Local-store tracker model.
+  std::vector<uint64_t> lst_cnt_;
+  std::vector<bool> lst_drained_;
+  std::map<uint32_t, uint64_t> lst_rise_;   // per warp, the last cycle lmem_st_drained rose
+  std::vector<std::optional<uint32_t>> lst_prev_ = std::vector<std::optional<uint32_t>>(VX_CFG_NUM_LSU_BLOCKS);
+  uint32_t commit_pct_ = 100;
+  uint64_t n_lst_inc_ = 0, n_lst_lanes_ = 0, n_commits_ = 0, n_b2b_lst_ = 0;
 
   struct FenceObs {
     uint64_t held_cycles = 0;

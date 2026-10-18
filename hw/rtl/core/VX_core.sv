@@ -416,8 +416,12 @@ module VX_core import VX_gpu_pkg::*, VX_tlb_pkg::*; #(
     wire [`VX_CFG_NUM_LSU_BLOCKS-1:0]                         xlate_wt_inc_valid;
     wire [`VX_CFG_NUM_LSU_BLOCKS-1:0][NW_WIDTH-1:0]           xlate_wt_inc_wid;
     wire [`VX_CFG_NUM_LSU_BLOCKS-1:0][`CLOG2(`VX_CFG_NUM_LSU_LANES+1)-1:0] xlate_wt_inc_cnt;
+    wire [`VX_CFG_NUM_LSU_BLOCKS-1:0]                         xlate_lst_inc_valid;
+    wire [`VX_CFG_NUM_LSU_BLOCKS-1:0][NW_WIDTH-1:0]           xlate_lst_inc_wid;
+    wire [`VX_CFG_NUM_LSU_BLOCKS-1:0][`CLOG2(`VX_CFG_NUM_LSU_LANES+1)-1:0] xlate_lst_inc_cnt;
 
     wire [`VX_CFG_NUM_WARPS-1:0] dlmem_drained;
+    wire [`VX_CFG_NUM_WARPS-1:0] lmem_st_drained;
 
     VX_dlmem_lsu_xlate #(
         .INSTANCE_ID   (`SFORMATF(("%s-dlmem-xlate", INSTANCE_ID))),
@@ -432,6 +436,7 @@ module VX_core import VX_gpu_pkg::*, VX_tlb_pkg::*; #(
         .peer_wr_row    (peer_wr_row),
         .peer_wr_stride (peer_wr_stride),
         .drained        (dlmem_drained),
+        .lmem_st_drained(lmem_st_drained),
         .in_if          (lsu_client_if),
         .out_if         (xlate_out_if),
         .out_remote     (xlate_remote),
@@ -439,6 +444,9 @@ module VX_core import VX_gpu_pkg::*, VX_tlb_pkg::*; #(
         .wt_inc_valid   (xlate_wt_inc_valid),
         .wt_inc_wid     (xlate_wt_inc_wid),
         .wt_inc_cnt     (xlate_wt_inc_cnt),
+        .lst_inc_valid  (xlate_lst_inc_valid),
+        .lst_inc_wid    (xlate_lst_inc_wid),
+        .lst_inc_cnt    (xlate_lst_inc_cnt),
         .empty          (xlate_empty)
     );
     // The remote lanes reach the egress through the local-memory switches, flagged in their attributes.
@@ -530,6 +538,9 @@ module VX_core import VX_gpu_pkg::*, VX_tlb_pkg::*; #(
         .TAG_WIDTH  (LSU_TAG_WIDTH),
         .ADDR_WIDTH (VX_dlmem_pkg::DLMEM_LMEM_AW)
     ) dlmem_lmem_if();
+
+    wire [`VX_CFG_LMEM_NUM_BANKS-1:0]               lmem_st_commit_valid;
+    wire [`VX_CFG_LMEM_NUM_BANKS-1:0][NW_WIDTH-1:0] lmem_st_commit_wid;
 `endif
 
     VX_mem_unit #(
@@ -551,6 +562,8 @@ module VX_core import VX_gpu_pkg::*, VX_tlb_pkg::*; #(
     `ifdef VX_CFG_EXT_DLMEM_ENABLE
         .dlmem_remote_if(dlmem_remote_if),
         .dlmem_lmem_if (dlmem_lmem_if),
+        .lmem_st_commit_valid (lmem_st_commit_valid),
+        .lmem_st_commit_wid (lmem_st_commit_wid),
     `endif
         .empty         (mem_unit_empty),
         .lsu_mem_if    (lsu_mem_if),
@@ -566,6 +579,7 @@ module VX_core import VX_gpu_pkg::*, VX_tlb_pkg::*; #(
     wire                dlmem_egress_empty;
     wire                dlmem_ingress_empty;
     wire                dlmem_wtrack_empty;
+    wire                lmem_st_track_empty;
 
     VX_dlmem_egress #(
         .INSTANCE_ID (`SFORMATF(("%s-dlmem-egress", INSTANCE_ID))),
@@ -608,7 +622,26 @@ module VX_core import VX_gpu_pkg::*, VX_tlb_pkg::*; #(
         .empty     (dlmem_wtrack_empty)
     );
 
-    wire dlmem_empty = dlmem_egress_empty && dlmem_ingress_empty && dlmem_wtrack_empty;
+    // Local plain stores between translation and their bank write.
+    `STATIC_ASSERT (VX_dlmem_pkg::DLMEM_LST_XB_G2 <= (`MAX_FANOUT + `MAX_FANOUT / 2),
+        ("the local-store bound covers at most three crossbar arbiter levels"))
+    VX_dlmem_wtrack #(
+        .NUM_INC   (`VX_CFG_NUM_LSU_BLOCKS),
+        .NUM_DEC   (`VX_CFG_LMEM_NUM_BANKS),
+        .MAX_COUNT (VX_dlmem_pkg::DLMEM_LST_MAX)
+    ) lmem_st_track (
+        .clk       (clk),
+        .reset     (reset),
+        .inc_valid (xlate_lst_inc_valid),
+        .inc_wid   (xlate_lst_inc_wid),
+        .inc_cnt   (xlate_lst_inc_cnt),
+        .dec_valid (lmem_st_commit_valid),
+        .dec_wid   (lmem_st_commit_wid),
+        .drained   (lmem_st_drained),
+        .empty     (lmem_st_track_empty)
+    );
+
+    wire dlmem_empty = dlmem_egress_empty && dlmem_ingress_empty && dlmem_wtrack_empty && lmem_st_track_empty;
 `endif
 
     // Address translation is relocated to the socket (one MMU per L1 cache).
@@ -650,7 +683,7 @@ module VX_core import VX_gpu_pkg::*, VX_tlb_pkg::*; #(
     // BAR (vx_barrier / vx_barrier_arrive) drains LSU + MMU before suspending or registering arrival.
     assign warp_ctl_if.lsu_sched_drained = (&lsu_sched_empty) && mmu_empty;
 `ifdef VX_CFG_EXT_DLMEM_ENABLE
-    assign warp_ctl_if.dlmem_drained = dlmem_drained;
+    assign warp_ctl_if.dlmem_drained = dlmem_drained & lmem_st_drained;
 `endif
 
 `ifdef PERF_ENABLE

@@ -36,6 +36,7 @@ module VX_local_mem_top import VX_gpu_pkg::*; #(
     localparam TAG_VALUE_WIDTH  = 16,
     localparam DMA_TAG_VALUE_WIDTH = 8,
     localparam AMO_OP_WIDTH     = 4,
+    localparam HART_IN_WIDTH    = 16,
 
     parameter TAG_WIDTH         = TAG_VALUE_WIDTH + UUID_WIDTH,
     parameter DMA_TAG_WIDTH     = DMA_TAG_VALUE_WIDTH + UUID_WIDTH,
@@ -62,6 +63,7 @@ module VX_local_mem_top import VX_gpu_pkg::*; #(
     input  wire [NUM_REQS-1:0][AMO_OP_WIDTH-1:0] mem_req_amo_op,
     input  wire [NUM_REQS-1:0]                 mem_req_amo_unsigned,
     input  wire [NUM_REQS-1:0][`VX_CFG_XLEN-1:0] mem_req_amo_cmp,
+    input  wire [NUM_REQS-1:0][HART_IN_WIDTH-1:0] mem_req_hart_id,
     output wire [NUM_REQS-1:0]                 mem_req_ready,
 
     // Core response
@@ -69,6 +71,12 @@ module VX_local_mem_top import VX_gpu_pkg::*; #(
     output wire [NUM_REQS-1:0][WORD_WIDTH-1:0] mem_rsp_data,
     output wire [NUM_REQS-1:0][TAG_VALUE_WIDTH-1:0] mem_rsp_tag,
     input  wire [NUM_REQS-1:0]                 mem_rsp_ready,
+
+`ifdef VX_CFG_EXT_DLMEM_ENABLE
+    // Plain-store commits of the LSU inputs, one per bank
+    output wire [NUM_BANKS-1:0]                st_commit_valid,
+    output wire [NUM_BANKS-1:0][7:0]           st_commit_wid,
+`endif
 
     // DMA request: one row of NUM_BANKS words at a bank address
     input  wire                                dma_req_valid,
@@ -91,6 +99,8 @@ module VX_local_mem_top import VX_gpu_pkg::*; #(
         ("local_mem_top: TAG_WIDTH must be TAG_VALUE_WIDTH + UUID_WIDTH"))
     `STATIC_ASSERT (DMA_TAG_WIDTH == DMA_TAG_VALUE_WIDTH + UUID_WIDTH,
         ("local_mem_top: DMA_TAG_WIDTH must be DMA_TAG_VALUE_WIDTH + UUID_WIDTH"))
+    `STATIC_ASSERT (HART_ID_WIDTH <= HART_IN_WIDTH,
+        ("local_mem_top: hart id is %0d bits, the testbench packs %0d", HART_ID_WIDTH, HART_IN_WIDTH))
 
     VX_mem_bus_if #(
         .DATA_SIZE (WORD_SIZE),
@@ -113,7 +123,7 @@ module VX_local_mem_top import VX_gpu_pkg::*; #(
             req_attr.amo.amo_valid    = mem_req_amo_valid[i];
             req_attr.amo.amo_op       = amo_op_e'(mem_req_amo_op[i]);
             req_attr.amo.amo_unsigned = mem_req_amo_unsigned[i];
-            req_attr.amo.hart_id      = HART_ID_WIDTH'(i);
+            req_attr.amo.hart_id      = HART_ID_WIDTH'(mem_req_hart_id[i]);
         `ifdef VX_CFG_EXT_ZACAS_ENABLE
             req_attr.amo.amo_cmp      = mem_req_amo_cmp[i];
         `endif
@@ -121,6 +131,9 @@ module VX_local_mem_top import VX_gpu_pkg::*; #(
     `ifndef VX_CFG_EXT_ZACAS_ENABLE
         `UNUSED_VAR (mem_req_amo_cmp[i])
     `endif
+        if (HART_IN_WIDTH > HART_ID_WIDTH) begin : g_hart_hi
+            `UNUSED_VAR (mem_req_hart_id[i][HART_IN_WIDTH-1:HART_ID_WIDTH])
+        end
         assign lsu_bus_if[i].req_valid = mem_req_valid[i];
         assign lsu_bus_if[i].req_data.rw = mem_req_rw[i];
         assign lsu_bus_if[i].req_data.byteen = mem_req_byteen[i];
@@ -156,6 +169,13 @@ module VX_local_mem_top import VX_gpu_pkg::*; #(
     assign dma_bus_if.rsp_ready = dma_rsp_ready;
     `UNUSED_VAR (dma_bus_if.rsp_data.tag.uuid)
 
+`ifdef VX_CFG_EXT_DLMEM_ENABLE
+    wire [NUM_BANKS-1:0][NW_WIDTH-1:0] st_commit_wid_w;
+    for (genvar i = 0; i < NUM_BANKS; ++i) begin : g_st_commit_wid
+        assign st_commit_wid[i] = 8'(st_commit_wid_w[i]);
+    end
+`endif
+
     VX_local_mem #(
         .INSTANCE_ID  (INSTANCE_ID),
         .SIZE         (SIZE),
@@ -169,11 +189,16 @@ module VX_local_mem_top import VX_gpu_pkg::*; #(
         .AMO_ENABLE   (`VX_CFG_EXT_A_ENABLED),
     `ifdef VX_CFG_EXT_DLMEM_ENABLE
         .STORE_ACK_MASK (NUM_REQS'(1) << (NUM_REQS - 1)),
+        .COMMIT_MASK  ((NUM_REQS'(1) << (NUM_REQS - 1)) - NUM_REQS'(1)),
     `endif
         .OUT_BUF      (3)
     ) local_mem (
         .clk        (clk),
         .reset      (reset),
+    `ifdef VX_CFG_EXT_DLMEM_ENABLE
+        .st_commit_valid (st_commit_valid),
+        .st_commit_wid   (st_commit_wid_w),
+    `endif
         .lsu_bus_if (lsu_bus_if),
         .dma_bus_if (dma_bus_if)
     );

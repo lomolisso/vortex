@@ -17,8 +17,12 @@
 // random per-side back-pressure, and the response merge cycle by cycle against
 // a transcription of VX_rr_arbiter's 3-input table (inputs {local, global,
 // remote} at indices 2, 1, 0), which no parity cell puts under contention.
+// Then LocalMem's per-bank store commit pulse: one per plain store of an LSU
+// port, sent with delay 1 in the tick its bank writes it, none for the
+// ingress or DMA ports, loads or atomics.
 
 #include "local_mem_switch.h"
+#include "local_mem.h"
 #include "mem_block_pool.h"
 #include <cstdio>
 #include <cstring>
@@ -62,6 +66,28 @@ static int rr3_table(uint32_t state, uint32_t r) {
   if (m("0010?") || m("011??") || m("10100")) return 2;
   return -1;
 }
+
+// Records the tick each commit pulse is taken; created after the memory, as the core's tracker.
+class CommitProbe : public SimObject<CommitProbe> {
+public:
+  using Ptr = std::shared_ptr<CommitProbe>;
+  struct Pulse { uint64_t tick; uint32_t bank; uint32_t wid; };
+  std::vector<SimChannel<uint32_t>> In;
+  std::vector<Pulse> pulses;
+  CommitProbe(const SimContext& ctx, const char* name, uint32_t n)
+    : SimObject<CommitProbe>(ctx, name), In(n, this) {}
+protected:
+  void on_reset() { pulses.clear(); }
+  void on_tick() {
+    for (uint32_t b = 0; b < In.size(); ++b) {
+      while (!In[b].empty()) {
+        pulses.push_back({SimPlatform::instance().cycles(), b, In[b].peek()});
+        In[b].pop();
+      }
+    }
+  }
+  friend class SimObject<CommitProbe>;
+};
 
 static std::shared_ptr<mem_block_t> blk(uint8_t v) {
   auto b = make_mem_block();
@@ -252,6 +278,120 @@ int main() {
     CHECK(mism == 0);
     std::printf("merge: %u responses out, grants remote=%u global=%u local=%u, mismatches=%u\n",
                 out_cnt, grants[0], grants[1], grants[2], mism);
+  }
+
+  // ---- 4. LocalMem store commit pulses ----
+  {
+    constexpr uint32_t NLSU = 4, NB = 4, INGRESS = NLSU, DMA = NLSU + 1;
+    const uint32_t word = LSU_WORD_SIZE;
+    auto lmem = LocalMem::Create("lmem", LocalMem::Config{
+      1u << 14, word, NLSU + 2, DMA, 2, false, NLSU});
+    auto probe = CommitProbe::Create("probe", NB);
+    CHECK(lmem->CommitOut.size() == NB);
+    for (uint32_t b = 0; b < NB; ++b) {
+      lmem->CommitOut.at(b).bind(&probe->In.at(b));
+    }
+    platform.reset();
+    uint64_t cyc = platform.cycles();
+    auto step = [&](uint32_t n = 1) {
+      for (uint32_t k = 0; k < n; ++k) {
+        platform.tick();
+        ++cyc;
+      }
+    };
+    auto addr = [&](uint32_t bank, uint32_t row) { return LMEM + (uint64_t(row) * NB + bank) * word; };
+    auto req = [&](MemOp op, uint32_t bank, uint32_t row, uint32_t wid, uint32_t tid, bool dma = false) {
+      uint64_t a = addr(bank, row);
+      auto data = blk(uint8_t(0x30 + wid));
+      MemReq r(op, a, op == MemOp::LD ? nullptr : data,
+               op == MemOp::LD ? 0 : ((uint64_t(1) << word) - 1) << (a & 63), 0, make_hart_id(5, wid, tid), cyc);
+      r.flags.local = 1;
+      r.flags.dma = dma;
+      return r;
+    };
+    // Pulses taken in the window, as (tick - t0, bank, wid).
+    auto taken = [&](size_t from) {
+      std::vector<CommitProbe::Pulse> v(probe->pulses.begin() + from, probe->pulses.end());
+      return v;
+    };
+
+    // A solo store: the bank writes it in tick t0+W; its pulse is still in
+    // flight after that tick and is taken in tick t0+W+1.
+    uint64_t t0 = cyc;
+    lmem->Inputs.at(1).send(req(MemOp::ST, 2, 0, 3, 1), 1);
+    uint64_t seen = 0;
+    for (uint32_t k = 0; k < 8 && !seen; ++k) {
+      step();
+      if (lmem->CommitOut.at(2).size() != 0 && probe->pulses.empty()) {
+        seen = cyc - 1;  // the tick that just ran
+      }
+    }
+    step(4);
+    CHECK(seen != 0);
+    CHECK(probe->pulses.size() == 1);
+    uint64_t W = seen - t0;
+    if (probe->pulses.size() == 1) {
+      CHECK(probe->pulses[0].bank == 2 && probe->pulses[0].wid == 3);
+      CHECK(probe->pulses[0].tick == seen + 1);
+    }
+
+    // Ingress and DMA stores, loads: no pulse. Four LSU stores to four banks
+    // in one cycle: four pulses taken together.
+    size_t base = probe->pulses.size();
+    t0 = cyc;
+    lmem->Inputs.at(INGRESS).send(req(MemOp::ST, 0, 1, 1, 0), 1);
+    lmem->Inputs.at(DMA).send(req(MemOp::ST, 1, 1, 1, 0, true), 1);
+    lmem->Inputs.at(0).send(req(MemOp::LD, 3, 1, 1, 0), 1);
+    step(8);
+    while (!lmem->Outputs.at(0).empty()) lmem->Outputs.at(0).pop();
+    CHECK(probe->pulses.size() == base);
+    t0 = cyc;
+    for (uint32_t p = 0; p < NLSU; ++p) {
+      lmem->Inputs.at(p).send(req(MemOp::ST, p, 2, p, p), 1);
+    }
+    step(8);
+    {
+      auto v = taken(base);
+      CHECK(v.size() == NLSU);
+      for (uint32_t k = 0; k < v.size(); ++k) {
+        CHECK(v[k].tick == t0 + W + 1 && v[k].bank == k && v[k].wid == k);
+      }
+    }
+
+    // Two LSU stores to one bank: one write per cycle, so pulses one tick apart.
+    // A DMA write to the bank in the same cycle wins it and delays both.
+    for (bool dma : {false, true}) {
+      base = probe->pulses.size();
+      t0 = cyc;
+      lmem->Inputs.at(0).send(req(MemOp::ST, 1, 3, 2, 0), 1);
+      lmem->Inputs.at(3).send(req(MemOp::ST, 1, 4, 1, 3), 1);
+      if (dma) {
+        lmem->Inputs.at(DMA).send(req(MemOp::ST, 1, 5, 0, 0, true), 1);
+      }
+      step(10);
+      auto v = taken(base);
+      CHECK(v.size() == 2);
+      if (v.size() == 2) {
+        CHECK(v[0].bank == 1 && v[1].bank == 1 && v[0].wid + v[1].wid == 3);
+        CHECK(v[0].tick == t0 + W + 1 + dma && v[1].tick == t0 + W + 2 + dma);
+      }
+    }
+
+  #if VX_CFG_EXT_A_ENABLED
+    // An atomic writes its bank too, but it is not a plain store.
+    base = probe->pulses.size();
+    lmem->Inputs.at(2).send(req(MemOp::AMO_ADD, 0, 6, 2, 2), 1);
+    step(10);
+    while (!lmem->Outputs.at(2).empty()) lmem->Outputs.at(2).pop();
+    CHECK(probe->pulses.size() == base);
+  #endif
+    CHECK(probe->pulses.size() == 1 + NLSU + 2 + 2);
+    for (uint32_t b = 0; b < NB; ++b) {
+      CHECK(probe->In.at(b).size() == 0);
+    }
+    std::printf("commit: one pulse per LSU store, taken %u cycles after the request is sent "
+                "(bank write +1), none for ingress, DMA, loads%s: %zu pulses\n",
+                uint32_t(W + 1), VX_CFG_EXT_A_ENABLED ? ", atomics" : "", probe->pulses.size());
   }
 
   std::printf(g_fail ? "FAILED (%d)\n" : "PASSED\n", g_fail);

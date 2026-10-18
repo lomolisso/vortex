@@ -269,6 +269,16 @@ public:
 			perf_stats_.reads += !bank_req.is_write();
 			perf_stats_.writes += bank_req.is_write();
 
+#ifdef VX_CFG_EXT_DLMEM_ENABLE
+			// The write is final now; the crossbar appended the input port to the tag.
+			if (bank_req.op == MemOp::ST
+			 && (bank_req.tag & ((1u << log2ceil(config_.num_reqs)) - 1)) < config_.commit_ports) {
+				constexpr uint32_t LOG_THREADS = log2ceil(VX_CFG_NUM_THREADS);
+				constexpr uint32_t WID_MASK = (1u << log2ceil(VX_CFG_NUM_WARPS)) - 1;
+				simobject_->CommitOut.at(i).send((bank_req.hart_id >> LOG_THREADS) & WID_MASK, 1);
+			}
+#endif
+
 			// remove input
 			xbar_req_out.pop();
 		}
@@ -287,6 +297,9 @@ LocalMem::LocalMem(const SimContext& ctx, const char* name, const Config& config
 	: SimObject<LocalMem>(ctx, name)
 	, Inputs(config.num_reqs, this)
 	, Outputs(config.num_reqs, this)
+#ifdef VX_CFG_EXT_DLMEM_ENABLE
+	, CommitOut(1 << config.B, this)
+#endif
 	, impl_(new Impl(this, config))
 {}
 

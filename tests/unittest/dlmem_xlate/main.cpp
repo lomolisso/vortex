@@ -206,6 +206,19 @@ void compare_req(const std::string& ctx, const LsuReq& got, const LsuReq& exp) {
   }
 }
 
+// Lanes of a translated request that are plain stores into this core's local
+// memory: the switch's local leg, restricted to stores (an AMO counts nothing).
+uint32_t local_store_lanes(const LsuReq& out) {
+  if (out.op != MemOp::ST || out.flags.fence) {
+    return 0;
+  }
+  uint32_t n = 0;
+  for (uint32_t i = 0; i < out.mask.size(); ++i) {
+    n += out.mask.test(i) && !out.dlmem_remote.test(i) && get_addr_type(out.addrs.at(i)) == AddrType::Shared;
+  }
+  return n;
+}
+
 ///////////////////////////////////////////////////////////////////////////////
 // Cycle-exact model of the stage and its peer table
 
@@ -226,6 +239,7 @@ struct BlockModel {
   std::deque<InEntry> in;
   std::deque<OutEntry> out;
   std::deque<WtInc> wt;  // expected this tick
+  std::deque<WtInc> lst; // expected this tick
 };
 
 struct TableModel {
@@ -260,6 +274,8 @@ struct Harness {
   uint64_t outputs = 0;
   uint64_t fences = 0;
   uint64_t wt_events = 0;
+  uint64_t lst_events = 0;
+  uint64_t lst_lanes = 0;
   uint64_t kinds[4] = {0, 0, 0, 0};  // active lanes per dlmem_ref::Kind
 
   Harness(const std::string& name, const dlmem_ref::Cfg& c, uint32_t core_id, uint32_t nb,
@@ -267,7 +283,8 @@ struct Harness {
     : ctx(name), cfg(c), my_core(core_id % c.ncc), num_blocks(nb), blocks(nb) {
     dut = DlmemXlate::Create(name.c_str(), cfg, core_id, nb, aborts, aborts);
     tm.reset(cfg.nw);
-    if (dut->ReqIn.size() != nb || dut->ReqOut.size() != nb || dut->WtIncOut.size() != nb) {
+    if (dut->ReqIn.size() != nb || dut->ReqOut.size() != nb || dut->WtIncOut.size() != nb
+     || dut->LstIncOut.size() != nb) {
       fail(ctx, "one request/output/count channel per block expected");
     }
     for (uint32_t b = 0; b < nb; ++b) {
@@ -326,6 +343,7 @@ struct Harness {
     for (uint32_t b = 0; b < num_blocks; ++b) {
       auto& bm = blocks[b];
       bm.wt.clear();
+      bm.lst.clear();
       // A request sent this cycle enters after this tick, under the rows written so far.
       for (auto& in : bm.in) {
         if (in.entered) {
@@ -345,6 +363,10 @@ struct Harness {
       LsuReq e = expected_out(ctx, cfg, my_core, ie.row, tm.stride, ie.req, &remote, kinds);
       if (remote != 0) {
         bm.wt.push_back(WtInc{ie.req.wid, remote});
+      }
+      uint32_t local = local_store_lanes(e);
+      if (local != 0) {
+        bm.lst.push_back(WtInc{ie.req.wid, local});
       }
       bm.out.push_back({std::move(e), cycle, ie.avail - 1});
       bm.in.pop_front();
@@ -377,6 +399,22 @@ struct Harness {
         ++wt_events;
       }
       bm.wt.clear();
+      auto& lst = dut->LstIncOut.at(b);
+      if (lst.size() != bm.lst.size()) {
+        fail(ctx, "local-store count events " + std::to_string(lst.size()) + ", expected "
+                  + std::to_string(bm.lst.size()) + bctx);
+      }
+      for (auto& w : bm.lst) {
+        auto& g = lst.peek();
+        if (g.wid != w.wid || g.cnt != w.cnt) {
+          fail(ctx, "local-store count {wid=" + std::to_string(g.wid) + ", cnt=" + std::to_string(g.cnt)
+                    + "}, expected {" + std::to_string(w.wid) + ", " + std::to_string(w.cnt) + "}" + bctx);
+        }
+        lst.pop();
+        ++lst_events;
+        lst_lanes += w.cnt;
+      }
+      bm.lst.clear();
       if (!ready.at(b) || out.empty()) {
         continue;
       }
@@ -647,11 +685,14 @@ void run_vectors() {
         platform.tick();
         h.check_outputs(cycle, ready, nullptr);
       }
-      // Every remote request counts, whatever its op.
+      // Every remote request counts, whatever its op; a local lane only as a store.
       uint32_t lanes = (v.kind == V::K_REMOTE) ? 2 : 0;
-      if (h.outputs != 3 || h.wt_events != (lanes ? 3u : 0u) || !h.drained()) {
-        fail(ctx, "stage emitted " + std::to_string(h.outputs) + " requests and "
-                  + std::to_string(h.wt_events) + " count events");
+      bool local = (v.kind != V::K_REMOTE) && get_addr_type(v.out_addr) == AddrType::Shared;
+      if (h.outputs != 3 || h.wt_events != (lanes ? 3u : 0u) || h.lst_events != (local ? 1u : 0u)
+       || h.lst_lanes != (local ? 2u : 0u) || !h.drained()) {
+        fail(ctx, "stage emitted " + std::to_string(h.outputs) + " requests, "
+                  + std::to_string(h.wt_events) + " remote and " + std::to_string(h.lst_events)
+                  + " local-store count events");
       }
     }
     platform.finalize();
@@ -903,6 +944,8 @@ struct RandomResult {
   uint64_t requests = 0;
   uint64_t fences = 0;
   uint64_t wt_events = 0;
+  uint64_t lst_events = 0;
+  uint64_t lst_lanes = 0;
   uint64_t kinds[4] = {0, 0, 0, 0};
 
   void mix(uint64_t v) {
@@ -998,11 +1041,14 @@ RandomResult run_random(const RandomShape& rs, Variant variant, uint32_t seed, u
         fail(base, "requests left in the model");
       }
       for (uint32_t b = 0; b < rs.blocks; ++b) {
-        if (!h->dut->ReqIn.at(b).empty() || !h->dut->ReqOut.at(b).empty() || !h->dut->WtIncOut.at(b).empty()) {
+        if (!h->dut->ReqIn.at(b).empty() || !h->dut->ReqOut.at(b).empty() || !h->dut->WtIncOut.at(b).empty()
+         || !h->dut->LstIncOut.at(b).empty()) {
           fail(base, "stage not empty at the end");
         }
       }
       res.wt_events += h->wt_events;
+      res.lst_events += h->lst_events;
+      res.lst_lanes += h->lst_lanes;
       res.requests += h->outputs;
       res.fences += h->fences;
       for (uint32_t k = 0; k < 4; ++k) {
@@ -1029,7 +1075,8 @@ void run_random_all(uint32_t seed, uint32_t reqs, uint32_t workers) {
         ref = r;
         continue;
       }
-      if (r.digest != ref.digest || r.cycles != ref.cycles || r.wt_events != ref.wt_events) {
+      if (r.digest != ref.digest || r.cycles != ref.cycles || r.wt_events != ref.wt_events
+       || r.lst_events != ref.lst_events || r.lst_lanes != ref.lst_lanes) {
         fail(std::string("random ") + V::kShapes[rs.shape].name,
              std::string("variant '") + variant_name(variant) + "' differs from 'flat'");
       }
@@ -1037,13 +1084,15 @@ void run_random_all(uint32_t seed, uint32_t reqs, uint32_t workers) {
     // A one-core cluster has no remote peer.
     bool need_remote = V::kShapes[rs.shape].ncc > 1;
     if (ref.kinds[dlmem_ref::NONE] == 0 || ref.kinds[dlmem_ref::LOCAL] == 0 || ref.kinds[dlmem_ref::OOB] == 0
-     || ref.fences == 0 || (need_remote && (ref.kinds[dlmem_ref::REMOTE] == 0 || ref.wt_events == 0))) {
+     || ref.fences == 0 || ref.lst_events == 0
+     || (need_remote && (ref.kinds[dlmem_ref::REMOTE] == 0 || ref.wt_events == 0))) {
       fail(std::string("random ") + V::kShapes[rs.shape].name, "traffic missed a lane kind");
     }
     std::cout << "random " << V::kShapes[rs.shape].name << " blocks=" << rs.blocks << " lanes=" << rs.lanes
               << ": requests=" << ref.requests << " cycles=" << ref.cycles
               << " local=" << ref.kinds[1] << " remote=" << ref.kinds[2] << " oob=" << ref.kinds[3]
               << " pass=" << ref.kinds[0] << " fences=" << ref.fences << " wt_inc=" << ref.wt_events
+              << " lst_inc=" << ref.lst_events << "/" << ref.lst_lanes
               << " digest=" << std::hex << ref.digest << std::dec
               << " (flat=domains=threads x" << workers << ")" << std::endl;
   }
@@ -1207,6 +1256,187 @@ void run_fence_hold(MemOp op) {
             << std::endl;
 }
 
+// The fence hold on local stores, with both trackers as the core has them: the
+// stage counts the local lanes of a store to the warp's own rank and of a plain
+// local-memory store when they leave (delay 0, so the count is visible after
+// that tick), and the fence waits for both trackers. A bank write at tick T
+// pulses the commit with delay 1, the tracker counts it at T+1 and the fence
+// leaves at T+2; a host send before tick T lands as a bank send in tick T does.
+// Loads and AMOs to local addresses count nothing and hold nothing.
+void run_fence_hold_local(MemOp op) {
+  auto& platform = SimPlatform::instance();
+  platform.set_num_workers(1);
+  constexpr uint32_t kBanks = 4;
+  auto cfg = make_cfg(2, 4, 2, 14);
+  const uint64_t db = cfg.dlmem_base;
+  const uint64_t sram = uint64_t(1) << cfg.lmem_log;
+  const bool st = (op == MemOp::ST);
+  std::string ctx = std::string("fence-hold-local-") + (st ? "st" : (op == MemOp::LD ? "ld" : "amo"));
+  auto dut = DlmemXlate::Create("fence-hold-local", cfg, 0, 2, true, false);
+  auto wt = DlmemWTrack::Create("fence-hold-local-wtrack", 2, cfg.nw, 255);
+  auto lst = DlmemWTrack::Create("fence-hold-local-lst", 2, cfg.nw, 255, kBanks);
+  if (lst->CommitIn.size() != kBanks || wt->CommitIn.size() != 0) {
+    fail(ctx, "one commit port per bank expected");
+  }
+  for (uint32_t b = 0; b < 2; ++b) {
+    dut->WtIncOut.at(b).bind(&wt->IncIn.at(b));
+    dut->LstIncOut.at(b).bind(&lst->IncIn.at(b));
+  }
+  dut->set_drained_query([w = wt.get(), l = lst.get()](uint32_t wid) { return w->drained(wid) && l->drained(wid); });
+  platform.reset();
+
+  uint64_t cycle = 0;
+  std::vector<int64_t> left(16, -1);  // tick each uuid left the stage
+  auto step = [&]() {
+    platform.tick();
+    for (uint32_t b = 0; b < 2; ++b) {
+      auto& out = dut->ReqOut.at(b);
+      while (!out.empty()) {
+        left.at(out.peek().uuid) = cycle;
+        out.pop();
+      }
+    }
+    ++cycle;
+  };
+  auto fence = [&](uint64_t uuid, uint32_t wid) {
+    LsuReq req = window_req(uuid, wid, 0, MemOp::FLUSH);
+    req.flags.fence = 1;
+    return req;
+  };
+  auto check_count = [&](uint32_t want, const char* when) {
+    if (lst->count(2) != want || lst->drained(2) != (want == 0)) {
+      fail(ctx, std::string(when) + ": local-store count " + std::to_string(lst->count(2)) + " (drained="
+                + std::to_string(lst->drained(2)) + "), expected " + std::to_string(want));
+    }
+  };
+  auto commit = [&](std::initializer_list<uint32_t> banks) {
+    for (uint32_t bank : banks) {
+      lst->CommitIn.at(bank).send(2, 1);
+    }
+  };
+
+  // Slot 2: rank 0 is this core (slot 2), rank 1 lives on core 1.
+  dut->PeerWrIn.send({2, dlmem_ref::Row{2, {{0, 2}, {1, 3}}}, 0x1000}, 1);
+  step();
+  // Both lanes on the warp's own rank; then one plain local lane and one global lane.
+  dut->ReqIn.at(0).send(window_req(1, 2, db + 0x40, op), 1);
+  step();
+  {
+    LsuReq req = window_req(2, 2, cfg.lmem_base + 0x200, op);
+    req.addrs[1] = 0x10040;
+    dut->ReqIn.at(0).send(req, 1);
+  }
+  step();
+  if (left[1] != 2) {
+    fail(ctx, "the self-rank access left at tick " + std::to_string(left[1]) + ", expected 2");
+  }
+  check_count(st ? 2 : 0, "after the self-rank access left");
+  dut->ReqIn.at(0).send(fence(3, 2), 1);
+  dut->ReqIn.at(1).send(fence(4, 1), 1);
+  step();
+  if (left[2] != 3) {
+    fail(ctx, "the plain local access left at tick " + std::to_string(left[2]) + ", expected 3");
+  }
+  check_count(st ? 3 : 0, "after the plain local access left");
+  dut->ReqIn.at(0).send(window_req(5, 2, db + 0x80), 1);
+  for (uint32_t k = 0; k < 6; ++k) {
+    step();
+  }
+  if (left[4] != 4) {
+    fail(ctx, "the fence of warp 1 left at tick " + std::to_string(left[4]) + ", expected 4");
+  }
+  if (wt->count(2) != 0) {
+    fail(ctx, "local accesses counted as remote");
+  }
+  if (!st) {
+    if (left[3] != 4 || left[5] != 5) {
+      fail(ctx, "the fence behind local accesses left at tick " + std::to_string(left[3])
+                + " and the load at " + std::to_string(left[5]) + ", expected 4 and 5");
+    }
+    if (!dut->empty() || !wt->empty() || !lst->empty() || !platform.idle()) {
+      fail(ctx, "stage or trackers not empty at the end");
+    }
+    platform.finalize();
+    std::cout << ctx << ": local loads and AMOs count nothing and do not hold the fence: ok" << std::endl;
+    return;
+  }
+
+  auto check_held = [&](uint64_t fence_id, uint64_t load_id) {
+    if (left[fence_id] >= 0 || left[load_id] >= 0) {
+      fail(ctx, "the fence of warp 2 left at tick " + std::to_string(left[fence_id]) + " and the load behind it at "
+                + std::to_string(left[load_id]) + " with " + std::to_string(lst->count(2))
+                + " local and " + std::to_string(wt->count(2)) + " remote lanes outstanding");
+    }
+  };
+  check_held(3, 5);
+  // Two banks write in one cycle: both commits land in one tracker tick.
+  commit({0, 3});
+  step();
+  check_held(3, 5);
+  step();
+  check_count(1, "after two commits in one cycle");
+  check_held(3, 5);
+  // The last bank write, at tick T.
+  uint64_t T = cycle;
+  commit({1});
+  step();
+  check_count(1, "in the tick of the last bank write");
+  check_held(3, 5);
+  step();
+  check_count(0, "the tick after the last bank write");
+  check_held(3, 5);
+  for (uint32_t k = 0; k < 3; ++k) {
+    step();
+  }
+  if (int64_t(T) + 2 != left[3] || int64_t(T) + 3 != left[5]) {
+    fail(ctx, "last bank write at tick " + std::to_string(T) + ", the fence left at " + std::to_string(left[3])
+              + " and the load at " + std::to_string(left[5]) + ", expected T+2 and T+3");
+  }
+
+  // Remote and local lanes outstanding together: the fence waits for both trackers.
+  dut->ReqIn.at(0).send(window_req(6, 2, db + sram + 0x40, MemOp::ST), 1);
+  step();
+  dut->ReqIn.at(0).send(window_req(7, 2, db + 0x100, MemOp::ST), 1);
+  step();
+  dut->ReqIn.at(0).send(fence(8, 2), 1);
+  step();
+  dut->ReqIn.at(0).send(window_req(9, 2, db + 0xc0), 1);
+  for (uint32_t k = 0; k < 4; ++k) {
+    step();
+  }
+  if (left[6] < 0 || left[7] < 0 || wt->count(2) != 2) {
+    fail(ctx, "mixed: the stores did not leave or the remote count is " + std::to_string(wt->count(2)));
+  }
+  check_count(2, "mixed: after the local store left");
+  check_held(8, 9);
+  commit({0, 1});
+  for (uint32_t k = 0; k < 4; ++k) {
+    step();
+  }
+  check_count(0, "mixed: after the local commits");
+  check_held(8, 9);
+  int64_t ack = -1;
+  for (uint32_t k = 0; k < 2; ++k) {
+    ack = cycle;
+    wt->DecIn.send(2, 1);
+    step();
+    check_held(8, 9);
+  }
+  for (uint32_t k = 0; k < 4; ++k) {
+    step();
+  }
+  if (left[8] != ack + 2 || left[9] != ack + 3) {
+    fail(ctx, "mixed: last remote ack sent at " + std::to_string(ack) + ", the fence left at "
+              + std::to_string(left[8]) + " and the load at " + std::to_string(left[9]));
+  }
+  if (!dut->empty() || !wt->empty() || !lst->empty() || !platform.idle()) {
+    fail(ctx, "stage or trackers not empty at the end");
+  }
+  platform.finalize();
+  std::cout << ctx << ": held behind its warp's local stores until the commit (bank write +2 cycles)"
+            << " and behind both trackers together: ok" << std::endl;
+}
+
 ///////////////////////////////////////////////////////////////////////////////
 // Out-of-bounds and remote aborts, each in a child process
 
@@ -1366,6 +1596,9 @@ int main(int argc, char** argv) {
     run_fence();
     for (MemOp op : {MemOp::ST, MemOp::LD, MemOp::AMO_ADD}) {
       run_fence_hold(op);
+    }
+    for (MemOp op : {MemOp::ST, MemOp::LD, MemOp::AMO_ADD}) {
+      run_fence_hold_local(op);
     }
   }
   if (mode == "all" || mode == "random") {

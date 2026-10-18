@@ -32,6 +32,7 @@ DlmemXlate::DlmemXlate(const SimContext& ctx,
   , ReqOut(num_blocks, SimChannel<LsuReq>(this))
   , PeerWrIn(this)
   , WtIncOut(num_blocks, SimChannel<WtInc>(this))
+  , LstIncOut(num_blocks, SimChannel<WtInc>(this))
   , cfg_(cfg)
   , my_core_(0)
   , num_blocks_(num_blocks)
@@ -110,6 +111,10 @@ void DlmemXlate::on_tick() {
       if (remote != 0) {
         WtIncOut.at(b).send(WtInc{req.wid, remote}, 0);
       }
+      uint32_t local = local_store_lanes(req);
+      if (local != 0) {
+        LstIncOut.at(b).send(WtInc{req.wid, local}, 0);
+      }
       DT(3, this->name() << " block" << b << " xlate: " << req);
       out.send(std::move(req), 1);
       in.pop();
@@ -120,6 +125,20 @@ void DlmemXlate::on_tick() {
   if (!busy) {
     this->tick_sleep();
   }
+}
+
+// The switch's local leg, restricted to plain stores: an AMO is a write op
+// here but leaves the RTL request's rw bit clear.
+uint32_t DlmemXlate::local_store_lanes(const LsuReq& req) {
+  if (req.op != MemOp::ST || req.flags.fence) {
+    return 0;
+  }
+  uint32_t n = 0;
+  for (uint32_t i = 0; i < req.mask.size(); ++i) {
+    n += req.mask.test(i) && !req.dlmem_remote.test(i)
+      && get_addr_type(req.addrs.at(i)) == AddrType::Shared;
+  }
+  return n;
 }
 
 uint32_t DlmemXlate::translate(LsuReq& req, const dlmem_ref::Row& row) {

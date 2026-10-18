@@ -199,15 +199,18 @@ module VX_wctl_unit import VX_gpu_pkg::*; #(
 
 `ifdef VX_CFG_EXT_DLMEM_ENABLE
     // A warp's barrier arrival counts, and a warp exits, only once its earlier
-    // instructions have committed and none of its remote stores is in flight.
+    // instructions have committed, none of its remote accesses is in flight and
+    // its local stores are written.
     wire [`VX_CFG_NUM_WARPS-1:0] warp_drained = warp_ctl_if.warp_pending_alm_empty & warp_ctl_if.dlmem_drained;
     wire wid_drained = warp_drained[execute_if.data.header.wid];
 
     // BAR (vx_barrier or vx_barrier_arrive) also drains LSU before continuing.
     wire bar_drain = execute_if.valid && is_bar && (!warp_ctl_if.lsu_sched_drained || !wid_drained);
 
+    // A committed store can still sit uncounted in the LSU or its translation stage.
     wire exit_drain = execute_if.valid && is_tmc && execute_if.data.header.eop
-                   && (rs1_data[`VX_CFG_NUM_THREADS-1:0] == '0) && !wid_drained;
+                   && (rs1_data[`VX_CFG_NUM_THREADS-1:0] == '0)
+                   && (!warp_ctl_if.lsu_sched_drained || !wid_drained);
 `else
     // BAR (vx_barrier or vx_barrier_arrive) drains LSU before continuing.
     wire bar_drain = execute_if.valid && is_bar && !warp_ctl_if.lsu_sched_drained;

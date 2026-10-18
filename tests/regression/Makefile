@@ -22,7 +22,7 @@ TESTS := \
 # without DLMEM too, so it runs first and shares the default-config driver.
 ifeq ($(XLEN),64)
 TESTS += cta_gang cluster_rank cluster_sync dlmem_local \
-         dlmem_store dlmem_load dlmem_atomic dlmem_stress
+         dlmem_store dlmem_load dlmem_atomic dlmem_stress lmem_bar_order
 endif
 
 # --- common exclude list ---------------------------------------------

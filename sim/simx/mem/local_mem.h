@@ -26,6 +26,9 @@ public:
     uint32_t dma_begin; // ports [dma_begin, num_reqs) are DMA ports
     uint32_t B; // log2 number of banks
     bool write_reponse;
+#ifdef VX_CFG_EXT_DLMEM_ENABLE
+    uint32_t commit_ports = 0; // plain stores from ports [0, commit_ports) pulse CommitOut
+#endif
   };
 
   struct PerfStats {
@@ -43,6 +46,10 @@ public:
 
   std::vector<SimChannel<MemReq>> Inputs;
   std::vector<SimChannel<MemRsp>> Outputs;
+#ifdef VX_CFG_EXT_DLMEM_ENABLE
+  // Per bank: the writer warp of each such store, the cycle after its write.
+  std::vector<SimChannel<uint32_t>> CommitOut;
+#endif
 
   LocalMem(const SimContext& ctx, const char* name, const Config& config);
   virtual ~LocalMem();

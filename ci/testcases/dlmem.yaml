@@ -27,7 +27,8 @@ defaults:
             tests/regression/cta_gang, tests/regression/cluster_sync,
             tests/regression/dlmem_local, tests/regression/dlmem_store,
             tests/regression/dlmem_load, tests/regression/dlmem_atomic,
-            tests/regression/dlmem_stress, VX_config.toml, VX_types.toml]
+            tests/regression/dlmem_stress, tests/regression/lmem_bar_order,
+            VX_config.toml, VX_types.toml]
 tests:
   # The cluster-rank CSR over three launches (K = 1, 2 as 1x2x1, 4 as 2x1x2),
   # each CTA's rank against its intra-cluster index, and the rank address map
@@ -709,6 +710,64 @@ tests:
     shape: {cores: 4}
     args: "-p -f -k 4 -n 4"
 
+  # --- local-store ordering ---
+  # A producer lane stores a word into its block's local memory, then releases
+  # consumers on other warps through a named group barrier (bar), a fence and a
+  # flag (fence), or a fence and the group barrier (fencebar). Every producer
+  # and consumer lane first fills the word's bank with a burst of stores, and
+  # DXA copies keep the banks busy. Every consumer must read the new word: a
+  # barrier or fence waits until the warp's local stores are written into the
+  # bank.
+  - id: lmem_bar_order
+    app: lmem_bar_order
+    drivers: [simx, rtlsim]
+    configs+: "-DVX_CFG_EXT_DXA_ENABLE"
+    args: "-m bar -d 1 -r 200 -b 8 -w 0 -e 768 -s 1"
+  - id: lmem_bar_order-fence
+    app: lmem_bar_order
+    drivers: [simx, rtlsim]
+    configs+: "-DVX_CFG_EXT_DXA_ENABLE"
+    args: "-m fence -d 1 -r 200 -b 8 -w 0 -e 768 -s 1"
+  - id: lmem_bar_order-fencebar
+    app: lmem_bar_order
+    drivers: [simx, rtlsim]
+    configs+: "-DVX_CFG_EXT_DXA_ENABLE"
+    args: "-m fencebar -d 1 -r 200 -b 8 -w 0 -e 768 -s 1"
+  - id: lmem_bar_order-w8
+    app: lmem_bar_order
+    drivers: [simx, rtlsim]
+    configs+: "-DVX_CFG_EXT_DXA_ENABLE"
+    shape: {warps: 8}
+    args: "-m fence -d 1 -r 200 -b 8 -w 0 -e 768 -s 1"
+  # 32 warps of 8 threads and 2000 rounds: 480,000 consumer reads per mode.
+  - id: lmem_bar_order-stress
+    app: lmem_bar_order
+    drivers: [simx, rtlsim]
+    tier: nightly
+    configs+: "-DVX_CFG_EXT_DXA_ENABLE -DVX_CFG_NUM_WARPS=32 -DVX_CFG_NUM_THREADS=8"
+    shape: {l2cache: true}
+    args: "-m bar -d 1 -r 2000 -e 3072 -b 2 -w 0"
+  - id: lmem_bar_order-stress-fence
+    app: lmem_bar_order
+    drivers: [simx, rtlsim]
+    tier: nightly
+    configs+: "-DVX_CFG_EXT_DXA_ENABLE -DVX_CFG_NUM_WARPS=32 -DVX_CFG_NUM_THREADS=8"
+    shape: {l2cache: true}
+    args: "-m fence -d 1 -r 2000 -e 3072 -b 2 -w 0"
+  # Without DXA the instruction count does not depend on timing; fencebar has
+  # no flag polling.
+  - id: parity-lmem-bar-order
+    check: model_parity
+    app: lmem_bar_order
+    xlen: [64]
+    configs+: "-DVX_CFG_EXT_DXA_ENABLE"
+    args: "-m bar -d 0 -r 100 -b 8 -w 0"
+  - id: parity-lmem-bar-order-fence
+    check: model_parity
+    app: lmem_bar_order
+    xlen: [64]
+    configs+: "-DVX_CFG_EXT_DXA_ENABLE"
+    args: "-m fencebar -d 0 -r 100 -b 8 -w 0"
 
   # Illegal knob combinations must stop the build, in SimX (the processor
   # object) and in the RTL (a Verilator lint of the processor), each with the

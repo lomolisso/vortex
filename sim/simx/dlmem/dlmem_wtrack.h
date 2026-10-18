@@ -24,6 +24,9 @@ namespace vortex {
 // Increments come from each LSU block's translation, decrements from the
 // egress: DecIn for store acks, DoneIn for answered loads, AMOs and SCs, never
 // both in one cycle (the core merges them into the RTL's one decrement port).
+// The core's second instance counts local plain stores instead: increments
+// from the translation, one decrement per bank write on CommitIn, several
+// banks in one cycle.
 // drained(w) is the registered cnt[w] == 0 of the cycle after.
 class DlmemWTrack : public SimObject<DlmemWTrack> {
 public:
@@ -32,12 +35,14 @@ public:
   std::vector<SimChannel<WtInc>> IncIn;
   SimChannel<uint32_t> DecIn;
   SimChannel<uint32_t> DoneIn;
+  std::vector<SimChannel<uint32_t>> CommitIn;
 
   DlmemWTrack(const SimContext& ctx,
               const char* name,
               uint32_t num_inc,
               uint32_t num_warps,
-              uint32_t max_count);
+              uint32_t max_count,
+              uint32_t num_commit = 0);
 
   bool drained(uint32_t wid) const {
     return drained_.at(wid);

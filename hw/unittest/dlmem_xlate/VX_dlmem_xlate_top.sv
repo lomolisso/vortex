@@ -18,8 +18,8 @@
 // the fence bit are driven separately and merged into the raw tag here, so the
 // testbench needs no tag layout; in_tag_eff returns the merged tag. The cfg_*
 // outputs are constants that give the testbench the package-derived widths
-// and the attribute fields the stage may rewrite. drained stands in for the
-// core's store tracker.
+// and the attribute fields the stage may rewrite. drained and lmem_st_drained
+// stand in for the core's remote-access and local-store trackers.
 module VX_dlmem_xlate_top import VX_gpu_pkg::*; #(
     parameter  CORE_ID       = 0,
     parameter  OOB_ASSERT    = 0,
@@ -89,10 +89,14 @@ module VX_dlmem_xlate_top import VX_gpu_pkg::*; #(
     output wire [NB-1:0]                        wt_inc_valid,
     output wire [NB-1:0][NW_WIDTH-1:0]          wt_inc_wid,
     output wire [NB-1:0][CNT_W-1:0]             wt_inc_cnt,
+    output wire [NB-1:0]                        lst_inc_valid,
+    output wire [NB-1:0][NW_WIDTH-1:0]          lst_inc_wid,
+    output wire [NB-1:0][CNT_W-1:0]             lst_inc_cnt,
     output wire [NB-1:0]                        empty,
 
-    // Per-warp store tracker state; a fence waits at the output until set.
+    // Per-warp tracker states; a fence waits at the output until both are set.
     input  wire [NW-1:0]                        drained,
+    input  wire [NW-1:0]                        lmem_st_drained,
 
     // Responses, scheduler side in, LSU side out.
     input  wire [NB-1:0]                        mem_rsp_valid,
@@ -221,6 +225,7 @@ module VX_dlmem_xlate_top import VX_gpu_pkg::*; #(
         .peer_wr_row    (wr_row),
         .peer_wr_stride (wr_stride),
         .drained        (drained),
+        .lmem_st_drained (lmem_st_drained),
         .in_if          (in_if),
         .out_if         (out_if),
         .out_remote     (out_remote),
@@ -228,6 +233,9 @@ module VX_dlmem_xlate_top import VX_gpu_pkg::*; #(
         .wt_inc_valid   (wt_inc_valid),
         .wt_inc_wid     (wt_inc_wid),
         .wt_inc_cnt     (wt_inc_cnt),
+        .lst_inc_valid  (lst_inc_valid),
+        .lst_inc_wid    (lst_inc_wid),
+        .lst_inc_cnt    (lst_inc_cnt),
         .empty          (empty)
     );
 

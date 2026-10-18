@@ -43,7 +43,7 @@ interface VX_warp_ctl_if import VX_gpu_pkg::*; ();
 `ifdef VX_CFG_EXT_DLMEM_ENABLE
     // Valid with bar_addr: the phase read targets the slot's cluster barrier.
     wire bar_cluster;
-    // Per warp: no remote DLMEM store still in flight.
+    // Per warp: no remote DLMEM access in flight and every local store written.
     wire [`VX_CFG_NUM_WARPS-1:0] dlmem_drained;
 `endif
 

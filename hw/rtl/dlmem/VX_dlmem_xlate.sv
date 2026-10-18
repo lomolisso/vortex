@@ -21,7 +21,8 @@
 // field. Out-of-bounds lanes go to the issuer's own slot base, keeping their
 // 64-byte line offset like every other lane. A fence waits at the stage output
 // until its warp's remote accesses are performed (stores acknowledged, loads
-// and AMOs answered), so it orders them before every later access of the warp.
+// and AMOs answered) and its local plain stores are written into their banks,
+// so it orders them before every later access of the warp.
 module VX_dlmem_xlate import VX_gpu_pkg::*, VX_dlmem_pkg::*; #(
     parameter `STRING INSTANCE_ID = "",
     // Global core id (hart id core field); the core's index in its cluster is CORE_ID % DLMEM_NCC.
@@ -51,6 +52,8 @@ module VX_dlmem_xlate import VX_gpu_pkg::*, VX_dlmem_pkg::*; #(
 
     // Per warp, every remote access counted on wt_inc has been performed.
     input  wire [NW-1:0]                    drained,
+    // Per warp, every local store counted on lst_inc has been written.
+    input  wire [NW-1:0]                    lmem_st_drained,
 
     // Per-lane flags, qualified by out_if.req_valid.
     output wire [NUM_LANES-1:0]             out_remote,
@@ -60,6 +63,11 @@ module VX_dlmem_xlate import VX_gpu_pkg::*, VX_dlmem_pkg::*; #(
     output wire                             wt_inc_valid,
     output wire [NW_WIDTH-1:0]              wt_inc_wid,
     output wire [CNT_W-1:0]                 wt_inc_cnt,
+
+    // Local plain stores leaving the stage, per warp.
+    output wire                             lst_inc_valid,
+    output wire [NW_WIDTH-1:0]              lst_inc_wid,
+    output wire [CNT_W-1:0]                 lst_inc_cnt,
 
     output wire                             empty
 );
@@ -127,6 +135,7 @@ module VX_dlmem_xlate import VX_gpu_pkg::*, VX_dlmem_pkg::*; #(
     wire [NUM_LANES-1:0][LSU_ADDR_WIDTH-1:0] addr_out;
     wire [NUM_LANES-1:0][MEM_ATTR_WIDTH-1:0] attr_out;
     wire [NUM_LANES-1:0][DLMEM_CORE_W-1:0]   lane_core;
+    wire [NUM_LANES-1:0]                     lane_lst;
 
     for (genvar i = 0; i < NUM_LANES; ++i) begin : g_lanes
         wire [LSU_ADDR_WIDTH-1:0] a = req_r.addr[i];
@@ -173,13 +182,16 @@ module VX_dlmem_xlate import VX_gpu_pkg::*, VX_dlmem_pkg::*; #(
             if (win) begin
                 attr.is_addr_local = ~rem;
                 attr.is_addr_io    = 1'b0;
-                // A remote access carries its source warp to the target.
-                if (rem) begin
-                    attr.amo.hart_id = hart_id;
-                end
+            end
+            // A remote access carries its source warp to the target, a local
+            // one to its bank, which reports the warp's stores as committed.
+            if (rem || (act && attr.is_addr_local)) begin
+                attr.amo.hart_id = hart_id;
             end
         end
         assign attr_out[i] = attr;
+        // VX_lmem_switch's local leg, plain stores only (atomics carry rw=0).
+        assign lane_lst[i] = act && req_r.rw && attr.is_addr_local && ~attr.is_addr_remote;
 
         assign out_remote[i] = rem;
         assign out_oob[i]    = oob;
@@ -188,7 +200,7 @@ module VX_dlmem_xlate import VX_gpu_pkg::*, VX_dlmem_pkg::*; #(
 
     // drained is registered after the count, so an access leaving in the cycle
     // before its fence is already visible to it.
-    wire fence_hold = is_fence_r && ~drained[hdr_r.wid];
+    wire fence_hold = is_fence_r && ~(drained[hdr_r.wid] && lmem_st_drained[hdr_r.wid]);
 
     assign out_if.req_valid       = req_valid_r && ~fence_hold;
     assign out_if.req_data.rw     = req_r.rw;
@@ -210,6 +222,10 @@ module VX_dlmem_xlate import VX_gpu_pkg::*, VX_dlmem_pkg::*; #(
     assign wt_inc_valid = out_fire && (| out_remote);
     assign wt_inc_wid   = hdr_r.wid;
     `POP_COUNT(wt_inc_cnt, out_remote);
+
+    assign lst_inc_valid = out_fire && (| lane_lst);
+    assign lst_inc_wid   = hdr_r.wid;
+    `POP_COUNT(lst_inc_cnt, lane_lst);
 
     assign empty = ~req_valid_r;
 

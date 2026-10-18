@@ -403,14 +403,16 @@ void SfuUnit::on_tick() {
 						continue; // drain LSU before the barrier
 				#ifdef VX_CFG_EXT_DLMEM_ENABLE
 					// an arrival counts only once the warp's earlier instructions
-					// committed and its remote stores are acknowledged
+					// committed, its remote accesses are performed and its local
+					// stores are written
 					if (core_->has_pending_instrs(trace->wid) || !core_->dlmem_drained(trace->wid))
 						continue;
 				#endif
 				}
 			#ifdef VX_CFG_EXT_DLMEM_ENABLE
 				else if (*wctl_p == WctlType::TMC) {
-					// a warp leaves its slot only with nothing of it still in flight
+					// a warp leaves its slot only with nothing of it still in flight;
+					// a committed store can wait uncounted in the LSU or the translation
 					auto& rs1 = trace->src_data[0];
 					int last = VX_CFG_NUM_THREADS - 1;
 					while (last > 0 && !trace->tmask.test(last))
@@ -419,7 +421,8 @@ void SfuUnit::on_tick() {
 					for (uint32_t t = 0; t < VX_CFG_NUM_THREADS; ++t) {
 						is_exit = is_exit && !((rs1.at(last).u >> t) & 1);
 					}
-					if (is_exit && (core_->has_pending_instrs(trace->wid) || !core_->dlmem_drained(trace->wid)))
+					if (is_exit && (!core_->lsu_drained() || core_->has_pending_instrs(trace->wid)
+					             || !core_->dlmem_drained(trace->wid)))
 						continue;
 				}
 			#endif

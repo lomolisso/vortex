@@ -42,6 +42,8 @@ module VX_local_mem import VX_gpu_pkg::*; #(
 `ifdef VX_CFG_EXT_DLMEM_ENABLE
     // Inputs whose stores return a response once the bank has committed them
     parameter [NUM_REQS-1:0] STORE_ACK_MASK = '0,
+    // Inputs whose plain stores are reported on st_commit once written
+    parameter [NUM_REQS-1:0] COMMIT_MASK = '0,
 `endif
 
     // Response buffer
@@ -53,6 +55,12 @@ module VX_local_mem import VX_gpu_pkg::*; #(
     // PERF
 `ifdef PERF_ENABLE
     output lmem_perf_t lmem_perf,
+`endif
+
+`ifdef VX_CFG_EXT_DLMEM_ENABLE
+    // Per bank, a COMMIT_MASK input's plain store written in the previous cycle, and its warp
+    output wire [NUM_BANKS-1:0]                st_commit_valid,
+    output wire [NUM_BANKS-1:0][NW_WIDTH-1:0]  st_commit_wid,
 `endif
 
     // LSU read/write port
@@ -122,7 +130,12 @@ module VX_local_mem import VX_gpu_pkg::*; #(
         assign req_amo_valid[i]    = AMO_ENABLE ? lane_attr.amo.amo_valid : 1'b0;
         assign req_amo_op[i]       = AMO_ENABLE ? lane_attr.amo.amo_op : '0;
         assign req_amo_unsigned[i] = AMO_ENABLE ? lane_attr.amo.amo_unsigned : 1'b0;
+    `ifdef VX_CFG_EXT_DLMEM_ENABLE
+        // A committing input's hart id names the warp its stores are reported for.
+        assign req_amo_hart_id[i]  = ((AMO_ENABLE != 0) || COMMIT_MASK[i]) ? lane_attr.amo.hart_id : '0;
+    `else
         assign req_amo_hart_id[i]  = AMO_ENABLE ? lane_attr.amo.hart_id : '0;
+    `endif
     `ifdef VX_CFG_EXT_ZACAS_ENABLE
         assign req_amo_cmp[i]      = AMO_ENABLE ? lane_attr.amo.amo_cmp : '0;
     `endif
@@ -649,6 +662,31 @@ module VX_local_mem import VX_gpu_pkg::*; #(
                                     && ~amo_busy
                                     && (bank_rsp_ready || (per_bank_req_rw[i] && ~req_store_ack))
                                     && ~is_rdw_hazard;
+
+        // A plain store is final in the cycle the bank accepts it: atomics, LR/SC
+        // and their write-backs carry rw=0, and DMA beats never reach the crossbar.
+        wire st_commit = lsu_active && per_bank_req_rw[i] && COMMIT_MASK[per_bank_req_idx[i]];
+        wire [HART_ID_WIDTH-1:0] st_commit_hart_id = per_bank_req_amo_hart_id[i];
+        wire [NW_WIDTH-1:0] st_commit_wid_n;
+        if (NW_BITS != 0) begin : g_commit_wid
+            assign st_commit_wid_n = st_commit_hart_id[NT_BITS +: NW_BITS];
+        end else begin : g_commit_wid0
+            assign st_commit_wid_n = '0;
+        end
+        `UNUSED_VAR (st_commit_hart_id)
+
+        VX_pipe_register #(
+            .DATAW  (1 + NW_WIDTH),
+            .RESETW (1)
+        ) st_commit_reg (
+            .clk      (clk),
+            .reset    (reset),
+            .enable   (1'b1),
+            .data_in  ({st_commit, st_commit_wid_n}),
+            .data_out ({st_commit_valid[i], st_commit_wid[i]})
+        );
+
+        `RUNTIME_ASSERT(~(st_commit && per_bank_req_amo_valid[i]), ("%t: *** %s bank%0d: store commit of an atomic", $time, INSTANCE_ID, i))
     `else
         assign bank_rsp_valid = per_bank_req_valid[i]
                              && ~dma_pending
