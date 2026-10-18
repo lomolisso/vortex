@@ -200,9 +200,11 @@ int run_launch(vx_device_h dev, vx_queue_h q, vx_kernel_h kernel, const Caps& ca
   arg.flags       = use_dxa ? FLAG_DXA : 0;
 
   vx_buffer_h dxa_buf = nullptr;
+  // The queued write reads it when the queue runs it, so it lives until the read completes.
+  std::vector<uint32_t> src;
   if (use_dxa) {
 #ifdef VX_CFG_EXT_DXA_ENABLE
-    std::vector<uint32_t> src(DXA_TILES * DXA_WORDS);
+    src.resize(DXA_TILES * DXA_WORDS);
     for (uint32_t i = 0; i < src.size(); ++i)
       src[i] = dxa_word(seed, i);
     const uint64_t src_bytes = src.size() * sizeof(uint32_t);
@@ -211,6 +213,7 @@ int run_launch(vx_device_h dev, vx_queue_h q, vx_kernel_h kernel, const Caps& ca
     CHECK(vx_buffer_address(dxa_buf, &arg.dxa_addr));
     if (vortex::dxa::program_1d(dev, 0, arg.dxa_addr, DXA_TILES * DXA_WORDS, DXA_WORDS, sizeof(uint32_t))) {
       std::printf("*** programming the DXA descriptor failed\n");
+      vx_queue_finish(q, VX_TIMEOUT_INFINITE);
       return 1;
     }
 #endif

@@ -117,7 +117,7 @@ const char* policy_name(uint32_t p) {
 // accepted submission see the same memory.
 struct Job {
   vx_buffer_h rec_buf = nullptr, arrive_buf = nullptr;
-  std::vector<uint32_t> recs;
+  std::vector<uint32_t> recs, arrive;
   gang_arg_t arg = {};
   vx_launch_info_t li = {};
   uint32_t num_blocks = 0;
@@ -137,9 +137,9 @@ void job_create(vx_device_h dev, vx_queue_h q, vx_kernel_h kernel, const Caps& c
   CHECK(vx_buffer_address(j.rec_buf, &j.arg.rec_addr));
   if (rendezvous) {
     const uint64_t arrive_bytes = (uint64_t)L.g * sizeof(uint32_t);
-    std::vector<uint32_t> zeros(L.g, 0);
+    j.arrive.assign(L.g, 0);
     CHECK(vx_buffer_create(dev, arrive_bytes, VX_MEM_READ_WRITE, &j.arrive_buf));
-    CHECK(vx_enqueue_write(q, j.arrive_buf, 0, zeros.data(), arrive_bytes, 0, nullptr, nullptr));
+    CHECK(vx_enqueue_write(q, j.arrive_buf, 0, j.arrive.data(), arrive_bytes, 0, nullptr, nullptr));
     CHECK(vx_buffer_address(j.arrive_buf, &j.arg.arrive_addr));
   }
   j.arg.k          = L.k;
@@ -177,7 +177,9 @@ void job_create(vx_device_h dev, vx_queue_h q, vx_kernel_h kernel, const Caps& c
   }
 }
 
-void job_release(Job& j) {
+// The queued uploads read j's host vectors when they run, so they finish first.
+void job_release(vx_queue_h q, Job& j) {
+  CHECK(vx_queue_finish(q, VX_TIMEOUT_INFINITE));
   if (j.arrive_buf)
     vx_buffer_release(j.arrive_buf);
   vx_buffer_release(j.rec_buf);
@@ -304,12 +306,12 @@ int run_launch(vx_device_h dev, vx_queue_h q, vx_kernel_h kernel, const Caps& ca
   const vx_result_t r = submit(q, j.li, L.how, &ev);
   if (r != VX_SUCCESS) {
     std::printf("*** %s: the launch returned %s\n", L.name, vx_result_string(r));
-    job_release(j);
+    job_release(q, j);
     return -1;
   }
   job_wait(q, j, ev);
   const int errors = check_records(caps, L, applied, j, rendezvous);
-  job_release(j);
+  job_release(q, j);
   return errors;
 }
 
@@ -337,7 +339,7 @@ int expect_reject(vx_device_h dev, vx_queue_h q, vx_kernel_h kernel, const Caps&
   std::printf("%s %s%s: %s (expected %s)\n", errors ? "***" : "reject:", what,
               L.how == Submit::Commands ? " (batch)" : "", vx_result_string(r),
               vx_result_string(want));
-  job_release(j);
+  job_release(q, j);
   return errors;
 }
 
