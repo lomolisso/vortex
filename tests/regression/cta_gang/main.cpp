@@ -13,7 +13,8 @@
 //   -p       parity mode: fixed ALU work and no rendezvous, so the instruction
 //            count does not depend on timing
 //   -r       rejection mode: descriptors the runtime must refuse, an old-size
-//            descriptor it must run as DEFAULT, and a SPREAD batch launch
+//            descriptor it must run as DEFAULT, a SPREAD batch launch, and
+//            DEFAULT clusters that exactly fill a core's warps or slots
 //   -v       print every cluster's placement (core:slot by rank), to diff models
 //
 // Every block records its core, slot, rank and local-memory base; the host checks
@@ -324,6 +325,10 @@ int expect_reject(vx_device_h dev, vx_queue_h q, vx_kernel_h kernel, const Caps&
   const vx_result_t r = submit(q, j.li, L.how, &ev);
   int errors = 0;
   if (r == VX_SUCCESS) {
+    // A launch that cannot be co-resident may never finish.
+    std::printf("*** %s%s: accepted, expected %s\n", what,
+                L.how == Submit::Commands ? " (batch)" : "", vx_result_string(want));
+    std::fflush(stdout);
     job_wait(q, j, ev);
     ++errors;
   } else if (r != want) {
@@ -355,6 +360,21 @@ int run_rejects(vx_device_h dev, vx_queue_h q, vx_kernel_h kernel, const Caps& c
       over.k = (uint32_t)std::max(caps.num_warps, caps.max_cluster) + 1;
       errors += expect_reject(dev, q, kernel, caps, over, VX_ERR_INVALID_VALUE,
                               "DEFAULT with K above max(NUM_WARPS, MAX_CLUSTER)");
+      // DEFAULT puts a whole cluster on one core, so its K blocks must fit there at once.
+      if (caps.num_warps >= 2) {
+        Launch warps = L;
+        warps.policy = VX_CLUSTER_POLICY_DEFAULT;
+        warps.k = 2;
+        warps.w = (uint32_t)caps.num_warps / 2 + 1;
+        errors += expect_reject(dev, q, kernel, caps, warps, VX_ERR_INVALID_VALUE,
+                                "DEFAULT with K * W above NUM_WARPS");
+        Launch slots = L;
+        slots.policy = VX_CLUSTER_POLICY_DEFAULT;
+        slots.k = 2;
+        slots.lmem = (uint32_t)caps.lmem_size / 2 + VX_CFG_MEM_BLOCK_SIZE;
+        errors += expect_reject(dev, q, kernel, caps, slots, VX_ERR_INVALID_VALUE,
+                                "DEFAULT with K above the local-memory slots");
+      }
       // Pre-programmed geometry cannot be checked against the gang's placement bound.
       errors += expect_reject(dev, q, kernel, caps, L, VX_ERR_INVALID_VALUE,
                               "SPREAD with ndim 0",
@@ -384,6 +404,16 @@ int run_rejects(vx_device_h dev, vx_queue_h q, vx_kernel_h kernel, const Caps& c
     const uint32_t k = std::min<uint32_t>(2, (uint32_t)caps.max_cluster);
     const Launch batch = {k, 3, 1, 0, VX_CLUSTER_POLICY_SPREAD, Submit::Commands, "batch"};
     e = run_launch(dev, q, kernel, caps, batch);
+    errors += (e < 0) ? 1 : e;
+    // DEFAULT clusters that exactly fill a core's warps, or its local-memory slots.
+    const uint32_t w = std::max<uint32_t>(1, (uint32_t)caps.num_warps / 2);
+    const Launch full_warps = {(uint32_t)caps.num_warps / w, 2, w, 0, VX_CLUSTER_POLICY_DEFAULT,
+                               Submit::Launch, "default-full-warps"};
+    e = run_launch(dev, q, kernel, caps, full_warps);
+    errors += (e < 0) ? 1 : e;
+    const Launch full_slots = {k2, 2, 1, (uint32_t)caps.lmem_size / k2, VX_CLUSTER_POLICY_DEFAULT,
+                               Submit::Commands, "default-full-slots"};
+    e = run_launch(dev, q, kernel, caps, full_slots);
     errors += (e < 0) ? 1 : e;
   }
   return errors;

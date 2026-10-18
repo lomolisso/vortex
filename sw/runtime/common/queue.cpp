@@ -292,26 +292,30 @@ vx_result_t launch_policy(Device* dev, const vx_launch_info_t* info,
         k *= std::max<uint32_t>(info->cluster_dim[i], 1);
         block_size *= info->block_dim[i];
     }
-    uint64_t nw = 0, max_cluster = 0;
+    uint64_t nw = 0, max_cluster = 0, nt = 0, lmem_cap = 0, line = 0;
     r = dev->query_caps(VX_CAPS_NUM_WARPS, &nw);
     if (r == VX_SUCCESS) r = dev->query_caps(VX_CAPS_DLMEM_MAX_CLUSTER, &max_cluster);
+    if (r == VX_SUCCESS) r = dev->query_caps(VX_CAPS_NUM_THREADS, &nt);
+    if (r == VX_SUCCESS) r = dev->query_caps(VX_CAPS_LOCAL_MEM_SIZE, &lmem_cap);
+    if (r == VX_SUCCESS) r = dev->query_caps(VX_CAPS_CACHE_LINE_SIZE, &line);
     if (r != VX_SUCCESS) return r;
     // The KMU's rank counter holds the largest cluster of either policy.
     if (k > std::max(nw, max_cluster)) return VX_ERR_INVALID_VALUE;
-    if (p != VX_CLUSTER_POLICY_SPREAD) return VX_SUCCESS;
-    if (k > max_cluster) return VX_ERR_INVALID_VALUE;
 
-    // Each member needs a free slot and W free warps on a core of one hardware cluster.
-    uint64_t nt = 0, lmem_cap = 0, line = 0, cores = 0, clusters = 0;
-    r = dev->query_caps(VX_CAPS_NUM_THREADS, &nt);
-    if (r == VX_SUCCESS) r = dev->query_caps(VX_CAPS_LOCAL_MEM_SIZE, &lmem_cap);
-    if (r == VX_SUCCESS) r = dev->query_caps(VX_CAPS_CACHE_LINE_SIZE, &line);
-    if (r == VX_SUCCESS) r = dev->query_caps(VX_CAPS_NUM_CORES, &cores);
-    if (r == VX_SUCCESS) r = dev->query_caps(VX_CAPS_NUM_CLUSTERS, &clusters);
-    if (r != VX_SUCCESS) return r;
+    // DEFAULT puts every member on one core: unless all of them hold a slot and
+    // W warps at once, the first cluster barrier never completes.
     const uint64_t warps  = std::max<uint64_t>((block_size + nt - 1) / nt, 1);
     const uint64_t stride = (info->lmem_size + line - 1) / line * line;
     const uint64_t slots  = (stride == 0) ? nw : std::min(nw, lmem_cap / stride);
+    if (p != VX_CLUSTER_POLICY_SPREAD)
+        return (k * warps > nw || k > slots) ? VX_ERR_INVALID_VALUE : VX_SUCCESS;
+    if (k > max_cluster) return VX_ERR_INVALID_VALUE;
+
+    // SPREAD needs each member's slot and W warps on a core of one hardware cluster.
+    uint64_t cores = 0, clusters = 0;
+    r = dev->query_caps(VX_CAPS_NUM_CORES, &cores);
+    if (r == VX_SUCCESS) r = dev->query_caps(VX_CAPS_NUM_CLUSTERS, &clusters);
+    if (r != VX_SUCCESS) return r;
     const uint64_t ncc    = cores / clusters;
     if (k > ncc * std::min(slots, nw / warps)) return VX_ERR_INVALID_VALUE;
     return VX_SUCCESS;

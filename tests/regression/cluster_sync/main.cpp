@@ -15,6 +15,8 @@
 //   -p       parity mode: no atomics and no rank-dependent work, so the
 //            instruction count does not depend on timing
 //   -v       print every cluster's placement (core:slot by rank)
+//   -x       pass a launch whose clusters cannot be co-resident to the
+//            runtime, which must refuse it with VX_ERR_INVALID_VALUE
 //
 // With the A extension, every warp adds itself to its cluster's counter for
 // the phase before arriving and reads the counter back after the release; it
@@ -22,7 +24,8 @@
 // token of its phase. The host checks the kernel's error counts, the counters,
 // that each block ran once, its rank, and that a DEFAULT cluster stays on one
 // core. A DEFAULT cluster must fit on one core at once (K * W warps and K
-// slots), or its barrier would deadlock: the app refuses such a launch.
+// slots), or its barrier would deadlock: the app refuses such a launch unless
+// -x leaves the refusal to the runtime.
 
 #include <vortex2.h>
 #include <VX_types.h>
@@ -63,6 +66,7 @@ int         req_policy  = -1;   // -1: not given
 bool        relaxed     = false;
 bool        parity_mode = false;
 bool        verbose     = false;
+bool        expect_reject = false;
 
 const char* const kModeNames[] = {"sync", "split", "skew", "mixed", "exit"};
 
@@ -83,13 +87,13 @@ struct Launch {
 void usage() {
   std::printf("Usage: [-k cluster size] [-w warps per block] [-n clusters] [-s: SPREAD | -d: DEFAULT]"
               " [-i phases] [-l local-memory bytes] [-m sync|split|skew|mixed|exit] [-r: relaxed]"
-              " [-p: parity] [-v: placement] [-h]\n");
+              " [-p: parity] [-v: placement] [-x: expect the runtime to refuse] [-h]\n");
 }
 
 void parse_args(int argc, char** argv) {
   int c;
   bool bad = false;
-  while ((c = getopt(argc, argv, "k:w:n:sdi:l:m:rpvh")) != -1) {
+  while ((c = getopt(argc, argv, "k:w:n:sdi:l:m:rpvxh")) != -1) {
     switch (c) {
       case 'k': req_k       = (uint32_t)std::atoi(optarg); break;
       case 'w': req_w       = (uint32_t)std::atoi(optarg); break;
@@ -110,6 +114,7 @@ void parse_args(int argc, char** argv) {
       case 'r': relaxed     = true;                        break;
       case 'p': parity_mode = true;                        break;
       case 'v': verbose     = true;                        break;
+      case 'x': expect_reject = true;                      break;
       case 'h': usage(); std::exit(0);
       default:  usage(); std::exit(-1);
     }
@@ -118,6 +123,7 @@ void parse_args(int argc, char** argv) {
   // instruction count depend on timing.
   bad |= parity_mode && req_mode != MODE_SYNC;
   bad |= relaxed && req_mode != MODE_SYNC;
+  bad |= expect_reject && req_k == 0 && req_policy < 0;
   if (bad || optind < argc || req_w == 0 || req_g == 0 || req_lmem % sizeof(uint32_t) != 0) {
     usage();
     std::exit(-1);
@@ -259,7 +265,12 @@ int run_launch(vx_device_h dev, vx_queue_h q, vx_kernel_h kernel, const Caps& ca
   std::printf("%s: %s, K=%u, %u clusters of %u-warp blocks, %u phases of %s%s%s, %u local-memory bytes\n",
               L.name, policy_name(L.policy), L.k, L.g, L.w, j.phases, kModeNames[req_mode],
               relaxed ? " (relaxed)" : "", counting ? " with arrival counters" : "", req_lmem);
-  if (const char* why = not_coresident(caps, L)) {
+  const char* why = not_coresident(caps, L);
+  if (expect_reject && !why) {
+    std::printf("*** %s: -x needs a launch whose clusters cannot be co-resident\n", L.name);
+    return 1;
+  }
+  if (why && !expect_reject) {
     std::printf("*** %s: refused, its clusters cannot be co-resident: %s\n", L.name, why);
     return 1;
   }
@@ -300,9 +311,24 @@ int run_launch(vx_device_h dev, vx_queue_h q, vx_kernel_h kernel, const Caps& ca
   li.cluster_policy = L.policy;
   vx_event_h launch_ev = nullptr;
   const vx_result_t r = vx_enqueue_launch(q, &li, 0, nullptr, &launch_ev);
+  if (expect_reject && r == VX_ERR_INVALID_VALUE) {
+    std::printf("reject: %s: %s (expected VX_ERR_INVALID_VALUE)\n", L.name, vx_result_string(r));
+    if (j.count_buf)
+      vx_buffer_release(j.count_buf);
+    vx_buffer_release(j.err_buf);
+    vx_buffer_release(j.rec_buf);
+    return 0;
+  }
   if (r != VX_SUCCESS) {
-    std::printf("*** %s: the launch returned %s\n", L.name, vx_result_string(r));
+    std::printf("*** %s: the launch returned %s%s\n", L.name, vx_result_string(r),
+                expect_reject ? ", expected VX_ERR_INVALID_VALUE" : "");
     return 1;
+  }
+  // An accepted launch that cannot be co-resident deadlocks below.
+  if (expect_reject) {
+    std::printf("*** %s: the launch was accepted, expected VX_ERR_INVALID_VALUE (%s)\n",
+                L.name, why);
+    std::fflush(stdout);
   }
   std::vector<vx_event_h> evs = {download(q, j.recs, j.rec_buf, launch_ev),
                                  download(q, j.errs, j.err_buf, launch_ev)};
@@ -314,7 +340,7 @@ int run_launch(vx_device_h dev, vx_queue_h q, vx_kernel_h kernel, const Caps& ca
   }
   vx_event_release(launch_ev);
 
-  const int errors = check(caps, L, j);
+  const int errors = check(caps, L, j) + (expect_reject ? 1 : 0);
   if (j.count_buf)
     vx_buffer_release(j.count_buf);
   vx_buffer_release(j.err_buf);

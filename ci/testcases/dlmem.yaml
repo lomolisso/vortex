@@ -231,6 +231,13 @@ tests:
     configs+: "-DVX_CFG_EXT_A_ENABLE"
     shape: {cores: 2, warps: 8, l2cache: true}
     args: "-d -k 4 -w 2 -m mixed"
+  # Four two-warp blocks cannot share one 4-warp core, so their first cluster
+  # barrier would never complete: the runtime must refuse the launch.
+  - id: cluster_sync-reject-default
+    app: cluster_sync
+    drivers: [simx, rtlsim]
+    shape: {cores: 1}
+    args: "-d -k 4 -w 2 -x"
 
   # SimX<->rtlsim parity of the cluster barrier at XLEN 64: 64 phases with fixed
   # work and no atomics. Sixteen one-warp blocks fill the four cores at once, so
