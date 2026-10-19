@@ -27,9 +27,11 @@ namespace vortex {
 // stage that rewrites the lanes of a request falling in the DLMEM window.
 // As in the RTL, a request keeps the peer row current when it entered, since
 // its slot may be re-admitted while a committed store waits here; the stride
-// is read when it leaves. A fence leaves only once its warp's remote accesses
-// are performed (stores acknowledged, loads and AMOs answered) and its local
-// plain stores are written into their banks.
+// is read when it leaves. A fence, and every packet of a release (.rl) AMO,
+// leaves only once its warp's remote accesses are performed (stores
+// acknowledged, loads and AMOs answered) and its local plain stores are written
+// into their banks. Earlier global accesses, and earlier local loads, AMOs and
+// LR/SC, are not waited for.
 class DlmemXlate : public SimObject<DlmemXlate> {
 public:
   using Ptr = std::shared_ptr<DlmemXlate>;

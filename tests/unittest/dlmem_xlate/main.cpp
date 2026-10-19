@@ -1437,6 +1437,154 @@ void run_fence_hold_local(MemOp op) {
             << " and behind both trackers together: ok" << std::endl;
 }
 
+// The release AMO hold, with both trackers as the core has them: an AMO with
+// .rl right behind its warp's uncommitted plain local-memory store, then
+// behind its unacknowledged remote store, waits as a fence does and holds the
+// load behind it; it leaves in the cycle the registered drain rises. A plain
+// AMO in the same spot leaves right behind the store, and a drained warp's
+// release AMO on another block is not held.
+void run_rl_hold() {
+  auto& platform = SimPlatform::instance();
+  platform.set_num_workers(1);
+  constexpr uint32_t kBanks = 4;
+  auto cfg = make_cfg(2, 4, 2, 14);
+  const uint64_t db = cfg.dlmem_base;
+  const uint64_t sram = uint64_t(1) << cfg.lmem_log;
+  const uint64_t amo_addr = cfg.lmem_base + 0x300;
+  std::string ctx = "rl-hold";
+  auto dut = DlmemXlate::Create("rl-hold", cfg, 0, 2, true, false);
+  auto wt = DlmemWTrack::Create("rl-hold-wtrack", 2, cfg.nw, 255);
+  auto lst = DlmemWTrack::Create("rl-hold-lst", 2, cfg.nw, 255, kBanks);
+  for (uint32_t b = 0; b < 2; ++b) {
+    dut->WtIncOut.at(b).bind(&wt->IncIn.at(b));
+    dut->LstIncOut.at(b).bind(&lst->IncIn.at(b));
+  }
+  dut->set_drained_query([w = wt.get(), l = lst.get()](uint32_t wid) { return w->drained(wid) && l->drained(wid); });
+  platform.reset();
+
+  uint64_t cycle = 0;
+  std::vector<int64_t> left(32, -1);  // tick each uuid left the stage
+  auto step = [&]() {
+    platform.tick();
+    for (uint32_t b = 0; b < 2; ++b) {
+      auto& out = dut->ReqOut.at(b);
+      while (!out.empty()) {
+        auto& r = out.peek();
+        if (r.amo_rl != (r.uuid == 3 || r.uuid == 4 || r.uuid == 9)) {
+          fail(ctx, "request #" + std::to_string(r.uuid) + " left with amo_rl=" + std::to_string(r.amo_rl));
+        }
+        left.at(r.uuid) = cycle;
+        out.pop();
+      }
+    }
+    ++cycle;
+  };
+  auto amo = [&](uint64_t uuid, uint32_t wid, bool rl) {
+    LsuReq req = window_req(uuid, wid, amo_addr, MemOp::AMO_ADD);
+    req.addrs[1] = amo_addr + 8;
+    req.amo_rl = rl;
+    return req;
+  };
+  auto check_held = [&](const char* what, uint64_t amo_id, uint64_t load_id) {
+    if (left[amo_id] >= 0 || left[load_id] >= 0) {
+      fail(ctx, std::string(what) + ": the release AMO left at tick " + std::to_string(left[amo_id])
+                + " and the load behind it at " + std::to_string(left[load_id]) + " with "
+                + std::to_string(lst->count(2)) + " local and " + std::to_string(wt->count(2))
+                + " remote lanes outstanding");
+    }
+  };
+
+  // Slot 2: rank 0 is this core (slot 2), rank 1 lives on core 1.
+  dut->PeerWrIn.send({2, dlmem_ref::Row{2, {{0, 2}, {1, 3}}}, 0x1000}, 1);
+  step();
+
+  // A plain local-memory store, then warp 2's release AMO and a load behind it
+  // on block 0, while drained warp 1 sends a release AMO on block 1.
+  dut->ReqIn.at(0).send(window_req(1, 2, cfg.lmem_base + 0x200, MemOp::ST), 1);
+  step();
+  dut->ReqIn.at(0).send(amo(3, 2, true), 1);
+  dut->ReqIn.at(1).send(amo(4, 1, true), 1);
+  uint64_t sent = cycle;
+  step();
+  if (left[1] != 2 || lst->count(2) != 2) {
+    fail(ctx, "local: the store left at tick " + std::to_string(left[1]) + " counting " + std::to_string(lst->count(2)));
+  }
+  dut->ReqIn.at(0).send(window_req(5, 2, db + 0x80), 1);
+  for (uint32_t k = 0; k < 6; ++k) {
+    step();
+  }
+  check_held("local", 3, 5);
+  if (left[4] != int64_t(sent) + 1) {
+    fail(ctx, "the drained warp's release AMO left at tick " + std::to_string(left[4]) + ", expected "
+              + std::to_string(sent + 1));
+  }
+  // Both bank writes at tick T: the tracker counts them at T+1, the AMO leaves at T+2.
+  uint64_t T = cycle;
+  lst->CommitIn.at(0).send(2, 1);
+  lst->CommitIn.at(1).send(2, 1);
+  step();
+  check_held("local, in the tick of the bank writes", 3, 5);
+  step();
+  check_held("local, the tick after the bank writes", 3, 5);
+  for (uint32_t k = 0; k < 3; ++k) {
+    step();
+  }
+  if (int64_t(T) + 2 != left[3] || int64_t(T) + 3 != left[5]) {
+    fail(ctx, "local: bank writes at tick " + std::to_string(T) + ", the release AMO left at "
+              + std::to_string(left[3]) + " and the load at " + std::to_string(left[5]) + ", expected T+2 and T+3");
+  }
+
+  // A remote store, then the release AMO and a load behind it.
+  dut->ReqIn.at(0).send(window_req(6, 2, db + sram + 0x40, MemOp::ST), 1);
+  step();
+  dut->ReqIn.at(0).send(amo(9, 2, true), 1);
+  step();
+  if (left[6] < 0 || wt->count(2) != 2) {
+    fail(ctx, "remote: the store did not leave or the remote count is " + std::to_string(wt->count(2)));
+  }
+  dut->ReqIn.at(0).send(window_req(10, 2, db + 0xc0), 1);
+  for (uint32_t k = 0; k < 6; ++k) {
+    step();
+  }
+  check_held("remote", 9, 10);
+  int64_t ack = -1;
+  for (uint32_t k = 0; k < 2; ++k) {
+    ack = cycle;
+    wt->DecIn.send(2, 1);
+    step();
+    check_held("remote, during the acks", 9, 10);
+  }
+  for (uint32_t k = 0; k < 4; ++k) {
+    step();
+  }
+  if (left[9] != ack + 2 || left[10] != ack + 3) {
+    fail(ctx, "remote: last ack sent at " + std::to_string(ack) + ", the release AMO left at "
+              + std::to_string(left[9]) + " and the load at " + std::to_string(left[10]) + ", expected +2 and +3");
+  }
+
+  // A plain AMO right behind an uncommitted local store is not held.
+  dut->ReqIn.at(0).send(window_req(11, 2, cfg.lmem_base + 0x240, MemOp::ST), 1);
+  step();
+  dut->ReqIn.at(0).send(amo(12, 2, false), 1);
+  step();
+  step();
+  if (left[11] < 0 || left[12] != left[11] + 1 || lst->count(2) != 2) {
+    fail(ctx, "plain: the store left at tick " + std::to_string(left[11]) + " and the plain AMO at "
+              + std::to_string(left[12]) + " with " + std::to_string(lst->count(2)) + " local lanes outstanding");
+  }
+  lst->CommitIn.at(0).send(2, 1);
+  lst->CommitIn.at(1).send(2, 1);
+  for (uint32_t k = 0; k < 3; ++k) {
+    step();
+  }
+  if (!dut->empty() || !wt->empty() || !lst->empty() || !platform.idle()) {
+    fail(ctx, "stage or trackers not empty at the end");
+  }
+  platform.finalize();
+  std::cout << ctx << ": a release AMO waits behind its warp's local stores and remote accesses like a fence;"
+            << " a plain AMO and a drained warp's release AMO do not: ok" << std::endl;
+}
+
 ///////////////////////////////////////////////////////////////////////////////
 // Out-of-bounds and remote aborts, each in a child process
 
@@ -1547,7 +1695,7 @@ void run_abort() {
 }
 
 void usage() {
-  std::cout << "usage: dlmem_xlate_test [--mode=vectors|timing|fence|random|abort|all] [--seed=N]\n"
+  std::cout << "usage: dlmem_xlate_test [--mode=vectors|timing|fence|rl|random|abort|all] [--seed=N]\n"
                "                        [--reqs=N] [--workers=N]\n";
 }
 
@@ -1577,8 +1725,8 @@ int main(int argc, char** argv) {
       return 2;
     }
   }
-  if (mode != "all" && mode != "vectors" && mode != "timing" && mode != "fence" && mode != "random"
-   && mode != "abort") {
+  if (mode != "all" && mode != "vectors" && mode != "timing" && mode != "fence" && mode != "rl"
+   && mode != "random" && mode != "abort") {
     usage();
     return 2;
   }
@@ -1600,6 +1748,9 @@ int main(int argc, char** argv) {
     for (MemOp op : {MemOp::ST, MemOp::LD, MemOp::AMO_ADD}) {
       run_fence_hold_local(op);
     }
+  }
+  if (mode == "all" || mode == "rl") {
+    run_rl_hold();
   }
   if (mode == "all" || mode == "random") {
     run_random_all(seed, reqs, workers);

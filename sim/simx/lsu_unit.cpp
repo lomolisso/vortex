@@ -83,9 +83,38 @@ LsuUnit::LsuUnit(const SimContext& ctx, const char* name, Core* core)
 #endif
 #ifdef VX_CFG_EXT_DLMEM_ENABLE
 	, XlateReqOut(VX_CFG_NUM_LSU_BLOCKS, SimChannel<LsuReq>(this))
+	, UnlockOut(VX_CFG_NUM_LSU_BLOCKS, SimChannel<uint32_t>(this))
 #endif
 	, pending_loads_(0)
+#ifdef VX_CFG_EXT_DLMEM_ENABLE
+	, aq_done_(VX_CFG_NUM_WARPS, 0)
+{
+	// The release is the result's handshake with the commit, which the LSU sees
+	// as its output's pop; delivery order is the queue order.
+	for (uint32_t b = 0; b < VX_CFG_NUM_LSU_BLOCKS; ++b) {
+		Outputs.at(b).tx_callback([this, b](instr_trace_t* const& beat, uint64_t /*cycle*/) {
+			auto& marks = unlock_beats_.at(b);
+			auto it = std::find(marks.begin(), marks.end(), beat);
+			int32_t wid = -1;
+			if (it != marks.end()) {
+				wid = int32_t(beat->wid);
+				marks.erase(it);
+			}
+			out_unlock_.at(b).push_back(wid);
+		});
+		Outputs.at(b).pop_callback([this, b]() {
+			auto& order = out_unlock_.at(b);
+			int32_t wid = order.front();
+			order.pop_front();
+			if (wid >= 0) {
+				UnlockOut.at(b).send(uint32_t(wid), ACQ_UNLOCK_DELAY);
+			}
+		});
+	}
+}
+#else
 {}
+#endif
 
 LsuUnit::~LsuUnit()
 {}
@@ -120,7 +149,34 @@ void LsuUnit::on_reset() {
 		state.reset();
 	}
 	pending_loads_ = 0;
+#ifdef VX_CFG_EXT_DLMEM_ENABLE
+	std::fill(aq_done_.begin(), aq_done_.end(), 0);
+	for (uint32_t b = 0; b < VX_CFG_NUM_LSU_BLOCKS; ++b) {
+		unlock_beats_.at(b).clear();
+		out_unlock_.at(b).clear();
+	}
+#endif
 }
+
+#ifdef VX_CFG_EXT_DLMEM_ENABLE
+bool LsuUnit::is_acquire_amo(const instr_trace_t* trace) {
+	return std::get_if<AmoType>(&trace->op_type)
+	    && std::get<IntrAmoArgs>(trace->instr_ptr->get_args()).aq;
+}
+
+// The instruction's last answered packet releases the warp. Packets of a
+// pid-split instruction can be answered out of order, so its eop result need
+// not be the last.
+void LsuUnit::mark_unlock(uint32_t b, instr_trace_t* beat, bool is_final) {
+	if (!is_final || !is_acquire_amo(beat))
+		return;
+	auto& done = aq_done_.at(beat->wid);
+	if (++done < beat->num_pkts)
+		return;
+	done = 0;
+	unlock_beats_.at(b).push_back(beat);
+}
+#endif
 
 void LsuUnit::compute_addrs(uint32_t b, instr_trace_t* trace) {
 	// AGU formula: addr[t] = rs1[t] + stride * rs2[t] + offset
@@ -309,6 +365,9 @@ void LsuUnit::process_response_step(uint32_t b) {
 		// Load writeback crosses one more registered stage than the
 		// direct-commit path before reaching the commit arbiter.
 		output.send(trace, 2);
+#ifdef VX_CFG_EXT_DLMEM_ENABLE
+		this->mark_unlock(b, trace, is_final);
+#endif
 	} else {
 		// A non-final fragment still spends a commit-port slot: it drains
 		// as a writeback-less beat that carries no retirement, so a
@@ -319,6 +378,9 @@ void LsuUnit::process_response_step(uint32_t b) {
 		beat->wb = false;
 		beat->eop = false;
 		output.send(beat, 2);
+#ifdef VX_CFG_EXT_DLMEM_ENABLE
+		this->mark_unlock(b, beat, is_final);
+#endif
 	}
 	if (is_fence) {
 		if (is_final) {
@@ -346,6 +408,12 @@ void LsuUnit::ingest_inputs(uint32_t b) {
 	auto lsu_type_tag = std::get_if<LsuType>(&trace->op_type);
 	if (lsu_type_tag && *lsu_type_tag == LsuType::FENCE && !state.req_queue.empty())
 		return;
+#ifdef VX_CFG_EXT_DLMEM_ENABLE
+	// An acquire AMO's warp is released over UnlockOut, not by the commit.
+	if (is_acquire_amo(trace)) {
+		trace->resume_warp = false;
+	}
+#endif
 	state.req_queue.push(trace);
 	input.pop();
 }
@@ -545,6 +613,9 @@ void LsuUnit::process_request_step(uint32_t b) {
 		            : (is_write ? MemOp::ST : MemOp::LD);
 		if (is_amo) {
 			lsu_req.flags.amo_unsigned = amo_is_unsigned(*amo_tag);
+#ifdef VX_CFG_EXT_DLMEM_ENABLE
+			lsu_req.amo_rl = std::get<IntrAmoArgs>(trace->instr_ptr->get_args()).rl;
+#endif
 		}
 		uint32_t t0 = state.addr_list.size() - state.remain_addrs;
 		uint32_t beat_n = std::min<uint32_t>(VX_CFG_NUM_LSU_LANES, state.remain_addrs);

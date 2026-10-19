@@ -13,16 +13,18 @@
 
 `include "VX_define.vh"
 
-// VX_sched_unlock_if — the RTU releases the warps its ops wstall'd at decode.
+// VX_sched_unlock_if — a unit releases the warps its ops wstall'd at decode.
 //
-//   valid/wid  — release the WARP. Both RTU ops that stall a warp are released by
-//                the op itself retiring: a TRACE once its burst has handed the RTU
-//                the ray, a WAIT once a record has landed and it returns the
-//                status. Never by a traversal event, so the pulse cannot race the
-//                stall it clears — decode set that stall strictly earlier.
+//   valid/wid  — release the WARP. Every op that stalls a warp this way is released
+//                by the op itself retiring: an RTU TRACE once its burst has handed
+//                the RTU the ray, a WAIT once a record has landed and it returns
+//                the status; in DLMEM builds, an acquire AMO once the LSU returns
+//                its last response. Never by an unrelated event, so the pulse
+//                cannot race the stall it clears — decode set that stall strictly
+//                earlier.
 //
-// Single raiser (the RTU unit), no trap, no PC redirect — a plain warp unlock, and
-// nothing else. The issue stage knows nothing about the RTU.
+// Raisers: the RTU unit and, in DLMEM builds, each LSU block (one instance each).
+// No trap, no PC redirect — a plain warp unlock, and nothing else.
 
 interface VX_sched_unlock_if import VX_gpu_pkg::*; ();
 

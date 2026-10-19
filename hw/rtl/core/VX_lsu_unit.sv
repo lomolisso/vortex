@@ -28,6 +28,11 @@ module VX_lsu_unit import VX_gpu_pkg::*; #(
     // Outputs
     VX_commit_if.master     commit_if [`VX_CFG_ISSUE_WIDTH],
 
+`ifdef VX_CFG_EXT_DLMEM_ENABLE
+    // Per-block release of warps stalled by an acquire AMO.
+    VX_sched_unlock_if.master per_block_unlock_if [`VX_CFG_NUM_LSU_BLOCKS],
+`endif
+
     // Per-block client connection to VX_lsu_scheduler (at VX_core).
     VX_lsu_sched_if.master per_block_client_if [`VX_CFG_NUM_LSU_BLOCKS]
 );
@@ -65,6 +70,9 @@ module VX_lsu_unit import VX_gpu_pkg::*; #(
             .reset            (reset),
             .execute_if       (per_block_execute_if[block_idx]),
             .result_if        (per_block_result_if[block_idx]),
+        `ifdef VX_CFG_EXT_DLMEM_ENABLE
+            .sched_unlock_if  (per_block_unlock_if[block_idx]),
+        `endif
             .client_if        (per_block_client_if[block_idx])
         );
     end

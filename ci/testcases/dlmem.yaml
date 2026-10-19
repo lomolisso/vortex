@@ -12,6 +12,9 @@ defaults:
             hw/rtl/core/VX_cta_dispatch.sv, hw/rtl/core/VX_csr_data.sv,
             hw/rtl/core/VX_kmu_bus_arb.sv, hw/rtl/core/VX_bar_unit.sv,
             hw/rtl/core/VX_scheduler.sv, hw/rtl/mem/VX_gbar_unit.sv,
+            hw/rtl/core/VX_decode.sv, hw/rtl/core/VX_execute.sv,
+            hw/rtl/core/VX_lsu_slice.sv, hw/rtl/core/VX_lsu_unit.sv,
+            hw/rtl/interfaces/VX_sched_unlock_if.sv, sim/simx/decode.cpp,
             hw/rtl/core/VX_mem_unit.sv, hw/rtl/cp/VX_cp_axil_regfile.sv,
             hw/rtl/mem/VX_lmem_switch.sv, hw/rtl/mem/VX_local_mem.sv, hw/rtl/VX_socket.sv,
             sim/simx/kmu, sim/simx/cta_dispatcher, sim/simx/scheduler, sim/simx/csr_unit.cpp,
@@ -28,6 +31,7 @@ defaults:
             tests/regression/dlmem_local, tests/regression/dlmem_store,
             tests/regression/dlmem_load, tests/regression/dlmem_atomic,
             tests/regression/dlmem_stress, tests/regression/lmem_bar_order,
+            tests/regression/dlmem_amo_order,
             VX_config.toml, VX_types.toml]
 tests:
   # The cluster-rank CSR over three launches (K = 1, 2 as 1x2x1, 4 as 2x1x2),
@@ -669,6 +673,77 @@ tests:
     env: {DRIVER: rtlsim, APP: dlmem_atomic, ARGS: "-x lrsc", EXPECT: "remote LR/SC is not supported"}
     run: *expect_fail_run
 
+  # The spinlock released by amoswap.w.rl alone, without the fence before it:
+  # the release must wait for the critical section's window store to rank 0.
+  # A regression guard: today's timing orders the store first even without .rl.
+  - id: dlmem_atomic-rl
+    app: dlmem_atomic
+    drivers: [simx, rtlsim]
+    configs+: "-DVX_CFG_EXT_A_ENABLE"
+    shape: {cores: 4, l2cache: true}
+    args: "-k 4 -t 2 -r -n 3"
+
+  # --- AMO acquire/release ---
+  # One cluster of four blocks on four cores. Rank 0 stores DATA into rank 1,
+  # then swaps FLAG into rank 2 with amoswap.d.rl; rank 2 polls FLAG and reads
+  # DATA, which must never be older than the FLAG seen. In -aq rank 0 stores
+  # DATA into rank 2 and swaps FLAG into rank 1; rank 2 reads FLAG with
+  # amoor.d.aq and its own DATA with a load issued right behind it. The nightly
+  # cases slow the store down: rank 3 floods rank 1 with window stores while
+  # rank 1 keeps its own banks busy with atomics, or with DXA copies (-dxa).
+  # These litmus cases and -wide are regression guards that today's timing
+  # passes even without .aq/.rl; -lat and parity-dlmem-amo-order detect a
+  # missing hold.
+  - id: dlmem_amo_order
+    app: dlmem_amo_order
+    drivers: [simx, rtlsim]
+    configs+: "-DVX_CFG_EXT_A_ENABLE -DVX_CFG_EXT_DXA_ENABLE"
+    shape: {cores: 4, l2cache: true}
+    args: "-m mp -n 1000"
+  - id: dlmem_amo_order-aq
+    app: dlmem_amo_order
+    drivers: [simx, rtlsim]
+    configs+: "-DVX_CFG_EXT_A_ENABLE -DVX_CFG_EXT_DXA_ENABLE"
+    shape: {cores: 4, l2cache: true}
+    args: "-m mpaq -n 1000"
+  # Fixed latency probes: an .aq AMO must hold the warp for its round trip, an
+  # .rl AMO must wait for an earlier remote store's ack; plain AMOs must not.
+  - id: dlmem_amo_order-lat
+    app: dlmem_amo_order
+    drivers: [simx, rtlsim]
+    configs+: "-DVX_CFG_EXT_A_ENABLE -DVX_CFG_EXT_DXA_ENABLE"
+    shape: {cores: 4, l2cache: true}
+    args: "-m lat"
+  - id: dlmem_amo_order-flood
+    app: dlmem_amo_order
+    drivers: [simx, rtlsim]
+    tier: nightly
+    configs+: "-DVX_CFG_EXT_A_ENABLE -DVX_CFG_EXT_DXA_ENABLE"
+    shape: {cores: 4, l2cache: true}
+    args: "-m mp -n 5000 -F"
+  - id: dlmem_amo_order-dxa
+    app: dlmem_amo_order
+    drivers: [simx, rtlsim]
+    tier: nightly
+    configs+: "-DVX_CFG_EXT_A_ENABLE -DVX_CFG_EXT_DXA_ENABLE"
+    shape: {cores: 4, l2cache: true}
+    args: "-m mp -n 5000 -F -D"
+  # Two warps per block, every lane: .aqrl, .aq and .rl AMOs with local and
+  # remote lanes in one instruction, lr.d.aq/sc.d.rl on local words and a
+  # global amoadd.d.aqrl; every word and the global count are checked.
+  - id: dlmem_amo_order-wide
+    app: dlmem_amo_order
+    drivers: [simx, rtlsim]
+    configs+: "-DVX_CFG_EXT_A_ENABLE -DVX_CFG_EXT_DXA_ENABLE"
+    shape: {cores: 4, l2cache: true}
+    args: "-m wide -n 20"
+  - id: dlmem_amo_order-wide-simd2
+    app: dlmem_amo_order
+    drivers: [simx, rtlsim]
+    configs+: "-DVX_CFG_EXT_A_ENABLE -DVX_CFG_EXT_DXA_ENABLE -DVX_CFG_SIMD_WIDTH=2 -DVX_CFG_ISSUE_WIDTH=2"
+    shape: {cores: 4, warps: 8, l2cache: true}
+    args: "-m wide -n 20"
+
   # SimX<->rtlsim parity of the network at XLEN 64: fixed loops of window
   # stores, loads and atomics into the next rank's slice, on another core, with
   # no spin and no data-dependent trip count, between fence-free cluster
@@ -709,6 +784,24 @@ tests:
     configs+: "-DVX_CFG_EXT_A_ENABLE -DVX_CFG_SOCKET_SIZE=4"
     shape: {cores: 4}
     args: "-p -f -k 4 -n 4"
+
+  # The AMO latency probes: fixed loops, no spin, the warp held by .aq and the
+  # AMO by .rl in both models alike.
+  - id: parity-dlmem-amo-order
+    check: model_parity
+    app: dlmem_amo_order
+    xlen: [64]
+    configs+: "-DVX_CFG_EXT_A_ENABLE -DVX_CFG_EXT_DXA_ENABLE"
+    shape: {cores: 4, l2cache: true}
+    args: "-m lat"
+  # amo's .aqrl counter with two LSU lanes: each AMO is split into packets, and
+  # the last packet's answer releases the warp.
+  - id: parity-dlmem-amo-aqrl-lanes2
+    check: model_parity
+    app: amo
+    xlen: [64]
+    configs+: "-DVX_CFG_EXT_A_ENABLE -DVX_CFG_NUM_LSU_LANES=2"
+    args: "-tamoadd_aqrl"
 
   # --- local-store ordering ---
   # A producer lane stores a word into its block's local memory, then releases

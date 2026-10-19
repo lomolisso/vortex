@@ -14,12 +14,13 @@
 `include "VX_define.vh"
 
 // The core's DLMEM aperture translation (peer table and per-LSU-block stages),
-// the same wrapper VX_core instantiates, with flat ports. The request header fields the stage reads (wid, cta_id, pid) and
-// the fence bit are driven separately and merged into the raw tag here, so the
-// testbench needs no tag layout; in_tag_eff returns the merged tag. The cfg_*
-// outputs are constants that give the testbench the package-derived widths
-// and the attribute fields the stage may rewrite. drained and lmem_st_drained
-// stand in for the core's remote-access and local-store trackers.
+// the same wrapper VX_core instantiates, with flat ports. The request header
+// fields the stage reads (wid, cta_id, pid) and the fence and release bits are
+// driven separately and merged into the raw tag here, so the testbench needs
+// no tag layout; in_tag_eff returns the merged tag. The cfg_* outputs are
+// constants that give the testbench the package-derived widths and the
+// attribute fields the stage may rewrite. drained and lmem_st_drained stand in
+// for the core's remote-access and local-store trackers.
 module VX_dlmem_xlate_top import VX_gpu_pkg::*; #(
     parameter  CORE_ID       = 0,
     parameter  OOB_ASSERT    = 0,
@@ -69,6 +70,7 @@ module VX_dlmem_xlate_top import VX_gpu_pkg::*; #(
     input  wire [NB-1:0][NW_WIDTH-1:0]          in_cta,
     input  wire [NB-1:0][PID_W-1:0]             in_pid,
     input  wire [NB-1:0]                        in_fence,
+    input  wire [NB-1:0]                        in_rl,
     output wire [NB-1:0][TAG_W-1:0]             in_tag_eff,
     output wire [NB-1:0]                        in_ready,
     output wire [NB-1:0][NW_WIDTH-1:0]          row_slot,
@@ -94,7 +96,8 @@ module VX_dlmem_xlate_top import VX_gpu_pkg::*; #(
     output wire [NB-1:0][CNT_W-1:0]             lst_inc_cnt,
     output wire [NB-1:0]                        empty,
 
-    // Per-warp tracker states; a fence waits at the output until both are set.
+    // Per-warp tracker states; a fence or a release AMO waits at the output
+    // until both are set.
     input  wire [NW-1:0]                        drained,
     input  wire [NW-1:0]                        lmem_st_drained,
 
@@ -180,8 +183,8 @@ module VX_dlmem_xlate_top import VX_gpu_pkg::*; #(
             hdr.cta_id = NCTA_WIDTH'(in_cta[b]);
             hdr.pid    = in_pid[b];
         end
-        assign in_tag_eff[b] = {hdr, in_tag[b][TAG_W-HDR_W-1:1], in_fence[b]};
-        `UNUSED_VAR (in_tag[b][0])
+        assign in_tag_eff[b] = {hdr, in_tag[b][TAG_W-HDR_W-1:2], in_rl[b], in_fence[b]};
+        `UNUSED_VAR (in_tag[b][1:0])
 
         assign in_if[b].req_valid       = in_valid[b];
         assign in_if[b].req_data.rw     = in_rw[b];

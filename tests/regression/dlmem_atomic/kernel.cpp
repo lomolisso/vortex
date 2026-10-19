@@ -342,3 +342,43 @@ __kernel void lrsc_k(atomic_arg_t* __UNIFORM__ arg) {
   x.cl.sync();
   ctx_done(x, arg);
 }
+
+// lock_k with the release AMO alone, no fence before it: the .rl must order
+// the critical section's window stores. Last in the file, so the other
+// kernels keep their code addresses.
+__kernel void lock_rl_k(atomic_arg_t* __UNIFORM__ arg) {
+  Ctx x;
+  ctx_init(x, arg);
+  auto own8 = reinterpret_cast<volatile uint64_t*>(x.own);
+  if (x.tid == 0) {
+    if (x.rank + 1 == x.k)
+      x.own[LOCK_WORD] = 0;
+    if (x.rank == 1 % x.k)
+      x.own[LOCK_HOLDER] = ~0u;
+    if (x.rank == 0)
+      own8[LOCK_COUNT] = 0;
+  }
+  x.cl.sync();
+  if (x.lane == 0) {
+    auto lock   = x.window<uint32_t>(x.k - 1) + LOCK_WORD;
+    auto holder = x.window<uint32_t>(1 % x.k) + LOCK_HOLDER;
+    auto count  = x.window<uint64_t>(0) + LOCK_COUNT;
+    const uint32_t me = (x.rank << 16) | x.tid;
+    for (uint32_t j = 0; j < arg->iters; ++j) {
+      uint32_t spins = 0, got;
+      while ((got = amoswap_w_aq(lock, 1)) != 0 && ++spins < SPIN_LIMIT) {}
+      x.check(TEST_LOCK, (j << 24) | 0xFFFFFF, got, 0);
+      *holder = me;
+      *count = *count + 1;
+      x.check(TEST_LOCK, j << 24, *holder, me);
+      amoswap_w_rl(lock, 0);
+    }
+  }
+  x.cl.sync();
+  if (x.rank == 0 && x.tid == 0) {
+    auto out = block_words(x, arg, 0, LOCK_BWORDS);
+    out[0] = x.own[2 * LOCK_COUNT];
+    out[1] = x.own[2 * LOCK_COUNT + 1];
+  }
+  ctx_done(x, arg);
+}

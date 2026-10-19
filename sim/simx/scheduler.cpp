@@ -61,6 +61,9 @@ void warp_t::reset() {
 
 Scheduler::Scheduler(const SimContext& ctx, const char* name, Core* core)
     : SimObject<Scheduler>(ctx, name)
+#ifdef VX_CFG_EXT_DLMEM_ENABLE
+    , UnlockIn(VX_CFG_NUM_LSU_BLOCKS, SimChannel<uint32_t>(this))
+#endif
     , core_(core)
     , warps_(VX_CFG_NUM_WARPS, VX_CFG_NUM_THREADS)
     , ipdom_size_(VX_CFG_NUM_THREADS - 1)
@@ -107,6 +110,29 @@ void Scheduler::on_reset() {
   // cta_dispatcher_ and barrier_unit_ are SimObjects — SimPlatform calls
   // their do_reset() directly.
 }
+
+#ifdef VX_CFG_EXT_DLMEM_ENABLE
+void Scheduler::on_tick() {
+  bool busy = false;
+  for (auto& in : UnlockIn) {
+    while (!in.empty()) {
+      uint32_t wid = in.peek();
+      __assert(active_warps_.test(wid) && stalled_warps_.test(wid),
+               "LSU unlock of a warp that is not stalled: wid=" << wid);
+      // The channel's delay is the stall register: the release is already
+      // clocked, so it applies to the registered state too.
+      // Sound only because the Scheduler, created in Core::Impl, ticks before Core.
+      this->resume(wid);
+      stalled_warps_.reset(wid);
+      in.pop();
+    }
+    busy |= (in.size() != 0);
+  }
+  if (!busy) {
+    this->tick_sleep();
+  }
+}
+#endif
 
 void Scheduler::activate_warp(uint32_t wid, const cta_warp_record_t& rec) {
   auto& warp = warps_[wid];

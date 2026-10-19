@@ -19,10 +19,12 @@
 // to DLMEM_BASE | core << LMEM_LOG | offset, flagged on out_remote because that
 // encoding can alias a global address once the core field outgrows the rank
 // field. Out-of-bounds lanes go to the issuer's own slot base, keeping their
-// 64-byte line offset like every other lane. A fence waits at the stage output
-// until its warp's remote accesses are performed (stores acknowledged, loads
-// and AMOs answered) and its local plain stores are written into their banks,
-// so it orders them before every later access of the warp.
+// 64-byte line offset like every other lane. A fence, and every packet of an
+// AMO with .rl, waits at the stage output until its warp's remote accesses are
+// performed (stores acknowledged, loads and AMOs answered) and its local plain
+// stores are written into their banks, so it orders them before every later
+// access of the warp. Earlier global accesses need a fence; earlier local loads,
+// AMOs and LR/SC are not waited for.
 module VX_dlmem_xlate import VX_gpu_pkg::*, VX_dlmem_pkg::*; #(
     parameter `STRING INSTANCE_ID = "",
     // Global core id (hart id core field); the core's index in its cluster is CORE_ID % DLMEM_NCC.
@@ -129,6 +131,7 @@ module VX_dlmem_xlate import VX_gpu_pkg::*, VX_dlmem_pkg::*; #(
     lsu_header_t hdr_r;
     assign hdr_r = req_r.tag[LSU_CLIENT_TAG_WIDTH-1 -: HDR_W];
     wire is_fence_r = req_r.tag[0];
+    wire is_rl_r    = req_r.tag[1];
     wire [NW_WIDTH-1:0] my_slot = NW_WIDTH'(hdr_r.cta_id);
     wire [LMEM_AW-1:0] own_base = slot_base[my_slot][LMEM_LOG-1:WA];
 
@@ -200,9 +203,9 @@ module VX_dlmem_xlate import VX_gpu_pkg::*, VX_dlmem_pkg::*; #(
 
     // drained is registered after the count, so an access leaving in the cycle
     // before its fence is already visible to it.
-    wire fence_hold = is_fence_r && ~(drained[hdr_r.wid] && lmem_st_drained[hdr_r.wid]);
+    wire order_hold = (is_fence_r || is_rl_r) && ~(drained[hdr_r.wid] && lmem_st_drained[hdr_r.wid]);
 
-    assign out_if.req_valid       = req_valid_r && ~fence_hold;
+    assign out_if.req_valid       = req_valid_r && ~order_hold;
     assign out_if.req_data.rw     = req_r.rw;
     assign out_if.req_data.mask   = req_r.mask;
     assign out_if.req_data.byteen = req_r.byteen;
@@ -210,7 +213,7 @@ module VX_dlmem_xlate import VX_gpu_pkg::*, VX_dlmem_pkg::*; #(
     assign out_if.req_data.attr   = attr_out;
     assign out_if.req_data.data   = req_r.data;
     assign out_if.req_data.tag    = req_r.tag;
-    assign req_ready_r            = out_if.req_ready && ~fence_hold;
+    assign req_ready_r            = out_if.req_ready && ~order_hold;
 
     assign in_if.rsp_valid  = out_if.rsp_valid;
     assign in_if.rsp_data   = out_if.rsp_data;

@@ -323,6 +323,7 @@ public:
         dlmem_xlate_->ReqOut.at(b).bind(&lmem_switch_.at(b)->ReqIn);
         dlmem_xlate_->WtIncOut.at(b).bind(&dlmem_wtrack_->IncIn.at(b));
         dlmem_xlate_->LstIncOut.at(b).bind(&lmem_st_track_->IncIn.at(b));
+        lsu->UnlockOut.at(b).bind(&scheduler_->UnlockIn.at(b));
       }
       for (uint32_t i = 0; i < VX_CFG_LMEM_NUM_BANKS; ++i) {
         local_mem_->CommitOut.at(i).bind(&lmem_st_track_->CommitIn.at(i));
@@ -548,7 +549,8 @@ public:
     // A warp blocked on a stalling instruction is released when that
     // instruction commits. Default to releasing every stalling instruction;
     // warp-control (SFU) refines this for ops whose warp is instead released by
-    // the barrier/spawn machinery (see SfuUnit::on_tick).
+    // the barrier/spawn machinery (see SfuUnit::on_tick), and the LSU for an
+    // acquire AMO, whose warp it releases itself (DLMEM builds).
     trace->resume_warp = trace->fetch_stall;
 
     // Advance the warp's PC by the instruction's true size (2 bytes for RVC,

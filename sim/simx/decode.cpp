@@ -654,6 +654,10 @@ Instr::Ptr Decoder::decode(uint32_t code, uint64_t uuid) {
       std::abort();
     }
     instr->set_args(IntrAmoArgs{funct3, aq, rl});
+#ifdef VX_CFG_EXT_DLMEM_ENABLE
+    // acquire: the warp issues nothing more until the AMO's result leaves the LSU
+    instr->set_wstall(aq != 0);
+#endif
     instr->set_dest_reg(rd, RegType::Integer);
     instr->set_src_reg(0, rs1, RegType::Integer);
     instr->set_src_reg(1, rs2, RegType::Integer);

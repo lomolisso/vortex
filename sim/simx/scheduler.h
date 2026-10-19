@@ -120,6 +120,11 @@ struct warp_t {
 // live here.
 class Scheduler : public SimObject<Scheduler> {
 public:
+#ifdef VX_CFG_EXT_DLMEM_ENABLE
+  // Per LSU block: the warp of an acquire AMO whose result has committed.
+  std::vector<SimChannel<uint32_t>> UnlockIn;
+#endif
+
   Scheduler(const SimContext& ctx, const char* name, Core* core);
   ~Scheduler();
 
@@ -197,6 +202,9 @@ public:
 
 protected:
   void on_reset();
+#ifdef VX_CFG_EXT_DLMEM_ENABLE
+  void on_tick();
+#endif
 
 private:
   struct wspawn_t {

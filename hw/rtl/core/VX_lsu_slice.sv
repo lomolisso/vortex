@@ -28,6 +28,11 @@ module VX_lsu_slice import VX_gpu_pkg::*; #(
     // Outputs
     VX_result_if.master     result_if,
 
+`ifdef VX_CFG_EXT_DLMEM_ENABLE
+    // Releases the warp an acquire AMO stalled at decode.
+    VX_sched_unlock_if.master sched_unlock_if,
+`endif
+
     // The slice exposes the memory-client side as a VX_lsu_sched_if master;
     // the parent wires it into VX_lsu_scheduler.
     VX_lsu_sched_if.master  client_if
@@ -48,8 +53,13 @@ module VX_lsu_slice import VX_gpu_pkg::*; #(
     `UNUSED_PARAM (CORE_ID)
     `UNUSED_SPARAM (INSTANCE_ID)
 
+`ifdef VX_CFG_EXT_DLMEM_ENABLE
+    // tag_width = header + op_type + align + pkt_addr + aq + rl + fence
+    localparam TAG_WIDTH = $bits(lsu_header_t) + INST_LSU_BITS + (NUM_LANES * REQ_ASHIFT) + LSUQ_SIZEW + 2 + 1;
+`else
     // tag_width = header + op_type + align + pkt_addr + fence
     localparam TAG_WIDTH = $bits(lsu_header_t) + INST_LSU_BITS + (NUM_LANES * REQ_ASHIFT) + LSUQ_SIZEW + 1;
+`endif
     `STATIC_ASSERT (TAG_WIDTH == LSU_CLIENT_TAG_WIDTH, ("LSU client tag width mismatch — pkg/slice out of sync"))
 `ifdef VX_CFG_EXT_A_ENABLE
     `STATIC_ASSERT ((CORE_ID >> (HART_ID_BITS - NW_BITS - NT_BITS)) == 0, ("global core id does not fit the hart id core field"))
@@ -377,6 +387,25 @@ module VX_lsu_slice import VX_gpu_pkg::*; #(
     end
 
     // pack memory request tag
+`ifdef VX_CFG_EXT_DLMEM_ENABLE
+    wire req_aq, req_rl;
+`ifdef VX_CFG_EXT_A_ENABLE
+    assign req_aq = execute_if.data.op_args.lsu.amo_valid && execute_if.data.op_args.lsu.amo_aq;
+    assign req_rl = execute_if.data.op_args.lsu.amo_valid && execute_if.data.op_args.lsu.amo_rl;
+`else
+    assign req_aq = 1'b0;
+    assign req_rl = 1'b0;
+`endif
+    assign mem_req_tag = {
+        execute_if.data.header,
+        execute_if.data.op_type,
+        req_align,
+        pkt_waddr,
+        req_aq,
+        req_rl,
+        req_is_fence
+    };
+`else
     assign mem_req_tag = {
         execute_if.data.header,
         execute_if.data.op_type,
@@ -384,6 +413,7 @@ module VX_lsu_slice import VX_gpu_pkg::*; #(
         pkt_waddr,
         req_is_fence
     };
+`endif
 
     // Pack per-lane mem_req signals into the client_if request payload;
     // unpack the response payload into per-lane mem_rsp signals.
@@ -411,6 +441,19 @@ module VX_lsu_slice import VX_gpu_pkg::*; #(
     `UNUSED_VAR (rsp_op_type)
 
     // unpack memory response tag
+`ifdef VX_CFG_EXT_DLMEM_ENABLE
+    wire rsp_aq, rsp_rl;
+    `UNUSED_VAR (rsp_rl)
+    assign {
+        rsp_hdr,
+        rsp_op_type,
+        rsp_align,
+        pkt_raddr,
+        rsp_aq,
+        rsp_rl,
+        rsp_is_fence
+    } = mem_rsp_tag;
+`else
     assign {
         rsp_hdr,
         rsp_op_type,
@@ -418,6 +461,7 @@ module VX_lsu_slice import VX_gpu_pkg::*; #(
         pkt_raddr,
         rsp_is_fence
     } = mem_rsp_tag;
+`endif
 
     // load response formatting
 
@@ -470,16 +514,30 @@ module VX_lsu_slice import VX_gpu_pkg::*; #(
         rsp_hdr2.eop = mem_rsp_eop_pkt;
     end
 
+`ifdef VX_CFG_EXT_DLMEM_ENABLE
+    // An acquire AMO's aq bit travels beside its result to the unlock below.
+    wire result_rsp_aq, result_aq;
+`endif
+
     VX_elastic_buffer #(
+    `ifdef VX_CFG_EXT_DLMEM_ENABLE
+        .DATAW (1 + $bits(lsu_result_t)),
+    `else
         .DATAW ($bits(lsu_result_t)),
+    `endif
         .SIZE  (2)
     ) rsp_buf (
         .clk       (clk),
         .reset     (reset),
         .valid_in  (mem_rsp_valid),
         .ready_in  (mem_rsp_ready),
+    `ifdef VX_CFG_EXT_DLMEM_ENABLE
+        .data_in   ({rsp_aq, rsp_hdr2, rsp_data}),
+        .data_out  ({result_rsp_aq, result_rsp_if.data}),
+    `else
         .data_in   ({rsp_hdr2, rsp_data}),
         .data_out  (result_rsp_if.data),
+    `endif
         .valid_out (result_rsp_if.valid),
         .ready_out (result_rsp_if.ready)
     );
@@ -501,7 +559,11 @@ module VX_lsu_slice import VX_gpu_pkg::*; #(
 
     VX_stream_arb #(
         .NUM_INPUTS (2),
+    `ifdef VX_CFG_EXT_DLMEM_ENABLE
+        .DATAW      (1 + $bits(lsu_result_t)),
+    `else
         .DATAW      ($bits(lsu_result_t)),
+    `endif
         .ARBITER    ("P"), // prioritize result_rsp_if
         .OUT_BUF    (3)
     ) rsp_arb (
@@ -509,12 +571,23 @@ module VX_lsu_slice import VX_gpu_pkg::*; #(
         .reset     (reset),
         .valid_in  ({result_no_rsp_if.valid, result_rsp_if.valid}),
         .ready_in  ({result_no_rsp_if.ready, result_rsp_if.ready}),
+    `ifdef VX_CFG_EXT_DLMEM_ENABLE
+        .data_in   ({1'b0, result_no_rsp_if.data, result_rsp_aq, result_rsp_if.data}),
+        .data_out  ({result_aq, result_if.data}),
+    `else
         .data_in   ({result_no_rsp_if.data, result_rsp_if.data}),
         .data_out  (result_if.data),
+    `endif
         .valid_out (result_if.valid),
         .ready_out (result_if.ready),
         `UNUSED_PIN (sel_out)
     );
+
+`ifdef VX_CFG_EXT_DLMEM_ENABLE
+    // AMOs always take the response path, and its eop is the instruction's last packet.
+    assign sched_unlock_if.valid = result_if.valid && result_if.ready && result_if.data.header.eop && result_aq;
+    assign sched_unlock_if.wid   = result_if.data.header.wid;
+`endif
 
 `ifdef DBG_TRACE_MEM
     always @(posedge clk) begin

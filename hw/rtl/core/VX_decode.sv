@@ -372,6 +372,10 @@ module VX_decode import
                 op_args.lsu.amo_unsigned = amo_unsigned;
                 op_args.lsu.amo_aq   = instr[26];
                 op_args.lsu.amo_rl   = instr[25];
+            `ifdef VX_CFG_EXT_DLMEM_ENABLE
+                // An acquire keeps its warp from issuing until the LSU returns its last response.
+                is_wstall = instr[26];
+            `endif
                 `USED_IREG (rd);
                 `USED_IREG (rs1);
                 // LR has rs2=x0; the LSU just sees rs2_data=0 as rhs.

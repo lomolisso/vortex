@@ -48,6 +48,8 @@ module VX_scheduler import VX_gpu_pkg::*; #(
     output wire [NW_WIDTH-1:0] peer_wr_slot,
     output dlmem_row_t      peer_wr_row,
     output wire [`VX_CFG_LMEM_LOG_SIZE:0] peer_wr_stride,
+    // per LSU block, the release of a warp stalled by an acquire AMO
+    VX_sched_unlock_if.slave lsu_unlock_if [`VX_CFG_NUM_LSU_BLOCKS],
 `endif
 
     // status
@@ -199,6 +201,21 @@ module VX_scheduler import VX_gpu_pkg::*; #(
     wire [`CLOG2(`VX_CFG_NUM_WARPS+1)-1:0] active_warps_cnt;
     `POP_COUNT(active_warps_cnt, active_warps);
 
+`ifdef VX_CFG_EXT_DLMEM_ENABLE
+    // Releases of warps a wstall'd instruction left stalled at decode: acquire AMOs, per LSU block.
+    localparam NUM_UNLOCKS = `VX_CFG_NUM_LSU_BLOCKS;
+    wire [NUM_UNLOCKS-1:0]               unlock_valid;
+    wire [NUM_UNLOCKS-1:0][NW_WIDTH-1:0] unlock_wid;
+    for (genvar i = 0; i < `VX_CFG_NUM_LSU_BLOCKS; ++i) begin : g_lsu_unlock
+        assign unlock_valid[i] = lsu_unlock_if[i].valid;
+        assign unlock_wid[i]   = lsu_unlock_if[i].wid;
+        `RUNTIME_ASSERT(~unlock_valid[i] || stalled_warps[unlock_wid[i]],
+            ("%s LSU unlock of a warp that is not stalled: block=%0d, wid=%0d", INSTANCE_ID, i, unlock_wid[i]))
+        `RUNTIME_ASSERT(~(unlock_valid[i] && schedule_fire && (schedule_wid == unlock_wid[i])),
+            ("%s LSU unlock of the warp being scheduled: block=%0d, wid=%0d", INSTANCE_ID, i, unlock_wid[i]))
+    end
+`endif
+
      always @(*) begin
         active_warps_n  = active_warps;
         stalled_warps_n = stalled_warps;
@@ -319,6 +336,14 @@ module VX_scheduler import VX_gpu_pkg::*; #(
         // redirect — the candidate is serviced inline by the warp's loop.
         if (sched_unlock_if.valid) begin
             stalled_warps_n[sched_unlock_if.wid] = 1'b0;
+        end
+    `endif
+
+    `ifdef VX_CFG_EXT_DLMEM_ENABLE
+        for (integer i = 0; i < NUM_UNLOCKS; ++i) begin
+            if (unlock_valid[i]) begin
+                stalled_warps_n[unlock_wid[i]] = 1'b0;
+            end
         end
     `endif
     end

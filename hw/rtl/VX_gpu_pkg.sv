@@ -999,9 +999,9 @@ package VX_gpu_pkg;
     `PACKAGE_ASSERT($bits(fpu_args_t) == INST_ARGS_BITS)
 
     // lsu_args_t carries AMO sideband when EXT_A_ENABLE.
-    // amo_valid / amo_op are inspected only when amo_valid==1; for plain
-    // loads/stores they're zero. aq/rl are decoded but unused (sequentially
-    // consistent). amo_unsigned distinguishes the U-variants of MIN/MAX.
+    // amo_valid / amo_op are inspected only when amo_valid==1; for plain loads/stores
+    // they're zero. aq/rl order the warp's accesses in DLMEM builds and are unused
+    // elsewhere (sequentially consistent). amo_unsigned tells MIN/MAX U-variants apart.
     // export_mask marks a vx_om_export (OM fragment export) and says which
     // words of the aperture record the shader is writing:
     //   bit 0 = colour (record + 0), bit 1 = depth (record + 4)
@@ -1480,11 +1480,17 @@ package VX_gpu_pkg;
     localparam LMEM_TAG_WIDTH       = LMEM_TAG_WIDTH_BASE;
 
     // Width of the tag carried over VX_lsu_sched_if: lsu_header + op_type
-    // + per-lane align + packet allocator addr + fence flag (matches the
-    // local TAG_WIDTH built inside VX_lsu_slice).
+    // + per-lane align + packet allocator addr (+ AMO aq, rl in DLMEM builds)
+    // + fence flag (matches the local TAG_WIDTH built inside VX_lsu_slice).
+`ifdef VX_CFG_EXT_DLMEM_ENABLE
+    localparam LSU_CLIENT_TAG_WIDTH = $bits(lsu_header_t) + INST_LSU_BITS
+                                    + (`VX_CFG_NUM_LSU_LANES * `CLOG2(LSU_WORD_SIZE))
+                                    + `LOG2UP(`VX_CFG_LSU_PENDING_SIZE) + 2 + 1;
+`else
     localparam LSU_CLIENT_TAG_WIDTH = $bits(lsu_header_t) + INST_LSU_BITS
                                     + (`VX_CFG_NUM_LSU_LANES * `CLOG2(LSU_WORD_SIZE))
                                     + `LOG2UP(`VX_CFG_LSU_PENDING_SIZE) + 1;
+`endif
 
     // Request/response payloads for VX_lsu_sched_if. Valid/ready live on
     // the interface, never in the payload (Vortex elastic-idiom rule).

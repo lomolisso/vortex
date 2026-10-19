@@ -1145,9 +1145,9 @@ struct LsuReq {
   uint64_t uuid;
 #ifdef VX_CFG_EXT_DLMEM_ENABLE
   uint32_t cta_id;                   // selects the issuing CTA's peer row
-  BitVector<> dlmem_remote;          // per lane, set by the aperture translation
-  BitVector<> dlmem_oob;
+  BitVector<> dlmem_remote, dlmem_oob; // per lane, set by the aperture translation
   std::vector<uint32_t> dlmem_core;  // target core of a remote lane
+  bool amo_rl;                       // release AMO: held at the translation like a fence
 #endif
 
   LsuReq(uint32_t size)
@@ -1165,9 +1165,9 @@ struct LsuReq {
     , uuid(0)
 #ifdef VX_CFG_EXT_DLMEM_ENABLE
     , cta_id(0)
-    , dlmem_remote(size)
-    , dlmem_oob(size)
+    , dlmem_remote(size), dlmem_oob(size)
     , dlmem_core(size, 0)
+    , amo_rl(false)
 #endif
   {}
 

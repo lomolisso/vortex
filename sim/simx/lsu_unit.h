@@ -19,6 +19,9 @@
 #include "func_unit.h"
 #include "instr.h"
 #include "VX_config.h"
+#ifdef VX_CFG_EXT_DLMEM_ENABLE
+#include <deque>
+#endif
 
 // The TCU metadata SRAM is present when any metadata-consuming mode (MX or
 // sparse) is enabled. Internal derived macro — not a VX_CFG_* knob; same
@@ -91,6 +94,13 @@ public:
 #ifdef VX_CFG_EXT_DLMEM_ENABLE
 	// Per-block requests and fences toward the aperture translation stage.
 	std::vector<SimChannel<LsuReq>> XlateReqOut;
+
+	// Per block: the warp of an acquire AMO, sent as the commit takes its last result.
+	std::vector<SimChannel<uint32_t>> UnlockOut;
+
+	// UnlockOut's delay: the scheduler's stall register, so the warp can be picked
+	// this many cycles after the commit takes the result.
+	static constexpr uint32_t ACQ_UNLOCK_DELAY = 1;
 #endif
 
 	// Returns true when all LSU blocks have no in-flight requests.
@@ -114,6 +124,13 @@ private:
 
 	// Drain Inputs[b] into req_queue.
 	void ingest_inputs(uint32_t b);
+
+#ifdef VX_CFG_EXT_DLMEM_ENABLE
+	static bool is_acquire_amo(const instr_trace_t* trace);
+
+	// Called for every result beat sent to Outputs[b].
+	void mark_unlock(uint32_t b, instr_trace_t* beat, bool is_final);
+#endif
 
   struct mem_addr_size_t {
 		uint64_t addr;
@@ -162,6 +179,16 @@ private:
 
 	std::array<lsu_state_t, VX_CFG_NUM_LSU_BLOCKS> states_;
 	uint64_t pending_loads_;
+
+#ifdef VX_CFG_EXT_DLMEM_ENABLE
+	// Packets of each warp's acquire AMO answered so far; a warp has at most one,
+	// since it stays stalled until the last is released.
+	std::vector<uint32_t> aq_done_;
+	// Per block: last results of acquire AMOs sent to Outputs, not yet delivered.
+	std::array<std::vector<instr_trace_t*>, VX_CFG_NUM_LSU_BLOCKS> unlock_beats_;
+	// Per block, in Outputs' queue order: the warp each result releases, or -1.
+	std::array<std::deque<int32_t>, VX_CFG_NUM_LSU_BLOCKS> out_unlock_;
+#endif
 };
 
 }

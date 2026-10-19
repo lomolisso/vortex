@@ -16,6 +16,8 @@
 //              read-modify-write of a counter in rank 0
 //            3 amo{add,xor,and,or,min,max,minu,maxu}.{w,d} into every slice
 //            4 compare-and-swap counters (only with VX_CFG_EXT_ZACAS_ENABLE)
+//   -r       the lock's release is amoswap.w.rl alone, without the vx_fence()
+//            before it: the release must wait for the counter's window store
 //   -p       parity mode: one launch of fixed window-atomic loops into the next
 //            rank (K = 2, or -k), no spin and no data-dependent trip count
 //   -f       with -p, a fence after each iteration's atomics, which must wait
@@ -70,6 +72,7 @@ bool     pfence    = false;
 bool     neg_lrsc  = false;
 bool     verbose   = false;
 bool     control   = false;
+bool     rl_only   = false;
 
 struct Caps {
   uint64_t num_cores = 0, num_clusters = 0, num_warps = 0, num_threads = 0;
@@ -84,12 +87,12 @@ struct Launch {
 
 void usage() {
   std::printf("Usage: [-k K] [-n clusters] [-w warps per block] [-l bytes] [-i iters] [-t mask]"
-              " [-p [-f]] [-x lrsc] [-c] [-v] [-h]\n");
+              " [-p [-f]] [-r] [-x lrsc] [-c] [-v] [-h]\n");
 }
 
 void parse_args(int argc, char** argv) {
   int c;
-  while ((c = getopt(argc, argv, "k:n:w:l:i:t:pfx:cvh")) != -1) {
+  while ((c = getopt(argc, argv, "k:n:w:l:i:t:pfrx:cvh")) != -1) {
     switch (c) {
       case 'k': req_k     = (uint32_t)std::atoi(optarg); break;
       case 'n': req_g     = (uint32_t)std::atoi(optarg); break;
@@ -99,6 +102,7 @@ void parse_args(int argc, char** argv) {
       case 't': req_tests = (uint32_t)std::strtoul(optarg, nullptr, 0); break;
       case 'p': parity    = true;                        break;
       case 'f': pfence    = true;                        break;
+      case 'r': rl_only   = true;                        break;
       case 'x':
         if (std::strcmp(optarg, "lrsc") != 0) {
           usage();
@@ -113,7 +117,7 @@ void parse_args(int argc, char** argv) {
     }
   }
   if (optind < argc || req_w == 0 || req_iters == 0 || req_iters > 255 || (parity && neg_lrsc)
-   || (pfence && !parity)) {
+   || (pfence && !parity) || (rl_only && (parity || neg_lrsc))) {
     usage();
     std::exit(-1);
   }
@@ -137,7 +141,7 @@ uint32_t slots_per_core(const Caps& caps, const Launch& L) {
 const char* kernel_name(uint32_t test) {
   switch (test) {
   case TEST_HIST: return "hist_k";
-  case TEST_LOCK: return "lock_k";
+  case TEST_LOCK: return rl_only ? "lock_rl_k" : "lock_k";
   case TEST_OPS:  return "ops_k";
   case TEST_CAS:  return "cas_k";
   case TEST_LRSC: return "lrsc_k";

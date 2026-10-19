@@ -124,6 +124,7 @@ module VX_core import VX_gpu_pkg::*, VX_tlb_pkg::*; #(
 `ifdef VX_CFG_EXT_DLMEM_ENABLE
     // Each block's LSU requests reach its scheduler through the aperture translation stage.
     VX_lsu_sched_if xlate_out_if [`VX_CFG_NUM_LSU_BLOCKS]();
+    VX_sched_unlock_if lsu_unlock_if [`VX_CFG_NUM_LSU_BLOCKS]();  // acquire AMO release -> scheduler
     wire [`VX_CFG_NUM_LSU_BLOCKS-1:0] lsu_sched_raw_empty;
     wire [`VX_CFG_NUM_LSU_BLOCKS-1:0] xlate_empty;
     // The slice's read-tag pool (LSU_PENDING_SIZE) relies on the scheduler to refuse
@@ -283,6 +284,7 @@ module VX_core import VX_gpu_pkg::*, VX_tlb_pkg::*; #(
         .peer_wr_slot   (peer_wr_slot),
         .peer_wr_row    (peer_wr_row),
         .peer_wr_stride (peer_wr_stride),
+        .lsu_unlock_if  (lsu_unlock_if),
     `endif
 
         .busy           (sched_busy)
@@ -365,6 +367,9 @@ module VX_core import VX_gpu_pkg::*, VX_tlb_pkg::*; #(
         // execute exposes LSU client interfaces; lsu_scheduler sits between
         // execute and lsu_mem_if (which connects to mem_unit).
         .lsu_client_if  (lsu_client_if),
+    `ifdef VX_CFG_EXT_DLMEM_ENABLE
+        .lsu_unlock_if  (lsu_unlock_if),
+    `endif
 
     `ifdef TCU_META_ENABLE
         .tcu_mem_if     (tcu_mem_if),

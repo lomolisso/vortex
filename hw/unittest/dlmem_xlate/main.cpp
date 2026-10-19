@@ -18,7 +18,8 @@
 // and core, one request each, with exact outputs.
 // --mode=random: launches, each a drain, a new stride and a rewrite of every
 // row, then traffic with row rewrites at random cycles. Lanes mix in-window,
-// out-of-bounds and outside addresses, masked lanes and fences, under
+// out-of-bounds and outside addresses, masked lanes, fences and release AMOs
+// (an AMO request with the .rl tag bit), under
 // back-pressure phases. Every request must leave once, in order per block,
 // one cycle after it enters while the output is ready, translated with the row
 // current when it entered; untouched fields stay bit-equal, except the hart id
@@ -26,9 +27,9 @@
 // trackers count the remote lanes and the local plain-store lanes leaving the
 // stage and drive drained and lmem_st_drained, registered like the trackers,
 // with acknowledgements and bank commits (several per cycle) at random rates:
-// a fence must not leave while its warp is undrained on either, and one right
-// behind a remote access or a local store of its warp must be held. Each warp
-// uses one block, as in the core.
+// a fence or a release AMO must not leave while its warp is undrained on
+// either, and one right behind a remote access or a local store of its warp
+// must be held. Each warp uses one block, as in the core.
 // --mode=sched: random traffic into a model of the LSU scheduler's input queue
 // (random acceptance and drain), filling it and handing requests over as the
 // stage empties. The model is ideal, so the empty fold VX_core relies on rests
@@ -42,7 +43,11 @@
 // store through the window (own rank) and a plain local-memory store, each
 // held the same way on lmem_st_drained until its bank commit; a local load,
 // a local AMO and a fence count nothing; a drained warp's fence is not held.
-// --mode=all: directed, random, sched, then fence.
+// --mode=rl: a release AMO right behind its warp's uncommitted local store, then
+// behind its unacknowledged remote store, is held and leaves in the cycle
+// lmem_st_drained or drained rises; a plain AMO in the same spot is not held,
+// nor is a drained warp's release AMO.
+// --mode=all: directed, random, sched, fence, then rl.
 
 #include "vl_simulator.h"
 #include "VVX_dlmem_xlate_top.h"
@@ -199,6 +204,7 @@ struct Request {
   bool     rw = false;
   uint64_t mask = 0;
   bool     fence = false;
+  bool     rl = false;              // release AMO
   uint32_t wid = 0;
   uint32_t cta = 0;
   uint32_t pid = 0;
@@ -206,7 +212,7 @@ struct Request {
   std::vector<uint64_t> addr;   // word addresses
   std::vector<Bits>     attr;
   std::vector<uint64_t> data;
-  Bits     tag;                 // raw; the top merges wid/cta/pid/fence into it
+  Bits     tag;                 // raw; the top merges wid/cta/pid/fence/rl into it
 
   // Captured when the stage accepts it.
   uint64_t entry_cycle = 0;
@@ -360,6 +366,9 @@ public:
     if (opts_.mode == "fence" || opts_.mode == "all") {
       this->run_fence();
     }
+    if (opts_.mode == "rl" || opts_.mode == "all") {
+      this->run_rl();
+    }
     if (failures_ != 0) {
       std::printf("FAILED: %u check(s) failed\n", failures_);
       return 1;
@@ -389,6 +398,13 @@ private:
 
   uint64_t rnd() {
     return rng_();
+  }
+
+  // The LSU sends an AMO with rw=0 and amo_valid set on its lanes.
+  void mark_amo(Request& q) {
+    for (auto& at : q.attr) {
+      set_bits(at, kAttrAmoValid, 1, 1);
+    }
   }
 
   uint32_t below(uint64_t n) {
@@ -565,6 +581,7 @@ private:
     q.pid   = below(uint64_t(1) << pid_w_);
     q.fence = chance(4);
     q.rw    = chance(40);
+    q.rl    = !q.fence && !q.rw && chance(10);
     uint32_t mpick = below(100);
     uint64_t full = ref::low_mask(nl_);
     q.mask = (mpick < 3) ? 0 : (mpick < 25) ? full : (rnd() & full);
@@ -581,6 +598,9 @@ private:
       q.addr.push_back(this->gen_lane(c, row) >> 3);
       q.attr.push_back(this->rand_bits(attr_w_));
       q.data.push_back(rnd());
+    }
+    if (q.rl) {
+      this->mark_amo(q);
     }
     return q;
   }
@@ -694,6 +714,7 @@ private:
       set_bits(t->in_rw, b, 1, o->rw);
       set_bits(t->in_mask, b * nl_, nl_, o->mask);
       set_bits(t->in_fence, b, 1, o->fence);
+      set_bits(t->in_rl, b, 1, o->rl);
       set_bits(t->in_wid, b * nw_w_, nw_w_, o->wid);
       set_bits(t->in_cta, b * nw_w_, nw_w_, o->cta);
       set_bits(t->in_pid, b * pid_w_, pid_w_, o->pid);
@@ -829,7 +850,8 @@ private:
       }
 
       bool valid = get_bits(t->out_valid, b, 1);
-      bool held = !q.empty() && q.front().fence && !(drained_[q.front().wid] && lst_drained_[q.front().wid]);
+      bool ordered = !q.empty() && (q.front().fence || q.front().rl);
+      bool held = ordered && !(drained_[q.front().wid] && lst_drained_[q.front().wid]);
       if (valid_prev_[b] && !ready_prev_[b] && !valid) {
         this->fail(strf("block %u: output dropped while stalled", b));
       }
@@ -842,30 +864,32 @@ private:
       }
       if (held) {
         const Request& h = q.front();
+        const char* what = h.fence ? "fence" : "release AMO";
         if (valid) {
-          this->fail(strf("block %u seq %" PRIu64 ": fence of warp %u left with the warp undrained", b, h.seq, h.wid));
+          this->fail(strf("block %u seq %" PRIu64 ": %s of warp %u left with the warp undrained", b, h.seq, what,
+                          h.wid));
         }
         ++n_held_cycles_;
         auto& fo = fobs_[h.seq];
         if (fo.held_cycles++ == 0) {
-          ++n_fence_held_;
+          ++(h.fence ? n_fence_held_ : n_rl_held_);
         }
       }
-      if (!q.empty() && q.front().fence && rem_st_prev_[b] == q.front().wid) {
-        // The fence right behind its warp's remote access sees that access counted.
+      if (ordered && rem_st_prev_[b] == q.front().wid) {
+        // The fence or release AMO right behind its warp's remote access sees that access counted.
         if (!held) {
-          this->fail(strf("block %u seq %" PRIu64 ": fence behind a remote access of warp %u not held", b,
-                          q.front().seq, q.front().wid));
+          this->fail(strf("block %u seq %" PRIu64 ": %s behind a remote access of warp %u not held", b,
+                          q.front().seq, q.front().fence ? "fence" : "release AMO", q.front().wid));
         }
-        ++n_b2b_;
+        ++(q.front().fence ? n_b2b_ : n_b2b_rl_);
       }
-      if (!q.empty() && q.front().fence && lst_prev_[b] == q.front().wid) {
+      if (ordered && lst_prev_[b] == q.front().wid) {
         // The same for a local store.
         if (!held) {
-          this->fail(strf("block %u seq %" PRIu64 ": fence behind a local store of warp %u not held", b,
-                          q.front().seq, q.front().wid));
+          this->fail(strf("block %u seq %" PRIu64 ": %s behind a local store of warp %u not held", b,
+                          q.front().seq, q.front().fence ? "fence" : "release AMO", q.front().wid));
         }
-        ++n_b2b_lst_;
+        ++(q.front().fence ? n_b2b_lst_ : n_b2b_rl_);
       }
       rem_st_prev_[b].reset();
       lst_prev_[b].reset();
@@ -914,7 +938,7 @@ private:
           lst_inc[r.wid] += r.exp_lst;
           lst_prev_[b] = r.wid;
         }
-        if (r.fence) {
+        if (r.fence || r.rl || fobs_.count(r.seq)) {
           fobs_[r.seq].fire_cycle = cycle_;
         }
         if (lane0_) {
@@ -949,12 +973,13 @@ private:
         if (in_ready) {
           o->entry_cycle = cycle_;
           o->tag_eff = get_field(t->in_tag_eff, b * tag_w_, tag_w_);
-          if (get_bits(o->tag_eff, 0, 1) != o->fence) {
-            this->fail(strf("block %u: merged tag lost the fence bit", b));
+          if (get_bits(o->tag_eff, 0, 1) != o->fence || get_bits(o->tag_eff, 1, 1) != o->rl) {
+            this->fail(strf("block %u: merged tag lost the fence or release bit", b));
           }
           this->expect(*o);
           ++n_in_;
           n_fence_ += o->fence;
+          n_rl_ += o->rl;
           entered_prev_[b] = o->seq;
           q.push_back(*o);
           max_occ_ = std::max<size_t>(max_occ_, q.size());
@@ -1150,6 +1175,8 @@ private:
                 "encoding range %" PRIu64 "\n", n_remote_past_, n_alias_none_);
     std::printf("random: %" PRIu64 " local-store events (%" PRIu64 " lanes), %" PRIu64 " bank commits, %" PRIu64
                 " fences right behind their warp's local store\n", n_lst_inc_, n_lst_lanes_, n_commits_, n_b2b_lst_);
+    std::printf("random: %" PRIu64 " release AMOs, %" PRIu64 " held, %" PRIu64 " right behind their warp's remote "
+                "access or local store\n", n_rl_, n_rl_held_, n_b2b_rl_);
     std::string s;
     for (uint32_t v : n_strides_) {
       s += strf(" %u", v);
@@ -1168,6 +1195,9 @@ private:
     }
     if (n_lst_lanes_ == 0 || n_b2b_lst_ == 0 || n_fence_held_ == 0) {
       this->fail("random traffic never counted a local store, or never held a fence right behind one");
+    }
+    if (n_rl_held_ == 0 || n_b2b_rl_ == 0) {
+      this->fail("random traffic never held a release AMO, or never put one right behind its warp's access");
     }
   }
 
@@ -1411,11 +1441,7 @@ private:
       commit_pct_ = 0;
       uint64_t lanes0 = n_lst_lanes_;
       Request ld = this->fence_req(w, false, false, local);
-      Request amo = this->fence_req(w, false, false, cfg_.lmem_base + 24);
-      for (auto& at : amo.attr) {
-        set_bits(at, attr_local_pos_, 1, 1);
-        set_bits(at, 4, 1, 1);   // amo_valid (MEM_ATTR_AMO_OFFS); the LSU sends an AMO with rw=0
-      }
+      Request amo = this->amo_req(w, false, cfg_.lmem_base + 24);
       Request fs = this->fence_req(w, true, true, local);
       Request fe = this->fence_req(w, true, false, 0);
       uint64_t c3 = cycle_;
@@ -1479,7 +1505,112 @@ private:
     }
   }
 
+  Request amo_req(uint32_t wid, bool rl, uint64_t byte_addr) {
+    Request q = this->fence_req(wid, false, false, byte_addr);
+    q.rl = rl;
+    for (auto& at : q.attr) {
+      set_bits(at, attr_local_pos_, 1, 1);
+    }
+    this->mark_amo(q);
+    return q;
+  }
+
+  // An AMO right behind its warp's store with the store's completion withheld:
+  // a release AMO is held until the completion, then leaves in the cycle the
+  // tracker's flag rises; a plain one leaves right behind the store.
+  void rl_case(const char* what, bool remote_st, uint64_t st_addr, uint32_t w, uint32_t w2) {
+    const uint32_t hold = 20;
+    const uint64_t amo_addr = cfg_.lmem_base + 24;
+    auto withhold = [&](bool on) {
+      (remote_st ? ack_pct_ : commit_pct_) = on ? 0 : 100;
+    };
+    auto pending = [&]() { return remote_st ? wt_cnt_[w] : lst_cnt_[w]; };
+    auto store = [&]() {
+      Request st = this->fence_req(w, false, true, st_addr);
+      if (!remote_st) {
+        for (auto& at : st.attr) {
+          set_bits(at, attr_local_pos_, 1, 1);
+        }
+      }
+      return st;
+    };
+
+    withhold(true);
+    Request am = this->amo_req(w, true, amo_addr);
+    Request ld = this->fence_req(w2, false, false, cfg_.dlmem_base + 16);
+    uint64_t c0 = cycle_;
+    this->offer_all({store(), am, ld}, hold);
+    const FenceObs& ho = fobs_[am.seq];
+    if (ho.fire_cycle != ~uint64_t(0) || ho.held_cycles + 3 < hold || queue_[0].size() != 2
+     || queue_[0].front().seq != am.seq || pending() != 1) {
+      this->fail(strf("rl: release AMO after a %s: held %" PRIu64 " of %u cycles, fired at %" PRId64
+                      ", %zu request(s) in the stage, %" PRIu64 " pending", what, ho.held_cycles, hold,
+                      int64_t(ho.fire_cycle), queue_[0].size(), pending()));
+    }
+    withhold(false);
+    uint64_t c_done = cycle_;
+    this->offer_all({}, 4);
+    bool rise_ok = remote_st || lst_rise_[w] == ho.fire_cycle;
+    if (ho.fire_cycle != c_done + 1 || !rise_ok || this->busy()) {
+      this->fail(strf("rl: release AMO after a %s: completed in cycle %" PRIu64 ", fired in %" PRId64
+                      " (expected %" PRIu64 ")", what, c_done - c0, int64_t(ho.fire_cycle - c0), c_done + 1 - c0));
+    }
+    std::printf("rl: release AMO after a %s held %" PRIu64 " cycles with the completion withheld and a load "
+                "behind it, then left %" PRId64 " cycle(s) after the completion\n",
+                what, ho.held_cycles, int64_t(ho.fire_cycle - c_done));
+
+    withhold(true);
+    Request pa = this->amo_req(w, false, amo_addr);
+    const FenceObs& po = fobs_[pa.seq];   // watched, so its fire cycle is recorded
+    uint64_t c1 = cycle_;
+    this->offer_all({store(), pa}, 6);
+    if (po.held_cycles != 0 || po.fire_cycle != c1 + 2 || pending() != 1) {
+      this->fail(strf("rl: plain AMO after a %s: held %" PRIu64 " cycles, fired in %" PRId64 " (expected 2), %"
+                      PRIu64 " pending", what, po.held_cycles, int64_t(po.fire_cycle - c1), pending()));
+    }
+    this->drain();
+    std::printf("rl: plain AMO after a %s left right behind it\n", what);
+  }
+
+  void run_rl() {
+    this->drain();
+    const bool two = (ncc_ >= 2 && maxc_ >= 2);
+    TblRow r;
+    r.k = two ? 2 : 1;
+    r.peers.assign(maxc_, ref::Peer{my_core_, 0});
+    if (two) {
+      r.peers[1] = ref::Peer{(my_core_ + 1) % ncc_, 1};
+    }
+    wr_stride_ = 64;
+    wr_ = std::make_pair(0u, r);
+    this->clock();
+    uint64_t remote = cfg_.dlmem_base + (uint64_t(1) << lmem_log_) + 8;
+    uint32_t w  = 0;
+    uint32_t w2 = (nw_ > nb_) ? nb_ : 0;
+
+    this->rl_case("plain local-memory store", false, cfg_.lmem_base + 16, w, w2);
+    if (two) {
+      this->rl_case("remote store", true, remote, w, w2);
+    } else {
+      std::printf("rl: the remote case needs a cluster of at least two cores, skipped\n");
+    }
+
+    // A drained warp's release AMO goes straight through, to any address.
+    Request a2 = this->amo_req(w2, true, two ? remote : cfg_.lmem_base + 24);
+    uint64_t c2 = cycle_;
+    this->offer_all({a2}, 4);
+    const FenceObs& ao = fobs_[a2.seq];
+    if (ao.held_cycles != 0 || ao.fire_cycle != c2 + 1) {
+      this->fail(strf("rl: a drained warp's release AMO held %" PRIu64 " cycles, fired in %" PRId64 " (expected 1)",
+                      ao.held_cycles, int64_t(ao.fire_cycle - c2)));
+    }
+    this->drain();
+    std::printf("rl: a drained warp's release AMO was not held\n");
+  }
+
   ///////////////////////////////////////////////////////////////////////////
+
+  static constexpr uint32_t kAttrAmoValid = 4;   // MEM_ATTR_AMO_OFFS
 
   Options opts_;
   std::mt19937_64 rng_;
@@ -1543,6 +1674,7 @@ private:
   };
   std::map<uint64_t, FenceObs> fobs_;
   uint64_t n_fence_held_ = 0, n_held_cycles_ = 0, n_b2b_ = 0, n_acks_ = 0;
+  uint64_t n_rl_ = 0, n_rl_held_ = 0, n_b2b_rl_ = 0;
 
   bool     lane0_ = false;
   uint64_t last_addr0_ = 0;
@@ -1559,7 +1691,7 @@ private:
 };
 
 static void usage(const char* prog) {
-  std::printf("usage: %s [--mode=all|directed|random|sched|oob|remote|fence] [--seed=N] [--launches=N] [--cycles=N] "
+  std::printf("usage: %s [--mode=all|directed|random|sched|oob|remote|fence|rl] [--seed=N] [--launches=N] [--cycles=N] "
               "[--watchdog=N] [--no-oob]\n", prog);
 }
 
@@ -1592,7 +1724,7 @@ int main(int argc, char** argv) {
     }
   }
   if (opts.mode != "all" && opts.mode != "directed" && opts.mode != "random" && opts.mode != "sched"
-   && opts.mode != "oob" && opts.mode != "remote" && opts.mode != "fence") {
+   && opts.mode != "oob" && opts.mode != "remote" && opts.mode != "fence" && opts.mode != "rl") {
     usage(argv[0]);
     return 2;
   }

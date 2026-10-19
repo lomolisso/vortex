@@ -35,6 +35,11 @@ module VX_execute import VX_gpu_pkg::*; #(
     // only the LSU client interfaces.
     VX_lsu_sched_if.master lsu_client_if [`VX_CFG_NUM_LSU_BLOCKS],
 
+`ifdef VX_CFG_EXT_DLMEM_ENABLE
+    // Per LSU block, the release of warps stalled by an acquire AMO.
+    VX_sched_unlock_if.master lsu_unlock_if [`VX_CFG_NUM_LSU_BLOCKS],
+`endif
+
 `ifdef TCU_META_ENABLE
     // TCU AGU memory client (single warp-level AGU shared across blocks).
     // VX_core wires this to client 1 of block 0's lsu_scheduler.
@@ -107,6 +112,9 @@ module VX_execute import VX_gpu_pkg::*; #(
         .reset           (reset),
         .dispatch_if         (dispatch_if[EX_LSU * `VX_CFG_ISSUE_WIDTH +: `VX_CFG_ISSUE_WIDTH]),
         .commit_if           (commit_if[EX_LSU * `VX_CFG_ISSUE_WIDTH +: `VX_CFG_ISSUE_WIDTH]),
+    `ifdef VX_CFG_EXT_DLMEM_ENABLE
+        .per_block_unlock_if (lsu_unlock_if),
+    `endif
         .per_block_client_if (lsu_client_if)
     );
 

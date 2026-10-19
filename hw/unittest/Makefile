@@ -266,15 +266,15 @@ endif
 # NCC 6 has no vectors, so it runs random traffic only. The full runs also feed
 # a model of the LSU scheduler's queue, stressing back-pressure and handoffs,
 # and every run models the core's remote-access and local-store trackers, so
-# fences wait for their warp's remote accesses and local stores. The
-# bound-assert build must abort on an out-of-bounds lane; the last build sends
-# a remote lane and holds a fence until its store is acknowledged, and a local
-# store's fence until its bank commit; the final clean keeps a plain `run`
-# from reusing it.
+# fences and release AMOs wait for their warp's remote accesses and local
+# stores. The bound-assert build must abort on an out-of-bounds lane; the last
+# build sends a remote lane, holds a fence until its store is acknowledged and
+# a local store's fence until its bank commit, and holds a release AMO the same
+# way; the final clean keeps a plain `run` from reusing it.
 # Then the core elaborates and lints with the stages and the DLMEM endpoints in
 # place, at 1 core, at 8 cores with two LSU blocks and two cores per socket,
 # and at 4 cores in one socket.
-# $(1)=CONFIGS $(2)=CORE_ID $(3)=OOB_ASSERT $(4)=OPTS $(5)=OPTS of an extra run
+# $(1)=CONFIGS $(2)=CORE_ID $(3)=OOB_ASSERT $(4)=OPTS $(5),$(6)=OPTS of extra runs
 define dlmem_xlate_case
 	$(MAKE) -C dlmem_xlate clean
 	$(MAKE) -C dlmem_xlate CONFIGS="-DVX_CFG_EXT_DLMEM_ENABLE $(1)" CORE_ID=$(2) OOB_ASSERT=$(3)
@@ -282,6 +282,8 @@ define dlmem_xlate_case
 		OPTS="$(4)")
 	$(if $(5),$(MAKE) -C dlmem_xlate run CONFIGS="-DVX_CFG_EXT_DLMEM_ENABLE $(1)" CORE_ID=$(2) OOB_ASSERT=$(3) \
 		OPTS="$(5)")
+	$(if $(6),$(MAKE) -C dlmem_xlate run CONFIGS="-DVX_CFG_EXT_DLMEM_ENABLE $(1)" CORE_ID=$(2) OOB_ASSERT=$(3) \
+		OPTS="$(6)")
 endef
 run-dlmem-xlate:
 ifeq ($(XLEN),64)
@@ -307,7 +309,7 @@ ifeq ($(XLEN),64)
 	! dlmem_xlate/dlmem_xlate --mode=oob > dlmem_xlate/oob.log 2>&1
 	grep -q "DLMEM access out of bounds" dlmem_xlate/oob.log
 	$(call dlmem_xlate_case,-DVX_CFG_NUM_CORES=2 -DVX_CFG_SOCKET_SIZE=1 -DVX_CFG_NUM_WARPS=4 \
-		-DVX_CFG_LMEM_LOG_SIZE=14,0,0,--mode=remote,--mode=fence)
+		-DVX_CFG_LMEM_LOG_SIZE=14,0,0,--mode=remote,--mode=fence,--mode=rl)
 	$(MAKE) -C dlmem_xlate clean
 	$(MAKE) -C core lint CONFIGS="-DVX_CFG_EXT_DLMEM_ENABLE -DVX_CFG_NUM_CORES=1"
 	$(MAKE) -C core lint CONFIGS="-DVX_CFG_EXT_DLMEM_ENABLE -DVX_CFG_NUM_CORES=8 -DVX_CFG_SOCKET_SIZE=2 \
