@@ -70,6 +70,12 @@ done < "$MANIFEST"
   exit 1
 }
 
+# Synthesis runs in one tree share this install: serialize them so a second
+# run never races the first one's downloads or its in-place prepare step.
+mkdir -p "$INSTALL_DIR"
+exec 9> "$INSTALL_DIR/.install.lock"
+flock 9
+
 complete=1
 for corner in tt ss ff; do
   [[ -s "$LIB_DIR/asap7_${VT}_${corner}.lib" ]] || complete=0

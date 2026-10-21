@@ -3,6 +3,7 @@
 import hashlib
 import gzip
 import json
+import os
 import pathlib
 import re
 import argparse
@@ -24,6 +25,13 @@ def read_manifest(manifest):
         elif re.fullmatch(r'[0-9a-f]{64}', fields[0]) and len(fields) == 2:
             files.append((fields[0], fields[1]))
     return metadata, files
+
+
+def write_atomic(path, text):
+    # A synthesis run may be reading the previous copy.
+    tmp = path.with_name(path.name + '.tmp')
+    tmp.write_text(text)
+    os.replace(tmp, path)
 
 
 def sha256(path):
@@ -148,8 +156,8 @@ def main():
             cell_count += cells
             bodies.append(f'/* {group} */\n{body}')
         output = lib_dir / f'asap7_{args.vt}_{corner.lower()}.lib'
-        output.write_text(f'library (asap7_{args.vt}_{corner.lower()}) {{\n' +
-                          '\n'.join(bodies) + '\n}\n')
+        write_atomic(output, f'library (asap7_{args.vt}_{corner.lower()}) {{\n' +
+                     '\n'.join(bodies) + '\n}\n')
         print(f'Prepared {output} ({cell_count} cells)')
         outputs.append(output)
 
@@ -165,7 +173,7 @@ def main():
             module_count += modules
             model_parts.append(f'// {group}: {source.name}\n{text.rstrip()}')
         models_output = verilog_dir / f'asap7_{args.vt}_cells.v'
-        models_output.write_text('\n\n'.join(model_parts) + '\n')
+        write_atomic(models_output, '\n\n'.join(model_parts) + '\n')
         print(f'Prepared {models_output} ({module_count} modules)')
         outputs.append(models_output)
 
@@ -178,7 +186,7 @@ def main():
         'outputs': {str(path.relative_to(args.output)): sha256(path) for path in outputs},
     }
     versions_output = metadata_dir / f'asap7_{args.vt}.json'
-    versions_output.write_text(json.dumps(versions, indent=2, sort_keys=True) + '\n')
+    write_atomic(versions_output, json.dumps(versions, indent=2, sort_keys=True) + '\n')
     print(f'Prepared {versions_output}')
 
 
