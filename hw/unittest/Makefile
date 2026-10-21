@@ -99,9 +99,12 @@ define lmem_switch_case
 endef
 # With DLMEM (RV64 only) the switch gains its remote leg and round-robin
 # response merge, the local memory a store-acknowledging ingress input and
-# per-bank commit reports of the LSU inputs' plain stores, and the memory unit
-# is linted with all of them wired.
+# per-bank commit reports of every LSU-input access, and the memory unit is
+# linted with all of them wired. With mbarriers the banks also run the mbarrier
+# ops against mbar_ref, and each erroneous op must stop the last build with its
+# assert; the final clean keeps a plain `run` from reusing it.
 DLMEM_LMEM := -DVX_CFG_EXT_DLMEM_ENABLE
+MBAR_LMEM  := $(DLMEM_LMEM) $(LMEM_BASE) -DVX_CFG_EXT_MBAR_ENABLE
 run-lmem:
 	$(call lmem_case,$(LMEM_BASE))
 	$(call lmem_case,$(LMEM_BASE) -DVX_CFG_EXT_ZACAS_ENABLE)
@@ -113,11 +116,20 @@ ifeq ($(XLEN),64)
 	$(call lmem_case,$(DLMEM_LMEM) $(LMEM_BASE))
 	$(call lmem_case,$(DLMEM_LMEM) $(LMEM_BASE) -DVX_CFG_EXT_ZACAS_ENABLE)
 	$(call lmem_case,$(DLMEM_LMEM))
+	$(call lmem_case,$(MBAR_LMEM))
+	! local_mem/local_mem --neg=underflow > local_mem/neg_underflow.log 2>&1
+	grep -q "mbarrier pending underflow" local_mem/neg_underflow.log
+	! local_mem/local_mem --neg=txrange > local_mem/neg_txrange.log 2>&1
+	grep -q "mbarrier tx out of range" local_mem/neg_txrange.log
+	! local_mem/local_mem --neg=align > local_mem/neg_align.log 2>&1
+	grep -q "mbarrier op is not a naturally aligned doubleword" local_mem/neg_align.log
+	$(MAKE) -C local_mem clean
 	$(call lmem_switch_case,$(DLMEM_LMEM) -DVX_CFG_NUM_LSU_LANES=1)
 	$(call lmem_switch_case,$(DLMEM_LMEM) -DVX_CFG_NUM_LSU_LANES=2)
 	$(call lmem_switch_case,$(DLMEM_LMEM) -DVX_CFG_NUM_LSU_LANES=4 $(LMEM_BASE) -DVX_CFG_EXT_ZACAS_ENABLE)
 	$(MAKE) -C mem_unit lint CONFIGS="$(DLMEM_LMEM) $(LMEM_BASE)"
 	$(MAKE) -C mem_unit lint CONFIGS="$(DLMEM_LMEM) $(LMEM_BASE) -DVX_CFG_ISSUE_WIDTH=2"
+	$(MAKE) -C mem_unit lint CONFIGS="$(MBAR_LMEM)"
 endif
 
 # CTA launch path: the KMU's cluster walk under launch-bus back-pressure, and
@@ -265,12 +277,14 @@ endif
 # and 8), second-cluster core ids, 1 to 8 lanes, 1 and 2 blocks, and Zacas.
 # NCC 6 has no vectors, so it runs random traffic only. The full runs also feed
 # a model of the LSU scheduler's queue, stressing back-pressure and handoffs,
-# and every run models the core's remote-access and local-store trackers, so
+# and every run models the core's remote-access and local-access trackers, so
 # fences and release AMOs wait for their warp's remote accesses and local
-# stores. The bound-assert build must abort on an out-of-bounds lane; the last
+# accesses. The bound-assert build must abort on an out-of-bounds lane; a build
+# with mbarriers counts their ops on local lanes, holds an arrive like a
+# release AMO, and must abort on one on a global or a remote lane; the last
 # build sends a remote lane, holds a fence until its store is acknowledged and
-# a local store's fence until its bank commit, and holds a release AMO the same
-# way; the final clean keeps a plain `run` from reusing it.
+# a local access's fence until its bank commit, and holds a release AMO the
+# same way; the final clean keeps a plain `run` from reusing it.
 # Then the core elaborates and lints with the stages and the DLMEM endpoints in
 # place, at 1 core, at 8 cores with two LSU blocks and two cores per socket,
 # and at 4 cores in one socket.
@@ -308,6 +322,12 @@ ifeq ($(XLEN),64)
 		-DVX_CFG_LMEM_LOG_SIZE=14,1,1,--mode=random --no-oob --seed=8)
 	! dlmem_xlate/dlmem_xlate --mode=oob > dlmem_xlate/oob.log 2>&1
 	grep -q "DLMEM access out of bounds" dlmem_xlate/oob.log
+	$(call dlmem_xlate_case,-DVX_CFG_NUM_CORES=2 -DVX_CFG_SOCKET_SIZE=1 -DVX_CFG_NUM_WARPS=4 \
+		-DVX_CFG_LMEM_LOG_SIZE=14 -DVX_CFG_EXT_A_ENABLE -DVX_CFG_EXT_MBAR_ENABLE,1,0,--seed=9,--mode=mbar)
+	! dlmem_xlate/dlmem_xlate --mode=mbar-global > dlmem_xlate/mbar_global.log 2>&1
+	grep -q "mbarrier op on a global address" dlmem_xlate/mbar_global.log
+	! dlmem_xlate/dlmem_xlate --mode=mbar-remote > dlmem_xlate/mbar_remote.log 2>&1
+	grep -q "remote mbarrier ops are not supported yet" dlmem_xlate/mbar_remote.log
 	$(call dlmem_xlate_case,-DVX_CFG_NUM_CORES=2 -DVX_CFG_SOCKET_SIZE=1 -DVX_CFG_NUM_WARPS=4 \
 		-DVX_CFG_LMEM_LOG_SIZE=14,0,0,--mode=remote,--mode=fence,--mode=rl)
 	$(MAKE) -C dlmem_xlate clean

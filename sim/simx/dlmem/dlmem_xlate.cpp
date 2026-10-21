@@ -14,6 +14,9 @@
 #include "dlmem_xlate.h"
 #include <algorithm>
 #include <iostream>
+#ifdef VX_CFG_EXT_MBAR_ENABLE
+#include "mbar_ref.h"
+#endif
 
 using namespace vortex;
 
@@ -32,7 +35,7 @@ DlmemXlate::DlmemXlate(const SimContext& ctx,
   , ReqOut(num_blocks, SimChannel<LsuReq>(this))
   , PeerWrIn(this)
   , WtIncOut(num_blocks, SimChannel<WtInc>(this))
-  , LstIncOut(num_blocks, SimChannel<WtInc>(this))
+  , LaccIncOut(num_blocks, SimChannel<WtInc>(this))
   , cfg_(cfg)
   , my_core_(0)
   , num_blocks_(num_blocks)
@@ -112,10 +115,13 @@ void DlmemXlate::on_tick() {
       if (remote != 0) {
         WtIncOut.at(b).send(WtInc{req.wid, remote}, 0);
       }
-      uint32_t local = local_store_lanes(req);
+      uint32_t local = local_access_lanes(req);
       if (local != 0) {
-        LstIncOut.at(b).send(WtInc{req.wid, local}, 0);
+        LaccIncOut.at(b).send(WtInc{req.wid, local}, 0);
       }
+      // Every lane of the switch's local leg is a counted one, so the bank
+      // reports the commit of exactly what was counted.
+      req.flags.lacc = (local != 0);
       DT(3, this->name() << " block" << b << " xlate: " << req);
       out.send(std::move(req), 1);
       in.pop();
@@ -128,10 +134,9 @@ void DlmemXlate::on_tick() {
   }
 }
 
-// The switch's local leg, restricted to plain stores: an AMO is a write op
-// here but leaves the RTL request's rw bit clear.
-uint32_t DlmemXlate::local_store_lanes(const LsuReq& req) {
-  if (req.op != MemOp::ST || req.flags.fence) {
+// The switch's local leg, whatever the op; a fence token's lanes access nothing.
+uint32_t DlmemXlate::local_access_lanes(const LsuReq& req) {
+  if (req.flags.fence) {
     return 0;
   }
   uint32_t n = 0;
@@ -149,6 +154,11 @@ uint32_t DlmemXlate::translate(LsuReq& req, const dlmem_ref::Row& row) {
   int remote_lane = -1;
   uint64_t remote_addr = 0;
   uint32_t remote_core = 0;
+#ifdef VX_CFG_EXT_MBAR_ENABLE
+  // An mbarrier lives in local memory: an op on a global lane has no object.
+  const bool is_mbar = memop_is_mbar(req.op) && !req.flags.fence;
+  int global_lane = -1;
+#endif
   for (uint32_t i = 0; i < req.mask.size(); ++i) {
     req.dlmem_remote.reset(i);
     req.dlmem_oob.reset(i);
@@ -158,6 +168,11 @@ uint32_t DlmemXlate::translate(LsuReq& req, const dlmem_ref::Row& row) {
       continue;
     uint64_t addr = req.addrs.at(i);
     auto x = dlmem_ref::translate(cfg_, addr, row, my_core_, req.cta_id, stride_);
+#ifdef VX_CFG_EXT_MBAR_ENABLE
+    if (is_mbar && global_lane < 0 && x.kind == dlmem_ref::NONE && get_addr_type(addr) != AddrType::Shared) {
+      global_lane = i;
+    }
+#endif
     if (x.kind == dlmem_ref::NONE)
       continue;
     req.addrs.at(i) = x.out_addr;
@@ -186,6 +201,21 @@ uint32_t DlmemXlate::translate(LsuReq& req, const dlmem_ref::Row& row) {
               << " (#" << req.uuid << ")" << std::endl;
     std::abort();
   }
+#ifdef VX_CFG_EXT_MBAR_ENABLE
+  if (global_lane >= 0) {
+    std::cerr << SimPlatform::instance().cycles() << ": " << this->name() << " " << mbar_ref::MSG_GLOBAL
+              << ": wid=" << req.wid << " cta=" << req.cta_id << " lane=" << global_lane << " addr=0x" << std::hex
+              << (req.addrs.at(global_lane) & ~uint64_t(LSU_WORD_SIZE - 1)) << std::dec
+              << " (#" << req.uuid << ")" << std::endl;
+    std::abort();
+  }
+  if (is_mbar && remote_lane >= 0) {
+    std::cerr << SimPlatform::instance().cycles() << ": " << this->name() << " " << mbar_ref::MSG_REMOTE
+              << ": wid=" << req.wid << " cta=" << req.cta_id << " lane=" << remote_lane << " addr=0x" << std::hex
+              << remote_addr << std::dec << " core=" << remote_core << " (#" << req.uuid << ")" << std::endl;
+    std::abort();
+  }
+#endif
   if (remote_lane >= 0 && abort_on_remote_) {
     std::cerr << SimPlatform::instance().cycles() << ": " << this->name()
               << " remote DLMEM access is not supported yet: wid=" << req.wid << " cta=" << req.cta_id

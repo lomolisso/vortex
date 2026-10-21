@@ -32,20 +32,21 @@ package VX_dlmem_pkg;
     localparam DLMEM_WT_MAX        = `VX_CFG_DLMEM_STORE_CREDITS + `VX_CFG_DLMEM_PENDING_SIZE
                                    + (`VX_CFG_LSU_QUEUE_IN_SIZE + 3) * `VX_CFG_NUM_LSU_LANES;
     localparam DLMEM_WT_W          = `CLOG2(DLMEM_WT_MAX + 1);
-    // A warp's local plain stores between translation and their bank write: what the
-    // LSU queues and the per-lane buffers can hold, then per bank the registered commit
-    // and the local memory's request crossbar. Each of its arbiters buffers two entries,
-    // and VX_stream_arb splits more than 1.5 * MAX_FANOUT inputs into groups of MAX_FANOUT
-    // under a joining arbiter: G1 groups of the LSU lanes and the DLMEM ingress, and G2
-    // groups of those when G1 is too wide in turn.
-    localparam DLMEM_LST_XB_IN     = `VX_CFG_NUM_LSU_BLOCKS * `VX_CFG_NUM_LSU_LANES + 1;
-    localparam DLMEM_LST_XB_G1     = (DLMEM_LST_XB_IN > (`MAX_FANOUT + `MAX_FANOUT / 2))
-                                   ? `CDIV(DLMEM_LST_XB_IN, `MAX_FANOUT) : 0;
-    localparam DLMEM_LST_XB_G2     = (DLMEM_LST_XB_G1 > (`MAX_FANOUT + `MAX_FANOUT / 2))
-                                   ? `CDIV(DLMEM_LST_XB_G1, `MAX_FANOUT) : 0;
-    localparam DLMEM_LST_MAX       = (`VX_CFG_LSU_QUEUE_IN_SIZE + 3) * `VX_CFG_NUM_LSU_LANES
-                                   + (3 + 2 * (DLMEM_LST_XB_G1 + DLMEM_LST_XB_G2)) * `VX_CFG_LMEM_NUM_BANKS;
-    localparam DLMEM_LST_W         = `CLOG2(DLMEM_LST_MAX + 1);
+    // A warp's local accesses between translation and their bank commit: what the
+    // LSU queues and the per-lane buffers can hold, then per bank the local memory's
+    // request crossbar, an atomic in its read and write-back stages, and the registered
+    // commit. Each of the crossbar's arbiters buffers two entries, and VX_stream_arb
+    // splits more than 1.5 * MAX_FANOUT inputs into groups of MAX_FANOUT under a joining
+    // arbiter: G1 groups of the LSU lanes and the DLMEM ingress, and G2 groups of those
+    // when G1 is too wide in turn.
+    localparam DLMEM_LACC_XB_IN    = `VX_CFG_NUM_LSU_BLOCKS * `VX_CFG_NUM_LSU_LANES + 1;
+    localparam DLMEM_LACC_XB_G1    = (DLMEM_LACC_XB_IN > (`MAX_FANOUT + `MAX_FANOUT / 2))
+                                   ? `CDIV(DLMEM_LACC_XB_IN, `MAX_FANOUT) : 0;
+    localparam DLMEM_LACC_XB_G2    = (DLMEM_LACC_XB_G1 > (`MAX_FANOUT + `MAX_FANOUT / 2))
+                                   ? `CDIV(DLMEM_LACC_XB_G1, `MAX_FANOUT) : 0;
+    localparam DLMEM_LACC_MAX      = (`VX_CFG_LSU_QUEUE_IN_SIZE + 3) * `VX_CFG_NUM_LSU_LANES
+                                   + (5 + 2 * (DLMEM_LACC_XB_G1 + DLMEM_LACC_XB_G2)) * `VX_CFG_LMEM_NUM_BANKS;
+    localparam DLMEM_LACC_W        = `CLOG2(DLMEM_LACC_MAX + 1);
 
     localparam [1:0] DLMEM_OP_LD  = 2'd0;
     localparam [1:0] DLMEM_OP_ST  = 2'd1;

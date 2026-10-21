@@ -208,6 +208,15 @@ package VX_gpu_pkg;
         AMO_OP_MAX   = 4'h8,
         // MINU/MAXU collapse into MIN/MAX + amo_unsigned bit.
         AMO_OP_CAS   = 4'h9
+    `ifdef VX_CFG_EXT_MBAR_ENABLE
+        // mbarrier ops, executed by the local memory banks only.
+      , AMO_OP_MBAR_ARRIVE      = 4'hA
+      , AMO_OP_MBAR_ARRIVE_TX   = 4'hB
+      , AMO_OP_MBAR_EXPECT_TX   = 4'hC
+      , AMO_OP_MBAR_COMPLETE_TX = 4'hD
+      , AMO_OP_MBAR_TEST_WAIT   = 4'hE
+      , AMO_OP_MBAR_TRY_WAIT    = 4'hF
+    `endif
     } amo_op_e;
 
     // Slim AMO sideband. width derives from byteen popcount at the cache
@@ -238,6 +247,8 @@ package VX_gpu_pkg;
     // drains it instead of walking. A host flush carries is_flush alone.
     typedef struct packed {
     `ifdef VX_CFG_EXT_DLMEM_ENABLE
+        // A local access the DLMEM translation counted: its bank reports the commit.
+        logic                        is_lacc;        // MEM_ATTR_LACC_OFFS   = MEM_ATTR_REMOTE_OFFS + 1
         logic                        is_addr_remote; // MEM_ATTR_REMOTE_OFFS = MEM_ATTR_FENCE_OFFS + 1
     `endif
         logic                        is_fence;      // MEM_ATTR_FENCE_OFFS = MEM_ATTR_AMO_OFFS + AMO_REQ_BITS
@@ -256,6 +267,7 @@ package VX_gpu_pkg;
     localparam MEM_ATTR_FENCE_OFFS  = MEM_ATTR_AMO_OFFS + AMO_REQ_BITS;
 `ifdef VX_CFG_EXT_DLMEM_ENABLE
     localparam MEM_ATTR_REMOTE_OFFS = MEM_ATTR_FENCE_OFFS + 1;
+    localparam MEM_ATTR_LACC_OFFS   = MEM_ATTR_REMOTE_OFFS + 1;
 `endif
 
     // Total width of the mem-bus attr field. Use this as the parameter

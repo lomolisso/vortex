@@ -311,26 +311,26 @@ public:
     // RTL's registered value, before this cycle's counts land.
     snprintf(sname, 100, "%s-dlmem_wtrack", name.c_str());
     dlmem_wtrack_ = DlmemWTrack::Create(sname, VX_CFG_NUM_LSU_BLOCKS, VX_CFG_NUM_WARPS, DLMEM_WT_LIMIT);
-    // Local plain-store lanes from the translation to their bank write; created
+    // Local-access lanes from the translation to their bank commit; created
     // after them for the same reason.
-    snprintf(sname, 100, "%s-lmem_st_track", name.c_str());
-    lmem_st_track_ = DlmemWTrack::Create(sname, VX_CFG_NUM_LSU_BLOCKS, VX_CFG_NUM_WARPS, DLMEM_LST_LIMIT,
-                                         VX_CFG_LMEM_NUM_BANKS);
+    snprintf(sname, 100, "%s-lmem_acc_track", name.c_str());
+    lmem_acc_track_ = DlmemWTrack::Create(sname, VX_CFG_NUM_LSU_BLOCKS, VX_CFG_NUM_WARPS, DLMEM_LACC_LIMIT,
+                                          VX_CFG_LMEM_NUM_BANKS);
     {
       auto lsu = std::static_pointer_cast<LsuUnit>(func_units_.at((int)FUType::LSU));
       for (uint32_t b = 0; b < VX_CFG_NUM_LSU_BLOCKS; ++b) {
         lsu->XlateReqOut.at(b).bind(&dlmem_xlate_->ReqIn.at(b));
         dlmem_xlate_->ReqOut.at(b).bind(&lmem_switch_.at(b)->ReqIn);
         dlmem_xlate_->WtIncOut.at(b).bind(&dlmem_wtrack_->IncIn.at(b));
-        dlmem_xlate_->LstIncOut.at(b).bind(&lmem_st_track_->IncIn.at(b));
+        dlmem_xlate_->LaccIncOut.at(b).bind(&lmem_acc_track_->IncIn.at(b));
         lsu->UnlockOut.at(b).bind(&scheduler_->UnlockIn.at(b));
       }
       for (uint32_t i = 0; i < VX_CFG_LMEM_NUM_BANKS; ++i) {
-        local_mem_->CommitOut.at(i).bind(&lmem_st_track_->CommitIn.at(i));
+        local_mem_->CommitOut.at(i).bind(&lmem_acc_track_->CommitIn.at(i));
       }
     }
-    dlmem_xlate_->set_drained_query([wtrack = dlmem_wtrack_.get(), lst = lmem_st_track_.get()](uint32_t wid) {
-      return wtrack->drained(wid) && lst->drained(wid);
+    dlmem_xlate_->set_drained_query([wtrack = dlmem_wtrack_.get(), lacc = lmem_acc_track_.get()](uint32_t wid) {
+      return wtrack->drained(wid) && lacc->drained(wid);
     });
     scheduler_->peer_wr_out().bind(&dlmem_xlate_->PeerWrIn);
   #endif
@@ -872,9 +872,9 @@ public:
       return true;
     }
   #ifdef VX_CFG_EXT_DLMEM_ENABLE
-    // A committed store can still wait in the translation stage, for its remote
-    // ack or for its local bank write.
-    if (!dlmem_xlate_->empty() || !dlmem_wtrack_->empty() || !lmem_st_track_->empty()) {
+    // A committed access can still wait in the translation stage, for a remote
+    // ack or for its local bank commit.
+    if (!dlmem_xlate_->empty() || !dlmem_wtrack_->empty() || !lmem_acc_track_->empty()) {
       return true;
     }
   #endif
@@ -1027,7 +1027,7 @@ public:
   const std::shared_ptr<LocalMemSwitch>& lmem_switch(uint32_t idx) const { return lmem_switch_.at(idx); }
 
 #ifdef VX_CFG_EXT_DLMEM_ENABLE
-  bool dlmem_drained(uint32_t wid) const { return dlmem_wtrack_->drained(wid) && lmem_st_track_->drained(wid); }
+  bool dlmem_drained(uint32_t wid) const { return dlmem_wtrack_->drained(wid) && lmem_acc_track_->drained(wid); }
   SimChannel<uint32_t>& dlmem_ack_in() { return dlmem_wtrack_->DecIn; }
   SimChannel<uint32_t>& dlmem_done_in() { return dlmem_wtrack_->DoneIn; }
 #endif
@@ -1121,7 +1121,7 @@ private:
 #ifdef VX_CFG_EXT_DLMEM_ENABLE
   DlmemXlate::Ptr dlmem_xlate_;
   DlmemWTrack::Ptr dlmem_wtrack_;
-  DlmemWTrack::Ptr lmem_st_track_;
+  DlmemWTrack::Ptr lmem_acc_track_;
 #endif
 };
 

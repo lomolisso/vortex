@@ -394,6 +394,29 @@ module VX_decode import
             `endif
             end
         `endif
+        `ifdef VX_CFG_EXT_MBAR_ENABLE
+            INST_EXT3: begin
+                // mbarrier ops: a .D AMO on a local-memory object, the op in funct3.
+                // funct7 and funct3 5..7 are reserved.
+                if (funct7 == 7'd0 && funct3 <= 3'd4) begin
+                    ex_type = EX_LSU;
+                    op_type = INST_OP_BITS'({1'b0, LSU_FMT_D});
+                    op_args.lsu.is_store = 0;
+                    op_args.lsu.is_float = 0;
+                    op_args.lsu.pack     = 0;
+                    op_args.lsu.offset   = 0;
+                    op_args.lsu.amo_valid    = 1'b1;
+                    op_args.lsu.amo_op       = amo_op_e'(4'(AMO_OP_MBAR_ARRIVE) + 4'(funct3));
+                    op_args.lsu.amo_unsigned = 1'b0;
+                    op_args.lsu.amo_aq       = 1'b0;
+                    // An arrive releases the warp's earlier local-memory accesses.
+                    op_args.lsu.amo_rl       = (funct3 <= 3'd1);
+                    `USED_IREG (rd);
+                    `USED_IREG (rs1);
+                    `USED_IREG (rs2);
+                end
+            end
+        `endif
             INST_SYS : begin
                 if (funct3[1:0] != 0) begin
                     ex_type = EX_SFU;

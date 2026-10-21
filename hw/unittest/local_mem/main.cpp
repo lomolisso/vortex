@@ -17,7 +17,11 @@
 // atomics, loads, stores and DMA traffic. Everything is checked against a
 // golden memory model. DLMEM builds add an input whose stores are
 // acknowledged once committed, as the DLMEM ingress uses it, and report every
-// plain store of the other inputs on a per-bank commit port with its warp.
+// access of the other inputs on a per-bank commit port with its warp: a load or
+// store once the bank performs it, an atomic once it writes back. mbarrier
+// builds run the mbarrier ops against mbar_ref, directed and racing DMA and
+// stores; --neg=<underflow|txrange|align> issues one erroneous op, and the
+// bank's assert must abort the run.
 
 #include "vl_simulator.h"
 #include "VVX_local_mem_top.h"
@@ -38,6 +42,11 @@
 #include <type_traits>
 #include <unordered_map>
 #include <vector>
+
+#ifdef VX_CFG_EXT_MBAR_ENABLE
+#include "mbar_ref.h"
+namespace mbar = vortex::mbar_ref;
+#endif
 
 constexpr uint32_t XLEN       = VX_CFG_XLEN;
 constexpr uint32_t WORD_SIZE  = XLEN / 8;
@@ -86,16 +95,24 @@ constexpr bool COMMIT_EN = true;
 constexpr bool COMMIT_EN = false;
 #endif
 
-// LSU inputs report their plain stores' commits.
-static bool commits_stores(uint32_t lane) {
-  return COMMIT_EN && lane < NUM_LSU_REQS;
+#ifdef VX_CFG_EXT_MBAR_ENABLE
+constexpr bool MBAR_EN = true;
+#else
+constexpr bool MBAR_EN = false;
+#endif
+
+// An LSU input reports the commit of every access the translation counted.
+static bool reports_commits(uint32_t lane, bool counted) {
+  return COMMIT_EN && lane < NUM_LSU_REQS && counted;
 }
 static_assert(WORD_SIZE == 4 || WORD_SIZE == 8, "unsupported XLEN");
 
 // VX_gpu_pkg amo_op_e
 enum AmoOp : uint8_t {
   AMO_LR = 0, AMO_SC = 1, AMO_ADD = 2, AMO_SWAP = 3, AMO_XOR = 4,
-  AMO_OR = 5, AMO_AND = 6, AMO_MIN = 7, AMO_MAX = 8, AMO_CAS = 9
+  AMO_OR = 5, AMO_AND = 6, AMO_MIN = 7, AMO_MAX = 8, AMO_CAS = 9,
+  AMO_MBAR_ARRIVE = 10, AMO_MBAR_ARRIVE_TX = 11, AMO_MBAR_EXPECT_TX = 12,
+  AMO_MBAR_COMPLETE_TX = 13, AMO_MBAR_TEST_WAIT = 14, AMO_MBAR_TRY_WAIT = 15
 };
 
 static const char* amo_name(uint8_t op, bool uns) {
@@ -110,6 +127,12 @@ static const char* amo_name(uint8_t op, bool uns) {
   case AMO_MIN:  return uns ? "AMOMINU" : "AMOMIN";
   case AMO_MAX:  return uns ? "AMOMAXU" : "AMOMAX";
   case AMO_CAS:  return "AMOCAS";
+  case AMO_MBAR_ARRIVE:      return "MBAR_ARRIVE";
+  case AMO_MBAR_ARRIVE_TX:   return "MBAR_ARRIVE_TX";
+  case AMO_MBAR_EXPECT_TX:   return "MBAR_EXPECT_TX";
+  case AMO_MBAR_COMPLETE_TX: return "MBAR_COMPLETE_TX";
+  case AMO_MBAR_TEST_WAIT:   return "MBAR_TEST_WAIT";
+  case AMO_MBAR_TRY_WAIT:    return "MBAR_TRY_WAIT";
   default:       return "AMO?";
   }
 }
@@ -190,6 +213,7 @@ struct LsuReq {
   bool     uns    = false;
   uint64_t cmp    = 0;
   int      wid    = -1; // issuing warp; -1: the hart id is the lane index
+  bool     counted = true; // DLMEM: the translation counted it (attr is_lacc)
 };
 
 // hart id = {core, wid, tid}, with core 0 and the lane as the thread.
@@ -207,6 +231,10 @@ static uint32_t req_wid(uint32_t lane, const LsuReq& r) {
 
 static bool is_plain_store(const LsuReq& r) {
   return r.rw && !r.amo;
+}
+
+static uint32_t req_bank(const LsuReq& r) {
+  return r.addr & (NUM_BANKS - 1);
 }
 
 struct DmaReq {
@@ -365,8 +393,8 @@ public:
     ev.dma_rsp_tag = static_cast<uint32_t>(t->dma_rsp_tag);
 #ifdef VX_CFG_EXT_DLMEM_ENABLE
     for (uint32_t b = 0; b < NUM_BANKS; ++b) {
-      ev.commit[b] = get_bits(t->st_commit_valid, b, 1);
-      ev.commit_wid[b] = static_cast<uint32_t>(get_bits(t->st_commit_wid, b * 8, 8));
+      ev.commit[b] = get_bits(t->lmem_commit_valid, b, 1);
+      ev.commit_wid[b] = static_cast<uint32_t>(get_bits(t->lmem_commit_wid, b * 8, 8));
     }
 #endif
     this->account(ev);
@@ -398,6 +426,9 @@ private:
       set_bits(t->mem_req_amo_unsigned, i, 1, r.uns);
       set_bits(t->mem_req_amo_cmp, i * XLEN, XLEN, r.cmp);
       set_bits(t->mem_req_hart_id, i * HART_BITS, HART_BITS, req_hart_id(i, r));
+#ifdef VX_CFG_EXT_DLMEM_ENABLE
+      set_bits(t->mem_req_lacc, i, 1, r.counted);
+#endif
       set_bits(t->mem_rsp_ready, i, 1, rsp_ready[i]);
     }
     DmaReq d = dma.value_or(DmaReq{});
@@ -412,13 +443,16 @@ private:
     t->dma_rsp_ready = dma_rsp_ready;
   }
 
-  // Per warp, LSU-input plain stores accepted and not yet reported committed:
-  // it must never go negative, and must return to zero once the banks drain.
+  // Per bank and warp, LSU-input accesses accepted and not yet reported
+  // committed: it must never go negative, and must return to zero once the
+  // banks drain.
   void account(const Events& ev) {
     for (uint32_t i = 0; i < NUM_REQS; ++i) {
-      if (ev.lsu_acc[i] && commits_stores(i) && is_plain_store(ev.acc_req[i])) {
-        ++uncommitted[req_wid(i, ev.acc_req[i])];
-        ++accepted_stores;
+      if (ev.lsu_acc[i] && reports_commits(i, ev.acc_req[i].counted)) {
+        uint32_t w = req_wid(i, ev.acc_req[i]);
+        ++uncommitted[w];
+        ++bank_uncommitted[req_bank(ev.acc_req[i])][w];
+        ++accepted;
       }
     }
     for (uint32_t b = 0; b < NUM_BANKS; ++b) {
@@ -427,18 +461,20 @@ private:
       }
       ++commits;
       uint32_t w = ev.commit_wid[b];
-      if (w >= NUM_WARPS || uncommitted[w] == 0) {
+      if (w >= NUM_WARPS || bank_uncommitted[b][w] == 0) {
         commit_errors.push_back(strf("[cycle %" PRIu64 "] bank %u reported a commit of warp %u with no "
-                                     "uncommitted store of that warp", cycle_, b, w));
+                                     "uncommitted access of that warp to the bank", cycle_, b, w));
         continue;
       }
       --uncommitted[w];
+      --bank_uncommitted[b][w];
     }
   }
 
 public:
   std::array<uint64_t, NUM_WARPS> uncommitted{};
-  uint64_t accepted_stores = 0;
+  std::array<std::array<uint64_t, NUM_WARPS>, NUM_BANKS> bank_uncommitted{};
+  uint64_t accepted = 0;
   uint64_t commits = 0;
   std::vector<std::string> commit_errors;
 
@@ -456,6 +492,7 @@ struct Options {
   uint32_t stress_cycles = 20000;
   uint32_t max_report    = 3;
   bool     verbose       = false;
+  std::string neg;
 };
 
 class Testbench {
@@ -467,8 +504,16 @@ public:
   }
 
   int run() {
-    std::printf("local_mem: XLEN=%u lanes=%u banks=%u rows=%u size=%u amo=%d zacas=%d seed=%u\n",
-                XLEN, NUM_REQS, NUM_BANKS, NUM_ROWS, LMEM_SIZE, AMO_EN, CAS_EN, opts_.seed);
+    std::printf("local_mem: XLEN=%u lanes=%u banks=%u rows=%u size=%u amo=%d zacas=%d mbar=%d seed=%u\n",
+                XLEN, NUM_REQS, NUM_BANKS, NUM_ROWS, LMEM_SIZE, AMO_EN, CAS_EN, MBAR_EN, opts_.seed);
+    if (!opts_.neg.empty()) {
+    #ifdef VX_CFG_EXT_MBAR_ENABLE
+      return this->mbar_negative(opts_.neg);
+    #else
+      std::printf("--neg needs an mbarrier build\n");
+      return 2;
+    #endif
+    }
     this->init_memory();
     if (!this->calibrate()) {
       return 1;
@@ -478,10 +523,17 @@ public:
     }
     if (COMMIT_EN) {
       this->store_commit();
+      this->commit();
     }
     if (AMO_EN) {
       this->directed();
       this->lrsc_window();
+    #ifdef VX_CFG_EXT_MBAR_ENABLE
+      this->mbar_directed();
+      for (uint32_t s = 0; s < opts_.stress_seeds; ++s) {
+        this->mbar_stress(opts_.seed * 104729u + s);
+      }
+    #endif
     } else {
       std::printf("atomics disabled (VX_CFG_EXT_A_ENABLE not set): directed atomic runs skipped\n");
     }
@@ -1024,10 +1076,11 @@ private:
 
   ///////////////////////////////////////////////////////////////////////////
   // Store commits: a plain store of an LSU input is reported on its bank's
-  // commit port, with the warp of its hart id, the cycle after the SRAM write;
-  // nothing else is reported. With the store written at bank cycle T, the
-  // report is valid at T+1, which is bank_lat_ + 1 cycles after an
-  // uncontended port handshake and rsp_lat_ - 1 cycles before the
+  // commit port, with the warp of its hart id, the cycle after the SRAM write,
+  // as every access of an LSU input is (see the access commits below); the
+  // ack input and DMA writes are never reported. With the store written at
+  // bank cycle T, the report is valid at T+1, which is bank_lat_ + 1 cycles
+  // after an uncontended port handshake and rsp_lat_ - 1 cycles before the
   // acknowledgement the ack input would get for the same store.
 
   struct Issue {
@@ -1247,16 +1300,25 @@ private:
         LsuReq ld;
         ld.byteen = FULL_BE;
         ld.addr = st.addr;
+        // The load reports too, under another warp.
+        ld.wid = static_cast<int>((wid + 1) % NUM_WARPS);
         ScnRun sr = this->run_issues({this->lsu_issue(0, 0, st), this->lsu_issue(off, ld_lane, ld)}, true, 6);
         ++sweep_runs;
         if (!sr.ok) {
           continue;
         }
         const int st_acc = sr.acc[0], ld_acc = sr.acc[1];
-        const int rep = sr.commits.empty() ? -1 : sr.commits[0].rel;
+        std::vector<CommitEv> st_reps;
+        for (const CommitEv& c : sr.commits) {
+          if (c.wid == wid) {
+            st_reps.push_back(c);
+          }
+        }
+        const int rep = st_reps.empty() ? -1 : st_reps[0].rel;
         std::string ctx = strf("bank %u, load from +%d: store accepted +%d, reported +%d, load accepted +%d, "
                                "returned %s", bank, off, st_acc, rep, ld_acc, hex(sr.data[1]).c_str());
-        if (sr.commits.size() != 1 || rep != st_acc + commit_lat || sr.commits[0].wid != wid) {
+        const size_t want_reps = (reports_commits(ld_lane, ld.counted) && NUM_WARPS > 1) ? 2 : 1;
+        if (st_reps.size() != 1 || rep != st_acc + commit_lat || sr.commits.size() != want_reps) {
           this->fail(strf("FAIL store-commit %s: expected one report of warp %u at +%d", ctx.c_str(), wid,
                           st_acc + commit_lat));
         }
@@ -1278,7 +1340,7 @@ private:
     std::printf("store-commit: load sweep %u runs, %u loads after the store, %u reaching the bank in the report "
                 "cycle\n", sweep_runs, after_store, at_report);
 
-    // Nothing else is reported: the ack input's stores, loads, atomics, DMA writes.
+    // The ack input's stores and DMA writes are not reported.
     uint32_t silent_runs = 0;
     auto expect_silent = [&](const char* what, std::vector<Issue> issues) {
       ScnRun sr = this->run_issues(std::move(issues), true, 8);
@@ -1293,11 +1355,6 @@ private:
       rows.push_back(row);
       LsuReq st = this->plain_store(row, bank, 0, FULL_BE);
       expect_silent("a store of the ack input", {this->lsu_issue(0, ACK_LANE, st)});
-      LsuReq ld;
-      ld.byteen = FULL_BE;
-      ld.addr = word_addr(row, bank);
-      ld.wid = 0;
-      expect_silent("a load", {this->lsu_issue(0, 0, ld)});
       DmaReq dw;
       dw.rw = true;
       dw.row = row;
@@ -1310,32 +1367,8 @@ private:
       di.dma = true;
       di.dreq = dw;
       expect_silent("a DMA write", {di});
-      if (AMO_EN) {
-        for (int width = 0; width < NUM_WIDTHS; ++width) {
-          LsuReq amo;
-          amo.amo = true;
-          amo.op = AMO_ADD;
-          amo.byteen = lane_byteen(width);
-          amo.addr = word_addr(row, bank);
-          amo.data = lane_position(width, this->rand_word());
-          amo.wid = 0;
-          this->gold(row, bank) = amo_new_word(amo, this->gold(row, bank));
-          expect_silent("an AMOADD", {this->lsu_issue(0, 0, amo)});
-          LsuReq lr = amo;
-          lr.op = AMO_LR;
-          LsuReq sc = amo;
-          sc.op = AMO_SC;
-          sc.data = lane_position(width, this->rand_word());
-          this->gold(row, bank) = merge(this->gold(row, bank), sc.data, sc.byteen);
-          expect_silent("an LR/SC pair", {this->lsu_issue(0, 0, lr), this->lsu_issue(1, 0, sc)});
-          LsuReq sc_fail = sc;
-          sc_fail.data = lane_position(width, this->rand_word());
-          expect_silent("a failing SC", {this->lsu_issue(0, 0, sc_fail)});
-        }
-      }
     }
-    std::printf("store-commit: %u runs of ack-input stores, loads, DMA writes%s without a report\n", silent_runs,
-                AMO_EN ? ", AMOs, LR/SC" : "");
+    std::printf("store-commit: %u runs of ack-input stores and DMA writes without a report\n", silent_runs);
 
     // Stalled stores: the report moves with the SRAM write. Each scenario runs
     // twice, the victim store once on an LSU input (its report) and once on the
@@ -1366,6 +1399,8 @@ private:
         rows.push_back(row);
         rows.push_back(row2);
         uint32_t wid = this->rand_below(NUM_WARPS);
+        // The aux requests report too; their warp tells them from the victim.
+        const int aux_wid = static_cast<int>((wid + 1) % NUM_WARPS);
         for (int twin = 0; twin < 2; ++twin) {
           const std::vector<uint32_t>& aux = twin ? aux_b : aux_a;
           const uint32_t victim = twin ? static_cast<uint32_t>(ACK_LANE) : 0;
@@ -1391,13 +1426,15 @@ private:
             amo.byteen = FULL_BE;
             amo.addr = word_addr(row2, bank);
             amo.data = this->rand_word();
+            amo.wid = aux_wid;
             this->gold(row2, bank) = amo_new_word(amo, this->gold(row2, bank));
             issues.push_back(this->lsu_issue(0, aux[0], amo));
           } else {
-            LsuReq s1 = this->plain_store(row2, bank, 0, FULL_BE);
+            LsuReq s1 = this->plain_store(row2, bank, aux_wid, FULL_BE);
             LsuReq ld;
             ld.byteen = FULL_BE;
             ld.addr = s1.addr;
+            ld.wid = aux_wid;
             issues.push_back(this->lsu_issue(0, aux[0], s1));
             issues.push_back(this->lsu_issue(1, aux[1], ld));
             victim_at = 2;
@@ -1414,7 +1451,8 @@ private:
           }
           acc[twin] = sr.acc[v];
           if (twin == 0) {
-            if (sr.commits.empty() || sr.commits.back().bank != bank || sr.commits.back().wid != wid) {
+            if (sr.commits.empty() || sr.commits.back().bank != bank
+             || (sr.commits.back().wid != wid && NUM_WARPS > 1)) {
               this->fail(strf("FAIL store-commit %s bank %u: no report of the stalled store's warp %u",
                               st_names[kind], bank, wid));
               ok = false;
@@ -1423,8 +1461,8 @@ private:
             evt[0] = sr.commits.back().rel;
           } else {
             evt[1] = sr.rsp[v];
-            if (!sr.commits.empty() && sr.commits.back().wid == wid && sr.commits.back().rel >= sr.acc[v]
-             && kind != ST_RDW) {
+            if (NUM_WARPS > 1 && !sr.commits.empty() && sr.commits.back().wid == wid
+             && sr.commits.back().rel >= sr.acc[v]) {
               this->fail(strf("FAIL store-commit %s bank %u: the ack input's store was reported",
                               st_names[kind], bank));
             }
@@ -1506,6 +1544,1013 @@ private:
     this->check_rows("store-commit", rows);
     std::printf("store-commit: %s\n\n", (failures_ == before) ? "ok" : "FAILED");
   }
+
+  ///////////////////////////////////////////////////////////////////////////
+  // Access commits: every access of an LSU input is reported once, on its
+  // bank's commit port with its warp. A load or plain store reports the cycle
+  // after the bank performs it, bank_lat_ + 1 after an uncontended handshake;
+  // an atomic (LR, SC whether it fails or not, every mbarrier op) the cycle
+  // after its write-back stage, bank_lat_ + 3. The ack input never reports.
+
+  static int commit_delay(const LsuReq& r) {
+    return r.amo ? 3 : 1;
+  }
+
+  // r alone on an idle memory: one report at the expected cycle, bank and
+  // warp from an LSU input, none from the ack input. Returns the response.
+  std::optional<uint64_t> expect_report(const std::string& what, uint32_t lane, const LsuReq& r) {
+    ScnRun sr = this->run_issues({this->lsu_issue(0, lane, r)}, true, 6);
+    ++commit_runs_;
+    if (!sr.ok) {
+      return std::nullopt;
+    }
+    std::string got;
+    for (const auto& c : sr.commits) {
+      got += strf(" {+%d bank %u wid %u}", c.rel, c.bank, c.wid);
+    }
+    if (!reports_commits(lane, r.counted)) {
+      if (!sr.commits.empty()) {
+        this->fail(strf("FAIL commit %s on lane %u (%s) was reported:%s", what.c_str(), lane,
+                        acks_stores(lane) ? "the ack input" : "not counted by the translation", got.c_str()));
+      }
+    } else {
+      const int want = sr.acc[0] + bank_lat_ + commit_delay(r);
+      const uint32_t wid = req_wid(lane, r);
+      if (sr.commits.size() != 1 || sr.commits[0].rel != want || sr.commits[0].bank != req_bank(r)
+       || sr.commits[0].wid != wid) {
+        this->fail(strf("FAIL commit %s lane %u bank %u wid %u: accepted +%d, expected one report at +%d, got%s",
+                        what.c_str(), lane, req_bank(r), wid, sr.acc[0], want, got.empty() ? " none" : got.c_str()));
+      }
+    }
+    if (r.rw && !acks_stores(lane)) {
+      return std::nullopt;
+    }
+    return sr.data[0];
+  }
+
+  void check_ret(const std::string& what, std::optional<uint64_t> got, uint64_t want) {
+    if (!got || *got != want) {
+      this->fail(strf("FAIL %s: returned %s, expected %s", what.c_str(), got ? hex(*got).c_str() : "nothing",
+                      hex(want).c_str()));
+    }
+  }
+
+  void commit() {
+    const uint32_t before = failures_;
+    const uint32_t runs0 = commit_runs_;
+    std::vector<uint32_t> rows;
+
+    // Loads, from every LSU input to every bank, and from the ack input.
+    for (uint32_t lane = 0; lane < NUM_REQS; ++lane) {
+      for (uint32_t bank = 0; bank < NUM_BANKS; ++bank) {
+        uint32_t row = this->rand_below(NUM_ROWS);
+        LsuReq ld;
+        ld.byteen = FULL_BE;
+        ld.addr = word_addr(row, bank);
+        ld.wid = static_cast<int>(this->rand_below(NUM_WARPS));
+        auto ret = this->expect_report("load", lane, ld);
+        this->check_ret(strf("commit load lane %u bank %u", lane, bank), ret, this->gold(row, bank));
+      }
+    }
+    std::printf("commit: loads report at handshake +%d\n", bank_lat_ + 1);
+
+    if (AMO_EN) {
+      // Atomics, LR, SC and a failing SC, at every width, from the first and
+      // last LSU input and the ack input.
+      std::vector<uint32_t> lanes = {0};
+      if (NUM_LSU_REQS > 1) {
+        lanes.push_back(NUM_LSU_REQS - 1);
+      }
+      if (ACK_LANE >= 0) {
+        lanes.push_back(static_cast<uint32_t>(ACK_LANE));
+      }
+      for (uint32_t lane : lanes) {
+        for (uint32_t bank = 0; bank < NUM_BANKS; ++bank) {
+          for (int width = 0; width < NUM_WIDTHS; ++width) {
+            uint32_t row = this->rand_below(NUM_ROWS);
+            rows.push_back(row);
+            uint64_t& g = this->gold(row, bank);
+            const std::string at = strf("lane %u bank %u %s", lane, bank, width_name(width));
+            LsuReq a;
+            a.amo = true;
+            a.byteen = lane_byteen(width);
+            a.addr = word_addr(row, bank);
+            a.wid = static_cast<int>(this->rand_below(NUM_WARPS));
+            for (uint8_t op : {AMO_ADD, AMO_SWAP, AMO_CAS}) {
+              if (op == AMO_CAS && !CAS_EN) {
+                continue;
+              }
+              a.op = op;
+              a.data = lane_position(width, this->rand_word());
+              if (op == AMO_CAS) {
+                uint64_t cur = (XLEN == 64 && width == W_HI) ? (g >> 32) : g;
+                a.cmp = (XLEN == 32 || width != W_D) ? (cur & MASK32) : cur;
+              }
+              auto ret = this->expect_report(amo_name(op, false), lane, a);
+              this->check_ret(strf("commit %s %s", amo_name(op, false), at.c_str()), ret, g);
+              g = amo_new_word(a, g);
+            }
+            a.op = AMO_LR;
+            a.data = 0;
+            this->check_ret("commit LR " + at, this->expect_report("LR", lane, a), g);
+            a.op = AMO_SC;
+            a.data = lane_position(width, this->rand_word());
+            this->check_ret("commit SC " + at, this->expect_report("SC", lane, a), sc_rsp_word(a, false));
+            g = merge(g, a.data, a.byteen);
+            a.data = lane_position(width, this->rand_word());
+            this->check_ret("commit failing SC " + at, this->expect_report("failing SC", lane, a),
+                            sc_rsp_word(a, true));
+          }
+        }
+      }
+      std::printf("commit: atomics, LR, SC and failing SC report at handshake +%d\n", bank_lat_ + 3);
+    }
+
+    // Accesses the translation did not count (the TCU metadata loads share LSU
+    // input 0 and bypass it): performed, never reported.
+    if (COMMIT_EN) {
+      uint32_t silent = 0;
+      std::vector<uint32_t> lanes = {0};
+      if (NUM_LSU_REQS > 1) {
+        lanes.push_back(NUM_LSU_REQS - 1);
+      }
+      for (uint32_t lane : lanes) {
+        for (uint32_t bank = 0; bank < NUM_BANKS; ++bank) {
+          uint32_t row = this->rand_below(NUM_ROWS);
+          rows.push_back(row);
+          uint64_t& g = this->gold(row, bank);
+          const std::string at = strf("uncounted lane %u bank %u", lane, bank);
+          LsuReq r;
+          r.counted = false;
+          r.byteen = FULL_BE;
+          r.addr = word_addr(row, bank);
+          r.wid = static_cast<int>(this->rand_below(NUM_WARPS));
+          this->check_ret("commit load " + at, this->expect_report("uncounted load", lane, r), g);
+          r.rw = true;
+          r.data = this->rand_word();
+          this->expect_report("uncounted store", lane, r);
+          g = r.data;
+          r.rw = false;
+          silent += 2;
+          if (AMO_EN) {
+            r.amo = true;
+            r.op = AMO_ADD;
+            r.data = this->rand_word();
+            this->check_ret("commit AMOADD " + at, this->expect_report("uncounted AMOADD", lane, r), g);
+            g = amo_new_word(r, g);
+            r.op = AMO_LR;
+            r.data = 0;
+            this->check_ret("commit LR " + at, this->expect_report("uncounted LR", lane, r), g);
+            r.op = AMO_SC;
+            r.data = this->rand_word();
+            this->check_ret("commit SC " + at, this->expect_report("uncounted SC", lane, r), sc_rsp_word(r, false));
+            g = merge(g, r.data, r.byteen);
+            silent += 3;
+          #ifdef VX_CFG_EXT_MBAR_ENABLE
+            const uint64_t token = this->rand_word();
+            LsuReq w = mbar_req(AMO_MBAR_TEST_WAIT, row, bank, token, r.wid);
+            w.counted = false;
+            this->check_ret("commit MBAR_TEST_WAIT " + at, this->expect_report("uncounted MBAR_TEST_WAIT", lane, w),
+                            mbar::apply(AMO_MBAR_TEST_WAIT, g, token).ret_word);
+            ++silent;
+          #endif
+          }
+        }
+      }
+      std::printf("commit: %u uncounted accesses from LSU inputs, none reported\n", silent);
+    }
+
+    // Two LSU inputs to one bank, offered together: the reports follow the
+    // bank order, each its own delay after its access, an atomic holding the
+    // bank for three cycles and a load or store for one.
+    if (NUM_LSU_REQS > 1) {
+      enum { K_LD, K_ST, K_AMO, NUM_K_ACC };
+      static const char* knames[NUM_K_ACC] = {"load", "store", "atomic"};
+      uint32_t pair_runs = 0;
+      for (int ka = 0; ka < NUM_K_ACC; ++ka) {
+        for (int kb = 0; kb < NUM_K_ACC; ++kb) {
+          if ((ka == K_AMO || kb == K_AMO) && !AMO_EN) {
+            continue;
+          }
+          for (uint32_t bank = 0; bank < NUM_BANKS; ++bank) {
+            uint32_t rowv[2];
+            rowv[0] = this->rand_below(NUM_ROWS);
+            rowv[1] = this->other_row(rowv[0]);
+            const int kinds[2] = {ka, kb};
+            LsuReq req[2];
+            uint64_t expect[2] = {0, 0};
+            const uint32_t wid0 = this->rand_below(NUM_WARPS);
+            for (int j = 0; j < 2; ++j) {
+              rows.push_back(rowv[j]);
+              LsuReq& r = req[j];
+              r.byteen = FULL_BE;
+              r.addr = word_addr(rowv[j], bank);
+              r.wid = static_cast<int>((wid0 + static_cast<uint32_t>(j)) % NUM_WARPS);
+              uint64_t& g = this->gold(rowv[j], bank);
+              if (kinds[j] == K_ST) {
+                r.rw = true;
+                r.data = this->rand_word();
+                g = r.data;
+              } else if (kinds[j] == K_AMO) {
+                r.amo = true;
+                r.op = AMO_ADD;
+                r.data = this->rand_word();
+                expect[j] = g;
+                g = amo_new_word(r, g);
+              } else {
+                expect[j] = g;
+              }
+            }
+            ScnRun sr = this->run_issues({this->lsu_issue(0, 0, req[0]), this->lsu_issue(0, 1, req[1])}, true, 8);
+            ++pair_runs;
+            if (!sr.ok) {
+              continue;
+            }
+            const int f = (sr.acc[0] <= sr.acc[1]) ? 0 : 1;
+            const int s = 1 - f;
+            const int b1 = sr.acc[f] + bank_lat_;
+            const int b2 = std::max(sr.acc[s] + bank_lat_, b1 + commit_delay(req[f]));
+            const int rep[2] = {f == 0 ? b1 + commit_delay(req[0]) : b2 + commit_delay(req[0]),
+                                f == 1 ? b1 + commit_delay(req[1]) : b2 + commit_delay(req[1])};
+            const CommitEv want[2] = {{rep[f], bank, req_wid(f, req[f])}, {rep[s], bank, req_wid(s, req[s])}};
+            bool good = sr.commits.size() == 2;
+            for (size_t k = 0; good && k < 2; ++k) {
+              good = sr.commits[k].rel == want[k].rel && sr.commits[k].bank == bank && sr.commits[k].wid == want[k].wid;
+            }
+            if (!good) {
+              std::string got;
+              for (const auto& c : sr.commits) {
+                got += strf(" {+%d bank %u wid %u}", c.rel, c.bank, c.wid);
+              }
+              this->fail(strf("FAIL commit pair %s then %s bank %u: accepted +%d/+%d, expected reports {+%d wid %u} "
+                              "{+%d wid %u}, got%s", knames[kinds[f]], knames[kinds[s]], bank, sr.acc[f], sr.acc[s],
+                              want[0].rel, want[0].wid, want[1].rel, want[1].wid, got.empty() ? " none" : got.c_str()));
+            }
+            for (int j = 0; j < 2; ++j) {
+              if (kinds[j] != K_ST && sr.data[j] != expect[j]) {
+                this->fail(strf("FAIL commit pair bank %u: %s returned %s, expected %s", bank, knames[kinds[j]],
+                                hex(sr.data[j]).c_str(), hex(expect[j]).c_str()));
+              }
+            }
+          }
+        }
+      }
+      std::printf("commit: %u two-input runs on one bank, reports in bank order\n", pair_runs);
+    }
+
+    this->check_commit_errors("commit");
+    std::sort(rows.begin(), rows.end());
+    rows.erase(std::unique(rows.begin(), rows.end()), rows.end());
+    this->check_rows("commit", rows);
+    std::printf("commit: %u runs: %s\n\n", commit_runs_ - runs0, (failures_ == before) ? "ok" : "FAILED");
+  }
+
+#ifdef VX_CFG_EXT_MBAR_ENABLE
+  ///////////////////////////////////////////////////////////////////////////
+  // mbarrier ops: amo_op 10..15 on a full doubleword, checked against
+  // mbar_ref::apply. A writing op returns the old word and writes the updated
+  // object back; a wait returns 1 once the token's phase has completed and
+  // writes nothing, and is no reservation-breaking store.
+
+  static LsuReq mbar_req(uint32_t op, uint32_t row, uint32_t bank, uint64_t operand, int wid) {
+    LsuReq r;
+    r.amo = true;
+    r.op = static_cast<uint8_t>(op);
+    r.byteen = FULL_BE;
+    r.addr = word_addr(row, bank);
+    r.data = operand;
+    r.wid = wid;
+    return r;
+  }
+
+  void put_word(uint32_t row, uint32_t bank, uint64_t v) {
+    DmaReq d;
+    d.rw = true;
+    d.row = row;
+    d.be.fill(0);
+    d.be[bank] = FULL_BE;
+    d.data[bank] = v;
+    this->dma_access(d);
+    this->gold(row, bank) = v;
+  }
+
+  uint64_t get_word(uint32_t row, uint32_t bank) {
+    return this->dma_read(row)[bank];
+  }
+
+  // A well-formed object with random fields.
+  uint64_t rand_mbar_word() {
+    uint64_t exp = 1 + this->rand_below(this->rand_below(4) ? 16 : mbar::COUNT_MAX);
+    uint64_t pend = this->rand_below(static_cast<uint32_t>(exp) + 1);
+    int64_t tx = 0;
+    switch (this->rand_below(4)) {
+    case 0: tx = 0; break;
+    case 1: tx = static_cast<int64_t>(this->rand_below(512)) - 256; break;
+    default: tx = static_cast<int64_t>(this->rand_below(2 * mbar::TX_MAX + 1)) - mbar::TX_MAX; break;
+    }
+    return mbar::pack(pend, exp, tx, this->rand_below(2));
+  }
+
+  // An operand that keeps the op on `w` free of errors.
+  uint64_t rand_mbar_operand(uint32_t op, uint64_t w) {
+    const int64_t tx = mbar::tx(w);
+    const uint32_t pend = mbar::pending(w);
+    auto upto = [&](uint64_t n) -> uint64_t {
+      if (n == 0) {
+        return 0;
+      }
+      return this->rand_below(4) ? this->rand_below(static_cast<uint32_t>(std::min<uint64_t>(n, 300)) + 1)
+                                 : (this->rand_below(2) ? n : this->rand_below(static_cast<uint32_t>(n) + 1));
+    };
+    switch (op) {
+    case mbar::OP_ARRIVE:      return this->rand_below(3) ? std::min<uint64_t>(pend, 1 + this->rand_below(2)) : upto(pend);
+    case mbar::OP_ARRIVE_TX:
+    case mbar::OP_EXPECT_TX:   return upto(static_cast<uint64_t>(mbar::TX_MAX - tx));
+    case mbar::OP_COMPLETE_TX: return (tx > 0 && this->rand_below(2)) ? static_cast<uint64_t>(tx)
+                                                                     : upto(static_cast<uint64_t>(tx + mbar::TX_MAX));
+    default: {
+      uint64_t tok = this->rand_word();
+      return this->rand_below(2) ? tok : ((tok & ~(1ull << 63)) | (w & (1ull << 63)));
+    }
+    }
+  }
+
+  // A random op, the arrivals only while something is pending.
+  uint32_t rand_mbar_op(uint64_t w) {
+    for (;;) {
+      uint32_t op = mbar::OP_BASE + this->rand_below(6);
+      if ((op == mbar::OP_ARRIVE || op == mbar::OP_ARRIVE_TX) && mbar::pending(w) == 0) {
+        continue;
+      }
+      return op;
+    }
+  }
+
+  // One op on an idle memory: its returned word, its commit report and the word it leaves.
+  void mbar_one(const std::string& what, uint32_t lane, uint32_t row, uint32_t bank, uint32_t op, uint64_t old,
+                uint64_t operand) {
+    mbar::Result res = mbar::apply(op, old, operand);
+    if (res.err != mbar::ERR_NONE) {
+      this->fail(strf("FAIL mbar %s: the testbench generated an erroneous op", what.c_str()));
+      return;
+    }
+    this->put_word(row, bank, old);
+    LsuReq r = mbar_req(op, row, bank, operand, static_cast<int>(this->rand_below(NUM_WARPS)));
+    std::string ctx = strf("mbar %s: %s old %s operand %s lane %u", what.c_str(), amo_name(r.op, false),
+                           hex(old).c_str(), hex(operand).c_str(), lane);
+    auto ret = this->expect_report(ctx, lane, r);
+    this->check_ret(ctx, ret, res.ret_word);
+    uint64_t want = res.writes ? res.new_word : old;
+    uint64_t got = this->get_word(row, bank);
+    if (got != want) {
+      this->fail(strf("FAIL %s: left %s, expected %s", ctx.c_str(), hex(got).c_str(), hex(want).c_str()));
+    }
+    this->gold(row, bank) = want;
+    ++mbar_ops_[op - mbar::OP_BASE];
+    mbar_flips_ += res.flip;
+  }
+
+  void mbar_directed() {
+    const uint32_t before = failures_;
+    using namespace mbar;
+    const int64_t TM = TX_MAX;
+    struct Vec { uint32_t op; uint64_t old; uint64_t operand; const char* what; };
+    const Vec vecs[] = {
+      {OP_ARRIVE,      init(3),                      1,      "arrive, phase open"},
+      {OP_ARRIVE,      pack(1, 3, 0, 0),             1,      "last arrival flips 0->1"},
+      {OP_ARRIVE,      pack(1, 3, 0, 1),             1,      "last arrival flips 1->0"},
+      {OP_ARRIVE,      init(3),                      3,      "count 3 completes"},
+      {OP_ARRIVE,      init(5),                      2,      "count 2 of 5"},
+      {OP_ARRIVE,      init(2),                      0,      "count 0"},
+      {OP_ARRIVE,      pack(1, 3, 64, 0),            1,      "last arrival, tx outstanding"},
+      {OP_ARRIVE,      init(uint32_t(COUNT_MAX)),    COUNT_MAX, "count COUNT_MAX completes"},
+      {OP_ARRIVE,      pack(2, 3, 0, 0) | (3ull << 61), 1,   "reserved bits written zero"},
+      {OP_ARRIVE_TX,   init(2),                      128,    "arrive_tx, phase open"},
+      {OP_ARRIVE_TX,   pack(1, 2, -64, 0),           64,     "arrive_tx completes a negative tx"},
+      {OP_ARRIVE_TX,   pack(1, 2, 0, 1),             0,      "arrive_tx 0 bytes completes"},
+      {OP_EXPECT_TX,   init(2),                      256,    "expect_tx"},
+      {OP_EXPECT_TX,   pack(0, 2, -64, 1),           64,     "expect after complete flips 1->0"},
+      {OP_EXPECT_TX,   pack(0, 4, 0, 0),             0,      "expect 0 on a finished phase flips"},
+      {OP_EXPECT_TX,   pack(1, 1, TM - 1, 0),        1,      "tx reaches TX_MAX"},
+      {OP_EXPECT_TX,   init(1),                      uint64_t(TM), "expect TX_MAX"},
+      {OP_COMPLETE_TX, init(1),                      64,     "complete before expect: negative tx"},
+      {OP_COMPLETE_TX, pack(0, 1, 64, 0),            64,     "complete_tx flips"},
+      {OP_COMPLETE_TX, pack(1, 1, 100, 0),           100,    "complete_tx, arrival outstanding"},
+      {OP_COMPLETE_TX, pack(1, 1, -(TM - 1), 0),     1,      "tx reaches -TX_MAX"},
+      {OP_COMPLETE_TX, pack(1, 1, TM, 0),            uint64_t(2 * TM), "complete 2*TX_MAX"},
+      {OP_TEST_WAIT,   pack(1, 2, 0, 0),             0,      "wait, phase 0 open"},
+      {OP_TEST_WAIT,   pack(1, 2, 0, 0),             1ull << 63, "wait, phase 0 completed"},
+      {OP_TEST_WAIT,   pack(2, 2, 5, 1),             0,      "wait, phase 1 completed"},
+      {OP_TEST_WAIT,   pack(2, 2, 5, 1),             ~0ull,  "wait, phase 1 open, token all ones"},
+      {OP_TEST_WAIT,   pack(0, 3, -7, 0) | (1ull << 62), 0x7fffffffffffffffull, "wait ignores token low bits"},
+      {OP_TRY_WAIT,    pack(1, 2, 0, 0),             1ull << 63, "op 15 waits like op 14"},
+      {OP_TRY_WAIT,    pack(1, 2, 0, 1),             1ull << 63, "op 15, phase open"},
+    };
+    uint32_t n = 0;
+    for (const Vec& v : vecs) {
+      uint32_t lane = n % NUM_REQS;
+      uint32_t row = this->rand_below(NUM_ROWS);
+      uint32_t bank = n % NUM_BANKS;
+      this->mbar_one(v.what, lane, row, bank, v.op, v.old, v.operand);
+      ++n;
+    }
+    std::printf("mbar: %u directed vectors\n", n);
+
+    for (uint32_t i = 0; i < 400; ++i) {
+      uint64_t w = this->rand_mbar_word();
+      uint32_t op = this->rand_mbar_op(w);
+      uint64_t operand = this->rand_mbar_operand(op, w);
+      this->mbar_one("random vector", this->rand_below(NUM_REQS), this->rand_below(NUM_ROWS),
+                     this->rand_below(NUM_BANKS), op, w, operand);
+    }
+    std::printf("mbar: 400 random vectors\n");
+
+    // Reservations: a wait between LR and SC leaves the reservation, a writing op breaks it.
+    uint32_t res_runs = 0;
+    const uint32_t other = (NUM_LSU_REQS > 1) ? 1 : static_cast<uint32_t>(ACK_LANE);
+    for (uint32_t bank = 0; bank < NUM_BANKS; ++bank) {
+      for (uint32_t op : {uint32_t(OP_TEST_WAIT), uint32_t(OP_TRY_WAIT), uint32_t(OP_ARRIVE), uint32_t(OP_EXPECT_TX)}) {
+        uint32_t row = this->rand_below(NUM_ROWS);
+        uint64_t w = init(4);
+        this->put_word(row, bank, w);
+        LsuReq lr = mbar_req(AMO_LR, row, bank, 0, 0);
+        this->check_ret("mbar LR", this->lsu_access(0, lr), w);
+        uint64_t operand = this->rand_mbar_operand(op, w);
+        mbar::Result res = mbar::apply(op, w, operand);
+        this->check_ret(strf("mbar %s between LR and SC", amo_name(op, false)),
+                        this->lsu_access(other, mbar_req(op, row, bank, operand, 1)), res.ret_word);
+        if (res.writes) {
+          w = res.new_word;
+        }
+        LsuReq sc = mbar_req(AMO_SC, row, bank, this->rand_word(), 0);
+        this->check_ret(strf("mbar SC after %s", amo_name(op, false)), this->lsu_access(0, sc),
+                        sc_rsp_word(sc, res.writes));
+        if (!res.writes) {
+          w = sc.data;
+        }
+        this->gold(row, bank) = w;
+        if (this->get_word(row, bank) != w) {
+          this->fail(strf("FAIL mbar reservation run %s bank %u: word %s, expected %s", amo_name(op, false), bank,
+                          hex(this->get_word(row, bank)).c_str(), hex(w).c_str()));
+        }
+        ++res_runs;
+      }
+    }
+    std::printf("mbar: %u LR/SC runs around waits and writing ops\n", res_runs);
+
+    this->mbar_wait_hold();
+    this->check_commit_errors("mbar");
+    std::printf("mbar directed: %s\n", (failures_ == before) ? "ok" : "FAILED");
+  }
+
+  // A wait's response held by back-pressure keeps its 0/1 outcome while DMA
+  // traffic re-drives the bank and rewrites the object. k loads ahead of it on
+  // the same port fill the response path, so the wait's own response can stall
+  // in the bank. The object is rewritten once the wait's commit report shows it
+  // performed.
+  void mbar_wait_hold() {
+    const uint32_t lane = 0;
+    const int stall_cycles = 30;
+    uint32_t runs = 0, stalled = 0;
+    for (uint32_t k = 0; k <= 4; ++k) {
+      for (uint32_t bank = 0; bank < NUM_BANKS; ++bank) {
+        const uint32_t row = this->rand_below(NUM_ROWS);
+        uint64_t w = this->rand_mbar_word() | 0x123ull;
+        this->put_word(row, bank, w);
+        const uint64_t token = this->rand_below(2) ? 0 : (1ull << 63);
+        const uint64_t want = mbar::apply(mbar::OP_TEST_WAIT, w, token).ret_word;
+        std::deque<std::pair<LsuReq, uint64_t>> todo, sent;
+        for (uint32_t i = 0; i < k; ++i) {
+          uint32_t r2 = this->other_row(row);
+          LsuReq ld;
+          ld.byteen = FULL_BE;
+          ld.addr = word_addr(r2, bank);
+          ld.wid = 1;
+          todo.push_back({ld, this->gold(r2, bank)});
+        }
+        todo.push_back({mbar_req(mbar::OP_TEST_WAIT, row, bank, token, 0), want});
+        const uint64_t w2 = (w ^ (1ull << 63)) ^ 0xff00ull;
+        int wait_rep = -1, release = stall_cycles;
+        bool dma_done = false;
+        std::vector<uint64_t> got;
+        for (int rel = 0; rel < 200 && got.size() < k + 1; ++rel) {
+          if (!dut_.lane[lane] && !todo.empty()) {
+            todo.front().first.tag = this->next_tag();
+            dut_.lane[lane] = todo.front().first;
+            sent.push_back(todo.front());
+            todo.pop_front();
+          }
+          if (wait_rep >= 0 && !dma_done && !dut_.dma) {
+            DmaReq d;
+            d.rw = true;
+            d.row = row;
+            d.be.fill(0);
+            d.be[bank] = FULL_BE;
+            d.data[bank] = w2;
+            d.tag = this->next_dma_tag();
+            dut_.dma = d;
+            dma_done = true;
+          } else if (dma_done && !dut_.dma && rel < release) {
+            DmaReq d;
+            d.rw = false;
+            d.row = row;
+            d.tag = this->next_dma_tag();
+            dut_.dma = d;
+          }
+          dut_.rsp_ready[lane] = (rel >= release);
+          Events ev = dut_.clock();
+          if (ev.commit[bank] && ev.commit_wid[bank] == 0 && wait_rep < 0) {
+            wait_rep = rel;
+            if (rel < release) {
+              release = rel + 10;
+              ++stalled;
+            }
+          }
+          if (ev.lsu_rsp[lane]) {
+            got.push_back(ev.rsp_data[lane]);
+          }
+        }
+        dut_.rsp_ready[lane] = true;
+        for (uint32_t i = 0; i < 8; ++i) {
+          dut_.clock();
+        }
+        dut_.dma.reset();
+        this->idle(2);
+        if (dma_done) {
+          this->gold(row, bank) = w2;
+        }
+        ++runs;
+        if (got.size() != k + 1) {
+          this->fail(strf("FAIL mbar wait hold k=%u bank %u: %zu responses of %u", k, bank, got.size(), k + 1));
+          continue;
+        }
+        for (uint32_t i = 0; i <= k; ++i) {
+          if (got[i] != sent[i].second) {
+            this->fail(strf("FAIL mbar wait hold k=%u bank %u: response %u (%s) is %s, expected %s", k, bank, i,
+                            i == k ? "the wait" : "a load", hex(got[i]).c_str(), hex(sent[i].second).c_str()));
+          }
+        }
+      }
+    }
+    if (stalled == 0) {
+      this->fail("FAIL mbar wait hold: no wait performed while its port's responses were stalled");
+    }
+    std::printf("mbar: %u waits behind stalled responses (%u performed during the stall), the object rewritten "
+                "behind them\n", runs, stalled);
+  }
+
+  // Random op streams on a few objects from every input, racing each other,
+  // DMA writes of the same objects, DMA reads of their rows and loads and
+  // stores of the neighbouring words. Ops on one bank perform in handshake
+  // order, so each is modelled when its port takes it; an object takes at most
+  // one staged op at a time, so its operands are always chosen error-free. A
+  // DMA write racing an object's op is resolved by the op's returned word: the
+  // DMA word has the other phase, so the two orders return different words.
+  struct MbarObj {
+    uint32_t row = 0, bank = 0;
+    uint64_t gold = 0;
+    int      staged = -1;          // lane holding an op to it, not yet taken
+    uint32_t outstanding = 0;      // taken, not yet answered (ops with a response)
+    bool     unconfirmed_store = false;
+    uint64_t store_cycle = 0;
+    bool     dma_pending = false;  // a DMA write of it is offered
+    bool     racing = false;       // a DMA write landed with one op outstanding
+    uint64_t dma_word = 0;
+  };
+  struct MbarPend {
+    uint32_t lane = 0;
+    int      obj = -1;             // -1: a neighbouring word
+    uint32_t op = 0;
+    uint64_t operand = 0;
+    uint64_t before = 0;
+    uint64_t exp_ret = 0;
+    uint64_t taken = 0;
+    bool     race = false;
+    uint64_t alt_ret = 0, final_a = 0, final_b = 0;
+  };
+
+  void mbar_stress(uint32_t seed) {
+    const uint32_t before = failures_;
+    std::mt19937_64 rng(seed);
+    auto rnd = [&](uint32_t n) { return static_cast<uint32_t>(rng() % n); };
+    auto chance = [&](uint32_t pct) { return rnd(100) < pct; };
+    const uint32_t OBJ_ROWS = 2, NB_ROWS = 4, DMA_ROWS = 2;
+    const uint32_t nb_row0 = OBJ_ROWS, dma_row0 = OBJ_ROWS + NB_ROWS;
+
+    std::vector<MbarObj> objs;
+    for (uint32_t row = 0; row < OBJ_ROWS; ++row) {
+      for (uint32_t b = 0; b < NUM_BANKS; ++b) {
+        MbarObj o;
+        o.row = row;
+        o.bank = b;
+        o.gold = mbar::init(1 + rnd(6));
+        this->put_word(row, b, o.gold);
+        objs.push_back(o);
+      }
+    }
+    std::array<std::vector<uint32_t>, NUM_REQS> priv;
+    uint32_t next_owner = 0;
+    for (uint32_t row = nb_row0; row < nb_row0 + NB_ROWS; ++row) {
+      for (uint32_t b = 0; b < NUM_BANKS; ++b) {
+        priv[next_owner++ % NUM_REQS].push_back(row * NUM_BANKS + b);
+      }
+    }
+
+    std::unordered_map<uint32_t, MbarPend> pend;
+    std::array<std::optional<MbarPend>, NUM_REQS> staged;
+    std::deque<DmaPending> dma_pend;
+    std::optional<int> dma_obj;   // the object the offered DMA write targets
+    uint64_t n_ops[6] = {}, n_flips = 0, n_ld = 0, n_st = 0, n_init = 0, n_dma_wr = 0, n_dma_rd = 0;
+    uint64_t n_race_op_first = 0, n_race_dma_first = 0, n_dma_obj = 0;
+    uint32_t errors = 0;
+    const uint64_t start = dut_.cycle();
+    uint64_t last_progress = start;
+    auto report = [&](const std::string& m) {
+      ++errors;
+      if (errors <= 10) {
+        this->fail(strf("FAIL mbar stress seed=%u [cycle %" PRIu64 "] %s", seed, dut_.cycle(), m.c_str()));
+      } else {
+        ++failures_;
+      }
+    };
+
+    auto gen_lane = [&](uint32_t l) {
+      LsuReq r;
+      r.wid = static_cast<int>(rnd(NUM_WARPS));
+      MbarPend p;
+      p.lane = l;
+      uint32_t kind = rnd(100);
+      if (kind < 60) {
+        std::vector<int> free;
+        for (size_t j = 0; j < objs.size(); ++j) {
+          const MbarObj& o = objs[j];
+          if (o.staged < 0 && !o.dma_pending && !o.racing) {
+            free.push_back(static_cast<int>(j));
+          }
+        }
+        if (free.empty()) {
+          return;
+        }
+        int j = free[rnd(static_cast<uint32_t>(free.size()))];
+        MbarObj& o = objs[j];
+        p.obj = j;
+        if (chance(8)) {
+          // Re-initialise it with a plain store, as software does.
+          r.rw = true;
+          r.byteen = FULL_BE;
+          r.addr = word_addr(o.row, o.bank);
+          r.data = mbar::init(1 + rnd(6));
+          p.op = 0;
+        } else {
+          uint32_t op;
+          do {
+            op = mbar::OP_BASE + rnd(6);
+          } while ((op == mbar::OP_ARRIVE || op == mbar::OP_ARRIVE_TX) && mbar::pending(o.gold) == 0);
+          const int64_t tx = mbar::tx(o.gold);
+          uint64_t operand;
+          switch (op) {
+          case mbar::OP_ARRIVE:
+            operand = chance(70) ? 1 : 1 + rnd(mbar::pending(o.gold));
+            break;
+          case mbar::OP_ARRIVE_TX:
+          case mbar::OP_EXPECT_TX:
+            operand = rnd(static_cast<uint32_t>(std::min<int64_t>(mbar::TX_MAX - tx, 256)) + 1);
+            break;
+          case mbar::OP_COMPLETE_TX:
+            operand = (tx > 0 && chance(50)) ? static_cast<uint64_t>(tx)
+                                             : rnd(static_cast<uint32_t>(std::min<int64_t>(tx + mbar::TX_MAX, 256)) + 1);
+            break;
+          default:
+            operand = (rng() & ~(1ull << 63)) | (uint64_t(rnd(2)) << 63);
+            break;
+          }
+          r = mbar_req(op, o.row, o.bank, operand, r.wid);
+          p.op = op;
+          p.operand = operand;
+        }
+        o.staged = static_cast<int>(l);
+      } else {
+        const uint32_t w = priv[l][rnd(static_cast<uint32_t>(priv[l].size()))];
+        r.addr = word_addr(w / NUM_BANKS, w % NUM_BANKS);
+        r.byteen = FULL_BE;
+        if (chance(50)) {
+          p.exp_ret = gold_[w];
+          p.op = 1;
+          ++n_ld;
+        } else {
+          r.rw = true;
+          r.byteen = 1 + rnd(FULL_BE);
+          r.data = rng() & WORD_MASK;
+          gold_[w] = merge(gold_[w], r.data, r.byteen);
+          p.op = 2;
+          ++n_st;
+        }
+      }
+      r.tag = this->next_tag();
+      dut_.lane[l] = r;
+      staged[l] = p;
+    };
+
+    // The offered request on lane l was taken: model it in handshake order.
+    auto taken = [&](uint32_t l, const LsuReq& r) {
+      MbarPend p = *staged[l];
+      staged[l].reset();
+      p.taken = dut_.cycle();
+      if (p.obj >= 0) {
+        MbarObj& o = objs[p.obj];
+        o.staged = -1;
+        if (r.rw) {
+          o.gold = r.data;
+          o.unconfirmed_store = true;
+          o.store_cycle = p.taken;
+          ++n_init;
+          if (acks_stores(l)) {
+            MbarPend ack = p;
+            ack.obj = -1;
+            ack.op = 2;
+            pend[r.tag] = ack;
+          }
+          return;
+        }
+        mbar::Result res = mbar::apply(p.op, o.gold, p.operand);
+        if (res.err != mbar::ERR_NONE) {
+          report("the testbench generated an erroneous op");
+        }
+        p.before = o.gold;
+        p.exp_ret = res.ret_word;
+        if (res.writes) {
+          o.gold = res.new_word;
+        }
+        ++o.outstanding;
+        ++n_ops[p.op - mbar::OP_BASE];
+        n_flips += res.flip;
+        pend[r.tag] = p;
+      } else if (!r.rw || acks_stores(l)) {
+        pend[r.tag] = p;
+      }
+    };
+
+    auto gen_dma = [&]() {
+      DmaReq d;
+      d.tag = this->next_dma_tag();
+      uint32_t kind = rnd(100);
+      if (kind < 35) {
+        // One object, with one op or none outstanding.
+        std::vector<int> ok;
+        for (size_t j = 0; j < objs.size(); ++j) {
+          const MbarObj& o = objs[j];
+          if (o.staged < 0 && !o.racing && !o.dma_pending && !o.unconfirmed_store && o.outstanding <= 1) {
+            ok.push_back(static_cast<int>(j));
+          }
+        }
+        if (ok.empty()) {
+          return;
+        }
+        int j = ok[rnd(static_cast<uint32_t>(ok.size()))];
+        MbarObj& o = objs[j];
+        // The other phase, and enough pending for the op it may race.
+        uint64_t need = 1, ph = mbar::phase(o.gold);
+        for (const auto& kv : pend) {
+          if (kv.second.obj == j) {
+            ph = mbar::phase(kv.second.before);
+            if (kv.second.op == mbar::OP_ARRIVE) {
+              need = std::max<uint64_t>(need, kv.second.operand);
+            }
+          }
+        }
+        const uint64_t pnd = std::min<uint64_t>(need + rnd(4), mbar::COUNT_MAX);
+        o.dma_word = mbar::pack(pnd, std::max<uint64_t>(pnd, 1 + rnd(16)), 0, static_cast<uint32_t>(ph ^ 1));
+        o.dma_pending = true;
+        dma_obj = j;
+        d.rw = true;
+        d.row = o.row;
+        d.be.fill(0);
+        d.be[o.bank] = FULL_BE;
+        d.data[o.bank] = o.dma_word;
+        ++n_dma_obj;
+      } else if (kind < 60) {
+        d.rw = true;
+        d.row = dma_row0 + rnd(DMA_ROWS);
+        for (uint32_t b = 0; b < NUM_BANKS; ++b) {
+          d.data[b] = rng() & WORD_MASK;
+          d.be[b] = rnd(FULL_BE + 1);
+          this->gold(d.row, b) = dma_merge(d, b, this->gold(d.row, b));
+        }
+        ++n_dma_wr;
+      } else {
+        d.rw = false;
+        d.row = rnd(dma_row0 + DMA_ROWS);
+        DmaPending dp{d.tag, d.row, {}, dut_.cycle()};
+        for (uint32_t b = 0; b < NUM_BANKS; ++b) {
+          dp.expect[b] = this->gold(d.row, b);
+        }
+        dma_pend.push_back(dp);
+        ++n_dma_rd;
+      }
+      dut_.dma = d;
+    };
+
+    auto dma_landed = [&]() {
+      if (!dma_obj) {
+        return;
+      }
+      MbarObj& o = objs[*dma_obj];
+      o.dma_pending = false;
+      if (o.outstanding == 0) {
+        o.gold = o.dma_word;
+      } else {
+        for (auto& kv : pend) {
+          MbarPend& p = kv.second;
+          if (p.obj != *dma_obj) {
+            continue;
+          }
+          mbar::Result alt = mbar::apply(p.op, o.dma_word, p.operand);
+          if (alt.err != mbar::ERR_NONE) {
+            report("the racing DMA word makes the op erroneous");
+          }
+          p.race = true;
+          p.alt_ret = alt.ret_word;
+          p.final_a = o.dma_word;
+          p.final_b = alt.writes ? alt.new_word : o.dma_word;
+        }
+        o.racing = true;
+      }
+      dma_obj.reset();
+    };
+
+    auto busy = [&]() {
+      if (!pend.empty() || !dma_pend.empty() || dut_.dma) {
+        return true;
+      }
+      for (uint32_t l = 0; l < NUM_REQS; ++l) {
+        if (dut_.lane[l]) {
+          return true;
+        }
+      }
+      return false;
+    };
+
+    bool draining = false;
+    while (true) {
+      const uint64_t now = dut_.cycle();
+      if (!draining && now - start >= opts_.stress_cycles / 2) {
+        draining = true;
+      }
+      if (draining && !busy()) {
+        break;
+      }
+      if (now - last_progress > 2000) {
+        report("no progress for 2000 cycles (deadlock)");
+        dut_.dma.reset();
+        for (auto& l : dut_.lane) {
+          l.reset();
+        }
+        break;
+      }
+      if (!draining) {
+        for (uint32_t l = 0; l < NUM_REQS; ++l) {
+          if (!dut_.lane[l] && chance(50)) {
+            gen_lane(l);
+          }
+        }
+        if (!dut_.dma && chance(40)) {
+          gen_dma();
+        }
+      }
+      for (uint32_t l = 0; l < NUM_REQS; ++l) {
+        dut_.rsp_ready[l] = chance(80);
+      }
+      dut_.dma_rsp_ready = chance(70);
+      Events ev = dut_.clock();
+      if (ev.any()) {
+        last_progress = dut_.cycle();
+      }
+      if (ev.dma_acc) {
+        dma_landed();
+      }
+      for (uint32_t l = 0; l < NUM_REQS; ++l) {
+        if (ev.lsu_acc[l]) {
+          taken(l, ev.acc_req[l]);
+        }
+      }
+      for (uint32_t l = 0; l < NUM_REQS; ++l) {
+        if (!ev.lsu_rsp[l]) {
+          continue;
+        }
+        auto it = pend.find(ev.rsp_tag[l]);
+        if (it == pend.end()) {
+          report(strf("lane %u: response with unknown tag 0x%x", l, ev.rsp_tag[l]));
+          continue;
+        }
+        MbarPend p = it->second;
+        pend.erase(it);
+        const uint64_t got = ev.rsp_data[l];
+        if (p.obj < 0) {
+          if (p.op == 1 && got != p.exp_ret) {
+            report(strf("lane %u load of a neighbouring word: expected %s, got %s", l, hex(p.exp_ret).c_str(),
+                        hex(got).c_str()));
+          }
+          continue;
+        }
+        MbarObj& o = objs[p.obj];
+        --o.outstanding;
+        if (o.unconfirmed_store && p.taken > o.store_cycle) {
+          o.unconfirmed_store = false;
+        }
+        const std::string what = strf("lane %u %s operand %s on object (row %u, bank %u), word before %s", l,
+                                      amo_name(p.op, false), hex(p.operand).c_str(), o.row, o.bank,
+                                      hex(p.before).c_str());
+        if (p.race) {
+          o.racing = false;
+          if (got == p.exp_ret) {
+            o.gold = p.final_a;
+            ++n_race_op_first;
+          } else if (got == p.alt_ret) {
+            o.gold = p.final_b;
+            ++n_race_dma_first;
+          } else {
+            report(strf("%s, racing a DMA write of %s: returned %s, expected %s (op first) or %s (DMA first)",
+                        what.c_str(), hex(o.dma_word).c_str(), hex(got).c_str(), hex(p.exp_ret).c_str(),
+                        hex(p.alt_ret).c_str()));
+          }
+        } else if (got != p.exp_ret) {
+          report(strf("%s: returned %s, expected %s", what.c_str(), hex(got).c_str(), hex(p.exp_ret).c_str()));
+        }
+      }
+      if (ev.dma_rsp) {
+        if (dma_pend.empty()) {
+          report("unexpected DMA response");
+        } else {
+          DmaPending dp = dma_pend.front();
+          dma_pend.pop_front();
+          for (uint32_t b = 0; b < NUM_BANKS && dp.row >= dma_row0; ++b) {
+            if (ev.dma_rsp_data[b] != dp.expect[b]) {
+              report(strf("DMA read (row 0x%x, bank %u): expected %s, got %s", dp.row, b, hex(dp.expect[b]).c_str(),
+                          hex(ev.dma_rsp_data[b]).c_str()));
+            }
+          }
+        }
+      }
+    }
+    dut_.rsp_ready.fill(true);
+    dut_.dma_rsp_ready = true;
+    this->idle(8);
+    for (const MbarObj& o : objs) {
+      this->gold(o.row, o.bank) = o.gold;
+    }
+    std::vector<uint32_t> rows;
+    for (uint32_t row = 0; row < dma_row0 + DMA_ROWS; ++row) {
+      rows.push_back(row);
+    }
+    this->check_rows("mbar stress", rows);
+    for (uint32_t w = 0; w < NUM_WARPS; ++w) {
+      if (dut_.uncommitted[w] != 0) {
+        report(strf("warp %u: %" PRIu64 " LSU-input access(es) never reported committed", w, dut_.uncommitted[w]));
+      }
+    }
+    this->check_commit_errors("mbar stress");
+    if (n_race_op_first + n_race_dma_first == 0) {
+      report("no DMA write raced an op on its object");
+    }
+    std::printf("mbar stress seed=%u: %" PRIu64 " cycles, ops arrive %" PRIu64 " arrive_tx %" PRIu64 " expect_tx %"
+                PRIu64 " complete_tx %" PRIu64 " test_wait %" PRIu64 " op15 %" PRIu64 ", %" PRIu64 " flips, %" PRIu64
+                " re-inits; %" PRIu64 " DMA writes of objects, races resolved op-first %" PRIu64 " / DMA-first %"
+                PRIu64 "; neighbours %" PRIu64 " ld + %" PRIu64 " st; DMA %" PRIu64 " wr + %" PRIu64 " rd; %s\n",
+                seed, dut_.cycle() - start, n_ops[0], n_ops[1], n_ops[2], n_ops[3], n_ops[4], n_ops[5], n_flips,
+                n_init, n_dma_obj, n_race_op_first, n_race_dma_first, n_ld, n_st, n_dma_wr, n_dma_rd,
+                (failures_ == before) ? "ok" : "FAILED");
+  }
+
+  // One erroneous op; the bank must abort the run with its assert.
+  int mbar_negative(const std::string& kind) {
+    const uint32_t row = 5 % NUM_ROWS, bank = NUM_BANKS - 1;
+    LsuReq r;
+    if (kind == "underflow") {
+      this->put_word(row, bank, mbar::init(1));
+      r = mbar_req(mbar::OP_ARRIVE, row, bank, 2, 0);
+    } else if (kind == "txrange") {
+      this->put_word(row, bank, mbar::init(1));
+      r = mbar_req(mbar::OP_EXPECT_TX, row, bank, uint64_t(mbar::TX_MAX) + 1, 0);
+    } else if (kind == "align") {
+      this->put_word(row, bank, mbar::init(5));
+      r = mbar_req(mbar::OP_ARRIVE, row, bank, 1, 0);
+      r.byteen = 0x0f;
+    } else {
+      std::printf("unknown --neg=%s\n", kind.c_str());
+      return 2;
+    }
+    std::printf("neg %s: issuing %s; the bank's assert must abort the run here\n", kind.c_str(),
+                amo_name(r.op, false));
+    std::fflush(stdout);
+    this->lsu_access(0, r);
+    this->idle(8);
+    std::printf("FAILED: neg %s did not abort\n", kind.c_str());
+    return 1;
+  }
+
+  uint64_t mbar_ops_[6] = {};
+  uint64_t mbar_flips_ = 0;
+#endif
 
   ///////////////////////////////////////////////////////////////////////////
   // Directed: one atomic on one bank and one DMA access injected at a fixed
@@ -2694,7 +3739,7 @@ private:
     uint32_t wr_stall_run = 0, wr_stall_max = 0;
     const uint64_t start = dut_.cycle();
     uint64_t last_progress = start;
-    const uint64_t st0 = dut_.accepted_stores, cm0 = dut_.commits;
+    const uint64_t st0 = dut_.accepted, cm0 = dut_.commits;
 
     auto report = [&](const std::string& m) {
       ++errors;
@@ -2714,8 +3759,9 @@ private:
       }
       LsuReq r;
       r.tag = this->next_tag();
-      if (commits_stores(l)) {
+      if (reports_commits(l, true)) {
         r.wid = static_cast<int>(rnd(NUM_WARPS));
+        r.counted = rnd(4) != 0;
       }
       Pending p{l, -1, 0, dut_.cycle(), ""};
       uint32_t kind = rnd(100);
@@ -2927,7 +3973,7 @@ private:
       this->idle(4);
       for (uint32_t w = 0; w < NUM_WARPS; ++w) {
         if (dut_.uncommitted[w] != 0) {
-          report(strf("warp %u: %" PRIu64 " LSU-input store(s) never reported committed", w, dut_.uncommitted[w]));
+          report(strf("warp %u: %" PRIu64 " LSU-input access(es) never reported committed", w, dut_.uncommitted[w]));
         }
       }
       this->check_commit_errors("stress");
@@ -2964,9 +4010,9 @@ private:
       }
     }
     if (COMMIT_EN) {
-      std::printf("stress seed=%u: %" PRIu64 " LSU-input stores, %" PRIu64
+      std::printf("stress seed=%u: %" PRIu64 " LSU-input accesses, %" PRIu64
                   " commits reported in total, per-warp balance 0\n",
-                  seed, dut_.accepted_stores - st0, dut_.commits - cm0);
+                  seed, dut_.accepted - st0, dut_.commits - cm0);
     }
   }
 
@@ -2990,10 +4036,12 @@ private:
   uint32_t tag_ = 0;
   uint32_t dma_tag_ = 0;
   uint32_t failures_ = 0;
+  uint32_t commit_runs_ = 0;
 };
 
 static void usage(const char* prog) {
-  std::printf("usage: %s [--seed=N] [--stress-seeds=N] [--stress-cycles=N] [--max-report=N] [--verbose]\n", prog);
+  std::printf("usage: %s [--seed=N] [--stress-seeds=N] [--stress-cycles=N] [--max-report=N] [--verbose] "
+              "[--neg=underflow|txrange|align]\n", prog);
 }
 
 int main(int argc, char** argv) {
@@ -3015,6 +4063,8 @@ int main(int argc, char** argv) {
       opts.max_report = static_cast<uint32_t>(std::strtoul(a + 13, nullptr, 0));
     } else if (std::strcmp(a, "--verbose") == 0) {
       opts.verbose = true;
+    } else if (std::strncmp(a, "--neg=", 6) == 0) {
+      opts.neg = a + 6;
     } else {
       usage(argv[0]);
       return 2;

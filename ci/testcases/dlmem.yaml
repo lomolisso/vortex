@@ -31,8 +31,9 @@ defaults:
             tests/regression/dlmem_local, tests/regression/dlmem_store,
             tests/regression/dlmem_load, tests/regression/dlmem_atomic,
             tests/regression/dlmem_stress, tests/regression/lmem_bar_order,
-            tests/regression/dlmem_amo_order,
-            VX_config.toml, VX_types.toml]
+            tests/regression/dlmem_amo_order, sw/common/mbar_ref.h,
+            hw/rtl/cache/VX_amo_alu.sv, hw/rtl/cache/VX_amo_unit.sv, sim/simx/amo,
+            sim/simx/types.h, VX_config.toml, VX_types.toml]
 tests:
   # The cluster-rank CSR over three launches (K = 1, 2 as 1x2x1, 4 as 2x1x2),
   # each CTA's rank against its intra-cluster index, and the rank address map
@@ -803,14 +804,14 @@ tests:
     configs+: "-DVX_CFG_EXT_A_ENABLE -DVX_CFG_NUM_LSU_LANES=2"
     args: "-tamoadd_aqrl"
 
-  # --- local-store ordering ---
+  # --- local-access ordering ---
   # A producer lane stores a word into its block's local memory, then releases
   # consumers on other warps through a named group barrier (bar), a fence and a
   # flag (fence), or a fence and the group barrier (fencebar). Every producer
   # and consumer lane first fills the word's bank with a burst of stores, and
   # DXA copies keep the banks busy. Every consumer must read the new word: a
-  # barrier or fence waits until the warp's local stores are written into the
-  # bank.
+  # barrier or fence waits until the warp's local accesses have committed in
+  # their banks.
   - id: lmem_bar_order
     app: lmem_bar_order
     drivers: [simx, rtlsim]
@@ -847,6 +848,53 @@ tests:
     configs+: "-DVX_CFG_EXT_DXA_ENABLE -DVX_CFG_NUM_WARPS=32 -DVX_CFG_NUM_THREADS=8"
     shape: {l2cache: true}
     args: "-m fence -d 1 -r 2000 -e 3072 -b 2 -w 0"
+  # The release must also wait for the producer's earlier local atomics and
+  # loads, not only its stores: X updated by amoswap.d (amo), and load
+  # buffering (ld), where the producer loads X before its ordering point and
+  # must see the previous round, while the consumers store the new round into
+  # X once released. rl releases through amoswap.d.rl of the polled flag. The
+  # barrier also waits for the warp's outstanding responses, so under bar
+  # amo and ld do not depend on the counter; under fence and rl only the
+  # local-access counter holds the release. Like the store cases these pass on
+  # timing alone, also with two LSU blocks; only a --debug trace shows the
+  # hold.
+  - id: lmem_bar_order-amo
+    app: lmem_bar_order
+    drivers: [simx, rtlsim]
+    configs+: "-DVX_CFG_EXT_DXA_ENABLE -DVX_CFG_EXT_A_ENABLE"
+    args: "-m bar -o amo -d 1 -r 200 -b 8 -w 0 -e 768 -s 1"
+  - id: lmem_bar_order-ld
+    app: lmem_bar_order
+    drivers: [simx, rtlsim]
+    configs+: "-DVX_CFG_EXT_DXA_ENABLE -DVX_CFG_EXT_A_ENABLE"
+    args: "-m bar -o ld -d 1 -r 200 -b 8 -w 0 -e 768 -s 1"
+  - id: lmem_bar_order-fence-amo
+    app: lmem_bar_order
+    drivers: [simx, rtlsim]
+    configs+: "-DVX_CFG_EXT_DXA_ENABLE -DVX_CFG_EXT_A_ENABLE"
+    args: "-m fence -o amo -d 1 -r 200 -b 8 -w 0 -e 768 -s 1"
+  - id: lmem_bar_order-rl
+    app: lmem_bar_order
+    drivers: [simx, rtlsim]
+    configs+: "-DVX_CFG_EXT_DXA_ENABLE -DVX_CFG_EXT_A_ENABLE"
+    args: "-m rl -o st -d 1 -r 200 -b 8 -w 0 -e 768 -s 1"
+  - id: lmem_bar_order-rl-ld
+    app: lmem_bar_order
+    drivers: [simx, rtlsim]
+    configs+: "-DVX_CFG_EXT_DXA_ENABLE -DVX_CFG_EXT_A_ENABLE"
+    args: "-m rl -o ld -d 1 -r 200 -b 8 -w 0 -e 768 -s 1"
+  # Two LSU blocks: each block's translation stage counts its warps' accesses,
+  # and the other block's consumers reach the banks through separate inputs.
+  - id: lmem_bar_order-rl-ld-blocks2
+    app: lmem_bar_order
+    drivers: [simx, rtlsim]
+    configs+: "-DVX_CFG_EXT_DXA_ENABLE -DVX_CFG_EXT_A_ENABLE -DVX_CFG_ISSUE_WIDTH=2"
+    args: "-m rl -o ld -d 1 -r 200 -b 8 -w 0 -e 768 -s 1"
+  - id: lmem_bar_order-fence-amo-blocks2
+    app: lmem_bar_order
+    drivers: [simx, rtlsim]
+    configs+: "-DVX_CFG_EXT_DXA_ENABLE -DVX_CFG_EXT_A_ENABLE -DVX_CFG_ISSUE_WIDTH=2"
+    args: "-m fence -o amo -d 1 -r 200 -b 8 -w 0 -e 768 -s 1"
   # Without DXA the instruction count does not depend on timing; fencebar has
   # no flag polling.
   - id: parity-lmem-bar-order
@@ -861,6 +909,14 @@ tests:
     xlen: [64]
     configs+: "-DVX_CFG_EXT_DXA_ENABLE"
     args: "-m fencebar -d 0 -r 100 -b 8 -w 0"
+  # The producer's X update is an amoswap.d: three bank cycles per lane, and a
+  # response the barrier waits for.
+  - id: parity-lmem-bar-order-amo
+    check: model_parity
+    app: lmem_bar_order
+    xlen: [64]
+    configs+: "-DVX_CFG_EXT_DXA_ENABLE -DVX_CFG_EXT_A_ENABLE"
+    args: "-m bar -o amo -d 0 -r 100 -b 8 -w 0"
 
   # Illegal knob combinations must stop the build, in SimX (the processor
   # object) and in the RTL (a Verilator lint of the processor), each with the

@@ -21,6 +21,9 @@
 //            own banks with atomics
 //   -D       rank 1 streams DXA copies into its own local memory instead
 //   -v       print every lat sample
+//
+// A device whose largest cluster is below four prints SKIPPED when the run was
+// launched without options, and fails when any option asked for a run.
 
 #include <vortex2.h>
 #include <dxa.h>
@@ -49,6 +52,7 @@ uint32_t fence   = 0;
 uint32_t flood   = 0;
 uint32_t dxa     = 0;
 bool     verbose = false;
+bool     requested = false;
 
 #define CHECK(expr) do {                                              \
     vx_result_t _r = (expr);                                          \
@@ -75,6 +79,7 @@ uint32_t parse_count(const char* s) {
 }
 
 void parse_args(int argc, char** argv) {
+  requested = (argc > 1);
   int c;
   while ((c = getopt(argc, argv, "m:n:fFDvh")) != -1) {
     switch (c) {
@@ -209,9 +214,12 @@ int main(int argc, char** argv) {
     return 1;
   }
   if (max_cluster < K) {
-    std::printf("Error: a cluster of %u needs VX_CAPS_DLMEM_MAX_CLUSTER >= %u, the device has %u\nFAILED!\n",
-                K, K, (uint32_t)max_cluster);
-    return 1;
+    std::printf("%s: a cluster of %u needs VX_CAPS_DLMEM_MAX_CLUSTER >= %u, the device has %u\n",
+                requested ? "Error" : "SKIPPED", K, K, (uint32_t)max_cluster);
+    vx_queue_release(q);
+    vx_device_release(dev);
+    std::printf(requested ? "FAILED!\n" : "PASSED!\n");
+    return requested ? 1 : 0;
   }
 
   // Alive until the queue has run the upload.

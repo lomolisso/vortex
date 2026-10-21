@@ -399,29 +399,27 @@ inline std::ostream &operator<<(std::ostream &os, const LsuType& type) {
 
 ///////////////////////////////////////////////////////////////////////////////
 
-// Memory-op tag. Always-present ops (LD/ST/FLUSH) at the low values,
-// VX_CFG_EXT_A_ENABLE atomic family contiguous at 3..13.
+// Memory-op tag. Always-present ops (LD/ST/FLUSH) at the low values, the VX_CFG_EXT_A_ENABLE atomic family contiguous at 3..12.
 enum class MemOp : uint8_t {
-  // Always-present (independent of VX_CFG_EXT_A_ENABLE)
-  LD        = 0,
+  LD        = 0,  // always present (independent of VX_CFG_EXT_A_ENABLE)
   ST        = 1,
   FLUSH     = 2,
-  // Atomic family (only meaningful when VX_CFG_EXT_A_ENABLE)
-  AMO_LR    = 3,
+  AMO_LR    = 3,  // atomic family (only meaningful when VX_CFG_EXT_A_ENABLE)
   AMO_SC    = 4,
   AMO_SWAP  = 5,
   AMO_ADD   = 6,
   AMO_AND   = 7,
   AMO_OR    = 8,
   AMO_XOR   = 9,
-  // MIN/MAX collapse signed/unsigned variants; the LSU sets
-  // `flags.amo_unsigned` for AMOMINU/AMOMAXU and the AMO ALU branches on it.
+  // MIN/MAX collapse signed/unsigned variants; the LSU sets `flags.amo_unsigned` for AMOMINU/AMOMAXU and the AMO ALU branches on it.
   AMO_MIN   = 10,
   AMO_MAX   = 11,
-  // Compare-and-swap. Kept last so the range checks below stay contiguous;
-  // it is the only atomic that reads a third operand (the comparand, which
-  // the instruction takes from rd).
+  // Compare-and-swap. Kept last so the range checks below stay contiguous; it is the only atomic
+  // that reads a third operand (the comparand, which the instruction takes from rd).
   AMO_CAS   = 12,
+#ifdef VX_CFG_EXT_MBAR_ENABLE
+  MBAR_ARRIVE = 13, MBAR_ARRIVE_TX = 14, MBAR_EXPECT_TX = 15, MBAR_COMPLETE_TX = 16, MBAR_TEST_WAIT = 17, MBAR_TRY_WAIT = 18,
+#endif
 };
 
 inline bool memop_is_atomic(MemOp op) {
@@ -435,8 +433,7 @@ inline bool memop_is_write(MemOp op) {
 }
 inline bool memop_is_amo(MemOp op) { return memop_is_atomic(op); }
 
-// Memory-request flags.
-struct MemFlags {
+struct MemFlags {  // memory-request flags
   union {
     uint32_t raw;
     struct {
@@ -446,22 +443,18 @@ struct MemFlags {
       uint32_t amo_unsigned : 1;  // bit 3: MIN/MAX signedness (1=unsigned)
       uint32_t dma          : 1;  // bit 4: written by a DMA engine, not a hart
     #ifdef VX_CFG_EXT_DXA_ENABLE
-      // DXA completion sideband — populated only on DXA's LMEM-DMA writes.
-      // notify_bar_id carries the RAW (kernel-encoded) bar handle:
-      //   bits[7:0]   = cta_local_id (= get_local_group_id())
-      //   bits[N+7:8] = user bar_no (N = CLOG2(NUM_BARRIERS))
-      // Multicast adds cta_warp_idx into the low byte, so the field must
-      // be wide enough to hold (bar_no << 8) | (MAX_CTAS_per_core - 1).
-      // For NUM_BARRIERS = 8 and NUM_WARPS ≤ 16, that's at most 11 bits;
-      // 16 bits leaves headroom for larger configs.
+      // DXA completion sideband — populated only on DXA's LMEM-DMA writes. notify_bar_id carries the RAW (kernel-encoded) bar handle: bits[7:0] = cta_local_id (= get_local_group_id()), bits[N+7:8] = user bar_no (N = CLOG2(NUM_BARRIERS)).
+      // Multicast adds cta_warp_idx into the low byte, so the field must be wide enough to hold (bar_no << 8) | (MAX_CTAS_per_core - 1). For NUM_BARRIERS = 8 and NUM_WARPS ≤ 16, that's at most 11 bits; 16 bits leaves headroom for larger configs.
       uint32_t dxa_notify_done   : 1;   // bit 5
       uint32_t dxa_notify_bar_id : 16;  // bits 6..21
     #else
       uint32_t                   : 17;  // bits 5..21
     #endif
-      // LSU fence token: the caches above the device's shared level walk on
-      // it and the shared level drains; the host cache flush never sets it.
+      // LSU fence token: the caches above the device's shared level walk on it and the shared level drains; the host cache flush never sets it.
       uint32_t fence             : 1;   // bit 22
+    #ifdef VX_CFG_EXT_DLMEM_ENABLE
+      uint32_t lacc              : 1;   // bit 23: a local access the DLMEM translation counted; its bank reports the commit
+    #endif
     };
   };
 
@@ -480,7 +473,6 @@ struct MemFlags {
   }
 };
 static_assert(sizeof(MemFlags) == sizeof(uint32_t), "MemFlags must be 32-bit");
-
 inline std::ostream &operator<<(std::ostream &os, const MemOp& op) {
   switch (op) {
   case MemOp::LD:        os << "LD"; break;
@@ -496,6 +488,9 @@ inline std::ostream &operator<<(std::ostream &os, const MemOp& op) {
   case MemOp::AMO_MIN:   os << "AMO_MIN"; break;
   case MemOp::AMO_MAX:   os << "AMO_MAX"; break;
   case MemOp::AMO_CAS:   os << "AMO_CAS"; break;
+#ifdef VX_CFG_EXT_MBAR_ENABLE
+  case MemOp::MBAR_ARRIVE: os << "MBAR_ARRIVE"; break; case MemOp::MBAR_ARRIVE_TX: os << "MBAR_ARRIVE_TX"; break; case MemOp::MBAR_EXPECT_TX: os << "MBAR_EXPECT_TX"; break; case MemOp::MBAR_COMPLETE_TX: os << "MBAR_COMPLETE_TX"; break; case MemOp::MBAR_TEST_WAIT: os << "MBAR_TEST_WAIT"; break; case MemOp::MBAR_TRY_WAIT: os << "MBAR_TRY_WAIT"; break;
+#endif
   default:               os << "?MemOp" << (int)op; break;
   }
   return os;
@@ -514,8 +509,10 @@ enum class AmoType {
   AMOMINU,
   AMOMAXU,
   AMOCAS
+#ifdef VX_CFG_EXT_MBAR_ENABLE
+  , MBAR_ARRIVE, MBAR_ARRIVE_TX, MBAR_EXPECT_TX, MBAR_COMPLETE_TX, MBAR_TEST_WAIT
+#endif
 };
-
 struct IntrAmoArgs {
   uint32_t width : 3;
   uint32_t aq : 1;
@@ -535,6 +532,9 @@ inline std::ostream &operator<<(std::ostream &os, const AmoType& type) {
   case AmoType::AMOMAX:  os << "AMOMAX"; break;
   case AmoType::AMOMINU: os << "AMOMINU"; break;
   case AmoType::AMOMAXU: os << "AMOMAXU"; break;
+#ifdef VX_CFG_EXT_MBAR_ENABLE
+  case AmoType::MBAR_ARRIVE: os << "MBAR_ARRIVE"; break; case AmoType::MBAR_ARRIVE_TX: os << "MBAR_ARRIVE_TX"; break; case AmoType::MBAR_EXPECT_TX: os << "MBAR_EXPECT_TX"; break; case AmoType::MBAR_COMPLETE_TX: os << "MBAR_COMPLETE_TX"; break; case AmoType::MBAR_TEST_WAIT: os << "MBAR_TEST_WAIT"; break;
+#endif
   default:
     assert(false);
   }
@@ -1228,9 +1228,8 @@ struct LsuRsp {
 
 ///////////////////////////////////////////////////////////////////////////////
 
-// Maps RVA AmoType → MemOp. Signed/unsigned MIN/MAX variants collapse onto
-// MemOp::AMO_MIN/MAX; the unsigned distinction rides on flags.amo_unsigned
-// (set per-AMO by the LSU via amo_is_unsigned() below).
+// Maps RVA AmoType → MemOp. Signed/unsigned MIN/MAX variants collapse onto MemOp::AMO_MIN/MAX;
+// the unsigned distinction rides on flags.amo_unsigned (set per-AMO by the LSU via amo_is_unsigned() below).
 inline MemOp amo_to_memop(AmoType t) {
   switch (t) {
   case AmoType::LR:      return MemOp::AMO_LR;
@@ -1245,6 +1244,9 @@ inline MemOp amo_to_memop(AmoType t) {
   case AmoType::AMOMAX:
   case AmoType::AMOMAXU: return MemOp::AMO_MAX;
   case AmoType::AMOCAS:  return MemOp::AMO_CAS;
+#ifdef VX_CFG_EXT_MBAR_ENABLE
+  case AmoType::MBAR_ARRIVE: return MemOp::MBAR_ARRIVE; case AmoType::MBAR_ARRIVE_TX: return MemOp::MBAR_ARRIVE_TX; case AmoType::MBAR_EXPECT_TX: return MemOp::MBAR_EXPECT_TX; case AmoType::MBAR_COMPLETE_TX: return MemOp::MBAR_COMPLETE_TX; case AmoType::MBAR_TEST_WAIT: return MemOp::MBAR_TEST_WAIT;
+#endif
   }
   std::abort();
 }
@@ -1254,9 +1256,8 @@ inline bool amo_is_unsigned(AmoType t) {
   return t == AmoType::AMOMINU || t == AmoType::AMOMAXU;
 }
 
-// Globally-unique per-hart id. Lower bits carry the most entropy
-// (thread, then warp, then core) so the small per-bank reservation
-// table sees fewer hash collisions.
+// Globally-unique per-hart id. Lower bits carry the most entropy (thread, then warp, then core)
+// so the small per-bank reservation table sees fewer hash collisions.
 inline uint32_t make_hart_id(uint32_t cid, uint32_t wid, uint32_t tid) {
   constexpr uint32_t LOG_WARPS   = log2ceil(VX_CFG_NUM_WARPS);
   constexpr uint32_t LOG_THREADS = log2ceil(VX_CFG_NUM_THREADS);
@@ -1270,8 +1271,7 @@ struct MemReq {
   uint64_t addr;
   std::shared_ptr<mem_block_t> data;
   uint64_t byteen = 0;
-  // Comparand, read only by compare-and-swap. The data block carries the
-  // swap value, so the comparand needs a field of its own.
+  // Comparand, read only by compare-and-swap. The data block carries the swap value, so the comparand needs a field of its own.
   uint64_t amo_cmp = 0;
   uint32_t tag;
   uint32_t hart_id;
@@ -2064,6 +2064,15 @@ struct FwdArm {
 struct FwdDone {
   uint32_t core_id;
 };
+
+#ifdef VX_CFG_EXT_MBAR_ENABLE
+// mbarrier ops: atomics that only the local-memory banks execute, outside the
+// AMO_LR..AMO_CAS range helpers. Defined here, below every assert, so that the
+// knob-off build keeps this header's line numbers.
+inline bool memop_is_mbar(MemOp op) {
+  return op >= MemOp::MBAR_ARRIVE && op <= MemOp::MBAR_TRY_WAIT;
+}
+#endif
 
 ///////////////////////////////////////////////////////////////////////////////
 

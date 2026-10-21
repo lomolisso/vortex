@@ -48,6 +48,9 @@ module VX_amo_unit import VX_gpu_pkg::*; #(
     parameter HOLD_CREDIT_BITS = 6,
     parameter LINE_ADDR_BITS  = 32,
     parameter DATA_WIDTH      = 64,  // ALU operand width (cache word, capped at 64)
+`ifdef VX_CFG_EXT_MBAR_ENABLE
+    parameter MBAR_ENABLE     = 0,   // mbarrier ops (see VX_amo_alu)
+`endif
     parameter ARITH_WIDTH     = DATA_WIDTH // non-CAS op width (see VX_amo_alu)
 ) (
     input  wire                          clk,
@@ -63,6 +66,10 @@ module VX_amo_unit import VX_gpu_pkg::*; #(
     input  wire [63:0]                   compute_cmp,
     output wire [63:0]                   compute_new_word,
     output wire [63:0]                   compute_ret_word,
+`ifdef VX_CFG_EXT_MBAR_ENABLE
+    output wire                          compute_mbar_flip,
+    output wire [1:0]                    compute_mbar_err,
+`endif
 
     // Reservation activity (single-fire per cycle).
     input  wire                          res_reserve,    // LR commit
@@ -77,6 +84,9 @@ module VX_amo_unit import VX_gpu_pkg::*; #(
     // Pure ALU (no state, no clock).
     VX_amo_alu #(
         .DATA_WIDTH  (DATA_WIDTH),
+    `ifdef VX_CFG_EXT_MBAR_ENABLE
+        .MBAR_ENABLE (MBAR_ENABLE),
+    `endif
         .ARITH_WIDTH (ARITH_WIDTH)
     ) alu (
         .op       (compute_op),
@@ -85,6 +95,10 @@ module VX_amo_unit import VX_gpu_pkg::*; #(
         .old_word (compute_old),
         .rhs      (compute_rhs),
         .cmp      (compute_cmp),
+    `ifdef VX_CFG_EXT_MBAR_ENABLE
+        .mbar_flip (compute_mbar_flip),
+        .mbar_err  (compute_mbar_err),
+    `endif
         .new_word (compute_new_word),
         .ret_word (compute_ret_word)
     );

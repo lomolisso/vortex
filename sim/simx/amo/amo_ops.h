@@ -16,6 +16,9 @@
 #include <stdint.h>
 #include <cstdlib>
 #include "types.h"
+#ifdef VX_CFG_EXT_MBAR_ENABLE
+#include "mbar_ref.h"
+#endif
 
 namespace vortex {
 
@@ -33,6 +36,13 @@ struct AmoComputeResult {
   uint64_t ret_word;
 };
 
+#ifdef VX_CFG_EXT_MBAR_ENABLE
+// The mbar_ref op code (amo_op) of an mbarrier MemOp.
+inline uint32_t mbar_op_code(MemOp op) {
+  return mbar_ref::OP_BASE + (uint32_t(op) - uint32_t(MemOp::MBAR_ARRIVE));
+}
+#endif
+
 // `cmp` is the comparand, and only compare-and-swap reads it: that op stores
 // `rhs` when the loaded word equals `cmp` and leaves memory alone otherwise.
 // Every other op ignores it.
@@ -40,6 +50,13 @@ inline AmoComputeResult amo_compute(MemOp op, uint8_t width,
                                     uint64_t old_word, uint64_t rhs,
                                     bool unsigned_minmax = false,
                                     uint64_t cmp = 0) {
+#ifdef VX_CFG_EXT_MBAR_ENABLE
+  // An mbarrier op is always a doubleword; its errors are the caller's to check.
+  if (memop_is_mbar(op)) {
+    auto r = mbar_ref::apply(mbar_op_code(op), old_word, rhs);
+    return {r.new_word, r.ret_word};
+  }
+#endif
   // Mask both inputs to width-sized values; sign-extension at the
   // word boundary is needed for signed comparisons (MIN/MAX).
   const bool is_w = (width == 2);

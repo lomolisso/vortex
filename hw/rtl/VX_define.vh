@@ -108,6 +108,16 @@
     `endif
 `endif
 
+// mbarriers are local-memory words updated by the banks' atomic unit.
+`ifdef VX_CFG_EXT_MBAR_ENABLE
+    `ifndef VX_CFG_EXT_DLMEM_ENABLE
+        `error "mbarriers require DLMEM"
+    `endif
+    `ifndef VX_CFG_EXT_A_ENABLE
+        `error "mbarriers require the A extension"
+    `endif
+`endif
+
 // Convenience flag: the TCU metadata SRAM is present when any metadata-consuming
 // mode (MX or sparse) is enabled. Internal derived macro — not a VX_CFG_* knob.
 `ifdef VX_CFG_TCU_MX_ENABLE

@@ -168,6 +168,11 @@ ProcessorImpl::ProcessorImpl()
                 "DLMEM requires the KMU dest field to hold every core's field-wise dest");
 #endif
 
+#ifdef VX_CFG_EXT_MBAR_ENABLE
+  static_assert(VX_CFG_EXT_DLMEM_ENABLED, "mbarriers require DLMEM");
+  static_assert(VX_CFG_EXT_A_ENABLED, "mbarriers require the A extension");
+#endif
+
   // connect L3 core interfaces
   for (uint32_t i = 0; i < VX_CFG_NUM_CLUSTERS; ++i) {
     for (uint32_t j = 0; j < VX_CFG_L2_MEM_PORTS; ++j) {

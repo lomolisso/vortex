@@ -165,9 +165,15 @@ wait.
 - **Remote stores.** An arrival also waits until every remote store of the
   warp is acknowledged, i.e. committed in the destination bank (see the
   network below), so the barrier orders them with no change to its own logic.
-- **Not covered yet.** A local-memory store still queued past the LSU (in the
-  local-memory switch or bank queues) can in principle be overtaken by a
-  peer's later load of the same word; `__syncthreads()` has the same gap.
+- **Local accesses.** A `BAR`, a cluster arrive, an exit, a `FENCE`, a `.rl`
+  AMO and an mbarrier arrive also wait until every earlier local-memory
+  access of the warp (load, store, atomic, mbarrier op) has committed in its
+  bank, so none still queued in the local-memory switch or a bank queue can
+  be overtaken by a peer's later access to the same word.
+- **Not covered.** An mbarrier arrive does not order global memory: global
+  data needs a fence before the arrive. Local-memory reads by tensor-core
+  ops (the TCU metadata AGU, the WGMMA DMA) are not counted, so none of these
+  waits for them.
 - **Exit hold and plain `BAR`.** In a DLMEM build a warp cannot exit, and a
   plain `BAR` cannot arrive, while the warp has instructions in flight or
   unacknowledged remote stores.
@@ -202,10 +208,11 @@ models it as `DlmemXlate`, behind an `LsuUnit`-owned channel.
   core's egress (next section). On an idle machine every SPREAD peer with
   K > 1 is on another core (spread first).
 - **Fence hold.** A fence is held at the stage output until its warp has no
-  remote access left to perform: every remote store acknowledged, and every
-  remote load, atomic and SC answered. The warp's counter rises when the
-  access leaves the stage and its drained flag is registered, so a fence right
-  behind an access of the same warp always waits for its completion.
+  remote access left to perform: every remote store acknowledged, every
+  remote load, atomic and SC answered, and its local accesses committed. The
+  warp's counter rises when the access leaves the stage and its drained flag
+  is registered, so a fence right behind an access of the same warp always
+  waits for its completion.
 - **Out of bounds.** A rank at or past K inside the window, or an offset past
   the block's footprint, is the runtime assertion `DLMEM access out of
   bounds`; the lane is steered into the issuer's own slot. A DEFAULT cluster

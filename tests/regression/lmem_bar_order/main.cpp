@@ -6,6 +6,12 @@
 //   -m bar       the group barrier orders the store (default)
 //   -m fence     vx_fence() orders the store before a flag store the consumers poll
 //   -m fencebar  vx_fence() and then the group barrier, with no polling
+//   -m rl        amoswap.d.rl of a flag the consumers poll (needs the A extension)
+//   -o st        the producer stores the round into X (default)
+//   -o amo       the producer swaps the round into X with amoswap.d (needs A)
+//   -o ld        load buffering: the producer loads X before its ordering point
+//                and must see the previous round, which the consumers overwrite
+//                with the round once released
 //   -r R         rounds (default 200)
 //   -b N         stores per lane and round into X's bank, from every producer and
 //                consumer lane, the producer's last one carrying X (default 8, >= 1)
@@ -16,6 +22,9 @@
 //   -x W         doubleword index of X past the tiles (default 0)
 //   -w D         producer idle iterations before its stores (default 0)
 //   -v           print every consumer thread with an error and each streamer's copies
+//
+// -o st with bar, fence or fencebar runs kernel_main; the other combinations
+// run order_k, so kernel_main's instruction stream does not depend on them.
 
 #include <vortex2.h>
 #include <dxa.h>
@@ -39,6 +48,7 @@ constexpr uint32_t kMaxStreamers = VX_CFG_NUM_BARRIERS - 3;
 
 const char* kernel_file = "kernel.vxbin";
 uint32_t mode       = MODE_BAR;
+uint32_t x_access   = ACC_ST;
 uint32_t rounds     = 200;
 uint32_t burst      = 8;
 uint32_t dxa_on     = 1;
@@ -81,8 +91,8 @@ void cleanup() {
   } while (0)
 
 void usage() {
-  std::printf("Usage: [-m bar|fence|fencebar] [-r rounds] [-b burst] [-d 0|1] [-e tile elements]"
-              " [-s streamers] [-x X word] [-w delay] [-v] [-h]\n");
+  std::printf("Usage: [-m bar|fence|fencebar|rl] [-o st|amo|ld] [-r rounds] [-b burst] [-d 0|1]"
+              " [-e tile elements] [-s streamers] [-x X word] [-w delay] [-v] [-h]\n");
 }
 
 // A decimal count; anything else, a sign included, is a usage error.
@@ -99,7 +109,7 @@ uint32_t parse_count(const char* s) {
 
 void parse_args(int argc, char** argv) {
   int c;
-  while ((c = getopt(argc, argv, "m:r:b:d:e:s:x:w:vh")) != -1) {
+  while ((c = getopt(argc, argv, "m:o:r:b:d:e:s:x:w:vh")) != -1) {
     switch (c) {
       case 'm':
         if (!std::strcmp(optarg, "bar")) {
@@ -108,6 +118,20 @@ void parse_args(int argc, char** argv) {
           mode = MODE_FENCE;
         } else if (!std::strcmp(optarg, "fencebar")) {
           mode = MODE_FENCEBAR;
+        } else if (!std::strcmp(optarg, "rl")) {
+          mode = MODE_RL;
+        } else {
+          usage();
+          std::exit(-1);
+        }
+        break;
+      case 'o':
+        if (!std::strcmp(optarg, "st")) {
+          x_access = ACC_ST;
+        } else if (!std::strcmp(optarg, "amo")) {
+          x_access = ACC_AMO;
+        } else if (!std::strcmp(optarg, "ld")) {
+          x_access = ACC_LD;
         } else {
           usage();
           std::exit(-1);
@@ -136,8 +160,21 @@ const char* mode_name() {
   switch (mode) {
     case MODE_FENCE:    return "fence";
     case MODE_FENCEBAR: return "fencebar";
+    case MODE_RL:       return "rl";
     default:            return "bar";
   }
+}
+
+const char* access_name() {
+  switch (x_access) {
+    case ACC_AMO: return "amo";
+    case ACC_LD:  return "ld";
+    default:      return "st";
+  }
+}
+
+bool use_order_k() {
+  return x_access != ACC_ST || mode == MODE_RL;
 }
 
 }  // namespace
@@ -166,9 +203,16 @@ int main(int argc, char** argv) {
               " %u streamers of %u-byte tiles, X at word %u, delay %u, %u banks\n",
               mode_name(), (uint32_t)nw, (uint32_t)nt, rounds, burst, dxa_on ? "on" : "off",
               streamers, tile_elems * (uint32_t)sizeof(uint32_t), x_word, delay, banks);
+  if (use_order_k())
+    std::printf("lmem_bar_order: producer access %s, order_k\n", access_name());
 
   if (!(isa & VX_ISA_EXT_DLMEM) || !(isa & VX_ISA_EXT_DXA)) {
     std::printf("Error: the device needs DLMEM and DXA\nFAILED!\n");
+    cleanup();
+    return 1;
+  }
+  if ((x_access == ACC_AMO || mode == MODE_RL) && !(isa & VX_ISA_STD_A)) {
+    std::printf("Error: -o amo and -m rl need the A extension\nFAILED!\n");
     cleanup();
     return 1;
   }
@@ -208,7 +252,7 @@ int main(int argc, char** argv) {
 
   kernel_arg_t arg = {};
   CHECK(vx_buffer_address(res_buf, &arg.res_addr));
-  arg.mode          = mode;
+  arg.mode          = use_order_k() ? (mode | (x_access << ACC_SHIFT)) : mode;
   arg.rounds        = rounds;
   arg.dxa_on        = dxa_on;
   arg.tile_elems    = tile_elems;
@@ -220,7 +264,7 @@ int main(int argc, char** argv) {
   arg.banks         = banks;
 
   CHECK(vx_module_load_file(dev, kernel_file, &mod));
-  CHECK(vx_module_get_kernel(mod, "main", &kernel));
+  CHECK(vx_module_get_kernel(mod, use_order_k() ? "order_k" : "main", &kernel));
 
   vx_launch_info_t li = {};
   li.struct_size  = sizeof(li);
@@ -245,7 +289,8 @@ int main(int argc, char** argv) {
 
   uint64_t stale = 0, timeouts = 0, copies = 0;
   uint32_t unfinished = 0, threads_hit = 0, first_round = 0;
-  const uint32_t c0 = (streamers + 1) * (uint32_t)nt;
+  // kernel_main records the consumers; order_k the producer too, whose lane 0 checks its loads in ld mode.
+  const uint32_t c0 = (streamers + (use_order_k() ? 0 : 1)) * (uint32_t)nt;
   for (uint32_t t = c0; t < block; ++t) {
     const uint32_t* e = &res[(size_t)t * RES_WORDS];
     if (e[RES_STALE] == ~0u) {
@@ -269,10 +314,11 @@ int main(int argc, char** argv) {
     if (verbose)
       std::printf("  streamer warp %u: %u DXA copies\n", w, n);
   }
-  const uint64_t reads = (uint64_t)rounds * (block - c0);
-  std::printf("lmem_bar_order: %lu stale of %lu consumer reads, %lu flag timeouts, %u threads hit,"
+  const uint64_t reads = (x_access == ACC_LD) ? rounds : (uint64_t)rounds * (block - (streamers + 1) * (uint32_t)nt);
+  std::printf("lmem_bar_order: %lu stale of %lu %s reads, %lu flag timeouts, %u threads hit,"
               " first stale round %u, %u unfinished threads, %lu DXA copies\n",
-              (unsigned long)stale, (unsigned long)reads, (unsigned long)timeouts, threads_hit,
+              (unsigned long)stale, (unsigned long)reads, (x_access == ACC_LD) ? "producer" : "consumer",
+              (unsigned long)timeouts, threads_hit,
               first_round, unfinished, (unsigned long)copies);
 
   vx_kernel_release(kernel);

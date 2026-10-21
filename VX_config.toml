@@ -40,6 +40,9 @@ VX_CFG_EXT_DXA_ENABLE = false
 # Distributed local memory (RV64 only): the warps of a thread-block cluster
 # address every member block's local memory through one window.
 VX_CFG_EXT_DLMEM_ENABLE = false
+# mbarriers: 64-bit local-memory synchronization objects updated by the local
+# memory banks' atomic unit. Requires DLMEM and the A extension.
+VX_CFG_EXT_MBAR_ENABLE = false
 VX_CFG_EXT_TEX_ENABLE = false
 VX_CFG_EXT_RASTER_ENABLE = false
 VX_CFG_EXT_OM_ENABLE = false

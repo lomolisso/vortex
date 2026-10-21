@@ -27,7 +27,7 @@ public:
     uint32_t B; // log2 number of banks
     bool write_reponse;
 #ifdef VX_CFG_EXT_DLMEM_ENABLE
-    uint32_t commit_ports = 0; // plain stores from ports [0, commit_ports) pulse CommitOut
+    uint32_t commit_ports = 0; // counted accesses (flags.lacc) from ports [0, commit_ports) pulse CommitOut
 #endif
   };
 
@@ -47,7 +47,8 @@ public:
   std::vector<SimChannel<MemReq>> Inputs;
   std::vector<SimChannel<MemRsp>> Outputs;
 #ifdef VX_CFG_EXT_DLMEM_ENABLE
-  // Per bank: the writer warp of each such store, the cycle after its write.
+  // Per bank: the warp of each such access when it commits, 1 cycle after the
+  // bank takes a load or store and 3 cycles after it takes an atomic.
   std::vector<SimChannel<uint32_t>> CommitOut;
 #endif
 

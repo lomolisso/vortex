@@ -20,11 +20,11 @@
 // encoding can alias a global address once the core field outgrows the rank
 // field. Out-of-bounds lanes go to the issuer's own slot base, keeping their
 // 64-byte line offset like every other lane. A fence, and every packet of an
-// AMO with .rl, waits at the stage output until its warp's remote accesses are
-// performed (stores acknowledged, loads and AMOs answered) and its local plain
-// stores are written into their banks, so it orders them before every later
-// access of the warp. Earlier global accesses need a fence; earlier local loads,
-// AMOs and LR/SC are not waited for.
+// AMO with .rl (an mbarrier arrive included), waits at the stage output until
+// its warp's remote accesses are performed (stores acknowledged, loads and AMOs
+// answered) and its local accesses (loads, stores, AMOs, LR/SC, mbarrier ops)
+// have committed in their banks, so it orders them before every later access of
+// the warp. Earlier global accesses need a fence.
 module VX_dlmem_xlate import VX_gpu_pkg::*, VX_dlmem_pkg::*; #(
     parameter `STRING INSTANCE_ID = "",
     // Global core id (hart id core field); the core's index in its cluster is CORE_ID % DLMEM_NCC.
@@ -54,8 +54,8 @@ module VX_dlmem_xlate import VX_gpu_pkg::*, VX_dlmem_pkg::*; #(
 
     // Per warp, every remote access counted on wt_inc has been performed.
     input  wire [NW-1:0]                    drained,
-    // Per warp, every local store counted on lst_inc has been written.
-    input  wire [NW-1:0]                    lmem_st_drained,
+    // Per warp, every local access counted on lacc_inc has committed.
+    input  wire [NW-1:0]                    lmem_acc_drained,
 
     // Per-lane flags, qualified by out_if.req_valid.
     output wire [NUM_LANES-1:0]             out_remote,
@@ -66,10 +66,10 @@ module VX_dlmem_xlate import VX_gpu_pkg::*, VX_dlmem_pkg::*; #(
     output wire [NW_WIDTH-1:0]              wt_inc_wid,
     output wire [CNT_W-1:0]                 wt_inc_cnt,
 
-    // Local plain stores leaving the stage, per warp.
-    output wire                             lst_inc_valid,
-    output wire [NW_WIDTH-1:0]              lst_inc_wid,
-    output wire [CNT_W-1:0]                 lst_inc_cnt,
+    // Local accesses leaving the stage, per warp.
+    output wire                             lacc_inc_valid,
+    output wire [NW_WIDTH-1:0]              lacc_inc_wid,
+    output wire [CNT_W-1:0]                 lacc_inc_cnt,
 
     output wire                             empty
 );
@@ -138,7 +138,10 @@ module VX_dlmem_xlate import VX_gpu_pkg::*, VX_dlmem_pkg::*; #(
     wire [NUM_LANES-1:0][LSU_ADDR_WIDTH-1:0] addr_out;
     wire [NUM_LANES-1:0][MEM_ATTR_WIDTH-1:0] attr_out;
     wire [NUM_LANES-1:0][DLMEM_CORE_W-1:0]   lane_core;
-    wire [NUM_LANES-1:0]                     lane_lst;
+    wire [NUM_LANES-1:0]                     lane_lacc;
+`ifdef VX_CFG_EXT_MBAR_ENABLE
+    wire [NUM_LANES-1:0]                     lane_mbar_global, lane_mbar_remote;
+`endif
 
     for (genvar i = 0; i < NUM_LANES; ++i) begin : g_lanes
         wire [LSU_ADDR_WIDTH-1:0] a = req_r.addr[i];
@@ -187,14 +190,21 @@ module VX_dlmem_xlate import VX_gpu_pkg::*, VX_dlmem_pkg::*; #(
                 attr.is_addr_io    = 1'b0;
             end
             // A remote access carries its source warp to the target, a local
-            // one to its bank, which reports the warp's stores as committed.
+            // one to its bank, which reports the warp's accesses as committed.
             if (rem || (act && attr.is_addr_local)) begin
                 attr.amo.hart_id = hart_id;
             end
+            // VX_lmem_switch's local leg, every access: counted here and marked
+            // for its bank, which reports the commit of marked accesses only.
+            attr.is_lacc = act && attr.is_addr_local && ~rem;
         end
         assign attr_out[i] = attr;
-        // VX_lmem_switch's local leg, plain stores only (atomics carry rw=0).
-        assign lane_lst[i] = act && req_r.rw && attr.is_addr_local && ~attr.is_addr_remote;
+        assign lane_lacc[i] = attr.is_lacc;
+    `ifdef VX_CFG_EXT_MBAR_ENABLE
+        wire is_mbar = attr.amo.amo_valid && (attr.amo.amo_op >= AMO_OP_MBAR_ARRIVE);
+        assign lane_mbar_global[i] = act && is_mbar && ~attr.is_addr_local && ~rem;
+        assign lane_mbar_remote[i] = act && is_mbar && rem;
+    `endif
 
         assign out_remote[i] = rem;
         assign out_oob[i]    = oob;
@@ -203,7 +213,7 @@ module VX_dlmem_xlate import VX_gpu_pkg::*, VX_dlmem_pkg::*; #(
 
     // drained is registered after the count, so an access leaving in the cycle
     // before its fence is already visible to it.
-    wire order_hold = (is_fence_r || is_rl_r) && ~(drained[hdr_r.wid] && lmem_st_drained[hdr_r.wid]);
+    wire order_hold = (is_fence_r || is_rl_r) && ~(drained[hdr_r.wid] && lmem_acc_drained[hdr_r.wid]);
 
     assign out_if.req_valid       = req_valid_r && ~order_hold;
     assign out_if.req_data.rw     = req_r.rw;
@@ -226,9 +236,9 @@ module VX_dlmem_xlate import VX_gpu_pkg::*, VX_dlmem_pkg::*; #(
     assign wt_inc_wid   = hdr_r.wid;
     `POP_COUNT(wt_inc_cnt, out_remote);
 
-    assign lst_inc_valid = out_fire && (| lane_lst);
-    assign lst_inc_wid   = hdr_r.wid;
-    `POP_COUNT(lst_inc_cnt, lane_lst);
+    assign lacc_inc_valid = out_fire && (| lane_lacc);
+    assign lacc_inc_wid   = hdr_r.wid;
+    `POP_COUNT(lacc_inc_cnt, lane_lacc);
 
     assign empty = ~req_valid_r;
 
@@ -258,5 +268,15 @@ module VX_dlmem_xlate import VX_gpu_pkg::*, VX_dlmem_pkg::*; #(
     `RUNTIME_ASSERT (~((REMOTE_ASSERT != 0) && out_fire && (| out_remote)),
         ("%t: %s remote DLMEM access is not supported yet: wid=%0d cta=%0d lane=%0d addr=0x%0h core=%0d (#%0d)",
             $time, INSTANCE_ID, hdr_r.wid, my_slot, rem_lane, {rem_win_addr, WA'(0)}, lane_core[rem_lane], hdr_r.uuid))
+
+`ifdef VX_CFG_EXT_MBAR_ENABLE
+    // An mbarrier lives in a local memory: the banks are the only place its ops run.
+    `RUNTIME_ASSERT (~(out_fire && (| lane_mbar_global)),
+        ("%t: %s mbarrier op on a global address: wid=%0d lanes=0x%0h (#%0d)",
+            $time, INSTANCE_ID, hdr_r.wid, lane_mbar_global, hdr_r.uuid))
+    `RUNTIME_ASSERT (~(out_fire && (| lane_mbar_remote)),
+        ("%t: %s remote mbarrier ops are not supported yet: wid=%0d lanes=0x%0h (#%0d)",
+            $time, INSTANCE_ID, hdr_r.wid, lane_mbar_remote, hdr_r.uuid))
+`endif
 
 endmodule

@@ -36,18 +36,19 @@ constexpr uint32_t dlmem_clog2(uint64_t x) {
 // The access tracker's largest count, 2^DLMEM_WT_W - 1.
 constexpr uint32_t DLMEM_WT_LIMIT = (1u << dlmem_clog2(uint64_t(DLMEM_WT_MAX) + 1)) - 1;
 
-// VX_dlmem_pkg's bound on one warp's local plain-store lanes between the
-// translation and their bank write, with the RTL crossbar's arbiter groups
-// (VX_stream_arb's MAX_FANOUT is 8).
-constexpr uint32_t DLMEM_LST_XB_IN = VX_CFG_NUM_LSU_BLOCKS * VX_CFG_NUM_LSU_LANES + 1;
-constexpr uint32_t DLMEM_LST_XB_G1 = (DLMEM_LST_XB_IN > 12) ? (DLMEM_LST_XB_IN + 7) / 8 : 0;
-constexpr uint32_t DLMEM_LST_XB_G2 = (DLMEM_LST_XB_G1 > 12) ? (DLMEM_LST_XB_G1 + 7) / 8 : 0;
-static_assert(DLMEM_LST_XB_G2 <= 12, "the local-store bound covers at most three crossbar arbiter levels");
-constexpr uint32_t DLMEM_LST_MAX = (VX_CFG_LSU_QUEUE_IN_SIZE + 3) * VX_CFG_NUM_LSU_LANES
-                                 + (3 + 2 * (DLMEM_LST_XB_G1 + DLMEM_LST_XB_G2)) * VX_CFG_LMEM_NUM_BANKS;
+// VX_dlmem_pkg's bound on one warp's local-access lanes between the
+// translation and their bank commit, with the RTL crossbar's arbiter groups
+// (VX_stream_arb's MAX_FANOUT is 8); per bank, an atomic in its read and
+// write-back stages on top of the store path.
+constexpr uint32_t DLMEM_LACC_XB_IN = VX_CFG_NUM_LSU_BLOCKS * VX_CFG_NUM_LSU_LANES + 1;
+constexpr uint32_t DLMEM_LACC_XB_G1 = (DLMEM_LACC_XB_IN > 12) ? (DLMEM_LACC_XB_IN + 7) / 8 : 0;
+constexpr uint32_t DLMEM_LACC_XB_G2 = (DLMEM_LACC_XB_G1 > 12) ? (DLMEM_LACC_XB_G1 + 7) / 8 : 0;
+static_assert(DLMEM_LACC_XB_G2 <= 12, "the local-access bound covers at most three crossbar arbiter levels");
+constexpr uint32_t DLMEM_LACC_MAX = (VX_CFG_LSU_QUEUE_IN_SIZE + 3) * VX_CFG_NUM_LSU_LANES
+                                  + (5 + 2 * (DLMEM_LACC_XB_G1 + DLMEM_LACC_XB_G2)) * VX_CFG_LMEM_NUM_BANKS;
 
-// The local-store tracker's largest count, 2^DLMEM_LST_W - 1.
-constexpr uint32_t DLMEM_LST_LIMIT = (1u << dlmem_clog2(uint64_t(DLMEM_LST_MAX) + 1)) - 1;
+// The local-access tracker's largest count, 2^DLMEM_LACC_W - 1.
+constexpr uint32_t DLMEM_LACC_LIMIT = (1u << dlmem_clog2(uint64_t(DLMEM_LACC_MAX) + 1)) - 1;
 
 // Request network packet (VX_dlmem_pkg dlmem_req_pkt_t); the fabric routes it
 // to `dst`, the target core.

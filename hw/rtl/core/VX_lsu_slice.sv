@@ -113,8 +113,9 @@ module VX_lsu_slice import VX_gpu_pkg::*; #(
         assign mem_req_attr_struct[i].is_flush  = req_is_fence;
         assign mem_req_attr_struct[i].is_fence  = req_is_fence;
     `ifdef VX_CFG_EXT_DLMEM_ENABLE
-        // The DLMEM translation stage sets it on the lanes bound for a peer core.
+        // The DLMEM translation stage sets them: lanes bound for a peer core, counted local lanes.
         assign mem_req_attr_struct[i].is_addr_remote = 1'b0;
+        assign mem_req_attr_struct[i].is_lacc        = 1'b0;
     `endif
     `ifdef VX_CFG_EXT_OM_ENABLE
         // OM fragment-export aperture.

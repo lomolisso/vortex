@@ -404,7 +404,7 @@ void SfuUnit::on_tick() {
 				#ifdef VX_CFG_EXT_DLMEM_ENABLE
 					// an arrival counts only once the warp's earlier instructions
 					// committed, its remote accesses are performed and its local
-					// stores are written
+					// accesses are committed
 					if (core_->has_pending_instrs(trace->wid) || !core_->dlmem_drained(trace->wid))
 						continue;
 				#endif

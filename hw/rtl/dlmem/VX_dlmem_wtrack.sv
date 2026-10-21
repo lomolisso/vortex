@@ -17,8 +17,8 @@
 // translation, decrements when they complete. As the remote-access tracker,
 // drained[w] means every earlier remote store of warp w has committed in its
 // target bank and every earlier remote load or AMO has returned its data; as
-// the local-store tracker, every earlier local plain store of warp w has been
-// written into its bank.
+// the local-access tracker, every earlier local load, store, AMO, LR/SC and
+// mbarrier op of warp w has been performed in its bank.
 module VX_dlmem_wtrack import VX_gpu_pkg::*, VX_dlmem_pkg::*; #(
     parameter NUM_INC   = `VX_CFG_NUM_LSU_BLOCKS,
     parameter NUM_DEC   = 1,

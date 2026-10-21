@@ -23,6 +23,10 @@
 #include "amo_ops.h"
 #include "amo_unit.h"
 #endif
+#ifdef VX_CFG_EXT_MBAR_ENABLE
+#include <iostream>
+#include "mbar_ref.h"
+#endif
 
 using namespace vortex;
 
@@ -54,6 +58,10 @@ protected:
 #endif
 	MemCrossBar::Ptr mem_xbar_;
 	mutable PerfStats perf_stats_;
+#ifdef VX_CFG_EXT_DLMEM_ENABLE
+	// Per bank, the cycle the last commit pulse lands.
+	std::vector<uint64_t> commit_due_;
+#endif
 
 	uint64_t to_local_addr(uint64_t addr) {
 		return bit_getw(addr, 0, addr_bits_-1);
@@ -64,6 +72,17 @@ protected:
 	// are the same access as far as the bank is concerned.
 	uint64_t bank_word(uint64_t addr) {
 		return to_local_addr(addr) >> log2ceil(config_.line_size);
+	}
+#endif
+
+#ifdef VX_CFG_EXT_MBAR_ENABLE
+	[[noreturn]] void mbar_abort(uint32_t bank, const MemReq& req, const char* msg,
+	                             uint64_t word = 0, uint64_t operand = 0) {
+		std::cerr << SimPlatform::instance().cycles() << ": " << simobject_->name() << "-bank" << bank
+		          << " " << msg << ": op=" << req.op << " addr=0x" << std::hex << req.addr
+		          << " byteen=0x" << req.byteen << " word=0x" << word << " operand=0x" << operand
+		          << std::dec << " (#" << req.uuid << ")" << std::endl;
+		std::abort();
 	}
 #endif
 
@@ -79,6 +98,9 @@ public:
 		, amo_rdw_addr_(1 << config.B, 0)
 		, amo_rdw_valid_(1 << config.B, false)
 		, amo_rdw_pending_(1 << config.B, false)
+#endif
+#ifdef VX_CFG_EXT_DLMEM_ENABLE
+		, commit_due_(1 << config.B, 0)
 #endif
 	{
 		char sname[100];
@@ -112,7 +134,29 @@ public:
 		std::fill(amo_rdw_valid_.begin(), amo_rdw_valid_.end(), false);
 		std::fill(amo_rdw_pending_.begin(), amo_rdw_pending_.end(), false);
 #endif
+#ifdef VX_CFG_EXT_DLMEM_ENABLE
+		std::fill(commit_due_.begin(), commit_due_.end(), 0);
+#endif
 	}
+
+#ifdef VX_CFG_EXT_DLMEM_ENABLE
+	// An access from an LSU port that the translation counted (flags.lacc; the
+	// TCU metadata loads share port 0 and bypass it) is committed `delay`
+	// cycles after the bank takes it: a load or a store at once, registered
+	// (1); an atomic at its write-back, the third cycle of its occupancy,
+	// registered (3). The crossbar appended the input port to the tag.
+	void commit_pulse(uint32_t bank, const MemReq& req, uint32_t delay) {
+		if (!req.flags.lacc || (req.tag & ((1u << log2ceil(config_.num_reqs)) - 1)) >= config_.commit_ports)
+			return;
+		constexpr uint32_t LOG_THREADS = log2ceil(VX_CFG_NUM_THREADS);
+		constexpr uint32_t WID_MASK = (1u << log2ceil(VX_CFG_NUM_WARPS)) - 1;
+		uint64_t due = SimPlatform::instance().cycles() + delay;
+		__assert(due > commit_due_.at(bank), simobject_->name() << "-bank" << bank
+		         << ": two commit pulses in one cycle");
+		commit_due_.at(bank) = due;
+		simobject_->CommitOut.at(bank).send((req.hart_id >> LOG_THREADS) & WID_MASK, delay);
+	}
+#endif
 
 	void tick() {
 		// process bank requets from xbar
@@ -156,7 +200,11 @@ public:
 			// (this was the prior behaviour — LMEM had no AMO path). LR/SC
 			// reservations are tracked per hart for correct contended
 			// compare-swap, mirroring the dcache AMO path used for global/SSBO.
+#ifdef VX_CFG_EXT_MBAR_ENABLE
+			if (memop_is_atomic(bank_req.op) || memop_is_mbar(bank_req.op)) {
+#else
 			if (memop_is_atomic(bank_req.op)) {
+#endif
 				const uint32_t bmask   = VX_CFG_MEM_BLOCK_SIZE - 1;
 				const uint64_t la      = to_local_addr(bank_req.addr);
 				const uint32_t byte_off = (uint32_t)(la & bmask);
@@ -167,7 +215,17 @@ public:
 				const bool     is_lr   = (op == MemOp::AMO_LR);
 				const bool     is_sc   = (op == MemOp::AMO_SC);
 				const bool     sc_fail = is_sc && !amo_unit_.check(bank_req.hart_id, la);
+#ifdef VX_CFG_EXT_MBAR_ENABLE
+				// A wait writes nothing, so it is no commit and leaves no shadow, like a load-reserved.
+				const bool     is_mbar = memop_is_mbar(op);
+				const bool     is_wait = is_mbar && mbar_ref::is_wait(mbar_op_code(op));
+				const bool     do_store = !is_lr && !sc_fail && !is_wait;
+				if (is_mbar && ((byte_off & 7) != 0 || bank_req.byteen != (0xffull << byte_off))) {
+					this->mbar_abort(i, bank_req, mbar_ref::MSG_ALIGN);
+				}
+#else
 				const bool     do_store = !is_lr && !sc_fail;
+#endif
 
 				uint8_t obuf[8] = {0};
 				ram_.read(obuf, la, wbytes);
@@ -177,6 +235,17 @@ public:
 				auto rmw = amo_compute(op, width, old_word, rhs,
 				                       bank_req.flags.amo_unsigned,
 				                       bank_req.amo_cmp);
+#ifdef VX_CFG_EXT_MBAR_ENABLE
+				if (is_mbar) {
+					const uint32_t err = mbar_ref::apply(mbar_op_code(op), old_word, rhs).err;
+					if (err & mbar_ref::ERR_UNDERFLOW) {
+						this->mbar_abort(i, bank_req, mbar_ref::MSG_UNDERFLOW, old_word, rhs);
+					}
+					if (err & mbar_ref::ERR_TX_RANGE) {
+						this->mbar_abort(i, bank_req, mbar_ref::MSG_TX_RANGE, old_word, rhs);
+					}
+				}
+#endif
 
 				// Build the response before mutating any state so a full RspIn
 				// can stall-retry cleanly.
@@ -209,6 +278,9 @@ public:
 				DT(4, simobject_->name() << "-bank" << i << " amo : " << bank_req);
 				amo_rdw_addr_[i]    = this->bank_word(bank_req.addr);
 				amo_rdw_pending_[i] = do_store;
+#ifdef VX_CFG_EXT_DLMEM_ENABLE
+				this->commit_pulse(i, bank_req, AMO_BANK_STALL_CYCLES + 1);
+#endif
 				xbar_req_out.pop();
 				amo_busy_[i] = AMO_BANK_STALL_CYCLES;   // capture, then write back
 				continue;
@@ -270,12 +342,9 @@ public:
 			perf_stats_.writes += bank_req.is_write();
 
 #ifdef VX_CFG_EXT_DLMEM_ENABLE
-			// The write is final now; the crossbar appended the input port to the tag.
-			if (bank_req.op == MemOp::ST
-			 && (bank_req.tag & ((1u << log2ceil(config_.num_reqs)) - 1)) < config_.commit_ports) {
-				constexpr uint32_t LOG_THREADS = log2ceil(VX_CFG_NUM_THREADS);
-				constexpr uint32_t WID_MASK = (1u << log2ceil(VX_CFG_NUM_WARPS)) - 1;
-				simobject_->CommitOut.at(i).send((bank_req.hart_id >> LOG_THREADS) & WID_MASK, 1);
+			// The store is written and the load has read its data now.
+			if (bank_req.op == MemOp::ST || bank_req.op == MemOp::LD) {
+				this->commit_pulse(i, bank_req, 1);
 			}
 #endif
 

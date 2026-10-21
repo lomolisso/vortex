@@ -6,10 +6,17 @@
 #define MODE_BAR      0   // the producer's store is ordered by the group barrier
 #define MODE_FENCE    1   // the producer's store is ordered by vx_fence() before a flag store
 #define MODE_FENCEBAR 2   // vx_fence() and then the group barrier, with no polling
+#define MODE_RL       3   // amoswap.d.rl of the flag that the consumers poll (order_k)
+
+// order_k only: what the producer does to X before its ordering point, in mode bits [15:8].
+#define ACC_ST        0   // stores the round into X
+#define ACC_AMO       1   // swaps the round into X with amoswap.d
+#define ACC_LD        2   // loads X, which must still hold the previous round; the consumers store the round after the release
+#define ACC_SHIFT     8
 
 typedef struct {
   uint64_t res_addr;     // RES_WORDS per thread, then one copy count per streamer warp
-  uint32_t mode;
+  uint32_t mode;         // MODE_*; for order_k also ACC_* << ACC_SHIFT
   uint32_t rounds;
   uint32_t dxa_on;       // the streamer warps keep DXA tile copies in flight
   uint32_t tile_elems;   // 32-bit elements per DXA tile
@@ -21,9 +28,9 @@ typedef struct {
   uint32_t banks;        // local-memory banks, interleaved by doubleword
 } kernel_arg_t;
 
-#define RES_STALE     0   // reads of X older than the round; ~0 if the thread never finished
+#define RES_STALE     0   // reads of X older than the round (ld: producer loads that saw the round); ~0 if the thread never finished
 #define RES_FIRST     1   // the first round with a stale read, 0 if none
-#define RES_TIMEOUT   2   // fence mode: rounds whose flag never arrived
+#define RES_TIMEOUT   2   // fence and rl modes: rounds whose flag never arrived
 #define RES_WORDS     3
 
 // Polls of the flag before a consumer gives the round up.

@@ -38,10 +38,10 @@ module VX_dlmem_lsu_xlate import VX_gpu_pkg::*; #(
     input  dlmem_row_t                      peer_wr_row,
     input  wire [LMEM_LOG:0]                peer_wr_stride,
 
-    // Per warp, no remote access awaits its completion and no local store its
-    // bank write; fences wait for both.
+    // Per warp, no remote access awaits its completion and no local access its
+    // bank commit; fences wait for both.
     input  wire [NW-1:0]                    drained,
-    input  wire [NW-1:0]                    lmem_st_drained,
+    input  wire [NW-1:0]                    lmem_acc_drained,
 
     VX_lsu_sched_if.slave                   in_if  [NB],
     VX_lsu_sched_if.master                  out_if [NB],
@@ -55,10 +55,10 @@ module VX_dlmem_lsu_xlate import VX_gpu_pkg::*; #(
     output wire [NB-1:0][NW_WIDTH-1:0]      wt_inc_wid,
     output wire [NB-1:0][CNT_W-1:0]         wt_inc_cnt,
 
-    // Local plain stores leaving each stage, per warp.
-    output wire [NB-1:0]                    lst_inc_valid,
-    output wire [NB-1:0][NW_WIDTH-1:0]      lst_inc_wid,
-    output wire [NB-1:0][CNT_W-1:0]         lst_inc_cnt,
+    // Local accesses leaving each stage, per warp.
+    output wire [NB-1:0]                    lacc_inc_valid,
+    output wire [NB-1:0][NW_WIDTH-1:0]      lacc_inc_wid,
+    output wire [NB-1:0][CNT_W-1:0]         lacc_inc_cnt,
 
     output wire [NB-1:0]                    empty
 );
@@ -99,15 +99,15 @@ module VX_dlmem_lsu_xlate import VX_gpu_pkg::*; #(
             .slot_base       (slot_base),
             .stride          (stride),
             .drained         (drained),
-            .lmem_st_drained (lmem_st_drained),
+            .lmem_acc_drained (lmem_acc_drained),
             .out_remote      (out_remote[b]),
             .out_oob         (out_oob[b]),
             .wt_inc_valid    (wt_inc_valid[b]),
             .wt_inc_wid      (wt_inc_wid[b]),
             .wt_inc_cnt      (wt_inc_cnt[b]),
-            .lst_inc_valid   (lst_inc_valid[b]),
-            .lst_inc_wid     (lst_inc_wid[b]),
-            .lst_inc_cnt     (lst_inc_cnt[b]),
+            .lacc_inc_valid  (lacc_inc_valid[b]),
+            .lacc_inc_wid    (lacc_inc_wid[b]),
+            .lacc_inc_cnt    (lacc_inc_cnt[b]),
             .empty           (empty[b])
         );
     end

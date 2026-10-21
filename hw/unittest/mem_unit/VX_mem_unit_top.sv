@@ -149,9 +149,9 @@ module VX_mem_unit_top import VX_gpu_pkg::*; #(
     `UNUSED_VAR (dlmem_lmem_if.rsp_valid)
     `UNUSED_VAR (dlmem_lmem_if.rsp_data)
 
-    wire [`VX_CFG_LMEM_NUM_BANKS-1:0]               lmem_st_commit_valid;
-    wire [`VX_CFG_LMEM_NUM_BANKS-1:0][NW_WIDTH-1:0] lmem_st_commit_wid;
-    `UNUSED_VAR ({lmem_st_commit_valid, lmem_st_commit_wid})
+    wire [`VX_CFG_LMEM_NUM_BANKS-1:0]               lmem_commit_valid;
+    wire [`VX_CFG_LMEM_NUM_BANKS-1:0][NW_WIDTH-1:0] lmem_commit_wid;
+    `UNUSED_VAR ({lmem_commit_valid, lmem_commit_wid})
 `endif
 
     VX_mem_unit #(
@@ -165,8 +165,8 @@ module VX_mem_unit_top import VX_gpu_pkg::*; #(
     `ifdef VX_CFG_EXT_DLMEM_ENABLE
         .dlmem_remote_if (dlmem_remote_if),
         .dlmem_lmem_if (dlmem_lmem_if),
-        .lmem_st_commit_valid (lmem_st_commit_valid),
-        .lmem_st_commit_wid (lmem_st_commit_wid),
+        .lmem_commit_valid (lmem_commit_valid),
+        .lmem_commit_wid   (lmem_commit_wid),
     `endif
         .empty         (mem_unit_empty),
         .lsu_mem_if    (lsu_mem_if),

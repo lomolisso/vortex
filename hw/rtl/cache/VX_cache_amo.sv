@@ -564,6 +564,10 @@ module VX_cache_amo import VX_gpu_pkg::*; #(
         `endif
             .compute_new_word (new_word),
             .compute_ret_word (ret_word_unused),
+        `ifdef VX_CFG_EXT_MBAR_ENABLE
+            `UNUSED_PIN (compute_mbar_flip),
+            `UNUSED_PIN (compute_mbar_err),
+        `endif
             .res_reserve   (res_reserve),
             .res_clear     (res_clear),
             .res_invalidate(res_invalidate),

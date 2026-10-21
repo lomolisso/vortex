@@ -64,6 +64,10 @@ module VX_local_mem_top import VX_gpu_pkg::*; #(
     input  wire [NUM_REQS-1:0]                 mem_req_amo_unsigned,
     input  wire [NUM_REQS-1:0][`VX_CFG_XLEN-1:0] mem_req_amo_cmp,
     input  wire [NUM_REQS-1:0][HART_IN_WIDTH-1:0] mem_req_hart_id,
+`ifdef VX_CFG_EXT_DLMEM_ENABLE
+    // The DLMEM translation counted the access (attr is_lacc)
+    input  wire [NUM_REQS-1:0]                 mem_req_lacc,
+`endif
     output wire [NUM_REQS-1:0]                 mem_req_ready,
 
     // Core response
@@ -73,9 +77,9 @@ module VX_local_mem_top import VX_gpu_pkg::*; #(
     input  wire [NUM_REQS-1:0]                 mem_rsp_ready,
 
 `ifdef VX_CFG_EXT_DLMEM_ENABLE
-    // Plain-store commits of the LSU inputs, one per bank
-    output wire [NUM_BANKS-1:0]                st_commit_valid,
-    output wire [NUM_BANKS-1:0][7:0]           st_commit_wid,
+    // Access commits of the LSU inputs, one per bank
+    output wire [NUM_BANKS-1:0]                lmem_commit_valid,
+    output wire [NUM_BANKS-1:0][7:0]           lmem_commit_wid,
 `endif
 
     // DMA request: one row of NUM_BANKS words at a bank address
@@ -127,6 +131,9 @@ module VX_local_mem_top import VX_gpu_pkg::*; #(
         `ifdef VX_CFG_EXT_ZACAS_ENABLE
             req_attr.amo.amo_cmp      = mem_req_amo_cmp[i];
         `endif
+        `ifdef VX_CFG_EXT_DLMEM_ENABLE
+            req_attr.is_lacc          = mem_req_lacc[i];
+        `endif
         end
     `ifndef VX_CFG_EXT_ZACAS_ENABLE
         `UNUSED_VAR (mem_req_amo_cmp[i])
@@ -170,9 +177,9 @@ module VX_local_mem_top import VX_gpu_pkg::*; #(
     `UNUSED_VAR (dma_bus_if.rsp_data.tag.uuid)
 
 `ifdef VX_CFG_EXT_DLMEM_ENABLE
-    wire [NUM_BANKS-1:0][NW_WIDTH-1:0] st_commit_wid_w;
-    for (genvar i = 0; i < NUM_BANKS; ++i) begin : g_st_commit_wid
-        assign st_commit_wid[i] = 8'(st_commit_wid_w[i]);
+    wire [NUM_BANKS-1:0][NW_WIDTH-1:0] lmem_commit_wid_w;
+    for (genvar i = 0; i < NUM_BANKS; ++i) begin : g_lmem_commit_wid
+        assign lmem_commit_wid[i] = 8'(lmem_commit_wid_w[i]);
     end
 `endif
 
@@ -196,8 +203,8 @@ module VX_local_mem_top import VX_gpu_pkg::*; #(
         .clk        (clk),
         .reset      (reset),
     `ifdef VX_CFG_EXT_DLMEM_ENABLE
-        .st_commit_valid (st_commit_valid),
-        .st_commit_wid   (st_commit_wid_w),
+        .lmem_commit_valid (lmem_commit_valid),
+        .lmem_commit_wid   (lmem_commit_wid_w),
     `endif
         .lsu_bus_if (lsu_bus_if),
         .dma_bus_if (dma_bus_if)

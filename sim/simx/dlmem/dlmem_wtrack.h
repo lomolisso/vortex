@@ -24,9 +24,9 @@ namespace vortex {
 // Increments come from each LSU block's translation, decrements from the
 // egress: DecIn for store acks, DoneIn for answered loads, AMOs and SCs, never
 // both in one cycle (the core merges them into the RTL's one decrement port).
-// The core's second instance counts local plain stores instead: increments
-// from the translation, one decrement per bank write on CommitIn, several
-// banks in one cycle.
+// The core's second instance counts local accesses instead: increments from
+// the translation, one decrement per bank commit on CommitIn, several banks
+// in one cycle.
 // drained(w) is the registered cnt[w] == 0 of the cycle after.
 class DlmemWTrack : public SimObject<DlmemWTrack> {
 public:

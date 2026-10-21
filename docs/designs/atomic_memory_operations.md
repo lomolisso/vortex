@@ -475,6 +475,9 @@ breaks every hart's reservation on each bank word the write touches.
 | local memory | 3-cycle in-place RMW | same occupancy, modeled as a per-bank busy count |
 | reservations | bounded line-indexed stations with hold credit | one reservation **per hart** |
 
+With `VX_CFG_EXT_MBAR_ENABLE`, `amo_op_e` 10–15 and `MemOp` 13–18 are the
+mbarrier ops, which only the local memory banks execute.
+
 Two of these differences matter when mirroring logic between the models:
 
 - **Request direction.** A SimX predicate written to mirror an RTL condition

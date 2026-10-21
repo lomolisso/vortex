@@ -344,6 +344,9 @@ static op_string_t op_string(const Instr &instr) {
         case AmoType::AMOMINU: return {"AMOMINU.D", ""};
         case AmoType::AMOMAXU: return {"AMOMAXU.D", ""};
         case AmoType::AMOCAS:  return {"AMOCAS.D", ""};
+#ifdef VX_CFG_EXT_MBAR_ENABLE
+        case AmoType::MBAR_ARRIVE: return {"MBAR.ARRIVE", ""}; case AmoType::MBAR_ARRIVE_TX: return {"MBAR.ARRIVE_TX", ""}; case AmoType::MBAR_EXPECT_TX: return {"MBAR.EXPECT_TX", ""}; case AmoType::MBAR_COMPLETE_TX: return {"MBAR.COMPLETE_TX", ""}; case AmoType::MBAR_TEST_WAIT: return {"MBAR.TEST_WAIT", ""};
+#endif
         default:
           std::abort();
         }
@@ -429,7 +432,6 @@ static op_string_t op_string(const Instr &instr) {
  );
  return {"", ""};
 }
-
 namespace vortex {
 std::ostream &operator<<(std::ostream &os, const Instr &instr) {
   auto sintr = ::op_string(instr);
@@ -466,12 +468,10 @@ Decoder::Decoder(const SimContext& ctx, const char* name, PoolAllocator<Instr, 6
   : SimObject<Decoder>(ctx, name)
   , instr_pool_(instr_pool)
 {}
-
 Decoder::~Decoder() {}
 
 Instr::Ptr Decoder::decode(uint32_t code, uint64_t uuid) {
-  // Detect RVC from the raw bits and expand to a 32-bit instruction.
-  const bool is_rvc = (code & 0x3u) != 0x3u;
+  const bool is_rvc = (code & 0x3u) != 0x3u;  // RVC: expand to a 32-bit instruction
   if (is_rvc) {
     auto r = rvc_decompress(code & 0xFFFFu);
     assert(!r.illegal && "illegal RVC encoding");
@@ -1132,6 +1132,28 @@ Instr::Ptr Decoder::decode(uint32_t code, uint64_t uuid) {
     // known-violation handoff class, checked against its decoded destination.
     gfx_doctrine::check(*instr);
   } break;
+#ifdef VX_CFG_EXT_MBAR_ENABLE
+  case Opcode::EXT3: { // mbarrier ops: doubleword atomics on a local-memory word, amo_op = 10 + funct3
+    if (funct7 != 0)
+      std::abort();
+    switch (funct3) {
+    case 0: instr->set_op_type(AmoType::MBAR_ARRIVE); break;
+    case 1: instr->set_op_type(AmoType::MBAR_ARRIVE_TX); break;
+    case 2: instr->set_op_type(AmoType::MBAR_EXPECT_TX); break;
+    case 3: instr->set_op_type(AmoType::MBAR_COMPLETE_TX); break;
+    case 4: instr->set_op_type(AmoType::MBAR_TEST_WAIT); break;
+    default:
+      std::abort();
+    }
+    instr->set_fu_type(FUType::LSU);
+    // An arrival releases the warp's earlier local-memory accesses: it is held
+    // at the translation like an AMO with .rl.
+    instr->set_args(IntrAmoArgs{3, 0, funct3 <= 1});
+    instr->set_dest_reg(rd, RegType::Integer);
+    instr->set_src_reg(0, rs1, RegType::Integer);
+    instr->set_src_reg(1, rs2, RegType::Integer);
+  } break;
+#endif
   default:
     std::abort();
   }

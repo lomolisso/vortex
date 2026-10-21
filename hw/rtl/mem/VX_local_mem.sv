@@ -42,7 +42,8 @@ module VX_local_mem import VX_gpu_pkg::*; #(
 `ifdef VX_CFG_EXT_DLMEM_ENABLE
     // Inputs whose stores return a response once the bank has committed them
     parameter [NUM_REQS-1:0] STORE_ACK_MASK = '0,
-    // Inputs whose plain stores are reported on st_commit once written
+    // Inputs whose accesses marked by the DLMEM translation (attr is_lacc) are
+    // reported on lmem_commit once performed
     parameter [NUM_REQS-1:0] COMMIT_MASK = '0,
 `endif
 
@@ -58,9 +59,9 @@ module VX_local_mem import VX_gpu_pkg::*; #(
 `endif
 
 `ifdef VX_CFG_EXT_DLMEM_ENABLE
-    // Per bank, a COMMIT_MASK input's plain store written in the previous cycle, and its warp
-    output wire [NUM_BANKS-1:0]                st_commit_valid,
-    output wire [NUM_BANKS-1:0][NW_WIDTH-1:0]  st_commit_wid,
+    // Per bank, a COMMIT_MASK input's access performed in the previous cycle, and its warp
+    output wire [NUM_BANKS-1:0]                lmem_commit_valid,
+    output wire [NUM_BANKS-1:0][NW_WIDTH-1:0]  lmem_commit_wid,
 `endif
 
     // LSU read/write port
@@ -91,7 +92,12 @@ module VX_local_mem import VX_gpu_pkg::*; #(
     localparam AMO_CMP_WIDTH   = 0;
 `endif
     localparam AMO_SB_WIDTH    = 1 + $bits(amo_op_e) + 1 + HART_ID_WIDTH + AMO_CMP_WIDTH;
+`ifdef VX_CFG_EXT_DLMEM_ENABLE
+    // plus the is_lacc marker
+    localparam REQ_DATAW       = 1 + BANK_ADDR_WIDTH + WORD_SIZE + WORD_WIDTH + TAG_WIDTH + AMO_SB_WIDTH + 1;
+`else
     localparam REQ_DATAW       = 1 + BANK_ADDR_WIDTH + WORD_SIZE + WORD_WIDTH + TAG_WIDTH + AMO_SB_WIDTH;
+`endif
     localparam RSP_DATAW       = WORD_WIDTH + TAG_WIDTH;
 
     `STATIC_ASSERT(ADDR_WIDTH == (BANK_ADDR_WIDTH + `CLOG2(NUM_BANKS)), ("invalid parameter"))
@@ -122,6 +128,9 @@ module VX_local_mem import VX_gpu_pkg::*; #(
 `ifdef VX_CFG_EXT_ZACAS_ENABLE
     wire [NUM_REQS-1:0][AMO_CMP_WIDTH-1:0] req_amo_cmp;
 `endif
+`ifdef VX_CFG_EXT_DLMEM_ENABLE
+    wire [NUM_REQS-1:0]                  req_lacc;
+`endif
     // Gated by AMO_ENABLE: the widths stay constant and the zeros constant-fold
     // through the crossbar payload (the VX_cache_bank pattern).
     for (genvar i = 0; i < NUM_REQS; ++i) begin : g_req_amo
@@ -131,8 +140,9 @@ module VX_local_mem import VX_gpu_pkg::*; #(
         assign req_amo_op[i]       = AMO_ENABLE ? lane_attr.amo.amo_op : '0;
         assign req_amo_unsigned[i] = AMO_ENABLE ? lane_attr.amo.amo_unsigned : 1'b0;
     `ifdef VX_CFG_EXT_DLMEM_ENABLE
-        // A committing input's hart id names the warp its stores are reported for.
+        // A committing input's hart id names the warp its accesses are reported for.
         assign req_amo_hart_id[i]  = ((AMO_ENABLE != 0) || COMMIT_MASK[i]) ? lane_attr.amo.hart_id : '0;
+        assign req_lacc[i]         = COMMIT_MASK[i] && lane_attr.is_lacc;
     `else
         assign req_amo_hart_id[i]  = AMO_ENABLE ? lane_attr.amo.hart_id : '0;
     `endif
@@ -157,6 +167,9 @@ module VX_local_mem import VX_gpu_pkg::*; #(
 `ifdef VX_CFG_EXT_ZACAS_ENABLE
     wire [NUM_BANKS-1:0][AMO_CMP_WIDTH-1:0] per_bank_req_amo_cmp;
 `endif
+`ifdef VX_CFG_EXT_DLMEM_ENABLE
+    wire [NUM_BANKS-1:0]                    per_bank_req_lacc;
+`endif
     wire [NUM_BANKS-1:0][REQ_SEL_WIDTH-1:0] per_bank_req_idx;
     wire [NUM_BANKS-1:0]                    per_bank_req_ready;
 
@@ -173,6 +186,9 @@ module VX_local_mem import VX_gpu_pkg::*; #(
     for (genvar i = 0; i < NUM_REQS; ++i) begin : g_req_data_in
         assign req_valid_in[i] = lsu_bus_if[i].req_valid;
         assign req_data_in[i] = {
+        `ifdef VX_CFG_EXT_DLMEM_ENABLE
+            req_lacc[i],
+        `endif
             req_amo_valid[i],
             req_amo_op[i],
             req_amo_unsigned[i],
@@ -218,6 +234,9 @@ module VX_local_mem import VX_gpu_pkg::*; #(
 
     for (genvar i = 0; i < NUM_BANKS; ++i) begin : g_per_bank_req_data_soa
         assign {
+        `ifdef VX_CFG_EXT_DLMEM_ENABLE
+            per_bank_req_lacc[i],
+        `endif
             per_bank_req_amo_valid[i],
             per_bank_req_amo_op[i],
             per_bank_req_amo_unsigned[i],
@@ -356,6 +375,22 @@ module VX_local_mem import VX_gpu_pkg::*; #(
         wire                       sc_resolving;  // SC outcome replaces the response
         wire                       sc_fail;
         wire                       sc_lane_hi;    // outcome lane of a resolving .W SC
+    `ifdef VX_CFG_EXT_MBAR_ENABLE
+        wire                       wait_resolving; // an mbarrier wait's outcome replaces the response
+        wire                       wait_done;
+    `endif
+    `ifdef VX_CFG_EXT_DLMEM_ENABLE
+        wire                       amo_commit;    // a COMMIT_MASK input's atomic in its write-back stage
+        wire [NW_WIDTH-1:0]        amo_commit_wid;
+        wire [NW_WIDTH-1:0]        req_wid;
+        if (NW_BITS != 0) begin : g_req_wid
+            wire [HART_ID_WIDTH-1:0] req_hart_id = per_bank_req_amo_hart_id[i];
+            assign req_wid = req_hart_id[NT_BITS +: NW_BITS];
+            `UNUSED_VAR (req_hart_id)
+        end else begin : g_req_wid0
+            assign req_wid = '0;
+        end
+    `endif
 
         if (AMO_ENABLE != 0) begin : g_amo
 
@@ -460,9 +495,18 @@ module VX_local_mem import VX_gpu_pkg::*; #(
             // Everything that ends up writing the word: a plain store, a
             // read-modify-write atomic (which carries rw=0 and so is not a store by
             // the request flag), and a store-conditional that found its reservation.
+        `ifdef VX_CFG_EXT_MBAR_ENABLE
+            // An mbarrier wait only reads; amo_wb_op_r holds the atomic in flight.
+            wire is_wait_op = (amo_op_e'(amo_wb_op_r) == AMO_OP_MBAR_TEST_WAIT)
+                           || (amo_op_e'(amo_wb_op_r) == AMO_OP_MBAR_TRY_WAIT);
+            wire res_commits_store = res_is_store_r
+                                  || (res_is_amo_r && ~res_is_lr_r && ~res_is_sc_r && ~is_wait_op)
+                                  || (res_is_sc_r && res_check);
+        `else
             wire res_commits_store = res_is_store_r
                                   || (res_is_amo_r && ~res_is_lr_r && ~res_is_sc_r)
                                   || (res_is_sc_r && res_check);
+        `endif
 
             reg amo_wb_is_lr_r;
             reg amo_wb_sc_fail_r;
@@ -475,7 +519,12 @@ module VX_local_mem import VX_gpu_pkg::*; #(
 
             // A load-reserved leaves the word alone, and a failed store-conditional
             // must not store; every other atomic writes its computed value back.
+        `ifdef VX_CFG_EXT_MBAR_ENABLE
+            // An mbarrier wait writes nothing either.
+            assign amo_wb_store = amo_wb_valid_r && ~amo_wb_is_lr_r && ~amo_wb_sc_fail_r && ~is_wait_op;
+        `else
             assign amo_wb_store = amo_wb_valid_r && ~amo_wb_is_lr_r && ~amo_wb_sc_fail_r;
+        `endif
             assign amo_busy = amo_rd_valid_r || amo_wb_valid_r;
 
             always @(posedge clk) begin
@@ -500,6 +549,27 @@ module VX_local_mem import VX_gpu_pkg::*; #(
                 `endif
                 end
             end
+
+        `ifdef VX_CFG_EXT_DLMEM_ENABLE
+            // Committed at its write-back stage, whether it writes or not.
+            reg                amo_wb_commit_r;
+            reg [NW_WIDTH-1:0] amo_wb_wid_r;
+            always @(posedge clk) begin
+                if (amo_accept) begin
+                    amo_wb_commit_r <= per_bank_req_lacc[i];
+                    amo_wb_wid_r    <= req_wid;
+                end
+            end
+            assign amo_commit     = amo_wb_valid_r && amo_wb_commit_r;
+            assign amo_commit_wid = amo_wb_wid_r;
+        `endif
+
+        `ifdef VX_CFG_EXT_MBAR_ENABLE
+            // A wait answers whether the token's phase has completed, from the word
+            // the response carries, in the cycle that response leaves the bank.
+            assign wait_resolving = amo_rd_valid_r && is_wait_op;
+            assign wait_done      = (per_bank_rsp_data[i][WORD_WIDTH-1] != amo_wb_rhs_r[WORD_WIDTH-1]);
+        `endif
 
             // old_word is this cycle's SRAM output -- the same value the response
             // carries back, which is why ret_word is not used here.
@@ -536,10 +606,17 @@ module VX_local_mem import VX_gpu_pkg::*; #(
             // legal. Clamp the depth instead of inheriting the L1-miss sizing.
             // A hold must outlast one refused LR from every other hart of the core.
             localparam LMEM_HOLD_CREDIT_BITS = `MAX(3, `CLOG2(`VX_CFG_NUM_WARPS * `VX_CFG_NUM_THREADS));
+        `ifdef VX_CFG_EXT_MBAR_ENABLE
+            wire       amo_mbar_flip;
+            wire [1:0] amo_mbar_err;
+        `endif
             VX_amo_unit #(
                 .NUM_RES_ENTRIES  (`MIN(`VX_CFG_AMO_RS_SIZE, 4)),
                 .HOLD_CREDIT_BITS (LMEM_HOLD_CREDIT_BITS),
                 .LINE_ADDR_BITS   (BANK_ADDR_WIDTH),
+            `ifdef VX_CFG_EXT_MBAR_ENABLE
+                .MBAR_ENABLE      (1),
+            `endif
                 .DATA_WIDTH       (WORD_WIDTH)
             ) amo_unit (
                 .clk              (clk),
@@ -557,6 +634,10 @@ module VX_local_mem import VX_gpu_pkg::*; #(
             `endif
                 .compute_new_word (amo_new_word),
                 .compute_ret_word (amo_ret_word),
+            `ifdef VX_CFG_EXT_MBAR_ENABLE
+                .compute_mbar_flip (amo_mbar_flip),
+                .compute_mbar_err  (amo_mbar_err),
+            `endif
                 // A load-reserved claims the word; a store-conditional gives up its
                 // own reservation whether it succeeds or fails; any committing store
                 // breaks whoever else holds one.
@@ -572,6 +653,19 @@ module VX_local_mem import VX_gpu_pkg::*; #(
             if (WORD_WIDTH < 64) begin : g_amo_hi_unused
                 `UNUSED_VAR (amo_new_word[63:WORD_WIDTH])
             end
+        `ifdef VX_CFG_EXT_MBAR_ENABLE
+            `UNUSED_VAR (amo_mbar_flip)
+            wire wb_is_mbar = (amo_op_e'(amo_wb_op_r) >= AMO_OP_MBAR_ARRIVE);
+            `RUNTIME_ASSERT(~(amo_wb_valid_r && wb_is_mbar && ~(&amo_wb_byteen_r)),
+                ("%t: *** %s bank%0d: mbarrier op is not a naturally aligned doubleword: row=0x%0h byteen=0x%h",
+                    $time, INSTANCE_ID, i, amo_wb_addr_r, amo_wb_byteen_r))
+            `RUNTIME_ASSERT(~(amo_wb_valid_r && amo_mbar_err[0]),
+                ("%t: *** %s bank%0d: mbarrier pending underflow: row=0x%0h word=0x%h count=0x%0h",
+                    $time, INSTANCE_ID, i, amo_wb_addr_r, amo_old_r, amo_wb_rhs_r))
+            `RUNTIME_ASSERT(~(amo_wb_valid_r && amo_mbar_err[1]),
+                ("%t: *** %s bank%0d: mbarrier tx out of range: row=0x%0h word=0x%h op=%0d bytes=0x%0h",
+                    $time, INSTANCE_ID, i, amo_wb_addr_r, amo_old_r, amo_wb_op_r, amo_wb_rhs_r))
+        `endif
 
             assign amo_wb_addr   = amo_wb_addr_r;
             assign amo_wb_byteen = amo_wb_byteen_r;
@@ -585,6 +679,14 @@ module VX_local_mem import VX_gpu_pkg::*; #(
             assign sc_resolving  = 1'b0;
             assign sc_fail       = 1'b0;
             assign sc_lane_hi    = 1'b0;
+        `ifdef VX_CFG_EXT_MBAR_ENABLE
+            assign wait_resolving = 1'b0;
+            assign wait_done      = 1'b0;
+        `endif
+        `ifdef VX_CFG_EXT_DLMEM_ENABLE
+            assign amo_commit     = 1'b0;
+            assign amo_commit_wid = '0;
+        `endif
             `UNUSED_VAR (per_bank_req_amo_valid[i])
             `UNUSED_VAR (per_bank_req_amo_op[i])
             `UNUSED_VAR (per_bank_req_amo_unsigned[i])
@@ -663,30 +765,27 @@ module VX_local_mem import VX_gpu_pkg::*; #(
                                     && (bank_rsp_ready || (per_bank_req_rw[i] && ~req_store_ack))
                                     && ~is_rdw_hazard;
 
-        // A plain store is final in the cycle the bank accepts it: atomics, LR/SC
-        // and their write-backs carry rw=0, and DMA beats never reach the crossbar.
-        wire st_commit = lsu_active && per_bank_req_rw[i] && COMMIT_MASK[per_bank_req_idx[i]];
-        wire [HART_ID_WIDTH-1:0] st_commit_hart_id = per_bank_req_amo_hart_id[i];
-        wire [NW_WIDTH-1:0] st_commit_wid_n;
-        if (NW_BITS != 0) begin : g_commit_wid
-            assign st_commit_wid_n = st_commit_hart_id[NT_BITS +: NW_BITS];
-        end else begin : g_commit_wid0
-            assign st_commit_wid_n = '0;
-        end
-        `UNUSED_VAR (st_commit_hart_id)
+        // A load or plain store is final in the cycle the bank accepts it, an
+        // atomic (LR, SC and mbarrier ops included) once its write-back stage
+        // passes; DMA beats never reach the crossbar. The write-back stage owns
+        // the bank, so the two never meet. Only accesses the translation counted
+        // are reported: the TCU metadata loads share an LSU input and bypass it.
+        wire acc_commit = lsu_active && ~per_bank_req_amo_valid[i] && per_bank_req_lacc[i];
+        wire lmem_commit_n = acc_commit || amo_commit;
+        wire [NW_WIDTH-1:0] lmem_commit_wid_n = amo_commit ? amo_commit_wid : req_wid;
 
         VX_pipe_register #(
             .DATAW  (1 + NW_WIDTH),
             .RESETW (1)
-        ) st_commit_reg (
+        ) lmem_commit_reg (
             .clk      (clk),
             .reset    (reset),
             .enable   (1'b1),
-            .data_in  ({st_commit, st_commit_wid_n}),
-            .data_out ({st_commit_valid[i], st_commit_wid[i]})
+            .data_in  ({lmem_commit_n, lmem_commit_wid_n}),
+            .data_out ({lmem_commit_valid[i], lmem_commit_wid[i]})
         );
 
-        `RUNTIME_ASSERT(~(st_commit && per_bank_req_amo_valid[i]), ("%t: *** %s bank%0d: store commit of an atomic", $time, INSTANCE_ID, i))
+        `RUNTIME_ASSERT(~(acc_commit && amo_commit), ("%t: *** %s bank%0d: access commit beside an atomic's", $time, INSTANCE_ID, i))
     `else
         assign bank_rsp_valid = per_bank_req_valid[i]
                              && ~dma_pending
@@ -719,10 +818,19 @@ module VX_local_mem import VX_gpu_pkg::*; #(
         // the LSU's subword extraction. The outcome is resolved at the commit
         // stage, which is the same cycle the response carries the SRAM output,
         // so it substitutes here rather than needing a response of its own.
+    `ifdef VX_CFG_EXT_MBAR_ENABLE
+        // An mbarrier wait returns its outcome the same way.
+        wire [WORD_WIDTH-1:0] bank_rsp_word = sc_resolving
+                                            ? (sc_lane_hi ? (WORD_WIDTH'(sc_fail) << (WORD_WIDTH/2))
+                                                          : WORD_WIDTH'(sc_fail))
+                                            : wait_resolving ? WORD_WIDTH'(wait_done)
+                                                             : per_bank_rsp_data[i];
+    `else
         wire [WORD_WIDTH-1:0] bank_rsp_word = sc_resolving
                                             ? (sc_lane_hi ? (WORD_WIDTH'(sc_fail) << (WORD_WIDTH/2))
                                                           : WORD_WIDTH'(sc_fail))
                                             : per_bank_rsp_data[i];
+    `endif
 
         // Back-pressure-safe LSU response data. The bank SRAM OUT_REG
         // (per_bank_rsp_data) is read live by the response xbar, but the

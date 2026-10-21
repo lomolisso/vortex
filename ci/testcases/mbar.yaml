@@ -1,0 +1,232 @@
+# mbarriers: 64-bit synchronization objects in a block's local memory, which
+# the local memory banks update in their atomic unit (custom-2 arrive,
+# arrive_tx, expect_tx, complete_tx, test_wait). RV64, on a DLMEM device with
+# the A extension. The apps check every final object word against the golden
+# model sw/common/mbar_ref.h. See docs/proposals/dlmem_proposal.md.
+category: mbar
+defaults:
+  xlen: [64]
+  configs: "-DVX_CFG_EXT_DLMEM_ENABLE -DVX_CFG_EXT_A_ENABLE -DVX_CFG_EXT_MBAR_ENABLE"
+  tier: smoke
+  touches: [hw/rtl/cache/VX_amo_alu.sv, hw/rtl/cache/VX_amo_unit.sv, hw/rtl/mem/VX_local_mem.sv,
+            hw/rtl/core/VX_decode.sv, hw/rtl/VX_gpu_pkg.sv, hw/rtl/VX_define.vh, hw/rtl/dlmem,
+            hw/rtl/core/VX_lsu_slice.sv, hw/rtl/core/VX_mem_unit.sv, hw/rtl/core/VX_core.sv,
+            sim/simx/types.h, sim/simx/decode.cpp, sim/simx/amo, sim/simx/mem/local_mem,
+            sim/simx/lsu_unit, sim/simx/dlmem, sim/simx/core, sim/simx/processor.cpp,
+            sw/common/mbar_ref.h, sw/kernel/include/vx_mbar.h, tests/regression/mbar_local,
+            VX_config.toml, hw/rtl/cache/VX_cache_amo.sv, hw/rtl/core/VX_wctl_unit.sv,
+            hw/rtl/interfaces/VX_warp_ctl_if.sv, sim/simx/sfu_unit.cpp,
+            sw/kernel/include/vx_dlmem.h, sw/kernel/include/vx_dxa.h,
+            hw/rtl/mem/VX_lmem_switch.sv, hw/rtl/core/VX_lsu_unit.sv,
+            hw/rtl/core/VX_scheduler.sv, sw/common/dlmem_ref.h, hw/rtl/dxa, hw/rtl/VX_kmu.sv,
+            hw/rtl/Vortex.sv, hw/rtl/VX_cluster.sv, hw/rtl/interfaces/VX_kmu_bus_if.sv,
+            hw/rtl/core/VX_cta_dispatch.sv, hw/rtl/core/VX_csr_data.sv,
+            hw/rtl/core/VX_kmu_bus_arb.sv, hw/rtl/core/VX_bar_unit.sv,
+            hw/rtl/mem/VX_gbar_unit.sv, hw/rtl/core/VX_execute.sv,
+            hw/rtl/interfaces/VX_sched_unlock_if.sv, hw/rtl/cp/VX_cp_axil_regfile.sv,
+            hw/rtl/VX_socket.sv, sim/simx/kmu, sim/simx/cta_dispatcher, sim/simx/scheduler,
+            sim/simx/csr_unit.cpp, sim/simx/cluster, sim/simx/barrier_unit,
+            sim/common/cmd_processor.cpp, sim/simx/wctl_unit.cpp, sim/simx/socket,
+            sw/kernel/include/vx_spawn2.h, sw/runtime/common/caps.h,
+            sw/runtime/common/queue.cpp, sw/runtime/common/legacy_runtime.cpp,
+            tests/regression/cluster_rank, tests/regression/cta_gang,
+            tests/regression/cluster_sync, tests/regression/dlmem_local,
+            tests/regression/dlmem_store, tests/regression/dlmem_load,
+            tests/regression/dlmem_atomic, tests/regression/dlmem_stress,
+            tests/regression/lmem_bar_order, tests/regression/dlmem_amo_order, VX_types.toml]
+tests:
+  # One block of 4 warps x 4 threads. basic: every thread arrives with 1 and
+  # waits on its token for 32 phases; the stores before each arrive must be
+  # visible after the wait. count: lane 0 of each warp arrives for its warp,
+  # odd warps in two arrives. pc: two producer and two consumer warps over a
+  # double buffer with FULL and EMPTY barriers; an EMPTY arrive must wait for
+  # the warp's loads. tx: a scripted sequence of every op (each returned word
+  # against mbar_ref, a complete before its expect, a flip by expect_tx, tx at
+  # both ends of its range), then expect/complete/arrive_tx by every warp per
+  # phase with the completes first on odd phases.
+  - id: mbar_local
+    app: mbar_local
+    drivers: [simx, rtlsim]
+    args: "-m basic -r 32"
+  - id: mbar_local-count
+    app: mbar_local
+    drivers: [simx, rtlsim]
+    args: "-m count -r 32"
+  - id: mbar_local-pc
+    app: mbar_local
+    drivers: [simx, rtlsim]
+    args: "-m pc -r 32"
+  - id: mbar_local-tx
+    app: mbar_local
+    drivers: [simx, rtlsim]
+    args: "-m tx -r 16"
+  # The xrt leg wraps the same RTL in the AFU shell and host stack.
+  - id: mbar_local-pc-xrt
+    app: mbar_local
+    drivers: [xrt]
+    args: "-m pc -r 16"
+
+  # Wider shapes: 8 warps of 8 threads (64 arrivals per phase on one word, four
+  # producer and four consumer warps), and SIMD 2 with issue width 2, where a
+  # warp's lanes reach the banks as two packets.
+  - id: mbar_local-w8t8
+    app: mbar_local
+    drivers: [simx, rtlsim]
+    tier: nightly
+    shape: {warps: 8, threads: 8}
+    args: "-m basic -r 32"
+  - id: mbar_local-pc-w8t8
+    app: mbar_local
+    drivers: [simx, rtlsim]
+    tier: nightly
+    shape: {warps: 8, threads: 8}
+    args: "-m pc -r 64"
+  - id: mbar_local-tx-simd2
+    app: mbar_local
+    drivers: [simx, rtlsim]
+    tier: nightly
+    configs+: "-DVX_CFG_SIMD_WIDTH=2 -DVX_CFG_ISSUE_WIDTH=2"
+    shape: {warps: 8}
+    args: "-m tx -r 32"
+  # Two warps stream DXA copies into their own tiles, so DMA beats win the
+  # banks while the objects are updated.
+  - id: mbar_local-pc-dxa
+    app: mbar_local
+    drivers: [simx, rtlsim]
+    tier: nightly
+    configs+: "-DVX_CFG_EXT_DXA_ENABLE"
+    shape: {warps: 8}
+    args: "-m pc -r 64 -D 2"
+  - id: mbar_local-count-dxa
+    app: mbar_local
+    drivers: [simx, rtlsim]
+    tier: nightly
+    configs+: "-DVX_CFG_EXT_DXA_ENABLE"
+    shape: {warps: 8}
+    args: "-m count -r 64 -D 2"
+
+  # SimX<->rtlsim parity at XLEN 64: no spin (the warps meet in a register
+  # barrier where they would wait, then test_wait must pass at once), so the
+  # instruction count is exact; the arrive holds and the bank's atomic timing
+  # set the cycles.
+  - id: parity-mbar-local
+    check: model_parity
+    app: mbar_local
+    xlen: [64]
+    args: "-m pc -r 32 -p"
+  - id: parity-mbar-tx
+    check: model_parity
+    app: mbar_local
+    xlen: [64]
+    args: "-m tx -r 16 -p"
+
+  # Each must stop the simulation with the exact message: an arrive past
+  # pending, tx past its 21-bit range, an mbarrier op on a global address, and
+  # one on another block's object through the window (a SPREAD cluster of 2 on
+  # 2 cores, until remote mbarrier ops exist). The shape goes in CONFIGS, so
+  # the run reuses the prebuilt driver.
+  - id: mbar_local-underflow
+    via: script
+    driver: simx
+    env: {DRIVER: simx, APP: mbar_local, ARGS: "-x underflow", EXPECT: "mbarrier pending underflow"}
+    run: &expect_fail_run |
+      set -u
+      tmp=$(mktemp -d)
+      if ! make -C sw/runtime/"$DRIVER" > "$tmp/build.log" 2>&1 \
+         || ! make -C tests/regression/"$APP" >> "$tmp/build.log" 2>&1; then
+        echo "FAIL: the build failed with CONFIGS=${CONFIGS:-}"; tail -n 20 "$tmp/build.log"
+        rm -rf "$tmp"; exit 1
+      fi
+      timeout 120 ./ci/blackbox.sh --driver="$DRIVER" --app="$APP" --args="$ARGS" > "$tmp/run.log" 2>&1
+      rc=$?
+      fail=0
+      if [ $rc -eq 0 ]; then
+        echo "FAIL: '$ARGS' ran to completion on $DRIVER"; fail=1
+      elif [ $rc -eq 124 ]; then
+        echo "FAIL: '$ARGS' timed out on $DRIVER"; fail=1
+      elif ! grep -qF "$EXPECT" "$tmp/run.log"; then
+        echo "FAIL: '$ARGS' failed on $DRIVER (exit $rc) without '$EXPECT'"; fail=1
+      else
+        echo "OK: '$ARGS' stops $DRIVER (exit $rc): $(grep -F -m1 "$EXPECT" "$tmp/run.log")"
+      fi
+      [ $fail -eq 0 ] || tail -n 20 "$tmp/run.log"
+      rm -rf "$tmp"
+      exit $fail
+  - id: mbar_local-underflow
+    via: script
+    driver: rtlsim
+    env: {DRIVER: rtlsim, APP: mbar_local, ARGS: "-x underflow", EXPECT: "mbarrier pending underflow"}
+    run: *expect_fail_run
+  - id: mbar_local-txrange
+    via: script
+    driver: simx
+    env: {DRIVER: simx, APP: mbar_local, ARGS: "-x txrange", EXPECT: "mbarrier tx out of range"}
+    run: *expect_fail_run
+  - id: mbar_local-txrange
+    via: script
+    driver: rtlsim
+    env: {DRIVER: rtlsim, APP: mbar_local, ARGS: "-x txrange", EXPECT: "mbarrier tx out of range"}
+    run: *expect_fail_run
+  - id: mbar_local-global
+    via: script
+    driver: simx
+    env: {DRIVER: simx, APP: mbar_local, ARGS: "-x global", EXPECT: "mbarrier op on a global address"}
+    run: *expect_fail_run
+  - id: mbar_local-global
+    via: script
+    driver: rtlsim
+    env: {DRIVER: rtlsim, APP: mbar_local, ARGS: "-x global", EXPECT: "mbarrier op on a global address"}
+    run: *expect_fail_run
+  - id: mbar_local-remote
+    via: script
+    driver: simx
+    configs+: "-DVX_CFG_NUM_CORES=2 -DVX_CFG_L2_ENABLE"
+    env: {DRIVER: simx, APP: mbar_local, ARGS: "-x remote", EXPECT: "remote mbarrier ops are not supported yet"}
+    run: *expect_fail_run
+  - id: mbar_local-remote
+    via: script
+    driver: rtlsim
+    configs+: "-DVX_CFG_NUM_CORES=2 -DVX_CFG_L2_ENABLE"
+    env: {DRIVER: rtlsim, APP: mbar_local, ARGS: "-x remote", EXPECT: "remote mbarrier ops are not supported yet"}
+    run: *expect_fail_run
+
+  # The knob without its prerequisites must stop the build, in SimX (the
+  # processor object) and in the RTL (a Verilator lint of the processor), each
+  # with the exact message. Tagged simx only for cell placement.
+  - id: reject-nodlmem
+    via: script
+    driver: simx
+    configs: "-DVX_CFG_EXT_A_ENABLE -DVX_CFG_EXT_MBAR_ENABLE"
+    env: {EXPECT: "mbarriers require DLMEM"}
+    run: &reject_run |
+      set -u
+      read -r vh vl xl <<< "$(printf 'include config.mk\nall:\n\t@echo $(VORTEX_HOME) $(VERILATOR_PATH) $(XLEN)\n' | make -s -f -)"
+      tmp=$(mktemp -d)
+      make -C sim/simx DESTDIR="$tmp" "$tmp/obj/processor.o" > "$tmp/simx.log" 2>&1; simx_rc=$?
+      r=$vh/hw/rtl
+      "$vl/bin/verilator" --lint-only -Wno-lint -Wno-style -Wno-REDEFMACRO \
+        -DVX_CFG_XLEN="$xl" -DVX_CFG_XLEN_"$xl" -DSIMULATION ${CONFIGS:-} \
+        -Isw -Ihw -I"$r" -I"$r/libs" -I"$r/interfaces" -I"$r/core" -I"$r/mem" \
+        -I"$r/vm" -I"$r/cache" -I"$r/fpu" -I"$r/dlmem" \
+        "$r/VX_gpu_pkg.sv" "$r/fpu/VX_fpu_pkg.sv" "$r/dlmem/VX_dlmem_pkg.sv" \
+        "$r/VX_trace_pkg.sv" "$r/Vortex.sv" \
+        --top-module Vortex > "$tmp/rtl.log" 2>&1; rtl_rc=$?
+      fail=0
+      for side in simx rtl; do
+        rc=simx_rc; [ $side = rtl ] && rc=rtl_rc
+        if [ "${!rc}" -eq 0 ]; then
+          echo "FAIL: the $side build accepted CONFIGS=${CONFIGS:-}"; fail=1
+        elif ! grep -qF "$EXPECT" "$tmp/$side.log"; then
+          echo "FAIL: the $side build failed without '$EXPECT':"; tail -n 20 "$tmp/$side.log"; fail=1
+        else
+          echo "OK: the $side build rejects it: $(grep -F -m1 "$EXPECT" "$tmp/$side.log")"
+        fi
+      done
+      rm -rf "$tmp"
+      exit $fail
+  - id: reject-noa
+    via: script
+    driver: simx
+    configs: "-DVX_CFG_EXT_DLMEM_ENABLE -DVX_CFG_EXT_MBAR_ENABLE"
+    env: {EXPECT: "mbarriers require the A extension"}
+    run: *reject_run

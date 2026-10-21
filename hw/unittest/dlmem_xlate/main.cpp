@@ -24,12 +24,12 @@
 // one cycle after it enters while the output is ready, translated with the row
 // current when it entered; untouched fields stay bit-equal, except the hart id
 // of every local lane, which becomes the issuer's. Models of the core's two
-// trackers count the remote lanes and the local plain-store lanes leaving the
-// stage and drive drained and lmem_st_drained, registered like the trackers,
-// with acknowledgements and bank commits (several per cycle) at random rates:
-// a fence or a release AMO must not leave while its warp is undrained on
-// either, and one right behind a remote access or a local store of its warp
-// must be held. Each warp uses one block, as in the core.
+// trackers count the remote lanes and the local lanes (loads, stores, AMOs)
+// leaving the stage and drive drained and lmem_acc_drained, registered like the
+// trackers, with acknowledgements and bank commits (several per cycle) at
+// random rates: a fence or a release AMO must not leave while its warp is
+// undrained on either, and one right behind a remote or local access of its
+// warp must be held. Each warp uses one block, as in the core.
 // --mode=sched: random traffic into a model of the LSU scheduler's input queue
 // (random acceptance and drain), filling it and handing requests over as the
 // stage empties. The model is ideal, so the empty fold VX_core relies on rests
@@ -40,14 +40,19 @@
 // right behind it and a later request of the block: the fence is held with
 // drained low from its first cycle, the later request waits behind it, and the
 // fence leaves in the cycle the completion makes drained high. Then a local
-// store through the window (own rank) and a plain local-memory store, each
-// held the same way on lmem_st_drained until its bank commit; a local load,
-// a local AMO and a fence count nothing; a drained warp's fence is not held.
-// --mode=rl: a release AMO right behind its warp's uncommitted local store, then
-// behind its unacknowledged remote store, is held and leaves in the cycle
-// lmem_st_drained or drained rises; a plain AMO in the same spot is not held,
-// nor is a drained warp's release AMO.
-// --mode=all: directed, random, sched, fence, then rl.
+// store and a local load through the window (own rank), a plain local-memory
+// store and load, and a local AMO, each held the same way on lmem_acc_drained
+// until its bank commit; a fence counts nothing; a drained warp's fence is not
+// held.
+// --mode=rl: a release AMO right behind its warp's uncommitted local store, load
+// and AMO, then behind its unacknowledged remote store, is held and leaves in
+// the cycle lmem_acc_drained or drained rises; a plain AMO in the same spot is
+// not held, nor is a drained warp's release AMO.
+// --mode=mbar (mbarrier builds): mbarrier ops on local lanes are counted; an
+// arrive is held like a release AMO, the other ops are not.
+// --mode=mbar-global / --mode=mbar-remote: one mbarrier op on a global or a
+// remote lane; the stage's assert must abort the run.
+// --mode=all: directed, random, sched, fence, then rl (and mbar).
 
 #include "vl_simulator.h"
 #include "VVX_dlmem_xlate_top.h"
@@ -224,7 +229,7 @@ struct Request {
   std::vector<int>      kind;   // -1: not translated (masked lane or fence)
   uint64_t exp_remote = 0;
   uint64_t exp_oob = 0;
-  uint32_t exp_lst = 0;          // local plain-store lanes
+  uint32_t exp_lacc = 0;         // local lanes
 };
 
 enum class ReadyKind { ALWAYS, RANDOM, STALL };
@@ -276,6 +281,7 @@ public:
     attr_local_pos_  = this->single_bit(m_local, "is_addr_local");
     attr_io_pos_     = this->single_bit(m_io, "is_addr_io");
     attr_remote_pos_ = this->single_bit(m_remote, "is_addr_remote");
+    attr_lacc_pos_   = this->single_bit(get_field(t->cfg_attr_lacc, 0, attr_w_), "is_lacc");
     attr_hart_lsb_  = attr_w_;
     uint32_t hart_bits = 0;
     for (uint32_t i = 0; i < attr_w_; ++i) {
@@ -331,8 +337,8 @@ public:
     fired_prev_.assign(nb_, false);
     wt_cnt_.assign(nw_, 0);
     drained_.assign(nw_, true);
-    lst_cnt_.assign(nw_, 0);
-    lst_drained_.assign(nw_, true);
+    lacc_cnt_.assign(nw_, 0);
+    lacc_drained_.assign(nw_, true);
     rem_st_prev_.assign(nb_, std::nullopt);
 
     t->reset = 1;
@@ -368,6 +374,16 @@ public:
     }
     if (opts_.mode == "rl" || opts_.mode == "all") {
       this->run_rl();
+    }
+  #ifdef VX_CFG_EXT_MBAR_ENABLE
+    if (opts_.mode == "mbar" || opts_.mode == "all") {
+  #else
+    if (opts_.mode == "mbar") {
+  #endif
+      this->run_mbar();
+    }
+    if (opts_.mode == "mbar-global" || opts_.mode == "mbar-remote") {
+      this->run_mbar_neg(opts_.mode == "mbar-remote");
     }
     if (failures_ != 0) {
       std::printf("FAILED: %u check(s) failed\n", failures_);
@@ -405,6 +421,26 @@ private:
     for (auto& at : q.attr) {
       set_bits(at, kAttrAmoValid, 1, 1);
     }
+  }
+
+  void mark_mbar(Request& q, uint32_t op) {
+    for (auto& at : q.attr) {
+      set_bits(at, kAttrAmoValid, 1, 1);
+      set_bits(at, kAttrAmoOp, 4, op);
+    }
+  }
+
+  // Random attributes. An mbarrier build asserts on an mbarrier op outside the
+  // local memory, so random traffic keeps its AMO opcodes below them (an AMO
+  // marked later keeps the opcode drawn here).
+  Bits rand_attr() {
+    Bits at = this->rand_bits(attr_w_);
+  #ifdef VX_CFG_EXT_MBAR_ENABLE
+    if (get_bits(at, kAttrAmoOp, 4) >= kMbarArrive) {
+      set_bits(at, kAttrAmoOp + 3, 1, 0);
+    }
+  #endif
+    return at;
   }
 
   uint32_t below(uint64_t n) {
@@ -596,7 +632,7 @@ private:
       q.byteen.push_back(((1u << size) - 1) << at);
       LaneClass c = uniform ? uc : this->pick_class();
       q.addr.push_back(this->gen_lane(c, row) >> 3);
-      q.attr.push_back(this->rand_bits(attr_w_));
+      q.attr.push_back(this->rand_attr());
       q.data.push_back(rnd());
     }
     if (q.rl) {
@@ -617,14 +653,17 @@ private:
     q.stride = stride_;
     q.exp_remote = 0;
     q.exp_oob = 0;
-    q.exp_lst = 0;
-    // A local lane carries the issuer's hart id, and a local store is counted.
+    q.exp_lacc = 0;
+    // A local lane carries the issuer's hart id and is counted, whatever the
+    // access; is_lacc marks exactly the counted lanes for their banks.
     auto local_lane = [&](uint32_t i) {
       set_bits(q.exp_attr[i], attr_hart_lsb_, hart_w_, this->hart_id(q.wid, q.pid, i));
-      q.exp_lst += q.rw;
+      set_bits(q.exp_attr[i], attr_lacc_pos_, 1, 1);
+      ++q.exp_lacc;
     };
     for (uint32_t i = 0; i < nl_; ++i) {
       set_bits(q.exp_attr[i], attr_remote_pos_, 1, 0);
+      set_bits(q.exp_attr[i], attr_lacc_pos_, 1, 0);
       if (!((q.mask >> i) & 1) || q.fence) {
         ++n_untranslated_;
         continue;
@@ -699,7 +738,7 @@ private:
     }
     for (uint32_t w = 0; w < nw_; ++w) {
       set_bits(t->drained, w, 1, drained_[w]);
-      set_bits(t->lmem_st_drained, w, 1, lst_drained_[w]);
+      set_bits(t->lmem_acc_drained, w, 1, lacc_drained_[w]);
     }
     for (uint32_t b = 0; b < nb_; ++b) {
       const auto& o = offer_[b];
@@ -798,19 +837,19 @@ private:
     }
     std::vector<uint64_t> wt_inc(nw_, 0);
     // Up to one bank commit per local-memory bank per cycle.
-    std::vector<uint64_t> lst_inc(nw_, 0), lst_dec(nw_, 0);
+    std::vector<uint64_t> lacc_inc(nw_, 0), lacc_dec(nw_, 0);
     for (uint32_t k = 0; k < VX_CFG_LMEM_NUM_BANKS; ++k) {
       if (!chance(commit_pct_)) {
         continue;
       }
       std::vector<uint32_t> pend;
       for (uint32_t w = 0; w < nw_; ++w) {
-        if (lst_cnt_[w] > lst_dec[w]) {
+        if (lacc_cnt_[w] > lacc_dec[w]) {
           pend.push_back(w);
         }
       }
       if (!pend.empty()) {
-        ++lst_dec[pend[below(pend.size())]];
+        ++lacc_dec[pend[below(pend.size())]];
       }
     }
     this->drive();
@@ -851,7 +890,7 @@ private:
 
       bool valid = get_bits(t->out_valid, b, 1);
       bool ordered = !q.empty() && (q.front().fence || q.front().rl);
-      bool held = ordered && !(drained_[q.front().wid] && lst_drained_[q.front().wid]);
+      bool held = ordered && !(drained_[q.front().wid] && lacc_drained_[q.front().wid]);
       if (valid_prev_[b] && !ready_prev_[b] && !valid) {
         this->fail(strf("block %u: output dropped while stalled", b));
       }
@@ -883,16 +922,16 @@ private:
         }
         ++(q.front().fence ? n_b2b_ : n_b2b_rl_);
       }
-      if (ordered && lst_prev_[b] == q.front().wid) {
-        // The same for a local store.
+      if (ordered && lacc_prev_[b] == q.front().wid) {
+        // The same for a local access.
         if (!held) {
-          this->fail(strf("block %u seq %" PRIu64 ": %s behind a local store of warp %u not held", b,
+          this->fail(strf("block %u seq %" PRIu64 ": %s behind a local access of warp %u not held", b,
                           q.front().seq, q.front().fence ? "fence" : "release AMO", q.front().wid));
         }
-        ++(q.front().fence ? n_b2b_lst_ : n_b2b_rl_);
+        ++(q.front().fence ? n_b2b_lacc_ : n_b2b_rl_);
       }
       rem_st_prev_[b].reset();
-      lst_prev_[b].reset();
+      lacc_prev_[b].reset();
       bool fire = false;
       if (valid) {
         if (q.empty()) {
@@ -903,7 +942,7 @@ private:
         }
       }
       bool wt_valid = get_bits(t->wt_inc_valid, b, 1);
-      bool lst_valid = get_bits(t->lst_inc_valid, b, 1);
+      bool lacc_valid = get_bits(t->lacc_inc_valid, b, 1);
       if (fire) {
         const Request& r = q.front();
         bool want = (r.exp_remote != 0);
@@ -922,21 +961,22 @@ private:
           wt_inc[r.wid] += popcount(r.exp_remote);
           rem_st_prev_[b] = r.wid;
         }
-        bool want_lst = (r.exp_lst != 0);
-        if (lst_valid != want_lst) {
-          this->fail(strf("block %u seq %" PRIu64 ": lst_inc_valid=%d, expected %d", b, r.seq, lst_valid, want_lst));
+        bool want_lacc = (r.exp_lacc != 0);
+        if (lacc_valid != want_lacc) {
+          this->fail(strf("block %u seq %" PRIu64 ": lacc_inc_valid=%d, expected %d", b, r.seq, lacc_valid, want_lacc));
         }
-        if (want_lst) {
-          uint64_t wid = get_bits(t->lst_inc_wid, b * nw_w_, nw_w_);
-          uint64_t cnt = get_bits(t->lst_inc_cnt, b * cnt_w_, cnt_w_);
-          if (wid != r.wid || cnt != r.exp_lst) {
-            this->fail(strf("block %u seq %" PRIu64 ": lst_inc wid %" PRIu64 " cnt %" PRIu64 ", expected %u %u",
-                            b, r.seq, wid, cnt, r.wid, r.exp_lst));
+        if (want_lacc) {
+          uint64_t wid = get_bits(t->lacc_inc_wid, b * nw_w_, nw_w_);
+          uint64_t cnt = get_bits(t->lacc_inc_cnt, b * cnt_w_, cnt_w_);
+          if (wid != r.wid || cnt != r.exp_lacc) {
+            this->fail(strf("block %u seq %" PRIu64 ": lacc_inc wid %" PRIu64 " cnt %" PRIu64 ", expected %u %u",
+                            b, r.seq, wid, cnt, r.wid, r.exp_lacc));
           }
-          ++n_lst_inc_;
-          n_lst_lanes_ += r.exp_lst;
-          lst_inc[r.wid] += r.exp_lst;
-          lst_prev_[b] = r.wid;
+          ++n_lacc_inc_;
+          n_lacc_lanes_ += r.exp_lacc;
+          n_lacc_rd_lanes_ += r.rw ? 0 : r.exp_lacc;
+          lacc_inc[r.wid] += r.exp_lacc;
+          lacc_prev_[b] = r.wid;
         }
         if (r.fence || r.rl || fobs_.count(r.seq)) {
           fobs_[r.seq].fire_cycle = cycle_;
@@ -955,8 +995,8 @@ private:
         q.pop_front();
         ++n_out_;
         progress = true;
-      } else if (wt_valid || lst_valid) {
-        this->fail(strf("block %u: wt_inc_valid or lst_inc_valid without an output handshake", b));
+      } else if (wt_valid || lacc_valid) {
+        this->fail(strf("block %u: wt_inc_valid or lacc_inc_valid without an output handshake", b));
       }
 
       // Full throughput: a stage drained last cycle accepts this cycle.
@@ -1019,14 +1059,14 @@ private:
         progress = true;
       }
       drained_[w] = (wt_cnt_[w] == 0);
-      if (!lst_drained_[w] && lst_dec[w] == lst_cnt_[w] && lst_inc[w] == 0) {
-        lst_rise_[w] = cycle_ + 1;
+      if (!lacc_drained_[w] && lacc_dec[w] == lacc_cnt_[w] && lacc_inc[w] == 0) {
+        lacc_rise_[w] = cycle_ + 1;
       }
-      lst_cnt_[w] += lst_inc[w];
-      lst_cnt_[w] -= lst_dec[w];
-      n_commits_ += lst_dec[w];
-      progress |= (lst_dec[w] != 0);
-      lst_drained_[w] = (lst_cnt_[w] == 0);
+      lacc_cnt_[w] += lacc_inc[w];
+      lacc_cnt_[w] -= lacc_dec[w];
+      n_commits_ += lacc_dec[w];
+      progress |= (lacc_dec[w] != 0);
+      lacc_drained_[w] = (lacc_cnt_[w] == 0);
     }
 
     // A write lands at the edge: visible to requests from the next cycle.
@@ -1108,8 +1148,8 @@ private:
     auto undrained = [&]() {
       return std::any_of(wt_cnt_.begin(), wt_cnt_.end(), [](auto n) { return n != 0; })
           || std::any_of(drained_.begin(), drained_.end(), [](bool d) { return !d; })
-          || std::any_of(lst_cnt_.begin(), lst_cnt_.end(), [](auto n) { return n != 0; })
-          || std::any_of(lst_drained_.begin(), lst_drained_.end(), [](bool d) { return !d; });
+          || std::any_of(lacc_cnt_.begin(), lacc_cnt_.end(), [](auto n) { return n != 0; })
+          || std::any_of(lacc_drained_.begin(), lacc_drained_.end(), [](bool d) { return !d; });
     };
     while ((this->busy() || undrained()) && !this->watchdog()) {
       for (uint32_t b = 0; b < nb_; ++b) {
@@ -1173,10 +1213,11 @@ private:
                 n_untranslated_, n_wt_inc_, n_wt_stores_, n_wt_reads_);
     std::printf("random: remote lanes encoded past the window %" PRIu64 ", outside lanes inside the remote "
                 "encoding range %" PRIu64 "\n", n_remote_past_, n_alias_none_);
-    std::printf("random: %" PRIu64 " local-store events (%" PRIu64 " lanes), %" PRIu64 " bank commits, %" PRIu64
-                " fences right behind their warp's local store\n", n_lst_inc_, n_lst_lanes_, n_commits_, n_b2b_lst_);
+    std::printf("random: %" PRIu64 " local-access events (%" PRIu64 " lanes, %" PRIu64 " of loads or AMOs), %" PRIu64
+                " bank commits, %" PRIu64 " fences right behind their warp's local access\n", n_lacc_inc_,
+                n_lacc_lanes_, n_lacc_rd_lanes_, n_commits_, n_b2b_lacc_);
     std::printf("random: %" PRIu64 " release AMOs, %" PRIu64 " held, %" PRIu64 " right behind their warp's remote "
-                "access or local store\n", n_rl_, n_rl_held_, n_b2b_rl_);
+                "access or local access\n", n_rl_, n_rl_held_, n_b2b_rl_);
     std::string s;
     for (uint32_t v : n_strides_) {
       s += strf(" %u", v);
@@ -1193,8 +1234,8 @@ private:
     if (ncc_ > 1 && (n_fence_held_ == 0 || n_b2b_ == 0)) {
       this->fail("random traffic never held a fence, or never put one right behind its warp's remote access");
     }
-    if (n_lst_lanes_ == 0 || n_b2b_lst_ == 0 || n_fence_held_ == 0) {
-      this->fail("random traffic never counted a local store, or never held a fence right behind one");
+    if (n_lacc_lanes_ == 0 || n_lacc_rd_lanes_ == 0 || n_b2b_lacc_ == 0 || n_fence_held_ == 0) {
+      this->fail("random traffic never counted a local store and a local load, or never held a fence right behind one");
     }
     if (n_rl_held_ == 0 || n_b2b_rl_ == 0) {
       this->fail("random traffic never held a release AMO, or never put one right behind its warp's access");
@@ -1214,7 +1255,7 @@ private:
     for (uint32_t i = 0; i < nl_; ++i) {
       q.byteen.push_back(0xff);
       q.addr.push_back(i == 0 ? (byte_addr >> 3) : (rnd() & ref::low_mask(aw_)));
-      q.attr.push_back(this->rand_bits(attr_w_));
+      q.attr.push_back(this->rand_attr());
       q.data.push_back(rnd());
     }
     offer_[0] = q;
@@ -1358,7 +1399,7 @@ private:
     for (uint32_t i = 0; i < nl_; ++i) {
       q.byteen.push_back(0xff);
       q.addr.push_back(byte_addr >> 3);
-      q.attr.push_back(this->rand_bits(attr_w_));
+      q.attr.push_back(this->rand_attr());
       q.data.push_back(rnd());
     }
     return q;
@@ -1394,14 +1435,20 @@ private:
     uint32_t w2 = (nw_ > nb_) ? nb_ : 0;
     const uint32_t hold = 20;
 
-    // A local store through the window (own rank), then a plain local-memory
-    // store: each with its warp's fence and a later local load behind it,
-    // every bank commit withheld.
-    for (bool plain : {false, true}) {
-      const char* what = plain ? "plain local-memory store" : "window store to the own rank";
+    // Local accesses through the window (own rank) and to the plain local
+    // memory, and a local AMO: each with its warp's fence and a later local
+    // load behind it, every bank commit withheld.
+    enum { LA_WIN_ST, LA_PLAIN_ST, LA_WIN_LD, LA_PLAIN_LD, LA_AMO, NUM_LA };
+    static const char* la_names[NUM_LA] = {"window store to the own rank", "plain local-memory store",
+                                           "window load from the own rank", "plain local-memory load", "local AMO"};
+    for (int k = 0; k < NUM_LA; ++k) {
+      const char* what = la_names[k];
       ack_pct_ = 100;
       commit_pct_ = 0;
-      Request st = this->fence_req(w, false, true, plain ? cfg_.lmem_base + 16 : local);
+      const bool plain = (k == LA_PLAIN_ST || k == LA_PLAIN_LD);
+      Request st = (k == LA_AMO) ? this->amo_req(w, false, cfg_.lmem_base + 24)
+                                 : this->fence_req(w, false, k == LA_WIN_ST || k == LA_PLAIN_ST,
+                                                   plain ? cfg_.lmem_base + 16 : local);
       if (plain) {
         for (auto& at : st.attr) {
           set_bits(at, attr_local_pos_, 1, 1);
@@ -1418,42 +1465,41 @@ private:
                         ", %zu request(s) in the stage", what, fo.held_cycles, hold, int64_t(fo.fire_cycle),
                         queue_[0].size()));
       }
-      if (lst_cnt_[w] != 1 || wt_cnt_[w] != 0) {
-        this->fail(strf("fence: tracker models count %" PRIu64 " local stores and %" PRIu64 " remote accesses for "
-                        "warp %u after a %s, expected 1 and 0", lst_cnt_[w], wt_cnt_[w], w, what));
+      if (lacc_cnt_[w] != 1 || wt_cnt_[w] != 0) {
+        this->fail(strf("fence: tracker models count %" PRIu64 " local accesses and %" PRIu64 " remote accesses for "
+                        "warp %u after a %s, expected 1 and 0", lacc_cnt_[w], wt_cnt_[w], w, what));
       }
-      // One bank commit: lmem_st_drained rises at the edge, and the fence leaves in that cycle.
+      // One bank commit: lmem_acc_drained rises at the edge, and the fence leaves in that cycle.
       commit_pct_ = 100;
       uint64_t c_commit = cycle_;
       this->offer_all({}, 4);
-      if (fo.fire_cycle != c_commit + 1 || lst_rise_[w] != fo.fire_cycle || this->busy()) {
-        this->fail(strf("fence after a %s: committed in cycle %" PRIu64 ", lmem_st_drained rose in %" PRId64
+      if (fo.fire_cycle != c_commit + 1 || lacc_rise_[w] != fo.fire_cycle) {
+        this->fail(strf("fence after a %s: committed in cycle %" PRIu64 ", lmem_acc_drained rose in %" PRId64
                         ", fired in %" PRId64 " (expected %" PRIu64 ")", what, c_commit - c0,
-                        int64_t(lst_rise_[w] - c0), int64_t(fo.fire_cycle - c0), c_commit + 1 - c0));
+                        int64_t(lacc_rise_[w] - c0), int64_t(fo.fire_cycle - c0), c_commit + 1 - c0));
       }
+      this->drain();
       std::printf("fence: %s, fence held %" PRIu64 " cycles with the commit withheld and the load behind it, "
-                  "then left %" PRId64 " cycle(s) after the commit (the cycle lmem_st_drained rose)\n",
+                  "then left %" PRId64 " cycle(s) after the commit (the cycle lmem_acc_drained rose)\n",
                   what, fo.held_cycles, int64_t(fo.fire_cycle - c_commit));
     }
 
-    // A local load, a local AMO and a store-flagged fence count nothing: the fence behind them is not held.
+    // A store-flagged fence counts nothing: the fence behind it is not held.
     {
       commit_pct_ = 0;
-      uint64_t lanes0 = n_lst_lanes_;
-      Request ld = this->fence_req(w, false, false, local);
-      Request amo = this->amo_req(w, false, cfg_.lmem_base + 24);
+      uint64_t lanes0 = n_lacc_lanes_;
       Request fs = this->fence_req(w, true, true, local);
       Request fe = this->fence_req(w, true, false, 0);
       uint64_t c3 = cycle_;
-      this->offer_all({ld, amo, fs, fe}, 8);
+      this->offer_all({fs, fe}, 6);
       const FenceObs& fo3 = fobs_[fe.seq];
-      if (n_lst_lanes_ != lanes0 || lst_cnt_[w] != 0 || fo3.held_cycles != 0 || fo3.fire_cycle == ~uint64_t(0)) {
-        this->fail(strf("fence: a local load, AMO and store-flagged fence counted %" PRIu64 " local stores; the "
-                        "fence behind them held %" PRIu64 " cycles, fired in %" PRId64, n_lst_lanes_ - lanes0,
-                        fo3.held_cycles, int64_t(fo3.fire_cycle - c3)));
+      if (n_lacc_lanes_ != lanes0 || lacc_cnt_[w] != 0 || fo3.held_cycles != 0 || fo3.fire_cycle == ~uint64_t(0)) {
+        this->fail(strf("fence: a store-flagged fence counted %" PRIu64 " local accesses; the fence behind it held %"
+                        PRIu64 " cycles, fired in %" PRId64, n_lacc_lanes_ - lanes0, fo3.held_cycles,
+                        int64_t(fo3.fire_cycle - c3)));
       }
       commit_pct_ = 100;
-      std::printf("fence: a local load, a local AMO and a store-flagged fence counted no local store\n");
+      std::printf("fence: a store-flagged fence counted no local access\n");
     }
 
     if (!two) {
@@ -1515,18 +1561,20 @@ private:
     return q;
   }
 
-  // An AMO right behind its warp's store with the store's completion withheld:
-  // a release AMO is held until the completion, then leaves in the cycle the
-  // tracker's flag rises; a plain one leaves right behind the store.
-  void rl_case(const char* what, bool remote_st, uint64_t st_addr, uint32_t w, uint32_t w2) {
+  // An AMO right behind its warp's access (kind 0 store, 1 load, 2 AMO) with
+  // the access's completion withheld: a release AMO is held until the
+  // completion, then leaves in the cycle the tracker's flag rises; a plain one
+  // leaves right behind the access. rl_op/plain_op make them mbarrier ops.
+  void rl_case(const char* what, bool remote_st, uint64_t st_addr, uint32_t w, uint32_t w2, int kind = 0,
+               uint32_t rl_op = 0, uint32_t plain_op = 0) {
     const uint32_t hold = 20;
     const uint64_t amo_addr = cfg_.lmem_base + 24;
     auto withhold = [&](bool on) {
       (remote_st ? ack_pct_ : commit_pct_) = on ? 0 : 100;
     };
-    auto pending = [&]() { return remote_st ? wt_cnt_[w] : lst_cnt_[w]; };
+    auto pending = [&]() { return remote_st ? wt_cnt_[w] : lacc_cnt_[w]; };
     auto store = [&]() {
-      Request st = this->fence_req(w, false, true, st_addr);
+      Request st = (kind == 2) ? this->amo_req(w, false, st_addr) : this->fence_req(w, false, kind == 0, st_addr);
       if (!remote_st) {
         for (auto& at : st.attr) {
           set_bits(at, attr_local_pos_, 1, 1);
@@ -1537,6 +1585,9 @@ private:
 
     withhold(true);
     Request am = this->amo_req(w, true, amo_addr);
+    if (rl_op != 0) {
+      this->mark_mbar(am, rl_op);
+    }
     Request ld = this->fence_req(w2, false, false, cfg_.dlmem_base + 16);
     uint64_t c0 = cycle_;
     this->offer_all({store(), am, ld}, hold);
@@ -1549,8 +1600,10 @@ private:
     }
     withhold(false);
     uint64_t c_done = cycle_;
-    this->offer_all({}, 4);
-    bool rise_ok = remote_st || lst_rise_[w] == ho.fire_cycle;
+    this->offer_all({}, 2);
+    // Read before the AMO's own commit raises the flag again.
+    bool rise_ok = remote_st || lacc_rise_[w] == ho.fire_cycle;
+    this->offer_all({}, 2);
     if (ho.fire_cycle != c_done + 1 || !rise_ok || this->busy()) {
       this->fail(strf("rl: release AMO after a %s: completed in cycle %" PRIu64 ", fired in %" PRId64
                       " (expected %" PRIu64 ")", what, c_done - c0, int64_t(ho.fire_cycle - c0), c_done + 1 - c0));
@@ -1561,12 +1614,18 @@ private:
 
     withhold(true);
     Request pa = this->amo_req(w, false, amo_addr);
+    if (plain_op != 0) {
+      this->mark_mbar(pa, plain_op);
+    }
     const FenceObs& po = fobs_[pa.seq];   // watched, so its fire cycle is recorded
     uint64_t c1 = cycle_;
     this->offer_all({store(), pa}, 6);
-    if (po.held_cycles != 0 || po.fire_cycle != c1 + 2 || pending() != 1) {
+    // The plain AMO is local, so it counts beside a local access.
+    const uint64_t want_pending = remote_st ? 1 : 2;
+    if (po.held_cycles != 0 || po.fire_cycle != c1 + 2 || pending() != want_pending) {
       this->fail(strf("rl: plain AMO after a %s: held %" PRIu64 " cycles, fired in %" PRId64 " (expected 2), %"
-                      PRIu64 " pending", what, po.held_cycles, int64_t(po.fire_cycle - c1), pending()));
+                      PRIu64 " pending (expected %" PRIu64 ")", what, po.held_cycles, int64_t(po.fire_cycle - c1),
+                      pending(), want_pending));
     }
     this->drain();
     std::printf("rl: plain AMO after a %s left right behind it\n", what);
@@ -1589,6 +1648,8 @@ private:
     uint32_t w2 = (nw_ > nb_) ? nb_ : 0;
 
     this->rl_case("plain local-memory store", false, cfg_.lmem_base + 16, w, w2);
+    this->rl_case("plain local-memory load", false, cfg_.lmem_base + 16, w, w2, 1);
+    this->rl_case("local AMO", false, cfg_.lmem_base + 32, w, w2, 2);
     if (two) {
       this->rl_case("remote store", true, remote, w, w2);
     } else {
@@ -1608,9 +1669,91 @@ private:
     std::printf("rl: a drained warp's release AMO was not held\n");
   }
 
+  void rl_table(bool two) {
+    TblRow r;
+    r.k = two ? 2 : 1;
+    r.peers.assign(maxc_, ref::Peer{my_core_, 0});
+    if (two) {
+      r.peers[1] = ref::Peer{(my_core_ + 1) % ncc_, 1};
+    }
+    wr_stride_ = 64;
+    wr_ = std::make_pair(0u, r);
+    this->clock();
+  }
+
+  // mbarrier ops on local lanes count like any local access; an arrive is
+  // held behind its warp's earlier local access like a release AMO, and the
+  // other ops are not.
+  void run_mbar() {
+  #ifdef VX_CFG_EXT_MBAR_ENABLE
+    this->drain();
+    this->rl_table(false);
+    const uint32_t w = 0;
+    const uint32_t w2 = (nw_ > nb_) ? nb_ : 0;
+    for (uint32_t op = kMbarArrive; op <= kMbarArrive + 5; ++op) {
+      for (bool plain : {false, true}) {
+        Request q = this->fence_req(w, false, false, 0);
+        q.mask = ref::low_mask(nl_);
+        q.rl = (op <= kMbarArrive + 1);
+        for (uint32_t i = 0; i < nl_; ++i) {
+          q.addr[i] = ((plain ? cfg_.lmem_base : cfg_.dlmem_base) + 64 + 8 * i) >> 3;
+          if (plain) {
+            set_bits(q.attr[i], attr_local_pos_, 1, 1);
+          }
+        }
+        this->mark_mbar(q, op);
+        const uint64_t lanes0 = n_lacc_lanes_, outs0 = n_out_;
+        this->offer_all({q}, 4);
+        if (n_lacc_lanes_ - lanes0 != nl_ || n_out_ != outs0 + 1 || this->busy()) {
+          this->fail(strf("mbar: op %u on %u %s lanes counted %" PRIu64 " local accesses", op, nl_,
+                          plain ? "local-memory" : "window", n_lacc_lanes_ - lanes0));
+        }
+        this->drain();
+      }
+    }
+    std::printf("mbar: ops 10..15 on every lane, through the window and to the local memory, counted per lane\n");
+    this->rl_case("plain local-memory load, then an arrive", false, cfg_.lmem_base + 16, w, w2, 1,
+                  kMbarArrive, kMbarExpectTx);
+    this->rl_case("local AMO, then an arrive_tx", false, cfg_.lmem_base + 32, w, w2, 2,
+                  kMbarArrive + 1, kMbarArrive + 4);
+    this->rl_case("plain local-memory store, then an arrive", false, cfg_.lmem_base + 16, w, w2, 0,
+                  kMbarArrive, kMbarArrive + 3);
+  #else
+    this->fail("mbar mode needs an mbarrier build");
+  #endif
+  }
+
+  // One mbarrier op on a global or a remote lane; the build's assert must abort.
+  void run_mbar_neg(bool remote) {
+  #ifdef VX_CFG_EXT_MBAR_ENABLE
+    const bool two = (ncc_ >= 2 && maxc_ >= 2);
+    if (remote && !two) {
+      this->fail("mbar-remote mode needs a cluster of at least two cores");
+      return;
+    }
+    this->rl_table(two);
+    Request q = this->fence_req(0, false, false, remote ? cfg_.dlmem_base + (uint64_t(1) << lmem_log_) + 8 : 0x1000);
+    for (auto& at : q.attr) {
+      set_bits(at, attr_local_pos_, 1, 0);
+    }
+    this->mark_mbar(q, kMbarArrive);
+    std::printf("mbar: issuing an arrive on a %s lane; the stage's assert must abort here\n",
+                remote ? "remote" : "global");
+    std::fflush(stdout);
+    this->offer_all({q}, 6);
+    this->fail("the mbarrier op on a " + std::string(remote ? "remote" : "global") + " lane did not abort the run");
+  #else
+    (void)remote;
+    this->fail("mbar modes need an mbarrier build");
+  #endif
+  }
+
   ///////////////////////////////////////////////////////////////////////////
 
   static constexpr uint32_t kAttrAmoValid = 4;   // MEM_ATTR_AMO_OFFS
+  static constexpr uint32_t kAttrAmoOp    = 5;   // amo_req_t.amo_op, above amo_valid
+  static constexpr uint32_t kMbarArrive   = 10;  // amo_op_e AMO_OP_MBAR_ARRIVE
+  static constexpr uint32_t kMbarExpectTx = 12;
 
   Options opts_;
   std::mt19937_64 rng_;
@@ -1622,7 +1765,7 @@ private:
 
   uint32_t ncc_, nw_, maxc_, lmem_log_, nb_, nl_, aw_, attr_w_, tag_w_, rsp_w_, pid_w_, nw_w_, k_w_, core_w_;
   uint32_t hart_w_, hart_lsb_core_, nt_bits_, core_id_, cnt_w_, my_core_, rb_, pid_bits_;
-  uint32_t attr_local_pos_, attr_io_pos_, attr_hart_lsb_, attr_remote_pos_;
+  uint32_t attr_local_pos_, attr_io_pos_, attr_hart_lsb_, attr_remote_pos_, attr_lacc_pos_;
   uint64_t win_bytes_;
   ref::Cfg cfg_{};
 
@@ -1660,13 +1803,13 @@ private:
   std::vector<std::optional<uint32_t>> rem_st_prev_;
   uint32_t ack_pct_ = 100;
 
-  // Local-store tracker model.
-  std::vector<uint64_t> lst_cnt_;
-  std::vector<bool> lst_drained_;
-  std::map<uint32_t, uint64_t> lst_rise_;   // per warp, the last cycle lmem_st_drained rose
-  std::vector<std::optional<uint32_t>> lst_prev_ = std::vector<std::optional<uint32_t>>(VX_CFG_NUM_LSU_BLOCKS);
+  // Local-access tracker model.
+  std::vector<uint64_t> lacc_cnt_;
+  std::vector<bool> lacc_drained_;
+  std::map<uint32_t, uint64_t> lacc_rise_;   // per warp, the last cycle lmem_acc_drained rose
+  std::vector<std::optional<uint32_t>> lacc_prev_ = std::vector<std::optional<uint32_t>>(VX_CFG_NUM_LSU_BLOCKS);
   uint32_t commit_pct_ = 100;
-  uint64_t n_lst_inc_ = 0, n_lst_lanes_ = 0, n_commits_ = 0, n_b2b_lst_ = 0;
+  uint64_t n_lacc_inc_ = 0, n_lacc_lanes_ = 0, n_lacc_rd_lanes_ = 0, n_commits_ = 0, n_b2b_lacc_ = 0;
 
   struct FenceObs {
     uint64_t held_cycles = 0;
@@ -1691,8 +1834,8 @@ private:
 };
 
 static void usage(const char* prog) {
-  std::printf("usage: %s [--mode=all|directed|random|sched|oob|remote|fence|rl] [--seed=N] [--launches=N] [--cycles=N] "
-              "[--watchdog=N] [--no-oob]\n", prog);
+  std::printf("usage: %s [--mode=all|directed|random|sched|oob|remote|fence|rl|mbar|mbar-global|mbar-remote] [--seed=N] "
+              "[--launches=N] [--cycles=N] [--watchdog=N] [--no-oob]\n", prog);
 }
 
 int main(int argc, char** argv) {
@@ -1724,7 +1867,8 @@ int main(int argc, char** argv) {
     }
   }
   if (opts.mode != "all" && opts.mode != "directed" && opts.mode != "random" && opts.mode != "sched"
-   && opts.mode != "oob" && opts.mode != "remote" && opts.mode != "fence" && opts.mode != "rl") {
+   && opts.mode != "oob" && opts.mode != "remote" && opts.mode != "fence" && opts.mode != "rl"
+   && opts.mode != "mbar" && opts.mode != "mbar-global" && opts.mode != "mbar-remote") {
     usage(argv[0]);
     return 2;
   }

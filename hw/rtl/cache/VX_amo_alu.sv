@@ -28,6 +28,10 @@
 // keeps the full width.
 module VX_amo_alu import VX_gpu_pkg::*; #(
     parameter DATA_WIDTH  = 64,
+`ifdef VX_CFG_EXT_MBAR_ENABLE
+    // mbarrier ops on a 64-bit word; only the local memory banks run them.
+    parameter MBAR_ENABLE = 0,
+`endif
     parameter ARITH_WIDTH = DATA_WIDTH
 ) (
     input  amo_op_e     op,
@@ -36,6 +40,10 @@ module VX_amo_alu import VX_gpu_pkg::*; #(
     input  wire [63:0]  old_word,
     input  wire [63:0]  rhs,
     input  wire [63:0]  cmp,         // compare-and-swap comparand
+`ifdef VX_CFG_EXT_MBAR_ENABLE
+    output wire         mbar_flip,   // the mbarrier op completed the phase
+    output wire [1:0]   mbar_err,    // {tx out of range, pending underflow}
+`endif
     output wire [63:0]  new_word,
     output wire [63:0]  ret_word
 );
@@ -110,7 +118,80 @@ module VX_amo_alu import VX_gpu_pkg::*; #(
 
     // Zero-extend the AW-sized results back to the 64-bit port.
     // For SC the bank overrides ret_word with 0/1.
+`ifdef VX_CFG_EXT_MBAR_ENABLE
+    wire [63:0] rmw_new = 64'(res);
+    wire [63:0] rmw_ret = 64'(is_w ? {{(AW-32){1'b0}}, a[31:0]} : a);
+
+    if (MBAR_ENABLE != 0) begin : g_mbar
+        `STATIC_ASSERT (DATA_WIDTH == 64, ("mbarrier ops need a 64-bit word"))
+
+        // The object (sw/common/mbar_ref.h): pending[19:0] expected[39:20]
+        // tx[60:40] (signed bytes) [62:61] zero phase[63]. Fields wrap at their
+        // widths, so an erroneous op still leaves a defined word.
+        localparam signed [22:0] TX_MAX = 23'sd1048575;
+
+        wire        is_mbar = (op >= AMO_OP_MBAR_ARRIVE);
+        wire        is_wait = (op == AMO_OP_MBAR_TEST_WAIT) || (op == AMO_OP_MBAR_TRY_WAIT);
+        wire [19:0] pend    = old_word[19:0];
+        wire [19:0] expd    = old_word[39:20];
+        wire [20:0] tx      = old_word[60:40];
+        wire        phase   = old_word[63];
+        // A byte count of 2^21 or more cannot leave tx in range.
+        wire        big     = (| rhs[63:21]);
+        wire signed [22:0] tx_o  = {{2{tx[20]}}, tx};
+        wire signed [22:0] bytes = {2'b00, rhs[20:0]};
+
+        reg signed [22:0] tx_n;
+        reg [19:0]        pend_n;
+        reg               underflow, bad_bytes;
+        always @(*) begin
+            tx_n      = tx_o;
+            pend_n    = pend;
+            underflow = 1'b0;
+            bad_bytes = 1'b0;
+            case (op)
+            AMO_OP_MBAR_ARRIVE: begin
+                underflow = (rhs > 64'(pend));
+                pend_n    = pend - rhs[19:0];
+            end
+            AMO_OP_MBAR_ARRIVE_TX: begin
+                bad_bytes = big;
+                tx_n      = tx_o + bytes;
+                underflow = (pend == 20'd0);
+                pend_n    = pend - 20'd1;
+            end
+            AMO_OP_MBAR_EXPECT_TX: begin
+                bad_bytes = big;
+                tx_n      = tx_o + bytes;
+            end
+            AMO_OP_MBAR_COMPLETE_TX: begin
+                bad_bytes = big;
+                tx_n      = tx_o - bytes;
+            end
+            default:;
+            endcase
+        end
+        wire tx_range = bad_bytes || (tx_n > TX_MAX) || (tx_n < -TX_MAX);
+
+        // Every writing op ends with the completion check, expect_tx included: a
+        // complete_tx may come first and leave tx negative.
+        wire        done   = (pend_n == 20'd0) && (tx_n[20:0] == 21'd0);
+        wire [63:0] mbar_new = {phase ^ done, 2'b00, tx_n[20:0], expd, done ? expd : pend_n};
+        wire        writes = is_mbar && ~is_wait;
+
+        assign new_word  = writes ? mbar_new : (is_mbar ? old_word : rmw_new);
+        assign ret_word  = (is_mbar && is_wait) ? {63'b0, phase != rhs[63]} : (is_mbar ? old_word : rmw_ret);
+        assign mbar_flip = writes && done;
+        assign mbar_err  = writes ? {tx_range, underflow} : 2'b00;
+    end else begin : g_no_mbar
+        assign new_word  = rmw_new;
+        assign ret_word  = rmw_ret;
+        assign mbar_flip = 1'b0;
+        assign mbar_err  = 2'b00;
+    end
+`else
     assign new_word = 64'(res);
     assign ret_word = 64'(is_w ? {{(AW-32){1'b0}}, a[31:0]} : a);
+`endif
 
 endmodule

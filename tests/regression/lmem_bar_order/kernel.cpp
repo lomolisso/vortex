@@ -140,3 +140,152 @@ __kernel void kernel_main(kernel_arg_t* __UNIFORM__ arg) {
     res[tid * RES_WORDS + RES_STALE]   = stale;
   }
 }
+
+// The producer's X access as a store, an amoswap.d or a load, each followed
+// in the same asm block by its ordering point when that is an instruction.
+static inline __attribute__((always_inline)) void amo_x(volatile uint64_t* p, uint64_t v) {
+  __asm__ volatile ("amoswap.d zero, %0, (%1)" :: "r"(v), "r"(p) : "memory");
+}
+static inline __attribute__((always_inline)) uint64_t load_x(volatile uint64_t* p) {
+  uint64_t v;
+  __asm__ volatile ("ld %0, 0(%1)" : "=r"(v) : "r"(p) : "memory");
+  return v;
+}
+static inline __attribute__((always_inline)) void amo_fence(volatile uint64_t* p, uint64_t v) {
+  __asm__ volatile ("amoswap.d zero, %0, (%1)\n\tfence iorw, iorw" :: "r"(v), "r"(p) : "memory");
+}
+static inline __attribute__((always_inline)) uint64_t load_fence(volatile uint64_t* p) {
+  uint64_t v;
+  __asm__ volatile ("ld %0, 0(%1)\n\tfence iorw, iorw" : "=&r"(v) : "r"(p) : "memory");
+  return v;
+}
+static inline __attribute__((always_inline)) void store_rl(volatile uint64_t* p, volatile uint64_t* f, uint64_t v) {
+  __asm__ volatile ("sd %0, 0(%1)\n\tamoswap.d.rl zero, %0, (%2)" :: "r"(v), "r"(p), "r"(f) : "memory");
+}
+static inline __attribute__((always_inline)) void amo_rl(volatile uint64_t* p, volatile uint64_t* f, uint64_t v) {
+  __asm__ volatile ("amoswap.d zero, %0, (%1)\n\tamoswap.d.rl zero, %0, (%2)" :: "r"(v), "r"(p), "r"(f) : "memory");
+}
+static inline __attribute__((always_inline)) uint64_t load_rl(volatile uint64_t* p, volatile uint64_t* f, uint64_t r) {
+  uint64_t v;
+  __asm__ volatile ("ld %0, 0(%1)\n\tamoswap.d.rl zero, %3, (%2)" : "=&r"(v) : "r"(p), "r"(f), "r"(r) : "memory");
+  return v;
+}
+
+// kernel_main with two more axes, in a kernel of its own so that kernel_main's
+// code stays as it is: the producer's X access (ACC_*) and the rl release,
+// where the producer swaps the flag with amoswap.d.rl and the consumers poll it.
+// In ld mode the producer loads X before its ordering point and lane 0 checks
+// it still holds the previous round, while every consumer warp's lane 0 stores
+// the round into X once released: a load the release did not wait for could
+// reach the bank after that store.
+__kernel void order_k(kernel_arg_t* __UNIFORM__ arg) {
+  const uint32_t tid   = threadIdx.x;
+  const uint32_t warp  = get_sub_group_id();
+  const uint32_t nwarp = get_num_sub_groups();
+  const uint32_t lane  = tid % vx_num_threads();
+  const uint32_t S     = arg->streamers;
+  const uint32_t rel   = arg->mode & ((1u << ACC_SHIFT) - 1);
+  const uint32_t acc   = arg->mode >> ACC_SHIFT;
+
+  auto tile = reinterpret_cast<uint32_t*>(__local_mem());
+  auto ctrl = reinterpret_cast<volatile uint64_t*>(tile + S * arg->tile_elems);
+  volatile uint64_t* X    = ctrl + arg->x_word;
+  volatile uint64_t* flag = X + 1;
+  volatile uint64_t* done = X + 2;
+
+  if (tid == 0) {
+    *X = 0;
+    *flag = 0;
+    *done = 0;
+  }
+  __syncthreads();
+
+  auto res = reinterpret_cast<uint32_t*>(arg->res_addr);
+  if (warp < S) {
+    uint32_t copies = 0;
+    if (arg->dxa_on) {
+      vortex::barrier copy_bar(kCopyBar0 + warp, 1);
+      uint32_t* my_tile = tile + warp * arg->tile_elems;
+      while (*done == 0) {
+        copy_bar.expect_tx(1);
+        vx_dxa_issue_1d_wg(kDescSrc, copy_bar.id(), my_tile, (copies % arg->num_src_tiles) * arg->tile_elems);
+        copy_bar.arrive_and_wait();
+        ++copies;
+      }
+    }
+    if (lane == 0)
+      res[blockDim.x * RES_WORDS + warp] = copies;
+    return;
+  }
+
+  vortex::barrier grp(kGroupBar, nwarp - S);
+  const bool producer = (warp == S);
+  const bool poll = (rel == MODE_FENCE || rel == MODE_RL);
+  const bool ld   = (acc == ACC_LD);
+  const uint32_t burst = arg->burst;
+  volatile uint64_t* sink = X + arg->banks * (SINK_ROWS(arg->banks) + lane);
+  const uintptr_t to_x = -(uintptr_t)(lane == 0);
+  volatile uint64_t* last = reinterpret_cast<volatile uint64_t*>(
+      reinterpret_cast<uintptr_t>(sink) ^ ((reinterpret_cast<uintptr_t>(sink) ^ reinterpret_cast<uintptr_t>(X)) & to_x));
+  uint32_t stale = 0, first = 0, timeouts = 0;
+  for (uint32_t r = 1; r <= arg->rounds; ++r) {
+    bool check = !producer && !ld;
+    if (producer) {
+      for (uint32_t d = 0; d < arg->delay; ++d)
+        __asm__ volatile ("");
+      burst_stores(sink, r, burst - 1);
+      uint64_t seen = r - 1;
+      if (rel == MODE_RL) {
+        if (acc == ACC_ST)       store_rl(last, flag, r);
+        else if (acc == ACC_AMO) amo_rl(last, flag, r);
+        else                     seen = load_rl(last, flag, r);
+      } else if (poll) {
+        if (acc == ACC_ST)       store_fence(last, r);
+        else if (acc == ACC_AMO) amo_fence(last, r);
+        else                     seen = load_fence(last);
+        *flag = r;
+      } else if (rel == MODE_FENCEBAR) {
+        if (acc == ACC_ST)       store_fence(last, r);
+        else if (acc == ACC_AMO) amo_fence(last, r);
+        else                     seen = load_fence(last);
+        grp.arrive_and_wait();
+      } else {
+        if (acc == ACC_ST)       *last = r;
+        else if (acc == ACC_AMO) amo_x(last, r);
+        else                     seen = load_x(last);
+        grp.arrive_and_wait();
+      }
+      if (lane == 0 && seen != r - 1) {
+        ++stale;
+        if (first == 0)
+          first = r;
+      }
+    } else {
+      burst_stores(sink, r, 2 * burst);
+      if (poll) {
+        uint32_t spins = 0;
+        uint64_t f;
+        while ((f = *flag) < r && ++spins < SPIN_LIMIT) {}
+        if (f < r) {
+          ++timeouts;
+          check = false;
+        }
+      } else {
+        grp.arrive_and_wait();
+      }
+      if (ld)
+        *last = r;
+    }
+    if (check && *X != r) {
+      ++stale;
+      if (first == 0)
+        first = r;
+    }
+    grp.arrive_and_wait();
+  }
+  if (producer && lane == 0)
+    *done = 1;
+  res[tid * RES_WORDS + RES_FIRST]   = first;
+  res[tid * RES_WORDS + RES_TIMEOUT] = timeouts;
+  res[tid * RES_WORDS + RES_STALE]   = stale;
+}

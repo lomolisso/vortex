@@ -23,7 +23,7 @@ TESTS := \
 ifeq ($(XLEN),64)
 TESTS += cta_gang cluster_rank cluster_sync dlmem_local \
          dlmem_store dlmem_load dlmem_atomic dlmem_stress lmem_bar_order \
-         dlmem_amo_order
+         dlmem_amo_order mbar_local
 endif
 
 # --- common exclude list ---------------------------------------------

@@ -200,7 +200,7 @@ module VX_wctl_unit import VX_gpu_pkg::*; #(
 `ifdef VX_CFG_EXT_DLMEM_ENABLE
     // A warp's barrier arrival counts, and a warp exits, only once its earlier
     // instructions have committed, none of its remote accesses is in flight and
-    // its local stores are written.
+    // its local-memory accesses have committed in their banks.
     wire [`VX_CFG_NUM_WARPS-1:0] warp_drained = warp_ctl_if.warp_pending_alm_empty & warp_ctl_if.dlmem_drained;
     wire wid_drained = warp_drained[execute_if.data.header.wid];
 

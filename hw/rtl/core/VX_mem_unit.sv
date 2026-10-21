@@ -38,9 +38,9 @@ module VX_mem_unit import VX_gpu_pkg::*; #(
     // Remote lanes toward the DLMEM egress, and the ingress's local-memory port
     VX_lsu_mem_if.master    dlmem_remote_if [`VX_CFG_NUM_LSU_BLOCKS],
     VX_mem_bus_if.slave     dlmem_lmem_if,
-    // Per local-memory bank, an LSU plain store written in the previous cycle, and its warp
-    output wire [`VX_CFG_LMEM_NUM_BANKS-1:0] lmem_st_commit_valid,
-    output wire [`VX_CFG_LMEM_NUM_BANKS-1:0][NW_WIDTH-1:0] lmem_st_commit_wid,
+    // Per local-memory bank, an LSU access performed in the previous cycle, and its warp
+    output wire [`VX_CFG_LMEM_NUM_BANKS-1:0] lmem_commit_valid,
+    output wire [`VX_CFG_LMEM_NUM_BANKS-1:0][NW_WIDTH-1:0] lmem_commit_wid,
 `endif
 
     output wire             empty,
@@ -308,8 +308,8 @@ module VX_mem_unit import VX_gpu_pkg::*; #(
         .lmem_perf   (lmem_perf),
     `endif
     `ifdef VX_CFG_EXT_DLMEM_ENABLE
-        .st_commit_valid (lmem_st_commit_valid),
-        .st_commit_wid   (lmem_st_commit_wid),
+        .lmem_commit_valid (lmem_commit_valid),
+        .lmem_commit_wid   (lmem_commit_wid),
     `endif
         .dma_bus_if  (lmem_dma_if),
         .lsu_bus_if  (lmem_adapt_if)

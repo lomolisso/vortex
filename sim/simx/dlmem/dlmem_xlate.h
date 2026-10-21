@@ -27,11 +27,12 @@ namespace vortex {
 // stage that rewrites the lanes of a request falling in the DLMEM window.
 // As in the RTL, a request keeps the peer row current when it entered, since
 // its slot may be re-admitted while a committed store waits here; the stride
-// is read when it leaves. A fence, and every packet of a release (.rl) AMO,
-// leaves only once its warp's remote accesses are performed (stores
-// acknowledged, loads and AMOs answered) and its local plain stores are written
-// into their banks. Earlier global accesses, and earlier local loads, AMOs and
-// LR/SC, are not waited for.
+// is read when it leaves. A fence, and every packet of a release (.rl) AMO or
+// mbarrier arrive, leaves only once its warp's remote accesses are performed
+// (stores acknowledged, loads and AMOs answered) and its local accesses
+// (loads, stores, AMOs, LR/SC, mbarrier ops) are committed by their banks.
+// Earlier global accesses are not waited for. An mbarrier op aborts on a
+// global or a remote lane.
 class DlmemXlate : public SimObject<DlmemXlate> {
 public:
   using Ptr = std::shared_ptr<DlmemXlate>;
@@ -40,7 +41,7 @@ public:
   std::vector<SimChannel<LsuReq>> ReqOut;
   SimChannel<dlmem_ref::RowWrite> PeerWrIn;
   std::vector<SimChannel<WtInc>>  WtIncOut; // remote lanes, in the cycle of the output fire
-  std::vector<SimChannel<WtInc>>  LstIncOut; // local plain-store lanes, likewise
+  std::vector<SimChannel<WtInc>>  LaccIncOut; // local-access lanes, likewise
 
   // drained(wid): both trackers' registered drained[wid] as the RTL stage reads them.
   using DrainedQuery = std::function<bool(uint32_t)>;
@@ -70,7 +71,7 @@ private:
   using RowPtr = std::shared_ptr<const dlmem_ref::Row>;
 
   uint32_t translate(LsuReq& req, const dlmem_ref::Row& row);
-  static uint32_t local_store_lanes(const LsuReq& req);
+  static uint32_t local_access_lanes(const LsuReq& req);
 
   dlmem_ref::Cfg cfg_;
   uint32_t my_core_;
