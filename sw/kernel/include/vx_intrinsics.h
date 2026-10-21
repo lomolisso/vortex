@@ -507,6 +507,12 @@ inline __attribute__((const)) float vx_quad_ddy_f32(float value) {
 // Each lane gathers a value from the source lane's register file.
 // S = source lane (compile-time constant, 0-3).
 // The source lane retains its own rd value; lane (S+1) gets v1[S], (S+2) gets v2[S], (S+3) gets v3[S].
+// Every non-source lane of the group is written, active or not; a masked source lane is replaced by
+// the last active lane.
+// With fewer than 4 SIMD lanes a group spans several packets, and a lane whose packet precedes the
+// source lane's takes the last active lane of its own packet instead. So vx_wgather (S=0) is exact
+// when lane 0 of the group is active, but other source lanes, and vx_transpose4, are exact there
+// only for values that are uniform within each group of 4.
 #define __VX_WGATHER(src_lane, self_val, v1, v2, v3) ({ \
     size_t __ret = (self_val);                          \
     __asm__ volatile (                                  \

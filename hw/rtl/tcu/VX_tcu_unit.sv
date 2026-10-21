@@ -35,6 +35,11 @@ module VX_tcu_unit import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
     VX_lsu_sched_if.master  tcu_mem_if,
 `endif
 
+`ifdef TCU_WG_GROUPS_ENABLE
+    // Per block, the release of a warp whose wgmma wait_group is satisfied.
+    VX_sched_unlock_if.master unlock_if [`VX_CFG_NUM_TCU_BLOCKS],
+`endif
+
     // Inputs
     VX_dispatch_if.slave    dispatch_if [`VX_CFG_ISSUE_WIDTH],
 
@@ -52,6 +57,35 @@ module VX_tcu_unit import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
         .data_t (tcu_execute_t)
     ) per_block_execute_if[BLOCK_SIZE]();
 
+`ifdef TCU_WG_GROUPS_ENABLE
+    // commit_group and wait_group are taken here, ahead of the AGU/core
+    // split: they use no FEDP slot, tile buffer or metadata path.
+    VX_execute_if #(
+        .data_t (tcu_execute_t)
+    ) lane_execute_if[BLOCK_SIZE]();
+
+    VX_lane_dispatch #(
+        .BLOCK_SIZE (BLOCK_SIZE),
+        .NUM_LANES  (NUM_LANES),
+        .OUT_BUF    (3)
+    ) lane_dispatch (
+        .clk        (clk),
+        .reset      (reset),
+        .dispatch_if(dispatch_if),
+        .execute_if (lane_execute_if)
+    );
+
+    wire [BLOCK_SIZE-1:0] grp_req_fire;
+    wire [BLOCK_SIZE-1:0] grp_req_ready;
+    for (genvar bi = 0; bi < BLOCK_SIZE; ++bi) begin : g_grp_split
+        wire is_grp = (lane_execute_if[bi].data.op_type == INST_TCU_COMMIT)
+                   || (lane_execute_if[bi].data.op_type == INST_TCU_WAIT);
+        assign per_block_execute_if[bi].valid = lane_execute_if[bi].valid && ~is_grp;
+        assign per_block_execute_if[bi].data  = lane_execute_if[bi].data;
+        assign lane_execute_if[bi].ready = is_grp ? grp_req_ready[bi] : per_block_execute_if[bi].ready;
+        assign grp_req_fire[bi] = lane_execute_if[bi].valid && is_grp && grp_req_ready[bi];
+    end
+`else
     VX_lane_dispatch #(
         .BLOCK_SIZE (BLOCK_SIZE),
         .NUM_LANES  (NUM_LANES),
@@ -62,6 +96,7 @@ module VX_tcu_unit import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
         .dispatch_if(dispatch_if),
         .execute_if (per_block_execute_if)
     );
+`endif
 
     VX_result_if #(
         .data_t (tcu_result_t)
@@ -226,6 +261,10 @@ module VX_tcu_unit import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
     // TCU core instances
     // -----------------------------------------------------------------------
 
+`ifdef TCU_WG_GROUPS_ENABLE
+    wire [BLOCK_SIZE-1:0] wg_last_retire;
+`endif
+
     for (genvar block_idx = 0; block_idx < BLOCK_SIZE; ++block_idx) begin : g_blocks
         VX_tcu_core #(
             .INSTANCE_ID (`SFORMATF(("%s-fused%0d", INSTANCE_ID, block_idx)))
@@ -244,11 +283,88 @@ module VX_tcu_unit import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
             .ext_meta_wr_idx  (agu_meta_wr_idx),
             .ext_meta_wr_data (agu_meta_wr_data),
         `endif
+        `ifdef TCU_WG_GROUPS_ENABLE
+            .wg_last_retire (wg_last_retire[block_idx]),
+        `endif
             .execute_if (core_execute_if[block_idx]),
             .result_if  (core_result_if[block_idx])
         );
     end
 
+`ifdef TCU_WG_GROUPS_ENABLE
+    // -----------------------------------------------------------------------
+    // wgmma groups: per-block trackers and the commit/wait results, which
+    // yield to the AGU and core results.
+    // -----------------------------------------------------------------------
+
+    VX_result_if #(
+        .data_t (tcu_result_t)
+    ) gather_result_if[BLOCK_SIZE]();
+
+    for (genvar bi = 0; bi < BLOCK_SIZE; ++bi) begin : g_groups
+        wire is_wgmma_op = (core_execute_if[bi].data.op_type == INST_TCU_WGMMA)
+        `ifdef VX_CFG_TCU_SPARSE_ENABLE
+                        || (core_execute_if[bi].data.op_type == INST_TCU_WGMMA_SP)
+        `endif
+                        ;
+        wire wg_issue = core_execute_if[bi].valid && core_execute_if[bi].ready
+                     && is_wgmma_op && core_execute_if[bi].data.op_args.tcu.is_first_uop;
+
+        VX_tcu_groups #(
+            .INSTANCE_ID (`SFORMATF(("%s-groups%0d", INSTANCE_ID, bi))),
+            .BLOCK_ID    (bi)
+        ) groups (
+            .clk         (clk),
+            .reset       (reset),
+            .issue_valid (wg_issue),
+            .issue_wid   (core_execute_if[bi].data.header.wid),
+            .done_valid  (wg_last_retire[bi]),
+            .done_wid    (core_result_if[bi].data.header.wid),
+            .req_valid   (grp_req_fire[bi]),
+            .req_is_wait (lane_execute_if[bi].data.op_type == INST_TCU_WAIT),
+            .req_wid     (lane_execute_if[bi].data.header.wid),
+            .req_n       (lane_execute_if[bi].data.op_args.tcu.step_m[2:0]),
+            .unlock_if   (unlock_if[bi])
+        );
+
+        // commit and wait retire without a result
+        reg          grp_rsp_valid_r;
+        tcu_header_t grp_rsp_header_r;
+        wire grp_rsp_fire = grp_rsp_valid_r && gather_result_if[bi].ready && ~per_block_result_if[bi].valid;
+        assign grp_req_ready[bi] = ~grp_rsp_valid_r || grp_rsp_fire;
+        always @(posedge clk) begin
+            if (reset) begin
+                grp_rsp_valid_r <= 1'b0;
+            end else if (grp_req_ready[bi]) begin
+                grp_rsp_valid_r <= grp_req_fire[bi];
+            end
+            if (grp_req_fire[bi]) begin
+                grp_rsp_header_r <= lane_execute_if[bi].data.header;
+            end
+        end
+
+        assign gather_result_if[bi].valid = per_block_result_if[bi].valid || grp_rsp_valid_r;
+        assign gather_result_if[bi].data  = per_block_result_if[bi].valid
+            ? per_block_result_if[bi].data
+            : tcu_result_t'({grp_rsp_header_r, (NUM_LANES * `VX_CFG_XLEN)'(0)});
+        assign per_block_result_if[bi].ready = gather_result_if[bi].ready;
+    end
+
+    // -----------------------------------------------------------------------
+    // Lane gather
+    // -----------------------------------------------------------------------
+
+    VX_lane_gather #(
+        .BLOCK_SIZE (BLOCK_SIZE),
+        .NUM_LANES  (NUM_LANES),
+        .OUT_BUF    (3)
+    ) lane_gather (
+        .clk       (clk),
+        .reset     (reset),
+        .result_if (gather_result_if),
+        .commit_if (commit_if)
+    );
+`else
     // -----------------------------------------------------------------------
     // Lane gather
     // -----------------------------------------------------------------------
@@ -263,5 +379,6 @@ module VX_tcu_unit import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
         .result_if (per_block_result_if),
         .commit_if (commit_if)
     );
+`endif
 
 endmodule

@@ -139,18 +139,47 @@ module VX_opc_unit import VX_gpu_pkg::*; #(
 
     wire opd_last_fetch = pipe_ready_in && ~has_collision;
 
+    // A packet narrower than 4 lanes splits a group of 4 threads, which
+    // WGATHER and DXA combine: their packets are all issued, active or not.
+    localparam SIMD_ALL_PKTS = (SIMD_COUNT != 1) && (`VX_CFG_SIMD_WIDTH < 4);
+    localparam SIMD_KEYW     = `VX_CFG_SIMD_WIDTH + SIMD_ALL_PKTS;
+
+    wire [SIMD_COUNT-1:0][SIMD_KEYW-1:0] simd_keys;
+    wire [SIMD_KEYW-1:0] simd_key_out;
+
+    if (SIMD_ALL_PKTS) begin : g_simd_all_pkts
+        wire is_wgather = (scoreboard_if.data.ex_type == EX_BITS'(EX_ALU))
+                       && (scoreboard_if.data.op_args.alu.xtype == ALU_TYPE_OTHER)
+                       && scoreboard_if.data.op_type[3];
+    `ifdef VX_CFG_EXT_DXA_ENABLE
+        wire is_dxa = (scoreboard_if.data.ex_type == EX_BITS'(EX_SFU))
+                   && (scoreboard_if.data.op_type == INST_OP_BITS'(INST_SFU_DXA));
+    `else
+        wire is_dxa = 1'b0;
+    `endif
+        wire all_pkts = is_wgather || is_dxa;
+        for (genvar i = 0; i < SIMD_COUNT; ++i) begin : g_keys
+            assign simd_keys[i] = {scoreboard_if.data.tmask[i * `VX_CFG_SIMD_WIDTH +: `VX_CFG_SIMD_WIDTH], all_pkts};
+        end
+        assign simd_out = simd_key_out[SIMD_KEYW-1:1];
+        `UNUSED_VAR (simd_key_out[0])
+    end else begin : g_simd_nz_pkts
+        assign simd_keys = scoreboard_if.data.tmask;
+        assign simd_out  = simd_key_out;
+    end
+
     // simd iterator (skip requests with inactive threads)
     VX_nz_iterator #(
-        .DATAW (`VX_CFG_SIMD_WIDTH),
+        .DATAW (SIMD_KEYW),
         .N     (SIMD_COUNT)
     ) simd_iter (
         .clk     (clk),
         .reset   (reset),
         .valid_in(scoreboard_if.valid),
-        .data_in (scoreboard_if.data.tmask),
+        .data_in (simd_keys),
         .next    (opd_last_fetch),
         `UNUSED_PIN (valid_out),
-        .data_out(simd_out),
+        .data_out(simd_key_out),
         .pid     (simd_pid),
         .sop     (simd_sop),
         .eop     (simd_eop)

@@ -325,6 +325,12 @@ public:
         dlmem_xlate_->LaccIncOut.at(b).bind(&lmem_acc_track_->IncIn.at(b));
         lsu->UnlockOut.at(b).bind(&scheduler_->UnlockIn.at(b));
       }
+      simobject_->warp_spawn_out.bind(&lsu->SpawnIn);
+    #if defined(VX_CFG_EXT_MBAR_ENABLE) && defined(VX_CFG_TCU_WGMMA_ENABLE)
+      for (uint32_t b = 0; b < VX_CFG_NUM_TCU_BLOCKS; ++b) {
+        tcu_unit_->UnlockOut.at(b).bind(&scheduler_->UnlockIn.at(VX_CFG_NUM_LSU_BLOCKS + b));
+      }
+    #endif
       for (uint32_t i = 0; i < VX_CFG_LMEM_NUM_BANKS; ++i) {
         local_mem_->CommitOut.at(i).bind(&lmem_acc_track_->CommitIn.at(i));
       }
@@ -333,6 +339,8 @@ public:
       return wtrack->drained(wid) && lacc->drained(wid);
     });
     scheduler_->peer_wr_out().bind(&dlmem_xlate_->PeerWrIn);
+  #else
+  #line 336
   #endif
 
     this->reset();
@@ -356,6 +364,14 @@ public:
     pending_ifetches_ = 0;
 
     std::fill(ibuf_inflight_.begin(), ibuf_inflight_.end(), 0);
+  #ifdef VX_CFG_EXT_DLMEM_ENABLE
+    active_warps_.reset();
+  #ifdef TCU_META_ENABLE
+    std::fill(xreg_busy_.begin(), xreg_busy_.end(), std::array<uint32_t, 2>{0, 0});
+  #endif
+  #else
+  #line 358
+  #endif
 
     // perf_stats_ deliberately survives: these are the MPM counters, which are
     // free-running from device reset. A kernel launch re-enters reset() here but
@@ -382,8 +398,19 @@ public:
     // profiling
     perf_stats_.active_warps += scheduler_->active_warps().count();
     perf_stats_.stalled_warps += scheduler_->stalled_warps().count();
+  #ifdef VX_CFG_EXT_DLMEM_ENABLE
+    // Warps activated since the last cycle, by a CTA dispatch or a wspawn: the
+    // LSU clears their release state.
+    auto spawned = scheduler_->active_warps() & ~active_warps_;
+    active_warps_ = scheduler_->active_warps();
+    if (spawned.any()) {
+      simobject_->warp_spawn_out.send(spawned, 1);
+    }
+  #else
+  #line 384
+  #endif
 
-    // stop when fetch_latch cannot accept
+    scheduler_->dispatch_cta();  // the CTA launch does not wait on fetch
     if (fetch_latch_.full())
       return;
 
@@ -598,11 +625,19 @@ public:
         if (ibuffer->empty())
           continue;
 
-        // check scoreboard against sequencer micro-op (handles uop WAW/RAW)
         auto trace = ibuffer->peek();
         auto seq = sequencers_.at(wid);
-        auto uop_trace = seq->get(trace);  // returns cached uop or generates next
+        auto uop_trace = seq->get(trace);  // the cached uop or the next; none in a macro-op's setup cycle
+        if (uop_trace == nullptr) continue;
 
+      #if defined(VX_CFG_EXT_DLMEM_ENABLE) && defined(TCU_META_ENABLE)
+        if (this->xreg_busy(uop_trace)) {
+          any_scrb_blocked = true;
+          continue;
+        }
+      #elif !defined(VX_CFG_EXT_DLMEM_ENABLE)
+      #line 605
+      #endif
         if (scoreboard_->in_use(uop_trace)) {
           auto uses = scoreboard_->get_uses(uop_trace);
           if (!uop_trace->log_once(true)) {
@@ -677,6 +712,16 @@ public:
             // update scoreboard
             scoreboard_->reserve(uop_trace);
           }
+        #ifdef VX_CFG_EXT_DLMEM_ENABLE
+        #ifdef TCU_META_ENABLE
+          this->xreg_reserve(uop_trace);
+        #endif
+          // A release's CFENCE: a barrier waits for its commit.
+          if (uop_trace != trace && !trace->instr_ptr->is_macro_op())
+            pending_instrs_.push_back(uop_trace);
+        #else
+        #line 679
+        #endif
           // Update FU lock state: 10=acquire, 01=release. The lock keeps a
           // uop sequence contiguous at its functional unit, but the operand
           // collectors and their arbiter can reorder warps between issue
@@ -696,7 +741,7 @@ public:
           if (seq->advance()) {
             // Resume warp for macro instructions that stalled fetch at decode
             if (trace->instr_ptr->is_macro_op()) {
-              scheduler_->resume(trace->wid);
+              if (trace->fetch_stall) scheduler_->resume(trace->wid);
               // Macro trace never reaches commit (only micro-ops do),
               // so remove it from pending tracking and deallocate here.
               pending_instrs_.remove(trace);
@@ -839,7 +884,11 @@ public:
       }
 
       if (trace->eop) {
-
+      #if defined(VX_CFG_EXT_DLMEM_ENABLE) && defined(TCU_META_ENABLE)
+        this->xreg_release(trace);
+      #elif !defined(VX_CFG_EXT_DLMEM_ENABLE)
+      #line 842
+      #endif
         // instruction mix profiling
         switch (trace->fu_type) {
         case FUType::ALU: ++perf_stats_.alu_instrs; break;
@@ -1022,6 +1071,71 @@ public:
   }
 #endif
 
+#if defined(VX_CFG_EXT_DLMEM_ENABLE) && defined(TCU_META_ENABLE)
+  // The scoreboard's two special registers: XREG_0 (fflags, sparse metadata)
+  // and XREG_1 (frm, MX metadata). Only the fences read them, so a release
+  // waits for earlier TCU_LD writebacks; their writers are counted from issue
+  // to the commit of their last packet.
+  static uint32_t xreg_writes(const instr_trace_t* trace) {
+    if (auto tcu = std::get_if<TcuType>(&trace->op_type)) {
+      if (*tcu != TcuType::TCU_LD)
+        return 0;
+      return (std::get<IntrTcuArgs>(trace->instr_ptr->get_args()).fmt_d & 0x10) ? 2 : 1;
+    }
+    if (auto fpu = std::get_if<FpuType>(&trace->op_type)) {
+      switch (*fpu) {
+      case FpuType::FSGNJ:
+      case FpuType::FCLASS:
+      case FpuType::FMVXW:
+      case FpuType::FMVWX:
+        return 0;
+      default:
+        return 1;
+      }
+    }
+    if (auto csr = std::get_if<CsrType>(&trace->op_type)) {
+      auto args = std::get<IntrCsrArgs>(trace->instr_ptr->get_args());
+      bool write = (*csr == CsrType::CSRRW)
+                || (args.is_imm ? (args.imm != 0) : (trace->src_regs[0].idx != 0));
+      if (!write)
+        return 0;
+      return ((args.csr == VX_CSR_FFLAGS || args.csr == VX_CSR_FCSR) ? 1 : 0)
+           | ((args.csr == VX_CSR_FRM || args.csr == VX_CSR_FCSR) ? 2 : 0);
+    }
+    return 0;
+  }
+
+  static uint32_t xreg_reads(const instr_trace_t* trace) {
+    auto lsu = std::get_if<LsuType>(&trace->op_type);
+    return (lsu && (*lsu == LsuType::FENCE || *lsu == LsuType::CFENCE)) ? 3 : 0;
+  }
+
+  bool xreg_busy(const instr_trace_t* trace) const {
+    uint32_t reads = xreg_reads(trace);
+    auto& busy = xreg_busy_.at(trace->wid);
+    bool stall = ((reads & 1) && busy[0] != 0) || ((reads & 2) && busy[1] != 0);
+    if (stall && !const_cast<instr_trace_t*>(trace)->log_once(true)) {
+      DT(4, simobject_->name() << " *** xreg-stall: xregs=" << busy[0] << "," << busy[1] << ", " << *trace);
+    }
+    return stall;
+  }
+
+  void xreg_reserve(const instr_trace_t* trace) {
+    uint32_t writes = xreg_writes(trace);
+    auto& busy = xreg_busy_.at(trace->wid);
+    busy[0] += (writes & 1);
+    busy[1] += (writes >> 1) & 1;
+  }
+
+  void xreg_release(const instr_trace_t* trace) {
+    uint32_t writes = xreg_writes(trace);
+    auto& busy = xreg_busy_.at(trace->wid);
+    __assert(busy[0] >= (writes & 1) && busy[1] >= ((writes >> 1) & 1), "xreg release underflow");
+    busy[0] -= (writes & 1);
+    busy[1] -= (writes >> 1) & 1;
+  }
+#endif
+
   const std::shared_ptr<LocalMem>& local_mem() const { return local_mem_; }
   const std::shared_ptr<MemCoalescer>& mem_coalescer(uint32_t idx) const { return mem_coalescers_.at(idx); }
   const std::shared_ptr<LocalMemSwitch>& lmem_switch(uint32_t idx) const { return lmem_switch_.at(idx); }
@@ -1073,6 +1187,10 @@ private:
   PoolAllocator<Instr, 64> instr_pool_;
   Decoder::Ptr decoder_;
   std::vector<Sequencer::Ptr> sequencers_;
+#if defined(VX_CFG_EXT_DLMEM_ENABLE) && defined(TCU_META_ENABLE)
+  // Per warp: in-flight writers of XREG_0 and XREG_1.
+  std::vector<std::array<uint32_t, 2>> xreg_busy_ = std::vector<std::array<uint32_t, 2>>(VX_CFG_NUM_WARPS, {0, 0});
+#endif
   uint32_t    mpm_class_;
   Scheduler::Ptr scheduler_;
 
@@ -1122,6 +1240,8 @@ private:
   DlmemXlate::Ptr dlmem_xlate_;
   DlmemWTrack::Ptr dlmem_wtrack_;
   DlmemWTrack::Ptr lmem_acc_track_;
+  // The scheduler's active warps as of the last cycle.
+  WarpMask active_warps_;
 #endif
 };
 
@@ -1139,6 +1259,9 @@ Core::Core(const SimContext& ctx,
   , dcache_rsp_in(VX_CFG_DCACHE_NUM_REQS, this)
   , gbar_arrive_out(this)
   , gbar_resume_in(this)
+#ifdef VX_CFG_EXT_DLMEM_ENABLE
+  , warp_spawn_out(this)
+#endif
 #ifdef VX_CFG_EXT_RASTER_ENABLE
   , fwd_arm_in(this)
   , fwd_done_out(this)

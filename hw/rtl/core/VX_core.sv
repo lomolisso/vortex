@@ -125,6 +125,9 @@ module VX_core import VX_gpu_pkg::*, VX_tlb_pkg::*; #(
     // Each block's LSU requests reach its scheduler through the aperture translation stage.
     VX_lsu_sched_if xlate_out_if [`VX_CFG_NUM_LSU_BLOCKS]();
     VX_sched_unlock_if lsu_unlock_if [`VX_CFG_NUM_LSU_BLOCKS]();  // acquire AMO release -> scheduler
+`ifdef TCU_WG_GROUPS_ENABLE
+    VX_sched_unlock_if tcu_unlock_if [`VX_CFG_NUM_TCU_BLOCKS]();  // wgmma wait_group release -> scheduler
+`endif
     wire [`VX_CFG_NUM_LSU_BLOCKS-1:0] lsu_sched_raw_empty;
     wire [`VX_CFG_NUM_LSU_BLOCKS-1:0] xlate_empty;
     // The slice's read-tag pool (LSU_PENDING_SIZE) relies on the scheduler to refuse
@@ -286,6 +289,9 @@ module VX_core import VX_gpu_pkg::*, VX_tlb_pkg::*; #(
         .peer_wr_stride (peer_wr_stride),
         .lsu_unlock_if  (lsu_unlock_if),
     `endif
+    `ifdef TCU_WG_GROUPS_ENABLE
+        .tcu_unlock_if  (tcu_unlock_if),
+    `endif
 
         .busy           (sched_busy)
     );
@@ -369,6 +375,9 @@ module VX_core import VX_gpu_pkg::*, VX_tlb_pkg::*; #(
         .lsu_client_if  (lsu_client_if),
     `ifdef VX_CFG_EXT_DLMEM_ENABLE
         .lsu_unlock_if  (lsu_unlock_if),
+    `endif
+    `ifdef TCU_WG_GROUPS_ENABLE
+        .tcu_unlock_if  (tcu_unlock_if),
     `endif
 
     `ifdef TCU_META_ENABLE

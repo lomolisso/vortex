@@ -58,6 +58,11 @@ All tensor instructions are R-type on opcode `0x0B` (custom-0) with
 | 0 | WMMA | output format `fmt_d` | input format `fmt_s` | flags |
 | 1 | WGMMA | output format `fmt_d` | input format `fmt_s` | flags |
 | 2 | TCU_LD | metadata slot | **register**: base address | input format `fmt_s` |
+| 3 | WGMMA_COMMIT (`wgmma.commit_group`) | 0 | 0 | 0 |
+| 4 | WGMMA_WAIT (`wgmma.wait_group N`) | 0 | 0 | `N`, 0–7 (no register read) |
+
+`funct3` 3 and 4 exist with mbarriers and WGMMA (`VX_CFG_EXT_MBAR_ENABLE`
+and `VX_CFG_TCU_WGMMA_ENABLE`, §11); without them they decode as before.
 
 Flags of an MMA instruction:
 
@@ -74,6 +79,8 @@ Flags of an MMA instruction:
 | `INST_TCU_WMMA_SP` | 3 | sparse warp MMA |
 | `INST_TCU_WGMMA_SP` | 4 | sparse warpgroup MMA |
 | `INST_TCU_LD` | 5 | metadata load |
+| `INST_TCU_COMMIT` | 6 | close a wgmma group |
+| `INST_TCU_WAIT` | 7 | wait for wgmma groups |
 
 Sparsity is a distinct operation rather than a per-micro-op flag, so the
 micro-op arguments do not carry a sparse bit.
@@ -103,7 +110,11 @@ two extra bits:
 | `XREG_1` | MX scales | `TCU_LD` with `rd[4] = 1` | every MMA with an MX input format |
 
 A sparse MMA issued right after its `TCU_LD` stalls on the bit until the
-load's writeback releases it. `TCU_LD` writes no general register.
+load's writeback releases it. `TCU_LD` writes no general register. In a
+DLMEM build `FENCE` and every release (an mbarrier arrive, a `.rl` atomic, a
+barrier) read both bits too, so they wait for the warp's earlier `TCU_LD`
+loads like any other load
+([dlmem_proposal.md](../proposals/dlmem_proposal.md), memory-model contract).
 
 ---
 
@@ -308,6 +319,19 @@ from the same storage — structural fan-out, not arbitration. A row often
 holds several consecutive blocks, which the `TBUF_CACHE_HITS` counter
 reports.
 
+The blocks of a warpgroup issue the same WGMMAs but drift apart, so one block
+can start the next WGMMA while another still runs the previous one. Every
+request therefore carries its own block's descriptor, latched at that block's
+first compute micro-op, and the buffer latches the descriptor of each fetch it
+allocates; nothing in the key comes from whichever block started a WGMMA last.
+
+A refilled slab needs no forced refetch. The micro-ops run `m` innermost and
+`k` outermost, so a WGMMA starts on the tile's first bank row and ends on its
+last, and every tile spans at least four rows: the row left resident never
+holds the first row a later WGMMA needs, unless another block is reading that
+same slab at that moment, which the release protocol (`wait_group`, then the
+arrive that lets the producer refill) rules out.
+
 The `Q` A buffers and the B buffer are `Q + 1` readers of one
 bank-parallel local-memory port, merged by an arbiter.
 
@@ -431,6 +455,10 @@ multipliers map onto DSP blocks through `VX_CFG_TCU_USE_DSP`.
 Operand loads go through simulation channels; the tensor path never reads
 memory directly.
 
+As in the RTL, a WMMA or WGMMA does not stall its warp's fetch; it spends one
+setup cycle at the head of the instruction buffer, where `VX_uop_sequencer`
+latches the expansion, and then issues one micro-op per cycle.
+
 Perf: MPM class `TCU` — `TCU_TBUF_STALLS` (0xB03, cycles a WGMMA micro-op
 waited on tile-buffer data), `TCU_TBUF_CACHE_HITS` (0xB04, B rows reused),
 `TCU_LMEM_READS` (0xB05).
@@ -483,6 +511,52 @@ the geometry templates shared with the simulator;
 `sw/runtime/include/tensor_sp.h` and `tensor_mx.h` hold the host-side
 packing helpers.
 
+### 11.1 wgmma groups
+
+A WGMMA reads its shared-memory operands through the tile buffers after it
+issues; its accumulators are ordinary registers, which the scoreboard
+orders. A warp that hands a slab back to its producer (an mbarrier arrive)
+must therefore first wait until the wgmmas that read the slab are done. The
+PTX `wgmma.fence` / `commit_group` / `wait_group` model does that, with the
+mbarriers and WGMMA both enabled:
+
+| API | instruction | effect |
+|---|---|---|
+| `vx_wgmma_fence()`, `wgmma_context::fence()` | none | the scoreboard already orders register operands |
+| `vx_wgmma_commit_group()`, `commit_group()` | WGMMA_COMMIT | closes a group with the warp's wgmmas issued since the last commit |
+| `vx_wgmma_wait_group(N)`, `wait_group<N>()` | WGMMA_WAIT | stalls the warp until at most `N` of its committed groups are incomplete |
+
+The TCU keeps two counters per warp, which is enough because a warp always
+issues to the same TCU block and its micro-ops arrive in order: `issued`
+counts the WGMMAs (dense or sparse) whose first compute micro-op the block
+has accepted, and `done` those whose last compute micro-op's result has
+retired. Every retire, `commit_group` and `wait_group` drops the FIFO
+entries `done` has reached, so the entries left lie between `done` and
+`issued` and the RTL can compare them modulo a 6-bit count. `commit_group`
+then pushes `issued`; the FIFO is 8 deep, and a ninth incomplete group is a
+runtime assertion (`wgmma group overflow`). It retires at once, without a
+FEDP slot, a lock or a tile-buffer request. `wait_group N` stalls the warp
+at issue, like a blocking barrier, and leaves a waiter for it in the TCU.
+The waiter is satisfied when at most `N` FIFO entries exceed `done`.
+Satisfied at cycle `T` (at the wait, or at the retire that satisfies it),
+the TCU pulses the scheduler's unlock at `T + 1`, and the warp is
+schedulable from `T + 2`; each TCU block releases one warp per cycle,
+lowest warp first. A `wait_group 0` right after a `commit_group` therefore
+waits for the warp's last WGMMA result. WMMA is synchronous and unaffected.
+
+The H100 pattern, for a k-tile loop over `S` stages:
+
+```cpp
+full[s].wait_parity(phase);           // the slabs of k-tile i are in
+ctx::wgmma_sync(acc, desc_a, desc_b, acc);
+ctx::commit_group();
+ctx::wait_group<1>();                 // k-tile i-1's wgmma has read its slabs
+empty[(i - 1) % S].arrive();          // hand those slabs back
+```
+
+[`tests/regression/sgemm_tcu_wg_mbar`](../../tests/regression/sgemm_tcu_wg_mbar)
+runs this mainloop with a DXA producer warp.
+
 ---
 
 ## 12. Verification
@@ -492,6 +566,7 @@ packing helpers.
 | `tensor` | WMMA across thread counts, issue widths and formats |
 | `tensor_wg` | WGMMA, register- and memory-sourced, with and without FEDP2K |
 | `tensor_sp`, `tensor_mx`, `tensor_sp_mx` | sparsity, block-scaled formats, and both together |
+| `mbar` | the wgmma groups in an mbarrier mainloop (`sgemm_tcu_wg_mbar`), and a release waiting for `TCU_LD` (`sgemm_tcu_mx_mbar`) |
 | `unittest`, `hw-tcu` | the FEDP datapath per format, against a windowed reference |
 | `fpga_gate`, `asic_gate`, `tensor` device | timing and area of the unit |
 

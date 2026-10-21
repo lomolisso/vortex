@@ -126,6 +126,13 @@
     `define TCU_META_ENABLE
 `endif
 
+// wgmma commit/wait groups (TCU trackers, a scheduler unlock source).
+`ifdef VX_CFG_EXT_MBAR_ENABLE
+`ifdef VX_CFG_TCU_WGMMA_ENABLE
+    `define TCU_WG_GROUPS_ENABLE
+`endif
+`endif
+
 // Integer mul/div via DPI: simulation only (not synthesis) with DPI enabled.
 // Internal derived macros — not VX_CFG_* knobs.
 `ifndef SYNTHESIS

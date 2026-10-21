@@ -84,6 +84,9 @@ LsuUnit::LsuUnit(const SimContext& ctx, const char* name, Core* core)
 #ifdef VX_CFG_EXT_DLMEM_ENABLE
 	, XlateReqOut(VX_CFG_NUM_LSU_BLOCKS, SimChannel<LsuReq>(this))
 	, UnlockOut(VX_CFG_NUM_LSU_BLOCKS, SimChannel<uint32_t>(this))
+	, SpawnIn(this)
+#else
+#line 87
 #endif
 	, pending_loads_(0)
 #ifdef VX_CFG_EXT_DLMEM_ENABLE
@@ -155,6 +158,11 @@ void LsuUnit::on_reset() {
 		unlock_beats_.at(b).clear();
 		out_unlock_.at(b).clear();
 	}
+	gdirty_.assign(VX_CFG_NUM_WARPS, false);
+	gload_.assign(VX_CFG_NUM_WARPS, 0);
+	gload_dec_.assign(VX_CFG_NUM_WARPS, 0);
+#else
+#line 158
 #endif
 }
 
@@ -358,6 +366,14 @@ void LsuUnit::process_response_step(uint32_t b) {
 	}
 	entry.count -= lsu_rsp.mask.count(); // track remaining
 	bool is_final = (entry.count == 0);
+#ifdef VX_CFG_EXT_DLMEM_ENABLE
+	if (is_final && entry.gload) {
+		++gload_dec_.at(trace->wid);
+	}
+	if (is_final && is_fence) {
+		gdirty_.at(trace->wid) = false;
+	}
+#endif
 	if (is_final) {
 		state.pending_reqs.release(lsu_rsp.tag);
 	}
@@ -409,6 +425,8 @@ void LsuUnit::ingest_inputs(uint32_t b) {
 	if (lsu_type_tag && *lsu_type_tag == LsuType::FENCE && !state.req_queue.empty())
 		return;
 #ifdef VX_CFG_EXT_DLMEM_ENABLE
+	if (lsu_type_tag && *lsu_type_tag == LsuType::CFENCE && !state.req_queue.empty())
+		return;
 	// An acquire AMO's warp is released over UnlockOut, not by the commit.
 	if (is_acquire_amo(trace)) {
 		trace->resume_warp = false;
@@ -432,6 +450,8 @@ void LsuUnit::issue_fence(uint32_t b, instr_trace_t* trace) {
 	lsu_req.wid = trace->wid;
 #ifdef VX_CFG_EXT_DLMEM_ENABLE
 	lsu_req.cta_id = trace->cta_id;
+	auto lsu_type = std::get_if<LsuType>(&trace->op_type);
+	lsu_req.flags.fence_cta = (lsu_type && *lsu_type == LsuType::CFENCE);
 #endif
 	uint32_t last = 0;
 	for (uint32_t t = 0; t < VX_CFG_NUM_THREADS; ++t) {
@@ -440,8 +460,16 @@ void LsuUnit::issue_fence(uint32_t b, instr_trace_t* trace) {
 	}
 	uint32_t t0 = (last / VX_CFG_NUM_LSU_LANES) * VX_CFG_NUM_LSU_LANES;
 	for (uint32_t t = t0; t < VX_CFG_NUM_THREADS && t < t0 + VX_CFG_NUM_LSU_LANES; ++t) {
+	#ifdef VX_CFG_EXT_DLMEM_ENABLE
+		// A CTA fence token rides every lane, so each dcache channel carries a copy
+		// behind the warp's older requests on it: the channels reach the dcache
+		// independently, and its drain covers only the requests it has accepted.
+		if (!lsu_req.flags.fence_cta && !trace->tmask.test(t))
+			continue;
+	#else
 		if (!trace->tmask.test(t))
 			continue;
+	#endif
 		uint32_t i = t - t0;
 		lsu_req.mask.set(i);
 		lsu_req.addrs.at(i) = 0;
@@ -456,8 +484,48 @@ void LsuUnit::issue_fence(uint32_t b, instr_trace_t* trace) {
 	this->req_out(b).send(lsu_req);
 	state.fence.engage(trace);
 	state.req_queue.pop();
+#ifdef VX_CFG_EXT_DLMEM_ENABLE
+	if (lsu_req.flags.fence_cta) {
+		DT(3, this->name() << " cfence-token: " << *trace);
+	}
+#endif
 	DT(3, this->name() << " fence-lock: " << *trace);
 }
+
+#ifdef VX_CFG_EXT_DLMEM_ENABLE
+// Stacks are thread-private, so a CTA release has nothing to order there.
+bool LsuUnit::lane_is_global(uint64_t addr) {
+	if (get_addr_type(addr) == AddrType::Shared)
+		return false;
+	if (addr >= StackInterleave::BOTTOM && addr < StackInterleave::TOP)
+		return false;
+	uint32_t wl = VX_CFG_LMEM_LOG_SIZE + log2ceil(VX_CFG_DLMEM_MAX_CLUSTER);
+	return (addr >> wl) != (uint64_t(VX_MEM_DLMEM_BASE_ADDR) >> wl);
+}
+
+// Every packet waits until the warp's global reads are answered. The last
+// packet then sends a CTA fence token if the warp wrote globally since its
+// last fence; any other packet retires without a request, like a store.
+void LsuUnit::process_cfence(uint32_t b, instr_trace_t* trace) {
+	auto& state = states_.at(b);
+	if (gload_.at(trace->wid) != 0) {
+		if (!trace->log_once(true)) {
+			DT(4, this->name() << " cfence-wait: gload=" << gload_.at(trace->wid) << ", " << *trace);
+		}
+		return;
+	}
+	trace->log_once(false);
+	if (trace->eop && gdirty_.at(trace->wid)) {
+		this->issue_fence(b, trace);
+		return;
+	}
+	if (Outputs.at(b).full())
+		return; // stall
+	DT(3, this->name() << " cfence-skip: " << *trace);
+	Outputs.at(b).send(trace);
+	state.req_queue.pop();
+}
+#endif
 
 // Per-cycle request handler. Dispatches at most one batch (one
 // memory-side mem_req) per call. The head trace stays at the queue
@@ -544,6 +612,12 @@ void LsuUnit::process_request_step(uint32_t b) {
 		this->issue_fence(b, trace);
 		return;
 	}
+#ifdef VX_CFG_EXT_DLMEM_ENABLE
+	if (lsu_tag && *lsu_tag == LsuType::CFENCE) {
+		this->process_cfence(b, trace);
+		return;
+	}
+#endif
 
 	// check pending queue capacity. AMO always needs a return → reserve
 	// like a load, even though it carries write-bearing semantics.
@@ -652,6 +726,20 @@ void LsuUnit::process_request_step(uint32_t b) {
 
 		uint32_t count = lsu_req.mask.count();
 		bool is_eop = (state.remain_addrs == 0);
+#ifdef VX_CFG_EXT_DLMEM_ENABLE
+		bool has_global = false;
+		for (uint32_t i = 0; i < VX_CFG_NUM_LSU_LANES; ++i) {
+			has_global |= lsu_req.mask.test(i) && lane_is_global(lsu_req.addrs.at(i));
+		}
+		if (has_global && (is_write || (is_amo && *amo_tag != AmoType::LR))) {
+			gdirty_.at(trace->wid) = true;
+		}
+		const bool req_gload = has_global && (!is_write || is_amo);
+		if (req_gload) {
+			__assert(gload_.at(trace->wid) < GLOAD_MAX, "global load counter overflow, wid=" << trace->wid);
+			++gload_.at(trace->wid);
+		}
+#endif
 
 		uint32_t tag = 0;
 		if (!is_write || is_amo) {
@@ -667,7 +755,13 @@ void LsuUnit::process_request_step(uint32_t b) {
 			} else {
 				entry_args = std::get<IntrLsuArgs>(trace->instr_ptr->get_args());
 			}
+		#ifdef VX_CFG_EXT_DLMEM_ENABLE
+			pending_req_t entry{trace, count, is_eop, std::move(lane_entries), entry_args, true};
+			entry.gload = req_gload;
+			tag = state.pending_reqs.allocate(std::move(entry));
+		#else
 			tag = state.pending_reqs.allocate({trace, count, is_eop, std::move(lane_entries), entry_args, true});
+		#endif
 		}
 		lsu_req.tag  = tag;
 		lsu_req.cid  = trace->cid;
@@ -706,4 +800,21 @@ void LsuUnit::on_tick() {
 		this->process_request_step(b);
 		this->ingest_inputs(b);
 	}
+#ifdef VX_CFG_EXT_DLMEM_ENABLE
+	if (!SpawnIn.empty()) {
+		const auto& spawned = SpawnIn.peek();
+		for (uint32_t w = 0; w < VX_CFG_NUM_WARPS; ++w) {
+			if (!spawned.test(w))
+				continue;
+			__assert(gload_.at(w) == 0, "global loads in flight at warp spawn, wid=" << w);
+			gdirty_.at(w) = false;
+		}
+		SpawnIn.pop();
+	}
+	for (uint32_t w = 0; w < VX_CFG_NUM_WARPS; ++w) {
+		__assert(gload_.at(w) >= gload_dec_.at(w), "global load counter underflow, wid=" << w);
+		gload_.at(w) -= gload_dec_.at(w);
+		gload_dec_.at(w) = 0;
+	}
+#endif
 }

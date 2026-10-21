@@ -490,4 +490,20 @@ module VX_mem_unit import VX_gpu_pkg::*; #(
 
     assign empty = (& per_block_empty);
 
+`ifdef DBG_TRACE_MEM
+`ifdef VX_CFG_EXT_DLMEM_ENABLE
+    // A CTA fence copy reaching the dcache: the drain it starts covers the requests already accepted.
+    for (genvar i = 0; i < DCACHE_NUM_REQS; ++i) begin : g_trace_cta
+        wire is_cta = dcache_bus_if[i].req_valid && dcache_bus_if[i].req_data.attr[MEM_ATTR_FENCE_CTA_OFFS];
+        reg waiting_r;
+        always @(posedge clk) begin
+            waiting_r <= ~reset && is_cta && ~dcache_bus_if[i].req_ready;
+            if (~reset && is_cta && ~waiting_r) begin
+                `TRACE(2, ("%t: %s dcache-cta-fence[%0d]: arrive (#%0d)\n", $time, INSTANCE_ID, i, dcache_bus_if[i].req_data.tag.uuid))
+            end
+        end
+    end
+`endif
+`endif
+
 endmodule

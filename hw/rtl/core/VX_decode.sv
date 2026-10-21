@@ -354,6 +354,13 @@ module VX_decode import
                 op_args.lsu.is_float = 0;
                 op_args.lsu.pack     = 0;
                 op_args.lsu.offset   = 0;
+            `ifdef VX_CFG_EXT_DLMEM_ENABLE
+            `ifdef TCU_META_ENABLE
+                // Orders the warp's metadata loads too: wait for their scoreboard release.
+                rd_xregs[XREG_0] = 1'b1;
+                rd_xregs[XREG_1] = 1'b1;
+            `endif
+            `endif
             end
         `ifdef VX_CFG_EXT_A_ENABLE
             INST_AMO: begin
@@ -394,10 +401,24 @@ module VX_decode import
             `endif
             end
         `endif
-        `ifdef VX_CFG_EXT_MBAR_ENABLE
+        `ifdef VX_CFG_EXT_DLMEM_ENABLE
             INST_EXT3: begin
+                if (funct7 == 7'd0 && funct3 == 3'd7) begin
+                    // vx_fence_cta
+                    ex_type = EX_LSU;
+                    op_type = INST_LSU_CFENCE;
+                    op_args.lsu.is_store = 0;
+                    op_args.lsu.is_float = 0;
+                    op_args.lsu.pack     = 0;
+                    op_args.lsu.offset   = 0;
+                `ifdef TCU_META_ENABLE
+                    rd_xregs[XREG_0] = 1'b1;
+                    rd_xregs[XREG_1] = 1'b1;
+                `endif
+                end
+            `ifdef VX_CFG_EXT_MBAR_ENABLE
                 // mbarrier ops: a .D AMO on a local-memory object, the op in funct3.
-                // funct7 and funct3 5..7 are reserved.
+                // funct7 and funct3 5..6 are reserved.
                 if (funct7 == 7'd0 && funct3 <= 3'd4) begin
                     ex_type = EX_LSU;
                     op_type = INST_OP_BITS'({1'b0, LSU_FMT_D});
@@ -415,6 +436,7 @@ module VX_decode import
                     `USED_IREG (rs1);
                     `USED_IREG (rs2);
                 end
+            `endif
             end
         `endif
             INST_SYS : begin
@@ -679,6 +701,16 @@ module VX_decode import
                 `ifdef VX_CFG_EXT_TCU_ENABLE
                     7'h02: begin
                         ex_type = EX_TCU;
+                    `ifdef TCU_WG_GROUPS_ENABLE
+                        if (funct3 == 3'h3 || funct3 == 3'h4) begin
+                            // wgmma.commit_group / wgmma.wait_group N (N in the rs2 field)
+                            op_type = (funct3 == 3'h3) ? INST_OP_BITS'(INST_TCU_COMMIT)
+                                                       : INST_OP_BITS'(INST_TCU_WAIT);
+                            op_args.tcu = '0;
+                            op_args.tcu.step_m = {1'b0, rs2[2:0]};
+                            is_wstall = (funct3 == 3'h4);
+                        end else
+                    `endif
                     `ifdef TCU_META_ENABLE
                         if (funct3 == 3'h2) begin
                             // TCU_LD — warp-level metadata load.

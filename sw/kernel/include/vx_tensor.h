@@ -16,6 +16,31 @@
 #include <tensor_cfg.h>
 #include <vx_intrinsics.h>
 
+// wgmma ordering, after PTX wgmma.fence / commit_group / wait_group. A wgmma
+// reads its local-memory operands after it issues, so a warp that releases
+// such a buffer (an mbarrier arrive) must first wait for the wgmma's group.
+
+// The scoreboard already orders a wgmma's register operands: nothing to emit.
+inline __attribute__((always_inline)) void vx_wgmma_fence() {}
+
+#if VX_CFG_EXT_MBAR_ENABLED && VX_CFG_TCU_WGMMA_ENABLED
+
+// Closes a group with the warp's wgmmas issued since the previous commit. At
+// most 8 committed groups may be incomplete at once.
+inline __attribute__((always_inline)) void vx_wgmma_commit_group() {
+  __asm__ volatile (".insn r %0, 3, 2, x0, x0, x0" :: "i"(RISCV_CUSTOM0) : "memory");
+}
+
+// Stalls the warp until at most N (0..7, a constant) of its committed groups
+// have wgmmas that have not completed; a completed wgmma has read its operands.
+#define vx_wgmma_wait_group(N) do {                                          \
+    static_assert((N) >= 0 && (N) <= 7, "wgmma wait_group takes 0 to 7");   \
+    __asm__ volatile (".insn r %0, 4, 2, x0, x0, x%1"                        \
+                      :: "i"(RISCV_CUSTOM0), "i"(N) : "memory");             \
+  } while (0)
+
+#endif
+
 namespace vortex {
 namespace tensor {
 
@@ -965,6 +990,15 @@ public:
       }
     });
   }
+
+  // ---- wgmma groups (vx_wgmma_*) ----
+  static __attribute__((always_inline)) void fence() { vx_wgmma_fence(); }
+#if VX_CFG_EXT_MBAR_ENABLED && VX_CFG_TCU_WGMMA_ENABLED
+  static __attribute__((always_inline)) void commit_group() { vx_wgmma_commit_group(); }
+
+  template <int N>
+  static __attribute__((always_inline)) void wait_group() { vx_wgmma_wait_group(N); }
+#endif
 
   // ---- WGMMA sync intrinsic ----
   // SS: wgmma_sync(fragD, desc_a, desc_b, fragC) — any NRC

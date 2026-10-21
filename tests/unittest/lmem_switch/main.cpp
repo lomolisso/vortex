@@ -23,11 +23,15 @@
 // registered); none for uncounted accesses or the ingress or DMA ports. With
 // mbarriers: every op against mbar_ref, waits that neither write nor leave a
 // read-during-write shadow, reservations, the assert texts, and a random op
-// stream on a few words.
+// stream on a few words. Last, the dcache's CTA fence: at an L1 that is not the
+// shared level it drains an older write of another port, keeps the lines (a
+// later read hits), and sends nothing below marked as a fence; a GPU fence at
+// the same cache still walks.
 
 #include "local_mem_switch.h"
 #include "local_mem.h"
 #include "mem_block_pool.h"
+#include "cache.h"
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
@@ -99,6 +103,33 @@ protected:
     }
   }
   friend class SimObject<CommitProbe>;
+};
+
+// The memory below a cache: logs each request with its tick, answers reads.
+class MemModel : public SimObject<MemModel> {
+public:
+  using Ptr = std::shared_ptr<MemModel>;
+  struct Entry { uint64_t tick; MemReq req; };
+  SimChannel<MemReq> ReqIn;
+  SimChannel<MemRsp> RspOut;
+  std::vector<Entry> log;
+  MemModel(const SimContext& ctx, const char* name)
+    : SimObject<MemModel>(ctx, name), ReqIn(this), RspOut(this) {}
+protected:
+  void on_reset() { log.clear(); }
+  void on_tick() {
+    while (!ReqIn.empty()) {
+      auto& req = ReqIn.peek();
+      log.push_back({SimPlatform::instance().cycles(), req});
+      if (!req.is_write()) {
+        auto b = make_mem_block();
+        std::memset(b->data(), 0x5a, b->size());
+        RspOut.send(MemRsp{req.tag, req.hart_id, req.uuid, b}, 4);
+      }
+      ReqIn.pop();
+    }
+  }
+  friend class SimObject<MemModel>;
 };
 
 static std::shared_ptr<mem_block_t> blk(uint8_t v) {
@@ -203,6 +234,93 @@ static void mbar_negative(const char* name, uint64_t init, uint32_t op, uint64_t
   }
 }
 #endif
+
+// The dcache's CTA fence, at an L1 that is not the shared level.
+static __attribute__((noinline)) void test_cta_fence() {
+  auto& platform = SimPlatform::instance();
+  Cache::Config cfg{};
+  cfg.bypass = false;
+  cfg.C = 12; cfg.L = 6; cfg.S = 6; cfg.W = 3; cfg.A = 2; cfg.B = 0;
+  cfg.addr_width = 64; cfg.num_inputs = 2; cfg.mem_ports = 1;
+  cfg.write_back = false; cfg.write_reponse = false; cfg.mshr_size = 8;
+  cfg.latency = 2; cfg.repl_policy = Cache::FIFO; cfg.is_llc = false;
+  cfg.fence_shared = false;
+  cfg.fence_cta = true;
+  auto l1 = Cache::Create("l1", cfg);
+  auto mem = MemModel::Create("mem");
+  l1->mem_req_out.at(0).bind(&mem->ReqIn);
+  mem->RspOut.bind(&l1->mem_rsp_in.at(0));
+  platform.reset();
+  for (int k = 0; k < 80; ++k) platform.tick(); // tag init
+
+  const uint64_t X = GLB + 0x1000, Y = GLB + 0x2000;
+  std::map<uint32_t, uint64_t> rsp_tick; // tag -> tick its response left the cache
+  auto step = [&](int n = 1) {
+    for (int k = 0; k < n; ++k) {
+      platform.tick();
+      for (uint32_t p = 0; p < 2; ++p) {
+        while (!l1->core_rsp_out.at(p).empty()) {
+          rsp_tick[uint32_t(l1->core_rsp_out.at(p).peek().tag)] = platform.cycles();
+          l1->core_rsp_out.at(p).pop();
+        }
+      }
+    }
+  };
+  auto read = [&](uint32_t port, uint64_t a, uint32_t tag) {
+    l1->core_req_in.at(port).send(MemReq(MemOp::LD, a, nullptr, 0xff, tag), 0);
+  };
+  auto fence = [&](uint32_t port, bool cta, uint32_t tag) {
+    MemReq f(MemOp::FLUSH, 0, nullptr, 0, tag);
+    f.flags.fence = 1;
+    f.flags.fence_cta = cta;
+    l1->core_req_in.at(port).send(f, 0);
+  };
+  auto mem_reads = [&](uint64_t a) {
+    uint32_t n = 0;
+    for (auto& e : mem->log) n += !e.req.is_write() && (e.req.addr & ~uint64_t(63)) == a;
+    return n;
+  };
+  auto any_fence_below = [&]() {
+    bool f = false;
+    for (auto& e : mem->log) f = f || e.req.flags.fence || e.req.flags.fence_cta;
+    return f;
+  };
+
+  // A line the fence must keep.
+  read(0, Y, 1);
+  step(40);
+  CHECK(rsp_tick.count(1) && mem_reads(Y) == 1);
+
+  // An older write on port 1, then a CTA fence on port 0 in the next tick:
+  // the write leaves for memory before the fence answers.
+  MemReq w(MemOp::ST, X, blk(0x77), 0xff, 2);
+  l1->core_req_in.at(1).send(w, 0);
+  step();
+  fence(0, true, 3);
+  step(60);
+  uint64_t w_tick = 0;
+  for (auto& e : mem->log) if (e.req.is_write() && e.req.addr == X) w_tick = e.tick;
+  CHECK(w_tick != 0);
+  CHECK(rsp_tick.count(3) && rsp_tick[3] > w_tick);
+  CHECK(!any_fence_below());
+
+  // No walk: the line is still there.
+  read(0, Y, 4);
+  step(40);
+  CHECK(rsp_tick.count(4) && mem_reads(Y) == 1);
+
+  // A GPU fence at this level walks: the line is gone, and its own miss
+  // carries the fence below.
+  fence(1, false, 5);
+  step(200);
+  CHECK(rsp_tick.count(5));
+  read(0, Y, 6);
+  step(40);
+  CHECK(rsp_tick.count(6) && mem_reads(Y) == 2);
+  CHECK(any_fence_below());
+  std::printf("cta fence: write sent at %llu, fence answered at %llu; %zu memory requests\n",
+              (unsigned long long)w_tick, (unsigned long long)rsp_tick[3], mem->log.size());
+}
 
 int main() {
   for (uint32_t s = 0; s < 3; ++s)
@@ -574,7 +692,8 @@ int main() {
       base = probe->pulses.size();
       std::vector<MemOp> ops = {MemOp::LD, MemOp::ST};
     #if VX_CFG_EXT_A_ENABLED
-      ops.insert(ops.end(), {MemOp::AMO_ADD, MemOp::AMO_LR, MemOp::AMO_SC});
+      for (auto op : {MemOp::AMO_ADD, MemOp::AMO_LR, MemOp::AMO_SC})
+        ops.push_back(op);
     #endif
     #ifdef VX_CFG_EXT_MBAR_ENABLE
       ops.push_back(MemOp::MBAR_TEST_WAIT);
@@ -885,6 +1004,8 @@ int main() {
     }
   #endif
   }
+
+  test_cta_fence();
 
   std::printf(g_fail ? "FAILED (%d)\n" : "PASSED\n", g_fail);
   sw.reset();

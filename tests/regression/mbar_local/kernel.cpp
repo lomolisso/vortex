@@ -425,3 +425,69 @@ __kernel void neg_k(mbar_arg_t* __UNIFORM__ arg) {
   if (blockIdx.x == 0)
     finish(x, arg);
 }
+
+// pc_k over a global double buffer (one block, so one L1): the producers store
+// each element `burst` times, the last time with its tag, and arrive on FULL;
+// a consumer, possibly on another LSU block, must then load every tag. The
+// arrive is a CTA-scope release, so it waits until the stores have reached
+// the L1 ahead of the consumers' loads.
+__kernel void glob_k(mbar_arg_t* __UNIFORM__ arg) {
+  Ctx x;
+  ctx_init(x, arg);
+  const uint32_t P  = x.nww / 2;
+  const uint32_t C  = x.nww - P;
+  const uint32_t pt = P * x.nt;
+  const uint32_t ct = C * x.nt;
+  const uint32_t burst = arg->burst;
+  auto gbuf = reinterpret_cast<volatile uint64_t*>(arg->glob_addr);
+  if (x.tid == 0) {
+    for (uint32_t s = 0; s < 2; ++s) {
+      vortex::mbarrier(x.lm + OBJ_FULL + s).init(pt);
+      vortex::mbarrier(x.lm + OBJ_EMPTY + s).init(C);
+    }
+  }
+  __syncthreads();
+  const bool prod = (x.ww < P);
+  const uint32_t c = x.wt - pt;
+  for (uint32_t r = 0; r < arg->rounds; ++r) {
+    const uint32_t s = r & 1, k = r >> 1;
+    vortex::mbarrier full(x.lm + OBJ_FULL + s);
+    vortex::mbarrier empty(x.lm + OBJ_EMPTY + s);
+    volatile uint64_t* buf = gbuf + s * PC_ELEMS;
+    if (prod) {
+      if (!x.parity && r >= 2)
+        x.wait_parity(empty, k - 1, r);
+      for (uint32_t i = x.wt; i < PC_ELEMS; i += pt) {
+        for (uint32_t b = 1; b < burst; ++b)
+          buf[i] = 0;
+        buf[i] = tag(r, i);
+      }
+      const uint64_t tok = full.arrive(1);
+      x.check_phase(tok, k, r);
+      x.check_fields(tok, pt, 0, 0, r);
+    }
+    if (x.parity)
+      x.meet();
+    if (!prod) {
+      if (x.parity)
+        x.check(full.test_wait_parity(k), r, CHK_WAIT);
+      else
+        x.wait_parity(full, k, r);
+      bool ok = true;
+      for (uint32_t i = c; i < PC_ELEMS; i += ct)
+        ok &= (buf[i] == tag(r, i));
+      x.check(ok, r, CHK_DATA);
+      if (x.lane == 0) {
+        const uint64_t tok = empty.arrive(1);
+        x.check_phase(tok, k, r);
+        x.check_fields(tok, C, 0, 0, r);
+      }
+    }
+    if (x.parity) {
+      x.meet();
+      if (prod)
+        x.check(empty.test_wait_parity(k), r, CHK_WAIT);
+    }
+  }
+  finish(x, arg);
+}

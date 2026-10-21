@@ -38,6 +38,11 @@ module VX_tcu_core import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
     // Inputs
     VX_execute_if.slave execute_if,
 
+`ifdef TCU_WG_GROUPS_ENABLE
+    // the result retiring now is a WGMMA's last compute result
+    output wire         wg_last_retire,
+`endif
+
     // Outputs
     VX_result_if.master result_if
 );
@@ -273,6 +278,29 @@ module VX_tcu_core import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
         `UNUSED_PIN(alm_full),
         `UNUSED_PIN(size)
     );
+
+`ifdef TCU_WG_GROUPS_ENABLE
+    // Beside the header queue: whether the result is a WGMMA's last.
+    wire mdata_last_out;
+    VX_fifo_queue #(
+        .DATAW (1),
+        .DEPTH (MDATA_QUEUE_DEPTH),
+        .OUT_REG (1)
+    ) mdata_last_queue (
+        .clk    (clk),
+        .reset  (reset),
+        .push   (mdata_push),
+        .pop    (fedp_result_fire),
+        .data_in(is_wgmma && execute_if.data.op_args.tcu.is_last_uop),
+        .data_out(mdata_last_out),
+        `UNUSED_PIN(empty),
+        `UNUSED_PIN(alm_empty),
+        `UNUSED_PIN(full),
+        `UNUSED_PIN(alm_full),
+        `UNUSED_PIN(size)
+    );
+    assign wg_last_retire = fedp_result_fire && mdata_last_out;
+`endif
 
     assign result_if.data.header = setup_valid_r ? setup_header_r : mdata_queue_out;
 

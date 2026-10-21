@@ -98,6 +98,9 @@ public:
       VX_CFG_DCACHE_REPL_POLICY,     // replacement policy
       (VX_CFG_DCACHE_ENABLED != 0) && (VX_CFG_L2_ENABLED == 0) && (VX_CFG_L3_ENABLED == 0), // is_llc
       DCACHE_FENCE_SHARED,    // fence_shared
+    #ifdef VX_CFG_EXT_DLMEM_ENABLE
+      true,                   // fence_cta
+    #endif
     });
 
 #ifdef VX_CFG_EXT_TEX_ENABLE

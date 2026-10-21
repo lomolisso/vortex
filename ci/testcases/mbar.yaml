@@ -33,7 +33,11 @@ defaults:
             tests/regression/cluster_sync, tests/regression/dlmem_local,
             tests/regression/dlmem_store, tests/regression/dlmem_load,
             tests/regression/dlmem_atomic, tests/regression/dlmem_stress,
-            tests/regression/lmem_bar_order, tests/regression/dlmem_amo_order, VX_types.toml]
+            tests/regression/lmem_bar_order, tests/regression/dlmem_amo_order, VX_types.toml,
+            hw/rtl/core/VX_uop_sequencer.sv, hw/rtl/dlmem/VX_uop_release.sv, sim/simx/sequencer,
+            sim/simx/instr.h, hw/rtl/cache, sim/simx/mem/cache, hw/rtl/VX_socket.sv,
+            hw/rtl/tcu, sim/simx/tcu, sw/kernel/include/vx_tensor.h,
+            tests/regression/sgemm_tcu_wg_mbar, tests/regression/sgemm_tcu_mx_mbar]
 tests:
   # One block of 4 warps x 4 threads. basic: every thread arrives with 1 and
   # waits on its token for 32 phases; the stores before each arrive must be
@@ -97,6 +101,13 @@ tests:
     configs+: "-DVX_CFG_EXT_DXA_ENABLE"
     shape: {warps: 8}
     args: "-m pc -r 64 -D 2"
+  - id: mbar_local-pc-dxa-simd2
+    app: mbar_local
+    drivers: [simx, rtlsim]
+    tier: nightly
+    configs+: "-DVX_CFG_EXT_DXA_ENABLE -DVX_CFG_SIMD_WIDTH=2"
+    shape: {warps: 8}
+    args: "-m pc -r 64 -D 2"
   - id: mbar_local-count-dxa
     app: mbar_local
     drivers: [simx, rtlsim]
@@ -119,6 +130,126 @@ tests:
     app: mbar_local
     xlen: [64]
     args: "-m tx -r 16 -p"
+
+  # --- releases of global memory and tensor-core loads ---
+  # glob: pc over a global double buffer in one block, so one L1. With issue
+  # width 2 each producer warp has a consumer warp on the other LSU block,
+  # whose loads reach the L1 through another input: the FULL arrive, a
+  # CTA-scope release, must wait until the producers' stores are in the L1.
+  - id: mbar_local-glob
+    app: mbar_local
+    drivers: [simx, rtlsim]
+    configs+: "-DVX_CFG_ISSUE_WIDTH=2"
+    args: "-m glob -r 32 -b 4"
+  # The xrt leg shares the pc-xrt build.
+  - id: mbar_local-glob-xrt
+    app: mbar_local
+    drivers: [xrt]
+    args: "-m glob -r 16"
+  - id: mbar_local-glob-w8t8
+    app: mbar_local
+    drivers: [simx, rtlsim]
+    tier: nightly
+    configs+: "-DVX_CFG_ISSUE_WIDTH=4"
+    shape: {warps: 8, threads: 8}
+    args: "-m glob -r 64 -b 8"
+  # lmem_bar_order with a global X released by an mbarrier arrive; dlmem.yaml
+  # has the barrier and .rl forms. Every lane's stores miss on X's L1 bank, so
+  # the X store can wait there while the arrive goes to local memory.
+  - id: lmem_bar_order-gst-mbar
+    app: lmem_bar_order
+    drivers: [simx, rtlsim]
+    configs+: "-DVX_CFG_EXT_DXA_ENABLE -DVX_CFG_ISSUE_WIDTH=2"
+    args: "-m mbar -o gst -d 1 -r 200 -b 8 -w 0 -e 768 -s 1"
+  # MX metadata staged in local memory by a producer warp: the consumer's
+  # EMPTY arrive follows its TCU_LDs of the buffer, which the producer then
+  # overwrites; the arrive must wait for the TCU_LD writeback. Each K block
+  # has its own magnitude, so wrong scales fail the GEMM check.
+  - id: sgemm_tcu_mx_mbar
+    app: sgemm_tcu_mx_mbar
+    drivers: [simx, rtlsim]
+    configs+: "-DVX_CFG_EXT_TCU_ENABLE -DVX_CFG_TCU_MX_ENABLE -DVX_CFG_TCU_FP8_ENABLE -DVX_CFG_NUM_THREADS=4 -DITYPE=mxfp8 -DOTYPE=fp32"
+    args: "-k 256"
+
+  # --- wgmma groups ---
+  # A CUTLASS-style multi-stage mainloop: a DXA producer warp fills S stages
+  # of slabs behind FULL/EMPTY mbarriers; the WGMMA group (one consumer warp
+  # per issue slot) runs wgmma, commit_group, wait_group<1> and arrives on
+  # the previous stage's EMPTY. The GEMM is checked against the CPU; lat
+  # ends with wait_group<0> and prints the cycles from the last wgmma to it.
+  - id: sgemm_tcu_wg_mbar
+    app: sgemm_tcu_wg_mbar
+    drivers: [simx, rtlsim]
+    configs+: &wg_mbar "-DVX_CFG_EXT_TCU_ENABLE -DVX_CFG_TCU_WGMMA_ENABLE -DVX_CFG_EXT_DXA_ENABLE -DVX_CFG_ISSUE_WIDTH=2 -DVX_CFG_NUM_THREADS=8 -DVX_CFG_NUM_WARPS=8 -DITYPE=fp16 -DOTYPE=fp32 -DWGMMA_NRC=8"
+    args: "-m wait -s 3"
+  - id: sgemm_tcu_wg_mbar-lat
+    app: sgemm_tcu_wg_mbar
+    drivers: [simx, rtlsim]
+    configs+: *wg_mbar
+    args: "-m lat -s 3"
+  # k-tile 0 waits on a one-wgmma group at once, then on a 48-wgmma group,
+  # whose retires carry `done` far past the first, waited boundary (a 6-bit
+  # compare must not see that boundary again), then wait_group<2> on three
+  # groups sharing one boundary. The consumers drift apart in the large group,
+  # so the B buffer serves two different wgmmas at once.
+  - id: sgemm_tcu_wg_mbar-groups
+    app: sgemm_tcu_wg_mbar
+    drivers: [simx, rtlsim]
+    configs+: *wg_mbar
+    args: "-m groups -s 3"
+  # One stage refilled in place between wgmmas with the same descriptors, while
+  # the consumers' wgmmas on a zeroed slab overlap the refill.
+  - id: sgemm_tcu_wg_mbar-refill
+    app: sgemm_tcu_wg_mbar
+    drivers: [simx, rtlsim]
+    tier: nightly
+    configs+: *wg_mbar
+    args: "-m refill -s 1 -e 16 -k 128"
+  # Memory-sourced A with 16 accumulator registers, and the widest group
+  # (issue width 4, 16 threads) over four stages.
+  - id: sgemm_tcu_wg_mbar-ss16
+    app: sgemm_tcu_wg_mbar
+    drivers: [simx, rtlsim]
+    tier: nightly
+    configs+: "-DVX_CFG_EXT_TCU_ENABLE -DVX_CFG_TCU_WGMMA_ENABLE -DVX_CFG_EXT_DXA_ENABLE -DVX_CFG_ISSUE_WIDTH=2 -DVX_CFG_NUM_THREADS=8 -DVX_CFG_NUM_WARPS=8 -DITYPE=fp16 -DOTYPE=fp32 -DWGMMA_NRC=16 -DWGMMA_SS"
+    args: "-m wait -s 2 -M 64 -n 64 -k 128"
+  - id: sgemm_tcu_wg_mbar-iw4
+    app: sgemm_tcu_wg_mbar
+    drivers: [simx, rtlsim]
+    tier: nightly
+    configs+: "-DVX_CFG_EXT_TCU_ENABLE -DVX_CFG_TCU_WGMMA_ENABLE -DVX_CFG_EXT_DXA_ENABLE -DVX_CFG_ISSUE_WIDTH=4 -DVX_CFG_NUM_THREADS=16 -DVX_CFG_NUM_WARPS=8 -DITYPE=fp16 -DOTYPE=fp32 -DWGMMA_NRC=8"
+    args: "-m wait -s 4 -M 64 -n 64 -k 128"
+
+  # Parity of the new releases at XLEN 64, with no spin: the global double
+  # buffer (the CTA fence's drain at the L1), and the wgmma mainloop (the
+  # group waits and their unlock).
+  - id: parity-mbar-glob
+    check: model_parity
+    app: mbar_local
+    xlen: [64]
+    configs+: "-DVX_CFG_ISSUE_WIDTH=2"
+    args: "-m glob -r 16 -p"
+  # The wgmma cell runs at 4 warps, one block per core. At 8 warps it differs
+  # by 5.6% (simx 242227, rtlsim 256638, with wgmmas no longer holding fetch
+  # in SimX), and the gap is there without the groups: -m nowait -p at 8 warps
+  # 5.1% (215528 / 227135), and 4.9% (204679 / 215310) before the CTA fence
+  # existed. 8-warp cores already differ without the feature (see the
+  # proposal's open items).
+  - id: parity-wgmma-mbar
+    check: model_parity
+    app: sgemm_tcu_wg_mbar
+    xlen: [64]
+    configs+: "-DVX_CFG_EXT_TCU_ENABLE -DVX_CFG_TCU_WGMMA_ENABLE -DVX_CFG_EXT_DXA_ENABLE -DVX_CFG_ISSUE_WIDTH=2 -DVX_CFG_NUM_THREADS=8 -DVX_CFG_NUM_WARPS=4 -DITYPE=fp16 -DOTYPE=fp32 -DWGMMA_NRC=8"
+    args: "-m wait -p -s 3"
+  # The same mainloop with waits that block: -m refill waits with
+  # wait_group<0> right after each commit, so every release comes from the
+  # wgmma's retire (the -m wait waits all find their groups complete).
+  - id: parity-wgmma-wait0
+    check: model_parity
+    app: sgemm_tcu_wg_mbar
+    xlen: [64]
+    configs+: "-DVX_CFG_EXT_TCU_ENABLE -DVX_CFG_TCU_WGMMA_ENABLE -DVX_CFG_EXT_DXA_ENABLE -DVX_CFG_ISSUE_WIDTH=2 -DVX_CFG_NUM_THREADS=8 -DVX_CFG_NUM_WARPS=4 -DITYPE=fp16 -DOTYPE=fp32 -DWGMMA_NRC=8"
+    args: "-m refill -p -s 3"
 
   # Each must stop the simulation with the exact message: an arrive past
   # pending, tx past its 21-bit range, an mbarrier op on a global address, and

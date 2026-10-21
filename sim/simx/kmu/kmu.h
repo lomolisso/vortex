@@ -14,6 +14,7 @@
 #pragma once
 
 #include <cstdint>
+#include <memory>
 #include <vector>
 #include "types.h"
 #include "VX_types.h"
@@ -58,27 +59,22 @@ constexpr uint32_t KMU_POLICY_DEFAULT = 0;
 constexpr uint32_t KMU_POLICY_SPREAD  = 1;
 #endif
 
+class LaunchTree;
+
 // Kernel Management Unit. Holds the in-flight kernel descriptor, walks the
-// grid, and pushes one CTA per cycle onto a ready core's launch lane.
+// grid, and fires one CTA per cycle into the launch bus.
 class Kmu : public SimObject<Kmu> {
 public:
-  // Per-core launch lanes. Each lane is bound to a registered boundary stage
-  // feeding the core dispatcher's endpoint; readiness is the lane's local
-  // full() view — the KMU never reads a consumer's state.
+  // Launch lanes, one per endpoint of the launch bus (a core, or with DLMEM a
+  // cluster's gang unit), each bound to a registered boundary stage into the
+  // endpoint.
   std::vector<SimChannel<kmu_req_t>> bus_out;
 
-  // Per-core credit returns: the dispatcher sends one message per admitted
-  // CTA. Dispatch is additionally gated on the in-flight count so pacing
-  // rests on explicit slot accounting, not on transport back-pressure.
+  // One credit per beat the endpoint takes.
   std::vector<SimChannel<uint8_t>> credit_in;
 
-  // In-flight bound per core: the boundary stage's endpoint (2) plus the
-  // dispatcher endpoint (1) plus one admission credit in return flight, so
-  // the lane's full() view stays the binding gate whenever the transport
-  // applies back-pressure.
-  static constexpr uint32_t LAUNCH_CREDITS = 4;
-
-  Kmu(const SimContext& ctx, const char* name, uint32_t num_cores);
+  Kmu(const SimContext& ctx, const char* name, uint32_t num_lanes);
+  ~Kmu();
 
   void dcr_write(uint32_t addr, uint32_t value);
 
@@ -86,8 +82,8 @@ public:
   // between cycles).
   void start();
 
-  // True while CTAs remain to be issued.
-  bool running() const { return running_; }
+  // True while CTAs remain to be issued or wait in the launch bus's skids.
+  bool running() const;
 
   // A grid-less launch is a delegated draw launch: the KMU walks no CTAs and
   // the processor forwards the frame kick to the raster engines.
@@ -105,10 +101,10 @@ protected:
   void on_tick();
 
 private:
-  // Fill *req with the next CTA for `core_id`; false when the grid is
-  // exhausted. The caller steers: a locked cluster's members all target the
-  // owning core.
-  bool next_cta(kmu_req_t* req, uint32_t core_id);
+  // Fill *req with the next CTA and advance the walk.
+  void next_cta(kmu_req_t* req);
+
+  bool credits_idle() const;
 
   uint64_t PC_;
   uint64_t entry_;
@@ -124,20 +120,13 @@ private:
 #endif
   bool     running_;
   uint32_t cta_id_;
-  // Round-robin pointer over launch lanes; advances past the granted core
-  // when a message (cluster or standalone CTA) completes.
-  uint32_t rr_ptr_;
   uint8_t  ctx_id_;
   // Nested counter: group_origin advances by cluster_dim per axis;
   // intra_offset walks within the cluster.
   uint32_t group_origin_[3];
   uint32_t intra_offset_[3];
-  // Cluster ownership: a cluster's members are reserved for whichever core took
-  // its first CTA, so they cannot be distributed apart.
-  bool     cluster_locked_;
-  uint32_t cluster_core_;
-  // CTAs sent but not yet admitted by each core's dispatcher.
-  std::vector<uint32_t> inflight_;
+  // A cluster is one message: its members stay on the output its first took.
+  std::unique_ptr<LaunchTree> tree_;
 
   friend class SimObject<Kmu>;
 };

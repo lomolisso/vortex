@@ -54,30 +54,30 @@ __kernel void sync_k(sync_arg_t* __UNIFORM__ arg) {
     case MODE_SPLIT:
       // Rank 0 arrives last on even phases; the work after arriving puts the
       // waits of the higher ranks after the release.
-      token = cluster.barrier_arrive();
+      token = cluster.barrier_arrive_relaxed();
       work(2 * rank * spin);
-      cluster.barrier_wait(token);
+      cluster.barrier_wait_relaxed(token);
       break;
     case MODE_SKEW:
       cluster.sync();
       break;
     case MODE_MIXED:
-      token = cluster.barrier_arrive();
+      token = cluster.barrier_arrive_relaxed();
       __syncthreads();
       block_bar.arrive_and_wait();
-      cluster.barrier_wait(token);
+      cluster.barrier_wait_relaxed(token);
       break;
     case MODE_EXIT:
       if (last) {
-        token = cluster.barrier_arrive();
+        token = cluster.barrier_arrive_relaxed();
       } else {
         cluster.sync();
       }
       break;
     default:
       if (arg->relaxed) {
-        token = cluster.barrier_arrive();
-        cluster.barrier_wait(token);
+        token = cluster.barrier_arrive_relaxed();
+        cluster.barrier_wait_relaxed(token);
       } else {
         cluster.sync();
       }
@@ -111,4 +111,58 @@ __kernel void sync_k(sync_arg_t* __UNIFORM__ arg) {
   } else {
     rec[REC_RUNS] = 1;
   }
+}
+
+// Each phase the lead lane of every warp stores a tag into its block's line of
+// the phase's buffer, then arrives and waits; after the wait it loads the tag
+// of the same warp of the next rank, which sits in another core's L1 under
+// SPREAD. The reader loaded that line two phases ago, so its own L1 still
+// holds it: only the default arrive's fence (the store reaches the shared
+// cache) and the wait's fence (the reader's L1 drops the line) make the new
+// tag visible. The relaxed forms read stale data.
+__kernel void handoff_k(sync_arg_t* __UNIFORM__ arg) {
+  const uint32_t k      = arg->k;
+  const uint32_t phases = arg->phases;
+  const uint32_t b      = blockIdx.x;
+  const uint32_t nb     = gridDim.x;
+  const uint32_t warp   = get_sub_group_id();
+  const uint32_t warps  = get_num_sub_groups();
+  const bool lead = (threadIdx.x % arg->num_threads) == 0;
+  auto cluster = vortex::this_cluster();
+  const uint32_t rank = cluster.block_rank();
+  const uint32_t next = b - rank + (rank + 1) % k;
+  auto data = reinterpret_cast<volatile uint32_t*>(arg->data_addr);
+
+  uint32_t stale = 0;
+  uint32_t errors = 0;
+  for (uint32_t i = 0; i < phases; ++i) {
+    volatile uint32_t* buf = data + (size_t)(i & 1) * nb * arg->stride;
+    if (lead)
+      buf[b * arg->stride + warp] = ((i + 1) << 12) | b;
+    uint32_t token;
+    if (arg->relaxed) {
+      token = cluster.barrier_arrive_relaxed();
+      cluster.barrier_wait_relaxed(token);
+    } else {
+      token = cluster.barrier_arrive();
+      cluster.barrier_wait(token);
+    }
+    if (token != (i & 1))
+      ++errors;
+    if (lead && buf[next * arg->stride + warp] != (((i + 1) << 12) | next))
+      ++stale;
+  }
+
+  if (lead && (errors | stale) != 0)
+    reinterpret_cast<uint32_t*>(arg->err_addr)[b * warps + warp] = (stale << 8) | errors;
+  if (threadIdx.x != 0)
+    return;
+  auto rec = reinterpret_cast<uint32_t*>(arg->rec_addr) + b * REC_WORDS;
+  rec[REC_BLOCK]  = b;
+  rec[REC_CORE]   = vx_core_id();
+  rec[REC_CTA_ID] = get_local_group_id();
+  rec[REC_RANK]   = rank;
+  rec[REC_SIZE]   = cluster.num_blocks();
+  rec[REC_PHASES] = phases;
+  rec[REC_RUNS]   = 1;
 }

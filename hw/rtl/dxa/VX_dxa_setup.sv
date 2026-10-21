@@ -538,16 +538,18 @@ module VX_dxa_setup import VX_gpu_pkg::*, VX_dxa_pkg::*; (
                 if (ctr_r == 4'd7 && lat_rank >= 4) begin
                     s_initial_gmem_base <= s_initial_gmem_base
                                          + `VX_CFG_MEM_ADDR_WIDTH'(mul_off_result);
-                    // delta[2] = stride2 - (tile2-1)*stride1
-                    s_delta[2] <= lat_stride2 - mul_dlt_result;
+                    // delta[2] = stride2 - (tile2-1)*stride1 - (tile1-1)*stride0:
+                    // dims 1 and 2 both wrap; (tile1-1)*stride0 = stride1 - delta[1].
+                    s_delta[2] <= lat_stride2 - mul_dlt_result - lat_stride1 + s_delta[1];
                 end
 
                 // ── Phase 3 capture at ctr=9 (rank=5) ──
                 if (ctr_r == 4'd9 && lat_rank >= 5) begin
                     s_initial_gmem_base <= s_initial_gmem_base
                                          + `VX_CFG_MEM_ADDR_WIDTH'(mul_off_result);
-                    // delta[3] = stride3 - (tile3-1)*stride2
-                    s_delta[3] <= lat_stride3 - mul_dlt_result;
+                    // delta[3] = stride3 - (tile3-1)*stride2 - (wraps of dims 1-2),
+                    // the latter being stride2 - delta[2].
+                    s_delta[3] <= lat_stride3 - mul_dlt_result - lat_stride2 + s_delta[2];
                 end
 
                 // Transition to STAGED at the last capture cycle.

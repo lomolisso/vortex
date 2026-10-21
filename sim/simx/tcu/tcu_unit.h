@@ -84,6 +84,15 @@ public:
   SimChannel<LsuRsp> agu_rsp_in;
 #endif
 
+#if defined(VX_CFG_EXT_MBAR_ENABLE) && defined(VX_CFG_TCU_WGMMA_ENABLE)
+  // Per block: the warp whose wgmma wait_group is satisfied.
+  std::vector<SimChannel<uint32_t>> UnlockOut;
+
+  // UnlockOut's delay: the scheduler's stall register. A wait satisfied in
+  // cycle T is sent at T+1, so the warp can be picked at T+2.
+  static constexpr uint32_t WAIT_UNLOCK_DELAY = 1;
+#endif
+
 	void wmma(uint32_t wid,
 	          uint32_t fmt_s,
 	          uint32_t fmt_d,

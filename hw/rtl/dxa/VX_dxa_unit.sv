@@ -27,19 +27,70 @@ module VX_dxa_unit import VX_gpu_pkg::*, VX_dxa_pkg::*; #(
     `UNUSED_SPARAM (INSTANCE_ID)
     `UNUSED_VAR (execute_if.data.rs3_data)
 
+    localparam NUM_LANES = `VX_CFG_NUM_SFU_LANES;
+    localparam DXA_LANES = 4;
+    `STATIC_ASSERT (`VX_CFG_NUM_THREADS >= DXA_LANES, ("DXA requires at least 4 threads per warp"))
+    // Packet carrying lane 3: it issues the request; later packets only retire.
+    localparam SEND_PID  = (DXA_LANES - 1) / NUM_LANES;
+    localparam PID_W     = $bits(execute_if.data.header.pid);
+
+    wire is_send = (execute_if.data.header.pid == PID_W'(SEND_PID));
+
     // Wgather-based layout (lane index = thread_id & 3):
     //   Lane 0: rs1=smem_addr, rs2=coord2
     //   Lane 1: rs1=meta,      rs2=coord3
     //   Lane 2: rs1=coord0,    rs2=coord4
     //   Lane 3: rs1=coord1,    rs2=cta_mask (multicast)
-    wire [`VX_CFG_XLEN-1:0] lane0_rs1 = execute_if.data.rs1_data[0];
-    wire [`VX_CFG_XLEN-1:0] lane1_rs1 = execute_if.data.rs1_data[1];
-    wire [`VX_CFG_XLEN-1:0] lane2_rs1 = execute_if.data.rs1_data[2];
-    wire [`VX_CFG_XLEN-1:0] lane3_rs1 = execute_if.data.rs1_data[3];
-    wire [`VX_CFG_XLEN-1:0] lane0_rs2 = execute_if.data.rs2_data[0];
-    wire [`VX_CFG_XLEN-1:0] lane1_rs2 = execute_if.data.rs2_data[1];
-    wire [`VX_CFG_XLEN-1:0] lane2_rs2 = execute_if.data.rs2_data[2];
-    wire [`VX_CFG_XLEN-1:0] lane3_rs2 = execute_if.data.rs2_data[3];
+    wire [DXA_LANES-1:0][`VX_CFG_XLEN-1:0] lane_rs1;
+    wire [DXA_LANES-1:0][`VX_CFG_XLEN-1:0] lane_rs2;
+
+    if (SEND_PID != 0) begin : g_stage
+        localparam STAGE_LANES = SEND_PID * NUM_LANES;
+        // Every packet of a DXA is dispatched, active or not, and a warp's
+        // packets are contiguous within its issue slice, so one staging entry
+        // per slice holds the lanes of its earlier packets.
+        reg [`VX_CFG_ISSUE_WIDTH-1:0][STAGE_LANES-1:0][`VX_CFG_XLEN-1:0] stage_rs1;
+        reg [`VX_CFG_ISSUE_WIDTH-1:0][STAGE_LANES-1:0][`VX_CFG_XLEN-1:0] stage_rs2;
+        wire [ISSUE_ISW_W-1:0] isw = wid_to_isw(execute_if.data.header.wid);
+        wire stage_fire = execute_if.valid && execute_if.ready;
+
+        always @(posedge clk) begin
+            for (integer p = 0; p < SEND_PID; ++p) begin
+                if (stage_fire && (execute_if.data.header.pid == PID_W'(p))) begin
+                    stage_rs1[isw][p * NUM_LANES +: NUM_LANES] <= execute_if.data.rs1_data;
+                    stage_rs2[isw][p * NUM_LANES +: NUM_LANES] <= execute_if.data.rs2_data;
+                end
+            end
+        end
+
+        for (genvar k = 0; k < DXA_LANES; ++k) begin : g_lanes
+            if (k < STAGE_LANES) begin : g_staged
+                assign lane_rs1[k] = stage_rs1[isw][k];
+                assign lane_rs2[k] = stage_rs2[isw][k];
+            end else begin : g_packet
+                assign lane_rs1[k] = execute_if.data.rs1_data[k - STAGE_LANES];
+                assign lane_rs2[k] = execute_if.data.rs2_data[k - STAGE_LANES];
+            end
+        end
+    end else begin : g_direct
+        for (genvar k = 0; k < DXA_LANES; ++k) begin : g_lanes
+            assign lane_rs1[k] = execute_if.data.rs1_data[k];
+            assign lane_rs2[k] = execute_if.data.rs2_data[k];
+        end
+        if (NUM_LANES > DXA_LANES) begin : g_unused
+            `UNUSED_VAR (execute_if.data.rs1_data)
+            `UNUSED_VAR (execute_if.data.rs2_data)
+        end
+    end
+
+    wire [`VX_CFG_XLEN-1:0] lane0_rs1 = lane_rs1[0];
+    wire [`VX_CFG_XLEN-1:0] lane1_rs1 = lane_rs1[1];
+    wire [`VX_CFG_XLEN-1:0] lane2_rs1 = lane_rs1[2];
+    wire [`VX_CFG_XLEN-1:0] lane3_rs1 = lane_rs1[3];
+    wire [`VX_CFG_XLEN-1:0] lane0_rs2 = lane_rs2[0];
+    wire [`VX_CFG_XLEN-1:0] lane1_rs2 = lane_rs2[1];
+    wire [`VX_CFG_XLEN-1:0] lane2_rs2 = lane_rs2[2];
+    wire [`VX_CFG_XLEN-1:0] lane3_rs2 = lane_rs2[3];
     `UNUSED_VAR (lane3_rs2)
 
     // Cluster-contiguous LMEM placement guarantees receiver bases are
@@ -83,7 +134,7 @@ module VX_dxa_unit import VX_gpu_pkg::*, VX_dxa_pkg::*; #(
     // dxa_req_arb and this unit. Barrier transaction registration is
     // handled by software via vx_barrier.h::expect_tx.
     wire dxa_buf_ready, wb_ready;
-    wire accept = dxa_buf_ready && wb_ready;
+    wire accept = (dxa_buf_ready || ~is_send) && wb_ready;
     wire fire   = execute_if.valid && accept;
 
     assign execute_if.ready = accept;
@@ -95,7 +146,7 @@ module VX_dxa_unit import VX_gpu_pkg::*, VX_dxa_pkg::*; #(
     ) dxa_req_buf (
         .clk       (clk),
         .reset     (reset),
-        .valid_in  (fire),
+        .valid_in  (fire && is_send),
         .ready_in  (dxa_buf_ready),
         .data_in   (dxa_req_data_in),
         .valid_out (dxa_req_bus_if.req_valid),

@@ -46,6 +46,11 @@ public:
 		// Every memory agent of the device reaches this cache: a fence drains
 		// here instead of locking the inputs and walking the lines.
 		bool    fence_shared = false;
+	#ifdef VX_CFG_EXT_DLMEM_ENABLE
+		// The first level the LSU's fences reach: a CTA fence drains here, then
+		// goes on as a plain read of its line.
+		bool    fence_cta = false;
+	#endif
 	};
 
 	struct PerfStats {

@@ -68,6 +68,11 @@ module VX_cache_top import VX_gpu_pkg::*; #(
     // the path that interacts with the deferred data pipeline.
     parameter IS_LLC                = 1,
 
+`ifdef VX_CFG_EXT_DLMEM_ENABLE
+    // A CTA-scope fence drains this cache at any level and goes no further.
+    parameter CTA_FENCE             = 0,
+`endif
+
     // Memory request output buffer
     parameter MEM_OUT_BUF           = 3,
 
@@ -104,6 +109,9 @@ module VX_cache_top import VX_gpu_pkg::*; #(
     output wire [`CS_MEM_SECTOR_ADDR_WIDTH-1:0] mem_req_addr [MEM_PORTS],
     output wire [`CS_SECTOR_WIDTH-1:0] mem_req_data [MEM_PORTS],
     output wire [MEM_TAG_WIDTH-1:0] mem_req_tag [MEM_PORTS],
+`ifdef VX_CFG_EXT_DLMEM_ENABLE
+    output wire [MEM_ATTR_WIDTH-1:0] mem_req_attr [MEM_PORTS],
+`endif
     input  wire                     mem_req_ready [MEM_PORTS],
 
     // Memory response
@@ -150,6 +158,9 @@ module VX_cache_top import VX_gpu_pkg::*; #(
         assign mem_req_addr[i] = mem_bus_if[i].req_data.addr;
         assign mem_req_data[i] = mem_bus_if[i].req_data.data;
         assign mem_req_tag[i] = mem_bus_if[i].req_data.tag;
+    `ifdef VX_CFG_EXT_DLMEM_ENABLE
+        assign mem_req_attr[i] = mem_bus_if[i].req_data.attr;
+    `endif
         assign mem_bus_if[i].req_ready = mem_req_ready[i];
     end
 
@@ -182,6 +193,9 @@ module VX_cache_top import VX_gpu_pkg::*; #(
         .DIRTY_BYTES    (DIRTY_BYTES),
         .AMO_ENABLE     (AMO_ENABLE),
         .IS_LLC         (IS_LLC),
+    `ifdef VX_CFG_EXT_DLMEM_ENABLE
+        .CTA_FENCE      (CTA_FENCE),
+    `endif
         .CORE_OUT_BUF   (CORE_OUT_BUF),
         .MEM_OUT_BUF    (MEM_OUT_BUF)
     ) cache (

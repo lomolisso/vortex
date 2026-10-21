@@ -168,7 +168,7 @@ __kernel void stress_k(stress_arg_t* __UNIFORM__ arg) {
       x.cl.sync();
       break;
     case END_RELAXED:
-      x.cl.barrier_wait(x.cl.barrier_arrive());
+      x.cl.barrier_wait_relaxed(x.cl.barrier_arrive_relaxed());
       break;
     default: {
       vx_fence();

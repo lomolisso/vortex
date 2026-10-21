@@ -248,12 +248,12 @@ __kernel void parity_k(load_arg_t* __UNIFORM__ arg) {
   ctx_init(x, arg);
   for (uint32_t e = x.tid; e < x.n; e += x.nt)
     x.own[e] = parity_fill(x.seed, x.c, x.rank, e);
-  x.cl.barrier_wait(x.cl.barrier_arrive());
+  x.cl.barrier_wait_relaxed(x.cl.barrier_arrive_relaxed());
   auto w = x.window<uint32_t>((x.rank + 1) % x.k);
   uint32_t sum = 0;
   for (uint32_t j = 0; j < arg->rounds; ++j)
     sum += w[(j * x.nt + x.tid) % x.n];
-  x.cl.barrier_wait(x.cl.barrier_arrive());
+  x.cl.barrier_wait_relaxed(x.cl.barrier_arrive_relaxed());
   reinterpret_cast<uint32_t*>(arg->glob_addr)[x.b * x.nt + x.tid] = sum;
   ctx_done(x, arg);
 }

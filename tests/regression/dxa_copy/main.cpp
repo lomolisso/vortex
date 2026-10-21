@@ -25,6 +25,7 @@
 
 const char* kernel_file = "kernel.vxbin";
 uint32_t ndim = 2;
+uint32_t elect = 0;
 
 // Default sizes/tiles per dimension (overridable via CLI).
 uint32_t sizes[DXA_MAX_DIMS] = {32, 32, 1, 1, 1};
@@ -32,16 +33,18 @@ uint32_t tiles[DXA_MAX_DIMS] = {4, 4, 1, 1, 1};
 
 vx_device_h device = nullptr;
 vx_buffer_h src_buffer = nullptr;
+vx_buffer_h dst_buffer = nullptr;
 vx_queue_h  queue = nullptr;
 vx_module_h module_ = nullptr;
 vx_kernel_h kernel = nullptr;
 kernel_arg_t kernel_arg = {};
 
 static void show_usage() {
-  std::cout << "Usage: [-k kernel] [-d1|-d2|-d3|-d4|-d5] [-s<d> size] [-t<d> tile] [-h]\n";
+  std::cout << "Usage: [-k kernel] [-d1|-d2|-d3|-d4|-d5] [-s<d> size] [-t<d> tile] [-e] [-h]\n";
   std::cout << "  -d1..-d5: set number of dimensions (default: -d2)\n";
   std::cout << "  -s0 N:    set size of dimension 0 (innermost)\n";
   std::cout << "  -t0 N:    set tile size of dimension 0\n";
+  std::cout << "  -e:       issue the copy from one elected thread instead of the whole warp\n";
 }
 
 static void set_defaults() {
@@ -77,6 +80,7 @@ static void parse_args(int argc, char** argv) {
     if (argv[i][0] != '-') continue;
     if (strcmp(argv[i], "-k") == 0 && i + 1 < argc) { kernel_file = argv[++i]; continue; }
     if (strcmp(argv[i], "-h") == 0) { show_usage(); exit(0); }
+    if (strcmp(argv[i], "-e") == 0) { elect = 1; continue; }
     // -s<d> N and -t<d> N
     if (strlen(argv[i]) == 3 && i + 1 < argc) {
       int d = argv[i][2] - '0';
@@ -91,6 +95,7 @@ static void parse_args(int argc, char** argv) {
 void cleanup() {
   if (device) {
     if (src_buffer) vx_buffer_release(src_buffer);
+    if (dst_buffer) vx_buffer_release(dst_buffer);
     if (kernel)  vx_kernel_release(kernel);
     if (module_) vx_module_release(module_);
     if (queue)   vx_queue_release(queue);
@@ -128,6 +133,8 @@ int main(int argc, char* argv[]) {
 #else
   std::cout << "mode: LSU\n";
 #endif
+  if (elect)
+    std::cout << "issue: elected thread\n";
   std::cout << "ndim: " << ndim << "\n";
   std::cout << "sizes:";
   for (uint32_t d = 0; d < ndim; ++d) std::cout << " " << sizes[d];
@@ -157,6 +164,7 @@ int main(int argc, char* argv[]) {
 
   // Set up kernel args.
   kernel_arg.ndim = ndim;
+  kernel_arg.elect = elect;
   for (uint32_t d = 0; d < DXA_MAX_DIMS; ++d) {
     kernel_arg.sizes[d] = sizes[d];
     kernel_arg.tiles[d] = tiles[d];
@@ -171,6 +179,11 @@ int main(int argc, char* argv[]) {
   for (uint32_t i = 0; i < total_elems; ++i)
     h_src[i] = static_cast<TYPE>(i + 1);
   RT_CHECK(vx_enqueue_write(queue, src_buffer, 0, h_src.data(), buf_size, 0, nullptr, nullptr));
+
+  RT_CHECK(vx_buffer_create(device, buf_size, VX_MEM_WRITE, &dst_buffer));
+  RT_CHECK(vx_buffer_address(dst_buffer, &kernel_arg.dst_addr));
+  std::vector<TYPE> h_dst(total_elems, static_cast<TYPE>(0));
+  RT_CHECK(vx_enqueue_write(queue, dst_buffer, 0, h_dst.data(), buf_size, 0, nullptr, nullptr));
 
 #ifdef VX_CFG_EXT_DXA_ENABLE
   // Program DXA descriptor for N-D source tile.
@@ -236,8 +249,27 @@ int main(int argc, char* argv[]) {
     li.lmem_size    = local_mem;
     RT_CHECK(vx_enqueue_launch(queue, &li, 0, nullptr, &launch_ev));
   }
-  RT_CHECK(vx_event_wait_value(launch_ev, 1, VX_TIMEOUT_INFINITE));
+  vx_event_h read_ev = nullptr;
+  RT_CHECK(vx_enqueue_read(queue, h_dst.data(), dst_buffer, 0, buf_size, 1, &launch_ev, &read_ev));
+  RT_CHECK(vx_event_wait_value(read_ev, 1, VX_TIMEOUT_INFINITE));
+  vx_event_release(read_ev);
   vx_event_release(launch_ev);
+
+  // Every element belongs to exactly one tile, so the written-back tiles
+  // must reproduce the whole source array.
+  uint32_t errors = 0;
+  for (uint32_t i = 0; i < total_elems; ++i) {
+    if (h_dst[i] != h_src[i]) {
+      if (errors < 10)
+        std::cout << "*** error: [" << i << "] expected=" << h_src[i] << ", actual=" << h_dst[i] << "\n";
+      ++errors;
+    }
+  }
+  if (errors != 0) {
+    std::cout << "Found " << errors << " errors!\nFAILED!\n";
+    cleanup();
+    return errors;
+  }
 
   std::cout << "PASSED\n";
 

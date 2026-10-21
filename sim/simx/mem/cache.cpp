@@ -2251,6 +2251,20 @@ public:
           core_req_in.pop();
         }
       } else if (admit_.at(req_id)) {
+      #ifdef VX_CFG_EXT_DLMEM_ENABLE
+        // A CTA fence ends here: it goes on as a plain read of its line.
+        if (config_.fence_cta && core_req.flags.fence_cta) {
+          MemReq rd_req(core_req);
+          rd_req.flags.fence = 0;
+          rd_req.flags.fence_cta = 0;
+          if (bank_core_xbar_->ReqIn.at(req_id).try_send(rd_req, 0)) {
+            core_req_in.pop();
+            fired_.at(req_id) = true;
+            ++fwd_cnt_.at(req_id);
+          }
+          continue;
+        }
+      #endif
         if (bank_core_xbar_->ReqIn.at(req_id).try_send(core_req, 0)) {
           core_req_in.pop();
           fired_.at(req_id) = true;
@@ -2306,7 +2320,22 @@ private:
       any_fence_ = any_fence_ || fence_head_.at(i);
       fired_.at(i) = false;
     }
+  #ifdef VX_CFG_EXT_DLMEM_ENABLE
+    // A fence drains at the shared level, and a CTA fence also at the level
+    // that ends it; any other fence walks.
+    any_drain_ = false;
+    walk_req_ = false;
+    for (uint32_t i = 0; i < n; ++i) {
+      auto &in = simobject_->core_req_in.at(i);
+      bool drain = config_.fence_shared || (config_.fence_cta && fence_head_.at(i) && in.peek().flags.fence_cta);
+      drain_head_.at(i) = fence_head_.at(i) && drain;
+      any_drain_ = any_drain_ || drain_head_.at(i);
+      walk_req_ = walk_req_ || (fence_head_.at(i) && !drain);
+    }
+    const bool walk_req = walk_req_;
+  #else
     const bool walk_req = any_fence_ && !config_.fence_shared;
+  #endif
     for (uint32_t i = 0; i < n; ++i) {
       bool enable = false;
       switch (fence_state_) {
@@ -2335,6 +2364,31 @@ private:
       return pending;
     };
     switch (fence_state_) {
+  #ifdef VX_CFG_EXT_DLMEM_ENABLE
+    case FenceLock::Idle:
+      if (walk_req_) {
+        fence_state_ = FenceLock::Flush;
+        DT(3, simobject_->name() << " fence-walk");
+      } else if (any_drain_) {
+        for (uint32_t i = 0; i < n; ++i) {
+          released_.at(i) = drain_head_.at(i);
+          drain_fwd_.at(i) = fwd_cnt_.at(i);
+        }
+        drain_phase_ = DrainPhase::Transit;
+        fence_state_ = FenceLock::Drain;
+        DTH(3, simobject_->name() << " fence-drain: inputs={");
+        const char* sep = "";
+        for (uint32_t i = 0; i < n; ++i) {
+          if (drain_head_.at(i)) {
+            DTN(3, sep << i << ":#" << simobject_->core_req_in.at(i).peek().uuid);
+            sep = ", ";
+          }
+        }
+        __unused(sep);
+        DTN(3, "}" << std::endl);
+      }
+      break;
+  #else
     case FenceLock::Idle:
       if (any_fence_ && !config_.fence_shared) {
         fence_state_ = FenceLock::Flush;
@@ -2351,6 +2405,7 @@ private:
         DT(3, simobject_->name() << " fence-drain");
       }
       break;
+  #endif
     case FenceLock::Flush:
       for (auto &bank : banks_) {
         bank->fence_walk_begin();
@@ -2489,6 +2544,11 @@ private:
   FenceLock  fence_state_;
   DrainPhase drain_phase_;
   bool       any_fence_;
+#ifdef VX_CFG_EXT_DLMEM_ENABLE
+  bool       any_drain_ = false;
+  bool       walk_req_ = false;
+  std::vector<bool> drain_head_ = std::vector<bool>(config_.num_inputs, false);  // a fence head that drains
+#endif
   std::vector<bool> fence_head_;  // input head is a fence token
   std::vector<bool> admit_;       // input may pass to the banks this cycle
   std::vector<bool> fired_;       // input passed to the banks this cycle

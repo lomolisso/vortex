@@ -899,22 +899,52 @@ SimX is the structural reference this design mirrors: a single
 context (no separate storage object), `step()` returns the full
 `cta_warp_record_t`, and the scheduler owns it as a child, copying the record
 into per-warp state via `activate_warp(wid, rec)`. The fixed-stride allocator
-mirrors line for line (`usable_slots()` + round-robin `tail_slot_`), and RTL
-is cycle-for-cycle identical to it on `vecadd` / `sgemm` / `sgemm_tcu_wg` /
-`sgemm_tcu_wg_dxa_mcast`.
+mirrors line for line (`usable_slots()` + round-robin `tail_slot_`).
 
-The KMU→core transport is modelled as per-core **launch lanes**: each lane is
-a registered boundary stage feeding the dispatcher's endpoint, and the KMU
-additionally paces every core with explicit credits — `LAUNCH_CREDITS = 4`
-per core ([`kmu.h:62`](../../sim/simx/kmu/kmu.h#L62)) — spent when a CTA is
-sent and returned by the dispatcher one message per admission
-([`cta_dispatcher.cpp:142`](../../sim/simx/cta_dispatcher.cpp#L142)). The
-bound is the transport's occupancy made explicit — the boundary stage's
-endpoint (2) plus the dispatcher endpoint (1) plus one credit in return
-flight — so a busy core never accumulates work beyond what the RTL's skids
-would hold, and pacing rests on slot accounting rather than on peeking at
-the consumer's state. RTL needs no counter: its registered output skids
-apply the same bound as wires.
+**The launch bus.** [`LaunchTree`](../../sim/simx/kmu/launch_tree.h) models the
+chain of `VX_kmu_bus_arb` fan-outs between a launch source and its endpoints,
+level for level as the RTL instantiates them (device → clusters → sockets →
+cores; a raster build adds the cluster's registered merge stage):
+
+- A level with more than one output gives each output a two-entry skid
+  (`OUT_BUF=3`). Its ready is registered: it is the skid's occupancy at the
+  start of the cycle, and a beat that enters shows at the output a cycle later.
+- A compute message goes to the nearest *ready* output from the level's
+  round-robin pointer, so the core that frees a slot first takes the next CTA;
+  a pinned beat goes by its `dest`. A message holds its output until `eop`,
+  and the pointer advances only on `eop`.
+- A level with one output is a wire.
+- The skids of the last level live in the endpoints: the tree counts their
+  entries and learns of each pop from the endpoint's credit, which arrives the
+  next cycle, when the RTL's registered ready would see it.
+
+The `Kmu` fires one beat per cycle into its tree. `Kmu::running()` covers beats
+still held in internal skids, so the run loop cannot end with a launch in
+transit.
+
+**The dispatcher.** `step()` runs once per cycle, whether or not fetch can take
+a warp, as an FSM with `VX_cta_dispatch`'s timing:
+
+| Event | Cycle |
+|---|---|
+| Admit (idle, head CTA's slots free) | A |
+| First warp picked | A+1 |
+| `warp_fire_r` | A+2 |
+| Warp schedulable | A+3 |
+| Next admit after an N-warp CTA | A+N+2 |
+| Slot free after its CTA's last warp exits at E | E+3 (E+4 if it owes a DLMEM done event) |
+| Admission blocked by the count write-back | E+3 for any warp exit at E |
+
+**DLMEM.** A DLMEM build launches hop by hop, as the RTL does. The `Kmu`'s tree
+ends at one lane per hardware cluster, into that cluster's
+[`CtaGang`](../../sim/simx/kmu/cta_gang.h). The gang has a single output, its
+two-entry output skid, as `VX_cta_gang` does, and runs the same cycle table
+(K placement cycles, then one beat per cycle) on `dlmem_ref.h`. It does not
+pick cores. Below it a `LaunchFanout` (the cluster's socket and core levels)
+routes DEFAULT beats round-robin over ready cores and SPREAD beats by `dest`.
+A cluster of one core has no fan-out: the gang's skid feeds the core directly.
+Done events travel on the global-barrier event link
+(`GbarArrive.kind = CTA_DONE`) with the RTL's delay.
 
 The differences are deliberate, not drift:
 
@@ -926,27 +956,18 @@ The differences are deliberate, not drift:
 | Bus payload | `cluster_size` (scalar), `aligned_lmem_size` | `cluster_dim[3]`, raw `lmem_size` |
 | `cta_id` on the bus | absent | present (model-only, unused as identity) |
 | Stride rounding | in the KMU | in the dispatcher |
-| Launch pacing | elastic-skid back-pressure | explicit credits (`LAUNCH_CREDITS = 4`) |
+| Path with no registered level (one core; DLMEM with one cluster, KMU → gang) | combinational | one registered stage: a domain crossing must be registered, so the first CTA arrives a cycle later |
 | Fragment path | through `kmu_bus_if` → `VX_cta_dispatch` | injected at the scheduler by the FWD |
 
 The last row is the significant one: in RTL a fragment wave is a launch that
 traverses the same bus and the same dispatcher as a CTA, whereas SimX's
 per-core Fragment Work Distributor injects fragment warps directly at the
-scheduler ([`scheduler.h:141-166`](../../sim/simx/scheduler.h#L141)). The
-`kmu_req_t` union and `lane_launch` overlay exist only on the RTL side.
+scheduler ([`scheduler.h`](../../sim/simx/scheduler.h)). The `kmu_req_t` union
+and `lane_launch` overlay exist only on the RTL side, and SimX does not model
+fragments contending for the launch bus.
 
 The `cluster_dim[3]`-vs-`cluster_size` split is a real ABI divergence, though
-a benign one — SimX computes the product where RTL receives it
-([`cta_dispatcher.cpp:108-111`](../../sim/simx/cta_dispatcher.cpp#L108)).
-
-A DLMEM build launches hop by hop, as the RTL does: the `Kmu` has one lane per
-hardware cluster, each feeding that cluster's
-[`CtaGang`](../../sim/simx/kmu/cta_gang.h) through a register stage; the gang
-holds the per-core lanes and credits that the `Kmu` holds otherwise, and runs
-the same cycle table as `VX_cta_gang` (K placement cycles, then one beat per
-cycle) on `dlmem_ref.h`. Done events travel on the global-barrier event link
-(`GbarArrive.kind = CTA_DONE`) with the RTL's delay. Without DLMEM the topology
-is unchanged.
+a benign one: SimX computes the product where RTL receives it.
 
 ---
 

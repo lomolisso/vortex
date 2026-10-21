@@ -29,6 +29,8 @@ module VX_lsu_slice import VX_gpu_pkg::*; #(
     VX_result_if.master     result_if,
 
 `ifdef VX_CFG_EXT_DLMEM_ENABLE
+    // Warps the scheduler activated this cycle.
+    input wire [`VX_CFG_NUM_WARPS-1:0] warp_spawn,
     // Releases the warp an acquire AMO stalled at decode.
     VX_sched_unlock_if.master sched_unlock_if,
 `endif
@@ -50,12 +52,17 @@ module VX_lsu_slice import VX_gpu_pkg::*; #(
     localparam LMEM_BLK_LSB = `VX_CFG_LMEM_LOG_SIZE - MEM_ASHIFT;
     localparam [MEM_ADDRW-1:0] LMEM_BLK_BASE = MEM_ADDRW'(`VX_CFG_XLEN'(`VX_MEM_LMEM_BASE_ADDR) >> MEM_ASHIFT);
     `STATIC_ASSERT (MEM_ADDRW > LMEM_BLK_LSB, ("LMEM window wider than the block address space"))
+`ifdef VX_CFG_EXT_DLMEM_ENABLE
+    localparam DLMEM_WIN_BLK_LSB = `VX_CFG_LMEM_LOG_SIZE + DLMEM_RANK_BITS - MEM_ASHIFT;
+    localparam [MEM_ADDRW-1:0] DLMEM_WIN_BLK_BASE = MEM_ADDRW'(`VX_CFG_XLEN'(`VX_MEM_DLMEM_BASE_ADDR) >> MEM_ASHIFT);
+    `STATIC_ASSERT (MEM_ADDRW > DLMEM_WIN_BLK_LSB, ("DLMEM window wider than the block address space"))
+`endif
     `UNUSED_PARAM (CORE_ID)
     `UNUSED_SPARAM (INSTANCE_ID)
 
 `ifdef VX_CFG_EXT_DLMEM_ENABLE
-    // tag_width = header + op_type + align + pkt_addr + aq + rl + fence
-    localparam TAG_WIDTH = $bits(lsu_header_t) + INST_LSU_BITS + (NUM_LANES * REQ_ASHIFT) + LSUQ_SIZEW + 2 + 1;
+    // tag_width = header + op_type + align + pkt_addr + gload + aq + rl + fence
+    localparam TAG_WIDTH = $bits(lsu_header_t) + INST_LSU_BITS + (NUM_LANES * REQ_ASHIFT) + LSUQ_SIZEW + 1 + 2 + 1;
 `else
     // tag_width = header + op_type + align + pkt_addr + fence
     localparam TAG_WIDTH = $bits(lsu_header_t) + INST_LSU_BITS + (NUM_LANES * REQ_ASHIFT) + LSUQ_SIZEW + 1;
@@ -87,6 +94,9 @@ module VX_lsu_slice import VX_gpu_pkg::*; #(
     // VX_lsu_agu; this slice contains no address arithmetic).
 
     wire req_is_fence, rsp_is_fence;
+`ifdef VX_CFG_EXT_DLMEM_ENABLE
+    wire req_is_cfence = (execute_if.data.op_type == INST_LSU_CFENCE);
+`endif
 
     wire [NUM_LANES-1:0][`VX_CFG_XLEN-1:0] full_addr;
     for (genvar i = 0; i < NUM_LANES; ++i) begin : g_full_addr
@@ -104,6 +114,9 @@ module VX_lsu_slice import VX_gpu_pkg::*; #(
     // lsu_mem_if's per-lane req_data.user field.
 
     mem_bus_attr_t [NUM_LANES-1:0] mem_req_attr_struct;
+`ifdef VX_CFG_EXT_DLMEM_ENABLE
+    wire [NUM_LANES-1:0] lane_global;
+`endif
     wire [NUM_LANES-1:0][MEM_ATTR_WIDTH-1:0] mem_req_attr;
     for (genvar i = 0; i < NUM_LANES; ++i) begin : g_mem_req_attr
         wire [MEM_ADDRW-1:0] block_addr = full_addr[i][MEM_ASHIFT +: MEM_ADDRW];
@@ -116,6 +129,7 @@ module VX_lsu_slice import VX_gpu_pkg::*; #(
         // The DLMEM translation stage sets them: lanes bound for a peer core, counted local lanes.
         assign mem_req_attr_struct[i].is_addr_remote = 1'b0;
         assign mem_req_attr_struct[i].is_lacc        = 1'b0;
+        assign mem_req_attr_struct[i].is_fence_cta   = req_is_cfence;
     `endif
     `ifdef VX_CFG_EXT_OM_ENABLE
         // OM fragment-export aperture.
@@ -143,6 +157,14 @@ module VX_lsu_slice import VX_gpu_pkg::*; #(
             (block_addr[MEM_ADDRW-1:LMEM_BLK_LSB] == LMEM_BLK_BASE[MEM_ADDRW-1:LMEM_BLK_LSB]);
     `else
         assign mem_req_attr_struct[i].is_addr_local = 1'b0;
+    `endif
+    `ifdef VX_CFG_EXT_DLMEM_ENABLE
+        // The translation's window predicate: every window lane becomes local or remote.
+        wire lane_in_win = (block_addr[MEM_ADDRW-1:DLMEM_WIN_BLK_LSB] == DLMEM_WIN_BLK_BASE[MEM_ADDRW-1:DLMEM_WIN_BLK_LSB]);
+        // Stacks are thread-private: a CTA release has nothing to order there.
+        wire lane_in_stack = (full_addr[i] >= STACK_WINDOW_BOTTOM) && (full_addr[i] < STACK_WINDOW_TOP);
+        assign lane_global[i] = execute_if.data.header.tmask[i] && ~mem_req_attr_struct[i].is_addr_local
+                             && ~lane_in_win && ~lane_in_stack;
     `endif
     `ifdef VX_CFG_EXT_A_ENABLE
         amo_req_t lane_amo;
@@ -221,9 +243,52 @@ module VX_lsu_slice import VX_gpu_pkg::*; #(
         end
     end
 
+`ifdef VX_CFG_EXT_DLMEM_ENABLE
+    // Per warp: a global write was sent since the warp's last fence answered, and
+    // the global read packets still waiting for their response. A CTA fence waits
+    // for those reads, then drains the dcache only if the warp wrote globally.
+    localparam GLOAD_W = `CLOG2(`VX_CFG_LSU_QUEUE_IN_SIZE + `VX_CFG_LSU_PENDING_SIZE + 2 + 1) + PID_BITS;
+
+    reg [`VX_CFG_NUM_WARPS-1:0] gdirty;
+    reg [`VX_CFG_NUM_WARPS-1:0][GLOAD_W-1:0] gload;
+
+    wire req_has_global = (| lane_global) && ~req_is_fence;
+`ifdef VX_CFG_EXT_A_ENABLE
+    wire req_writes = (execute_if.data.op_args.lsu.is_store && ~execute_if.data.op_args.lsu.amo_valid)
+                   || (execute_if.data.op_args.lsu.amo_valid && (execute_if.data.op_args.lsu.amo_op != AMO_OP_LR));
+`else
+    wire req_writes = execute_if.data.op_args.lsu.is_store;
+`endif
+    wire req_gload = req_has_global && ~mem_req_rw;
+    wire rsp_gload;
+
+    wire cfence_hold = req_is_cfence && (gload[execute_if.data.header.wid] != '0);
+    wire cfence_skip = req_is_cfence && ~gdirty[execute_if.data.header.wid];
+    wire req_skip = req_is_fence && (~execute_if.data.header.eop || cfence_skip);
+`else
     wire req_skip = req_is_fence && ~execute_if.data.header.eop;
+`endif
     wire no_rsp_buf_enable = (mem_req_rw && ~execute_if.data.header.wb) || req_skip;
 
+`ifdef VX_CFG_EXT_DLMEM_ENABLE
+    assign mem_req_valid = execute_if.valid
+                        && ~req_skip
+                        && ~(no_rsp_buf_enable && ~no_rsp_buf_ready)
+                        && ~fence_lock
+                        && ~cfence_hold;
+
+    assign no_rsp_buf_valid = execute_if.valid
+                           && no_rsp_buf_enable
+                           && (req_skip || mem_req_ready)
+                           && ~fence_lock
+                           && ~cfence_hold;
+
+    assign execute_if.ready = (mem_req_ready || req_skip)
+                           && ~(no_rsp_buf_enable && ~no_rsp_buf_ready)
+                           && ~fence_lock
+                           && ~cfence_hold;
+
+`else
     assign mem_req_valid = execute_if.valid
                         && ~req_skip
                         && ~(no_rsp_buf_enable && ~no_rsp_buf_ready)
@@ -237,8 +302,16 @@ module VX_lsu_slice import VX_gpu_pkg::*; #(
     assign execute_if.ready = (mem_req_ready || req_skip)
                            && ~(no_rsp_buf_enable && ~no_rsp_buf_ready)
                            && ~fence_lock;
+`endif
 
+`ifdef VX_CFG_EXT_DLMEM_ENABLE
+    // A CTA fence token rides every lane, so each dcache channel carries a copy
+    // behind the warp's older requests on it: the channels reach the dcache
+    // independently, and its drain covers only the requests it has accepted.
+    assign mem_req_mask = req_is_cfence ? {NUM_LANES{1'b1}} : execute_if.data.header.tmask;
+`else
     assign mem_req_mask = execute_if.data.header.tmask;
+`endif
 `ifdef VX_CFG_EXT_A_ENABLE
     // AMO MemReq.rw is unconditionally 0: a missing line under SC must
     // miss-and-return-failure, not write-and-succeed.
@@ -402,6 +475,7 @@ module VX_lsu_slice import VX_gpu_pkg::*; #(
         execute_if.data.op_type,
         req_align,
         pkt_waddr,
+        req_gload,
         req_aq,
         req_rl,
         req_is_fence
@@ -450,10 +524,47 @@ module VX_lsu_slice import VX_gpu_pkg::*; #(
         rsp_op_type,
         rsp_align,
         pkt_raddr,
+        rsp_gload,
         rsp_aq,
         rsp_rl,
         rsp_is_fence
     } = mem_rsp_tag;
+
+    always @(posedge clk) begin
+        if (reset) begin
+            gdirty <= '0;
+            gload  <= '0;
+        end else begin
+            // A new warp has no earlier write for its first release to order.
+            gdirty <= gdirty & ~warp_spawn;
+            if (mem_rsp_fire && rsp_is_fence && mem_rsp_eop_pkt) begin
+                gdirty[rsp_hdr.wid] <= 1'b0;
+            end
+            if (mem_req_fire && req_has_global && req_writes) begin
+                gdirty[execute_if.data.header.wid] <= 1'b1;
+            end
+            if (mem_req_fire && req_gload && mem_rsp_fire && mem_rsp_eop && rsp_gload
+             && (execute_if.data.header.wid == rsp_hdr.wid)) begin
+                gload[rsp_hdr.wid] <= gload[rsp_hdr.wid];
+            end else begin
+                if (mem_req_fire && req_gload) begin
+                    gload[execute_if.data.header.wid] <= gload[execute_if.data.header.wid] + GLOAD_W'(1);
+                end
+                if (mem_rsp_fire && mem_rsp_eop && rsp_gload) begin
+                    gload[rsp_hdr.wid] <= gload[rsp_hdr.wid] - GLOAD_W'(1);
+                end
+            end
+        end
+    end
+
+    for (genvar w = 0; w < `VX_CFG_NUM_WARPS; ++w) begin : g_spawn_gload
+        `RUNTIME_ASSERT (~(warp_spawn[w] && (gload[w] != '0)),
+            ("%t: %s global loads in flight at warp spawn, wid=%0d", $time, INSTANCE_ID, w))
+    end
+    `RUNTIME_ASSERT (~(mem_req_fire && req_gload && (gload[execute_if.data.header.wid] == '1)),
+        ("%t: %s global load counter overflow, wid=%0d", $time, INSTANCE_ID, execute_if.data.header.wid))
+    `RUNTIME_ASSERT (~(mem_rsp_fire && mem_rsp_eop && rsp_gload && (gload[rsp_hdr.wid] == '0)),
+        ("%t: %s global load counter underflow, wid=%0d", $time, INSTANCE_ID, rsp_hdr.wid))
 `else
     assign {
         rsp_hdr,
@@ -619,6 +730,23 @@ module VX_lsu_slice import VX_gpu_pkg::*; #(
             `TRACE(2, (", tag=0x%0h (#%0d)\n", mem_rsp_tag, rsp_hdr.uuid))
         end
     end
+`ifdef VX_CFG_EXT_DLMEM_ENABLE
+    reg cfence_wait_r;
+    always @(posedge clk) begin
+        cfence_wait_r <= ~reset && execute_if.valid && cfence_hold;
+        if (~reset && execute_if.valid && cfence_hold && ~cfence_wait_r) begin
+            `TRACE(2, ("%t: %s cfence-wait: wid=%0d, gload=%0d (#%0d)\n", $time, INSTANCE_ID,
+                execute_if.data.header.wid, gload[execute_if.data.header.wid], execute_if.data.header.uuid))
+        end
+        if (execute_if.valid && execute_if.ready && req_is_cfence && execute_if.data.header.eop) begin
+            if (cfence_skip) begin
+                `TRACE(2, ("%t: %s cfence-skip: wid=%0d (#%0d)\n", $time, INSTANCE_ID, execute_if.data.header.wid, execute_if.data.header.uuid))
+            end else begin
+                `TRACE(2, ("%t: %s cfence-token: wid=%0d (#%0d)\n", $time, INSTANCE_ID, execute_if.data.header.wid, execute_if.data.header.uuid))
+            end
+        end
+    end
+`endif
 `endif
 
 

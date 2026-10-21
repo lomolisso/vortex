@@ -8,6 +8,7 @@
 #define MODE_SKEW   2  // rank r works r units before cluster.sync()
 #define MODE_MIXED  3  // __syncthreads() and a block barrier between arrive and wait
 #define MODE_EXIT   4  // the last phase only arrives, then the blocks exit
+#define MODE_HANDOFF 5 // handoff_k: global data passed to the next rank through the split barrier
 
 // sync_k: the grid is 1-D in clusters of k x 1 x 1, so block b is rank b % k
 // of cluster b / k.
@@ -21,6 +22,8 @@ typedef struct {
   uint32_t spin;         // ALU iterations per unit of skew or work
   uint32_t num_threads;  // threads per warp
   uint32_t relaxed;      // sync with the fence-free arrive and wait
+  uint64_t data_addr;    // handoff: two buffers of one line per block, `stride` words
+  uint32_t stride;
 } sync_arg_t;
 
 #define REC_BLOCK    0  // blockIdx.x

@@ -33,11 +33,27 @@ __kernel void kernel_main(kernel_arg_t* arg) {
   // Allocate shared memory for one tile.
   auto shmem = reinterpret_cast<TYPE*>(__local_mem());
 
+  // This thread's tile element: per-dim local offsets, then its global
+  // row-major index.
+  const uint32_t tid = threadIdx.x;
+  uint32_t gidx = 0;
+  {
+    uint32_t rem = tid;
+    uint32_t stride = 1;
+    for (uint32_t d = 0; d < ndim; ++d) {
+      gidx += (coords[d] + rem % arg->tiles[d]) * stride;
+      rem /= arg->tiles[d];
+      stride *= arg->sizes[d];
+    }
+  }
+
 #ifdef VX_CFG_EXT_DXA_ENABLE
   // ── DXA path: issue N-D tile copy, barrier wait ──
   vortex::barrier bar(0);
   const bool is_dxa_warp = (get_sub_group_id() == 0);
-  if (is_dxa_warp) {
+  // -e: a single elected thread issues, like a CUDA kernel issuing TMA.
+  const bool is_issuer = is_dxa_warp && (arg->elect == 0 || (tid % VX_CFG_NUM_THREADS) == 0);
+  if (is_issuer) {
     bar.expect_tx(1);  // Pre-register 1 pending DXA transaction
     switch (ndim) {
     case 1:
@@ -64,25 +80,14 @@ __kernel void kernel_main(kernel_arg_t* arg) {
 #else
   // ── LSU path: each thread loads one element, syncthreads ──
   auto src = reinterpret_cast<const TYPE*>(arg->src_addr);
-  const uint32_t tid = threadIdx.x;
   if (tid < num_elems) {
-    // Decompose tid into per-dim local offsets and compute global linear index.
-    uint32_t local[DXA_MAX_DIMS] = {};
-    uint32_t rem = tid;
-    for (uint32_t d = 0; d < ndim; ++d) {
-      local[d] = rem % arg->tiles[d];
-      rem /= arg->tiles[d];
-    }
-    // Global linear index in row-major order.
-    uint32_t gidx = 0;
-    uint32_t stride = 1;
-    for (uint32_t d = 0; d < ndim; ++d) {
-      gidx += (coords[d] + local[d]) * stride;
-      stride *= arg->sizes[d];
-    }
     shmem[tid] = src[gidx];
   }
   __syncthreads();
 #endif
-  (void)num_elems;
+
+  auto dst = reinterpret_cast<TYPE*>(arg->dst_addr);
+  if (tid < num_elems) {
+    dst[gidx] = shmem[tid];
+  }
 }

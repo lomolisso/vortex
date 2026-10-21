@@ -39,6 +39,10 @@ module VX_execute import VX_gpu_pkg::*; #(
     // Per LSU block, the release of warps stalled by an acquire AMO.
     VX_sched_unlock_if.master lsu_unlock_if [`VX_CFG_NUM_LSU_BLOCKS],
 `endif
+`ifdef TCU_WG_GROUPS_ENABLE
+    // Per TCU block, the release of warps stalled by a wgmma wait_group.
+    VX_sched_unlock_if.master tcu_unlock_if [`VX_CFG_NUM_TCU_BLOCKS],
+`endif
 
 `ifdef TCU_META_ENABLE
     // TCU AGU memory client (single warp-level AGU shared across blocks).
@@ -113,6 +117,7 @@ module VX_execute import VX_gpu_pkg::*; #(
         .dispatch_if         (dispatch_if[EX_LSU * `VX_CFG_ISSUE_WIDTH +: `VX_CFG_ISSUE_WIDTH]),
         .commit_if           (commit_if[EX_LSU * `VX_CFG_ISSUE_WIDTH +: `VX_CFG_ISSUE_WIDTH]),
     `ifdef VX_CFG_EXT_DLMEM_ENABLE
+        .active_warps        (sched_csr_if.active_warps),
         .per_block_unlock_if (lsu_unlock_if),
     `endif
         .per_block_client_if (lsu_client_if)
@@ -144,6 +149,9 @@ module VX_execute import VX_gpu_pkg::*; #(
     `endif
     `ifdef TCU_META_ENABLE
         .tcu_mem_if        (tcu_mem_if),
+    `endif
+    `ifdef TCU_WG_GROUPS_ENABLE
+        .unlock_if      (tcu_unlock_if),
     `endif
         .dispatch_if    (dispatch_if[EX_TCU * `VX_CFG_ISSUE_WIDTH +: `VX_CFG_ISSUE_WIDTH]),
         .commit_if      (commit_if[EX_TCU * `VX_CFG_ISSUE_WIDTH +: `VX_CFG_ISSUE_WIDTH])

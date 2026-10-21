@@ -70,7 +70,7 @@ ProcessorImpl::ProcessorImpl()
 
 #ifdef VX_CFG_EXT_DLMEM_ENABLE
   // Launch bus: a registered, credit-gated lane from the KMU to each
-  // cluster's gang unit, which owns the lanes to its cores.
+  // cluster's gang unit, ahead of the cluster's launch fan-out.
   for (uint32_t i = 0; i < VX_CFG_NUM_CLUSTERS; ++i) {
     snprintf(sname, 100, "kmu-lane%d", i);
     auto slice = RegSlice<kmu_req_t>::Create(sname, 1);
@@ -324,7 +324,7 @@ int ProcessorImpl::run() {
   int exitcode = 0;
   do {
     SimPlatform::instance().tick();
-    bool any_running = false;
+    bool any_running = kmu_->running();
     for (auto cluster : clusters_) {
       if (cluster->running()) {
         any_running = true;
@@ -483,7 +483,7 @@ bool ProcessorImpl::any_running() const {
   for (auto& cluster : clusters_) {
     if (cluster->running()) return true;
   }
-  return !SimPlatform::instance().idle();
+  return kmu_->running() || !SimPlatform::instance().idle();
 }
 
 ProcessorImpl::PerfStats ProcessorImpl::perf_stats() const {

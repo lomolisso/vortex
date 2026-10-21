@@ -195,6 +195,48 @@ module VX_uop_sequencer import
 
     wire uop_hold = is_uop_input && ~uop_active;
 
+`ifdef VX_CFG_EXT_DLMEM_ENABLE
+    // ------------------------------------------------------------------
+    // Release expander: [CFENCE, op], back to back. The CFENCE is a rewrite
+    // of the waiting instruction, so it issues in the cycle the instruction
+    // would have, with no setup cycle.
+    // ------------------------------------------------------------------
+    wire      rel_valid;
+    ibuffer_t rel_cfence, rel_op;
+    VX_uop_release uop_release (
+        .ibuf_in     (input_if.data),
+        .is_release  (rel_valid),
+        .ibuf_cfence (rel_cfence),
+        .ibuf_op     (rel_op)
+    );
+
+    // the CFENCE of the instruction at the input has issued
+    reg rel_sent;
+    wire rel_first = input_if.valid && rel_valid && ~uop_active && ~rel_sent;
+
+    always_ff @(posedge clk) begin
+        if (reset) begin
+            rel_sent <= 1'b0;
+        end else if (input_if.valid && input_if.ready) begin
+            rel_sent <= 1'b0;
+        end else if (output_if.valid && output_if.ready && rel_first) begin
+            rel_sent <= 1'b1;
+        end
+    end
+
+    assign output_if.valid = uop_active || (input_if.valid && ~uop_hold);
+    always_comb begin
+        if (uop_active) begin
+            output_if.data     = uop_data;
+            // fu_lock is set by the uop expander (e.g. VX_tcu_uops)
+        end else if (input_if.valid && rel_valid) begin
+            output_if.data = rel_sent ? rel_op : rel_cfence;
+        end else begin
+            output_if.data = input_if.data;
+        end
+    end
+    assign input_if.ready  = output_if.ready && (uop_active ? uop_done : (~uop_hold && ~rel_first));
+`else
     assign output_if.valid = uop_active || (input_if.valid && ~uop_hold);
     always_comb begin
         if (uop_active) begin
@@ -205,10 +247,15 @@ module VX_uop_sequencer import
         end
     end
     assign input_if.ready  = output_if.ready && (uop_active ? uop_done : ~uop_hold);
+`endif
 
 `ifdef DBG_TRACE_PIPELINE
     always @(posedge clk) begin
+    `ifdef VX_CFG_EXT_DLMEM_ENABLE
+        if (output_if.valid && output_if.ready && (uop_active || (input_if.valid && rel_valid))) begin
+    `else
         if (output_if.valid && output_if.ready && uop_active) begin
+    `endif
             `TRACE(1, ("%t: %s decode: wid=%0d, cta_id=%0d, PC=0x%0h, ex=", $time, INSTANCE_ID, WARP_ID, output_if.data.cta_id, to_fullPC(output_if.data.PC)))
             VX_trace_pkg::trace_ex_type(1, output_if.data.ex_type);
             `TRACE(1, (", op="))

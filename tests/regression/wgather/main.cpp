@@ -18,6 +18,7 @@
 const char* kernel_file   = "kernel.vxbin";
 uint32_t num_warps        = 4;
 uint32_t threads_per_warp = 0; // 0 = use device default (num_threads)
+bool basic_only           = false;
 
 vx_device_h device      = nullptr;
 vx_buffer_h dst_buffer  = nullptr;
@@ -29,16 +30,19 @@ kernel_arg_t kernel_arg = {};
 
 static void show_usage() {
     std::cout << "Vortex wgather test." << std::endl;
-    std::cout << "Usage: [-k kernel] [-n num_warps] [-t threads_per_warp] [-h help]" << std::endl;
+    std::cout << "Usage: [-k kernel] [-n num_warps] [-t threads_per_warp] [-b] [-h help]" << std::endl;
+    std::cout << "  -b: check only the source-lane-0 gather; below 4 SIMD lanes, vx_transpose4" << std::endl;
+    std::cout << "      is exact only for group-uniform values" << std::endl;
 }
 
 static void parse_args(int argc, char** argv) {
     int c;
-    while ((c = getopt(argc, argv, "n:t:k:h")) != -1) {
+    while ((c = getopt(argc, argv, "n:t:k:bh")) != -1) {
         switch (c) {
         case 'n': num_warps        = atoi(optarg); break;
         case 't': threads_per_warp = atoi(optarg); break;
         case 'k': kernel_file      = optarg;        break;
+        case 'b': basic_only       = true;          break;
         case 'h': show_usage(); exit(0);
         default:  show_usage(); exit(-1);
         }
@@ -187,7 +191,7 @@ int main(int argc, char* argv[]) {
         }
     }
 
-    for (uint32_t w = 0; w < num_warps; ++w) {
+    for (uint32_t w = 0; w < num_warps && !basic_only; ++w) {
         for (uint32_t tid = 0; tid < threads_per_warp; ++tid) {
             uint32_t group          = tid >> 2;
             uint32_t group_base     = group << 2;

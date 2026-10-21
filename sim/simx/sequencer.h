@@ -42,7 +42,8 @@ public:
   Sequencer(const SimContext& ctx, const char* name, Core* core, PoolAllocator<Instr, 64>& instr_pool);
 
   // Get current micro-op trace. Idempotent: returns same trace until advance().
-  // For simple instructions, returns the input trace (pass-through).
+  // For simple instructions, returns the input trace (pass-through). Returns
+  // nullptr in a TCU macro-op's setup cycle.
   instr_trace_t* get(instr_trace_t* trace);
 
   // Advance to next micro-op. Returns true when all micro-ops have been issued.
@@ -55,6 +56,11 @@ public:
   // the trap handler issues.
   void flush() { state_.reset(); }
 
+#ifdef VX_CFG_EXT_DLMEM_ENABLE
+  // A release (.rl AMO or SC, BAR, mbarrier arrive) issues as [CFENCE, op].
+  static bool is_release(const instr_trace_t* trace);
+#endif
+
 protected:
   void on_reset();
 
@@ -63,14 +69,23 @@ private:
   // uop generator callback: (macro_instr, uop_index) -> Instr::Ptr
   using GenFn = std::function<Instr::Ptr(const Instr&, uint32_t)>;
 
+#ifdef VX_CFG_EXT_DLMEM_ENABLE
+  // The release expander: the CFENCE, then the instruction itself.
+  enum class Release { None, Fence, Op };
+#endif
+
   struct State {
     bool     active;
     uint32_t uop_index;
     uint32_t uop_count;
     GenFn    gen_fn;
     instr_trace_t* current_uop;
+    uint64_t setup_cycle;
+#ifdef VX_CFG_EXT_DLMEM_ENABLE
+    Release  release = Release::None;
+#endif
 
-    State() : active(false), uop_index(0), uop_count(0), current_uop(nullptr) {}
+    State() : active(false), uop_index(0), uop_count(0), current_uop(nullptr), setup_cycle(~uint64_t(0)) {}
 
     void reset() {
       active = false;
@@ -78,11 +93,19 @@ private:
       uop_count = 0;
       gen_fn = nullptr;
       current_uop = nullptr;
+      setup_cycle = ~uint64_t(0);
+#ifdef VX_CFG_EXT_DLMEM_ENABLE
+      release = Release::None;
+#endif
     }
   };
 
   Core* core_;
   State state_;
+#ifdef VX_CFG_EXT_DLMEM_ENABLE
+  PoolAllocator<Instr, 64>& instr_pool_;
+  instr_trace_t* make_cfence(instr_trace_t* trace);
+#endif
   LsuUopGen lsu_uop_gen_;
 #ifdef VX_CFG_EXT_TCU_ENABLE
   TcuUopGen tcu_uop_gen_;

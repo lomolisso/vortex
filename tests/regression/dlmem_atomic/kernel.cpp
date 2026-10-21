@@ -298,7 +298,7 @@ static inline __attribute__((always_inline)) void parity_body(atomic_arg_t* __UN
   auto own8 = reinterpret_cast<volatile uint64_t*>(x.own);
   x.own[x.tid] = 0;
   own8[x.nt + x.tid] = 0;
-  x.cl.barrier_wait(x.cl.barrier_arrive());
+  x.cl.barrier_wait_relaxed(x.cl.barrier_arrive_relaxed());
   auto w = x.window<uint32_t>((x.rank + 1) % x.k);
   auto d = reinterpret_cast<volatile uint64_t*>(w);
   uint64_t sum = 0;
@@ -308,7 +308,7 @@ static inline __attribute__((always_inline)) void parity_body(atomic_arg_t* __UN
     if (FENCE)
       vx_fence();
   }
-  x.cl.barrier_wait(x.cl.barrier_arrive());
+  x.cl.barrier_wait_relaxed(x.cl.barrier_arrive_relaxed());
   auto mine = reinterpret_cast<uint32_t*>(arg->glob_addr) + (x.b * x.nt + x.tid) * PARITY_TWORDS;
   mine[0] = (uint32_t)sum;
   mine[1] = (uint32_t)(sum >> 32);

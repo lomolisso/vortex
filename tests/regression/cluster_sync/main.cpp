@@ -10,8 +10,9 @@
 //   -s / -d  SPREAD (default) / DEFAULT policy for the -k launch
 //   -i P     barrier phases per block (default 4, 64 with -p)
 //   -l B     local-memory bytes per block (default 0)
-//   -m mode  sync (default), split, skew, mixed or exit
-//   -r       sync with the fence-free arrive and wait instead of cluster.sync()
+//   -m mode  sync (default), split, skew, mixed, exit or handoff
+//   -r       sync with the fence-free arrive and wait instead of cluster.sync();
+//            handoff with the fence-free arrive and wait
 //   -p       parity mode: no atomics and no rank-dependent work, so the
 //            instruction count does not depend on timing
 //   -v       print every cluster's placement (core:slot by rank)
@@ -23,7 +24,11 @@
 // must hold every warp of the cluster. Every arrive must return the phase
 // token of its phase. The host checks the kernel's error counts, the counters,
 // that each block ran once, its rank, and that a DEFAULT cluster stays on one
-// core. A DEFAULT cluster must fit on one core at once (K * W warps and K
+// core. In handoff mode (its own kernel, no counters) each warp passes a
+// global word to the same warp of the next rank every phase through the split
+// barrier; under SPREAD the reader's L1 holds the line from two phases back,
+// so the default arrive and wait must make every read fresh, while -r is
+// expected to read stale data. A DEFAULT cluster must fit on one core at once (K * W warps and K
 // slots), or its barrier would deadlock: the app refuses such a launch unless
 // -x leaves the refusal to the runtime.
 
@@ -68,7 +73,7 @@ bool        parity_mode = false;
 bool        verbose     = false;
 bool        expect_reject = false;
 
-const char* const kModeNames[] = {"sync", "split", "skew", "mixed", "exit"};
+const char* const kModeNames[] = {"sync", "split", "skew", "mixed", "exit", "handoff"};
 
 struct Caps {
   uint64_t num_cores = 0, num_clusters = 0, num_warps = 0, num_threads = 0;
@@ -86,7 +91,7 @@ struct Launch {
 
 void usage() {
   std::printf("Usage: [-k cluster size] [-w warps per block] [-n clusters] [-s: SPREAD | -d: DEFAULT]"
-              " [-i phases] [-l local-memory bytes] [-m sync|split|skew|mixed|exit] [-r: relaxed]"
+              " [-i phases] [-l local-memory bytes] [-m sync|split|skew|mixed|exit|handoff] [-r: relaxed]"
               " [-p: parity] [-v: placement] [-x: expect the runtime to refuse] [-h]\n");
 }
 
@@ -122,7 +127,7 @@ void parse_args(int argc, char** argv) {
   // Rank-dependent work and the exit mode's lone arrivals would make the
   // instruction count depend on timing.
   bad |= parity_mode && req_mode != MODE_SYNC;
-  bad |= relaxed && req_mode != MODE_SYNC;
+  bad |= relaxed && req_mode != MODE_SYNC && req_mode != MODE_HANDOFF;
   bad |= expect_reject && req_k == 0 && req_policy < 0;
   if (bad || optind < argc || req_w == 0 || req_g == 0 || req_lmem % sizeof(uint32_t) != 0) {
     usage();
@@ -160,8 +165,8 @@ const char* not_coresident(const Caps& caps, const Launch& L) {
 }
 
 struct Job {
-  vx_buffer_h rec_buf = nullptr, err_buf = nullptr, count_buf = nullptr;
-  std::vector<uint32_t> recs, errs, counts;
+  vx_buffer_h rec_buf = nullptr, err_buf = nullptr, count_buf = nullptr, data_buf = nullptr;
+  std::vector<uint32_t> recs, errs, counts, data;
   sync_arg_t arg = {};
   uint32_t num_blocks = 0, phases = 0;
 };
@@ -214,8 +219,17 @@ int check(const Caps& caps, const Launch& L, const Job& j) {
     if (rec[REC_CORE] >= caps.num_cores)
       report(b, "core id", rec[REC_CORE], caps.num_cores - 1);
     for (uint32_t i = 0; i < w; ++i) {
-      if (j.errs[(size_t)b * w + i] != 0)
-        report(b, "kernel errors (bad counter or token) in a warp", j.errs[(size_t)b * w + i], 0);
+      const uint32_t e = j.errs[(size_t)b * w + i];
+      if (e == 0)
+        continue;
+      if (req_mode != MODE_HANDOFF) {
+        report(b, "kernel errors (bad counter or token) in a warp", e, 0);
+        continue;
+      }
+      if (e >> 8)
+        report(b, "stale handoff reads in a warp", e >> 8, 0);
+      if (e & 0xff)
+        report(b, "bad tokens in a warp", e & 0xff, 0);
     }
   }
   for (uint32_t g = 0; g < L.g && !j.counts.empty(); ++g) {
@@ -256,9 +270,9 @@ int check(const Caps& caps, const Launch& L, const Job& j) {
 }
 
 // One launch end to end: the mismatches, or 1 when it could not run.
-int run_launch(vx_device_h dev, vx_queue_h q, vx_kernel_h kernel, const Caps& caps,
-               const Launch& L) {
-  const bool counting = caps.atomics() && !parity_mode;
+int run_launch(vx_device_h dev, vx_queue_h q, vx_kernel_h kernel, vx_kernel_h handoff_kernel,
+               const Caps& caps, const Launch& L) {
+  const bool counting = caps.atomics() && !parity_mode && req_mode != MODE_HANDOFF;
   Job j;
   j.num_blocks = L.g * L.k;
   j.phases = req_p ? req_p : (parity_mode ? 64 : 4);
@@ -285,6 +299,13 @@ int run_launch(vx_device_h dev, vx_queue_h q, vx_kernel_h kernel, const Caps& ca
     j.counts.assign((size_t)L.g * j.phases, 0);
     upload(dev, q, j.counts, &j.count_buf, &j.arg.count_addr);
   }
+  if (req_mode == MODE_HANDOFF) {
+    // One cache line per block, so no two blocks share a line.
+    const uint32_t line_words = VX_CFG_MEM_BLOCK_SIZE / sizeof(uint32_t);
+    j.arg.stride = (L.w + line_words - 1) / line_words * line_words;
+    j.data.assign((size_t)2 * j.num_blocks * j.arg.stride, 0);
+    upload(dev, q, j.data, &j.data_buf, &j.arg.data_addr);
+  }
   j.arg.k           = L.k;
   j.arg.phases      = j.phases;
   j.arg.mode        = req_mode;
@@ -294,7 +315,7 @@ int run_launch(vx_device_h dev, vx_queue_h q, vx_kernel_h kernel, const Caps& ca
 
   vx_launch_info_t li = {};
   li.struct_size    = sizeof(li);
-  li.kernel         = kernel;
+  li.kernel         = (req_mode == MODE_HANDOFF) ? handoff_kernel : kernel;
   li.args_host      = &j.arg;
   li.args_size      = sizeof(j.arg);
   li.ndim           = 1;
@@ -313,6 +334,8 @@ int run_launch(vx_device_h dev, vx_queue_h q, vx_kernel_h kernel, const Caps& ca
   const vx_result_t r = vx_enqueue_launch(q, &li, 0, nullptr, &launch_ev);
   if (expect_reject && r == VX_ERR_INVALID_VALUE) {
     std::printf("reject: %s: %s (expected VX_ERR_INVALID_VALUE)\n", L.name, vx_result_string(r));
+    if (j.data_buf)
+      vx_buffer_release(j.data_buf);
     if (j.count_buf)
       vx_buffer_release(j.count_buf);
     vx_buffer_release(j.err_buf);
@@ -341,6 +364,15 @@ int run_launch(vx_device_h dev, vx_queue_h q, vx_kernel_h kernel, const Caps& ca
   vx_event_release(launch_ev);
 
   const int errors = check(caps, L, j) + (expect_reject ? 1 : 0);
+  if (req_mode == MODE_HANDOFF) {
+    uint64_t stale = 0;
+    for (uint32_t e : j.errs)
+      stale += e >> 8;
+    std::printf("%s: %llu stale handoff reads of %llu\n", L.name, (unsigned long long)stale,
+                (unsigned long long)j.num_blocks * L.w * j.phases);
+  }
+  if (j.data_buf)
+    vx_buffer_release(j.data_buf);
   if (j.count_buf)
     vx_buffer_release(j.count_buf);
   vx_buffer_release(j.err_buf);
@@ -382,8 +414,9 @@ int main(int argc, char** argv) {
 
   vx_module_h mod = nullptr;
   CHECK(vx_module_load_file(dev, kernel_file, &mod));
-  vx_kernel_h kernel = nullptr;
+  vx_kernel_h kernel = nullptr, handoff_kernel = nullptr;
   CHECK(vx_module_get_kernel(mod, "sync_k", &kernel));
+  CHECK(vx_module_get_kernel(mod, "handoff_k", &handoff_kernel));
 
   std::vector<Launch> launches;
   if (req_k != 0 || req_policy >= 0) {
@@ -407,8 +440,9 @@ int main(int argc, char** argv) {
   }
   int errors = 0;
   for (const Launch& L : launches)
-    errors += run_launch(dev, q, kernel, caps, L);
+    errors += run_launch(dev, q, kernel, handoff_kernel, caps, L);
 
+  vx_kernel_release(handoff_kernel);
   vx_kernel_release(kernel);
   vx_module_release(mod);
   vx_queue_release(q);

@@ -7,6 +7,7 @@
 #define MODE_PC    1   // producer and consumer warps over a double buffer
 #define MODE_TX    2   // a scripted op sequence, then software tx accounting by every worker warp
 #define MODE_COUNT 3   // one elected lane per worker warp arrives with a count
+#define MODE_GLOB  4   // pc over a global double buffer: the arrive must release global stores
 
 #define NEG_NONE      0
 #define NEG_UNDERFLOW 1   // more arrivals than pending
@@ -28,6 +29,8 @@ typedef struct {
   uint32_t script_len;
   uint32_t delay;        // idle iterations that skew the warps
   uint32_t parity;       // no spin: the workers meet in a register barrier, then test_wait must pass at once
+  uint64_t glob_addr;    // glob: 2 * PC_ELEMS doublewords
+  uint32_t burst;        // glob: stores per producer element and fill, the last one the tag
 } mbar_arg_t;
 
 #define ERR_COUNT 0   // failed checks of the thread

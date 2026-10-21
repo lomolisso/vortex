@@ -99,7 +99,8 @@ import VX_raster_pkg::*;
     VX_lane_dispatch #(
         .BLOCK_SIZE (BLOCK_SIZE),
         .NUM_LANES  (NUM_LANES),
-        .OUT_BUF    (3)
+        .OUT_BUF    (3),
+        .EX_TYPE    (EX_SFU)
     ) lane_dispatch (
         .clk        (clk),
         .reset      (reset),

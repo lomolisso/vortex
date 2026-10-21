@@ -247,6 +247,8 @@ package VX_gpu_pkg;
     // drains it instead of walking. A host flush carries is_flush alone.
     typedef struct packed {
     `ifdef VX_CFG_EXT_DLMEM_ENABLE
+        // A CTA-scope fence: the first cache level drains it and does not pass it on.
+        logic                        is_fence_cta;   // MEM_ATTR_FENCE_CTA_OFFS = MEM_ATTR_LACC_OFFS + 1
         // A local access the DLMEM translation counted: its bank reports the commit.
         logic                        is_lacc;        // MEM_ATTR_LACC_OFFS   = MEM_ATTR_REMOTE_OFFS + 1
         logic                        is_addr_remote; // MEM_ATTR_REMOTE_OFFS = MEM_ATTR_FENCE_OFFS + 1
@@ -268,6 +270,7 @@ package VX_gpu_pkg;
 `ifdef VX_CFG_EXT_DLMEM_ENABLE
     localparam MEM_ATTR_REMOTE_OFFS = MEM_ATTR_FENCE_OFFS + 1;
     localparam MEM_ATTR_LACC_OFFS   = MEM_ATTR_REMOTE_OFFS + 1;
+    localparam MEM_ATTR_FENCE_CTA_OFFS = MEM_ATTR_LACC_OFFS + 1;
 `endif
 
     // Total width of the mem-bus attr field. Use this as the parameter
@@ -507,6 +510,10 @@ package VX_gpu_pkg;
     localparam INST_LSU_SW =     4'b1010;
     localparam INST_LSU_SD =     4'b1011; // new for RV64I SD
     localparam INST_LSU_FENCE =  4'b1111;
+`ifdef VX_CFG_EXT_DLMEM_ENABLE
+    // CTA-scope fence: drains the warp's global accesses at the first cache level, skipped when it has none.
+    localparam INST_LSU_CFENCE = 4'b1110;
+`endif
     localparam INST_LSU_BITS =   4;
 
     localparam INST_FENCE_BITS = 1;
@@ -522,7 +529,11 @@ package VX_gpu_pkg;
     endfunction
 
     function automatic logic inst_lsu_is_fence(input logic [INST_LSU_BITS-1:0] op);
+`ifdef VX_CFG_EXT_DLMEM_ENABLE
+        return (op == INST_LSU_FENCE) || (op == INST_LSU_CFENCE);
+`else
         return (op == INST_LSU_FENCE);
+`endif
     endfunction
 
     ///////////////////////////////////////////////////////////////////////////
@@ -664,6 +675,11 @@ package VX_gpu_pkg;
 `ifdef TCU_META_ENABLE
     // TCU_LD — warp-level load into a metadata SRAM namespace.
     localparam INST_TCU_LD         = 4'h5;
+`endif
+`ifdef TCU_WG_GROUPS_ENABLE
+    // wgmma groups: commit closes the warp's open group, wait holds it until at most N groups are pending.
+    localparam INST_TCU_COMMIT     = 4'h6;
+    localparam INST_TCU_WAIT       = 4'h7;
 `endif
     localparam INST_TCU_BITS = 4;
 `endif
@@ -1492,12 +1508,12 @@ package VX_gpu_pkg;
     localparam LMEM_TAG_WIDTH       = LMEM_TAG_WIDTH_BASE;
 
     // Width of the tag carried over VX_lsu_sched_if: lsu_header + op_type
-    // + per-lane align + packet allocator addr (+ AMO aq, rl in DLMEM builds)
+    // + per-lane align + packet allocator addr (+ global-load mark, AMO aq, rl in DLMEM builds)
     // + fence flag (matches the local TAG_WIDTH built inside VX_lsu_slice).
 `ifdef VX_CFG_EXT_DLMEM_ENABLE
     localparam LSU_CLIENT_TAG_WIDTH = $bits(lsu_header_t) + INST_LSU_BITS
                                     + (`VX_CFG_NUM_LSU_LANES * `CLOG2(LSU_WORD_SIZE))
-                                    + `LOG2UP(`VX_CFG_LSU_PENDING_SIZE) + 2 + 1;
+                                    + `LOG2UP(`VX_CFG_LSU_PENDING_SIZE) + 1 + 2 + 1;
 `else
     localparam LSU_CLIENT_TAG_WIDTH = $bits(lsu_header_t) + INST_LSU_BITS
                                     + (`VX_CFG_NUM_LSU_LANES * `CLOG2(LSU_WORD_SIZE))

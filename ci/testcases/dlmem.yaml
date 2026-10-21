@@ -33,7 +33,9 @@ defaults:
             tests/regression/dlmem_stress, tests/regression/lmem_bar_order,
             tests/regression/dlmem_amo_order, sw/common/mbar_ref.h,
             hw/rtl/cache/VX_amo_alu.sv, hw/rtl/cache/VX_amo_unit.sv, sim/simx/amo,
-            sim/simx/types.h, VX_config.toml, VX_types.toml]
+            sim/simx/types.h, VX_config.toml, VX_types.toml,
+            hw/rtl/core/VX_uop_sequencer.sv, hw/rtl/dlmem/VX_uop_release.sv, sim/simx/sequencer,
+            sim/simx/instr.h, hw/rtl/cache, sim/simx/mem/cache, sw/kernel/include/vx_mbar.h]
 tests:
   # The cluster-rank CSR over three launches (K = 1, 2 as 1x2x1, 4 as 2x1x2),
   # each CTA's rank against its intra-cluster index, and the rank address map
@@ -237,6 +239,57 @@ tests:
     configs+: "-DVX_CFG_EXT_A_ENABLE"
     shape: {cores: 2, warps: 8, l2cache: true}
     args: "-d -k 4 -w 2 -m mixed"
+  # Split-barrier handoff of global data across cores (handoff_k): each phase
+  # every warp stores a word, arrives and waits, then loads the word of the
+  # same warp of the next rank, on another core under SPREAD, whose line its
+  # own L1 holds from two phases back. The default arrive and wait fence
+  # (.release / .acquire), so every read is fresh.
+  - id: cluster_sync-handoff
+    app: cluster_sync
+    drivers: [simx, rtlsim]
+    configs+: "-DVX_CFG_EXT_A_ENABLE"
+    shape: {cores: 2, l2cache: true}
+    args: "-s -k 2 -n 4 -i 8 -m handoff"
+  - id: cluster_sync-handoff-4c
+    app: cluster_sync
+    drivers: [simx, rtlsim]
+    tier: nightly
+    configs+: "-DVX_CFG_EXT_A_ENABLE -DVX_CFG_SOCKET_SIZE=2"
+    shape: {cores: 4, warps: 8, l2cache: true}
+    args: "-s -k 4 -n 4 -w 2 -i 16 -m handoff"
+  # The relaxed forms (-r) have no fence, so the reader's L1 serves the line
+  # it cached two phases back: the run must fail with stale reads. It fails
+  # by design while the L1s are not coherent.
+  - id: cluster_sync-handoff-relaxed
+    via: script
+    driver: simx
+    configs+: "-DVX_CFG_EXT_A_ENABLE -DVX_CFG_NUM_CORES=2 -DVX_CFG_L2_ENABLE"
+    env: {DRIVER: simx, APP: cluster_sync, ARGS: "-s -k 2 -n 4 -i 8 -m handoff -r", EXPECT: "stale handoff reads in a warp"}
+    run: &stale_run |
+      set -u
+      tmp=$(mktemp -d)
+      if ! make -C sw/runtime/"$DRIVER" > "$tmp/build.log" 2>&1 \
+         || ! make -C tests/regression/"$APP" >> "$tmp/build.log" 2>&1; then
+        echo "FAIL: the build failed with CONFIGS=${CONFIGS:-}"; tail -n 20 "$tmp/build.log"
+        rm -rf "$tmp"; exit 1
+      fi
+      timeout 300 ./ci/blackbox.sh --driver="$DRIVER" --app="$APP" --args="$ARGS" > "$tmp/run.log" 2>&1
+      rc=$?
+      fail=0
+      if [ $rc -eq 0 ] || [ $rc -eq 124 ] || ! grep -qF "$EXPECT" "$tmp/run.log"; then
+        echo "FAIL: '$ARGS' on $DRIVER (exit $rc) did not report '$EXPECT'"; fail=1
+      else
+        echo "OK: '$ARGS' on $DRIVER: $(grep -F -m1 'stale handoff reads of' "$tmp/run.log")"
+      fi
+      [ $fail -eq 0 ] || tail -n 20 "$tmp/run.log"
+      rm -rf "$tmp"
+      exit $fail
+  - id: cluster_sync-handoff-relaxed
+    via: script
+    driver: rtlsim
+    configs+: "-DVX_CFG_EXT_A_ENABLE -DVX_CFG_NUM_CORES=2 -DVX_CFG_L2_ENABLE"
+    env: {DRIVER: rtlsim, APP: cluster_sync, ARGS: "-s -k 2 -n 4 -i 8 -m handoff -r", EXPECT: "stale handoff reads in a warp"}
+    run: *stale_run
   # Four two-warp blocks cannot share one 4-warp core, so their first cluster
   # barrier would never complete: the runtime must refuse the launch.
   - id: cluster_sync-reject-default
@@ -827,6 +880,13 @@ tests:
     drivers: [simx, rtlsim]
     configs+: "-DVX_CFG_EXT_DXA_ENABLE"
     args: "-m fencebar -d 1 -r 200 -b 8 -w 0 -e 768 -s 1"
+  # Two-lane packets: a release arrives in several packets while DXA beats
+  # hold the banks.
+  - id: lmem_bar_order-simd2
+    app: lmem_bar_order
+    drivers: [simx, rtlsim]
+    configs+: "-DVX_CFG_EXT_DXA_ENABLE -DVX_CFG_SIMD_WIDTH=2"
+    args: "-m bar -d 1 -r 200 -b 8 -w 0 -e 768 -s 1"
   - id: lmem_bar_order-w8
     app: lmem_bar_order
     drivers: [simx, rtlsim]
@@ -895,6 +955,49 @@ tests:
     drivers: [simx, rtlsim]
     configs+: "-DVX_CFG_EXT_DXA_ENABLE -DVX_CFG_EXT_A_ENABLE -DVX_CFG_ISSUE_WIDTH=2"
     args: "-m fence -o amo -d 1 -r 200 -b 8 -w 0 -e 768 -s 1"
+  # A global X (-o gst): the producer's store goes through the L1, and every
+  # group lane's burst misses on X's L1 bank, so the X store can wait there
+  # while the release goes ahead. Two LSU blocks put a consumer warp on the
+  # other block. The barrier and .rl are CTA-scope releases of global memory
+  # (mbar.yaml has the mbarrier arrive).
+  - id: lmem_bar_order-gst
+    app: lmem_bar_order
+    drivers: [simx, rtlsim]
+    configs+: "-DVX_CFG_EXT_DXA_ENABLE -DVX_CFG_EXT_A_ENABLE -DVX_CFG_ISSUE_WIDTH=2"
+    args: "-m bar -o gst -d 1 -r 200 -b 8 -w 0 -e 768 -s 1"
+  - id: lmem_bar_order-gst-rl
+    app: lmem_bar_order
+    drivers: [simx, rtlsim]
+    configs+: "-DVX_CFG_EXT_DXA_ENABLE -DVX_CFG_EXT_A_ENABLE -DVX_CFG_ISSUE_WIDTH=2"
+    args: "-m rl -o gst -d 1 -r 200 -b 8 -w 0 -e 768 -s 1"
+  # The elected-lane release (-L): the producer's last lane stores X, on the
+  # warp's other dcache channel, and lane 0 alone releases. The CTA fence
+  # token must ride every channel to order the store; the trace scripts
+  # release_chan_{simx,rtl}.py check each channel's copy.
+  - id: lmem_bar_order-gst-rl-elect
+    app: lmem_bar_order
+    drivers: [simx, rtlsim]
+    configs+: "-DVX_CFG_EXT_DXA_ENABLE -DVX_CFG_EXT_A_ENABLE -DVX_CFG_ISSUE_WIDTH=2"
+    args: "-m rl -o gst -L -d 1 -r 200 -b 8 -w 0 -e 768 -s 1"
+  - id: lmem_bar_order-gst-mbar-elect
+    app: lmem_bar_order
+    drivers: [simx, rtlsim]
+    configs+: "-DVX_CFG_EXT_DXA_ENABLE -DVX_CFG_EXT_A_ENABLE -DVX_CFG_EXT_MBAR_ENABLE -DVX_CFG_ISSUE_WIDTH=2"
+    args: "-m mbar -o gst -L -d 1 -r 200 -b 8 -w 0 -e 768 -s 1"
+  # Global load buffering (-o gld): the producer's X load is still in flight
+  # at its release, which must hold until it is answered (the CTA fence's
+  # global-load wait; release_events.py counts it), or the store of the round
+  # by a released consumer could reach X first.
+  - id: lmem_bar_order-gld-rl
+    app: lmem_bar_order
+    drivers: [simx, rtlsim]
+    configs+: "-DVX_CFG_EXT_DXA_ENABLE -DVX_CFG_EXT_A_ENABLE -DVX_CFG_ISSUE_WIDTH=2"
+    args: "-m rl -o gld -d 1 -r 200 -b 8 -w 0 -e 768 -s 1"
+  - id: lmem_bar_order-gld-mbar
+    app: lmem_bar_order
+    drivers: [simx, rtlsim]
+    configs+: "-DVX_CFG_EXT_DXA_ENABLE -DVX_CFG_EXT_A_ENABLE -DVX_CFG_EXT_MBAR_ENABLE -DVX_CFG_ISSUE_WIDTH=2"
+    args: "-m mbar -o gld -d 1 -r 200 -b 8 -w 0 -e 768 -s 1"
   # Without DXA the instruction count does not depend on timing; fencebar has
   # no flag polling.
   - id: parity-lmem-bar-order
@@ -917,6 +1020,21 @@ tests:
     xlen: [64]
     configs+: "-DVX_CFG_EXT_DXA_ENABLE -DVX_CFG_EXT_A_ENABLE"
     args: "-m bar -o amo -d 0 -r 100 -b 8 -w 0"
+  # The barrier's CTA fence waits for the producer's global X load (gld), and
+  # with tensor metadata (-f) for a double divide in flight, as XREG_0 is
+  # also the fflags bit.
+  - id: parity-lmem-bar-order-gld
+    check: model_parity
+    app: lmem_bar_order
+    xlen: [64]
+    configs+: "-DVX_CFG_EXT_DXA_ENABLE"
+    args: "-m bar -o gld -d 0 -r 100 -b 8 -w 0"
+  - id: parity-lmem-bar-order-gld-fpu
+    check: model_parity
+    app: lmem_bar_order
+    xlen: [64]
+    configs+: "-DVX_CFG_EXT_DXA_ENABLE -DVX_CFG_EXT_TCU_ENABLE -DVX_CFG_TCU_MX_ENABLE -DVX_CFG_TCU_FP8_ENABLE"
+    args: "-m bar -o gld -f -d 0 -r 100 -b 8 -w 0"
 
   # Illegal knob combinations must stop the build, in SimX (the processor
   # object) and in the RTL (a Verilator lint of the processor), each with the

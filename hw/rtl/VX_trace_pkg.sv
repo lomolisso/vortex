@@ -202,6 +202,9 @@ package VX_trace_pkg;
                     INST_LSU_SW: `TRACE(level, ("SW"))
                     INST_LSU_SD: `TRACE(level, ("SD"))
                     INST_LSU_FENCE:`TRACE(level,("FENCE"))
+                `ifdef VX_CFG_EXT_DLMEM_ENABLE
+                    INST_LSU_CFENCE:`TRACE(level,("CFENCE"))
+                `endif
                     default:     `TRACE(level, ("?"))
                 endcase
             end

@@ -35,6 +35,8 @@ protected:
 	virtual void on_tick();
 
 private:
+	bool is_issued(const instr_trace_t* trace, uint32_t pid) const;
+
 	Core*    core_;
 	uint32_t block_size_;
 	uint32_t num_lanes_;

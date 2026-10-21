@@ -46,8 +46,10 @@ the programming model is CUDA's: a generic address window,
   `vx_cluster_block_rank()`, `vx_cluster_num_blocks()`,
   `vx_cluster_map_shared_rank()` and `vortex::cluster_group`.
   `vx_spawn2.h`'s `get_cluster_rank()` reads the CSR in a DLMEM build.
-- `cluster_group::sync()`, `barrier_arrive()` and `barrier_wait()` use the
-  hardware cluster barrier (below).
+- `cluster_group::sync()`, `barrier_arrive()` and `barrier_wait()`, and their
+  `_relaxed` forms, use the hardware cluster barrier (below).
+  `vx_fence_cta()` is CUDA's `__threadfence_block()` (memory-model contract
+  below).
 - Host: `VX_ISA_EXT_DLMEM` (`VX_CFG_MISA_EXT` bit 12) and
   `VX_CAPS_DLMEM_MAX_CLUSTER` (device-caps bits [48:42], 0 without DLMEM).
 
@@ -138,9 +140,11 @@ wait.
   they are separate state.
 - **Kernel API** ([`vx_dlmem.h`](../../sw/kernel/include/vx_dlmem.h)):
   `vx_cluster_sync()`, `vx_cluster_arrive()` (returns the token) and
-  `vx_cluster_wait(token)`; in C++ `cluster_group::sync()`,
-  `barrier_arrive()` and `barrier_wait(token)`. Every warp of every block of
-  the cluster makes each call exactly once per phase, as `__syncthreads()`
+  `vx_cluster_wait(token)`, and the fence-free `vx_cluster_arrive_relaxed()`
+  and `vx_cluster_wait_relaxed(token)`; in C++ `cluster_group::sync()`,
+  `barrier_arrive()`, `barrier_wait(token)`, `barrier_arrive_relaxed()` and
+  `barrier_wait_relaxed(token)`. Every warp of every block of the cluster
+  makes one arrive and one wait, or one sync, per phase, as `__syncthreads()`
   requires.
 - **Completion.** A block's arrival counts when its last warp arrives. For a
   SPREAD cluster with K > 1, the core then sends `CBAR{gang_id, epoch}` on the
@@ -157,11 +161,15 @@ wait.
   committed and the core's LSU queues are empty, so the earlier local and
   window stores have left the core's LSU and the earlier loads and atomics
   have returned; a warp leaves its wait only after every warp of the cluster
-  has arrived (arrive = release, wait = acquire). Since the sockets' L1s are
-  not coherent, `sync()` adds `vx_fence()` before the arrive and after the
-  wait, which gives CUDA's cluster scope for global memory too. The raw
-  `barrier_arrive()` and `barrier_wait()` have no fence (like PTX
-  `.relaxed`) and order only local and window memory.
+  has arrived (arrive = release, wait = acquire). Like every barrier arrival
+  it is also a CTA-scope release of global memory (memory-model contract
+  below), which reaches only the core's own L1. Since the sockets' L1s are
+  not coherent, the default forms follow CUDA's defaults for cluster scope:
+  `sync()` puts `vx_fence()` before the barrier and after it,
+  `barrier_arrive()` fences before arriving (PTX `barrier.cluster.arrive`,
+  `.release`) and `barrier_wait()` after waiting (`barrier.cluster.wait`,
+  `.acquire`). The `_relaxed` forms have no fence (PTX `.relaxed`): across
+  cores they order only local and window memory.
 - **Remote stores.** An arrival also waits until every remote store of the
   warp is acknowledged, i.e. committed in the destination bank (see the
   network below), so the barrier orders them with no change to its own logic.
@@ -170,10 +178,13 @@ wait.
   access of the warp (load, store, atomic, mbarrier op) has committed in its
   bank, so none still queued in the local-memory switch or a bank queue can
   be overtaken by a peer's later access to the same word.
-- **Not covered.** An mbarrier arrive does not order global memory: global
-  data needs a fence before the arrive. Local-memory reads by tensor-core
-  ops (the TCU metadata AGU, the WGMMA DMA) are not counted, so none of these
-  waits for them.
+- **Global memory and tensor-core loads.** Each of these releases is first
+  a CTA fence (memory-model contract below), so it also orders the warp's
+  earlier global accesses and `TCU_LD` metadata loads at CTA scope.
+- **Not covered.** A wgmma reads its local-memory operands asynchronously
+  after it issues; no release waits for it. Software waits for the wgmma's
+  group (`vx_wgmma_wait_group`) before releasing a buffer the wgmma reads, as
+  on the H100.
 - **Exit hold and plain `BAR`.** In a DLMEM build a warp cannot exit, and a
   plain `BAR` cannot arrive, while the warp has instructions in flight or
   unacknowledged remote stores.
@@ -316,6 +327,48 @@ socket and a crossbar across sockets, connect them
   hardware LR acts as a load and SC always fails.
 - **Errors.** A rank outside the cluster is a runtime assertion in the RTL and
   aborts SimX with the same message.
+- **CTA-scope release.** In a DLMEM build every release is a CTA-scope
+  release of global memory too, like PTX `mbarrier.arrive`, `atom.release`
+  and `bar.sync`: an mbarrier arrive (and `arrive_tx`), an AMO, SC or LR with
+  `.rl`, and every `BAR` (`__syncthreads()`, block barriers, the cluster
+  barrier, the async arrive). The async-arrive encoding also carries
+  `vx_barrier_expect_tx` (its count is a register value, so decode cannot
+  tell them apart), so `expect_tx` is a release here too, unlike on the
+  H100. The uop sequencer issues each one as a CTA fence micro-op followed
+  by the op itself, at the cost of one issue slot, plus a drain when the
+  warp has written global memory. The op then keeps its own holds (the
+  local-access and remote counts above).
+- **CTA fence.** `vx_fence_cta()` (custom-2, `funct3 = 7`; CUDA's
+  `__threadfence_block()`) is the fence alone. In the warp's LSU slice it
+  waits until the warp's global loads, LRs and AMOs have returned. If the
+  warp has written global memory since its last fence (or since it was
+  started, by a CTA dispatch or a `wspawn`), it then sends one fence token
+  marked CTA-scope; the L1 data cache drains it (its older requests commit,
+  as at the shared level) and answers it as a read of its word, without
+  walking, invalidating or forwarding. Otherwise it sends nothing. The token
+  rides every lane of the slice, whatever the warp's thread mask, so each
+  data-cache channel carries a copy behind the warp's older requests on it:
+  the channels reach the L1 independently, and a drain covers only the
+  requests the L1 has already accepted. The fence completes when every
+  copy has answered. In a build with tensor metadata a CTA fence, and every `FENCE`,
+  also waits through the scoreboard for the warp's earlier `TCU_LD`
+  writebacks (and, since they share its bits, for in-flight `fflags`
+  writers). Without a data cache the token is a GPU fence.
+- **What a CTA release orders.** Global memory, i.e. every lane address that
+  is neither local memory, nor the DLMEM window, nor the stack window
+  (`STACK_WINDOW_BOTTOM` to `STACK_WINDOW_TOP`). Stacks hold CUDA's local
+  memory, which is private to its thread, so a release does not order a
+  thread's stack stores before another thread's reads of them through a
+  pointer, as in CUDA. A thread that shares stack data must fence it with
+  `vx_fence()` itself.
+- **Acquire at CTA scope.** The block shares one L1, so a load issued after
+  the acquiring wait (an mbarrier `test_wait` branch, a barrier) sees the
+  released data with no invalidate. Cluster and device scope still need
+  `vx_fence()` on both sides, as above.
+- **Fence lock.** While the token is out, the slice holds its fence lock, so
+  the other warps of that LSU slice cannot send memory requests. The H100
+  does not stall other warps this way; it costs only when the releasing warp
+  has written global memory.
 
 ## Exclusions
 
@@ -337,7 +390,7 @@ RV32; `EXT_RASTER`; DXA multicast into a spread gang (until DXA × DLMEM).
   fence walks every data cache. The two models then cost it differently: at
   4 cores with SOCKET_SIZE=2 a fence loop takes 93162 SimX vs 141507 RTL cycles,
   with the knob off (1 core agrees within 0.9%). `cluster_group::sync()` puts a
-  fence on each side of the barrier, so its parity case runs the fence-free
+  fence on each side of the barrier, so its parity case runs the relaxed
   arrive/wait (3.4%) until the fence model covers this shape.
 
 ## Steps

@@ -69,11 +69,20 @@ public:
     }
 
 #ifdef VX_CFG_EXT_DLMEM_ENABLE
-    // Gang unit on the cluster's launch input. Its per-core lanes are the
-    // KMU's launch-lane pattern: a registered stage into the core's domain,
-    // and the admission credits back through a stage the core owns.
+    // Gang unit on the cluster's launch input, then the launch fan-out to the
+    // cores; a cluster of one core has no fan-out, so the gang's output skid
+    // feeds the core. The per-core lanes follow the KMU's launch-lane pattern:
+    // a registered stage into the core's domain, and the admission credits
+    // back through a stage the core owns.
     snprintf(sname, 100, "%s-cta-gang", name.c_str());
     cta_gang_ = CtaGang::Create(sname, dlmem_cfg());
+    bool fanout = (sockets_per_cluster * cores_per_socket_) > 1;
+    if (fanout) {
+      snprintf(sname, 100, "%s-launch", name.c_str());
+      launch_ = LaunchFanout::Create(sname, sockets_per_cluster, cores_per_socket_);
+      cta_gang_->bus_out.bind(&launch_->bus_in);
+      launch_->credit_out.bind(&cta_gang_->credit_in);
+    }
     for (uint32_t i = 0; i < sockets_per_cluster; ++i) {
       for (uint32_t c = 0; c < cores_per_socket_; ++c) {
         uint32_t lane = i * cores_per_socket_ + c;
@@ -81,7 +90,7 @@ public:
         auto* dispatcher = core->scheduler().cta_dispatcher();
         snprintf(sname, 100, "%s-gang-lane%d", name.c_str(), lane);
         auto slice = RegSlice<kmu_req_t>::Create(sname, 1);
-        cta_gang_->bus_out.at(lane).bind(&slice->In);
+        (fanout ? launch_->bus_out.at(lane) : cta_gang_->bus_out).bind(&slice->In);
         slice->Out.bind(&dispatcher->bus_in);
         snprintf(sname, 100, "%s-gang-credit%d", name.c_str(), lane);
         RegSlice<uint8_t>::Ptr cslice;
@@ -90,7 +99,7 @@ public:
           cslice = RegSlice<uint8_t>::Create(sname, 1);
         }
         dispatcher->credit_out.bind(&cslice->In);
-        cslice->Out.bind(&cta_gang_->credit_in.at(lane));
+        cslice->Out.bind(fanout ? &launch_->credit_in.at(lane) : &cta_gang_->credit_in);
         // cluster-barrier releases share the core's global-barrier resume end
         cta_gang_->release_out.at(lane).bind(&core->gbar_resume_in);
       }
@@ -356,7 +365,7 @@ public:
         return true;
     }
   #ifdef VX_CFG_EXT_DLMEM_ENABLE
-    if (cta_gang_->busy()) {
+    if (cta_gang_->busy() || (launch_ && launch_->busy())) {
       return true;
     }
   #endif
@@ -646,6 +655,7 @@ private:
 #endif
 #ifdef VX_CFG_EXT_DLMEM_ENABLE
   CtaGang::Ptr                cta_gang_;
+  LaunchFanout::Ptr           launch_;
   DlmemXbar<DlmemReqPkt>::Ptr dlmem_req_xbar_;
   DlmemXbar<DlmemRspPkt>::Ptr dlmem_rsp_xbar_;
 #endif

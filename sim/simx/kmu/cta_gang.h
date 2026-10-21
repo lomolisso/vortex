@@ -19,6 +19,7 @@
 #include <dlmem_ref.h>
 #include "types.h"
 #include "kmu.h"
+#include "launch_tree.h"
 
 namespace vortex {
 
@@ -39,7 +40,7 @@ struct GangEvent {
 // Gang unit of one hardware cluster (VX_cta_gang): it sits between the
 // cluster's launch lane and its cores.
 //
-// A DEFAULT launch passes through with the KMU's core steering. A SPREAD
+// A DEFAULT launch passes through; the cluster's fan-out picks its core. A SPREAD
 // message's K blocks are placed all or nothing, spread first, on an exact
 // mirror of every core's free CTA slots and used warps, one greedy step per
 // cycle, and then leave as K pinned beats, one per cycle. A slot returns to
@@ -54,10 +55,10 @@ public:
   SimChannel<kmu_req_t> bus_in;
   SimChannel<uint8_t>   credit_out;
 
-  // Per-core launch lanes, each bound to a registered stage in this unit's
-  // domain, and the dispatchers' admission credits.
-  std::vector<SimChannel<kmu_req_t>> bus_out;
-  std::vector<SimChannel<uint8_t>>   credit_in;
+  // The unit's output skid, into the cluster's launch fan-out (or the core of
+  // a one-core cluster), and one credit per beat taken from it.
+  SimChannel<kmu_req_t> bus_out;
+  SimChannel<uint8_t>   credit_in;
 
   // Cluster-barrier releases, one link per core.
   std::vector<SimEventLink<GbarResume>> release_out;
@@ -81,8 +82,8 @@ protected:
 private:
   enum class State { IDLE, PLACE, EMIT };
 
-  bool lane_ready(uint32_t core) const;
-  void send_beat(uint32_t core, const kmu_req_t& beat);
+  bool out_ready(const LaunchTree::Beat& beat) const;
+  void send_beat(const LaunchTree::Beat& beat);
   void apply_done(const GangEvent& d);
   void apply_cbar(const GangEvent& a);
   bool id_free() const;
@@ -116,12 +117,8 @@ private:
 
   std::deque<GangEvent> evt_q_;
 
-  // Legacy steering, as the KMU does it per core: round robin, a message
-  // locked to the core that took its first beat.
-  uint32_t rr_core_;
-  bool     locked_;
-  uint32_t lock_core_;
-  std::vector<uint32_t> inflight_;
+  LaunchTree out_;
+  bool       direct_;             // no fan-out: the output skid is the core's
 
   uint64_t rel_delay_;
 

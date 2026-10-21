@@ -14,6 +14,8 @@
 #pragma once
 
 #include "func_unit.h"
+#include <array>
+#include <vector>
 
 namespace vortex {
 
@@ -31,6 +33,18 @@ private:
   void execute(instr_trace_t* trace);
 
   uint32_t latency_of(const instr_trace_t* trace) const;
+
+  // A packet narrower than 4 lanes holds part of a WGATHER group of 4.
+  static constexpr bool kWgatherSplit = (VX_CFG_NUM_ALU_LANES < 4) && (VX_CFG_NUM_ALU_LANES < VX_CFG_NUM_THREADS);
+
+  void wgather_split(instr_trace_t* trace, uint32_t src_offset);
+
+  // Per issue slice: the source thread's operands from an earlier packet.
+  struct WgatherStage {
+    bool active = false;
+    std::array<reg_data_t, 3> ops = {};
+  };
+  std::vector<WgatherStage> wg_stages_ = std::vector<WgatherStage>(VX_CFG_ISSUE_WIDTH);
 };
 
 }

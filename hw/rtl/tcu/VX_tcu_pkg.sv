@@ -399,6 +399,10 @@ package VX_tcu_pkg;
                     op_args.tcu.step_m, op_args.tcu.step_n));
             end
         `endif
+        `ifdef TCU_WG_GROUPS_ENABLE
+            INST_TCU_COMMIT: `TRACE(level, ("WGMMA.COMMIT_GROUP"))
+            INST_TCU_WAIT:   `TRACE(level, ("WGMMA.WAIT_GROUP.%0d", op_args.tcu.step_m))
+        `endif
         `ifdef TCU_META_ENABLE
             INST_TCU_LD: begin
                 `TRACE(level, ("TCU_LD.%s.slot=%0d.",

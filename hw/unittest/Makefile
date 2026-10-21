@@ -409,6 +409,10 @@ endef
 CACHE_STALL := --tests=stress --seed=2 --stress-seeds=16 --stress-cycles=40000 --mem-ready=30
 # Randomized traffic with fences mixed in, each draining or walking per set.
 CACHE_FENCE := --tests=stress --seed=3 --stress-seeds=4 --stress-fence=4
+# A CTA-scope fence (DLMEM, RV64 only) drains the first cache level although it
+# is not the shared level: write-through and write-back L1s, with CTA fences
+# also mixed into the randomized traffic.
+CACHE_CTA  := AMO_ENABLE=0 IS_LLC=0 NUM_REQS=2 CTA_FENCE=1
 run-cache:
 	$(call cache_case,$(CACHE_BASE),,$(CACHE_FENCE))
 	$(call cache_case,$(CACHE_BASE) -DVX_CFG_EXT_ZACAS_ENABLE,NUM_REQS=2 NUM_BANKS=2,$(CACHE_STALL))
@@ -420,6 +424,10 @@ run-cache:
 	$(call cache_case,,AMO_ENABLE=0)
 	$(call cache_case,,AMO_ENABLE=0 WRITEBACK=0 NUM_REQS=2)
 	$(call cache_case,,AMO_ENABLE=0 IS_LLC=0 WRITEBACK=0 NUM_REQS=2,$(CACHE_FENCE))
+ifeq ($(XLEN),64)
+	$(call cache_case,-DVX_CFG_EXT_DLMEM_ENABLE,$(CACHE_CTA) WRITEBACK=0,$(CACHE_FENCE))
+	$(call cache_case,-DVX_CFG_EXT_DLMEM_ENABLE,$(CACHE_CTA) WRITEBACK=1,$(CACHE_FENCE))
+endif
 
 # TCU FEDP datapath — executed per format so a tcu/tfr change is gated by CI.
 # Each format must enable its own RTL datapath (FP16-only is the default). Covers

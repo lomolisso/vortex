@@ -50,6 +50,10 @@ module VX_scheduler import VX_gpu_pkg::*; #(
     output wire [`VX_CFG_LMEM_LOG_SIZE:0] peer_wr_stride,
     // per LSU block, the release of a warp stalled by an acquire AMO
     VX_sched_unlock_if.slave lsu_unlock_if [`VX_CFG_NUM_LSU_BLOCKS],
+`ifdef TCU_WG_GROUPS_ENABLE
+    // per TCU block, the release of a warp stalled by a wgmma wait_group
+    VX_sched_unlock_if.slave tcu_unlock_if [`VX_CFG_NUM_TCU_BLOCKS],
+`endif
 `endif
 
     // status
@@ -202,8 +206,13 @@ module VX_scheduler import VX_gpu_pkg::*; #(
     `POP_COUNT(active_warps_cnt, active_warps);
 
 `ifdef VX_CFG_EXT_DLMEM_ENABLE
-    // Releases of warps a wstall'd instruction left stalled at decode: acquire AMOs, per LSU block.
+    // Releases of warps a wstall'd instruction left stalled at decode: acquire AMOs, per LSU block,
+    // then wgmma wait_groups, per TCU block.
+`ifdef TCU_WG_GROUPS_ENABLE
+    localparam NUM_UNLOCKS = `VX_CFG_NUM_LSU_BLOCKS + `VX_CFG_NUM_TCU_BLOCKS;
+`else
     localparam NUM_UNLOCKS = `VX_CFG_NUM_LSU_BLOCKS;
+`endif
     wire [NUM_UNLOCKS-1:0]               unlock_valid;
     wire [NUM_UNLOCKS-1:0][NW_WIDTH-1:0] unlock_wid;
     for (genvar i = 0; i < `VX_CFG_NUM_LSU_BLOCKS; ++i) begin : g_lsu_unlock
@@ -214,6 +223,17 @@ module VX_scheduler import VX_gpu_pkg::*; #(
         `RUNTIME_ASSERT(~(unlock_valid[i] && schedule_fire && (schedule_wid == unlock_wid[i])),
             ("%s LSU unlock of the warp being scheduled: block=%0d, wid=%0d", INSTANCE_ID, i, unlock_wid[i]))
     end
+`ifdef TCU_WG_GROUPS_ENABLE
+    for (genvar i = 0; i < `VX_CFG_NUM_TCU_BLOCKS; ++i) begin : g_tcu_unlock
+        localparam U = `VX_CFG_NUM_LSU_BLOCKS + i;
+        assign unlock_valid[U] = tcu_unlock_if[i].valid;
+        assign unlock_wid[U]   = tcu_unlock_if[i].wid;
+        `RUNTIME_ASSERT(~unlock_valid[U] || stalled_warps[unlock_wid[U]],
+            ("%s TCU unlock of a warp that is not stalled: block=%0d, wid=%0d", INSTANCE_ID, i, unlock_wid[U]))
+        `RUNTIME_ASSERT(~(unlock_valid[U] && schedule_fire && (schedule_wid == unlock_wid[U])),
+            ("%s TCU unlock of the warp being scheduled: block=%0d, wid=%0d", INSTANCE_ID, i, unlock_wid[U]))
+    end
+`endif
 `endif
 
      always @(*) begin

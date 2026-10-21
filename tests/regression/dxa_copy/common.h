@@ -11,10 +11,12 @@
 
 typedef struct {
   uint32_t ndim;               // number of dimensions (1-5)
+  uint32_t elect;              // nonzero: only thread 0 of the DXA warp issues
   uint32_t sizes[DXA_MAX_DIMS];  // per-dimension array sizes
   uint32_t tiles[DXA_MAX_DIMS];  // per-dimension tile sizes
   uint32_t grids[DXA_MAX_DIMS];  // per-dimension grid sizes (sizes[d]/tiles[d])
   uint64_t src_addr;
+  uint64_t dst_addr;           // each block writes its tile back here for the host check
 } kernel_arg_t;
 
 #endif

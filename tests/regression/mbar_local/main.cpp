@@ -10,6 +10,10 @@
 //             then expect/complete/arrive_tx by every worker warp per phase,
 //             with completes landing before the expect on odd phases
 //   -m count  lane 0 of each worker warp arrives for the whole warp
+//   -m glob   pc over a global double buffer: the producers' global stores
+//             must be visible to the consumers after the wait (no streamers)
+//   -b B      glob: stores per element and fill, the last one with the tag
+//             (default 4)
 //   -r R      phases, or buffer fills in pc (default 32)
 //   -D S      S warps stream DXA copies into their own tiles meanwhile (default 0)
 //   -e E      32-bit elements per DXA tile, even (default 512)
@@ -56,10 +60,11 @@ uint32_t rounds     = 32;
 uint32_t streamers  = 0;
 uint32_t tile_elems = 512;
 uint32_t delay      = 64;
+uint32_t burst      = 4;
 bool     verbose    = false;
 bool     parity     = false;
 
-const char* const kModeNames[] = {"basic", "pc", "tx", "count"};
+const char* const kModeNames[] = {"basic", "pc", "tx", "count", "glob"};
 const char* const kNegNames[]  = {"", "underflow", "txrange", "global", "remote"};
 
 #define CHECK(expr) do {                                              \
@@ -72,7 +77,7 @@ const char* const kNegNames[]  = {"", "underflow", "txrange", "global", "remote"
   } while (0)
 
 void usage() {
-  std::printf("Usage: [-m basic|pc|tx|count] [-r rounds] [-D streamers] [-e tile elements] [-w delay] [-p]"
+  std::printf("Usage: [-m basic|pc|tx|count|glob] [-r rounds] [-D streamers] [-e tile elements] [-w delay] [-b burst] [-p]"
               " [-x underflow|txrange|global|remote] [-v] [-h]\n");
 }
 
@@ -98,14 +103,15 @@ uint32_t parse_name(const char* s, const char* const* names, uint32_t n, uint32_
 
 void parse_args(int argc, char** argv) {
   int c;
-  while ((c = getopt(argc, argv, "m:r:D:e:w:x:pvh")) != -1) {
+  while ((c = getopt(argc, argv, "m:r:D:e:w:b:x:pvh")) != -1) {
     switch (c) {
-      case 'm': mode       = parse_name(optarg, kModeNames, 4, 0); break;
+      case 'm': mode       = parse_name(optarg, kModeNames, 5, 0); break;
       case 'x': neg        = parse_name(optarg, kNegNames, 5, 1);  break;
       case 'r': rounds     = parse_count(optarg); break;
       case 'D': streamers  = parse_count(optarg); break;
       case 'e': tile_elems = parse_count(optarg); break;
       case 'w': delay      = parse_count(optarg); break;
+      case 'b': burst      = parse_count(optarg); break;
       case 'v': verbose    = true;                break;
       case 'p': parity     = true;                break;
       case 'h': usage(); std::exit(0);
@@ -113,7 +119,8 @@ void parse_args(int argc, char** argv) {
     }
   }
   if (optind < argc || rounds == 0 || tile_elems == 0 || (tile_elems & 1)
-      || streamers > kMaxStreamers || (neg && (streamers || parity)) || (parity && streamers)) {
+      || streamers > kMaxStreamers || (neg && (streamers || parity)) || (parity && streamers)
+      || burst == 0 || (mode == MODE_GLOB && streamers)) {
     usage();
     std::exit(-1);
   }
@@ -249,9 +256,10 @@ int main(int argc, char** argv) {
     std::printf("Error: the device needs DLMEM and the A extension%s\nFAILED!\n", streamers ? ", and DXA" : "");
     return 1;
   }
-  if (nw <= streamers || (mode == MODE_PC && workers < 2)) {
+  const bool two_sided = (mode == MODE_PC || mode == MODE_GLOB);
+  if (nw <= streamers || (two_sided && workers < 2)) {
     std::printf("Error: %u warps leave %d workers, %s needs %u\nFAILED!\n", (uint32_t)nw,
-                (int)nw - (int)streamers, kModeNames[mode], mode == MODE_PC ? 2 : 1);
+                (int)nw - (int)streamers, kModeNames[mode], two_sided ? 2 : 1);
     return 1;
   }
   if (lmem_bytes > lmem_cap) {
@@ -312,10 +320,21 @@ int main(int argc, char** argv) {
   CHECK(vx_buffer_create(dev, word_bytes, VX_MEM_READ_WRITE, &word_buf));
   CHECK(vx_enqueue_write(q, word_buf, 0, words.data(), word_bytes, 0, nullptr, nullptr));
 
+  std::vector<uint64_t> h_glob;
+  vx_buffer_h glob_buf = nullptr;
+  if (mode == MODE_GLOB && !neg) {
+    h_glob.assign(2 * PC_ELEMS, 0);
+    const uint64_t glob_bytes = h_glob.size() * sizeof(uint64_t);
+    CHECK(vx_buffer_create(dev, glob_bytes, VX_MEM_READ_WRITE, &glob_buf));
+    CHECK(vx_enqueue_write(q, glob_buf, 0, h_glob.data(), glob_bytes, 0, nullptr, nullptr));
+  }
+
   mbar_arg_t arg = {};
   CHECK(vx_buffer_address(err_buf,    &arg.err_addr));
   CHECK(vx_buffer_address(word_buf,   &arg.word_addr));
   CHECK(vx_buffer_address(script_buf, &arg.script_addr));
+  if (glob_buf)
+    CHECK(vx_buffer_address(glob_buf, &arg.glob_addr));
   arg.mode          = mode;
   arg.neg           = neg;
   arg.rounds        = rounds;
@@ -326,8 +345,9 @@ int main(int argc, char** argv) {
   arg.script_len    = (uint32_t)script.size();
   arg.delay         = delay;
   arg.parity        = parity;
+  arg.burst         = burst;
 
-  const char* const kKernels[] = {"basic_k", "pc_k", "tx_k", "count_k"};
+  const char* const kKernels[] = {"basic_k", "pc_k", "tx_k", "count_k", "glob_k"};
   vx_module_h mod = nullptr;
   vx_kernel_h kernel = nullptr;
   CHECK(vx_module_load_file(dev, kernel_file, &mod));
@@ -413,7 +433,7 @@ int main(int argc, char** argv) {
       }
       want[OBJ_BAR] = mr::init(nwt);
       model_ok &= replay_phases(want[OBJ_BAR], rounds, ops);
-    } else if (mode == MODE_PC) {
+    } else if (two_sided) {
       const uint32_t P = nww / 2, C = nww - P;
       for (uint32_t s = 0; s < 2; ++s) {
         const uint32_t fills = (rounds + 1 - s) / 2;
@@ -483,6 +503,8 @@ int main(int argc, char** argv) {
   vx_buffer_release(word_buf);
   vx_buffer_release(err_buf);
   vx_buffer_release(script_buf);
+  if (glob_buf)
+    vx_buffer_release(glob_buf);
   if (src)
     vx_buffer_release(src);
   vx_queue_release(q);

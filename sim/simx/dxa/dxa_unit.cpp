@@ -18,7 +18,15 @@
 
 using namespace vortex;
 
+static_assert(VX_CFG_NUM_THREADS >= 4, "DXA requires at least 4 threads per warp");
+
 instr_trace_t* DxaUnit::process(instr_trace_t* trace) {
+  // A warp wider than the SFU arrives as several packets, all dispatched even
+  // when inactive, that carry the whole operand set; only the one holding
+  // lane 3 issues the request.
+  if (trace->pid >= 0 && trace->pid != int(3 / VX_CFG_NUM_SFU_LANES)) {
+    return trace;
+  }
   if (req_out_.full()) {
     return nullptr;
   }

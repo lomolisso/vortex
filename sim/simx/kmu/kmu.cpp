@@ -13,13 +13,33 @@
 
 #include "kmu.h"
 #include <cassert>
+#include "constants.h"
+#include "debug.h"
+#include "launch_tree.h"
 
 using namespace vortex;
 
-Kmu::Kmu(const SimContext& ctx, const char* name, uint32_t num_cores)
+namespace {
+using Level = LaunchTree::Level;
+// The RTL's launch fan-out levels below the KMU, device first.
+std::vector<Level> launch_levels() {
+#ifdef VX_CFG_EXT_DLMEM_ENABLE
+  // Each cluster's gang unit is an endpoint; it owns the levels below.
+  return {Level(VX_CFG_NUM_CLUSTERS)};
+#elif defined(VX_CFG_EXT_RASTER_ENABLE)
+  // The cluster registers the stream it merges with its raster engines.
+  return {Level(VX_CFG_NUM_CLUSTERS), Level(1, true), Level(NUM_SOCKETS), Level(VX_CFG_SOCKET_SIZE)};
+#else
+  return {Level(VX_CFG_NUM_CLUSTERS), Level(NUM_SOCKETS), Level(VX_CFG_SOCKET_SIZE)};
+#endif
+}
+
+} // namespace
+
+Kmu::Kmu(const SimContext& ctx, const char* name, uint32_t num_lanes)
   : SimObject<Kmu>(ctx, name)
-  , bus_out(num_cores, this)
-  , credit_in(num_cores, this)
+  , bus_out(num_lanes, this)
+  , credit_in(num_lanes, this)
   , PC_(0)
   , entry_(0)
   , param_(0)
@@ -30,18 +50,22 @@ Kmu::Kmu(const SimContext& ctx, const char* name, uint32_t num_cores)
 #endif
   , running_(false)
   , cta_id_(0)
-  , rr_ptr_(0)
   , ctx_id_(0)
-  , cluster_locked_(false)
-  , cluster_core_(0)
-  , inflight_(num_cores, 0)
+  , tree_(new LaunchTree(launch_levels()))
 {
+  assert(tree_->num_leaves() == num_lanes);
   block_dim_[0]    = block_dim_[1]    = block_dim_[2]    = 1;
   grid_dim_[0]     = grid_dim_[1]     = grid_dim_[2]     = 1;
   cluster_dim_[0]  = cluster_dim_[1]  = cluster_dim_[2]  = 1;
   warp_step_[0]    = warp_step_[1]    = warp_step_[2]    = 1;
   group_origin_[0] = group_origin_[1] = group_origin_[2] = 0;
   intra_offset_[0] = intra_offset_[1] = intra_offset_[2] = 0;
+}
+
+Kmu::~Kmu() {}
+
+bool Kmu::running() const {
+  return running_ || !tree_->empty();
 }
 
 void Kmu::on_reset() {
@@ -55,12 +79,9 @@ void Kmu::on_reset() {
   // zero-initialized at construction.
   running_         = false;
   cta_id_          = 0;
-  rr_ptr_          = 0;
-  cluster_locked_  = false;
-  cluster_core_    = 0;
   group_origin_[0] = group_origin_[1] = group_origin_[2] = 0;
   intra_offset_[0] = intra_offset_[1] = intra_offset_[2] = 0;
-  inflight_.assign(inflight_.size(), 0);
+  tree_->reset();
 }
 
 void Kmu::dcr_write(uint32_t addr, uint32_t value) {
@@ -101,7 +122,6 @@ void Kmu::start() {
            && (cluster_dim_[1] > 0)
            && (cluster_dim_[2] > 0);
   ctx_id_ += 1;
-  cluster_locked_ = false;
   if (running_) {
     cta_id_          = 0;
     group_origin_[0] = group_origin_[1] = group_origin_[2] = 0;
@@ -111,68 +131,40 @@ void Kmu::start() {
 }
 
 void Kmu::on_tick() {
-  // Collect credits returned by dispatcher admissions.
-  uint32_t num_cores = bus_out.size();
-  for (uint32_t c = 0; c < num_cores; ++c) {
+  uint64_t now = SimPlatform::instance().cycles();
+  for (uint32_t c = 0, n = bus_out.size(); c < n; ++c) {
     auto& credits = credit_in.at(c);
     while (!credits.empty()) {
       credits.pop();
-      assert(inflight_[c] != 0);
-      --inflight_[c];
+      tree_->credit(c);
     }
   }
-  if (!running_) {
-    this->tick_sleep();
-    return;
-  }
-  // Steering: a locked cluster's remaining members stay with the owning core;
-  // otherwise the next cluster goes to the core the round-robin already points
-  // at. One CTA per cycle — the launch bus carries a single beat. A lane is
-  // ready when its transport has room and the core still owes fewer than
-  // LAUNCH_CREDITS admissions, so a busy core never accumulates work.
-  //
-  // The destination is fixed before the message is sent, so a busy core stalls
-  // the bus instead of yielding its turn to a neighbour. Scanning for any ready
-  // lane here would let a core that drains faster absorb its neighbour's share
-  // and leave the placement lopsided.
-  auto lane_ready = [&](uint32_t c) {
-    return !bus_out.at(c).full() && inflight_[c] < LAUNCH_CREDITS;
+  auto sink = [this](uint32_t lane, const kmu_req_t& req) {
+    DT(2, this->name() << " launch: lane=" << lane << ", cta_id=" << req.cta_id);
+    bus_out.at(lane).send(req, 0);
   };
-  uint32_t target = num_cores;
-  if (cluster_locked_) {
-    if (lane_ready(cluster_core_)) {
-      target = cluster_core_;
+  tree_->begin_cycle();
+  tree_->advance(now, sink);
+  if (running_) {
+    // One CTA per cycle; a cluster is one message, its last member the eop.
+    LaunchTree::Beat beat{};
+    beat.eop = ((intra_offset_[0] + 1) == cluster_dim_[0])
+            && ((intra_offset_[1] + 1) == cluster_dim_[1])
+            && ((intra_offset_[2] + 1) == cluster_dim_[2]);
+    if (tree_->ready(beat)) {
+      this->next_cta(&beat.req);
+      DT(1, this->name() << " cta-fire: cta_id=" << beat.req.cta_id << ", block_idx=["
+            << beat.req.block_idx[0] << "," << beat.req.block_idx[1] << "," << beat.req.block_idx[2] << "]");
+      tree_->push(beat, now, sink);
     }
-  } else if (lane_ready(rr_ptr_)) {
-    target = rr_ptr_;
   }
-  if (target == num_cores)
-    return; // no ready lane this cycle
-  kmu_req_t req{};
-  if (!this->next_cta(&req, target))
-    return;
-  bus_out.at(target).send(req, 1);
-  ++inflight_[target];
-  if (!cluster_locked_) {
-    // Message complete: advance past the granted core.
-    rr_ptr_ = (target + 1) % num_cores;
+  if (!running_ && tree_->empty() && this->credits_idle()) {
+    this->tick_sleep();
   }
 }
 
-bool Kmu::next_cta(kmu_req_t* req, uint32_t core_id) {
-  if (!running_) return false;
-
-  // A cluster's CTAs must all land on one core: they address each other's local
-  // memory by rank and rendezvous on a per-core barrier slot. So once a core
-  // takes the first member, the rest of the cluster belongs to it.
-  assert(!cluster_locked_ || (cluster_core_ == core_id));
-
-  // Is the CTA being handed out now the last of its cluster?
-  bool last_of_cluster = ((intra_offset_[0] + 1) == cluster_dim_[0])
-                      && ((intra_offset_[1] + 1) == cluster_dim_[1])
-                      && ((intra_offset_[2] + 1) == cluster_dim_[2]);
-  cluster_locked_ = !last_of_cluster;
-  cluster_core_   = core_id;
+void Kmu::next_cta(kmu_req_t* req) {
+  assert(running_);
 
   // Effective block_idx = group_origin + intra_offset.
   uint32_t block_idx[3] = {
@@ -254,6 +246,14 @@ bool Kmu::next_cta(kmu_req_t* req, uint32_t core_id) {
       }
     }
   }
+}
 
+// A credit still in flight is delivered without waking this unit.
+bool Kmu::credits_idle() const {
+  for (const auto& credits : credit_in) {
+    if (credits.size() != 0) {
+      return false;
+    }
+  }
   return true;
 }

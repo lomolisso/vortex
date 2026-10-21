@@ -22,11 +22,16 @@
 // Usage rules:
 // - vx_mbar_init() is a plain store: follow it with __syncthreads() (or a
 //   cluster sync) before any thread uses the object.
-// - An arrive releases the warp's earlier local and window (DLMEM) memory
-//   accesses only. Call vx_fence() first when the waiters read global data.
-// - An arrive does not wait for local-memory reads by tensor-core ops (the
-//   TCU metadata AGU, the WGMMA DMA): wait for the TCU op to complete before
-//   arriving on a barrier that guards the buffer it reads.
+// - An arrive is a CTA-scope release, like PTX mbarrier.arrive: the warp's
+//   earlier local, window (DLMEM) and global accesses, and its tensor-core
+//   metadata loads, are performed before it. Stack accesses are not: the
+//   stack holds thread-private local memory, as in CUDA, so stack data shared
+//   through a pointer needs vx_fence() before the arrive.
+// - An arrive does not wait for asynchronous wgmma operations, which read
+//   their operands from local memory after they issue: call
+//   vx_wgmma_wait_group() (vx_tensor.h) before arriving on a barrier that
+//   guards a buffer a wgmma reads, as warpgroup_wait<N>() comes before the
+//   arrive on the H100.
 // - Every lane of a warp is a separate update of the object, serialized at
 //   its bank: one elected lane arriving with a count is the efficient form.
 // - The object must be an 8-byte aligned word of the caller's own local memory.

@@ -7,11 +7,24 @@
 //   -m fence     vx_fence() orders the store before a flag store the consumers poll
 //   -m fencebar  vx_fence() and then the group barrier, with no polling
 //   -m rl        amoswap.d.rl of a flag the consumers poll (needs the A extension)
+//   -m mbar      an mbarrier arrive by every producer lane on an object the
+//                consumers wait on (-o gst only; needs a VX_CFG_EXT_MBAR_ENABLE build)
 //   -o st        the producer stores the round into X (default)
 //   -o amo       the producer swaps the round into X with amoswap.d (needs A)
 //   -o ld        load buffering: the producer loads X before its ordering point
 //                and must see the previous round, which the consumers overwrite
 //                with the round once released
+//   -o gst       X is a global word, read through the L1; every group lane's
+//                burst stores go to lines of its own on X's L1 bank, a new one
+//                per store (-m bar|rl|mbar)
+//   -o gld       load buffering on a global X: the producer loads X before its
+//                release and must see the previous round, which the consumers
+//                overwrite with the round once released (-m bar|rl|mbar)
+//   -L           with -o gst and -m rl|mbar: the producer's last lane stores X
+//                and lane 0 alone releases (an mbarrier of count 1 for mbar)
+//   -f           with -o gld and -m bar: a double divide is in flight at the
+//                producer's release, which its fence waits for in a build
+//                with tensor metadata (XREG_0 is also the fflags bit)
 //   -r R         rounds (default 200)
 //   -b N         stores per lane and round into X's bank, from every producer and
 //                consumer lane, the producer's last one carrying X (default 8, >= 1)
@@ -23,8 +36,9 @@
 //   -w D         producer idle iterations before its stores (default 0)
 //   -v           print every consumer thread with an error and each streamer's copies
 //
-// -o st with bar, fence or fencebar runs kernel_main; the other combinations
-// run order_k, so kernel_main's instruction stream does not depend on them.
+// -o st with bar, fence or fencebar runs kernel_main; -o gst runs global_k,
+// -o gld and -L release_k; the other combinations run order_k, so
+// kernel_main's and global_k's instruction streams do not depend on them.
 
 #include <vortex2.h>
 #include <dxa.h>
@@ -56,12 +70,15 @@ uint32_t tile_elems = 768;
 uint32_t streamers  = 1;
 uint32_t x_word     = 0;
 uint32_t delay      = 0;
+bool     elect      = false;
+bool     fpu        = false;
 bool     verbose    = false;
 
 vx_device_h dev     = nullptr;
 vx_queue_h  q       = nullptr;
 vx_buffer_h src     = nullptr;
 vx_buffer_h res_buf = nullptr;
+vx_buffer_h gx_buf  = nullptr;
 vx_module_h mod     = nullptr;
 vx_kernel_h kernel  = nullptr;
 
@@ -69,12 +86,14 @@ void cleanup() {
   if (kernel)  vx_kernel_release(kernel);
   if (mod)     vx_module_release(mod);
   if (res_buf) vx_buffer_release(res_buf);
+  if (gx_buf)  vx_buffer_release(gx_buf);
   if (src)     vx_buffer_release(src);
   if (q)       vx_queue_release(q);
   if (dev)     vx_device_release(dev);
   kernel = nullptr;
   mod = nullptr;
   res_buf = nullptr;
+  gx_buf = nullptr;
   src = nullptr;
   q = nullptr;
   dev = nullptr;
@@ -91,8 +110,8 @@ void cleanup() {
   } while (0)
 
 void usage() {
-  std::printf("Usage: [-m bar|fence|fencebar|rl] [-o st|amo|ld] [-r rounds] [-b burst] [-d 0|1]"
-              " [-e tile elements] [-s streamers] [-x X word] [-w delay] [-v] [-h]\n");
+  std::printf("Usage: [-m bar|fence|fencebar|rl|mbar] [-o st|amo|ld|gst|gld] [-r rounds] [-b burst] [-d 0|1]"
+              " [-e tile elements] [-s streamers] [-x X word] [-w delay] [-L] [-f] [-v] [-h]\n");
 }
 
 // A decimal count; anything else, a sign included, is a usage error.
@@ -109,7 +128,7 @@ uint32_t parse_count(const char* s) {
 
 void parse_args(int argc, char** argv) {
   int c;
-  while ((c = getopt(argc, argv, "m:o:r:b:d:e:s:x:w:vh")) != -1) {
+  while ((c = getopt(argc, argv, "m:o:r:b:d:e:s:x:w:Lfvh")) != -1) {
     switch (c) {
       case 'm':
         if (!std::strcmp(optarg, "bar")) {
@@ -120,6 +139,8 @@ void parse_args(int argc, char** argv) {
           mode = MODE_FENCEBAR;
         } else if (!std::strcmp(optarg, "rl")) {
           mode = MODE_RL;
+        } else if (!std::strcmp(optarg, "mbar")) {
+          mode = MODE_MBAR;
         } else {
           usage();
           std::exit(-1);
@@ -132,6 +153,10 @@ void parse_args(int argc, char** argv) {
           x_access = ACC_AMO;
         } else if (!std::strcmp(optarg, "ld")) {
           x_access = ACC_LD;
+        } else if (!std::strcmp(optarg, "gst")) {
+          x_access = ACC_GST;
+        } else if (!std::strcmp(optarg, "gld")) {
+          x_access = ACC_GLD;
         } else {
           usage();
           std::exit(-1);
@@ -144,13 +169,19 @@ void parse_args(int argc, char** argv) {
       case 's': streamers  = parse_count(optarg); break;
       case 'x': x_word     = parse_count(optarg); break;
       case 'w': delay      = parse_count(optarg); break;
+      case 'L': elect      = true;                break;
+      case 'f': fpu        = true;                break;
       case 'v': verbose    = true;                break;
       case 'h': usage(); std::exit(0);
       default:  usage(); std::exit(-1);
     }
   }
   if (optind < argc || rounds == 0 || burst == 0 || dxa_on > 1 || tile_elems == 0 || (tile_elems & 1)
-      || streamers == 0 || streamers > kMaxStreamers) {
+      || streamers == 0 || streamers > kMaxStreamers
+      || ((x_access == ACC_GST || x_access == ACC_GLD) && mode != MODE_BAR && mode != MODE_RL && mode != MODE_MBAR)
+      || (mode == MODE_MBAR && x_access != ACC_GST && x_access != ACC_GLD)
+      || (elect && (x_access != ACC_GST || mode == MODE_BAR))
+      || (fpu && (x_access != ACC_GLD || mode != MODE_BAR))) {
     usage();
     std::exit(-1);
   }
@@ -161,6 +192,7 @@ const char* mode_name() {
     case MODE_FENCE:    return "fence";
     case MODE_FENCEBAR: return "fencebar";
     case MODE_RL:       return "rl";
+    case MODE_MBAR:     return "mbar";
     default:            return "bar";
   }
 }
@@ -169,12 +201,20 @@ const char* access_name() {
   switch (x_access) {
     case ACC_AMO: return "amo";
     case ACC_LD:  return "ld";
+    case ACC_GST: return "gst";
+    case ACC_GLD: return "gld";
     default:      return "st";
   }
 }
 
 bool use_order_k() {
   return x_access != ACC_ST || mode == MODE_RL;
+}
+
+const char* kernel_name() {
+  if (x_access == ACC_GLD || elect)
+    return "release_k";
+  return (x_access == ACC_GST) ? "global_k" : use_order_k() ? "order_k" : "main";
 }
 
 }  // namespace
@@ -204,10 +244,15 @@ int main(int argc, char** argv) {
               mode_name(), (uint32_t)nw, (uint32_t)nt, rounds, burst, dxa_on ? "on" : "off",
               streamers, tile_elems * (uint32_t)sizeof(uint32_t), x_word, delay, banks);
   if (use_order_k())
-    std::printf("lmem_bar_order: producer access %s, order_k\n", access_name());
+    std::printf("lmem_bar_order: producer access %s, %s\n", access_name(), kernel_name());
 
   if (!(isa & VX_ISA_EXT_DLMEM) || !(isa & VX_ISA_EXT_DXA)) {
     std::printf("Error: the device needs DLMEM and DXA\nFAILED!\n");
+    cleanup();
+    return 1;
+  }
+  if (mode == MODE_MBAR && !VX_CFG_EXT_MBAR_ENABLED) {
+    std::printf("Error: -m mbar needs a VX_CFG_EXT_MBAR_ENABLE build\nFAILED!\n");
     cleanup();
     return 1;
   }
@@ -252,6 +297,19 @@ int main(int argc, char** argv) {
 
   kernel_arg_t arg = {};
   CHECK(vx_buffer_address(res_buf, &arg.res_addr));
+  // Global X, then 8 * burst lines per group lane, 16 lines apart: an L1 has
+  // at most 16 banks, interleaved by line, so every one of them is on X's bank.
+  std::vector<uint64_t> h_gx;
+  if (x_access == ACC_GST || x_access == ACC_GLD) {
+    arg.gx_stride = 16 * VX_CFG_DCACHE_LINE_SIZE / sizeof(uint64_t);
+    h_gx.assign((size_t)arg.gx_stride * (1 + 8 * burst * (nw - streamers) * nt), 0);
+    const uint64_t gx_bytes = h_gx.size() * sizeof(uint64_t);
+    CHECK(vx_buffer_create(dev, gx_bytes, VX_MEM_READ_WRITE, &gx_buf));
+    CHECK(vx_buffer_address(gx_buf, &arg.gx_addr));
+    CHECK(vx_enqueue_write(q, gx_buf, 0, h_gx.data(), gx_bytes, 0, nullptr, nullptr));
+    std::printf("lmem_bar_order: global X at %#lx, burst lines %u doublewords apart\n",
+                (unsigned long)arg.gx_addr, arg.gx_stride);
+  }
   arg.mode          = use_order_k() ? (mode | (x_access << ACC_SHIFT)) : mode;
   arg.rounds        = rounds;
   arg.dxa_on        = dxa_on;
@@ -262,9 +320,11 @@ int main(int argc, char** argv) {
   arg.delay         = delay;
   arg.burst         = burst;
   arg.banks         = banks;
+  arg.elect         = elect;
+  arg.fpu           = fpu;
 
   CHECK(vx_module_load_file(dev, kernel_file, &mod));
-  CHECK(vx_module_get_kernel(mod, use_order_k() ? "order_k" : "main", &kernel));
+  CHECK(vx_module_get_kernel(mod, kernel_name(), &kernel));
 
   vx_launch_info_t li = {};
   li.struct_size  = sizeof(li);
@@ -314,10 +374,11 @@ int main(int argc, char** argv) {
     if (verbose)
       std::printf("  streamer warp %u: %u DXA copies\n", w, n);
   }
-  const uint64_t reads = (x_access == ACC_LD) ? rounds : (uint64_t)rounds * (block - (streamers + 1) * (uint32_t)nt);
+  const bool producer_reads = (x_access == ACC_LD || x_access == ACC_GLD);
+  const uint64_t reads = producer_reads ? rounds : (uint64_t)rounds * (block - (streamers + 1) * (uint32_t)nt);
   std::printf("lmem_bar_order: %lu stale of %lu %s reads, %lu flag timeouts, %u threads hit,"
               " first stale round %u, %u unfinished threads, %lu DXA copies\n",
-              (unsigned long)stale, (unsigned long)reads, (x_access == ACC_LD) ? "producer" : "consumer",
+              (unsigned long)stale, (unsigned long)reads, producer_reads ? "producer" : "consumer",
               (unsigned long)timeouts, threads_hit,
               first_round, unfinished, (unsigned long)copies);
 
@@ -327,6 +388,9 @@ int main(int argc, char** argv) {
   mod = nullptr;
   vx_buffer_release(res_buf);
   res_buf = nullptr;
+  if (gx_buf)
+    vx_buffer_release(gx_buf);
+  gx_buf = nullptr;
   vx_buffer_release(src);
   src = nullptr;
   vx_queue_release(q);

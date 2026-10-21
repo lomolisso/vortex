@@ -169,3 +169,43 @@ tests:
   touches: [hw/rtl/core/VX_cta_dispatch.sv, hw/rtl/VX_kmu.sv, hw/rtl/core/VX_kmu_bus_arb.sv,
             sim/simx/cta_dispatcher.cpp, sim/simx/kmu/, sim/simx/processor.cpp,
             sw/kernel/include/vx_spawn2.h, tests/regression/multikernel]
+# Warp lane gather (vx_wgather, vx_transpose4). Below 4 SIMD lanes a group of 4
+# threads spans several packets: -b checks only the source-lane-0 gather, which
+# stays exact there (vx_intrinsics.h).
+- id: wgather
+  via: blackbox
+  drivers:
+  - simx
+  - rtlsim
+  app: wgather
+  touches: &wgather_touches [hw/rtl/core/VX_alu_int.sv, hw/rtl/core/VX_alu_unit.sv,
+            hw/rtl/core/VX_lane_dispatch.sv, hw/rtl/core/VX_opc_unit.sv,
+            sim/simx/alu_unit, sim/simx/dispatcher, sw/kernel/include/vx_intrinsics.h,
+            tests/regression/wgather]
+- id: wgather-simd2
+  via: blackbox
+  drivers:
+  - simx
+  - rtlsim
+  app: wgather
+  configs: -DVX_CFG_SIMD_WIDTH=2
+  args: -b
+  touches: *wgather_touches
+- id: wgather-simd1
+  via: blackbox
+  drivers:
+  - simx
+  - rtlsim
+  app: wgather
+  configs: -DVX_CFG_SIMD_WIDTH=1
+  args: -b
+  touches: *wgather_touches
+- id: wgather-lanes2
+  via: blackbox
+  drivers:
+  - simx
+  - rtlsim
+  app: wgather
+  configs: -DVX_CFG_NUM_ALU_LANES=2
+  args: -b
+  touches: *wgather_touches

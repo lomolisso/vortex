@@ -24,6 +24,9 @@ using namespace vortex;
 Sequencer::Sequencer(const SimContext& ctx, const char* name, Core* core, PoolAllocator<Instr, 64>& instr_pool)
   : SimObject<Sequencer>(ctx, name)
   , core_(core)
+#ifdef VX_CFG_EXT_DLMEM_ENABLE
+  , instr_pool_(instr_pool)
+#endif
   , lsu_uop_gen_(instr_pool)
 #ifdef VX_CFG_EXT_TCU_ENABLE
   , tcu_uop_gen_(instr_pool)
@@ -40,10 +43,59 @@ void Sequencer::on_reset() {
   state_.reset();
 }
 
+#ifdef VX_CFG_EXT_DLMEM_ENABLE
+bool Sequencer::is_release(const instr_trace_t* trace) {
+  if (std::get_if<AmoType>(&trace->op_type)) {
+    return std::get<IntrAmoArgs>(trace->instr_ptr->get_args()).rl;
+  }
+  auto wctl = std::get_if<WctlType>(&trace->op_type);
+  if (wctl && *wctl == WctlType::BAR) {
+    auto args = std::get<IntrWctlArgs>(trace->instr_ptr->get_args());
+    return args.is_sync_bar || args.is_bar_arrive;
+  }
+  return false;
+}
+
+instr_trace_t* Sequencer::make_cfence(instr_trace_t* trace) {
+  uint64_t uuid = trace->uuid;
+  uint64_t uop_uuid = uuid & ~uint64_t(0xff000000); // uop index 0 in bits [31:24], as the RTL get_uop_uuid
+  auto instr = std::allocate_shared<Instr>(instr_pool_, uop_uuid, FUType::LSU);
+  instr->set_parent_uuid(uuid);
+  instr->set_op_type(LsuType::CFENCE);
+  instr->set_args(IntrLsuArgs{0, 0, 0});
+  auto uop = core_->trace_pool().allocate(1);
+  new (uop) instr_trace_t(uop_uuid);
+  uop->cid       = trace->cid;
+  uop->wid       = trace->wid;
+  uop->cta_id    = trace->cta_id;
+  uop->PC        = trace->PC;
+  uop->code      = trace->code;
+  uop->tmask     = trace->tmask;
+  uop->instr_ptr = instr;
+  uop->fu_type   = FUType::LSU;
+  uop->op_type   = LsuType::CFENCE;
+  return uop;
+}
+#endif
+
 instr_trace_t* Sequencer::get(instr_trace_t* trace) {
   // Idempotent: return cached micro-op if available
   if (state_.current_uop)
     return state_.current_uop;
+
+#ifdef VX_CFG_EXT_DLMEM_ENABLE
+  // The CFENCE rewrites the waiting instruction, so it can issue in the cycle
+  // the instruction would have; the instruction follows.
+  if (state_.release == Release::None && is_release(trace)) {
+    state_.release = Release::Fence;
+    state_.current_uop = this->make_cfence(trace);
+    return state_.current_uop;
+  }
+  if (state_.release == Release::Op) {
+    state_.current_uop = trace;
+    return trace;
+  }
+#endif
 
   // Activate sequencing for macro-op instructions
   if (!state_.active && trace->instr_ptr->is_macro_op()) {
@@ -64,6 +116,9 @@ instr_trace_t* Sequencer::get(instr_trace_t* trace) {
       state_.gen_fn = [this](const Instr& m, uint32_t i) {
         return tcu_uop_gen_.get(m, i);
       };
+      // VX_uop_sequencer latches the expansion in the cycle the macro-op
+      // reaches it and emits the first uop in the next one.
+      state_.setup_cycle = SimPlatform::instance().cycles();
       break;
   #endif
   #if defined(VX_CFG_EXT_RTU_ENABLE) || defined(VX_CFG_EXT_OM_ENABLE)
@@ -101,6 +156,8 @@ instr_trace_t* Sequencer::get(instr_trace_t* trace) {
   }
 
   if (state_.active) {
+    if (state_.setup_cycle == SimPlatform::instance().cycles())
+      return nullptr;
     // Generate micro-op Instr
     auto uop_instr = state_.gen_fn(*trace->instr_ptr, state_.uop_index);
 
@@ -132,6 +189,16 @@ instr_trace_t* Sequencer::get(instr_trace_t* trace) {
 
 bool Sequencer::advance() {
   state_.current_uop = nullptr;
+#ifdef VX_CFG_EXT_DLMEM_ENABLE
+  if (state_.release == Release::Fence) {
+    state_.release = Release::Op;
+    return false;
+  }
+  if (state_.release == Release::Op) {
+    state_.release = Release::None;
+    return true;
+  }
+#endif
   if (state_.active) {
     ++state_.uop_index;
     if (state_.uop_index >= state_.uop_count || state_.uop_index >= 255) {

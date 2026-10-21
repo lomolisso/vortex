@@ -57,6 +57,9 @@ module VX_cache_cluster import VX_gpu_pkg::*; #(
     parameter IS_LLC                = 0,      // Indicates this cache cluster is the LLC (handles AMO completion).
 
     parameter SHARED_LEVEL          = IS_LLC, // Every memory agent reaches these caches: a fence drains them, never walks them.
+`ifdef VX_CFG_EXT_DLMEM_ENABLE
+    parameter CTA_FENCE             = 0,      // A CTA-scope fence drains here, at any level, and goes no further.
+`endif
 
     parameter AMO_ENABLE            = 0       // Enable atomic memory operations.
  ) (
@@ -148,6 +151,9 @@ module VX_cache_cluster import VX_gpu_pkg::*; #(
             .PASSTHRU     (PASSTHRU),
             .IS_LLC       (IS_LLC),
             .SHARED_LEVEL (SHARED_LEVEL),
+        `ifdef VX_CFG_EXT_DLMEM_ENABLE
+            .CTA_FENCE    (CTA_FENCE),
+        `endif
             .AMO_ENABLE   (AMO_ENABLE)
         ) cache_wrap (
         `ifdef PERF_ENABLE

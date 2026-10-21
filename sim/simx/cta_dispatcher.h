@@ -13,6 +13,7 @@
 
 #pragma once
 
+#include <array>
 #include <cstdint>
 #include <vector>
 #include "types.h"
@@ -57,16 +58,15 @@ struct CtaDone {
 };
 #endif
 
-// CTA dispatcher: consumes CTAs pushed by the KMU and admits one warp rank
-// per step() into a free warp slot.
+// CTA dispatcher: takes CTAs off the launch bus and launches their warps, one
+// step() per cycle, with the RTL dispatcher's timing.
 class CtaDispatcher : public SimObject<CtaDispatcher> {
 public:
-  // Launch-lane endpoint (capacity 1): the CTA the KMU has committed to this
-  // core. An unadmitted CTA stays here, holding the lane's credit.
+  // The launch bus's last skid (two entries): CTAs routed to this core and not
+  // yet admitted.
   SimChannel<kmu_req_t> bus_in;
 
-  // Credit return to the KMU: one message per admitted CTA, so launch pacing
-  // rests on explicit slot accounting rather than transport back-pressure.
+  // One credit per admitted CTA, back to the launch bus.
   SimChannel<uint8_t> credit_out;
 
 #ifdef VX_CFG_EXT_DLMEM_ENABLE
@@ -77,8 +77,8 @@ public:
   CtaDispatcher(const SimContext& ctx, const char* name, Core* core);
   ~CtaDispatcher();
 
-  // Try to dispatch one warp rank into a free warp slot.
-  // Returns true on success and sets *wid_out / *rec_out.
+  // Advance one cycle. Returns true with the warp that becomes active this
+  // cycle.
   bool step(const WarpMask& active_warps, uint32_t* wid_out, cta_warp_record_t* rec_out);
 
   // Notify that a warp has exited; frees its lmem slot when all warps of the CTA are done.
@@ -105,7 +105,7 @@ public:
 
   // True while a CTA is being dispatched or waits in the launch lane.
   bool running() const {
-    return has_cta_ || (bus_in.size() != 0);
+    return has_cta_ || fire_valid_ || act_valid_ || (bus_in.size() != 0);
   }
 
   // Kernel start PC of the most recently dispatched CTA. The Fragment Work
@@ -117,7 +117,9 @@ protected:
   void on_reset();
 
 private:
-  bool next_warp(bool is_init, cta_warp_record_t* out);
+  void admit(uint64_t now);
+
+  void next_warp(bool is_init, cta_warp_record_t* out);
 
   // Usable slot count for a given per-CTA stride: floor(capacity/stride) capped
   // at NUM_WARPS (all slots when stride is 0). This is the occupancy bound that
@@ -143,6 +145,23 @@ private:
   std::vector<uint32_t> wid_to_slot_;
   uint32_t  tail_slot_;   // next slot to allocate (round-robin over usable slots)
 
+  // A warp's slot frees, and the dispatcher takes a CTA again, this many
+  // cycles after it exits: the retirement pipeline, then the count write-back.
+  static constexpr uint64_t RETIRE_DELAY = 3;
+  std::vector<uint64_t> slot_free_at_;
+  std::array<uint64_t, RETIRE_DELAY + 1> done_cycle_;  // exit cycle + 1, by cycle
+
+  // The selected warp (warp_fire_r) and the one that goes active this cycle.
+  bool      fire_valid_;
+  bool      fire_last_;
+  uint32_t  fire_wid_;
+  cta_warp_record_t fire_rec_;
+  bool      act_valid_;
+  uint32_t  act_wid_;
+  cta_warp_record_t act_rec_;
+  WarpMask  dispatched_;
+  WarpMask  exited_;    // warps that exited this cycle
+
   // Currently-in-flight CTA (being dispatched warp-rank by warp-rank)
   bool      has_cta_;
   uint32_t  cur_slot_;    // slot index assigned to the current in-flight CTA
@@ -165,8 +184,6 @@ private:
   std::vector<bool>     evt_;              // the slot's block owes a done event
   std::vector<uint32_t> gang_;
   std::vector<uint32_t> epoch_;
-  // A slot whose done event is still leaving is not re-admitted before this cycle.
-  std::vector<uint64_t> done_pend_until_;
   std::vector<dlmem_ref::Row> peer_row_;
   uint32_t legacy_base_;                   // first slot of the same-core cluster being admitted
   bool     cbar_wr_valid_;

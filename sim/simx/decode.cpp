@@ -305,6 +305,9 @@ static op_string_t op_string(const Instr &instr) {
         }
       }
       case LsuType::FENCE: return {"FENCE", ""};
+#ifdef VX_CFG_EXT_DLMEM_ENABLE
+      case LsuType::CFENCE: return {"CFENCE", ""};
+#endif
       default:
         std::abort();
       }
@@ -345,7 +348,11 @@ static op_string_t op_string(const Instr &instr) {
         case AmoType::AMOMAXU: return {"AMOMAXU.D", ""};
         case AmoType::AMOCAS:  return {"AMOCAS.D", ""};
 #ifdef VX_CFG_EXT_MBAR_ENABLE
-        case AmoType::MBAR_ARRIVE: return {"MBAR.ARRIVE", ""}; case AmoType::MBAR_ARRIVE_TX: return {"MBAR.ARRIVE_TX", ""}; case AmoType::MBAR_EXPECT_TX: return {"MBAR.EXPECT_TX", ""}; case AmoType::MBAR_COMPLETE_TX: return {"MBAR.COMPLETE_TX", ""}; case AmoType::MBAR_TEST_WAIT: return {"MBAR.TEST_WAIT", ""};
+        case AmoType::MBAR_ARRIVE:      return {"MBAR.ARRIVE", ""};
+        case AmoType::MBAR_ARRIVE_TX:   return {"MBAR.ARRIVE_TX", ""};
+        case AmoType::MBAR_EXPECT_TX:   return {"MBAR.EXPECT_TX", ""};
+        case AmoType::MBAR_COMPLETE_TX: return {"MBAR.COMPLETE_TX", ""};
+        case AmoType::MBAR_TEST_WAIT:   return {"MBAR.TEST_WAIT", ""};
 #endif
         default:
           std::abort();
@@ -404,6 +411,12 @@ static op_string_t op_string(const Instr &instr) {
   #ifdef VX_CFG_EXT_TCU_ENABLE
     ,[&](TcuType tcu_type)-> op_string_t {
       auto tpuArgs = std::get<IntrTcuArgs>(instrArgs);
+    #if defined(VX_CFG_EXT_MBAR_ENABLE) && defined(VX_CFG_TCU_WGMMA_ENABLE)
+      if (tcu_type == TcuType::COMMIT)
+        return {"WGMMA.COMMIT_GROUP", ""};
+      if (tcu_type == TcuType::WAIT)
+        return {"WGMMA.WAIT_GROUP", std::to_string(tpuArgs.step_m)};
+    #endif
       return TcuUnit::op_string(tcu_type, tpuArgs);
     }
   #endif // VX_CFG_EXT_TCU_ENABLE
@@ -432,6 +445,10 @@ static op_string_t op_string(const Instr &instr) {
  );
  return {"", ""};
 }
+#ifndef VX_CFG_EXT_DLMEM_ENABLE
+#line 431
+#endif
+
 namespace vortex {
 std::ostream &operator<<(std::ostream &os, const Instr &instr) {
   auto sintr = ::op_string(instr);
@@ -468,10 +485,12 @@ Decoder::Decoder(const SimContext& ctx, const char* name, PoolAllocator<Instr, 6
   : SimObject<Decoder>(ctx, name)
   , instr_pool_(instr_pool)
 {}
+
 Decoder::~Decoder() {}
 
 Instr::Ptr Decoder::decode(uint32_t code, uint64_t uuid) {
-  const bool is_rvc = (code & 0x3u) != 0x3u;  // RVC: expand to a 32-bit instruction
+  // Detect RVC from the raw bits and expand to a 32-bit instruction.
+  const bool is_rvc = (code & 0x3u) != 0x3u;
   if (is_rvc) {
     auto r = rvc_decompress(code & 0xFFFFu);
     assert(!r.illegal && "illegal RVC encoding");
@@ -918,7 +937,7 @@ Instr::Ptr Decoder::decode(uint32_t code, uint64_t uuid) {
         instr->set_op_type(is_sparse ? TcuType::WMMA_SP : TcuType::WMMA);
         instr->set_args(IntrTcuArgs{0, 0, fmt_s, fmt_d, 0, 0, 0, 0, 0, 0});
         instr->set_macro_op();
-        instr->set_wstall(true);
+        // no wstall: fetch goes on while the sequencer expands it, as in the RTL
       } break;
     #ifdef VX_CFG_TCU_WGMMA_ENABLE
       case 1: { // WGMMA_SYNC — single macro Instr, sequencer expands to micro-ops
@@ -929,7 +948,7 @@ Instr::Ptr Decoder::decode(uint32_t code, uint64_t uuid) {
         instr->set_op_type(is_sparse ? TcuType::WGMMA_SP : TcuType::WGMMA);
         instr->set_args(IntrTcuArgs{is_a_smem ? 1u : 0u, cd_nregs, fmt_s, fmt_d, 0, 0, 0, 0, 0, 0});
         instr->set_macro_op();
-        instr->set_wstall(true);
+        // no wstall: fetch goes on while the sequencer expands it, as in the RTL
       } break;
     #endif // VX_CFG_TCU_WGMMA_ENABLE
     #ifdef TCU_META_ENABLE
@@ -942,6 +961,17 @@ Instr::Ptr Decoder::decode(uint32_t code, uint64_t uuid) {
         instr->set_src_reg(0, rs1, RegType::Integer);
       } break;
     #endif // TCU_META_ENABLE
+    #if defined(VX_CFG_EXT_MBAR_ENABLE) && defined(VX_CFG_TCU_WGMMA_ENABLE)
+      case 3: // wgmma.commit_group
+        instr->set_op_type(TcuType::COMMIT);
+        instr->set_args(IntrTcuArgs{0, 0, 0, 0, rs2 & 7, 0, 0, 0, 0, 0});
+        break;
+      case 4: // wgmma.wait_group N: N is the rs2 field, not a register
+        instr->set_op_type(TcuType::WAIT);
+        instr->set_args(IntrTcuArgs{0, 0, 0, 0, rs2 & 7, 0, 0, 0, 0, 0});
+        instr->set_wstall(true);
+        break;
+    #endif
       default:
         std::abort();
       }
@@ -1132,10 +1162,20 @@ Instr::Ptr Decoder::decode(uint32_t code, uint64_t uuid) {
     // known-violation handoff class, checked against its decoded destination.
     gfx_doctrine::check(*instr);
   } break;
-#ifdef VX_CFG_EXT_MBAR_ENABLE
-  case Opcode::EXT3: { // mbarrier ops: doubleword atomics on a local-memory word, amo_op = 10 + funct3
+#ifdef VX_CFG_EXT_DLMEM_ENABLE
+  case Opcode::EXT3: {
     if (funct7 != 0)
       std::abort();
+    if (funct3 == 7) { // vx_fence_cta
+      instr->set_fu_type(FUType::LSU);
+      instr->set_op_type(LsuType::CFENCE);
+      instr->set_args(IntrLsuArgs{0, 0, 0});
+      break;
+    }
+  #ifndef VX_CFG_EXT_MBAR_ENABLE
+    std::abort();
+  #else
+    // mbarrier ops: doubleword atomics on a local-memory word, amo_op = 10 + funct3
     switch (funct3) {
     case 0: instr->set_op_type(AmoType::MBAR_ARRIVE); break;
     case 1: instr->set_op_type(AmoType::MBAR_ARRIVE_TX); break;
@@ -1152,6 +1192,7 @@ Instr::Ptr Decoder::decode(uint32_t code, uint64_t uuid) {
     instr->set_dest_reg(rd, RegType::Integer);
     instr->set_src_reg(0, rs1, RegType::Integer);
     instr->set_src_reg(1, rs2, RegType::Integer);
+  #endif
   } break;
 #endif
   default:

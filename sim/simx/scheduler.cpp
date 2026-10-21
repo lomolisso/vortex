@@ -62,7 +62,7 @@ void warp_t::reset() {
 Scheduler::Scheduler(const SimContext& ctx, const char* name, Core* core)
     : SimObject<Scheduler>(ctx, name)
 #ifdef VX_CFG_EXT_DLMEM_ENABLE
-    , UnlockIn(VX_CFG_NUM_LSU_BLOCKS, SimChannel<uint32_t>(this))
+    , UnlockIn(NUM_UNLOCKS, SimChannel<uint32_t>(this))
 #endif
     , core_(core)
     , warps_(VX_CFG_NUM_WARPS, VX_CFG_NUM_THREADS)
@@ -118,7 +118,7 @@ void Scheduler::on_tick() {
     while (!in.empty()) {
       uint32_t wid = in.peek();
       __assert(active_warps_.test(wid) && stalled_warps_.test(wid),
-               "LSU unlock of a warp that is not stalled: wid=" << wid);
+               "unlock of a warp that is not stalled: wid=" << wid);
       // The channel's delay is the stall register: the release is already
       // clocked, so it applies to the registered state too.
       // Sound only because the Scheduler, created in Core::Impl, ticks before Core.
@@ -136,6 +136,7 @@ void Scheduler::on_tick() {
 
 void Scheduler::activate_warp(uint32_t wid, const cta_warp_record_t& rec) {
   auto& warp = warps_[wid];
+  assert(!active_warps_.test(wid));  // a slot the dispatcher picked stays free until it goes active
 
   // Reusing a warp for the next CTA skips the one-time prologue and rewinds to
   // the kernel's per-CTA dispatch window — a fixed 20-byte (5-instruction)
@@ -184,25 +185,24 @@ void Scheduler::activate_warp(uint32_t wid, const cta_warp_record_t& rec) {
      << ", mscratch=0x" << std::hex << warp.mscratch << std::dec);
 }
 
+void Scheduler::dispatch_cta() {
+  // Clock the dispatcher; a warp it hands back goes active now.
+  uint32_t wid;
+  cta_warp_record_t rec;
+  if (cta_dispatcher_->step(active_warps_, &wid, &rec)) {
+    activate_warp(wid, rec);
+  }
+#ifdef VX_CFG_EXT_DLMEM_ENABLE
+  uint32_t slot;
+  CbarSlot info;
+  if (cta_dispatcher_->take_cbar_wr(&slot, &info)) {
+    barrier_unit_->slot_admit(slot, info);
+  }
+#endif
+}
+
 instr_trace_t* Scheduler::schedule(const WarpMask& warp_mask) {
   int scheduled_warp = -1;
-
-  // Dispatch one CTA warp
-  {
-    uint32_t wid;
-    cta_warp_record_t rec;
-    if (cta_dispatcher_->step(active_warps_, &wid, &rec)) {
-      activate_warp(wid, rec);
-    }
-#ifdef VX_CFG_EXT_DLMEM_ENABLE
-    uint32_t slot;
-    CbarSlot info;
-    if (cta_dispatcher_->take_cbar_wr(&slot, &info)) {
-      barrier_unit_->slot_admit(slot, info);
-    }
-#endif
-  }
-
 #ifdef VX_CFG_EXT_RASTER_ENABLE
   // Inject ready fragment waves into free warp slots.
   if (fwd_armed_)

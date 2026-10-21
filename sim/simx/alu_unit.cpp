@@ -334,6 +334,10 @@ void AluUnit::execute(instr_trace_t* trace) {
 		// to the last active lane — mirrors VX_alu_int.sv's last_tid select.
 		auto wgArgs = std::get<IntrWgatherArgs>(instrArgs);
 		uint32_t src_offset = wgArgs.src_lane;
+		if (kWgatherSplit) {
+			this->wgather_split(trace, src_offset);
+			return;
+		}
 		// Snapshot the issue-time active mask: the loop below mutates trace->tmask
 		// (which `tmask` aliases) to suppress source lanes, so source-lane liveness
 		// must be judged against the pre-suppression mask, not the live one.
@@ -550,6 +554,53 @@ void AluUnit::execute(instr_trace_t* trace) {
 		DT(3, this->name() << " execute: op=" << mdv_type << ", " << *trace);
 	} else {
 		std::abort();
+	}
+}
+
+// Mirrors VX_alu_int.sv's g_wgather_pkt: lanes are placed by warp thread, a
+// source thread in an earlier packet of the warp comes from the stage that
+// packet filled, and the packet's last active lane stands in for a source
+// that is masked or in a later packet.
+void AluUnit::wgather_split(instr_trace_t* trace, uint32_t src_offset) {
+	constexpr uint32_t num_lanes = VX_CFG_NUM_ALU_LANES;
+	auto& rs1_data = trace->src_data[0];
+	auto& rs2_data = trace->src_data[1];
+	auto& rs3_data = trace->src_data[2];
+	auto& rd_data  = trace->dst_data;
+	auto active    = trace->tmask;
+
+	uint32_t base = uint32_t(trace->pid) * num_lanes;
+	uint32_t last_tid = base;
+	for (uint32_t t = base; t < base + num_lanes; ++t) {
+		if (active.test(t))
+			last_tid = t;
+	}
+	uint32_t nominal = (base & ~0x3u) + src_offset;
+	bool src_here = (nominal >= base) && (nominal < base + num_lanes);
+	bool src_prev = (nominal < base);
+
+	auto& stage = wg_stages_.at(trace->wid % VX_CFG_ISSUE_WIDTH);
+	std::array<reg_data_t, 3> ops;
+	if (src_here && active.test(nominal)) {
+		ops = {rs1_data[nominal], rs2_data[nominal], rs3_data[nominal]};
+	} else if (src_prev && stage.active) {
+		ops = stage.ops;
+	} else {
+		ops = {rs1_data[last_tid], rs2_data[last_tid], rs3_data[last_tid]};
+	}
+	if (src_here) {
+		stage.active = active.test(nominal);
+		stage.ops = {rs1_data[nominal], rs2_data[nominal], rs3_data[nominal]};
+	}
+
+	for (uint32_t t = base; t < base + num_lanes; ++t) {
+		uint32_t offset = (t - src_offset) & 0x3u;
+		if (offset == 0) {
+			trace->tmask.reset(t); // suppress writeback for source lane
+			continue;
+		}
+		trace->tmask.set(t);
+		rd_data[t] = ops[offset - 1];
 	}
 }
 

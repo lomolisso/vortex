@@ -26,15 +26,15 @@ __kernel void kernel_main(kernel_arg_t* __UNIFORM__ arg) {
     uint32_t group_base = group << 2;      // tid rounded down to multiple of 4
 
     // ---- Basic wgather test (src_offset=0) ----
-    // Each thread carries independent rs1/rs2/rs3 values.
-    // The source lane (offset=0 within each group) provides:
+    // Each thread carries its own rs1/rs2/rs3 values, so only the source
+    // lane's (offset=0 within each group) reach the other lanes:
     //   rs1 = group_base*10 + 1
     //   rs2 = group_base*10 + 2
     //   rs3 = group_base*10 + 3
-    size_t self_val = (size_t)wid * 1000 + (size_t)group_base;
-    size_t v1       = (size_t)group_base * 10 + 1;
-    size_t v2       = (size_t)group_base * 10 + 2;
-    size_t v3       = (size_t)group_base * 10 + 3;
+    size_t self_val = (size_t)wid * 1000 + (size_t)tid;
+    size_t v1       = (size_t)tid * 10 + 1;
+    size_t v2       = (size_t)tid * 10 + 2;
+    size_t v3       = (size_t)tid * 10 + 3;
 
     size_t result = vx_wgather(self_val, v1, v2, v3);
 

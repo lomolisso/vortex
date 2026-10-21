@@ -25,8 +25,8 @@
 // only at a row wrap, so its adds/compares sit on once-per-row paths.
 //
 // Single rolling-cursor scheme: gmem_cursor_r is updated by per-wrap
-// deltas precomputed in setup (delta[0]=stride[0], delta[d>0]=stride[d]-
-// (tile[d-1]-1)*stride[d-1]).
+// deltas precomputed in setup (delta[0]=stride[0]; delta[d>0]=stride[d]
+// minus the (tile-1)*stride span of every inner outer dim, as all of them wrap).
 
 `include "VX_define.vh"
 

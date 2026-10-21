@@ -27,6 +27,12 @@
 #include <cmath>
 #include <limits>
 #include <type_traits>
+#if defined(VX_CFG_EXT_MBAR_ENABLE) && defined(VX_CFG_TCU_WGMMA_ENABLE)
+#include <bitset>
+#include <deque>
+#else
+#line 29
+#endif
 
 using namespace vortex;
 
@@ -380,6 +386,11 @@ public:
     cta_owner_a_.fill(-1);
     cta_owner_b_ = -1;
     cur_block_ = 0;
+  #if defined(VX_CFG_EXT_MBAR_ENABLE) && defined(VX_CFG_TCU_WGMMA_ENABLE)
+    this->wg_reset();
+  #else
+  #line 382
+  #endif
   #ifdef TCU_META_ENABLE
     agu_.fill(agu_state_t{});
     agu_issue_rr_ = 0;
@@ -533,6 +544,15 @@ public:
   #ifdef TCU_META_ENABLE
     this->agu_step();
   #endif
+  #if defined(VX_CFG_EXT_MBAR_ENABLE) && defined(VX_CFG_TCU_WGMMA_ENABLE)
+    this->wg_unlock_step();
+    std::array<bool, VX_CFG_NUM_TCU_BLOCKS> grp_taken{};
+    for (uint32_t b = 0; b < VX_CFG_NUM_TCU_BLOCKS; ++b) {
+      grp_taken.at(b) = this->wg_request(b);
+    }
+  #else
+  #line 535
+  #endif
   #ifdef VX_CFG_TCU_WGMMA_ENABLE
     // Q-warp lock-step probe.
     // Pass 1 — identify active WGMMA blocks and prime each one's plan() on
@@ -541,6 +561,11 @@ public:
     for (uint32_t b = 0; b < VX_CFG_NUM_TCU_BLOCKS; ++b) {
       auto& input = simobject_->Inputs.at(b);
       if (input.empty()) continue;
+    #ifdef VX_CFG_EXT_MBAR_ENABLE
+      if (grp_taken.at(b)) continue;
+    #else
+    #line 543
+    #endif
       auto trace = input.peek();
       if (!tcu_is_wgmma(std::get<TcuType>(trace->op_type))) continue;
 
@@ -638,6 +663,12 @@ public:
       auto& input = simobject_->Inputs.at(b);
       if (input.empty())
         continue;
+    #if defined(VX_CFG_EXT_MBAR_ENABLE) && defined(VX_CFG_TCU_WGMMA_ENABLE)
+      if (grp_taken.at(b))
+        continue;
+    #else
+    #line 640
+    #endif
       auto trace = input.peek();
       auto tcu_type = std::get<TcuType>(trace->op_type);
       auto tpuArgs = std::get<IntrTcuArgs>(trace->instr_ptr->get_args());
@@ -756,6 +787,13 @@ public:
     #endif
       if (simobject_->Outputs.at(b).try_send(trace, delay)) {
         exec_done_.at(b) = false;
+      #if defined(VX_CFG_EXT_MBAR_ENABLE) && defined(VX_CFG_TCU_WGMMA_ENABLE)
+        if (tcu_is_wgmma(tcu_type) && tpuArgs.is_first_uop && !tpuArgs.is_setup_uop) {
+          ++wg_.at(trace->wid).issued;
+        }
+      #else
+      #line 758
+      #endif
       #ifdef VX_CFG_TCU_WGMMA_ENABLE
         // Clear this warp's plan bit on its last uop so the next WGMMA
         // re-decodes descriptors. Block stays in_wgmma_ until all warps drain.
@@ -1369,6 +1407,142 @@ private:
   // CTA owner per block's A buffer and the shared B buffer (-1 = unowned).
   std::array<int32_t, VX_CFG_NUM_TCU_BLOCKS> cta_owner_a_{};
   int32_t cta_owner_b_ = -1;
+
+#if defined(VX_CFG_EXT_MBAR_ENABLE) && defined(VX_CFG_TCU_WGMMA_ENABLE)
+public:
+  // wgmma commit/wait groups, as VX_tcu_groups: per warp, `issued` WGMMAs
+  // (first compute uop accepted), `done` ones (last compute result retired),
+  // and the commit_group boundaries; a group is pending while its boundary
+  // exceeds `done`. Retires, waits and commits drop the boundaries at or
+  // below `done`.
+  static constexpr uint32_t kGroupDepth = 8;
+
+  struct wg_groups_t {
+    uint32_t issued = 0;
+    uint32_t done = 0;
+    std::deque<uint32_t> bounds;
+    bool waiting = false;
+    uint32_t wait_n = 0;
+  };
+
+  void wg_reset() {
+    wg_.fill(wg_groups_t{});
+    for (auto& r : wg_ready_) r.reset();
+    for (auto& q : wg_out_last_) q.clear();
+  }
+
+  static uint32_t wg_pending(const wg_groups_t& g, uint32_t done) {
+    uint32_t n = 0;
+    for (auto bound : g.bounds) {
+      n += (bound > done);
+    }
+    return n;
+  }
+
+  static void wg_drop_done(wg_groups_t& g) {
+    while (!g.bounds.empty() && g.bounds.front() <= g.done) {
+      g.bounds.pop_front();
+    }
+  }
+
+  // One release per block per cycle, lowest warp first.
+  void wg_unlock_step() {
+    for (uint32_t b = 0; b < VX_CFG_NUM_TCU_BLOCKS; ++b) {
+      auto& ready = wg_ready_.at(b);
+      if (ready.none())
+        continue;
+      uint32_t wid = 0;
+      while (!ready.test(wid)) ++wid;
+      ready.reset(wid);
+      DT(2, simobject_->name() << " wait-unlock: wid=" << wid);
+      // An unbound channel would keep the release and hang the warp silently.
+      __assert(simobject_->UnlockOut.at(b).sink() != nullptr, "TCU unlock channel is not bound");
+      simobject_->UnlockOut.at(b).send(wid, TcuUnit::WAIT_UNLOCK_DELAY);
+    }
+  }
+
+  // Takes a commit_group or wait_group at the head of block b; they use no
+  // FEDP slot, tile buffer or lock and retire one cycle later. Returns
+  // whether the head was one, taken or not.
+  bool wg_request(uint32_t b) {
+    auto& input = simobject_->Inputs.at(b);
+    if (input.empty())
+      return false;
+    auto trace = input.peek();
+    auto tcu_type = std::get<TcuType>(trace->op_type);
+    if (tcu_type != TcuType::COMMIT && tcu_type != TcuType::WAIT)
+      return false;
+    auto& g = wg_.at(trace->wid);
+    if (tcu_type == TcuType::WAIT) {
+      // The warp is released over UnlockOut, not by the commit.
+      trace->resume_warp = false;
+    }
+    trace->dst_data.assign(VX_CFG_NUM_THREADS, reg_data_t{});
+    if (!simobject_->Outputs.at(b).try_send(trace, 1))
+      return true;
+    wg_drop_done(g);
+    if (tcu_type == TcuType::COMMIT) {
+      if (g.bounds.size() == kGroupDepth) {
+        std::cout << "Error: wgmma group overflow: wid=" << trace->wid << std::endl;
+        std::abort();
+      }
+      g.bounds.push_back(g.issued);
+      DT(2, simobject_->name() << " commit_group: wid=" << trace->wid << ", issued=" << g.issued
+         << ", done=" << g.done << ", pending=" << wg_pending(g, g.done));
+    } else {
+      uint32_t n = std::get<IntrTcuArgs>(trace->instr_ptr->get_args()).step_m;
+      uint32_t pending = wg_pending(g, g.done);
+      DT(2, simobject_->name() << " wait_group: wid=" << trace->wid << ", n=" << n
+         << ", pending=" << pending);
+      __assert(!g.waiting, "second wgmma wait of a warp: wid=" << trace->wid);
+      if (pending <= n) {
+        wg_ready_.at(b).set(trace->wid);
+      } else {
+        g.waiting = true;
+        g.wait_n = n;
+      }
+    }
+    DT(3, simobject_->name() << " execute: op=" << tcu_type << ", " << *trace);
+    input.pop();
+    return true;
+  }
+
+  void wg_result_arrived(uint32_t b, instr_trace_t* trace) {
+    auto tcu_type = std::get<TcuType>(trace->op_type);
+    bool last = false;
+    if (tcu_is_wgmma(tcu_type)) {
+      auto args = std::get<IntrTcuArgs>(trace->instr_ptr->get_args());
+      last = args.is_last_uop && !args.is_setup_uop;
+    }
+    wg_out_last_.at(b).push_back(last ? int32_t(trace->wid) : -1);
+  }
+
+  void wg_result_retired(uint32_t b) {
+    auto& order = wg_out_last_.at(b);
+    int32_t wid = order.front();
+    order.pop_front();
+    if (wid < 0)
+      return;
+    auto& g = wg_.at(wid);
+    __assert(g.done != g.issued, "wgmma retire without an issue: wid=" << wid);
+    ++g.done;
+    wg_drop_done(g);
+    DT(2, simobject_->name() << " wgmma-retire: wid=" << wid << ", done=" << g.done);
+    if (g.waiting && wg_pending(g, g.done) <= g.wait_n) {
+      g.waiting = false;
+      wg_ready_.at(b).set(wid);
+    }
+  }
+
+private:
+  std::array<wg_groups_t, VX_CFG_NUM_WARPS> wg_;
+  // Per block: warps whose wait is satisfied, awaiting their release.
+  std::array<std::bitset<VX_CFG_NUM_WARPS>, VX_CFG_NUM_TCU_BLOCKS> wg_ready_;
+  // Per block, per result in Outputs: the warp of a WGMMA's last result, else -1.
+  std::array<std::deque<int32_t>, VX_CFG_NUM_TCU_BLOCKS> wg_out_last_;
+#else
+#line 1371
+#endif
 };
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -1625,11 +1799,30 @@ TcuUnit::TcuUnit(const SimContext &ctx, const char* name, Core* core)
 	, agu_req_out(this)
 	, agu_rsp_in(this)
 #endif
+#if defined(VX_CFG_EXT_MBAR_ENABLE) && defined(VX_CFG_TCU_WGMMA_ENABLE)
+	, UnlockOut(VX_CFG_NUM_TCU_BLOCKS, SimChannel<uint32_t>(this))
+#else
+#line 1627
+#endif
 	, impl_(new Impl(this, core))
 {
   char sname[128];
   snprintf(sname, sizeof(sname), "%s-tbuf", name);
   tbuf_ = TcuTbuf::Create(sname);
+#if defined(VX_CFG_EXT_MBAR_ENABLE) && defined(VX_CFG_TCU_WGMMA_ENABLE)
+  // A result retires as the commit takes it, which the unit sees as its
+  // output's pop; the queue order is the arrival order.
+  for (uint32_t b = 0; b < VX_CFG_NUM_TCU_BLOCKS; ++b) {
+    Outputs.at(b).tx_callback([this, b](instr_trace_t* const& trace, uint64_t /*cycle*/) {
+      impl_->wg_result_arrived(b, trace);
+    });
+    Outputs.at(b).pop_callback([this, b]() {
+      impl_->wg_result_retired(b);
+    });
+  }
+#else
+#line 1632
+#endif
 }
 
 TcuUnit::~TcuUnit() {

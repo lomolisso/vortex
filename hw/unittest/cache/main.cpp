@@ -24,7 +24,10 @@
 // (settle). A randomized run mixes loads, stores, atomics and LR/SC under
 // random latency and back-pressure. Fence and flush rounds check where each
 // one walks the cache and where a fence only drains (fence), and that a
-// stream of either on one port does not starve the others (fstorm).
+// stream of either on one port does not starve the others (fstorm). With
+// CTA_FENCE (DLMEM builds), a CTA-scope fence drains at any level, keeps the
+// lines, waits for an older write from another port, and sends no fence or
+// flush to memory (fencecta).
 // Responses and final contents are checked against a reference memory that
 // applies each word's requests in the order the cache accepted them.
 
@@ -94,6 +97,9 @@
 #ifndef TB_IS_LLC
 #define TB_IS_LLC 1
 #endif
+#ifndef TB_CTA_FENCE
+#define TB_CTA_FENCE 0
+#endif
 
 // Without atomics a bank's load/store logic does not depend on IS_LLC, which
 // then only selects the cache's level: a last-level instance is the shared
@@ -125,6 +131,7 @@ constexpr uint32_t LATENCY     = TB_LATENCY;
 constexpr bool     WRITEBACK   = (TB_WRITEBACK != 0);
 constexpr bool     AMO_EN      = (TB_AMO_ENABLE != 0);
 constexpr bool     SHARED      = (TB_IS_LLC != 0);
+constexpr bool     CTA_FENCE   = (TB_CTA_FENCE != 0);
 constexpr bool     CAS_EN      = (VX_CFG_EXT_ZACAS_ENABLED != 0);
 
 constexpr uint32_t WORDS_PER_LINE   = LINE_SIZE / WORD_SIZE;
@@ -161,7 +168,14 @@ constexpr uint32_t ATTR_AMO_UNS   = ATTR_AMO_OP + 4;
 constexpr uint32_t ATTR_AMO_CMP   = ATTR_AMO_UNS + 1;
 constexpr uint32_t ATTR_HART      = ATTR_AMO_CMP + (CAS_EN ? XLEN : 0);
 constexpr uint32_t ATTR_FENCE     = ATTR_HART + HART_ID_BITS;
+#ifdef VX_CFG_EXT_DLMEM_ENABLE
+// {is_fence_cta, is_lacc, is_addr_remote} above is_fence.
+constexpr uint32_t ATTR_FENCE_CTA = ATTR_FENCE + 3;
+constexpr uint32_t ATTR_BITS      = ATTR_FENCE_CTA + 1;
+#else
+static_assert(!CTA_FENCE, "CTA fences exist in DLMEM builds only");
 constexpr uint32_t ATTR_BITS      = ATTR_FENCE + 1;
+#endif
 
 static_assert((WORD_SIZE & (WORD_SIZE - 1)) == 0 && WORD_SIZE >= 4 && WORD_SIZE <= 64, "unsupported WORD_SIZE");
 static_assert(SECTOR_SIZE % WORD_SIZE == 0 && LINE_SIZE % SECTOR_SIZE == 0, "unsupported line geometry");
@@ -410,6 +424,7 @@ struct Req {
   uint32_t hart   = 0;
   bool     flush  = false; // is_flush: a fence with `fence`, else a host flush
   bool     fence  = false;
+  bool     cta    = false; // a CTA-scope fence
   uint32_t tag    = 0;
   Role     role   = Role::None;
   std::string label;
@@ -467,6 +482,11 @@ public:
 
   uint64_t mem_writes() const {
     return mem_writes_;
+  }
+
+  // Memory requests that carried a fence or flush below the cache.
+  uint64_t fwd_fences() const {
+    return fwd_fences_;
   }
 
   // Sectors read and written by memory requests since the last clear.
@@ -532,6 +552,9 @@ public:
       }
       set_bits(t->core_req_attr[i], ATTR_HART, HART_ID_BITS, r.hart);
       set_bits(t->core_req_attr[i], ATTR_FENCE, 1, r.fence);
+#ifdef VX_CFG_EXT_DLMEM_ENABLE
+      set_bits(t->core_req_attr[i], ATTR_FENCE_CTA, 1, r.cta);
+#endif
       set_bytes(t->core_req_data[i], r.data.data(), WORD_SIZE);
       set_bits(t->core_req_tag[i], 0, TAG_BITS, r.tag);
       t->core_rsp_ready[i] = rsp_ready[i];
@@ -584,6 +607,12 @@ public:
         m.sector = get_bits(t->mem_req_addr[p], 0, SECTOR_ADDR_BITS);
         m.byteen = get_bits(t->mem_req_byteen[p], 0, SECTOR_SIZE);
         m.tag = get_bits(t->mem_req_tag[p], 0, MEM_TAG_BITS);
+#ifdef VX_CFG_EXT_DLMEM_ENABLE
+        if (get_bits(t->mem_req_attr[p], ATTR_FLUSH, 1) || get_bits(t->mem_req_attr[p], ATTR_FENCE, 1)
+         || get_bits(t->mem_req_attr[p], ATTR_FENCE_CTA, 1)) {
+          ++fwd_fences_;
+        }
+#endif
         get_bytes(t->mem_req_data[p], m.data.data(), SECTOR_SIZE);
         mreqs.push_back(m);
         ev.activity = true;
@@ -687,6 +716,7 @@ private:
   uint64_t cycle_      = 0;
   uint64_t mem_reads_  = 0;
   uint64_t mem_writes_ = 0;
+  uint64_t fwd_fences_ = 0;
 };
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -703,7 +733,7 @@ struct Options {
   bool     no_assert     = false;
   uint32_t stress_fence  = 0;     // stress: % of issues that are fences
   uint64_t watch         = ~0ull; // word whose traffic is traced
-  std::string tests      = "race,chain,chainbp,wbqburst,bypass,chainload,settle,fence,fstorm,stress";
+  std::string tests      = "race,chain,chainbp,wbqburst,bypass,chainload,settle,fence,fencecta,fstorm,stress";
 };
 
 struct Hang {};
@@ -763,6 +793,9 @@ public:
       }
       if (this->selected("fence")) {
         this->fence_rounds();
+      }
+      if (this->selected("fencecta")) {
+        this->fence_cta_round();
       }
       if (this->selected("fstorm")) {
         this->fence_storms();
@@ -2270,7 +2303,11 @@ private:
       return false;
     }
     if (opts_.stress_fence != 0 && rand_below(100) < opts_.stress_fence) {
-      this->present(port, this->make_flush(w, true, strf("stress fence 0x%" PRIx64, w)));
+      Req f = this->make_flush(w, true, strf("stress fence 0x%" PRIx64, w));
+      if (CTA_FENCE) {
+        f.cta = (rand_below(2) == 0);
+      }
+      this->present(port, f);
       return true;
     }
     uint32_t roll = AMO_EN ? rand_below(100) : rand_below(55);
@@ -2410,9 +2447,9 @@ private:
     return FENCE_LINE_BASE + round * (uint64_t(SETS_PER_BANK) * NUM_BANKS) + i;
   }
 
-  void fence_round(bool fence) {
-    const bool walks = !fence || !SHARED;
-    const std::string what = fence ? "fence" : "host flush";
+  void fence_round(bool fence, bool cta = false) {
+    const bool walks = !(fence && (SHARED || (cta && CTA_FENCE)));
+    const std::string what = cta ? "CTA fence" : (fence ? "fence" : "host flush");
     const uint32_t f0 = failures_;
     const uint64_t a0 = asserts_;
     const uint32_t pf = 0;
@@ -2430,7 +2467,10 @@ private:
     const uint64_t h_sector = h_addr / SECTOR_SIZE;
 
     std::vector<uint64_t> warm = w_addr;
-    warm.push_back(f_addr);
+    // A CTA fence's own word misses, so its read goes below, where it must arrive as a plain read.
+    if (!cta) {
+      warm.push_back(f_addr);
+    }
     for (size_t i = 0; i < warm.size(); ++i) {
       Req st;
       st.rw = true;
@@ -2456,8 +2496,36 @@ private:
     }
     dut_.read_log.clear();
     dut_.write_log.clear();
+    const uint64_t fwd0 = dut_.fwd_fences();
+    // S, a write on another port accepted just before the fence, to a line X
+    // whose fill is held: S waits behind that miss, and so must the fence.
+    const bool older_write = cta && (NUM_REQS > 1);
+    const uint64_t s_addr = this->fence_line(round, nw + 2) * LINE_SIZE;
+    const uint64_t s_sector = s_addr / SECTOR_SIZE;
+    uint32_t tx = 0;
+    if (older_write) {
+      dut_.hold(s_sector);
+      tx = this->present(po, this->make_load(s_addr, strf("%s held miss 0x%" PRIx64, what.c_str(), s_addr)));
+      for (uint32_t c = 0; !dut_.fill_waiting(s_sector); ++c) {
+        if (c > 1000) {
+          this->fail(strf("FAIL %s: the older write's line never missed to memory", what.c_str()));
+          break;
+        }
+        this->tick();
+      }
+      Req st;
+      st.rw = true;
+      st.addr = s_addr;
+      st.byteen = (WORD_SIZE == 64) ? ~0ull : ((1ull << WORD_SIZE) - 1);
+      st.data = this->rand_word();
+      st.label = strf("%s older store 0x%" PRIx64, what.c_str(), s_addr);
+      this->present(po, st);
+      this->wait_accept(po);
+    }
     const uint64_t c_fence = dut_.cycle();
-    uint32_t tf = this->present(pf, this->make_flush(f_addr, fence, what));
+    Req freq = this->make_flush(f_addr, fence, what);
+    freq.cta = cta;
+    uint32_t tf = this->present(pf, freq);
 
     // A draining fence holds only its own port: hits on another port go on.
     uint32_t served = 0;
@@ -2481,10 +2549,21 @@ private:
       this->fail(strf("FAIL %s answered while an earlier miss was still waiting for its fill", what.c_str()));
     }
     dut_.release(h_sector);
+    if (older_write) {
+      this->idle(128);
+      if (this->responded(pf, tf)) {
+        this->fail(strf("FAIL %s answered while an older write from port %u waited behind a miss", what.c_str(), po));
+      }
+      dut_.release(s_sector);
+    }
     while (!this->responded(pf, tf)) {
       this->tick();
     }
     const uint64_t c_done = dut_.cycle();
+    if (older_write && !this->responded(po, tx)) {
+      this->fail(strf("FAIL %s answered before the miss the older write waited behind", what.c_str()));
+    }
+    const uint64_t forwarded = dut_.fwd_fences() - fwd0;
     if (!this->responded(pf, th)) {
       this->fail(strf("FAIL %s answered before the earlier load on its port", what.c_str()));
     }
@@ -2511,6 +2590,9 @@ private:
       this->fail(strf("FAIL after a %s %u of %u resident lines missed, expected %u (%s)", what.c_str(), refetched, nw,
                       expect_refetched, walks ? "a walk invalidates them" : "a drain keeps them"));
     }
+    if (cta && CTA_FENCE && forwarded != 0) {
+      this->fail(strf("FAIL %s sent %" PRIu64 " fence or flush request(s) to memory", what.c_str(), forwarded));
+    }
     this->drain();
     std::printf("fence round: %s %s, %" PRIu64 " cycles from issue to answer (held fill included), "
                 "%u hits served beside it, %u/%u lines written back, %u/%u refetched: %s\n",
@@ -2522,6 +2604,14 @@ private:
   void fence_rounds() {
     this->fence_round(true);
     this->fence_round(false);
+  }
+
+  void fence_cta_round() {
+    if (!CTA_FENCE) {
+      std::printf("fence round: CTA fence skipped, not a CTA_FENCE cache\n");
+      return;
+    }
+    this->fence_round(true, true);
   }
 
   // A stream of fences or host flushes on port 0 while the other ports load

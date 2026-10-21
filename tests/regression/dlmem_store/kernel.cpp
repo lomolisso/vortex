@@ -183,7 +183,7 @@ __kernel void parity_k(store_arg_t* __UNIFORM__ arg) {
   ctx_init(x, arg);
   for (uint32_t e = x.tid; e < x.n; e += x.nt)
     x.own[e] = 0;
-  x.cl.barrier_wait(x.cl.barrier_arrive());
+  x.cl.barrier_wait_relaxed(x.cl.barrier_arrive_relaxed());
   const uint32_t rounds = arg->rounds, m = x.n / x.nt;
   auto mine = x.window<uint32_t>((x.rank + 1) % x.k) + x.tid * m;
   const uint32_t v0 = parity_value(x.seed, x.c, x.rank, 0, x.tid);
@@ -196,7 +196,7 @@ __kernel void parity_k(store_arg_t* __UNIFORM__ arg) {
     q[4] = v + 4; q[5] = v + 5; q[6] = v + 6; q[7] = v + 7;
   }
   vx_fence();
-  x.cl.barrier_wait(x.cl.barrier_arrive());
+  x.cl.barrier_wait_relaxed(x.cl.barrier_arrive_relaxed());
   auto glob = reinterpret_cast<uint32_t*>(arg->glob_addr) + x.b * x.n;
   for (uint32_t e = x.tid; e < x.n; e += x.nt)
     glob[e] = x.own[e];

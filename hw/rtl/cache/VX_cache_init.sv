@@ -18,11 +18,16 @@
 // go. At the device's shared level (SHARED_LEVEL) a fence (is_flush with
 // is_fence) drains instead: only the fence waits, until the banks have retired
 // every request accepted before it, and no line is walked.
+// With CTA_FENCE, a CTA-scope fence (is_fence_cta) drains here whatever the
+// level, and goes on as a plain read of its word, so no level below sees it.
 module VX_cache_init import VX_gpu_pkg::*; #(
     parameter NUM_REQS  = 4,                  // Number of Word requests per cycle
     parameter NUM_BANKS = 1,                  // Number of banks
     parameter TAG_WIDTH = UUID_WIDTH + 1,     // core request tag size
     parameter BANK_SEL_LATENCY = 1,           // Bank select latency
+`ifdef VX_CFG_EXT_DLMEM_ENABLE
+    parameter CTA_FENCE = 0,
+`endif
     parameter SHARED_LEVEL = 0                // every memory agent reaches this cache
 ) (
     input wire              clk,
@@ -97,8 +102,14 @@ module VX_cache_init import VX_gpu_pkg::*; #(
     wire [NUM_REQS-1:0] fence_req_mask;
     for (genvar i = 0; i < NUM_REQS; ++i) begin : g_flush_req_mask
         assign flush_req_mask[i] = core_bus_in_if[i].req_valid && core_bus_in_if[i].req_data.attr[MEM_ATTR_FLUSH_OFFS];
+    `ifdef VX_CFG_EXT_DLMEM_ENABLE
+        assign fence_req_mask[i] = flush_req_mask[i]
+                                && (((SHARED_LEVEL != 0) && core_bus_in_if[i].req_data.attr[MEM_ATTR_FENCE_OFFS])
+                                 || ((CTA_FENCE != 0) && core_bus_in_if[i].req_data.attr[MEM_ATTR_FENCE_CTA_OFFS]));
+    `else
         assign fence_req_mask[i] = flush_req_mask[i] && (SHARED_LEVEL != 0)
                                 && core_bus_in_if[i].req_data.attr[MEM_ATTR_FENCE_OFFS];
+    `endif
     end
     wire flush_req_enable = (| flush_req_mask);
     wire walk_req_enable  = (| (flush_req_mask & ~fence_req_mask));
@@ -126,11 +137,29 @@ module VX_cache_init import VX_gpu_pkg::*; #(
         endcase
     end
 
+`ifdef VX_CFG_EXT_DLMEM_ENABLE
+    for (genvar i = 0; i < NUM_REQS; ++i) begin : g_core_bus_out_req
+        assign core_bus_out_if[i].req_valid = core_bus_in_if[i].req_valid && input_enable[i];
+        if (CTA_FENCE != 0) begin : g_cta
+            wire is_cta = core_bus_in_if[i].req_data.attr[MEM_ATTR_FENCE_CTA_OFFS];
+            always @(*) begin
+                core_bus_out_if[i].req_data = core_bus_in_if[i].req_data;
+                core_bus_out_if[i].req_data.attr[MEM_ATTR_FLUSH_OFFS]     = core_bus_in_if[i].req_data.attr[MEM_ATTR_FLUSH_OFFS] && ~is_cta;
+                core_bus_out_if[i].req_data.attr[MEM_ATTR_FENCE_OFFS]     = core_bus_in_if[i].req_data.attr[MEM_ATTR_FENCE_OFFS] && ~is_cta;
+                core_bus_out_if[i].req_data.attr[MEM_ATTR_FENCE_CTA_OFFS] = 1'b0;
+            end
+        end else begin : g_no_cta
+            assign core_bus_out_if[i].req_data = core_bus_in_if[i].req_data;
+        end
+        assign core_bus_in_if[i].req_ready  = core_bus_out_if[i].req_ready && input_enable[i];
+    end
+`else
     for (genvar i = 0; i < NUM_REQS; ++i) begin : g_core_bus_out_req
         assign core_bus_out_if[i].req_valid = core_bus_in_if[i].req_valid && input_enable[i];
         assign core_bus_out_if[i].req_data  = core_bus_in_if[i].req_data;
         assign core_bus_in_if[i].req_ready  = core_bus_out_if[i].req_ready && input_enable[i];
     end
+`endif
 
     for (genvar i = 0; i < NUM_REQS; ++i) begin : g_core_bus_in_rsp
         assign core_bus_in_if[i].rsp_valid  = core_bus_out_if[i].rsp_valid;
@@ -161,7 +190,11 @@ module VX_cache_init import VX_gpu_pkg::*; #(
     wire drain_start = (state == STATE_IDLE) && ~walk_req_enable && fence_req_enable;
     wire drain_banks;
 
+`ifdef VX_CFG_EXT_DLMEM_ENABLE
+    if ((SHARED_LEVEL != 0) || (CTA_FENCE != 0)) begin : g_drain
+`else
     if (SHARED_LEVEL != 0) begin : g_drain
+`endif
 
         // The banks may start a drain only once every request accepted before
         // it has entered its bank. The bank select stage reorders requests, so

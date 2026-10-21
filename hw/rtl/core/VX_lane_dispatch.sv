@@ -17,7 +17,8 @@ module VX_lane_dispatch import VX_gpu_pkg::*; #(
     parameter BLOCK_SIZE = 1,
     parameter NUM_LANES  = 1,
     parameter OUT_BUF    = 0,
-    parameter MAX_FANOUT = `MAX_FANOUT
+    parameter MAX_FANOUT = `MAX_FANOUT,
+    parameter EX_TYPE    = -1 // execute unit served (EX_*), -1 if none applies
 ) (
     input  wire             clk,
     input  wire             reset,
@@ -30,6 +31,7 @@ module VX_lane_dispatch import VX_gpu_pkg::*; #(
 );
     `STATIC_ASSERT (`IS_DIVISBLE(`VX_CFG_ISSUE_WIDTH, BLOCK_SIZE), ("invalid parameter"))
     `STATIC_ASSERT (`IS_DIVISBLE(`VX_CFG_SIMD_WIDTH, NUM_LANES), ("invalid parameter"))
+    `UNUSED_PARAM (EX_TYPE)
 
     `DECL_EXECUTE_T (pe, NUM_LANES);
     localparam IN_DATAW     = $bits(dispatch_t);
@@ -49,9 +51,14 @@ module VX_lane_dispatch import VX_gpu_pkg::*; #(
     localparam DATA_IN_TMASK_OFF = IN_DATAW - (UUID_WIDTH + ISSUE_WIS_W + NCTA_WIDTH + SIMD_IDX_W + `VX_CFG_SIMD_WIDTH);
     localparam DATA_IN_OPDS_OFF = 1 + 1;
 
+    // A packet narrower than 4 lanes splits a group of 4 threads, which
+    // WGATHER and DXA combine: their packets are all issued, active or not.
+    localparam ALL_PKTS = (NUM_LANES < 4);
+
     typedef struct packed {
         logic [2:0][NUM_LANES-1:0][`VX_CFG_XLEN-1:0] rsdata;
         logic [NUM_LANES-1:0] tmask;
+        logic all;
     } packet_t;
 
     wire [`VX_CFG_ISSUE_WIDTH-1:0] dispatch_valid;
@@ -138,7 +145,25 @@ module VX_lane_dispatch import VX_gpu_pkg::*; #(
 
             packet_t [NUM_PACKETS-1:0] packets;
 
+            wire all_pkts;
+            if (ALL_PKTS && (EX_TYPE == EX_ALU)) begin : g_all_alu
+                dispatch_t dispatch_in;
+                assign dispatch_in = dispatch_data[issue_idx];
+                assign all_pkts = (dispatch_in.op_args.alu.xtype == ALU_TYPE_OTHER) && dispatch_in.op_type[3];
+                `UNUSED_VAR (dispatch_in)
+        `ifdef VX_CFG_EXT_DXA_ENABLE
+            end else if (ALL_PKTS && (EX_TYPE == EX_SFU)) begin : g_all_sfu
+                dispatch_t dispatch_in;
+                assign dispatch_in = dispatch_data[issue_idx];
+                assign all_pkts = (dispatch_in.op_type == INST_OP_BITS'(INST_SFU_DXA));
+                `UNUSED_VAR (dispatch_in)
+        `endif
+            end else begin : g_all_none
+                assign all_pkts = 1'b0;
+            end
+
             for (genvar i = 0; i < NUM_PACKETS; ++i) begin : g_per_packet_data
+                assign packets[i].all = all_pkts;
                 for (genvar j = 0; j < NUM_LANES; ++j) begin : g_j
                     localparam k = i * NUM_LANES + j;
                     assign packets[i].tmask[j]   = dispatch_tmask[k];
@@ -156,7 +181,7 @@ module VX_lane_dispatch import VX_gpu_pkg::*; #(
 
             VX_nz_iterator #(
                 .DATAW   ($bits(packet_t)),
-                .KEYW    (NUM_LANES),
+                .KEYW    (NUM_LANES + 1),
                 .N       (NUM_PACKETS),
                 .OUT_REG (FANOUT_ENABLE)
             ) packet_iter (
@@ -173,6 +198,7 @@ module VX_lane_dispatch import VX_gpu_pkg::*; #(
             );
 
             assign block_tmask[block_idx] = block_packet.tmask;
+            `UNUSED_VAR (block_packet.all)
             assign block_rsdata[block_idx] = block_packet.rsdata;
             assign block_pid[block_idx]   = start_p;
             assign block_sop[block_idx]   = is_first_p;

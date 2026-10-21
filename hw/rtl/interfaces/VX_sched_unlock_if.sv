@@ -19,11 +19,13 @@
 //                by the op itself retiring: an RTU TRACE once its burst has handed
 //                the RTU the ray, a WAIT once a record has landed and it returns
 //                the status; in DLMEM builds, an acquire AMO once the LSU returns
-//                its last response. Never by an unrelated event, so the pulse
-//                cannot race the stall it clears — decode set that stall strictly
-//                earlier.
+//                its last response; with wgmma groups, a wait_group N once at most
+//                N of the warp's groups are pending. Never by an unrelated event,
+//                so the pulse cannot race the stall it clears — decode set that
+//                stall strictly earlier.
 //
-// Raisers: the RTU unit and, in DLMEM builds, each LSU block (one instance each).
+// Raisers: the RTU unit, in DLMEM builds each LSU block, and with wgmma groups each
+// TCU block (one instance each).
 // No trap, no PC redirect — a plain warp unlock, and nothing else.
 
 interface VX_sched_unlock_if import VX_gpu_pkg::*; ();

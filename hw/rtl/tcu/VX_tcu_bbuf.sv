@@ -199,8 +199,9 @@ module VX_tcu_bbuf import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
     // Mode the slot pair was filled under (sparse vs dense). On mode
     // transition for the same warpgroup we must refill.
     logic                       slot_is_sparse_r;
-    // K-major mode + per-WGMMA latched fields. Descriptor fields are latched
-    // on setup; per-compute step fields are latched when a fetch is allocated.
+    // The descriptor fields and steps of the fetch, latched when it is
+    // allocated: the blocks share the buffer but need not be in the same
+    // WGMMA, so a request is matched against its own descriptor.
     logic                       slot_row_major_r;
     logic [LDM_W-1:0]           slot_ldm_words_r;
     logic [3:0]                 slot_step_k_r;
@@ -213,33 +214,28 @@ module VX_tcu_bbuf import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
     logic [KM_CTR_W-1:0]        km_req_ctr_r;
     logic [KM_CTR_W-1:0]        km_rsp_ctr_r;
 
-    // The WGMMA wrapper supplies the setup-latched descriptor on compute uops.
+    // The WGMMA wrapper supplies each block's own latched descriptor on its
+    // later compute uops.
     `UNUSED_VAR (req_step_m)
-    wire [BANK_ADDR_WIDTH-1:0] effective_desc_b_row_base =
-        req_is_first_uop ? desc_b_row_base : slot_desc_b_row_base_r;
-    // K-major slot fields (slot_row_major_r / slot_ldm_words_r /
-    // slot_step_k_r / slot_step_n_r) are latched at alloc_en — see the
-    // always_ff below. The K-major addressing arithmetic reads them
-    // directly. desc_b_ldm_words on the bus is used only for setup.
 
     // Per-mode fetch addresses.
     wire [BANK_ADDR_WIDTH-1:0] fetch_addr_dense =
-        effective_desc_b_row_base + BANK_ADDR_WIDTH'(dense_offset);
+        desc_b_row_base + BANK_ADDR_WIDTH'(dense_offset);
     wire [BANK_ADDR_WIDTH-1:0] fetch_addr_a_sparse =
-        effective_desc_b_row_base + BANK_ADDR_WIDTH'(sp_logrow_a >> LG_XLEN_RATIO);
+        desc_b_row_base + BANK_ADDR_WIDTH'(sp_logrow_a >> LG_XLEN_RATIO);
     wire [BANK_ADDR_WIDTH-1:0] fetch_addr_b_sparse =
-        effective_desc_b_row_base + BANK_ADDR_WIDTH'(sp_logrow_b >> LG_XLEN_RATIO);
+        desc_b_row_base + BANK_ADDR_WIDTH'(sp_logrow_b >> LG_XLEN_RATIO);
 
     wire [BANK_ADDR_WIDTH-1:0] fetch_addr_a =
         req_is_sparse ? fetch_addr_a_sparse : fetch_addr_dense;
 
     wire bank_row_resident_dense =
-        slot_a_valid_r && !slot_is_sparse_r
+        slot_a_valid_r && !slot_is_sparse_r && !slot_row_major_r
         && (slot_a_addr_r == fetch_addr_dense)
         && (slot_a_sub_half_r == dense_sub_half);
 
     wire bank_row_resident_sparse =
-        slot_a_valid_r && slot_is_sparse_r
+        slot_a_valid_r && slot_is_sparse_r && !slot_row_major_r
         && (slot_a_addr_r == fetch_addr_a_sparse)
         && (slot_a_sub_half_r == sp_sub_a)
         && (!SPARSE_TWO_SLOT || (slot_b_valid_r
@@ -253,15 +249,15 @@ module VX_tcu_bbuf import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
         slot_a_valid_r && slot_row_major_r
         && (!slot_is_sparse_r || slot_b_valid_r)
         && (!req_is_first_uop || refetched_for_first_uop_r)
+        && (slot_desc_b_row_base_r == desc_b_row_base)
+        && (slot_ldm_words_r == desc_b_ldm_words)
         && (slot_cta_id_r == req_cta_id)
         && (slot_step_k_r == req_step_k)
         && (slot_step_n_r == req_step_n);
 
     // Block-major residency is the existing dense/sparse branch; K-major
-    // overrides it when the first compute descriptor or latched slot mode
-    // selects K-major.
-    wire req_wants_kmajor =
-        req_is_first_uop ? (desc_b_ldm_words != '0) : slot_row_major_r;
+    // overrides it when the request's descriptor selects K-major.
+    wire req_wants_kmajor = (desc_b_ldm_words != '0);
 
     wire bank_row_resident = req_wants_kmajor
         ? bank_row_resident_kmajor
@@ -286,8 +282,7 @@ module VX_tcu_bbuf import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
     // the values being latched into the slot) and each request/response
     // accumulates the row stride, keeping the multiplier chain off the LMEM
     // request-address and response-lane paths.
-    wire [LDM_W-1:0] km_ldm_words_alloc =
-        req_is_first_uop ? desc_b_ldm_words : slot_ldm_words_r;
+    wire [LDM_W-1:0] km_ldm_words_alloc = desc_b_ldm_words;
     wire [3:0] km_k_words_alloc = req_is_sparse ? 4'(TCU_TC_K) : 4'(TCU_WG_FEDP_K);
 
     wire [KM_OFF_W-1:0] km_word_off_init =
@@ -402,13 +397,6 @@ module VX_tcu_bbuf import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
                 if (tcu_lmem_if.req_valid && tcu_lmem_if.req_ready)
                     req_inflight_r <= 1'b1;
 
-                // Latch descriptor fields on the first compute uop.
-                if (req_valid && req_is_first_uop) begin
-                    slot_desc_b_row_base_r <= desc_b_row_base;
-                    slot_ldm_words_r       <= desc_b_ldm_words;
-                    slot_row_major_r       <= (desc_b_ldm_words != '0);
-                end
-
                 if (last_rsp && req_is_first_uop)
                     refetched_for_first_uop_r <= 1'b1;
                 else if (fire && !req_is_first_uop)
@@ -442,8 +430,9 @@ module VX_tcu_bbuf import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
                             slot_step_k_r       <= req_step_k;
                             slot_step_n_r       <= req_step_n;
                             slot_cta_id_r       <= req_cta_id;
-                            // slot_row_major_r is latched from the setup
-                            // descriptor and reused for all compute refills.
+                            slot_desc_b_row_base_r <= desc_b_row_base;
+                            slot_ldm_words_r    <= desc_b_ldm_words;
+                            slot_row_major_r    <= (desc_b_ldm_words != '0);
                             km_req_ctr_r        <= '0;
                             km_rsp_ctr_r        <= '0;
                             km_word_off_req_r   <= km_word_off_init;

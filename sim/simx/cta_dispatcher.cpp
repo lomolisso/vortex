@@ -18,12 +18,13 @@
 #include <algorithm>
 #include <cassert>
 #include <iostream>
+#include "debug.h"
 
 using namespace vortex;
 
 CtaDispatcher::CtaDispatcher(const SimContext& ctx, const char* name, Core* core)
   : SimObject<CtaDispatcher>(ctx, name)
-  , bus_in(this, 1)
+  , bus_in(this, 2)
   , credit_out(this)
 #ifdef VX_CFG_EXT_DLMEM_ENABLE
   , PeerWrOut(this)
@@ -37,6 +38,12 @@ CtaDispatcher::CtaDispatcher(const SimContext& ctx, const char* name, Core* core
   , slot_rem_warps_(num_warps_, 0)
   , wid_to_slot_(num_warps_, num_warps_)  // num_warps_ = invalid/unassigned
   , tail_slot_(0)
+  , slot_free_at_(num_warps_, 0)
+  , fire_valid_(false)
+  , fire_last_(false)
+  , fire_wid_(0)
+  , act_valid_(false)
+  , act_wid_(0)
   , has_cta_(false)
   , cur_slot_(0)
   , cta_size_(0)
@@ -51,7 +58,6 @@ CtaDispatcher::CtaDispatcher(const SimContext& ctx, const char* name, Core* core
   , evt_(num_warps_, false)
   , gang_(num_warps_, 0)
   , epoch_(num_warps_, 0)
-  , done_pend_until_(num_warps_, 0)
   , peer_row_(num_warps_)
   , legacy_base_(0)
   , cbar_wr_valid_(false)
@@ -62,22 +68,28 @@ CtaDispatcher::CtaDispatcher(const SimContext& ctx, const char* name, Core* core
   for (auto& lanes : warp_init_lanes_) {
     lanes.resize(num_threads_);
   }
+  done_cycle_.fill(0);
 }
 
 CtaDispatcher::~CtaDispatcher() {}
 
 void CtaDispatcher::on_reset() {
   has_cta_    = false;
+  fire_valid_ = false;
+  act_valid_  = false;
+  dispatched_.reset();
+  exited_.reset();
   tail_slot_  = 0;
   for (uint32_t i = 0; i < num_warps_; ++i) {
     slot_rem_warps_[i] = 0;
+    slot_free_at_[i]   = 0;
     wid_to_slot_[i]    = num_warps_;  // invalid
   }
+  done_cycle_.fill(0);
   cur_kernel_pc_ = 0;
 #ifdef VX_CFG_EXT_DLMEM_ENABLE
   for (uint32_t i = 0; i < num_warps_; ++i) {
-    evt_[i]             = false;
-    done_pend_until_[i] = 0;
+    evt_[i] = false;
   }
   legacy_base_ = 0;
   cbar_wr_valid_ = false;
@@ -115,192 +127,220 @@ uint32_t CtaDispatcher::usable_slots(uint32_t stride) const {
 }
 
 bool CtaDispatcher::step(const WarpMask& active_warps, uint32_t* wid_out, cta_warp_record_t* rec_out) {
+  uint64_t now = SimPlatform::instance().cycles();
+  // A warp goes active the cycle after its selection is registered.
+  bool out = act_valid_;
+  if (act_valid_) {
+    *wid_out = act_wid_;
+    *rec_out = act_rec_;
+    act_valid_ = false;
+  }
+  if (fire_valid_) {
+    act_valid_ = true;
+    act_wid_   = fire_wid_;
+    act_rec_   = fire_rec_;
+  }
+  bool fire = false;
   if (!has_cta_) {
-    // The KMU pushes CTAs down a registered, credit-gated launch lane; the
-    // endpoint holds the one CTA committed to this core. It is popped only on
-    // admission — an unadmitted CTA keeps the lane's credit, so the KMU
-    // cannot over-commit work to a busy core.
-    if (bus_in.empty())
-      return false;
-    const kmu_req_t& next = bus_in.peek();
+    // Idle: take the head CTA; its first warp is picked from the next cycle.
+    this->admit(now);
+  } else if (fire_valid_ && fire_last_) {
+    // The CTA's last warp was picked last cycle: idle again from the next.
+    has_cta_ = false;
+  } else {
+    // Lowest warp slot not active, not given a rank, not exited this cycle (registered in the RTL).
+    int free_wid = -1;
+    for (int wid = 0; wid < (int)num_warps_; ++wid) {
+      if (!active_warps.test(wid) && !dispatched_.test(wid) && !exited_.test(wid)) {
+        free_wid = wid;
+        break;
+      }
+    }
+    if (free_wid >= 0) {
+      // Skip the startup only if every lane this launch activates has already run it.
+      uint32_t active = (block_size_rem_ >= num_threads_) ? num_threads_ : block_size_rem_;
+      auto& inited = warp_init_lanes_[free_wid];
+      bool needs_init = false;
+      for (uint32_t t = 0; t < active; ++t) {
+        if (!inited.test(t)) {
+          needs_init = true;
+          break;
+        }
+      }
+      this->next_warp(needs_init, &fire_rec_);
+      for (uint32_t t = 0; t < active; ++t) {
+        inited.set(t);
+      }
+      wid_to_slot_[free_wid] = cur_slot_;
+      dispatched_.set(free_wid);
+      fire_wid_  = uint32_t(free_wid);
+      fire_last_ = (rank_ >= cta_size_);
+      fire = true;
+    }
+  }
+  fire_valid_ = fire;
+  exited_.reset();
+  return out;
+}
 
-    // Fixed-stride admission. Round the per-CTA LMEM size up to a
-    // MEM_BLOCK_SIZE multiple — this uniform stride is the slot pitch.
-    // Multicast resolves receiver destinations as `issuer_base + r * stride`
-    // and the LMEM model is block-addressed (byteen-masked), so a non-aligned
-    // stride would truncate the destination; the descriptor handler rounds
-    // its stride the same way to stay consistent.
-    uint32_t stride = (next.lmem_size + VX_CFG_MEM_BLOCK_SIZE - 1u)
-                      & ~uint32_t(VX_CFG_MEM_BLOCK_SIZE - 1u);
-    uint32_t max_slots = usable_slots(stride);
+void CtaDispatcher::admit(uint64_t now) {
+  // The count write-back of a warp that exited RETIRE_DELAY cycles ago holds
+  // the table's write port.
+  uint64_t blk = now - RETIRE_DELAY;
+  if (bus_in.empty() || (now >= RETIRE_DELAY && done_cycle_[blk % done_cycle_.size()] == blk + 1)) {
+    return;
+  }
+  const kmu_req_t& next = bus_in.peek();
 
-    // Round-robin slot allocation over the usable range. Normalize the tail in
-    // case a kernel transition shrank the usable count.
-    if (tail_slot_ >= max_slots)
-      tail_slot_ = 0;
-    uint32_t base = tail_slot_;
+  // Fixed-stride admission. Round the per-CTA LMEM size up to a
+  // MEM_BLOCK_SIZE multiple — this uniform stride is the slot pitch.
+  // Multicast resolves receiver destinations as `issuer_base + r * stride`
+  // and the LMEM model is block-addressed (byteen-masked), so a non-aligned
+  // stride would truncate the destination; the descriptor handler rounds
+  // its stride the same way to stay consistent.
+  uint32_t stride = (next.lmem_size + VX_CFG_MEM_BLOCK_SIZE - 1u) & ~uint32_t(VX_CFG_MEM_BLOCK_SIZE - 1u);
+  uint32_t max_slots = usable_slots(stride);
+
+  // Round-robin slot allocation over the usable range. Normalize the tail in
+  // case a kernel transition shrank the usable count.
+  if (tail_slot_ >= max_slots) {
+    tail_slot_ = 0;
+  }
+  uint32_t base = tail_slot_;
 
 #ifdef VX_CFG_EXT_DLMEM_ENABLE
-    // A SPREAD block lands in the slot its gang unit reserved; it bypasses the
-    // cluster window and the tail. The payload decides, `pinned` only routes.
-    bool is_pinned = (next.policy == KMU_POLICY_SPREAD);
-    __assert(next.pinned == is_pinned, "a SPREAD block must arrive pinned");
-    uint64_t now = SimPlatform::instance().cycles();
-    auto slot_busy = [&](uint32_t s) {
-      return slot_rem_warps_[s] != 0 || now < done_pend_until_[s];
-    };
-#else
-    auto slot_busy = [&](uint32_t s) {
-      return slot_rem_warps_[s] != 0;
-    };
+  // A SPREAD block takes the slot its gang reserved, past the window and tail.
+  bool is_pinned = (next.policy == KMU_POLICY_SPREAD);
+  __assert(next.pinned == is_pinned, "a SPREAD block must arrive pinned");
+  __assert(!is_pinned || next.dest_core == my_core_, "a pinned block reached core " << my_core_ << ", not " << next.dest_core);
 #endif
+  auto slot_busy = [&](uint32_t s) {
+    return slot_rem_warps_[s] != 0 || now < slot_free_at_[s];
+  };
 
-    // Cluster start: reserve K consecutive usable slots. Pre-wrap to 0 if the
-    // window would overrun the usable range so the cluster stays contiguous
-    // (members must occupy consecutive slots for multicast). All K must be free
-    // up front so the following members never stall mid-cluster.
-    uint32_t k = 1;
+  // Cluster start: reserve K consecutive usable slots. Pre-wrap to 0 if the
+  // window would overrun the usable range so the cluster stays contiguous
+  // (members must occupy consecutive slots for multicast). All K must be free
+  // up front so the following members never stall mid-cluster.
+  uint32_t k = 1;
 #ifdef VX_CFG_EXT_DLMEM_ENABLE
-    if (is_pinned) {
-      base = next.forced_slot;
-      // The gang's mirror frees a slot only after its done event left, so this cannot fire.
-      __assert(base < num_warps_ && !slot_busy(base), "a pinned block's forced slot is not free");
-    } else
+  if (is_pinned) {
+    base = next.forced_slot;
+    // The gang's mirror frees a slot only after its done event left, so this cannot fire.
+    __assert(base < num_warps_ && !slot_busy(base), "a pinned block's forced slot is not free");
+  } else
 #endif
-    if (next.is_first_of_cluster) {
-      k = next.cluster_dim[0]
-        * next.cluster_dim[1]
-        * next.cluster_dim[2];
-      if (k == 0) k = 1;
-      if (base + k > max_slots)
-        base = 0;
-      if (k > max_slots)
-        k = max_slots;  // cluster larger than co-residency: clamp (degenerate)
-      for (uint32_t i = 0; i < k; ++i) {
-        if (slot_busy(base + i))
-          return false;  // window not free yet — wait
-      }
-    } else {
-      // Standalone CTA, or a following cluster member (its slot was reserved by
-      // the first-of-cluster window above and is guaranteed free).
-      if (slot_busy(base))
-        return false;
+  if (next.is_first_of_cluster) {
+    k = next.cluster_dim[0]
+      * next.cluster_dim[1]
+      * next.cluster_dim[2];
+    if (k == 0) {
+      k = 1;
     }
-
-    // A new launch is a new context: every slot owes the startup again. Keyed on
-    // the launch id, not the PC, so relaunching the same kernel still re-inits.
-    cur_kernel_pc_ = next.PC;
-    if (next.ctx_id != cur_ctx_id_) {
-      cur_ctx_id_ = next.ctx_id;
-      for (uint32_t i = 0; i < num_warps_; ++i) {
-        warp_init_lanes_[i].reset();
+    if (base + k > max_slots) {
+      base = 0;
+    }
+    if (k > max_slots) {
+      k = max_slots;  // cluster larger than co-residency: clamp (degenerate)
+    }
+    for (uint32_t i = 0; i < k; ++i) {
+      if (slot_busy(base + i)) {
+        return;  // window not free yet — wait
       }
     }
+  } else if (slot_busy(base)) {
+    // Standalone CTA, or a later cluster member (its window slot is reserved).
+    return;
+  }
 
-    // Accept the CTA into its slot; the pop returns the lane's credit and
-    // the admission is reported back to the KMU's launch accounting.
-    cta_ = next;
-    bus_in.pop();
-    credit_out.send(1, 1);
+  // A new launch (by id, not PC) is a new context: every slot owes the startup again.
+  cur_kernel_pc_ = next.PC;
+  if (next.ctx_id != cur_ctx_id_) {
+    cur_ctx_id_ = next.ctx_id;
+    for (uint32_t i = 0; i < num_warps_; ++i) {
+      warp_init_lanes_[i].reset();
+    }
+  }
 
-    cta_size_       = (cta_.block_size + num_threads_ - 1) / num_threads_;
-    rank_           = 0;
-    block_size_rem_ = cta_.block_size;
-    thread_idx_[0] = thread_idx_[1] = thread_idx_[2] = 0;
+  // Accept the CTA into its slot; the skid's ready sees the pop next cycle.
+  DT(1, this->name() << " kmu-accept: cta_id=" << next.cta_id << ", slot=" << base);
+  cta_ = next;
+  bus_in.pop();
+  credit_out.send(1, 0);
 
-    cur_slot_  = base;
-    lmem_addr_ = lmem_base_ + uint64_t(base) * stride;
-    slot_rem_warps_[base] = cta_size_;
+  cta_size_       = (cta_.block_size + num_threads_ - 1) / num_threads_;
+  rank_           = 0;
+  block_size_rem_ = cta_.block_size;
+  thread_idx_[0] = thread_idx_[1] = thread_idx_[2] = 0;
+
+  cur_slot_  = base;
+  lmem_addr_ = lmem_base_ + uint64_t(base) * stride;
+  slot_rem_warps_[base] = cta_size_;
 #ifdef VX_CFG_EXT_DLMEM_ENABLE
-    if (!is_pinned) {
-      tail_slot_ = (base + 1) % max_slots;
-    }
-    evt_[base]   = is_pinned;
-    gang_[base]  = cta_.gang_id;
-    epoch_[base] = cta_.epoch;
-    cbar_wr_valid_ = true;
-    cbar_wr_slot_  = base;
-    cbar_wr_info_  = CbarSlot{};
-    if (is_pinned) {
-      peer_row_[base] = cta_.row;
-      cbar_wr_info_.gang    = (cta_.row.k > 1);
-      cbar_wr_info_.gang_id = cta_.gang_id;
-      cbar_wr_info_.epoch   = cta_.epoch;
-      cbar_wr_info_.base    = base;
-      cbar_wr_info_.k       = cta_.row.k;
-    } else {
-      if (cta_.is_first_of_cluster) {
-        legacy_base_ = base;
-      }
-      // the row spans the clamped window, as the RTL builds it
-      uint32_t K = cta_.cluster_dim[0] * cta_.cluster_dim[1] * cta_.cluster_dim[2];
-      K = std::min((K == 0) ? 1u : K, max_slots);
-      peer_row_[base] = dlmem_ref::legacy_row(my_core_, legacy_base_, K, VX_CFG_DLMEM_MAX_CLUSTER);
-      cbar_wr_info_.base = legacy_base_;
-      cbar_wr_info_.k    = K;
-    }
-    // The RTL registers the row write one cycle after admission.
-    PeerWrOut.send({base, peer_row_[base], stride}, 1);
-#else
+  if (!is_pinned) {
     tail_slot_ = (base + 1) % max_slots;
+  }
+  evt_[base]   = is_pinned;
+  gang_[base]  = cta_.gang_id;
+  epoch_[base] = cta_.epoch;
+  cbar_wr_valid_ = true;
+  cbar_wr_slot_  = base;
+  cbar_wr_info_  = CbarSlot{};
+  if (is_pinned) {
+    peer_row_[base] = cta_.row;
+    cbar_wr_info_.gang    = (cta_.row.k > 1);
+    cbar_wr_info_.gang_id = cta_.gang_id;
+    cbar_wr_info_.epoch   = cta_.epoch;
+    cbar_wr_info_.base    = base;
+    cbar_wr_info_.k       = cta_.row.k;
+  } else {
+    if (cta_.is_first_of_cluster) {
+      legacy_base_ = base;
+    }
+    // the row spans the clamped window, as the RTL builds it
+    uint32_t K = cta_.cluster_dim[0] * cta_.cluster_dim[1] * cta_.cluster_dim[2];
+    K = std::min((K == 0) ? 1u : K, max_slots);
+    peer_row_[base] = dlmem_ref::legacy_row(my_core_, legacy_base_, K, VX_CFG_DLMEM_MAX_CLUSTER);
+    cbar_wr_info_.base = legacy_base_;
+    cbar_wr_info_.k    = K;
+  }
+  // The RTL registers the row write one cycle after admission.
+  PeerWrOut.send({base, peer_row_[base], stride}, 1);
+#else
+  tail_slot_ = (base + 1) % max_slots;
 #endif
 
-    has_cta_ = true;
-  }
-
-  // Find lowest-index free warp slot.
-  int free_wid = -1;
-  for (int wid = 0; wid < (int)num_warps_; ++wid) {
-    if (!active_warps.test(wid)) {
-      free_wid = wid;
-      break;
-    }
-  }
-  if (free_wid < 0) return false;
-
-  // Skip the startup only if every lane this launch activates has already run it.
-  uint32_t active = (block_size_rem_ >= num_threads_) ? num_threads_ : block_size_rem_;
-  auto& inited = warp_init_lanes_[free_wid];
-  bool needs_init = false;
-  for (uint32_t t = 0; t < active; ++t) {
-    if (!inited.test(t)) {
-      needs_init = true;
-      break;
-    }
-  }
-
-  if (!next_warp(needs_init, rec_out))
-    return false;
-
-  for (uint32_t t = 0; t < active; ++t) {
-    inited.set(t);
-  }
-
-  wid_to_slot_[free_wid] = cur_slot_;
-  *wid_out = uint32_t(free_wid);
-  return true;
+  dispatched_.reset();
+  has_cta_ = true;
 }
 
 #ifdef VX_CFG_EXT_DLMEM_ENABLE
 std::optional<CtaDone> CtaDispatcher::warp_done(uint32_t wid) {
+  exited_.set(wid);
   uint32_t slot = wid_to_slot_[wid];
   if (slot >= num_warps_) return std::nullopt;  // not a CTA-dispatcher warp
 #else
 void CtaDispatcher::warp_done(uint32_t wid) {
+  exited_.set(wid);
   uint32_t slot = wid_to_slot_[wid];
   if (slot >= num_warps_) return;  // not a CTA-dispatcher warp
 #endif
   wid_to_slot_[wid] = num_warps_;  // clear assignment
   assert(slot_rem_warps_[slot] > 0);
   // When the last warp of a CTA exits, its slot (and the LMEM region at
-  // slot × stride) frees immediately for reuse — no in-order reclaim.
-  --slot_rem_warps_[slot];
+  // slot × stride) frees for reuse — no in-order reclaim.
+  uint64_t now = SimPlatform::instance().cycles();
+  done_cycle_[now % done_cycle_.size()] = now + 1;
+  if (--slot_rem_warps_[slot] == 0) {
+    slot_free_at_[slot] = now + RETIRE_DELAY;
+  }
 #ifdef VX_CFG_EXT_DLMEM_ENABLE
-  if (slot_rem_warps_[slot] != 0 || !evt_[slot])
+  if (slot_rem_warps_[slot] != 0 || !evt_[slot]) {
     return std::nullopt;
-  // The RTL holds the slot two cycles more while its done event is pending.
+  }
+  // The slot stays taken until its done event leaves, a cycle later.
   evt_[slot] = false;
-  done_pend_until_[slot] = SimPlatform::instance().cycles() + 2;
+  slot_free_at_[slot] = now + RETIRE_DELAY + 1;
   return CtaDone{slot, gang_[slot], epoch_[slot]};
 #endif
 }
@@ -333,9 +373,7 @@ void CtaDispatcher::mark_slot_inited(uint32_t wid, const ThreadMask& tmask) {
   }
 }
 
-bool CtaDispatcher::next_warp(bool do_init, cta_warp_record_t* out) {
-  if (!has_cta_) return false;
-
+void CtaDispatcher::next_warp(bool do_init, cta_warp_record_t* out) {
   out->do_init  = do_init;
   out->PC       = Word(cta_.PC);
   out->entry    = Word(cta_.entry);
@@ -388,9 +426,4 @@ bool CtaDispatcher::next_warp(bool do_init, cta_warp_record_t* out) {
   block_size_rem_ -= (block_size_rem_ >= num_threads_) ? num_threads_ : block_size_rem_;
 
   ++rank_;
-  if (rank_ >= cta_size_) {
-    has_cta_ = false;
-  }
-
-  return true;
 }

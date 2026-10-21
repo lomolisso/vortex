@@ -56,8 +56,8 @@ CtaGang::CtaGang(const SimContext& ctx, const char* name, const dlmem_ref::Cfg& 
   // lane's credit loop.
   , bus_in(this, 2)
   , credit_out(this)
-  , bus_out(cfg.ncc, this)
-  , credit_in(cfg.ncc, this)
+  , bus_out(this)
+  , credit_in(this)
   , release_out(cfg.ncc, this)
   , cfg_(cfg)
   , blocks_(0)
@@ -72,10 +72,8 @@ CtaGang::CtaGang(const SimContext& ctx, const char* name, const dlmem_ref::Cfg& 
   , policy_(KMU_POLICY_DEFAULT)
   , k_(1)
   , w_(1)
-  , rr_core_(0)
-  , locked_(false)
-  , lock_core_(0)
-  , inflight_(cfg.ncc, 0)
+  , out_({LaunchTree::Level(1, true)})
+  , direct_(cfg.num_sockets * cfg.socket_size == 1)
   // From the cycle a release leaves: the gbar unit's response register, then
   // one response-fork stage per fan-out level that exists.
   , rel_delay_(1 + (cfg.num_sockets > 1 ? 1 : 0) + (cfg.socket_size > 1 ? 1 : 0))
@@ -88,7 +86,7 @@ void CtaGang::on_reset() {
   // A launch is not a device reset: ctx_ and the per-launch latches persist,
   // as in the RTL. Nothing is in flight here (busy() held the last launch),
   // so the placement state is the one the next launch's first beat would
-  // set; the legacy steering restarts with the KMU's round robin.
+  // set.
   dlmem_ref::reset(cfg_, mirror_);
   dlmem_ref::reset(cfg_, gids_);
   blocks_    = 0;
@@ -99,10 +97,7 @@ void CtaGang::on_reset() {
   failed_    = false;
   dirty_     = false;
   evt_q_.clear();
-  rr_core_   = 0;
-  locked_    = false;
-  lock_core_ = 0;
-  inflight_.assign(inflight_.size(), 0);
+  out_.reset();
 }
 
 void CtaGang::cta_event(const GangEvent& evt) {
@@ -124,15 +119,16 @@ bool CtaGang::id_free() const {
   return false;
 }
 
-bool CtaGang::lane_ready(uint32_t core) const {
-  return !bus_out.at(core).full() && inflight_.at(core) < Kmu::LAUNCH_CREDITS;
+bool CtaGang::out_ready(const LaunchTree::Beat& beat) const {
+  return out_.ready(beat);
 }
 
-void CtaGang::send_beat(uint32_t core, const kmu_req_t& beat) {
-  // The lane's own registered stage is the RTL unit's output register, so the
-  // unit adds one cycle to the launch path, as in hardware.
-  bus_out.at(core).send(beat, 0);
-  ++inflight_.at(core);
+void CtaGang::send_beat(const LaunchTree::Beat& beat) {
+  // The skid shows the beat at its output the next cycle: through the core
+  // lane's registered stage, or a cycle's delay into the fan-out.
+  out_.push(beat, SimPlatform::instance().cycles(), [this](uint32_t, const kmu_req_t& req) {
+    bus_out.send(req, direct_ ? 0 : 1);
+  });
   bus_in.pop();
   credit_out.send(1, 1);
 }
@@ -158,23 +154,12 @@ void CtaGang::apply_cbar(const GangEvent& a) {
 }
 
 void CtaGang::forward_legacy() {
-  uint32_t target = cfg_.ncc;
-  if (locked_) {
-    if (this->lane_ready(lock_core_)) {
-      target = lock_core_;
-    }
-  } else if (this->lane_ready(rr_core_)) {
-    target = rr_core_;
-  }
-  if (target == cfg_.ncc)
-    return;
-  kmu_req_t beat = bus_in.peek();
-  bool last = (beat.cluster_rank + 1 == cluster_size(beat));
-  this->send_beat(target, beat);
-  locked_    = !last;
-  lock_core_ = target;
-  if (!locked_) {
-    rr_core_ = (target + 1) % cfg_.ncc;
+  // The cluster's fan-out picks the core, and keeps a same-core cluster on it.
+  LaunchTree::Beat beat{};
+  beat.req = bus_in.peek();
+  beat.eop = (beat.req.cluster_rank + 1 == cluster_size(beat.req));
+  if (this->out_ready(beat)) {
+    this->send_beat(beat);
   }
 }
 
@@ -236,32 +221,35 @@ void CtaGang::emit() {
   if (bus_in.empty())
     return;
   const auto& p = members_.at(step_);
-  if (!this->lane_ready(p.core))
+  // A placed block is a whole message, routed to its core.
+  LaunchTree::Beat beat{};
+  beat.eop    = true;
+  beat.pinned = true;
+  beat.dest   = p.core;
+  if (!this->out_ready(beat)) {
     return;
-  kmu_req_t beat = bus_in.peek();
-  check(beat.cluster_rank == step_, "cta_gang: SPREAD beat out of rank order");
-  beat.pinned      = true;
-  beat.dest_core   = p.core;
-  beat.forced_slot = p.slot;
-  beat.gang_id     = cur_gang_;
-  beat.epoch       = cur_epoch_;
-  beat.row.k       = members_.size();
-  beat.row.peers   = members_;
-  this->send_beat(p.core, beat);
+  }
+  beat.req = bus_in.peek();
+  check(beat.req.cluster_rank == step_, "cta_gang: SPREAD beat out of rank order");
+  beat.req.pinned      = true;
+  beat.req.dest_core   = p.core;
+  beat.req.forced_slot = p.slot;
+  beat.req.gang_id     = cur_gang_;
+  beat.req.epoch       = cur_epoch_;
+  beat.req.row.k       = members_.size();
+  beat.req.row.peers   = members_;
+  this->send_beat(beat);
   if (++step_ == members_.size()) {
     state_ = State::IDLE;
   }
 }
 
 void CtaGang::on_tick() {
-  for (uint32_t c = 0; c < cfg_.ncc; ++c) {
-    auto& credits = credit_in.at(c);
-    while (!credits.empty()) {
-      credits.pop();
-      check(inflight_[c] != 0, "cta_gang: credit without a launch in flight");
-      --inflight_[c];
-    }
+  while (!credit_in.empty()) {
+    credit_in.pop();
+    out_.credit(0);
   }
+  out_.begin_cycle();
 
   // dirty_ is a register: an event lands in this cycle's placement snapshot,
   // but the retry gate sees it only from the next cycle.
@@ -335,7 +323,7 @@ void CtaGang::on_tick() {
   }
 
   bool rel_pend = std::find(gids_.rel_pend.begin(), gids_.rel_pend.end(), true) != gids_.rel_pend.end();
-  if (state_ == State::IDLE && evt_q_.empty() && bus_in.size() == 0 && !rel_pend) {
+  if (state_ == State::IDLE && evt_q_.empty() && bus_in.size() == 0 && credit_in.size() == 0 && !rel_pend) {
     this->tick_sleep();
   }
 }

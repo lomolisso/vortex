@@ -121,14 +121,22 @@ struct warp_t {
 class Scheduler : public SimObject<Scheduler> {
 public:
 #ifdef VX_CFG_EXT_DLMEM_ENABLE
-  // Per LSU block: the warp of an acquire AMO whose result has committed.
+  // Per LSU block: the warp of an acquire AMO whose result has committed; then,
+  // with wgmma groups, per TCU block: the warp whose wait_group is satisfied.
   std::vector<SimChannel<uint32_t>> UnlockIn;
+#if defined(VX_CFG_EXT_MBAR_ENABLE) && defined(VX_CFG_TCU_WGMMA_ENABLE)
+  static constexpr uint32_t NUM_UNLOCKS = VX_CFG_NUM_LSU_BLOCKS + VX_CFG_NUM_TCU_BLOCKS;
+#else
+  static constexpr uint32_t NUM_UNLOCKS = VX_CFG_NUM_LSU_BLOCKS;
+#endif
 #endif
 
   Scheduler(const SimContext& ctx, const char* name, Core* core);
   ~Scheduler();
 
   // ----- Warp lifecycle -----
+  // Clocks the CTA dispatcher; called every cycle, ahead of schedule().
+  void dispatch_cta();
   instr_trace_t* schedule(const WarpMask& warp_mask);
   void suspend(uint32_t wid);
   void resume(uint32_t wid);

@@ -40,6 +40,35 @@ void Dispatcher::on_reset() {
   }
 }
 
+static bool has_active(const ThreadMask& tmask, uint32_t first, uint32_t count) {
+  for (uint32_t t = first; t < first + count; ++t) {
+    if (tmask.test(t))
+      return true;
+  }
+  return false;
+}
+
+// A packet narrower than 4 lanes splits a group of 4 threads, which WGATHER
+// and DXA combine: their packets are all issued, active or not. As in the RTL,
+// the split happens first at the SIMD width, where an inactive slice of at
+// least 4 lanes is still skipped, then at the unit's lane count.
+bool Dispatcher::is_issued(const instr_trace_t* trace, uint32_t pid) const {
+  if (has_active(trace->tmask, pid * num_lanes_, num_lanes_))
+    return true;
+  if (num_lanes_ >= 4)
+    return false;
+  bool all_pkts = (std::get_if<WgatherType>(&trace->op_type) != nullptr);
+#ifdef VX_CFG_EXT_DXA_ENABLE
+  all_pkts = all_pkts || (std::get_if<DxaType>(&trace->op_type) != nullptr);
+#endif
+  if (!all_pkts)
+    return false;
+  if (VX_CFG_SIMD_WIDTH < 4)
+    return true;
+  uint32_t simd_first = (pid * num_lanes_) / VX_CFG_SIMD_WIDTH * VX_CFG_SIMD_WIDTH;
+  return has_active(trace->tmask, simd_first, VX_CFG_SIMD_WIDTH);
+}
+
 void Dispatcher::on_tick() {
   // process inputs
   uint32_t block_sent = 0;
@@ -78,24 +107,23 @@ void Dispatcher::on_tick() {
       // lanes are still stale.
       if (block_pid == 0) {
         uint32_t n_pkts = 0;
-        for (uint32_t j = 0; j < VX_CFG_NUM_THREADS; j += num_lanes_) {
-          for (uint32_t k = 0; k < num_lanes_; ++k) {
-            if (trace->tmask.test(j + k)) { ++n_pkts; break; }
-          }
+        for (uint32_t p = 0; p < num_packets_; ++p) {
+          n_pkts += this->is_issued(trace, p);
         }
         trace->num_pkts = n_pkts == 0 ? 1 : n_pkts;
       }
       // calculate current packet start and end
       int start(-1), end(-1);
-      for (uint32_t j = block_pid * num_lanes_, n = VX_CFG_NUM_THREADS; j < n; ++j) {
-        if (!trace->tmask.test(j))
+      for (uint32_t p = block_pid; p < num_packets_; ++p) {
+        if (!this->is_issued(trace, p))
           continue;
         if (start == -1)
-          start = j;
-        end = j;
+          start = p;
+        end = p;
       }
-      start /= num_lanes_;
-      end /= num_lanes_;
+      if (start == -1) {
+        start = end = 0;
+      }
 
       // issue partial trace
       if (start != end) {

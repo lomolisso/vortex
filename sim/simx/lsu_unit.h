@@ -98,6 +98,9 @@ public:
 	// Per block: the warp of an acquire AMO, sent as the commit takes its last result.
 	std::vector<SimChannel<uint32_t>> UnlockOut;
 
+	// Warps the scheduler activated: a new thread's release state starts clean.
+	SimChannel<WarpMask> SpawnIn;
+
 	// UnlockOut's delay: the scheduler's stall register, so the warp can be picked
 	// this many cycles after the commit takes the result.
 	static constexpr uint32_t ACQ_UNLOCK_DELAY = 1;
@@ -130,6 +133,12 @@ private:
 
 	// Called for every result beat sent to Outputs[b].
 	void mark_unlock(uint32_t b, instr_trace_t* beat, bool is_final);
+
+	// Neither local memory, the DLMEM window (the translation's predicate) nor the stacks.
+	static bool lane_is_global(uint64_t addr);
+
+	// Runs a CFENCE packet at the head of block b.
+	void process_cfence(uint32_t b, instr_trace_t* trace);
 #endif
 
   struct mem_addr_size_t {
@@ -152,6 +161,9 @@ private:
 		bool        is_tcu     = false;
 		uint32_t    client_tag = 0;
 		bool        is_fence   = false;
+	#ifdef VX_CFG_EXT_DLMEM_ENABLE
+		bool        gload      = false;  // a global read packet, counted in gload_
+	#endif
 	};
 
 	// Per-block LSU state. Each member is a named hardware sub-block.
@@ -188,6 +200,15 @@ private:
 	std::array<std::vector<instr_trace_t*>, VX_CFG_NUM_LSU_BLOCKS> unlock_beats_;
 	// Per block, in Outputs' queue order: the warp each result releases, or -1.
 	std::array<std::deque<int32_t>, VX_CFG_NUM_LSU_BLOCKS> out_unlock_;
+	// Per warp: a global write was sent since its last fence answered, and its
+	// global read packets (loads, LR, AMOs) still waiting for their response.
+	// Both are registers: a CFENCE sees this cycle's updates the next cycle.
+	// The RTL counter's range: every packet the warp's slice can hold, all in flight.
+	static constexpr uint32_t GLOAD_MAX = (1u << (log2ceil(VX_CFG_LSU_QUEUE_IN_SIZE + VX_CFG_LSU_PENDING_SIZE + 3)
+	                                             + log2ceil(VX_CFG_NUM_THREADS / VX_CFG_NUM_LSU_LANES))) - 1;
+	std::vector<bool>     gdirty_;
+	std::vector<uint32_t> gload_;
+	std::vector<uint32_t> gload_dec_;
 #endif
 };
 

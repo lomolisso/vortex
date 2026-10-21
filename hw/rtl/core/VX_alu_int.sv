@@ -162,8 +162,65 @@ module VX_alu_int import VX_gpu_pkg::*; #(
     // WGATHER — each group of 4 lanes operates independently. Source lane =
     // nominal (group_base | wg_src_offset), falling back to the last active lane
     // (branch's last_tid) when the nominal lane is masked — partial-warp safe.
+    // A warp split into packets narrower than 4 lanes spreads each group of 4
+    // threads over several packets.
+    localparam WG_SPLIT = (NUM_LANES < 4) && (NUM_LANES < `VX_CFG_NUM_THREADS);
     wire [NUM_LANES-1:0][`VX_CFG_XLEN-1:0] wgather_result;
-    if (NUM_LANES > 1) begin : g_wgather
+    if (WG_SPLIT) begin : g_wgather_pkt
+        // Place each lane by its warp thread. Every packet of the warp arrives
+        // in order, so a source thread in an earlier packet comes from the
+        // stage its packet filled; a source in a later packet is unavailable,
+        // and the last active lane stands in for a missing or masked source.
+        localparam NUM_STAGES = `VX_CFG_ISSUE_WIDTH / `VX_CFG_NUM_ALU_BLOCKS;
+        localparam STAGE_BITS = `CLOG2(NUM_STAGES);
+        wire [NUM_LANES-1:0][`VX_CFG_XLEN-1:0] alu_in3 = execute_if.data.rs3_data;
+        wire [1:0] pkt_base = 2'(execute_if.data.header.pid * NUM_LANES);
+        wire [1:0] src_rel  = wg_src_offset - pkt_base;
+        wire       src_here = (32'(src_rel) < NUM_LANES);
+        wire       src_prev = (wg_src_offset < pkt_base);
+        wire [LANE_WIDTH-1:0] nominal;
+        if (NUM_LANES > 1) begin : g_nominal
+            assign nominal = LANE_BITS'(src_rel);
+        end else begin : g_nominal_0
+            assign nominal = '0;
+        end
+        wire       is_wgather = (execute_if.data.op_args.alu.xtype == ALU_TYPE_OTHER) && alu_op[3];
+        wire       nominal_act = src_here && execute_if.data.header.tmask[nominal];
+        wire [2:0][`VX_CFG_XLEN-1:0] nominal_ops = {alu_in3[nominal], alu_in2[nominal], alu_in1[nominal]};
+        wire [2:0][`VX_CFG_XLEN-1:0] fallback_ops = {alu_in3[last_tid], alu_in2[last_tid], alu_in1[last_tid]};
+
+        // A warp's packets stay contiguous within its issue slice.
+        wire [`UP(STAGE_BITS)-1:0] stage_idx;
+        if (STAGE_BITS != 0) begin : g_stage_idx
+            wire [NW_WIDTH-1:0] stage_wid;
+            `ASSIGN_BLOCKED_WID (stage_wid, execute_if.data.header.wid, BLOCK_IDX, `VX_CFG_NUM_ALU_BLOCKS)
+            wire [ISSUE_ISW_W-1:0] stage_isw = wid_to_isw(stage_wid);
+            assign stage_idx = STAGE_BITS'(stage_isw / `VX_CFG_NUM_ALU_BLOCKS);
+        end else begin : g_stage_idx_0
+            assign stage_idx = '0;
+        end
+
+        reg [NUM_STAGES-1:0] stage_act;
+        reg [NUM_STAGES-1:0][2:0][`VX_CFG_XLEN-1:0] stage_ops;
+        wire stage_fire = execute_if.valid && execute_if.ready && is_wgather && src_here;
+        always @(posedge clk) begin
+            if (stage_fire) begin
+                stage_act[stage_idx] <= execute_if.data.header.tmask[nominal];
+                stage_ops[stage_idx] <= nominal_ops;
+            end
+        end
+
+        wire [2:0][`VX_CFG_XLEN-1:0] src_ops = nominal_act ? nominal_ops
+                                             : (src_prev && stage_act[stage_idx]) ? stage_ops[stage_idx]
+                                             : fallback_ops;
+        for (genvar i = 0; i < NUM_LANES; ++i) begin : g_i
+            wire [1:0] offset = pkt_base + 2'(i) - wg_src_offset; // (thread - src) mod 4
+            assign wgather_result[i] = (offset == 2'd1) ? src_ops[0]
+                                     : (offset == 2'd2) ? src_ops[1]
+                                     : (offset == 2'd3) ? src_ops[2]
+                                     : `VX_CFG_XLEN'(0); // offset 0 = source lane (write-suppressed)
+        end
+    end else if (NUM_LANES > 1) begin : g_wgather
         wire [NUM_LANES-1:0][`VX_CFG_XLEN-1:0] alu_in3 = execute_if.data.rs3_data;
         for (genvar i = 0; i < NUM_LANES; ++i) begin : g_i
             wire [LANE_BITS-1:0] nominal  = (LANE_BITS'(i) & ~LANE_BITS'(3)) | LANE_BITS'(wg_src_offset);
@@ -277,8 +334,15 @@ module VX_alu_int import VX_gpu_pkg::*; #(
     // For WGATHER, suppress write-back for every source lane (one per group of 4).
     // Lane k is a source if its lower 2 bits equal wg_src_offset.
     wire [NUM_LANES-1:0] wg_src_mask;
-    for (genvar k = 0; k < NUM_LANES; ++k) begin : g_wg_src_mask
-        assign wg_src_mask[k] = (2'(k) == wg_src_offset);
+    if (WG_SPLIT) begin : g_wg_src_pkt
+        wire [1:0] pkt_base = 2'(execute_if.data.header.pid * NUM_LANES);
+        for (genvar k = 0; k < NUM_LANES; ++k) begin : g_wg_src_mask
+            assign wg_src_mask[k] = ((pkt_base + 2'(k)) == wg_src_offset);
+        end
+    end else begin : g_wg_src
+        for (genvar k = 0; k < NUM_LANES; ++k) begin : g_wg_src_mask
+            assign wg_src_mask[k] = (2'(k) == wg_src_offset);
+        end
     end
 
     alu_header_t alu_hdr_in;

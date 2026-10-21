@@ -239,6 +239,9 @@ module VX_socket import VX_gpu_pkg::*, VX_tlb_pkg::*;
         .MEM_OUT_BUF    (3),
         .IS_LLC         (DCACHE_IS_LLC),
         .SHARED_LEVEL   (DCACHE_SHARED_LEVEL),
+    `ifdef VX_CFG_EXT_DLMEM_ENABLE
+        .CTA_FENCE      (1),
+    `endif
         .AMO_ENABLE     (`VX_CFG_EXT_A_ENABLED)
     ) dcache (
     `ifdef PERF_ENABLE

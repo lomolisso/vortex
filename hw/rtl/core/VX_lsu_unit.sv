@@ -29,6 +29,8 @@ module VX_lsu_unit import VX_gpu_pkg::*; #(
     VX_commit_if.master     commit_if [`VX_CFG_ISSUE_WIDTH],
 
 `ifdef VX_CFG_EXT_DLMEM_ENABLE
+    // The scheduler's active warps, whose activations reset the slices' per-warp release state.
+    input wire [`VX_CFG_NUM_WARPS-1:0] active_warps,
     // Per-block release of warps stalled by an acquire AMO.
     VX_sched_unlock_if.master per_block_unlock_if [`VX_CFG_NUM_LSU_BLOCKS],
 `endif
@@ -60,6 +62,19 @@ module VX_lsu_unit import VX_gpu_pkg::*; #(
         .data_t (lsu_result_t)
     ) per_block_result_if[BLOCK_SIZE]();
 
+`ifdef VX_CFG_EXT_DLMEM_ENABLE
+    // A CTA dispatch or a wspawn starts a warp.
+    reg [`VX_CFG_NUM_WARPS-1:0] active_warps_r;
+    always @(posedge clk) begin
+        if (reset) begin
+            active_warps_r <= '0;
+        end else begin
+            active_warps_r <= active_warps;
+        end
+    end
+    wire [`VX_CFG_NUM_WARPS-1:0] warp_spawn = active_warps & ~active_warps_r;
+`endif
+
     for (genvar block_idx = 0; block_idx < BLOCK_SIZE; ++block_idx) begin : g_blocks
         VX_lsu_slice #(
             .INSTANCE_ID (`SFORMATF(("%s%0d", INSTANCE_ID, block_idx))),
@@ -71,6 +86,7 @@ module VX_lsu_unit import VX_gpu_pkg::*; #(
             .execute_if       (per_block_execute_if[block_idx]),
             .result_if        (per_block_result_if[block_idx]),
         `ifdef VX_CFG_EXT_DLMEM_ENABLE
+            .warp_spawn       (warp_spawn),
             .sched_unlock_if  (per_block_unlock_if[block_idx]),
         `endif
             .client_if        (per_block_client_if[block_idx])

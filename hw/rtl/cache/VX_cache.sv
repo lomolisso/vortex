@@ -50,6 +50,9 @@ module VX_cache import VX_gpu_pkg::*; #(
     parameter IS_LLC                = 0,      // last-level cache: banks own AMO commit + RVA reservation tracking
 
     parameter SHARED_LEVEL          = IS_LLC, // every memory agent reaches this cache: a fence drains it, never walks it
+`ifdef VX_CFG_EXT_DLMEM_ENABLE
+    parameter CTA_FENCE             = 0,      // a CTA-scope fence drains here, at any level, and goes no further.
+`endif
 
     parameter AMO_ENABLE            = 0       // synthesize atomic-op logic in the banks
  ) (
@@ -108,6 +111,9 @@ module VX_cache import VX_gpu_pkg::*; #(
         .NUM_BANKS (NUM_BANKS),
         .TAG_WIDTH (TAG_WIDTH),
         .BANK_SEL_LATENCY (`TO_OUT_BUF_REG(REQ_XBAR_BUF)), // request xbar latency
+    `ifdef VX_CFG_EXT_DLMEM_ENABLE
+        .CTA_FENCE    (CTA_FENCE),
+    `endif
         .SHARED_LEVEL (SHARED_LEVEL)
     ) cache_init (
         .clk             (clk),
@@ -342,7 +348,12 @@ module VX_cache import VX_gpu_pkg::*; #(
             .MEM_OUT_BUF  (MEM_REQ_BUF_ENABLE ? 3 : 0),
             .IS_LLC       (IS_LLC),
             .AMO_ENABLE   (AMO_ENABLE),
+        `ifdef VX_CFG_EXT_DLMEM_ENABLE
+            // a CTA fence drains the banks at any level
+            .SHARED_LEVEL ((SHARED_LEVEL != 0) || (CTA_FENCE != 0))
+        `else
             .SHARED_LEVEL (SHARED_LEVEL)
+        `endif
         ) bank (
             .clk                (clk),
             .reset              (reset),

@@ -15,12 +15,14 @@
 // SimX gang unit (CtaGang) driven from host context the way hw/unittest/cta_gang
 // drives VX_cta_gang, and checked cycle by cycle against a model built on the
 // dlmem_ref placement functions: every cycle the unit's input take, its busy,
-// the beat on each core lane and the cluster-barrier release it sends must
+// the beat on its output lane and the cluster-barrier release it sends must
 // match the model, field for field. The model
-// is the RTL bench's, with SimX's per-core launch lanes (capacity plus launch
-// credits) in place of the RTL's output buffer; with always-ready lanes the two
-// coincide, so the deterministic schedule's placement.csv must equal the RTL
-// bench's byte for byte. Independently of the model, the bench tracks the
+// is the RTL bench's, with the lane standing for the RTL's two-entry output
+// buffer. The bench returns a lane credit in the cycle it takes the beat, so
+// under random back-pressure a full lane drains a cycle earlier than the RTL
+// buffer's registered ready allows; with an always-ready lane the two coincide,
+// so the deterministic schedule's placement.csv must equal the RTL bench's byte
+// for byte. Independently of the model, the bench tracks the
 // blocks it holds resident (no slot used twice, no core over its warps, no gang
 // id reused while live), the directed scenarios check hand-derived placements,
 // and a set of hand-computed vectors checks dlmem_ref itself.
@@ -148,7 +150,7 @@ struct Beat {
   kmu_req_t req;
 };
 
-// One beat on its way down a core lane, as the model predicts it.
+// One beat on its way down the output lane, as the model predicts it.
 struct Expect {
   kmu_req_t req;
   int       gang_seq;
@@ -169,18 +171,17 @@ struct DoneEvt {
 };
 
 ///////////////////////////////////////////////////////////////////////////////
-// Cycle model of the gang unit and its core lanes. Within a cycle a CTA_DONE
+// Cycle model of the gang unit and its output lane. Within a cycle a CTA_DONE
 // event applies first, then the unit decides, then the lowest pending release
-// leaves, and last a CBAR event counts (its release is a register). A lane takes
-// a beat while it holds fewer than its capacity and owes fewer than
-// LAUNCH_CREDITS admissions.
+// leaves, and last a CBAR event counts (its release is a register). The lane
+// takes a beat while it holds fewer than its capacity.
 
 class GangModel {
 public:
   enum Phase { IDLE, PLACE, EMIT };
 
   GangModel(const ref::Cfg& cfg, uint32_t lane_cap)
-    : cfg_(cfg), lanes_(cfg.ncc), inflight_(cfg.ncc, 0), lane_cap_(lane_cap) {
+    : cfg_(cfg), lane_cap_(lane_cap) {
     ref::reset(cfg_, m_);
     ref::reset(cfg_, g_);
   }
@@ -198,22 +199,21 @@ public:
     return in_valid || (phase_ != IDLE) || used || live;
   }
 
-  bool lane_empty(uint32_t c) const {
-    return lanes_.at(c).empty();
+  bool lane_empty() const {
+    return lane_.empty();
   }
 
-  // The bench took lane c's head (and returned its admission credit).
-  bool take(uint32_t c, Expect* e) {
-    auto& q = lanes_.at(c);
-    if (q.empty())
+  // The bench took the lane's head (and returned its credit).
+  bool take(Expect* e) {
+    if (lane_.empty())
       return false;
-    *e = q.front();
-    q.pop_front();
-    --inflight_[c];
+    *e = lane_.front();
+    lane_.pop_front();
     return true;
   }
 
-  // Advances one cycle; returns the lane the head beat leaves on, or -1. *rel
+  // Advances one cycle; returns the core the head beat is for (0 for a
+  // pass-through beat), or -1 when it stays. *rel
   // is the gang whose release leaves this cycle, or -1, and *rel_ep its epoch.
   int step(uint64_t cycle, const Beat* head, const DoneEvt* ev, std::string& err, int* rel, uint32_t* rel_ep) {
     const DoneEvt* done = (ev && !ev->cbar) ? ev : nullptr;
@@ -240,15 +240,9 @@ public:
           failed_ = false;
         }
         if (h.policy != KMU_POLICY_SPREAD) {
-          uint32_t target = locked_ ? lock_core_ : rr_core_;
-          if (this->lane_ready(target)) {
-            fire = int(target);
-            this->push(target, this->legacy_beat(*head, W, cycle));
-            locked_ = (h.cluster_rank + 1 != K);
-            lock_core_ = target;
-            if (!locked_) {
-              rr_core_ = (target + 1) % cfg_.ncc;
-            }
+          if (this->lane_ready()) {
+            fire = 0;
+            this->push(this->legacy_beat(*head, W, cycle));
           }
         } else {
           bool id_free = (K == 1);
@@ -316,14 +310,14 @@ public:
     case EMIT:
       if (head) {
         const ref::Peer& p = members_.at(idx_);
-        if (this->lane_ready(p.core)) {
+        if (this->lane_ready()) {
           const kmu_req_t& h = head->req;
           if (h.policy != KMU_POLICY_SPREAD || h.cluster_rank != idx_ || h.ctx_id != ctx_) {
             err = "model: beat out of step with the gang being emitted";
             return -1;
           }
           fire = int(p.core);
-          this->push(p.core, this->spread_beat(*head, cycle));
+          this->push(this->spread_beat(*head, cycle));
           idx_n = idx_ + 1;
           if (idx_ + 1 == k_) {
             phase_n = IDLE;
@@ -351,13 +345,12 @@ public:
   }
 
 private:
-  bool lane_ready(uint32_t c) const {
-    return lanes_.at(c).size() < lane_cap_ && inflight_.at(c) < Kmu::LAUNCH_CREDITS;
+  bool lane_ready() const {
+    return lane_.size() < lane_cap_;
   }
 
-  void push(uint32_t c, const Expect& e) {
-    lanes_.at(c).push_back(e);
-    ++inflight_[c];
+  void push(const Expect& e) {
+    lane_.push_back(e);
   }
 
   Expect legacy_beat(const Beat& b, uint32_t W, uint64_t cycle) const {
@@ -403,12 +396,7 @@ private:
   std::vector<ref::Peer> members_;
   uint32_t cur_gang_ = 0, cur_epoch_ = 0;
   uint64_t commit_cycle_ = 0;
-  // legacy steering: round robin, a message locked to the core of its first beat
-  uint32_t rr_core_ = 0;
-  bool     locked_ = false;
-  uint32_t lock_core_ = 0;
-  std::vector<std::deque<Expect>> lanes_;
-  std::vector<uint32_t> inflight_;
+  std::deque<Expect> lane_;
   uint32_t lane_cap_;
 };
 
@@ -571,18 +559,18 @@ private:
     return (it == ks_.end()) ? 1 : it->second;
   }
 
-  void check_out(uint32_t lane, const kmu_req_t& got, const Expect& e) {
+  void check_out(const kmu_req_t& got, const Expect& e) {
     if (same_req(got, e.req))
       return;
     if (got.pinned != e.req.pinned || got.dest_core != e.req.dest_core || got.forced_slot != e.req.forced_slot
      || got.gang_id != e.req.gang_id || got.epoch != e.req.epoch || !same_row(got.row, e.req.row)) {
-      this->fail("lane %u beat (gang %d rank %u): pin %d core %u slot %u gang %u epoch %u row %s;"
+      this->fail("output beat (gang %d rank %u): pin %d core %u slot %u gang %u epoch %u row %s;"
                  " model: pin %d core %u slot %u gang %u epoch %u row %s",
-                 lane, e.gang_seq, e.rank, int(got.pinned), got.dest_core, got.forced_slot, got.gang_id, got.epoch,
+                 e.gang_seq, e.rank, int(got.pinned), got.dest_core, got.forced_slot, got.gang_id, got.epoch,
                  row_str(got.row).c_str(), int(e.req.pinned), e.req.dest_core, e.req.forced_slot, e.req.gang_id,
                  e.req.epoch, row_str(e.req.row).c_str());
     } else {
-      this->fail("lane %u beat (gang %d rank %u): payload differs from the input beat", lane, e.gang_seq, e.rank);
+      this->fail("output beat (gang %d rank %u): payload differs from the input beat", e.gang_seq, e.rank);
     }
   }
 
@@ -652,7 +640,7 @@ private:
                  (unsigned long)delay);
       return false;
     }
-    GangModel model(cfg_, gang.bus_out.at(0).capacity());
+    GangModel model(cfg_, gang.bus_out.capacity());
     std::vector<std::deque<Beat>> beats(launches.size());
     int gang_seq = 0;
     for (uint32_t l = 0; l < launches.size(); ++l) {
@@ -765,102 +753,102 @@ private:
         gang.bus_in.send(head.req, 0);
       }
 
-      // core lanes: a beat visible before the tick is taken before it
-      bool any_had = false;
+      // the output lane: a beat visible before the tick is taken before it
       bool out_fire = false;
-      for (uint32_t c = 0; c < NCC; ++c) {
-        bool had = !gang.bus_out.at(c).empty();
-        any_had = any_had || had;
-        if (had == model.lane_empty(c)) {
-          this->fail("lane %u holds %s beat, the model says %s", c, had ? "a" : "no", had ? "none" : "one");
+      bool had = !gang.bus_out.empty();
+      if (had == model.lane_empty()) {
+        this->fail("the lane holds %s beat, the model says %s", had ? "a" : "no", had ? "none" : "one");
+        return false;
+      }
+      bool rdy = (o.ready_pct >= 100) || ((rng_() % 100) < o.ready_pct);
+      kmu_req_t beat{};
+      Expect e{};
+      if (had && rdy) {
+        beat = gang.bus_out.peek();
+        gang.bus_out.pop();
+        gang.credit_in.send(1, 0);
+        out_fire = true;
+        model.take(&e);
+        this->check_out(beat, e);
+      }
+      uint32_t c = beat.dest_core;
+      if (out_fire && e.req.pinned) {
+        // the bench's own view: the block is now resident on the core it is routed to
+        uint32_t s = beat.forced_slot;
+        if (c >= NCC || c != e.req.dest_core) {
+          this->fail("a beat routed to core %u, the model placed it on core %u (of %u)", c, e.req.dest_core, NCC);
           return false;
         }
-        bool rdy = (o.ready_pct >= 100) || ((rng_() % 100) < o.ready_pct);
-        if (!had || !rdy)
-          continue;
-        kmu_req_t beat = gang.bus_out.at(c).peek();
-        gang.bus_out.at(c).pop();
-        gang.credit_in.at(c).send(1, 0);
-        out_fire = true;
-        Expect e{};
-        model.take(c, &e);
-        this->check_out(c, beat, e);
-        if (e.req.pinned) {
-          // the bench's own view: the block is now resident
-          uint32_t s = beat.forced_slot;
-          if (beat.dest_core != c) {
-            this->fail("a beat for core %u left on lane %u", beat.dest_core, c);
-          }
-          if ((occ[c] >> s) & 1) {
-            this->fail("slot %u of core %u handed out twice", s, c);
-          }
-          occ[c] |= uint64_t(1) << s;
-          warps[c] += e.w;
-          if (warps[c] > cfg_.nw) {
-            this->fail("core %u holds %u warps (of %u)", c, warps[c], cfg_.nw);
-          }
-          if (e.req.row.k > 1) {
-            auto lit = live_ids.find(e.req.gang_id);
-            if (lit == live_ids.end()) {
-              live_ids[e.req.gang_id] = {e.gang_seq, e.req.row.k};
-            } else if (lit->second.first != e.gang_seq) {
-              this->fail("gang id %u handed to gang %d while gang %d still holds it", e.req.gang_id, e.gang_seq,
-                         lit->second.first);
-            }
-          }
-          auto git = gang_index.find(e.gang_seq);
-          if (git == gang_index.end()) {
-            GangRec g;
-            g.gang_seq = e.gang_seq;
-            g.k = e.req.row.k;
-            g.gang_id = e.req.gang_id;
-            g.epoch = e.req.epoch;
-            g.members.assign(e.req.row.k, ref::Peer{0, 0});
-            g.out_cycle.assign(e.req.row.k, 0);
-            g.done_cycle.assign(e.req.row.k, 0);
-            g.done_pres.assign(e.req.row.k, 0);
-            g.commit_cycle = e.commit_cycle;
-            gang_index[e.gang_seq] = gangs.size();
-            gangs.push_back(g);
-            git = gang_index.find(e.gang_seq);
-            if (g.k > 1) {
-              // an id is handed out again only once its last release left
-              auto hit = id_holder.find(g.gang_id);
-              if (hit != id_holder.end()) {
-                const Phase& old = phases.at(hit->second);
-                uint64_t left = old.inflight.empty() ? (old.phase ? cbars_left_[hit->second] : 0) : old.inflight.back().second;
-                if (old.pending || ((old.phase || !old.inflight.empty()) && g.commit_cycle <= left)) {
-                  this->fail("gang id %u handed to gang %d (commit %lu) before the release of gang %d left", g.gang_id,
-                             e.gang_seq, (unsigned long)g.commit_cycle, hit->second);
-                }
-              }
-              id_holder[g.gang_id] = e.gang_seq;
-              Phase ph;
-              ph.k = g.k;
-              ph.gang_id = g.gang_id;
-              ph.epoch = g.epoch;
-              ph.phases = o.phases ? o.phases(e.gang_seq) : 0;
-              phases[e.gang_seq] = ph;
-            }
-          }
-          GangRec& g = gangs[git->second];
-          g.members[e.rank] = {c, s};
-          g.out_cycle[e.rank] = cycles;
-          ks_[e.gang_seq] = e.req.row.k;
-          uint32_t P = (g.k > 1) ? phases.at(e.gang_seq).phases : 0;
-          res.push_back({e.gang_seq, e.rank, c, s, e.req.gang_id, e.req.epoch, e.w,
-                         (P > 0) ? NEVER : cycles + o.life(e.gang_seq, e.rank, c), P, 0,
-                         (P > 0) ? cycles + o.gap(e.gang_seq, e.rank, 0) : NEVER});
-        } else {
-          legacy_lat.push_back({e.in_cycle, cycles});
+        if ((occ[c] >> s) & 1) {
+          this->fail("slot %u of core %u handed out twice", s, c);
         }
+        occ[c] |= uint64_t(1) << s;
+        warps[c] += e.w;
+        if (warps[c] > cfg_.nw) {
+          this->fail("core %u holds %u warps (of %u)", c, warps[c], cfg_.nw);
+        }
+        if (e.req.row.k > 1) {
+          auto lit = live_ids.find(e.req.gang_id);
+          if (lit == live_ids.end()) {
+            live_ids[e.req.gang_id] = {e.gang_seq, e.req.row.k};
+          } else if (lit->second.first != e.gang_seq) {
+            this->fail("gang id %u handed to gang %d while gang %d still holds it", e.req.gang_id, e.gang_seq,
+                       lit->second.first);
+          }
+        }
+        auto git = gang_index.find(e.gang_seq);
+        if (git == gang_index.end()) {
+          GangRec g;
+          g.gang_seq = e.gang_seq;
+          g.k = e.req.row.k;
+          g.gang_id = e.req.gang_id;
+          g.epoch = e.req.epoch;
+          g.members.assign(e.req.row.k, ref::Peer{0, 0});
+          g.out_cycle.assign(e.req.row.k, 0);
+          g.done_cycle.assign(e.req.row.k, 0);
+          g.done_pres.assign(e.req.row.k, 0);
+          g.commit_cycle = e.commit_cycle;
+          gang_index[e.gang_seq] = gangs.size();
+          gangs.push_back(g);
+          git = gang_index.find(e.gang_seq);
+          if (g.k > 1) {
+            // an id is handed out again only once its last release left
+            auto hit = id_holder.find(g.gang_id);
+            if (hit != id_holder.end()) {
+              const Phase& old = phases.at(hit->second);
+              uint64_t left = old.inflight.empty() ? (old.phase ? cbars_left_[hit->second] : 0) : old.inflight.back().second;
+              if (old.pending || ((old.phase || !old.inflight.empty()) && g.commit_cycle <= left)) {
+                this->fail("gang id %u handed to gang %d (commit %lu) before the release of gang %d left", g.gang_id,
+                           e.gang_seq, (unsigned long)g.commit_cycle, hit->second);
+              }
+            }
+            id_holder[g.gang_id] = e.gang_seq;
+            Phase ph;
+            ph.k = g.k;
+            ph.gang_id = g.gang_id;
+            ph.epoch = g.epoch;
+            ph.phases = o.phases ? o.phases(e.gang_seq) : 0;
+            phases[e.gang_seq] = ph;
+          }
+        }
+        GangRec& g = gangs[git->second];
+        g.members[e.rank] = {c, s};
+        g.out_cycle[e.rank] = cycles;
+        ks_[e.gang_seq] = e.req.row.k;
+        uint32_t P = (g.k > 1) ? phases.at(e.gang_seq).phases : 0;
+        res.push_back({e.gang_seq, e.rank, c, s, e.req.gang_id, e.req.epoch, e.w,
+                       (P > 0) ? NEVER : cycles + o.life(e.gang_seq, e.rank, c), P, 0,
+                       (P > 0) ? cycles + o.gap(e.gang_seq, e.rank, 0) : NEVER});
+      } else if (out_fire) {
+        legacy_lat.push_back({e.in_cycle, cycles});
       }
+
 
       bool busy = gang.busy();
       if (busy != model.busy(head_valid)) {
         this->fail("busy=%d, the model says %d", int(busy), int(!busy));
       }
-      busy_prev = busy || any_had;
+      busy_prev = busy || had;
 
       std::string err;
       int rel = -1;

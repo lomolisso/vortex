@@ -82,6 +82,11 @@ public:
   SimEventLink<GbarArrive> gbar_arrive_out;
   SimEventLink<GbarResume> gbar_resume_in;
 
+#ifdef VX_CFG_EXT_DLMEM_ENABLE
+  // Warps the scheduler activated in a cycle (a CTA dispatch or a wspawn), toward the LSU.
+  SimChannel<WarpMask> warp_spawn_out;
+#endif
+
 #ifdef VX_CFG_EXT_RASTER_ENABLE
   // Fragment-work-distributor event links, wired core <-> raster core.
   SimEventLink<FwdArm>  fwd_arm_in;
