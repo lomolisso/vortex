@@ -31,6 +31,7 @@
 #include <cstddef>   // offsetof (flat<->BVH layout cross-check)
 #include <cstdint>
 #include <ostream>
+#include <set>
 #include <unordered_map>
 #include "instr_trace.h"
 #include "constants.h"
@@ -281,6 +282,11 @@ constexpr uint32_t kRtuStatesPerTri  = 2;   // CS_TRI_FEED + CS_TRI_WAIT
 constexpr uint32_t kRtuStatesPerInst = 6;
 constexpr uint32_t kRtuStatesPerRay  = 3;   // CS_SETUP, CS_HDR_REQ, CS_HDR_WAIT
 
+// Bytes the scheduler fetches for one structure: the span its decoders read
+// (RTU_NODE_DEC_BYTES, RTU_LEAF_DEC_BYTES, RTU_TRI_STRIDE in VX_rtu_pkg).
+constexpr uint32_t kRtuNodeDecBytes = 20 + 10 * VX_CFG_RTU_BVH_WIDTH;
+constexpr uint32_t kRtuLeafDecBytes = 56;
+
 // Of those, the ones that decode the fetched image: the node/leaf response and
 // its dispatch, the instance record, and the scene header. The box feed, the
 // stack push/pop, the request states and the PE waits all run from state the
@@ -461,12 +467,20 @@ struct Slot {
 // pulled, keyed by address. A read of a line it does not hold is a miss — the
 // walker reports it and stops, and the context fetches it. That is the whole
 // demand-fetch model: the walk itself discovers the fetch stream.
+//
+// The hardware holds only the structure it is visiting, so it re-reads every
+// line of every structure on each visit. `fetched` keys each pulled line by the
+// fetch group (the walk's n-th structure visit) it was pulled for; the walk
+// numbers its groups in order, so a replay finds the same keys.
 struct SceneView {
   const std::unordered_map<uint64_t, LineBuf>* lines = nullptr;
+  const std::set<std::pair<uint32_t, uint64_t>>* fetched = nullptr;
   uint64_t base_line = 0;   // line holding the scene's first byte
   uint32_t byte_off  = 0;   // scene base within that line
   bool     miss      = false;
   uint64_t miss_line = 0;
+  uint32_t group      = 0;  // current fetch group
+  uint32_t miss_group = 0;
 };
 
 struct Context {
@@ -478,10 +492,12 @@ struct Context {
   uint32_t slot  = 0;
   uint32_t lane  = 0;
   // Lines this context has pulled. The hardware keeps one fetch buffer and re-reads
-  // a node it revisits; the model keeps the bytes so the walk can be replayed
-  // deterministically, and charges a fetch for every line the walk first
-  // touches.
+  // every structure it visits; the model keeps the bytes so the walk can be
+  // replayed deterministically, and `fetched` records the fetch group each line
+  // was pulled for, so a revisit still costs its fetches.
   std::unordered_map<uint64_t, LineBuf> lines;
+  std::set<std::pair<uint32_t, uint64_t>> fetched;
+  uint32_t req_group = 0;    // fetch group of req_addr
   uint64_t base_line = 0;
   uint32_t byte_off  = 0;
   uint64_t req_addr  = 0;    // the line it wants (REQ / WAIT)

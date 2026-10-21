@@ -500,6 +500,7 @@ public:
     Slot& s = pool_.at(cx.slot);
     SceneView sv;
     sv.lines     = &cx.lines;
+    sv.fetched   = &cx.fetched;
     sv.base_line = cx.base_line;
     sv.byte_off  = cx.byte_off;
 
@@ -558,6 +559,7 @@ public:
 
     if (r.stalled) {
       cx.req_addr   = sv.miss_line;
+      cx.req_group  = sv.miss_group;
       cx.next_state = CtxState::REQ;
     } else {
       s.lanes[cx.lane] = result;   // carries cb_pending if the ray yielded

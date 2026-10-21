@@ -119,6 +119,7 @@ void MemoryEngine::drain_mem_rsp() {
         std::memcpy(cx.lines[e.addr].data(), rsp.data->data(),
                     VX_CFG_MEM_BLOCK_SIZE);
       }
+      cx.fetched.insert({cx.req_group, e.addr});
       cx.state = CtxState::PROBE;
     }
     e.valid = false;

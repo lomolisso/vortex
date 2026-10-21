@@ -52,6 +52,7 @@ void read_scene_bytes(SceneView& sv, uint32_t off, uint32_t len, uint8_t* out) {
       if (!sv.miss) {
         sv.miss = true;
         sv.miss_line = addr;
+        sv.miss_group = sv.group;
       }
       std::memset(out + done, 0, n);
     } else {
@@ -59,6 +60,26 @@ void read_scene_bytes(SceneView& sv, uint32_t off, uint32_t len, uint8_t* out) {
     }
     done += n;
     pos  += n;
+  }
+}
+
+// Fetch the lines of scene bytes [off, off+len) in address order, as part of a
+// new fetch group or the current one. A line not yet pulled for this group is a
+// miss, even when an earlier visit pulled it.
+void fetch_span(SceneView& sv, uint32_t off, uint32_t len, bool new_group) {
+  if (new_group) ++sv.group;
+  uint32_t first = (sv.byte_off + off) / VX_CFG_MEM_BLOCK_SIZE;
+  uint32_t last  = (sv.byte_off + off + len - 1) / VX_CFG_MEM_BLOCK_SIZE;
+  for (uint32_t l = first; l <= last; ++l) {
+    uint64_t addr = sv.base_line + uint64_t(l) * VX_CFG_MEM_BLOCK_SIZE;
+    if (sv.fetched->count({sv.group, addr}) == 0) {
+      if (!sv.miss) {
+        sv.miss = true;
+        sv.miss_line = addr;
+        sv.miss_group = sv.group;
+      }
+      return;
+    }
   }
 }
 
@@ -133,6 +154,8 @@ void walk_bvh4_subtree(SceneView& sv,
     uint32_t tris_off = leaf_off + kVxBvhLeafHeaderBytes;
     for (uint32_t i = 0; i < count; ++i) {
       if (ctx.terminated) return;
+      fetch_span(sv, tris_off + i * kVxBvhTriStride, kVxBvhTriStride, true);
+      if (sv.miss) return;
       uint8_t tri_buf[kVxBvhTriStride];
       read_scene_bytes(sv, tris_off + i * kVxBvhTriStride,
                        kVxBvhTriStride, tri_buf);
@@ -283,12 +306,22 @@ void walk_bvh4_subtree(SceneView& sv,
     if (ctx.terminated) break;
     if (++node_visits > kMaxNodeVisits) break;
     uint8_t kind_buf[4];
+    fetch_span(sv, current, sizeof(kind_buf), true);
+    if (sv.miss) return;
     read_scene_bytes(sv, current, sizeof(kind_buf), kind_buf);
     if (sv.miss) return;
     uint32_t kind_word = 0;
     std::memcpy(&kind_word, kind_buf, sizeof(uint32_t));
     uint32_t kind  = kind_word & kVxBvhKindMask;
     uint32_t count = (kind_word >> kVxBvhCountShift) & kVxBvhCountMask;
+    // The first line decodes the kind; the rest of the structure follows.
+    if (kind == kVxBvhKindInternal) {
+      fetch_span(sv, current, kRtuNodeDecBytes, false);
+    } else if (kind == kVxBvhKindLeafTri || kind == kVxBvhKindLeafInst
+            || kind == kVxBvhKindLeafProc) {
+      fetch_span(sv, current, kRtuLeafDecBytes, false);
+    }
+    if (sv.miss) return;
 
     if (kind == kVxBvhKindLeafTri) {
       ++perf.bvh_leaves_fetched;
@@ -654,6 +687,8 @@ WalkResult Bvh4Walker::walk_lane(const RtuReq& req, uint32_t t, SceneView& sv,
   // VxBvhSceneHeader: word0 = root node byte offset. Reading it is the ray's
   // first scene access, and therefore its first fetch.
   uint8_t hdr[kRtuSceneHeaderBytes];
+  fetch_span(sv, 0, sizeof(hdr), true);
+  if (sv.miss) return {true, false};
   read_scene_bytes(sv, 0, sizeof(hdr), hdr);
   if (sv.miss) return {true, false};
   uint32_t root_off = 0;
