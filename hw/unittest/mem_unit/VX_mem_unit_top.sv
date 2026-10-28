@@ -153,6 +153,12 @@ module VX_mem_unit_top import VX_gpu_pkg::*; #(
     wire [`VX_CFG_LMEM_NUM_BANKS-1:0][NW_WIDTH-1:0] lmem_commit_wid;
     `UNUSED_VAR ({lmem_commit_valid, lmem_commit_wid})
 `endif
+`ifdef VX_CFG_EXT_MBAR_ENABLE
+    // No try_wait retires; the waiter table's releases are left open.
+    wire                         mbar_unlock_valid;
+    wire [`VX_CFG_NUM_WARPS-1:0] mbar_unlock_mask;
+    `UNUSED_VAR ({mbar_unlock_valid, mbar_unlock_mask})
+`endif
 
     VX_mem_unit #(
         .INSTANCE_ID (INSTANCE_ID)
@@ -167,6 +173,12 @@ module VX_mem_unit_top import VX_gpu_pkg::*; #(
         .dlmem_lmem_if (dlmem_lmem_if),
         .lmem_commit_valid (lmem_commit_valid),
         .lmem_commit_wid   (lmem_commit_wid),
+    `endif
+    `ifdef VX_CFG_EXT_MBAR_ENABLE
+        .mbar_retire_valid (`VX_CFG_NUM_LSU_BLOCKS'(0)),
+        .mbar_retire_wid   ('0),
+        .mbar_unlock_valid (mbar_unlock_valid),
+        .mbar_unlock_mask  (mbar_unlock_mask),
     `endif
         .empty         (mem_unit_empty),
         .lsu_mem_if    (lsu_mem_if),

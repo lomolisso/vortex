@@ -353,6 +353,7 @@ static op_string_t op_string(const Instr &instr) {
         case AmoType::MBAR_EXPECT_TX:   return {"MBAR.EXPECT_TX", ""};
         case AmoType::MBAR_COMPLETE_TX: return {"MBAR.COMPLETE_TX", ""};
         case AmoType::MBAR_TEST_WAIT:   return {"MBAR.TEST_WAIT", ""};
+        case AmoType::MBAR_TRY_WAIT:    return {"MBAR.TRY_WAIT", ""};
 #endif
         default:
           std::abort();
@@ -1182,6 +1183,8 @@ Instr::Ptr Decoder::decode(uint32_t code, uint64_t uuid) {
     case 2: instr->set_op_type(AmoType::MBAR_EXPECT_TX); break;
     case 3: instr->set_op_type(AmoType::MBAR_COMPLETE_TX); break;
     case 4: instr->set_op_type(AmoType::MBAR_TEST_WAIT); break;
+    // The warp sleeps until the waiter table releases it.
+    case 5: instr->set_op_type(AmoType::MBAR_TRY_WAIT); instr->set_wstall(true); break;
     default:
       std::abort();
     }

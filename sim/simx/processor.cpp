@@ -171,6 +171,10 @@ ProcessorImpl::ProcessorImpl()
 #ifdef VX_CFG_EXT_MBAR_ENABLE
   static_assert(VX_CFG_EXT_DLMEM_ENABLED, "mbarriers require DLMEM");
   static_assert(VX_CFG_EXT_A_ENABLED, "mbarriers require the A extension");
+  // A try_wait must time out long before the RTL scheduler's STALL_TIMEOUT
+  // (VX_gpu_pkg.sv) takes every warp being asleep for a hang.
+  static_assert(VX_CFG_MBAR_SUSPEND_CYCLES < (VX_DBG_STALL_TIMEOUT) / 4,
+                "VX_CFG_MBAR_SUSPEND_CYCLES must stay well below the scheduler stall timeout");
 #endif
 
   // connect L3 core interfaces

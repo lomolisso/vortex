@@ -55,6 +55,11 @@ module VX_scheduler import VX_gpu_pkg::*; #(
     VX_sched_unlock_if.slave tcu_unlock_if [`VX_CFG_NUM_TCU_BLOCKS],
 `endif
 `endif
+`ifdef VX_CFG_EXT_MBAR_ENABLE
+    // the release of warps suspended in an mbarrier try_wait
+    input wire              mbar_unlock_valid,
+    input wire [`VX_CFG_NUM_WARPS-1:0] mbar_unlock_mask,
+`endif
 
     // status
     output wire             busy
@@ -235,6 +240,14 @@ module VX_scheduler import VX_gpu_pkg::*; #(
     end
 `endif
 `endif
+`ifdef VX_CFG_EXT_MBAR_ENABLE
+    for (genvar w = 0; w < `VX_CFG_NUM_WARPS; ++w) begin : g_mbar_unlock
+        `RUNTIME_ASSERT(~(mbar_unlock_valid && mbar_unlock_mask[w]) || stalled_warps[w],
+            ("%t: *** %s mbarrier unlock of a warp that is not stalled: wid=%0d", $time, INSTANCE_ID, w))
+        `RUNTIME_ASSERT(~(mbar_unlock_valid && mbar_unlock_mask[w] && schedule_fire && (schedule_wid == NW_WIDTH'(w))),
+            ("%t: *** %s mbarrier unlock of the warp being scheduled: wid=%0d", $time, INSTANCE_ID, w))
+    end
+`endif
 
      always @(*) begin
         active_warps_n  = active_warps;
@@ -364,6 +377,11 @@ module VX_scheduler import VX_gpu_pkg::*; #(
             if (unlock_valid[i]) begin
                 stalled_warps_n[unlock_wid[i]] = 1'b0;
             end
+        end
+    `endif
+    `ifdef VX_CFG_EXT_MBAR_ENABLE
+        if (mbar_unlock_valid) begin
+            stalled_warps_n &= ~mbar_unlock_mask;
         end
     `endif
     end

@@ -562,7 +562,7 @@ enum class AmoType {
   AMOMAXU,
   AMOCAS
 #ifdef VX_CFG_EXT_MBAR_ENABLE
-  , MBAR_ARRIVE, MBAR_ARRIVE_TX, MBAR_EXPECT_TX, MBAR_COMPLETE_TX, MBAR_TEST_WAIT
+  , MBAR_ARRIVE, MBAR_ARRIVE_TX, MBAR_EXPECT_TX, MBAR_COMPLETE_TX, MBAR_TEST_WAIT, MBAR_TRY_WAIT
 #else
 #line 516
 #endif
@@ -593,6 +593,7 @@ inline std::ostream &operator<<(std::ostream &os, const AmoType& type) {
   case AmoType::MBAR_EXPECT_TX:   os << "MBAR_EXPECT_TX"; break;
   case AmoType::MBAR_COMPLETE_TX: os << "MBAR_COMPLETE_TX"; break;
   case AmoType::MBAR_TEST_WAIT:   os << "MBAR_TEST_WAIT"; break;
+  case AmoType::MBAR_TRY_WAIT:    os << "MBAR_TRY_WAIT"; break;
 #else
 #line 537
 #endif
@@ -1324,6 +1325,7 @@ inline MemOp amo_to_memop(AmoType t) {
   case AmoType::MBAR_EXPECT_TX:   return MemOp::MBAR_EXPECT_TX;
   case AmoType::MBAR_COMPLETE_TX: return MemOp::MBAR_COMPLETE_TX;
   case AmoType::MBAR_TEST_WAIT:   return MemOp::MBAR_TEST_WAIT;
+  case AmoType::MBAR_TRY_WAIT:    return MemOp::MBAR_TRY_WAIT;
 #else
 #line 1247
 #endif

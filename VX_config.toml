@@ -43,6 +43,9 @@ VX_CFG_EXT_DLMEM_ENABLE = false
 # mbarriers: 64-bit local-memory synchronization objects updated by the local
 # memory banks' atomic unit. Requires DLMEM and the A extension.
 VX_CFG_EXT_MBAR_ENABLE = false
+# Longest an mbarrier try_wait keeps its warp suspended before returning false;
+# must stay well below the scheduler's stall timeout.
+VX_CFG_MBAR_SUSPEND_CYCLES = 1024
 VX_CFG_EXT_TEX_ENABLE = false
 VX_CFG_EXT_RASTER_ENABLE = false
 VX_CFG_EXT_OM_ENABLE = false

@@ -34,6 +34,11 @@ module VX_lsu_unit import VX_gpu_pkg::*; #(
     // Per-block release of warps stalled by an acquire AMO.
     VX_sched_unlock_if.master per_block_unlock_if [`VX_CFG_NUM_LSU_BLOCKS],
 `endif
+`ifdef VX_CFG_EXT_MBAR_ENABLE
+    // Per block, the retire of an mbarrier try_wait.
+    output wire [`VX_CFG_NUM_LSU_BLOCKS-1:0]               mbar_retire_valid,
+    output wire [`VX_CFG_NUM_LSU_BLOCKS-1:0][NW_WIDTH-1:0] mbar_retire_wid,
+`endif
 
     // Per-block client connection to VX_lsu_scheduler (at VX_core).
     VX_lsu_sched_if.master per_block_client_if [`VX_CFG_NUM_LSU_BLOCKS]
@@ -88,6 +93,10 @@ module VX_lsu_unit import VX_gpu_pkg::*; #(
         `ifdef VX_CFG_EXT_DLMEM_ENABLE
             .warp_spawn       (warp_spawn),
             .sched_unlock_if  (per_block_unlock_if[block_idx]),
+        `endif
+        `ifdef VX_CFG_EXT_MBAR_ENABLE
+            .mbar_retire_valid(mbar_retire_valid[block_idx]),
+            .mbar_retire_wid  (mbar_retire_wid[block_idx]),
         `endif
             .client_if        (per_block_client_if[block_idx])
         );

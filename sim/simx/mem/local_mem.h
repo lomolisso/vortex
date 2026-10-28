@@ -17,6 +17,17 @@
 
 namespace vortex {
 
+#ifdef VX_CFG_EXT_MBAR_ENABLE
+// A bank's mbarrier event, keyed by the word's (bank, row): a try_wait that
+// read an incomplete phase (insert, from warp `wid`) or an op whose write-back
+// completed one (flip).
+struct MbarBankEvt {
+  bool     flip;
+  uint32_t wid;
+  uint32_t row;
+};
+#endif
+
 class LocalMem : public SimObject<LocalMem> {
 public:
   struct Config {
@@ -50,6 +61,11 @@ public:
   // Per bank: the warp of each such access when it commits, 1 cycle after the
   // bank takes a load or store and 3 cycles after it takes an atomic.
   std::vector<SimChannel<uint32_t>> CommitOut;
+#endif
+#ifdef VX_CFG_EXT_MBAR_ENABLE
+  // Per bank, at most one per cycle: an insert 1 cycle after the bank takes the
+  // try_wait (its read), a flip 2 cycles after it takes the op (its write-back).
+  std::vector<SimChannel<MbarBankEvt>> MbarEvtOut;
 #endif
 
   LocalMem(const SimContext& ctx, const char* name, const Config& config);

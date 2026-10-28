@@ -1510,7 +1510,12 @@ package VX_gpu_pkg;
     // Width of the tag carried over VX_lsu_sched_if: lsu_header + op_type
     // + per-lane align + packet allocator addr (+ global-load mark, AMO aq, rl in DLMEM builds)
     // + fence flag (matches the local TAG_WIDTH built inside VX_lsu_slice).
-`ifdef VX_CFG_EXT_DLMEM_ENABLE
+`ifdef VX_CFG_EXT_MBAR_ENABLE
+    // plus the try_wait mark
+    localparam LSU_CLIENT_TAG_WIDTH = $bits(lsu_header_t) + INST_LSU_BITS
+                                    + (`VX_CFG_NUM_LSU_LANES * `CLOG2(LSU_WORD_SIZE))
+                                    + `LOG2UP(`VX_CFG_LSU_PENDING_SIZE) + 1 + 1 + 2 + 1;
+`elsif VX_CFG_EXT_DLMEM_ENABLE
     localparam LSU_CLIENT_TAG_WIDTH = $bits(lsu_header_t) + INST_LSU_BITS
                                     + (`VX_CFG_NUM_LSU_LANES * `CLOG2(LSU_WORD_SIZE))
                                     + `LOG2UP(`VX_CFG_LSU_PENDING_SIZE) + 1 + 2 + 1;

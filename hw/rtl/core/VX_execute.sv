@@ -43,6 +43,11 @@ module VX_execute import VX_gpu_pkg::*; #(
     // Per TCU block, the release of warps stalled by a wgmma wait_group.
     VX_sched_unlock_if.master tcu_unlock_if [`VX_CFG_NUM_TCU_BLOCKS],
 `endif
+`ifdef VX_CFG_EXT_MBAR_ENABLE
+    // Per LSU block, the retire of an mbarrier try_wait.
+    output wire [`VX_CFG_NUM_LSU_BLOCKS-1:0]               mbar_retire_valid,
+    output wire [`VX_CFG_NUM_LSU_BLOCKS-1:0][NW_WIDTH-1:0] mbar_retire_wid,
+`endif
 
 `ifdef TCU_META_ENABLE
     // TCU AGU memory client (single warp-level AGU shared across blocks).
@@ -119,6 +124,10 @@ module VX_execute import VX_gpu_pkg::*; #(
     `ifdef VX_CFG_EXT_DLMEM_ENABLE
         .active_warps        (sched_csr_if.active_warps),
         .per_block_unlock_if (lsu_unlock_if),
+    `endif
+    `ifdef VX_CFG_EXT_MBAR_ENABLE
+        .mbar_retire_valid   (mbar_retire_valid),
+        .mbar_retire_wid     (mbar_retire_wid),
     `endif
         .per_block_client_if (lsu_client_if)
     );

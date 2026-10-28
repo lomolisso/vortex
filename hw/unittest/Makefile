@@ -101,8 +101,9 @@ endef
 # response merge, the local memory a store-acknowledging ingress input and
 # per-bank commit reports of every LSU-input access, and the memory unit is
 # linted with all of them wired. With mbarriers the banks also run the mbarrier
-# ops against mbar_ref, and each erroneous op must stop the last build with its
-# assert; the final clean keeps a plain `run` from reusing it.
+# ops against mbar_ref and report their waiter events, and each erroneous op
+# must stop the last build with its assert; the final clean keeps a plain `run`
+# from reusing it. Then the mbarrier waiter table (run-mbar-waiters).
 DLMEM_LMEM := -DVX_CFG_EXT_DLMEM_ENABLE
 MBAR_LMEM  := $(DLMEM_LMEM) $(LMEM_BASE) -DVX_CFG_EXT_MBAR_ENABLE
 run-lmem:
@@ -124,12 +125,40 @@ ifeq ($(XLEN),64)
 	! local_mem/local_mem --neg=align > local_mem/neg_align.log 2>&1
 	grep -q "mbarrier op is not a naturally aligned doubleword" local_mem/neg_align.log
 	$(MAKE) -C local_mem clean
+	$(MAKE) run-mbar-waiters
 	$(call lmem_switch_case,$(DLMEM_LMEM) -DVX_CFG_NUM_LSU_LANES=1)
 	$(call lmem_switch_case,$(DLMEM_LMEM) -DVX_CFG_NUM_LSU_LANES=2)
 	$(call lmem_switch_case,$(DLMEM_LMEM) -DVX_CFG_NUM_LSU_LANES=4 $(LMEM_BASE) -DVX_CFG_EXT_ZACAS_ENABLE)
 	$(MAKE) -C mem_unit lint CONFIGS="$(DLMEM_LMEM) $(LMEM_BASE)"
 	$(MAKE) -C mem_unit lint CONFIGS="$(DLMEM_LMEM) $(LMEM_BASE) -DVX_CFG_ISSUE_WIDTH=2"
 	$(MAKE) -C mem_unit lint CONFIGS="$(MBAR_LMEM)"
+endif
+
+# The mbarrier waiter table (RV64 only): directed release timings (wake on a
+# flip, the time limit, every warp on one object and on many, a retire racing a
+# flip, ...) and random try_wait lifecycles checked cycle by cycle against a
+# model of the table. At the default time limit; with no suspension at all, 16
+# warps and 8 banks; at a short limit, so the random runs reach it often, also
+# with 8 warps and two LSU blocks. An insert for a retired warp must stop the last
+# build with its assert; the final clean keeps a plain `run` from reusing it.
+# $(1)=CONFIGS $(2)=OPTS
+define mbar_waiters_case
+	$(MAKE) -C mbar_waiters clean
+	$(MAKE) -C mbar_waiters CONFIGS="$(MBAR_LMEM) $(1)"
+	$(MAKE) -C mbar_waiters run CONFIGS="$(MBAR_LMEM) $(1)" OPTS="$(2)"
+endef
+run-mbar-waiters:
+ifeq ($(XLEN),64)
+	$(call mbar_waiters_case,,--seed=1 --cycles=5000)
+	$(call mbar_waiters_case,-DVX_CFG_MBAR_SUSPEND_CYCLES=0 -DVX_CFG_NUM_WARPS=16 -DVX_CFG_LMEM_NUM_BANKS=8,--seed=2)
+	$(call mbar_waiters_case,-DVX_CFG_MBAR_SUSPEND_CYCLES=24,--seed=3)
+	$(call mbar_waiters_case,-DVX_CFG_MBAR_SUSPEND_CYCLES=24 -DVX_CFG_NUM_WARPS=8 -DVX_CFG_ISSUE_WIDTH=2 \
+		-DVX_CFG_NUM_LSU_BLOCKS=2,--seed=4)
+	! mbar_waiters/mbar_waiters --neg=insert > mbar_waiters/neg_insert.log 2>&1
+	grep -q "mbarrier waiter insert after retire" mbar_waiters/neg_insert.log
+	$(MAKE) -C mbar_waiters clean
+else
+	@echo "run-mbar-waiters: mbarriers are RV64 only; nothing to run at XLEN $(XLEN)"
 endif
 
 # CTA launch path: the KMU's cluster walk under launch-bus back-pressure, and
@@ -496,6 +525,7 @@ clean:
 	$(MAKE) -C local_mem clean
 	$(MAKE) -C lmem_switch clean
 	$(MAKE) -C mem_unit clean
+	$(MAKE) -C mbar_waiters clean
 	$(MAKE) -C tcu_fedp clean
 	$(MAKE) -C cta_dispatcher clean
 	$(MAKE) -C kmu clean

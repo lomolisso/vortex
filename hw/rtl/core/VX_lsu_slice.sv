@@ -34,6 +34,11 @@ module VX_lsu_slice import VX_gpu_pkg::*; #(
     // Releases the warp an acquire AMO stalled at decode.
     VX_sched_unlock_if.master sched_unlock_if,
 `endif
+`ifdef VX_CFG_EXT_MBAR_ENABLE
+    // The last response of an mbarrier try_wait left the slice.
+    output wire                       mbar_retire_valid,
+    output wire [NW_WIDTH-1:0]        mbar_retire_wid,
+`endif
 
     // The slice exposes the memory-client side as a VX_lsu_sched_if master;
     // the parent wires it into VX_lsu_scheduler.
@@ -60,7 +65,10 @@ module VX_lsu_slice import VX_gpu_pkg::*; #(
     `UNUSED_PARAM (CORE_ID)
     `UNUSED_SPARAM (INSTANCE_ID)
 
-`ifdef VX_CFG_EXT_DLMEM_ENABLE
+`ifdef VX_CFG_EXT_MBAR_ENABLE
+    // tag_width = header + op_type + align + pkt_addr + gload + try_wait + aq + rl + fence
+    localparam TAG_WIDTH = $bits(lsu_header_t) + INST_LSU_BITS + (NUM_LANES * REQ_ASHIFT) + LSUQ_SIZEW + 1 + 1 + 2 + 1;
+`elsif VX_CFG_EXT_DLMEM_ENABLE
     // tag_width = header + op_type + align + pkt_addr + gload + aq + rl + fence
     localparam TAG_WIDTH = $bits(lsu_header_t) + INST_LSU_BITS + (NUM_LANES * REQ_ASHIFT) + LSUQ_SIZEW + 1 + 2 + 1;
 `else
@@ -470,6 +478,23 @@ module VX_lsu_slice import VX_gpu_pkg::*; #(
     assign req_aq = 1'b0;
     assign req_rl = 1'b0;
 `endif
+`ifdef VX_CFG_EXT_MBAR_ENABLE
+    // Marks a try_wait, whose retire the waiter table needs; rl and fence keep
+    // the tag bits the DLMEM translation reads.
+    wire req_tw = execute_if.data.op_args.lsu.amo_valid
+               && (amo_op_e'(execute_if.data.op_args.lsu.amo_op) == AMO_OP_MBAR_TRY_WAIT);
+    assign mem_req_tag = {
+        execute_if.data.header,
+        execute_if.data.op_type,
+        req_align,
+        pkt_waddr,
+        req_gload,
+        req_tw,
+        req_aq,
+        req_rl,
+        req_is_fence
+    };
+`else
     assign mem_req_tag = {
         execute_if.data.header,
         execute_if.data.op_type,
@@ -480,6 +505,7 @@ module VX_lsu_slice import VX_gpu_pkg::*; #(
         req_rl,
         req_is_fence
     };
+`endif
 `else
     assign mem_req_tag = {
         execute_if.data.header,
@@ -519,6 +545,20 @@ module VX_lsu_slice import VX_gpu_pkg::*; #(
 `ifdef VX_CFG_EXT_DLMEM_ENABLE
     wire rsp_aq, rsp_rl;
     `UNUSED_VAR (rsp_rl)
+`ifdef VX_CFG_EXT_MBAR_ENABLE
+    wire rsp_tw;
+    assign {
+        rsp_hdr,
+        rsp_op_type,
+        rsp_align,
+        pkt_raddr,
+        rsp_gload,
+        rsp_tw,
+        rsp_aq,
+        rsp_rl,
+        rsp_is_fence
+    } = mem_rsp_tag;
+`else
     assign {
         rsp_hdr,
         rsp_op_type,
@@ -529,6 +569,7 @@ module VX_lsu_slice import VX_gpu_pkg::*; #(
         rsp_rl,
         rsp_is_fence
     } = mem_rsp_tag;
+`endif
 
     always @(posedge clk) begin
         if (reset) begin
@@ -630,9 +671,15 @@ module VX_lsu_slice import VX_gpu_pkg::*; #(
     // An acquire AMO's aq bit travels beside its result to the unlock below.
     wire result_rsp_aq, result_aq;
 `endif
+`ifdef VX_CFG_EXT_MBAR_ENABLE
+    // So does a try_wait's mark, to its retire.
+    wire result_rsp_tw, result_tw;
+`endif
 
     VX_elastic_buffer #(
-    `ifdef VX_CFG_EXT_DLMEM_ENABLE
+    `ifdef VX_CFG_EXT_MBAR_ENABLE
+        .DATAW (2 + $bits(lsu_result_t)),
+    `elsif VX_CFG_EXT_DLMEM_ENABLE
         .DATAW (1 + $bits(lsu_result_t)),
     `else
         .DATAW ($bits(lsu_result_t)),
@@ -643,7 +690,10 @@ module VX_lsu_slice import VX_gpu_pkg::*; #(
         .reset     (reset),
         .valid_in  (mem_rsp_valid),
         .ready_in  (mem_rsp_ready),
-    `ifdef VX_CFG_EXT_DLMEM_ENABLE
+    `ifdef VX_CFG_EXT_MBAR_ENABLE
+        .data_in   ({rsp_tw, rsp_aq, rsp_hdr2, rsp_data}),
+        .data_out  ({result_rsp_tw, result_rsp_aq, result_rsp_if.data}),
+    `elsif VX_CFG_EXT_DLMEM_ENABLE
         .data_in   ({rsp_aq, rsp_hdr2, rsp_data}),
         .data_out  ({result_rsp_aq, result_rsp_if.data}),
     `else
@@ -671,7 +721,9 @@ module VX_lsu_slice import VX_gpu_pkg::*; #(
 
     VX_stream_arb #(
         .NUM_INPUTS (2),
-    `ifdef VX_CFG_EXT_DLMEM_ENABLE
+    `ifdef VX_CFG_EXT_MBAR_ENABLE
+        .DATAW      (2 + $bits(lsu_result_t)),
+    `elsif VX_CFG_EXT_DLMEM_ENABLE
         .DATAW      (1 + $bits(lsu_result_t)),
     `else
         .DATAW      ($bits(lsu_result_t)),
@@ -683,7 +735,10 @@ module VX_lsu_slice import VX_gpu_pkg::*; #(
         .reset     (reset),
         .valid_in  ({result_no_rsp_if.valid, result_rsp_if.valid}),
         .ready_in  ({result_no_rsp_if.ready, result_rsp_if.ready}),
-    `ifdef VX_CFG_EXT_DLMEM_ENABLE
+    `ifdef VX_CFG_EXT_MBAR_ENABLE
+        .data_in   ({2'b00, result_no_rsp_if.data, result_rsp_tw, result_rsp_aq, result_rsp_if.data}),
+        .data_out  ({result_tw, result_aq, result_if.data}),
+    `elsif VX_CFG_EXT_DLMEM_ENABLE
         .data_in   ({1'b0, result_no_rsp_if.data, result_rsp_aq, result_rsp_if.data}),
         .data_out  ({result_aq, result_if.data}),
     `else
@@ -699,6 +754,11 @@ module VX_lsu_slice import VX_gpu_pkg::*; #(
     // AMOs always take the response path, and its eop is the instruction's last packet.
     assign sched_unlock_if.valid = result_if.valid && result_if.ready && result_if.data.header.eop && result_aq;
     assign sched_unlock_if.wid   = result_if.data.header.wid;
+`endif
+`ifdef VX_CFG_EXT_MBAR_ENABLE
+    // A try_wait never takes the unlock above: the waiter table releases its warp.
+    assign mbar_retire_valid = result_if.valid && result_if.ready && result_if.data.header.eop && result_tw;
+    assign mbar_retire_wid   = result_if.data.header.wid;
 `endif
 
 `ifdef DBG_TRACE_MEM

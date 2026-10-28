@@ -63,6 +63,13 @@ Scheduler::Scheduler(const SimContext& ctx, const char* name, Core* core)
     : SimObject<Scheduler>(ctx, name)
 #ifdef VX_CFG_EXT_DLMEM_ENABLE
     , UnlockIn(NUM_UNLOCKS, SimChannel<uint32_t>(this))
+#ifdef VX_CFG_EXT_MBAR_ENABLE
+    , MbarUnlockIn(this)
+#else
+#line 63
+#endif
+#else
+#line 66
 #endif
     , core_(core)
     , warps_(VX_CFG_NUM_WARPS, VX_CFG_NUM_THREADS)
@@ -128,10 +135,32 @@ void Scheduler::on_tick() {
     }
     busy |= (in.size() != 0);
   }
+#ifdef VX_CFG_EXT_MBAR_ENABLE
+  while (!MbarUnlockIn.empty()) {
+    const auto& mask = MbarUnlockIn.peek();
+    for (uint32_t wid = 0; wid < VX_CFG_NUM_WARPS; ++wid) {
+      if (!mask.test(wid))
+        continue;
+      __assert(active_warps_.test(wid) && stalled_warps_next_.test(wid),
+               "mbarrier unlock of a warp that is not stalled: wid=" << wid);
+      // Still stalled in the register: it cannot be the warp being scheduled.
+      __assert(stalled_warps_.test(wid), "mbarrier unlock of the warp being scheduled: wid=" << wid);
+      this->resume(wid);
+      stalled_warps_.reset(wid);
+    }
+    MbarUnlockIn.pop();
+  }
+  busy |= (MbarUnlockIn.size() != 0);
+#else
+#line 130
+#endif
   if (!busy) {
     this->tick_sleep();
   }
 }
+#endif
+#ifndef VX_CFG_EXT_MBAR_ENABLE
+#line 135
 #endif
 
 void Scheduler::activate_warp(uint32_t wid, const cta_warp_record_t& rec) {

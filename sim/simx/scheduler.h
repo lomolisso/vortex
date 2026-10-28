@@ -129,6 +129,10 @@ public:
 #else
   static constexpr uint32_t NUM_UNLOCKS = VX_CFG_NUM_LSU_BLOCKS;
 #endif
+#ifdef VX_CFG_EXT_MBAR_ENABLE
+  // The warps the mbarrier waiter table releases, already past their stall register.
+  SimChannel<WarpMask> MbarUnlockIn;
+#endif
 #endif
 
   Scheduler(const SimContext& ctx, const char* name, Core* core);

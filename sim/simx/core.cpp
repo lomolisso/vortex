@@ -55,6 +55,11 @@
 #include "cta_gang.h"
 #include "dlmem/dlmem_xlate.h"
 #include "dlmem/dlmem_wtrack.h"
+#ifdef VX_CFG_EXT_MBAR_ENABLE
+#include "mbar_waiters.h"
+#endif
+#else
+#line 58
 #endif
 
 using namespace vortex;
@@ -316,6 +321,11 @@ public:
     snprintf(sname, 100, "%s-lmem_acc_track", name.c_str());
     lmem_acc_track_ = DlmemWTrack::Create(sname, VX_CFG_NUM_LSU_BLOCKS, VX_CFG_NUM_WARPS, DLMEM_LACC_LIMIT,
                                           VX_CFG_LMEM_NUM_BANKS);
+  #ifdef VX_CFG_EXT_MBAR_ENABLE
+    snprintf(sname, 100, "%s-mbar_waiters", name.c_str());
+    mbar_waiters_ = MbarWaiterTable::Create(sname, VX_CFG_LMEM_NUM_BANKS, VX_CFG_NUM_LSU_BLOCKS,
+                                            VX_CFG_MBAR_SUSPEND_CYCLES);
+  #endif
     {
       auto lsu = std::static_pointer_cast<LsuUnit>(func_units_.at((int)FUType::LSU));
       for (uint32_t b = 0; b < VX_CFG_NUM_LSU_BLOCKS; ++b) {
@@ -334,6 +344,15 @@ public:
       for (uint32_t i = 0; i < VX_CFG_LMEM_NUM_BANKS; ++i) {
         local_mem_->CommitOut.at(i).bind(&lmem_acc_track_->CommitIn.at(i));
       }
+    #ifdef VX_CFG_EXT_MBAR_ENABLE
+      for (uint32_t i = 0; i < VX_CFG_LMEM_NUM_BANKS; ++i) {
+        local_mem_->MbarEvtOut.at(i).bind(&mbar_waiters_->BankEvtIn.at(i));
+      }
+      for (uint32_t b = 0; b < VX_CFG_NUM_LSU_BLOCKS; ++b) {
+        lsu->MbarRetireOut.at(b).bind(&mbar_waiters_->RetireIn.at(b));
+      }
+      mbar_waiters_->UnlockOut.bind(&scheduler_->MbarUnlockIn);
+    #endif
     }
     dlmem_xlate_->set_drained_query([wtrack = dlmem_wtrack_.get(), lacc = lmem_acc_track_.get()](uint32_t wid) {
       return wtrack->drained(wid) && lacc->drained(wid);
@@ -1242,6 +1261,11 @@ private:
   DlmemWTrack::Ptr lmem_acc_track_;
   // The scheduler's active warps as of the last cycle.
   WarpMask active_warps_;
+#ifdef VX_CFG_EXT_MBAR_ENABLE
+  MbarWaiterTable::Ptr mbar_waiters_;
+#endif
+#else
+#line 1245
 #endif
 };
 

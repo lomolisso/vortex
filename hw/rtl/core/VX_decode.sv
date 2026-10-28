@@ -418,8 +418,8 @@ module VX_decode import
                 end
             `ifdef VX_CFG_EXT_MBAR_ENABLE
                 // mbarrier ops: a .D AMO on a local-memory object, the op in funct3.
-                // funct7 and funct3 5..6 are reserved.
-                if (funct7 == 7'd0 && funct3 <= 3'd4) begin
+                // funct7 and funct3 6 are reserved.
+                if (funct7 == 7'd0 && funct3 <= 3'd5) begin
                     ex_type = EX_LSU;
                     op_type = INST_OP_BITS'({1'b0, LSU_FMT_D});
                     op_args.lsu.is_store = 0;
@@ -432,6 +432,8 @@ module VX_decode import
                     op_args.lsu.amo_aq       = 1'b0;
                     // An arrive releases the warp's earlier local-memory accesses.
                     op_args.lsu.amo_rl       = (funct3 <= 3'd1);
+                    // A try_wait suspends its warp until the mbarrier waiter table releases it.
+                    is_wstall = (funct3 == 3'd5);
                     `USED_IREG (rd);
                     `USED_IREG (rs1);
                     `USED_IREG (rs2);

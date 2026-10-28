@@ -81,6 +81,13 @@ module VX_local_mem_top import VX_gpu_pkg::*; #(
     output wire [NUM_BANKS-1:0]                lmem_commit_valid,
     output wire [NUM_BANKS-1:0][7:0]           lmem_commit_wid,
 `endif
+`ifdef VX_CFG_EXT_MBAR_ENABLE
+    // mbarrier waiter events, one per bank: an insert (flip = 0) or a flip
+    output wire [NUM_BANKS-1:0]                mbar_evt_valid,
+    output wire [NUM_BANKS-1:0]                mbar_evt_flip,
+    output wire [NUM_BANKS-1:0][7:0]           mbar_evt_wid,
+    output wire [NUM_BANKS-1:0][BANK_ADDR_WIDTH-1:0] mbar_evt_row,
+`endif
 
     // DMA request: one row of NUM_BANKS words at a bank address
     input  wire                                dma_req_valid,
@@ -182,6 +189,12 @@ module VX_local_mem_top import VX_gpu_pkg::*; #(
         assign lmem_commit_wid[i] = 8'(lmem_commit_wid_w[i]);
     end
 `endif
+`ifdef VX_CFG_EXT_MBAR_ENABLE
+    wire [NUM_BANKS-1:0][NW_WIDTH-1:0] mbar_evt_wid_w;
+    for (genvar i = 0; i < NUM_BANKS; ++i) begin : g_mbar_evt_wid
+        assign mbar_evt_wid[i] = 8'(mbar_evt_wid_w[i]);
+    end
+`endif
 
     VX_local_mem #(
         .INSTANCE_ID  (INSTANCE_ID),
@@ -205,6 +218,12 @@ module VX_local_mem_top import VX_gpu_pkg::*; #(
     `ifdef VX_CFG_EXT_DLMEM_ENABLE
         .lmem_commit_valid (lmem_commit_valid),
         .lmem_commit_wid   (lmem_commit_wid_w),
+    `endif
+    `ifdef VX_CFG_EXT_MBAR_ENABLE
+        .mbar_evt_valid    (mbar_evt_valid),
+        .mbar_evt_flip     (mbar_evt_flip),
+        .mbar_evt_wid      (mbar_evt_wid_w),
+        .mbar_evt_row      (mbar_evt_row),
     `endif
         .lsu_bus_if (lsu_bus_if),
         .dma_bus_if (dma_bus_if)

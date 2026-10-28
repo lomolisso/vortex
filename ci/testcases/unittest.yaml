@@ -24,13 +24,15 @@ tests:
   # off: load/store/DMA only). The `hw` lane only builds local_mem without atomics.
   # Then the LSU's global/local switch at 1, 2 and 4 LSU lanes: every request
   # reaches each side it has lanes on exactly once, under independent back-pressure.
+  # At XLEN 64 also the mbarrier banks and the mbarrier waiter table.
   - id: hw-lmem
     via: script
     run: "make -C hw/unittest run-lmem"
     touches: [hw/rtl/mem, hw/rtl/cache/VX_amo_unit.sv, hw/rtl/cache/VX_amo_alu.sv,
               hw/rtl/VX_gpu_pkg.sv, hw/rtl/VX_define.vh, hw/rtl/core/VX_mem_unit.sv,
               hw/unittest/local_mem, hw/unittest/lmem_switch, hw/unittest/mem_unit,
-              hw/unittest/Makefile, sw/common/mbar_ref.h]
+              hw/unittest/Makefile, sw/common/mbar_ref.h, hw/rtl/dlmem/VX_mbar_waiters.sv,
+              hw/unittest/mbar_waiters]
   # CTA dispatcher and KMU: slot placement across launches, each launch opening
   # at slot 0 as SimX's does, with 4 and 8 CTA slots. In the xlen-64 tree the
   # same benches also run in DLMEM builds: the cluster rank on every launch beat

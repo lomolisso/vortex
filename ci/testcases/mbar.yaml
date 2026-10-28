@@ -1,8 +1,10 @@
 # mbarriers: 64-bit synchronization objects in a block's local memory, which
 # the local memory banks update in their atomic unit (custom-2 arrive,
-# arrive_tx, expect_tx, complete_tx, test_wait). RV64, on a DLMEM device with
-# the A extension. The apps check every final object word against the golden
-# model sw/common/mbar_ref.h. See docs/proposals/dlmem_proposal.md.
+# arrive_tx, expect_tx, complete_tx, test_wait, try_wait). RV64, on a DLMEM
+# device with the A extension. try_wait suspends the warp in the core's
+# waiter table until the phase completes or the time limit passes. The apps
+# check every final object word against the golden model
+# sw/common/mbar_ref.h. See docs/proposals/dlmem_proposal.md.
 category: mbar
 defaults:
   xlen: [64]
@@ -37,7 +39,8 @@ defaults:
             hw/rtl/core/VX_uop_sequencer.sv, hw/rtl/dlmem/VX_uop_release.sv, sim/simx/sequencer,
             sim/simx/instr.h, hw/rtl/cache, sim/simx/mem/cache, hw/rtl/VX_socket.sv,
             hw/rtl/tcu, sim/simx/tcu, sw/kernel/include/vx_tensor.h,
-            tests/regression/sgemm_tcu_wg_mbar, tests/regression/sgemm_tcu_mx_mbar]
+            tests/regression/sgemm_tcu_wg_mbar, tests/regression/sgemm_tcu_mx_mbar,
+            sim/simx/mbar_waiters, sim/simx/Makefile, tests/regression/mbar_wait]
 tests:
   # One block of 4 warps x 4 threads. basic: every thread arrives with 1 and
   # waits on its token for 32 phases; the stores before each arrive must be
@@ -250,6 +253,143 @@ tests:
     xlen: [64]
     configs+: "-DVX_CFG_EXT_TCU_ENABLE -DVX_CFG_TCU_WGMMA_ENABLE -DVX_CFG_EXT_DXA_ENABLE -DVX_CFG_ISSUE_WIDTH=2 -DVX_CFG_NUM_THREADS=8 -DVX_CFG_NUM_WARPS=4 -DITYPE=fp16 -DOTYPE=fp32 -DWGMMA_NRC=8"
     args: "-m refill -p -s 3"
+
+  # --- try_wait ---
+  # One block of 4 warps x 4 threads; worker warp 0 arrives, the others wait
+  # with try_wait. late: the arrive comes after the time limit, so every wait
+  # times out at least once, then succeeds. sleep: the producer sleeps
+  # through 100 time limits on an object nobody arrives on, so the whole core
+  # sleeps for longer than the scheduler's 100000-cycle stall timeout; only
+  # the time limit keeps it alive. many: every lane of every warp waits, on
+  # one object, on one object per warp, and on one per lane (a warp is woken
+  # by its last waiting lane's object or the time limit). mixed: the arrive
+  # lands among a waiter warp's lanes, so its first poll splits the warp; it
+  # runs 8 threads per warp, whose lanes reach the bank in two packets (with
+  # one packet per warp the arrive almost never falls inside one). A try_wait
+  # on one object returns false only after the time limit, every run must
+  # suspend a warp, and a time-out while every arrive was answered 64 cycles
+  # within the time limit is a lost wake-up (mixed and one-object many runs
+  # must stay within it).
+  - id: mbar_wait
+    app: mbar_wait
+    drivers: [simx, rtlsim]
+    args: "-m late -r 8"
+  - id: mbar_wait-sleep
+    app: mbar_wait
+    drivers: [simx, rtlsim]
+    args: "-m sleep -r 100"
+  - id: mbar_wait-many
+    app: mbar_wait
+    drivers: [simx, rtlsim]
+    args: "-m many -r 8"
+  - id: mbar_wait-many-warps
+    app: mbar_wait
+    drivers: [simx, rtlsim]
+    args: "-m many -o 4 -r 8"
+  - id: mbar_wait-many-lanes
+    app: mbar_wait
+    drivers: [simx, rtlsim]
+    args: "-m many -o 4 -L -r 8"
+  - id: mbar_wait-mixed
+    app: mbar_wait
+    drivers: [simx, rtlsim]
+    shape: {threads: 8}
+    args: "-m mixed -r 96"
+  # try_wait against the test_wait spin on the same late arrives: the run that
+  # sleeps must retire fewer instructions.
+  - id: mbar_wait-spin
+    via: script
+    driver: simx
+    env: {DRIVER: simx, ARGS: "-m late -r 8"}
+    run: &spin_cmp_run |
+      set -u
+      tmp=$(mktemp -d)
+      if ! make -C sw/runtime/"$DRIVER" > "$tmp/build.log" 2>&1 \
+         || ! make -C tests/regression/mbar_wait >> "$tmp/build.log" 2>&1; then
+        echo "FAIL: the build failed with CONFIGS=${CONFIGS:-}"; tail -n 20 "$tmp/build.log"
+        rm -rf "$tmp"; exit 1
+      fi
+      fail=0
+      for v in try spin; do
+        a="$ARGS"; [ $v = spin ] && a="$a -s"
+        if ! timeout 300 ./ci/blackbox.sh --driver="$DRIVER" --app=mbar_wait --args="$a" > "$tmp/$v.log" 2>&1; then
+          echo "FAIL: '$a' failed on $DRIVER"; tail -n 20 "$tmp/$v.log"; fail=1
+        fi
+        grep -F 'waiter threads' "$tmp/$v.log"
+      done
+      if [ $fail -eq 0 ]; then
+        ti=$(sed -n 's/^PERF: instrs=\([0-9]*\),.*/\1/p' "$tmp/try.log" | tail -n 1)
+        si=$(sed -n 's/^PERF: instrs=\([0-9]*\),.*/\1/p' "$tmp/spin.log" | tail -n 1)
+        if [ -z "$ti" ] || [ -z "$si" ]; then
+          echo "FAIL: no PERF summary"; fail=1
+        elif [ "$ti" -ge "$si" ]; then
+          echo "FAIL: try_wait retired $ti instructions, the test_wait spin $si"; fail=1
+        else
+          echo "OK: try_wait retired $ti instructions, the test_wait spin $si"
+        fi
+      fi
+      rm -rf "$tmp"
+      exit $fail
+  - id: mbar_wait-spin
+    via: script
+    driver: rtlsim
+    env: {DRIVER: rtlsim, ARGS: "-m late -r 8"}
+    run: *spin_cmp_run
+
+  # Wider shapes and bank pressure: 8 warps of 8 threads; SIMD 2 with issue
+  # width 2, where a warp's lanes reach the banks as two packets and only the
+  # last response ends the wait (its lanes wait on different objects, so the
+  # packets insert different ones); two warps streaming DXA copies, so DMA
+  # beats win the banks while the waiters poll and the arrives land. The
+  # mixed runs share the issue slots with up to seven waiter warps' nops and
+  # the DMA beats, so an arrive is answered up to ~1800 cycles after the
+  # meeting: they run a 4096-cycle time limit to keep it well within (the
+  # lost-wake-up check needs that), and 8 warps of 8 threads arrive 16 idle
+  # iterations late so that SimX's waiters still poll before the arrive.
+  - id: mbar_wait-many-w8t8
+    app: mbar_wait
+    drivers: [simx, rtlsim]
+    tier: nightly
+    shape: {warps: 8, threads: 8}
+    args: "-m many -o 8 -L -r 8"
+  - id: mbar_wait-mixed-w8t8
+    app: mbar_wait
+    drivers: [simx, rtlsim]
+    tier: nightly
+    configs+: "-DVX_CFG_MBAR_SUSPEND_CYCLES=4096"
+    shape: {warps: 8, threads: 8}
+    args: "-m mixed -r 96 -d 16"
+  - id: mbar_wait-many-lanes-simd2
+    app: mbar_wait
+    drivers: [simx, rtlsim]
+    tier: nightly
+    configs+: "-DVX_CFG_SIMD_WIDTH=2 -DVX_CFG_ISSUE_WIDTH=2"
+    shape: {warps: 8}
+    args: "-m many -o 4 -L -r 8"
+  - id: mbar_wait-dxa
+    app: mbar_wait
+    drivers: [simx, rtlsim]
+    tier: nightly
+    configs+: "-DVX_CFG_EXT_DXA_ENABLE"
+    shape: {warps: 8}
+    args: "-m late -r 16 -D 2"
+  - id: mbar_wait-mixed-dxa
+    app: mbar_wait
+    drivers: [simx, rtlsim]
+    tier: nightly
+    configs+: "-DVX_CFG_EXT_DXA_ENABLE -DVX_CFG_MBAR_SUSPEND_CYCLES=4096"
+    shape: {warps: 8}
+    args: "-m mixed -r 96 -D 2"
+
+  # Parity of try_wait at XLEN 64 with a fixed schedule: every wait is one
+  # try_wait that sleeps until the arrive wakes it and returns true, and each
+  # worker warp ends with one time-out; the table's decision, unlock and
+  # re-schedule cycles set the timing.
+  - id: parity-mbar-wait
+    check: model_parity
+    app: mbar_wait
+    xlen: [64]
+    args: "-m late -r 16 -p"
 
   # Each must stop the simulation with the exact message: an arrive past
   # pending, tx past its 21-bit range, an mbarrier op on a global address, and

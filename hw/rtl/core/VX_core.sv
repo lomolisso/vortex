@@ -128,6 +128,13 @@ module VX_core import VX_gpu_pkg::*, VX_tlb_pkg::*; #(
 `ifdef TCU_WG_GROUPS_ENABLE
     VX_sched_unlock_if tcu_unlock_if [`VX_CFG_NUM_TCU_BLOCKS]();  // wgmma wait_group release -> scheduler
 `endif
+`ifdef VX_CFG_EXT_MBAR_ENABLE
+    // mbarrier try_wait retires -> waiter table (VX_mem_unit) -> scheduler
+    wire [`VX_CFG_NUM_LSU_BLOCKS-1:0]               mbar_retire_valid;
+    wire [`VX_CFG_NUM_LSU_BLOCKS-1:0][NW_WIDTH-1:0] mbar_retire_wid;
+    wire                                           mbar_unlock_valid;
+    wire [`VX_CFG_NUM_WARPS-1:0]                   mbar_unlock_mask;
+`endif
     wire [`VX_CFG_NUM_LSU_BLOCKS-1:0] lsu_sched_raw_empty;
     wire [`VX_CFG_NUM_LSU_BLOCKS-1:0] xlate_empty;
     // The slice's read-tag pool (LSU_PENDING_SIZE) relies on the scheduler to refuse
@@ -292,6 +299,10 @@ module VX_core import VX_gpu_pkg::*, VX_tlb_pkg::*; #(
     `ifdef TCU_WG_GROUPS_ENABLE
         .tcu_unlock_if  (tcu_unlock_if),
     `endif
+    `ifdef VX_CFG_EXT_MBAR_ENABLE
+        .mbar_unlock_valid (mbar_unlock_valid),
+        .mbar_unlock_mask (mbar_unlock_mask),
+    `endif
 
         .busy           (sched_busy)
     );
@@ -378,6 +389,10 @@ module VX_core import VX_gpu_pkg::*, VX_tlb_pkg::*; #(
     `endif
     `ifdef TCU_WG_GROUPS_ENABLE
         .tcu_unlock_if  (tcu_unlock_if),
+    `endif
+    `ifdef VX_CFG_EXT_MBAR_ENABLE
+        .mbar_retire_valid (mbar_retire_valid),
+        .mbar_retire_wid (mbar_retire_wid),
     `endif
 
     `ifdef TCU_META_ENABLE
@@ -578,6 +593,12 @@ module VX_core import VX_gpu_pkg::*, VX_tlb_pkg::*; #(
         .dlmem_lmem_if (dlmem_lmem_if),
         .lmem_commit_valid (lmem_commit_valid),
         .lmem_commit_wid (lmem_commit_wid),
+    `endif
+    `ifdef VX_CFG_EXT_MBAR_ENABLE
+        .mbar_retire_valid (mbar_retire_valid),
+        .mbar_retire_wid (mbar_retire_wid),
+        .mbar_unlock_valid (mbar_unlock_valid),
+        .mbar_unlock_mask (mbar_unlock_mask),
     `endif
         .empty         (mem_unit_empty),
         .lsu_mem_if    (lsu_mem_if),

@@ -43,6 +43,14 @@ module VX_mem_unit import VX_gpu_pkg::*; #(
     output wire [`VX_CFG_LMEM_NUM_BANKS-1:0][NW_WIDTH-1:0] lmem_commit_wid,
 `endif
 
+`ifdef VX_CFG_EXT_MBAR_ENABLE
+    // Per LSU block, the retire of an mbarrier try_wait; the warps it releases
+    input wire [`VX_CFG_NUM_LSU_BLOCKS-1:0]               mbar_retire_valid,
+    input wire [`VX_CFG_NUM_LSU_BLOCKS-1:0][NW_WIDTH-1:0] mbar_retire_wid,
+    output wire                                          mbar_unlock_valid,
+    output wire [`VX_CFG_NUM_WARPS-1:0]                  mbar_unlock_mask,
+`endif
+
     output wire             empty,
 
     VX_lsu_mem_if.slave     lsu_mem_if [`VX_CFG_NUM_LSU_BLOCKS],
@@ -283,6 +291,14 @@ module VX_mem_unit import VX_gpu_pkg::*; #(
 
     end
 
+`ifdef VX_CFG_EXT_MBAR_ENABLE
+    localparam LMEM_ROW_WIDTH = LMEM_ADDR_WIDTH - `CLOG2(`VX_CFG_LMEM_NUM_BANKS);
+    wire [`VX_CFG_LMEM_NUM_BANKS-1:0]                     mbar_evt_valid;
+    wire [`VX_CFG_LMEM_NUM_BANKS-1:0]                     mbar_evt_flip;
+    wire [`VX_CFG_LMEM_NUM_BANKS-1:0][NW_WIDTH-1:0]       mbar_evt_wid;
+    wire [`VX_CFG_LMEM_NUM_BANKS-1:0][LMEM_ROW_WIDTH-1:0] mbar_evt_row;
+`endif
+
     VX_local_mem #(
         .INSTANCE_ID (`SFORMATF(("%s-lmem", INSTANCE_ID))),
         .SIZE        (1 << `VX_CFG_LMEM_LOG_SIZE),
@@ -311,9 +327,35 @@ module VX_mem_unit import VX_gpu_pkg::*; #(
         .lmem_commit_valid (lmem_commit_valid),
         .lmem_commit_wid   (lmem_commit_wid),
     `endif
+    `ifdef VX_CFG_EXT_MBAR_ENABLE
+        .mbar_evt_valid    (mbar_evt_valid),
+        .mbar_evt_flip     (mbar_evt_flip),
+        .mbar_evt_wid      (mbar_evt_wid),
+        .mbar_evt_row      (mbar_evt_row),
+    `endif
         .dma_bus_if  (lmem_dma_if),
         .lsu_bus_if  (lmem_adapt_if)
     );
+
+`ifdef VX_CFG_EXT_MBAR_ENABLE
+    VX_mbar_waiters #(
+        .INSTANCE_ID (`SFORMATF(("%s-mbar-waiters", INSTANCE_ID))),
+        .NUM_BANKS   (`VX_CFG_LMEM_NUM_BANKS),
+        .NUM_RETIRES (`VX_CFG_NUM_LSU_BLOCKS),
+        .ROW_WIDTH   (LMEM_ROW_WIDTH)
+    ) mbar_waiters (
+        .clk          (clk),
+        .reset        (reset),
+        .evt_valid    (mbar_evt_valid),
+        .evt_flip     (mbar_evt_flip),
+        .evt_wid      (mbar_evt_wid),
+        .evt_row      (mbar_evt_row),
+        .retire_valid (mbar_retire_valid),
+        .retire_wid   (mbar_retire_wid),
+        .unlock_valid (mbar_unlock_valid),
+        .unlock_mask  (mbar_unlock_mask)
+    );
+`endif
 
 `else
 

@@ -64,6 +64,16 @@ module VX_local_mem import VX_gpu_pkg::*; #(
     output wire [NUM_BANKS-1:0][NW_WIDTH-1:0]  lmem_commit_wid,
 `endif
 
+`ifdef VX_CFG_EXT_MBAR_ENABLE
+    // Per bank, in its op order: an insert (flip = 0) when a try_wait reads its
+    // phase not complete, a flip when an mbarrier op completes the phase of the
+    // word at row.
+    output wire [NUM_BANKS-1:0]                mbar_evt_valid,
+    output wire [NUM_BANKS-1:0]                mbar_evt_flip,
+    output wire [NUM_BANKS-1:0][NW_WIDTH-1:0]  mbar_evt_wid,
+    output wire [NUM_BANKS-1:0][ADDR_WIDTH-`CLOG2(NUM_BANKS)-1:0] mbar_evt_row,
+`endif
+
     // LSU read/write port
     VX_mem_bus_if.slave lsu_bus_if [NUM_REQS],
 
@@ -654,7 +664,17 @@ module VX_local_mem import VX_gpu_pkg::*; #(
                 `UNUSED_VAR (amo_new_word[63:WORD_WIDTH])
             end
         `ifdef VX_CFG_EXT_MBAR_ENABLE
-            `UNUSED_VAR (amo_mbar_flip)
+            // One atomic owns the bank from its read to its write-back, so its
+            // insert (read stage) and a flip (write-back stage) never meet.
+            wire evt_insert = wait_resolving && ~wait_done
+                           && (amo_op_e'(amo_wb_op_r) == AMO_OP_MBAR_TRY_WAIT);
+            wire evt_flip   = amo_wb_valid_r && amo_mbar_flip;
+            assign mbar_evt_valid[i] = evt_insert || evt_flip;
+            assign mbar_evt_flip[i]  = evt_flip;
+            assign mbar_evt_wid[i]   = amo_wb_wid_r;
+            assign mbar_evt_row[i]   = amo_wb_addr_r;
+            `RUNTIME_ASSERT(~(evt_insert && evt_flip),
+                ("%t: *** %s bank%0d: two mbarrier waiter events in one cycle", $time, INSTANCE_ID, i))
             wire wb_is_mbar = (amo_op_e'(amo_wb_op_r) >= AMO_OP_MBAR_ARRIVE);
             `RUNTIME_ASSERT(~(amo_wb_valid_r && wb_is_mbar && ~(&amo_wb_byteen_r)),
                 ("%t: *** %s bank%0d: mbarrier op is not a naturally aligned doubleword: row=0x%0h byteen=0x%h",
@@ -682,6 +702,10 @@ module VX_local_mem import VX_gpu_pkg::*; #(
         `ifdef VX_CFG_EXT_MBAR_ENABLE
             assign wait_resolving = 1'b0;
             assign wait_done      = 1'b0;
+            assign mbar_evt_valid[i] = 1'b0;
+            assign mbar_evt_flip[i]  = 1'b0;
+            assign mbar_evt_wid[i]   = '0;
+            assign mbar_evt_row[i]   = '0;
         `endif
         `ifdef VX_CFG_EXT_DLMEM_ENABLE
             assign amo_commit     = 1'b0;

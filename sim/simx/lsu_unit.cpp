@@ -85,6 +85,11 @@ LsuUnit::LsuUnit(const SimContext& ctx, const char* name, Core* core)
 	, XlateReqOut(VX_CFG_NUM_LSU_BLOCKS, SimChannel<LsuReq>(this))
 	, UnlockOut(VX_CFG_NUM_LSU_BLOCKS, SimChannel<uint32_t>(this))
 	, SpawnIn(this)
+#ifdef VX_CFG_EXT_MBAR_ENABLE
+	, MbarRetireOut(VX_CFG_NUM_LSU_BLOCKS, SimChannel<uint32_t>(this))
+#else
+#line 87
+#endif
 #else
 #line 87
 #endif
@@ -104,6 +109,18 @@ LsuUnit::LsuUnit(const SimContext& ctx, const char* name, Core* core)
 				marks.erase(it);
 			}
 			out_unlock_.at(b).push_back(wid);
+		#ifdef VX_CFG_EXT_MBAR_ENABLE
+			auto& tws = retire_beats_.at(b);
+			auto jt = std::find(tws.begin(), tws.end(), beat);
+			int32_t tw_wid = -1;
+			if (jt != tws.end()) {
+				tw_wid = int32_t(beat->wid);
+				tws.erase(jt);
+			}
+			out_retire_.at(b).push_back(tw_wid);
+		#else
+		#line 106
+		#endif
 		});
 		Outputs.at(b).pop_callback([this, b]() {
 			auto& order = out_unlock_.at(b);
@@ -112,10 +129,22 @@ LsuUnit::LsuUnit(const SimContext& ctx, const char* name, Core* core)
 			if (wid >= 0) {
 				UnlockOut.at(b).send(uint32_t(wid), ACQ_UNLOCK_DELAY);
 			}
+		#ifdef VX_CFG_EXT_MBAR_ENABLE
+			auto& retires = out_retire_.at(b);
+			int32_t tw_wid = retires.front();
+			retires.pop_front();
+			if (tw_wid >= 0) {
+				DT(2, this->name() << " mbar-retire: wid=" << tw_wid);
+				MbarRetireOut.at(b).send(uint32_t(tw_wid), MBAR_RETIRE_DELAY);
+			}
+		#else
+		#line 113
+		#endif
 		});
 	}
 }
 #else
+#line 116
 {}
 #endif
 
@@ -157,6 +186,12 @@ void LsuUnit::on_reset() {
 	for (uint32_t b = 0; b < VX_CFG_NUM_LSU_BLOCKS; ++b) {
 		unlock_beats_.at(b).clear();
 		out_unlock_.at(b).clear();
+	#ifdef VX_CFG_EXT_MBAR_ENABLE
+		retire_beats_.at(b).clear();
+		out_retire_.at(b).clear();
+	#else
+	#line 159
+	#endif
 	}
 	gdirty_.assign(VX_CFG_NUM_WARPS, false);
 	gload_.assign(VX_CFG_NUM_WARPS, 0);
@@ -176,14 +211,39 @@ bool LsuUnit::is_acquire_amo(const instr_trace_t* trace) {
 // pid-split instruction can be answered out of order, so its eop result need
 // not be the last.
 void LsuUnit::mark_unlock(uint32_t b, instr_trace_t* beat, bool is_final) {
+#ifdef VX_CFG_EXT_MBAR_ENABLE
+	const bool is_tw = is_try_wait(beat);
+	if (!is_final || !(is_acquire_amo(beat) || is_tw))
+		return;
+#else
 	if (!is_final || !is_acquire_amo(beat))
 		return;
+#endif
 	auto& done = aq_done_.at(beat->wid);
 	if (++done < beat->num_pkts)
 		return;
 	done = 0;
+#ifdef VX_CFG_EXT_MBAR_ENABLE
+	if (is_tw) {
+		retire_beats_.at(b).push_back(beat);
+		return;
+	}
+#else
+#line 184
+#endif
 	unlock_beats_.at(b).push_back(beat);
 }
+
+#ifdef VX_CFG_EXT_MBAR_ENABLE
+bool LsuUnit::is_try_wait(const instr_trace_t* trace) {
+	auto* type = std::get_if<AmoType>(&trace->op_type);
+	return type && *type == AmoType::MBAR_TRY_WAIT;
+}
+#else
+#line 184
+#endif
+#else
+#line 179
 #endif
 
 void LsuUnit::compute_addrs(uint32_t b, instr_trace_t* trace) {
@@ -431,6 +491,16 @@ void LsuUnit::ingest_inputs(uint32_t b) {
 	if (is_acquire_amo(trace)) {
 		trace->resume_warp = false;
 	}
+#ifdef VX_CFG_EXT_MBAR_ENABLE
+	// A try_wait's warp stays suspended until the waiter table releases it.
+	if (is_try_wait(trace)) {
+		trace->resume_warp = false;
+	}
+#else
+#line 431
+#endif
+#else
+#line 426
 #endif
 	state.req_queue.push(trace);
 	input.pop();

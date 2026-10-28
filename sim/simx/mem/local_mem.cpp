@@ -62,6 +62,12 @@ protected:
 	// Per bank, the cycle the last commit pulse lands.
 	std::vector<uint64_t> commit_due_;
 #endif
+#ifdef VX_CFG_EXT_MBAR_ENABLE
+	// Per bank, the cycle the last mbarrier event lands.
+	std::vector<uint64_t> evt_due_;
+#else
+#line 64
+#endif
 
 	uint64_t to_local_addr(uint64_t addr) {
 		return bit_getw(addr, 0, addr_bits_-1);
@@ -102,6 +108,11 @@ public:
 #ifdef VX_CFG_EXT_DLMEM_ENABLE
 		, commit_due_(1 << config.B, 0)
 #endif
+#ifdef VX_CFG_EXT_MBAR_ENABLE
+		, evt_due_(1 << config.B, 0)
+#else
+#line 104
+#endif
 	{
 		char sname[100];
 		snprintf(sname, 100, "%s-xbar", simobject->name().c_str());
@@ -137,6 +148,11 @@ public:
 #ifdef VX_CFG_EXT_DLMEM_ENABLE
 		std::fill(commit_due_.begin(), commit_due_.end(), 0);
 #endif
+#ifdef VX_CFG_EXT_MBAR_ENABLE
+		std::fill(evt_due_.begin(), evt_due_.end(), 0);
+#else
+#line 139
+#endif
 	}
 
 #ifdef VX_CFG_EXT_DLMEM_ENABLE
@@ -156,6 +172,32 @@ public:
 		commit_due_.at(bank) = due;
 		simobject_->CommitOut.at(bank).send((req.hart_id >> LOG_THREADS) & WID_MASK, delay);
 	}
+#endif
+
+#ifdef VX_CFG_EXT_MBAR_ENABLE
+	// The waiter table's view of an mbarrier op the bank just took: a try_wait
+	// that read an incomplete phase parks its warp from the read stage, the
+	// second cycle of the occupancy; a completed phase is seen at the
+	// write-back, the third.
+	void mbar_event(uint32_t bank, const MemReq& req, const mbar_ref::Result& r) {
+		constexpr uint32_t LOG_THREADS = log2ceil(VX_CFG_NUM_THREADS);
+		constexpr uint32_t WID_MASK = (1u << log2ceil(VX_CFG_NUM_WARPS)) - 1;
+		MbarBankEvt evt{r.flip, 0, uint32_t(this->bank_word(req.addr) >> config_.B)};
+		uint32_t delay = 2;
+		if (!r.flip) {
+			if (req.op != MemOp::MBAR_TRY_WAIT || r.ret_word != 0)
+				return;
+			evt.wid = (req.hart_id >> LOG_THREADS) & WID_MASK;
+			delay = 1;
+		}
+		uint64_t due = SimPlatform::instance().cycles() + delay;
+		__assert(due > evt_due_.at(bank), simobject_->name() << "-bank" << bank
+		         << ": two mbarrier waiter events in one cycle");
+		evt_due_.at(bank) = due;
+		simobject_->MbarEvtOut.at(bank).send(evt, delay);
+	}
+#else
+#line 159
 #endif
 
 	void tick() {
@@ -281,6 +323,13 @@ public:
 #ifdef VX_CFG_EXT_DLMEM_ENABLE
 				this->commit_pulse(i, bank_req, AMO_BANK_STALL_CYCLES + 1);
 #endif
+#ifdef VX_CFG_EXT_MBAR_ENABLE
+				if (is_mbar) {
+					this->mbar_event(i, bank_req, mbar_ref::apply(mbar_op_code(op), old_word, rhs));
+				}
+#else
+#line 283
+#endif
 				xbar_req_out.pop();
 				amo_busy_[i] = AMO_BANK_STALL_CYCLES;   // capture, then write back
 				continue;
@@ -368,6 +417,11 @@ LocalMem::LocalMem(const SimContext& ctx, const char* name, const Config& config
 	, Outputs(config.num_reqs, this)
 #ifdef VX_CFG_EXT_DLMEM_ENABLE
 	, CommitOut(1 << config.B, this)
+#endif
+#ifdef VX_CFG_EXT_MBAR_ENABLE
+	, MbarEvtOut(1 << config.B, this)
+#else
+#line 371
 #endif
 	, impl_(new Impl(this, config))
 {}

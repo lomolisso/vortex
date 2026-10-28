@@ -362,13 +362,73 @@ socket and a crossbar across sockets, connect them
   pointer, as in CUDA. A thread that shares stack data must fence it with
   `vx_fence()` itself.
 - **Acquire at CTA scope.** The block shares one L1, so a load issued after
-  the acquiring wait (an mbarrier `test_wait` branch, a barrier) sees the
+  the acquiring wait (an mbarrier `test_wait` or `try_wait` branch, a barrier) sees the
   released data with no invalidate. Cluster and device scope still need
   `vx_fence()` on both sides, as above.
 - **Fence lock.** While the token is out, the slice holds its fence lock, so
   the other warps of that LSU slice cannot send memory requests. The H100
   does not stall other warps this way; it costs only when the releasing warp
   has written global memory.
+
+## Suspending mbarrier waits
+
+- **Op.** `vx_mbar_try_wait(p, token)` returns true once the phase `token`
+  was taken in has completed, like PTX `mbarrier.try_wait`: while the phase
+  is incomplete the warp may suspend, and false means a time limit passed
+  first. The instruction (custom-2, `funct3 = 5`, always `.D`) answers with
+  the phase as its bank read it, before the warp suspends, so its answer is
+  false whenever the warp slept. The library follows a false answer with one
+  `test_wait`, so the call is true when the phase completed before the warp
+  resumed. `vx_mbar_try_wait_parity` passes the parity as the token's phase
+  bit. `vortex::mbarrier::wait()` and `wait_parity()` loop on it, like
+  `cuda::barrier::wait()` and CUTLASS's `ClusterBarrier::wait()`.
+  `test_wait` is unchanged and never suspends.
+- **The LSU is never held.** The op decodes as a warp stall, so the warp
+  issues nothing after it until it is released. The bank answers it at once,
+  read-only, like `test_wait`. Suspended warps therefore hold no LSU entry
+  and cannot block the arrive that frees them.
+- **Events.** Each local-memory bank reports, in its own op order, an
+  *insert* `{wid, row}` when a `try_wait` lane reads an incomplete phase, and
+  a *flip* `{row}` when an mbarrier op completes a phase. The LSU reports a
+  *retire* `{wid}` when the op's last response leaves, so every lane has
+  read the object by then.
+- **Waiter table.** One per core (RTL `VX_mbar_waiters` in `VX_mem_unit`,
+  SimX `MbarWaiterTable`), one entry per warp `{bank, row, woke, retired,
+  timer}`.
+  - An insert fills the warp's entry; the last lane's insert wins.
+  - A flip marks every entry on its `{bank, row}` woken.
+  - The retire releases the warp at once if no lane inserted or the entry
+    is already woken; otherwise it starts the timer.
+  - A woken retired entry, or an expired timer, releases the warp.
+  - No wake-up is lost: an object lives in one bank, which orders its ops,
+    so a flip either comes before a lane's read (the read returns true) or
+    after that lane's insert, on the same event stream.
+- **Timing.** The table decides in cycle T, sends a registered unlock mask to
+  the scheduler at T+1, and the warp can be scheduled at T+2, in both models
+  (checked on debug traces of both). The library's `test_wait` then reads
+  the phase complete after a wake-up, and incomplete after a time-out unless
+  the phase completed meanwhile.
+- **Time limit.** `VX_CFG_MBAR_SUSPEND_CYCLES`, 1024 by default. A build check
+  keeps it below a quarter of the scheduler's stall timeout, so a core whose
+  warps all sleep keeps waking up (`mbar_wait -m sleep` sleeps through 100
+  time limits). A real mbarrier hang therefore no longer trips the stall
+  assertion: its warps wake every time limit and poll again until the host
+  times out, as a `test_wait` spin did.
+- **Lanes.** Every active lane reads the object. Lanes can see different
+  answers when the phase completes between their reads; the warp is released
+  once, and the library's `test_wait` returns true in the lanes that saw it
+  incomplete. When the lanes of one warp wait on different objects, the warp
+  is woken when the object read by its last waiting lane completes, or at
+  the time limit; the other lanes may then return false early and poll
+  again, which is correct, only slower.
+- **Gaps.** No `suspendTimeHint`: the knob is the only limit. The build
+  check does not cover the scheduler's `EXT_SCHED_STALL_TIMEOUT` override
+  (`VX_scheduler.sv`), which can set a stall timeout below four time limits.
+  No wait on a
+  remote mbarrier; PTX allows waits only on the executing CTA's objects, and
+  remote mbarrier ops still assert. The limit counts core cycles, not
+  nanoseconds. Wake-ups by DXA completion and by remote arrives will come
+  through the same flip events once those ops reach the banks.
 
 ## Exclusions
 

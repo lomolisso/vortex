@@ -35,6 +35,15 @@
 // - Every lane of a warp is a separate update of the object, serialized at
 //   its bank: one elected lane arriving with a count is the efficient form.
 // - The object must be an 8-byte aligned word of the caller's own local memory.
+// - vx_mbar_try_wait() returns true once the phase has completed, like PTX
+//   mbarrier.try_wait: while it is incomplete the warp suspends until it
+//   completes or a time limit of VX_CFG_MBAR_SUSPEND_CYCLES cycles passes, and
+//   false means the limit expired first, so a caller that must wait loops on
+//   it. A warp waits on one object at a time: when its lanes wait on different
+//   objects, it is woken when the object read by its last waiting lane
+//   completes, or at the time limit, so the other lanes may return false
+//   early and poll again.
+// - vx_mbar_test_wait() never suspends: it reads the phase and returns.
 
 #if !defined(__riscv_xlen) || __riscv_xlen != 64
 #error "mbarriers require XLEN 64"
@@ -102,6 +111,18 @@ static inline __attribute__((always_inline)) bool vx_mbar_test_wait_parity(uint6
   return vx_mbar_test_wait(p, (uint64_t)(parity & 1) << 63);
 }
 
+// vx_mbar_test_wait() that suspends the warp while the phase is incomplete;
+// false once the time limit expires first.
+static inline __attribute__((always_inline)) bool vx_mbar_try_wait(uint64_t* p, uint64_t token) {
+  // The op answers with the phase it read before suspending the warp: after a
+  // wake-up, one test_wait tells a completed phase from an expired time limit.
+  return __VX_MBAR_OP(5, p, token) != 0 || vx_mbar_test_wait(p, token);
+}
+
+static inline __attribute__((always_inline)) bool vx_mbar_try_wait_parity(uint64_t* p, uint32_t parity) {
+  return vx_mbar_try_wait(p, (uint64_t)(parity & 1) << 63);
+}
+
 #ifdef __cplusplus
 }
 
@@ -126,12 +147,17 @@ public:
 
   bool test_wait_parity(uint32_t parity) const { return vx_mbar_test_wait_parity(obj_, parity); }
 
+  bool try_wait(uint64_t token) const { return vx_mbar_try_wait(obj_, token); }
+
+  bool try_wait_parity(uint32_t parity) const { return vx_mbar_try_wait_parity(obj_, parity); }
+
+  // Sleeps between polls instead of spinning, like cuda::barrier::wait().
   void wait(uint64_t token) const {
-    while (!test_wait(token)) {}
+    while (!try_wait(token)) {}
   }
 
   void wait_parity(uint32_t parity) const {
-    while (!test_wait_parity(parity)) {}
+    while (!try_wait_parity(parity)) {}
   }
 
   void arrive_and_wait(uint32_t count = 1) const { wait(arrive(count)); }

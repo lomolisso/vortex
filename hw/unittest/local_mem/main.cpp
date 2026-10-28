@@ -20,8 +20,11 @@
 // access of the other inputs on a per-bank commit port with its warp: a load or
 // store once the bank performs it, an atomic once it writes back. mbarrier
 // builds run the mbarrier ops against mbar_ref, directed and racing DMA and
-// stores; --neg=<underflow|txrange|align> issues one erroneous op, and the
-// bank's assert must abort the run.
+// stores, and check every bank's waiter events: an insert {wid, row} one cycle
+// after a try_wait is taken that reads the phase not complete, a flip {row}
+// two cycles after a writing op is taken that completes it, nothing for any
+// other op; in op order per bank. --neg=<underflow|txrange|align> issues one
+// erroneous op, and the bank's assert must abort the run.
 
 #include "vl_simulator.h"
 #include "VVX_local_mem_top.h"
@@ -36,6 +39,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <deque>
+#include <map>
 #include <optional>
 #include <random>
 #include <string>
@@ -329,6 +333,12 @@ struct Events {
   std::array<LsuReq, NUM_REQS>    acc_req{};
   std::array<bool, NUM_BANKS>     commit{};
   std::array<uint32_t, NUM_BANKS> commit_wid{};
+#ifdef VX_CFG_EXT_MBAR_ENABLE
+  std::array<bool, NUM_BANKS>     mbar_evt{};
+  std::array<bool, NUM_BANKS>     mbar_flip{};
+  std::array<uint32_t, NUM_BANKS> mbar_wid{};
+  std::array<uint32_t, NUM_BANKS> mbar_row{};
+#endif
   uint32_t num_commits() const {
     uint32_t n = 0;
     for (bool c : commit) {
@@ -396,6 +406,15 @@ public:
       ev.commit[b] = get_bits(t->lmem_commit_valid, b, 1);
       ev.commit_wid[b] = static_cast<uint32_t>(get_bits(t->lmem_commit_wid, b * 8, 8));
     }
+#endif
+#ifdef VX_CFG_EXT_MBAR_ENABLE
+    for (uint32_t b = 0; b < NUM_BANKS; ++b) {
+      ev.mbar_evt[b] = get_bits(t->mbar_evt_valid, b, 1);
+      ev.mbar_flip[b] = get_bits(t->mbar_evt_flip, b, 1);
+      ev.mbar_wid[b] = static_cast<uint32_t>(get_bits(t->mbar_evt_wid, b * 8, 8));
+      ev.mbar_row[b] = static_cast<uint32_t>(get_bits(t->mbar_evt_row, b * ROW_BITS, ROW_BITS));
+    }
+    this->mbar_account(ev);
 #endif
     this->account(ev);
     tick_ = sim_.step(tick_, 2);
@@ -471,12 +490,118 @@ private:
     }
   }
 
+#ifdef VX_CFG_EXT_MBAR_ENABLE
+  void mbar_account(const Events& ev) {
+    for (uint32_t b = 0; b < NUM_BANKS; ++b) {
+      if (ev.mbar_evt[b]) {
+        mbar_evs[b].push_back({cycle_, ev.mbar_flip[b], ev.mbar_wid[b], ev.mbar_row[b]});
+      }
+    }
+    for (uint32_t i = 0; i < NUM_REQS; ++i) {
+      if (ev.lsu_acc[i] && ev.acc_req[i].amo && ev.acc_req[i].op >= mbar::OP_BASE) {
+        MbarOp o;
+        o.lane = i;
+        o.req = ev.acc_req[i];
+        o.acc = cycle_;
+        mbar_ops[req_bank(o.req)].push_back(o);
+      }
+    }
+    for (uint32_t i = 0; i < NUM_REQS; ++i) {
+      if (!ev.lsu_rsp[i]) {
+        continue;
+      }
+      for (auto& q : mbar_ops) {
+        for (MbarOp& o : q) {
+          if (!o.known && o.lane == i && o.req.tag == ev.rsp_tag[i]) {
+            o.known = true;
+            o.rsp = cycle_;
+            uint64_t d = ev.rsp_data[i];
+            if (o.req.op == mbar::OP_TRY_WAIT) {
+              o.owes = (d == 0) ? 1 : 0;
+            } else if (o.req.op != mbar::OP_TEST_WAIT) {
+              o.owes = mbar::apply(o.req.op, d, o.req.data).flip ? 2 : 0;
+            }
+          }
+        }
+      }
+    }
+    for (uint32_t b = 0; b < NUM_BANKS; ++b) {
+      auto& q = mbar_ops[b];
+      while (!q.empty() && q.front().known) {
+        const MbarOp& o = q.front();
+        if (o.owes != 0) {
+          const bool flip = (o.owes == 2);
+          const uint32_t wid = req_wid(o.lane, o.req);
+          const uint32_t row = o.req.addr >> BANK_BITS;
+          std::string what = strf("%s lane %u wid %u row 0x%x (offered at %" PRIu64 ", answered at %" PRIu64 ")",
+                                  amo_name(o.req.op, false), o.lane, wid, row, o.acc, o.rsp);
+          if (mbar_evs[b].empty()) {
+            mbar_errors.push_back(strf("bank %u: no %s for %s", b, flip ? "flip" : "insert", what.c_str()));
+          } else {
+            const MbarEv e = mbar_evs[b].front();
+            mbar_evs[b].pop_front();
+            if (e.flip != flip || e.row != row || (!flip && e.wid != wid) || e.cycle <= o.acc || e.cycle > o.rsp) {
+              mbar_errors.push_back(strf("bank %u: %s at cycle %" PRIu64 " (wid %u, row 0x%x), expected the %s of %s",
+                                         b, e.flip ? "flip" : "insert", e.cycle, e.wid, e.row,
+                                         flip ? "flip" : "insert", what.c_str()));
+            }
+            (flip ? mbar_flips : mbar_inserts) += 1;
+          }
+        }
+        q.pop_front();
+      }
+    }
+  }
+#endif
+
 public:
   std::array<uint64_t, NUM_WARPS> uncommitted{};
   std::array<std::array<uint64_t, NUM_WARPS>, NUM_BANKS> bank_uncommitted{};
   uint64_t accepted = 0;
   uint64_t commits = 0;
   std::vector<std::string> commit_errors;
+
+#ifdef VX_CFG_EXT_MBAR_ENABLE
+  // Waiter events, per bank in op order. An mbarrier op taken by the bank owes
+  // the event its response tells: a try_wait answering 0 an insert, a writing
+  // op whose returned old word completes the phase a flip, any other none. The
+  // owed events of each bank must come out in its ops' order, after the op was
+  // offered and no later than its response; none may be left over.
+  struct MbarOp {
+    uint32_t lane = 0;
+    LsuReq   req;
+    uint64_t acc = 0;
+    bool     known = false;
+    int      owes = 0; // 0 none, 1 insert, 2 flip
+    uint64_t rsp = 0;
+  };
+  struct MbarEv {
+    uint64_t cycle = 0;
+    bool     flip = false;
+    uint32_t wid = 0;
+    uint32_t row = 0;
+  };
+  std::array<std::deque<MbarOp>, NUM_BANKS> mbar_ops;
+  std::array<std::deque<MbarEv>, NUM_BANKS> mbar_evs;
+  uint64_t mbar_inserts = 0;
+  uint64_t mbar_flips = 0;
+  std::vector<std::string> mbar_errors;
+
+  // Every op answered and every event matched.
+  void mbar_drained(const char* ctx) {
+    for (uint32_t b = 0; b < NUM_BANKS; ++b) {
+      if (!mbar_ops[b].empty()) {
+        mbar_errors.push_back(strf("%s: bank %u has %zu mbarrier op(s) unanswered", ctx, b, mbar_ops[b].size()));
+        mbar_ops[b].clear();
+      }
+      for (const MbarEv& e : mbar_evs[b]) {
+        mbar_errors.push_back(strf("%s: bank %u %s at cycle %" PRIu64 " (wid %u, row 0x%x) owed by no op", ctx, b,
+                                   e.flip ? "flip" : "insert", e.cycle, e.wid, e.row));
+      }
+      mbar_evs[b].clear();
+    }
+  }
+#endif
 
 private:
   vl_simulator<VVX_local_mem_top> sim_;
@@ -530,6 +655,7 @@ public:
       this->lrsc_window();
     #ifdef VX_CFG_EXT_MBAR_ENABLE
       this->mbar_directed();
+      this->mbar_events();
       for (uint32_t s = 0; s < opts_.stress_seeds; ++s) {
         this->mbar_stress(opts_.seed * 104729u + s);
       }
@@ -1097,11 +1223,24 @@ private:
     uint32_t wid;
   };
 
+#ifdef VX_CFG_EXT_MBAR_ENABLE
+  struct MbarEvRel {
+    int      rel;
+    uint32_t bank;
+    bool     flip;
+    uint32_t wid;
+    uint32_t row;
+  };
+#endif
+
   struct ScnRun {
     std::vector<int> acc;
     std::vector<int> rsp;
     std::vector<uint64_t> data;
     std::vector<CommitEv> commits;
+  #ifdef VX_CFG_EXT_MBAR_ENABLE
+    std::vector<MbarEvRel> mbar;
+  #endif
     bool ok = true;
   };
 
@@ -1188,6 +1327,11 @@ private:
         if (ev.commit[b]) {
           sr.commits.push_back({rel, b, ev.commit_wid[b]});
         }
+      #ifdef VX_CFG_EXT_MBAR_ENABLE
+        if (ev.mbar_evt[b]) {
+          sr.mbar.push_back({rel, b, ev.mbar_flip[b], ev.mbar_wid[b], ev.mbar_row[b]});
+        }
+      #endif
       }
       bool all = true;
       for (size_t k = 0; k < n; ++k) {
@@ -1245,6 +1389,16 @@ private:
     }
     dut_.commit_errors.clear();
   }
+
+#ifdef VX_CFG_EXT_MBAR_ENABLE
+  void check_mbar_errors(const char* ctx) {
+    dut_.mbar_drained(ctx);
+    for (const std::string& e : dut_.mbar_errors) {
+      this->fail(strf("FAIL mbar event stream %s: %s", ctx, e.c_str()));
+    }
+    dut_.mbar_errors.clear();
+  }
+#endif
 
   void store_commit() {
     const uint32_t before = failures_;
@@ -1556,6 +1710,40 @@ private:
     return r.amo ? 3 : 1;
   }
 
+#ifdef VX_CFG_EXT_MBAR_ENABLE
+  // The waiter event r owes, alone on an idle memory, at its exact cycle: an
+  // insert in the cycle after the bank takes it, a flip in the one after that.
+  void expect_mbar_event(const std::string& what, uint32_t lane, const LsuReq& r, int acc, uint64_t rsp,
+                         const std::vector<MbarEvRel>& evs) {
+    int owes = 0;
+    if (r.amo && r.op == mbar::OP_TRY_WAIT) {
+      owes = (rsp == 0) ? 1 : 0;
+    } else if (r.amo && r.op >= mbar::OP_BASE && r.op != mbar::OP_TEST_WAIT) {
+      owes = mbar::apply(r.op, rsp, r.data).flip ? 2 : 0;
+    }
+    std::string got;
+    for (const auto& e : evs) {
+      got += strf(" {+%d bank %u %s wid %u row 0x%x}", e.rel, e.bank, e.flip ? "flip" : "insert", e.wid, e.row);
+    }
+    if (owes == 0) {
+      if (!evs.empty()) {
+        this->fail(strf("FAIL mbar event %s lane %u: expected no event, got%s", what.c_str(), lane, got.c_str()));
+      }
+      return;
+    }
+    const int want = acc + bank_lat_ + owes;
+    const bool flip = (owes == 2);
+    const uint32_t row = r.addr >> BANK_BITS;
+    if (evs.size() != 1 || evs[0].rel != want || evs[0].bank != req_bank(r) || evs[0].flip != flip
+     || evs[0].row != row || (!flip && evs[0].wid != req_wid(lane, r))) {
+      this->fail(strf("FAIL mbar event %s lane %u bank %u: accepted +%d, expected one %s (wid %u, row 0x%x) at +%d, "
+                      "got%s", what.c_str(), lane, req_bank(r), acc, flip ? "flip" : "insert", req_wid(lane, r), row,
+                      want, got.empty() ? " none" : got.c_str()));
+    }
+    ++mbar_event_checks_[owes];
+  }
+#endif
+
   // r alone on an idle memory: one report at the expected cycle, bank and
   // warp from an LSU input, none from the ack input. Returns the response.
   std::optional<uint64_t> expect_report(const std::string& what, uint32_t lane, const LsuReq& r) {
@@ -1582,6 +1770,9 @@ private:
                         what.c_str(), lane, req_bank(r), wid, sr.acc[0], want, got.empty() ? " none" : got.c_str()));
       }
     }
+  #ifdef VX_CFG_EXT_MBAR_ENABLE
+    this->expect_mbar_event(what, lane, r, sr.acc[0], sr.data[0], sr.mbar);
+  #endif
     if (r.rw && !acks_stores(lane)) {
       return std::nullopt;
     }
@@ -2001,6 +2192,164 @@ private:
     this->mbar_wait_hold();
     this->check_commit_errors("mbar");
     std::printf("mbar directed: %s\n", (failures_ == before) ? "ok" : "FAILED");
+  }
+
+  // Waiter events of several ops, each placed by its op's commit report (an
+  // atomic reports two cycles after its bank takes it, at write-back + 1):
+  // insert = report - 2, flip = report - 1.
+  struct MbarScn {
+    const char* what;
+    uint64_t    word;
+    uint32_t    first_op;
+    uint64_t    first_operand;
+    uint32_t    second_op;
+    uint64_t    second_operand;
+  };
+
+  void mbar_events() {
+    const uint32_t before = failures_;
+    using namespace mbar;
+    const uint64_t P1 = 1ull << 63;
+    // Two ops on one object from one LSU input, so the bank takes them back to back.
+    const MbarScn scns[] = {
+      {"try_wait open, then the completing arrive", pack(1, 2, 0, 0), OP_TRY_WAIT, 0, OP_ARRIVE, 1},
+      {"completing arrive, then try_wait (reads it done)", pack(1, 2, 0, 0), OP_ARRIVE, 1, OP_TRY_WAIT, 0},
+      {"try_wait open, then an arrive that leaves it open", pack(2, 2, 0, 1), OP_TRY_WAIT, P1, OP_ARRIVE, 1},
+      {"test_wait open, then the completing arrive", pack(1, 2, 0, 0), OP_TEST_WAIT, 0, OP_ARRIVE, 1},
+      {"try_wait done, then a completing complete_tx", pack(0, 2, 64, 1), OP_TRY_WAIT, 0, OP_COMPLETE_TX, 64},
+      {"completing expect_tx, then try_wait open", pack(0, 2, -32, 0), OP_EXPECT_TX, 32, OP_TRY_WAIT, P1},
+      {"two try_waits open", pack(1, 1, 0, 1), OP_TRY_WAIT, P1, OP_TRY_WAIT, P1},
+    };
+    uint32_t runs = 0;
+    for (const MbarScn& c : scns) {
+      for (uint32_t bank = 0; bank < NUM_BANKS; ++bank) {
+        const uint32_t row = this->rand_below(NUM_ROWS);
+        this->put_word(row, bank, c.word);
+        const int w0 = static_cast<int>(this->rand_below(NUM_WARPS));
+        const int w1 = static_cast<int>(this->rand_below(NUM_WARPS));
+        LsuReq a = mbar_req(c.first_op, row, bank, c.first_operand, w0);
+        LsuReq b = mbar_req(c.second_op, row, bank, c.second_operand, w1);
+        ScnRun sr = this->run_issues({this->lsu_issue(0, 0, a), this->lsu_issue(0, 0, b)}, true, 6);
+        ++runs;
+        if (!sr.ok) {
+          continue;
+        }
+        const Result ra = apply(c.first_op, c.word, c.first_operand);
+        const uint64_t mid = ra.writes ? ra.new_word : c.word;
+        const Result rb = apply(c.second_op, mid, c.second_operand);
+        const uint64_t fin = rb.writes ? rb.new_word : mid;
+        this->check_ret(strf("mbar events %s bank %u: first", c.what, bank), sr.data[0], ra.ret_word);
+        this->check_ret(strf("mbar events %s bank %u: second", c.what, bank), sr.data[1], rb.ret_word);
+        std::vector<int> rep;
+        for (const auto& e : sr.commits) {
+          if (e.bank == bank) {
+            rep.push_back(e.rel);
+          }
+        }
+        this->gold(row, bank) = fin;
+        // An op right behind a write to its word waits a cycle more (read-during-write).
+        const int gap = ra.writes ? 4 : 3;
+        if (rep.size() != 2 || rep[1] != rep[0] + gap) {
+          this->fail(strf("FAIL mbar events %s bank %u: %zu commit reports, expected two %d cycles apart",
+                          c.what, bank, rep.size(), gap));
+          continue;
+        }
+        std::vector<MbarEvRel> want;
+        const Result* rs[2] = {&ra, &rb};
+        const LsuReq* rq[2] = {&a, &b};
+        for (int k = 0; k < 2; ++k) {
+          if (rq[k]->op == OP_TRY_WAIT && rs[k]->ret_word == 0) {
+            want.push_back({rep[k] - 2, bank, false, req_wid(0, *rq[k]), row});
+          } else if (rs[k]->flip) {
+            want.push_back({rep[k] - 1, bank, true, 0, row});
+          }
+        }
+        bool ok = (sr.mbar.size() == want.size());
+        for (size_t k = 0; ok && k < want.size(); ++k) {
+          const auto& g = sr.mbar[k];
+          ok = g.rel == want[k].rel && g.bank == want[k].bank && g.flip == want[k].flip && g.row == want[k].row
+            && (g.flip || g.wid == want[k].wid);
+        }
+        if (!ok) {
+          std::string got, exp;
+          for (const auto& e : sr.mbar) {
+            got += strf(" {+%d bank %u %s wid %u row 0x%x}", e.rel, e.bank, e.flip ? "flip" : "insert", e.wid, e.row);
+          }
+          for (const auto& e : want) {
+            exp += strf(" {+%d bank %u %s wid %u row 0x%x}", e.rel, e.bank, e.flip ? "flip" : "insert", e.wid, e.row);
+          }
+          this->fail(strf("FAIL mbar events %s bank %u: got%s, expected%s", c.what, bank,
+                          got.empty() ? " none" : got.c_str(), exp.empty() ? " none" : exp.c_str()));
+        }
+        if (this->get_word(row, bank) != fin) {
+          this->fail(strf("FAIL mbar events %s bank %u: word %s, expected %s", c.what, bank,
+                          hex(this->get_word(row, bank)).c_str(), hex(fin).c_str()));
+        }
+      }
+    }
+
+    // One try_wait per bank from as many LSU inputs at once, then one
+    // completing arrive per bank: the banks' inserts, then their flips, land in
+    // the same cycles.
+    const uint32_t nl = std::min(NUM_LSU_REQS, NUM_BANKS);
+    uint32_t same_insert = 0, same_flip = 0;
+    for (uint32_t round = 0; round < 4 && nl > 1; ++round) {
+      std::vector<uint32_t> rows(nl);
+      for (uint32_t k = 0; k < nl; ++k) {
+        rows[k] = this->rand_below(NUM_ROWS);
+        this->put_word(rows[k], k, pack(1, 3, 0, 0));
+      }
+      for (int pass = 0; pass < 2; ++pass) {
+        std::vector<Issue> is;
+        std::vector<LsuReq> rq;
+        for (uint32_t k = 0; k < nl; ++k) {
+          rq.push_back(pass == 0 ? mbar_req(OP_TRY_WAIT, rows[k], k, 0, static_cast<int>(k % NUM_WARPS))
+                                 : mbar_req(OP_ARRIVE, rows[k], k, 1, static_cast<int>(k % NUM_WARPS)));
+          is.push_back(this->lsu_issue(0, k, rq.back()));
+        }
+        ScnRun sr = this->run_issues(is, true, 6);
+        ++runs;
+        if (!sr.ok) {
+          continue;
+        }
+        std::map<int, uint32_t> per_cycle;
+        for (uint32_t k = 0; k < nl; ++k) {
+          int rep = -1;
+          for (const auto& e : sr.commits) {
+            if (e.bank == k) {
+              rep = e.rel;
+            }
+          }
+          const bool flip = (pass == 1);
+          bool found = false;
+          for (const auto& e : sr.mbar) {
+            if (e.bank == k) {
+              found = !found && rep >= 0 && e.rel == rep - (flip ? 1 : 2) && e.flip == flip && e.row == rows[k]
+                   && (flip || e.wid == req_wid(k, rq[k]));
+              ++per_cycle[e.rel];
+            }
+          }
+          if (!found) {
+            this->fail(strf("FAIL mbar events %s per bank, bank %u: no single event at its report%s",
+                            flip ? "flips" : "inserts", k, rep >= 0 ? strf(" (+%d)", rep).c_str() : ""));
+          }
+        }
+        for (const auto& pc : per_cycle) {
+          if (pc.second > 1) {
+            (pass == 0 ? same_insert : same_flip) += 1;
+          }
+        }
+      }
+      for (uint32_t k = 0; k < nl; ++k) {
+        this->gold(rows[k], k) = apply(OP_ARRIVE, pack(1, 3, 0, 0), 1).new_word;
+      }
+    }
+    if (nl > 1 && (same_insert == 0 || same_flip == 0)) {
+      this->fail(strf("FAIL mbar events: no cycle with inserts (%u) or flips (%u) on two banks", same_insert, same_flip));
+    }
+    this->check_mbar_errors("mbar events");
+    std::printf("mbar events: %u runs, %u cycles with inserts and %u with flips on several banks: %s\n", runs,
+                same_insert, same_flip, (failures_ == before) ? "ok" : "FAILED");
   }
 
   // A wait's response held by back-pressure keeps its 0/1 outcome while DMA
@@ -2550,6 +2899,7 @@ private:
 
   uint64_t mbar_ops_[6] = {};
   uint64_t mbar_flips_ = 0;
+  uint64_t mbar_event_checks_[3] = {};
 #endif
 
   ///////////////////////////////////////////////////////////////////////////
@@ -4023,6 +4373,15 @@ private:
     }
     uint32_t before = failures_;
     this->check_commit_errors("final");
+  #ifdef VX_CFG_EXT_MBAR_ENABLE
+    this->check_mbar_errors("final");
+    std::printf("mbar event stream: %" PRIu64 " inserts and %" PRIu64 " flips matched to their ops; "
+                "%" PRIu64 " inserts and %" PRIu64 " flips timed alone\n", dut_.mbar_inserts, dut_.mbar_flips,
+                mbar_event_checks_[1], mbar_event_checks_[2]);
+    if (dut_.mbar_inserts == 0 || dut_.mbar_flips == 0 || mbar_event_checks_[1] == 0 || mbar_event_checks_[2] == 0) {
+      this->fail("FAIL mbar event stream: no insert or no flip was checked");
+    }
+  #endif
     this->check_rows("final memory", rows);
     std::printf("final memory check: %u mismatching word(s) over %u rows\n", failures_ - before, NUM_ROWS);
   }

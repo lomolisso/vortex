@@ -105,6 +105,14 @@ public:
 	// this many cycles after the commit takes the result.
 	static constexpr uint32_t ACQ_UNLOCK_DELAY = 1;
 #endif
+#ifdef VX_CFG_EXT_MBAR_ENABLE
+	// Per block: the warp of a try_wait, sent as the commit takes its last result.
+	std::vector<SimChannel<uint32_t>> MbarRetireOut;
+
+	// The waiter table ticks before the commit that takes the result, so it
+	// sees the retire one cycle later and applies it as the earlier cycle's.
+	static constexpr uint32_t MBAR_RETIRE_DELAY = 1;
+#endif
 
 	// Returns true when all LSU blocks have no in-flight requests.
 	bool drained() const;
@@ -130,6 +138,9 @@ private:
 
 #ifdef VX_CFG_EXT_DLMEM_ENABLE
 	static bool is_acquire_amo(const instr_trace_t* trace);
+#ifdef VX_CFG_EXT_MBAR_ENABLE
+	static bool is_try_wait(const instr_trace_t* trace);
+#endif
 
 	// Called for every result beat sent to Outputs[b].
 	void mark_unlock(uint32_t b, instr_trace_t* beat, bool is_final);
@@ -200,6 +211,13 @@ private:
 	std::array<std::vector<instr_trace_t*>, VX_CFG_NUM_LSU_BLOCKS> unlock_beats_;
 	// Per block, in Outputs' queue order: the warp each result releases, or -1.
 	std::array<std::deque<int32_t>, VX_CFG_NUM_LSU_BLOCKS> out_unlock_;
+#ifdef VX_CFG_EXT_MBAR_ENABLE
+	// The same for try_waits: last results not yet delivered, then the warp each
+	// result in Outputs retires, or -1. A warp has at most one try_wait or
+	// acquire AMO in flight, so both share aq_done_.
+	std::array<std::vector<instr_trace_t*>, VX_CFG_NUM_LSU_BLOCKS> retire_beats_;
+	std::array<std::deque<int32_t>, VX_CFG_NUM_LSU_BLOCKS> out_retire_;
+#endif
 	// Per warp: a global write was sent since its last fence answered, and its
 	// global read packets (loads, LR, AMOs) still waiting for their response.
 	// Both are registers: a CFENCE sees this cycle's updates the next cycle.

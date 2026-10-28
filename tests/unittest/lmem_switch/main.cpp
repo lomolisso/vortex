@@ -22,8 +22,10 @@
 // delay 1 for a load or store and delay 3 for an atomic (its write-back stage,
 // registered); none for uncounted accesses or the ingress or DMA ports. With
 // mbarriers: every op against mbar_ref, waits that neither write nor leave a
-// read-during-write shadow, reservations, the assert texts, and a random op
-// stream on a few words. Last, the dcache's CTA fence: at an L1 that is not the
+// read-during-write shadow, reservations, the assert texts, the waiter-table
+// events (an insert for a try_wait that reads an incomplete phase, taken at
+// accept+1 with its warp; a flip for an op that completes one, at accept+2;
+// at most one per bank and cycle), and a random op stream on a few words. Last, the dcache's CTA fence: at an L1 that is not the
 // shared level it drains an older write of another port, keeps the lines (a
 // later read hits), and sends nothing below marked as a fence; a GPU fence at
 // the same cache still walks.
@@ -104,6 +106,30 @@ protected:
   }
   friend class SimObject<CommitProbe>;
 };
+
+#ifdef VX_CFG_EXT_MBAR_ENABLE
+// Records the tick each mbarrier event is taken, as the waiter table does.
+class EvtProbe : public SimObject<EvtProbe> {
+public:
+  using Ptr = std::shared_ptr<EvtProbe>;
+  struct Event { uint64_t tick; uint32_t bank; MbarBankEvt evt; };
+  std::vector<SimChannel<MbarBankEvt>> In;
+  std::vector<Event> events;
+  EvtProbe(const SimContext& ctx, const char* name, uint32_t n)
+    : SimObject<EvtProbe>(ctx, name), In(n, this) {}
+protected:
+  void on_reset() { events.clear(); }
+  void on_tick() {
+    for (uint32_t b = 0; b < In.size(); ++b) {
+      while (!In[b].empty()) {
+        events.push_back({SimPlatform::instance().cycles(), b, In[b].peek()});
+        In[b].pop();
+      }
+    }
+  }
+  friend class SimObject<EvtProbe>;
+};
+#endif
 
 // The memory below a cache: logs each request with its tick, answers reads.
 class MemModel : public SimObject<MemModel> {
@@ -223,6 +249,7 @@ static void mbar_negative(const char* name, uint64_t init, uint32_t op, uint64_t
       platform.tick();
       while (!lmem->Outputs.at(0).empty()) lmem->Outputs.at(0).pop();
       while (!lmem->CommitOut.at(1).empty()) lmem->CommitOut.at(1).pop();
+      while (!lmem->MbarEvtOut.at(1).empty()) lmem->MbarEvtOut.at(1).pop();
     }
   }, &aborted);
   CHECK(aborted);
@@ -529,6 +556,13 @@ int main() {
     for (uint32_t b = 0; b < NB; ++b) {
       lmem->CommitOut.at(b).bind(&probe->In.at(b));
     }
+  #ifdef VX_CFG_EXT_MBAR_ENABLE
+    auto evts = EvtProbe::Create("evts", NB);
+    CHECK(lmem->MbarEvtOut.size() == NB);
+    for (uint32_t b = 0; b < NB; ++b) {
+      lmem->MbarEvtOut.at(b).bind(&evts->In.at(b));
+    }
+  #endif
     platform.reset();
     uint64_t cyc = platform.cycles();
     std::map<uint64_t, uint64_t> rsps;  // tag -> word at the request's address
@@ -778,7 +812,19 @@ int main() {
         write(a, v.old);
         auto ref = apply(v.op, v.old, v.operand);
         CHECK(ref.err == ERR_NONE);
+        size_t ebase = evts->events.size();
         uint64_t ret = exec(port, mbar_memop(v.op), a, v.operand, 1, port);
+        step(4);
+        {
+          bool insert = (v.op == OP_TRY_WAIT) && (ref.ret_word == 0);
+          size_t want = (ref.flip || insert) ? 1 : 0;
+          CHECK(evts->events.size() - ebase == want);
+          if (evts->events.size() - ebase == 1) {
+            auto& e = evts->events.back();
+            CHECK(e.bank == n % NB && e.evt.row == 20 + n && e.evt.flip == ref.flip);
+            CHECK(ref.flip || e.evt.wid == 1);
+          }
+        }
         uint64_t now = exec(port, MemOp::LD, a, 0, 1, port);
         bool ok = (ret == ref.ret_word) && (now == (ref.writes ? ref.new_word : v.old));
         if (is_wait(v.op)) {
@@ -801,6 +847,43 @@ int main() {
       CHECK(apply(OP_EXPECT_TX, pack(0, 1, -32, 0), 32).flip);
       CHECK(!apply(OP_ARRIVE_TX, init(1), 64).flip);
       std::printf("mbar vectors: %u ops vs mbar_ref, %u phase flips\n", n, flips);
+    }
+
+    // Waiter-table events: an op taken in tick T flips at T+2 and a try_wait
+    // that reads the phase incomplete inserts at T+1, with its warp; a
+    // try_wait that reads it complete and a test_wait send nothing.
+    {
+      struct Ev { uint32_t op; uint64_t old; uint64_t operand; int32_t at; bool flip; };
+      const Ev evs[] = {
+        {OP_ARRIVE,      init(4),          4, 2, true},
+        {OP_ARRIVE,      init(4),          1, -1, false},
+        {OP_COMPLETE_TX, pack(0, 2, 8, 0), 8, 2, true},
+        {OP_TRY_WAIT,    init(4),          0, 1, false},
+        {OP_TRY_WAIT,    pack(4, 4, 0, 1), 0, -1, false},
+        {OP_TEST_WAIT,   init(4),          0, -1, false},
+      };
+      for (auto& v : evs) {
+        uint64_t a = lmem_addr(3, 62);
+        write(a, v.old);
+        size_t ebase = evts->events.size();
+        t0 = cyc;
+        uint64_t tag = next_tag++;
+        rsp_addr[tag] = a;
+        MemReq mr(mbar_memop(v.op), a, word_blk(a, v.operand), 0xffull << (a & 63), tag,
+                  make_hart_id(5, 2, 3), tag);
+        mr.flags.lacc = 1;
+        lmem->Inputs.at(3).send(mr, 1);
+        step(10);
+        rsps.erase(tag);
+        size_t got = evts->events.size() - ebase;
+        CHECK(got == (v.at >= 0 ? 1u : 0u));
+        if (got == 1 && v.at >= 0) {
+          auto& e = evts->events.back();
+          CHECK(e.tick == t0 + W + uint64_t(v.at) && e.bank == 3 && e.evt.row == 62 && e.evt.flip == v.flip);
+          CHECK(v.flip || e.evt.wid == 2);
+        }
+      }
+      std::printf("mbar events: insert at accept+1 with the warp, flip at accept+2\n");
     }
 
     // The occupancy and shadow: an op, then an LSU load of the same word sent
@@ -867,7 +950,8 @@ int main() {
         write(words[w], model[w]);
       }
       base = probe->pulses.size();
-      uint64_t want_pulses = 0, ops = 0, waits = 0, flips = 0, loads = 0, dmas = 0;
+      size_t ebase = evts->events.size();
+      uint64_t want_pulses = 0, ops = 0, waits = 0, flips = 0, loads = 0, dmas = 0, inserts = 0;
       std::vector<uint64_t> tokens[3];
       for (uint32_t c = 0; c < 4000; ++c) {
         for (uint32_t w = 0; w < 3; ++w) {
@@ -924,6 +1008,7 @@ int main() {
               ++waits;
             }
             flips += r.flip;
+            inserts += (op == OP_TRY_WAIT) && (r.ret_word == 0);
             ++ops;
           }
           uint64_t tag = next_tag++;
@@ -995,12 +1080,22 @@ int main() {
       for (auto& p : v) {
         CHECK(++per_tick[std::make_pair(p.tick, p.bank)] == 1);
       }
+      // One event per flip and per incomplete try_wait, never two on one bank in one tick.
+      uint64_t got_flips = 0, got_inserts = 0;
+      std::map<std::pair<uint64_t, uint32_t>, uint32_t> evt_tick;
+      for (size_t k = ebase; k < evts->events.size(); ++k) {
+        auto& e = evts->events[k];
+        got_flips += e.evt.flip;
+        got_inserts += !e.evt.flip;
+        CHECK(++evt_tick[std::make_pair(e.tick, e.bank)] == 1);
+      }
+      CHECK(got_flips == flips && got_inserts == inserts);
       for (uint32_t w = 0; w < 3; ++w) {
         CHECK(exec(w % NLSU, MemOp::LD, words[w], 0, 0, 0) == model[w]);
       }
-      std::printf("mbar random: %llu ops (%llu waits, %llu flips), %llu loads, %llu DMA beats, %zu pulses\n",
-                  (unsigned long long)ops, (unsigned long long)waits, (unsigned long long)flips,
-                  (unsigned long long)loads, (unsigned long long)dmas, v.size());
+      std::printf("mbar random: %llu ops (%llu waits, %llu flips, %llu inserts), %llu loads, %llu DMA beats, "
+                  "%zu pulses\n", (unsigned long long)ops, (unsigned long long)waits, (unsigned long long)flips,
+                  (unsigned long long)inserts, (unsigned long long)loads, (unsigned long long)dmas, v.size());
     }
   #endif
   }
