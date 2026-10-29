@@ -15,13 +15,13 @@
 // and a store tracker, joined by a request and a response network) driven by
 // the bench shared with the SimX unit test (tests/unittest/dlmem_ep).
 //
-// Modes: random all-to-all, hotspot (AMO adds on one word of core 0),
-// storeflood (credits bind), loadflood (pending entries bind), backpressure
-// (LSU response ready 10%), lrsc (remote LR/SC mixed with loads and stores)
-// and latency (a fixed schedule with always-ready sinks; --csv writes
-// src,dst,op,seq,issue_cycle,done_cycle per lane, compared with the SimX run of
-// the same schedule by compare_latency.py). Without --mode every mode runs,
-// with seeds 1 and 2.
+// Modes: random all-to-all (its AMOs include mbarrier arrive and tx ops),
+// hotspot (AMO adds on one word of core 0), storeflood (credits bind),
+// loadflood (pending entries bind), backpressure (LSU response ready 10%),
+// lrsc (remote LR/SC mixed with loads and stores) and latency (a fixed
+// schedule with always-ready sinks; --csv writes src,dst,op,seq,issue_cycle,
+// done_cycle per lane, compared with the SimX run of the same schedule by
+// compare_latency.py). Without --mode every mode runs, with seeds 1 and 2.
 //
 // Built with LRSC_ASSERT=1, a remote LR or SC must stop the simulation on the
 // egress assertion, as it would in the core.

@@ -2,9 +2,10 @@
 # the local memory banks update in their atomic unit (custom-2 arrive,
 # arrive_tx, expect_tx, complete_tx, test_wait, try_wait). RV64, on a DLMEM
 # device with the A extension. try_wait suspends the warp in the core's
-# waiter table until the phase completes or the time limit passes. The apps
-# check every final object word against the golden model
-# sw/common/mbar_ref.h. See docs/proposals/dlmem_proposal.md.
+# waiter table until the phase completes or the time limit passes. The
+# arrive and tx ops also reach a peer block's object through the DLMEM
+# window, as remote atomics. The apps check every final object word against
+# the golden model sw/common/mbar_ref.h. See docs/proposals/dlmem_proposal.md.
 category: mbar
 defaults:
   xlen: [64]
@@ -40,7 +41,8 @@ defaults:
             sim/simx/instr.h, hw/rtl/cache, sim/simx/mem/cache, hw/rtl/VX_socket.sv,
             hw/rtl/tcu, sim/simx/tcu, sw/kernel/include/vx_tensor.h,
             tests/regression/sgemm_tcu_wg_mbar, tests/regression/sgemm_tcu_mx_mbar,
-            sim/simx/mbar_waiters, sim/simx/Makefile, tests/regression/mbar_wait]
+            sim/simx/mbar_waiters, sim/simx/Makefile, tests/regression/mbar_wait,
+            tests/regression/mbar_remote]
 tests:
   # One block of 4 warps x 4 threads. basic: every thread arrives with 1 and
   # waits on its token for 32 phases; the stores before each arrive must be
@@ -391,11 +393,125 @@ tests:
     xlen: [64]
     args: "-m late -r 16 -p"
 
+  # --- remote ops ---
+  # SPREAD clusters of 2 blocks of 2 warps on 2 cores, so every op on a peer's
+  # object crosses the network to its bank as a remote atomic. all: every
+  # thread arrives on every rank's object for 16 phases, and rank p % 2 comes
+  # late in phase p, so its remote arrive completes the peer's phase while the
+  # peer's warps sleep and must wake them. data: window stores into the next
+  # rank's buffer, then a remote arrive, which releases them. global: global
+  # buffers released and acquired with the _cluster forms, the consumer's L1
+  # refilled with its buffer's old lines before each wait. tx: remote
+  # complete_tx, expect_tx and arrive_tx, with tx negative in between. self:
+  # DEFAULT clusters, so every peer sits on the caller's core and its object
+  # takes the local path through the window. relaxed: all with relaxed
+  # arrives (each rank's last of a phase stays a release), then a relaxed
+  # and a release arrive timed behind four window stores: the relaxed one
+  # must be cheaper every time. The host checks which op completed each
+  # phase and that every late completion woke its waiters.
+  - id: mbar_remote
+    app: mbar_remote
+    drivers: [simx, rtlsim]
+    shape: {cores: 2, l2cache: true}
+    args: "-m all"
+  - id: mbar_remote-data
+    app: mbar_remote
+    drivers: [simx, rtlsim]
+    shape: {cores: 2, l2cache: true}
+    args: "-m data"
+  - id: mbar_remote-global
+    app: mbar_remote
+    drivers: [simx, rtlsim]
+    shape: {cores: 2, l2cache: true}
+    args: "-m global"
+  - id: mbar_remote-tx
+    app: mbar_remote
+    drivers: [simx, rtlsim]
+    shape: {cores: 2, l2cache: true}
+    args: "-m tx"
+  - id: mbar_remote-self
+    app: mbar_remote
+    drivers: [simx, rtlsim]
+    shape: {cores: 2, l2cache: true}
+    args: "-m self"
+  - id: mbar_remote-relaxed
+    app: mbar_remote
+    drivers: [simx, rtlsim]
+    shape: {cores: 2, l2cache: true}
+    args: "-m all -R"
+
+  # Four cores of 8 warps in two sockets, clusters of 4 blocks of 2 warps: the
+  # ops of a phase cross both levels of the network and contend at each bank.
+  # A late rank arrives on four objects, one after another, from a core whose
+  # eight warps share the issue slots, so its last arrive lands up to ~2000
+  # cycles after the waiters slept: the cells run a 4096-cycle time limit to
+  # keep each wait within one suspension (the wake-up check needs that).
+  - id: mbar_remote-4c
+    app: mbar_remote
+    drivers: [simx, rtlsim]
+    tier: nightly
+    configs+: "-DVX_CFG_SOCKET_SIZE=2 -DVX_CFG_MBAR_SUSPEND_CYCLES=4096"
+    shape: {cores: 4, warps: 8, l2cache: true}
+    args: "-m all -k 4 -n 4 -w 2"
+  - id: mbar_remote-data-4c
+    app: mbar_remote
+    drivers: [simx, rtlsim]
+    tier: nightly
+    configs+: "-DVX_CFG_SOCKET_SIZE=2 -DVX_CFG_MBAR_SUSPEND_CYCLES=4096"
+    shape: {cores: 4, warps: 8, l2cache: true}
+    args: "-m data -k 4 -n 4 -w 2 -r 32"
+  - id: mbar_remote-global-4c
+    app: mbar_remote
+    drivers: [simx, rtlsim]
+    tier: nightly
+    configs+: "-DVX_CFG_SOCKET_SIZE=2 -DVX_CFG_MBAR_SUSPEND_CYCLES=4096"
+    shape: {cores: 4, warps: 8, l2cache: true}
+    args: "-m global -k 4 -n 4 -w 2"
+  - id: mbar_remote-tx-4c
+    app: mbar_remote
+    drivers: [simx, rtlsim]
+    tier: nightly
+    configs+: "-DVX_CFG_SOCKET_SIZE=2 -DVX_CFG_MBAR_SUSPEND_CYCLES=4096"
+    shape: {cores: 4, warps: 8, l2cache: true}
+    args: "-m tx -k 4 -n 4 -w 2 -r 32"
+  - id: mbar_remote-relaxed-4c
+    app: mbar_remote
+    drivers: [simx, rtlsim]
+    tier: nightly
+    configs+: "-DVX_CFG_SOCKET_SIZE=2 -DVX_CFG_MBAR_SUSPEND_CYCLES=4096"
+    shape: {cores: 4, warps: 8, l2cache: true}
+    args: "-m all -k 4 -n 4 -w 2 -R"
+
+  # Parity of remote ops at XLEN 64 with a fixed schedule: per phase the
+  # blocks meet at the cluster barrier, then one rank fills the other's
+  # buffer with window stores and arrives remotely, which wakes the other's
+  # sleeping warps; the release hold, the network, the bank and the wake-up
+  # set the timing.
+  # The first phase's fill, from cold caches, comes close to the default
+  # 1024-cycle time limit, which a wait must not reach.
+  - id: parity-mbar-remote
+    check: model_parity
+    app: mbar_remote
+    xlen: [64]
+    configs+: "-DVX_CFG_MBAR_SUSPEND_CYCLES=2048"
+    shape: {cores: 2, l2cache: true}
+    args: "-m data -p -r 16 -e 16"
+  # The same schedule with a relaxed arrive right behind each producer
+  # thread's stores, then its release arrive: the relaxed one is not held,
+  # the release one waits for it and the stores.
+  - id: parity-mbar-remote-relaxed
+    check: model_parity
+    app: mbar_remote
+    xlen: [64]
+    configs+: "-DVX_CFG_MBAR_SUSPEND_CYCLES=2048"
+    shape: {cores: 2, l2cache: true}
+    args: "-m data -p -R -r 16 -e 16"
+
   # Each must stop the simulation with the exact message: an arrive past
   # pending, tx past its 21-bit range, an mbarrier op on a global address, and
-  # one on another block's object through the window (a SPREAD cluster of 2 on
-  # 2 cores, until remote mbarrier ops exist). The shape goes in CONFIGS, so
-  # the run reuses the prebuilt driver.
+  # a wait on another block's object through the window (a SPREAD cluster of 2
+  # on 2 cores): a test_wait in mbar_local, a try_wait in mbar_remote. The
+  # shape goes in CONFIGS, so the run reuses the prebuilt driver.
   - id: mbar_local-underflow
     via: script
     driver: simx
@@ -452,13 +568,25 @@ tests:
     via: script
     driver: simx
     configs+: "-DVX_CFG_NUM_CORES=2 -DVX_CFG_L2_ENABLE"
-    env: {DRIVER: simx, APP: mbar_local, ARGS: "-x remote", EXPECT: "remote mbarrier ops are not supported yet"}
+    env: {DRIVER: simx, APP: mbar_local, ARGS: "-x remote", EXPECT: "remote mbarrier wait is not supported"}
     run: *expect_fail_run
   - id: mbar_local-remote
     via: script
     driver: rtlsim
     configs+: "-DVX_CFG_NUM_CORES=2 -DVX_CFG_L2_ENABLE"
-    env: {DRIVER: rtlsim, APP: mbar_local, ARGS: "-x remote", EXPECT: "remote mbarrier ops are not supported yet"}
+    env: {DRIVER: rtlsim, APP: mbar_local, ARGS: "-x remote", EXPECT: "remote mbarrier wait is not supported"}
+    run: *expect_fail_run
+  - id: mbar_remote-wait
+    via: script
+    driver: simx
+    configs+: "-DVX_CFG_NUM_CORES=2 -DVX_CFG_L2_ENABLE"
+    env: {DRIVER: simx, APP: mbar_remote, ARGS: "-x wait", EXPECT: "remote mbarrier wait is not supported"}
+    run: *expect_fail_run
+  - id: mbar_remote-wait
+    via: script
+    driver: rtlsim
+    configs+: "-DVX_CFG_NUM_CORES=2 -DVX_CFG_L2_ENABLE"
+    env: {DRIVER: rtlsim, APP: mbar_remote, ARGS: "-x wait", EXPECT: "remote mbarrier wait is not supported"}
     run: *expect_fail_run
 
   # The knob without its prerequisites must stop the build, in SimX (the

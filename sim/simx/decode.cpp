@@ -1165,8 +1165,16 @@ Instr::Ptr Decoder::decode(uint32_t code, uint64_t uuid) {
   } break;
 #ifdef VX_CFG_EXT_DLMEM_ENABLE
   case Opcode::EXT3: {
+  #ifdef VX_CFG_EXT_MBAR_ENABLE
+    // funct7 = 1 is the relaxed form of arrive and arrive_tx.
+    if (funct7 > 1 || (funct7 == 1 && funct3 > 1))
+      std::abort();
+  #else
+  #line 1168
     if (funct7 != 0)
       std::abort();
+  #line 1169
+  #endif
     if (funct3 == 7) { // vx_fence_cta
       instr->set_fu_type(FUType::LSU);
       instr->set_op_type(LsuType::CFENCE);
@@ -1189,9 +1197,9 @@ Instr::Ptr Decoder::decode(uint32_t code, uint64_t uuid) {
       std::abort();
     }
     instr->set_fu_type(FUType::LSU);
-    // An arrival releases the warp's earlier local-memory accesses: it is held
-    // at the translation like an AMO with .rl.
-    instr->set_args(IntrAmoArgs{3, 0, funct3 <= 1});
+    // A release arrival orders the warp's earlier local-memory accesses: it is
+    // held at the translation like an AMO with .rl. A relaxed one orders nothing.
+    instr->set_args(IntrAmoArgs{3, 0, funct3 <= 1 && funct7 == 0});
     instr->set_dest_reg(rd, RegType::Integer);
     instr->set_src_reg(0, rs1, RegType::Integer);
     instr->set_src_reg(1, rs2, RegType::Integer);

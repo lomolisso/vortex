@@ -46,7 +46,7 @@ constexpr const char* MSG_UNDERFLOW = "mbarrier pending underflow";
 constexpr const char* MSG_TX_RANGE  = "mbarrier tx out of range";
 constexpr const char* MSG_ALIGN     = "mbarrier op is not a naturally aligned doubleword";
 constexpr const char* MSG_GLOBAL    = "mbarrier op on a global address";
-constexpr const char* MSG_REMOTE    = "remote mbarrier ops are not supported yet";
+constexpr const char* MSG_REMOTE    = "remote mbarrier wait is not supported";
 
 constexpr uint32_t COUNT_BITS = 20;
 constexpr uint32_t TX_BITS    = 21;

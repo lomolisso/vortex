@@ -310,7 +310,8 @@ endif
 # fences and release AMOs wait for their warp's remote accesses and local
 # accesses. The bound-assert build must abort on an out-of-bounds lane; a build
 # with mbarriers counts their ops on local lanes, holds an arrive like a
-# release AMO, and must abort on one on a global or a remote lane; the last
+# release AMO, sends arrive and tx ops on remote lanes as remote AMOs, and must
+# abort on an op on a global lane and on a wait on a remote lane; the last
 # build sends a remote lane, holds a fence until its store is acknowledged and
 # a local access's fence until its bank commit, and holds a release AMO the
 # same way; the final clean keeps a plain `run` from reusing it.
@@ -352,11 +353,13 @@ ifeq ($(XLEN),64)
 	! dlmem_xlate/dlmem_xlate --mode=oob > dlmem_xlate/oob.log 2>&1
 	grep -q "DLMEM access out of bounds" dlmem_xlate/oob.log
 	$(call dlmem_xlate_case,-DVX_CFG_NUM_CORES=2 -DVX_CFG_SOCKET_SIZE=1 -DVX_CFG_NUM_WARPS=4 \
-		-DVX_CFG_LMEM_LOG_SIZE=14 -DVX_CFG_EXT_A_ENABLE -DVX_CFG_EXT_MBAR_ENABLE,1,0,--seed=9,--mode=mbar)
+		-DVX_CFG_LMEM_LOG_SIZE=14 -DVX_CFG_EXT_A_ENABLE -DVX_CFG_EXT_MBAR_ENABLE,1,0,--seed=9,--mode=mbar,--mode=mbar-remote)
 	! dlmem_xlate/dlmem_xlate --mode=mbar-global > dlmem_xlate/mbar_global.log 2>&1
 	grep -q "mbarrier op on a global address" dlmem_xlate/mbar_global.log
-	! dlmem_xlate/dlmem_xlate --mode=mbar-remote > dlmem_xlate/mbar_remote.log 2>&1
-	grep -q "remote mbarrier ops are not supported yet" dlmem_xlate/mbar_remote.log
+	! dlmem_xlate/dlmem_xlate --mode=mbar-remote-wait > dlmem_xlate/mbar_remote_wait.log 2>&1
+	grep -q "remote mbarrier wait is not supported" dlmem_xlate/mbar_remote_wait.log
+	! dlmem_xlate/dlmem_xlate --mode=mbar-remote-trywait > dlmem_xlate/mbar_remote_trywait.log 2>&1
+	grep -q "remote mbarrier wait is not supported" dlmem_xlate/mbar_remote_trywait.log
 	$(call dlmem_xlate_case,-DVX_CFG_NUM_CORES=2 -DVX_CFG_SOCKET_SIZE=1 -DVX_CFG_NUM_WARPS=4 \
 		-DVX_CFG_LMEM_LOG_SIZE=14,0,0,--mode=remote,--mode=fence,--mode=rl)
 	$(MAKE) -C dlmem_xlate clean

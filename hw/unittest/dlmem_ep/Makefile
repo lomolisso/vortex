@@ -14,12 +14,16 @@ NOC_DIR := $(VORTEX_HOME)/hw/unittest/dlmem_noc
 # make dependency, so rebuild after changing it.
 LRSC_ASSERT ?= 0
 
-# The endpoints belong to the DLMEM extension and carry AMOs: always build with both.
+# The endpoints belong to the DLMEM extension and carry AMOs, mbarrier ops
+# among them: always build with all three.
 ifeq ($(filter -DVX_CFG_EXT_DLMEM_ENABLE,$(CONFIGS)),)
 override CONFIGS += -DVX_CFG_EXT_DLMEM_ENABLE
 endif
 ifeq ($(filter -DVX_CFG_EXT_A_ENABLE,$(CONFIGS)),)
 override CONFIGS += -DVX_CFG_EXT_A_ENABLE
+endif
+ifeq ($(filter -DVX_CFG_EXT_MBAR_ENABLE,$(CONFIGS)),)
+override CONFIGS += -DVX_CFG_EXT_MBAR_ENABLE
 endif
 # A remote access needs a second core: without a shape, build one 2-core socket.
 ifeq ($(filter -DVX_CFG_NUM_CORES=% -DVX_CFG_SOCKET_SIZE=%,$(CONFIGS)),)

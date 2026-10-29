@@ -38,6 +38,7 @@
 
 // The including file provides the VX_CFG_* configuration first.
 #include <VX_types.h>
+#include "mbar_ref.h"
 
 namespace ep {
 
@@ -84,8 +85,13 @@ static_assert(NL <= 32 && NP <= 64 && TAGS <= 256, "bench containers too small")
 // RTL amo_op_e codes.
 enum : uint8_t {
   OP_LR = 0, OP_SC = 1, OP_ADD = 2, OP_SWAP = 3, OP_XOR = 4,
-  OP_OR = 5, OP_AND = 6, OP_MIN = 7, OP_MAX = 8, OP_CAS = 9
+  OP_OR = 5, OP_AND = 6, OP_MIN = 7, OP_MAX = 8, OP_CAS = 9,
+  OP_MBAR_ARRIVE = 10, OP_MBAR_ARRIVE_TX = 11, OP_MBAR_EXPECT_TX = 12, OP_MBAR_COMPLETE_TX = 13
 };
+
+inline bool is_mbar_op(uint8_t op) {
+  return op >= OP_MBAR_ARRIVE && op <= OP_MBAR_COMPLETE_TX;
+}
 
 enum Kind : uint8_t { K_LD, K_ST, K_AMO, K_LR, K_SC };
 
@@ -395,9 +401,11 @@ private:
     return m;
   }
 
+  // A remote mbarrier arrive or tx op is an AMO to the endpoints, which never look at its code.
   uint8_t rand_amo() {
-    static const uint8_t ops[] = {OP_ADD, OP_SWAP, OP_XOR, OP_OR, OP_AND, OP_MIN, OP_MAX, OP_CAS};
-    return ops[rnd(ZACAS ? 8 : 7)];
+    static const uint8_t ops[] = {OP_ADD, OP_SWAP, OP_XOR, OP_OR, OP_AND, OP_MIN, OP_MAX, OP_MBAR_ARRIVE,
+                                  OP_MBAR_ARRIVE_TX, OP_MBAR_EXPECT_TX, OP_MBAR_COMPLETE_TX, OP_CAS};
+    return ops[rnd(ZACAS ? 12 : 11)];
   }
 
   // size: log2 bytes, -1 for random; dst/addr: fixed when >= 0.
@@ -417,6 +425,10 @@ private:
     int sz = size;
     if (sz < 0) {
       sz = (kind == K_AMO || kind == K_LR || kind == K_SC) ? (chance(50) ? 2 : 3) : int(rnd(4));
+    }
+    const bool mbar = (kind == K_AMO) && is_mbar_op(amo_op);
+    if (mbar) {
+      sz = 3;  // an mbarrier is a whole doubleword
     }
     for (uint32_t l = 0; l < NL; ++l) {
       if (!(mask >> l & 1)) {
@@ -439,7 +451,7 @@ private:
       // Half the compare-and-swaps expect the word's initial value, so some succeed.
       op.cmp = chance(50) ? init_word(op.dst, op.waddr) : r64();
       op.amo_op = (kind == K_LR) ? uint8_t(OP_LR) : (kind == K_SC) ? uint8_t(OP_SC) : amo_op;
-      op.uns = (kind == K_AMO) && uns;
+      op.uns = (kind == K_AMO) && uns && !mbar;
       op.seq = seq_[c]++;
       ops_.push_back(op);
       ++n_open_;
@@ -611,6 +623,11 @@ private:
     case OP_MIN:  return uns ? std::min(old, rhs) : ((sx(old) < sx(rhs)) ? old : rhs);
     case OP_MAX:  return uns ? std::max(old, rhs) : ((sx(old) > sx(rhs)) ? old : rhs);
     case OP_CAS:  return (old == cmp) ? rhs : old;
+    case OP_MBAR_ARRIVE:
+    case OP_MBAR_ARRIVE_TX:
+    case OP_MBAR_EXPECT_TX:
+    case OP_MBAR_COMPLETE_TX:
+      return vortex::mbar_ref::apply(op, old, rhs).new_word;
     default:      return old;
     }
   }

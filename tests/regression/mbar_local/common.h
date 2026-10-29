@@ -13,7 +13,7 @@
 #define NEG_UNDERFLOW 1   // more arrivals than pending
 #define NEG_TXRANGE   2   // tx past its 21-bit range
 #define NEG_GLOBAL    3   // an arrive on a global address
-#define NEG_REMOTE    4   // an arrive on another block's object through the window
+#define NEG_REMOTE    4   // a test_wait on another block's object through the window
 
 typedef struct {
   uint64_t err_addr;     // ERR_WORDS uint32 per thread

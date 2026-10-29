@@ -50,8 +50,14 @@
 // not held, nor is a drained warp's release AMO.
 // --mode=mbar (mbarrier builds): mbarrier ops on local lanes are counted; an
 // arrive is held like a release AMO, the other ops are not.
-// --mode=mbar-global / --mode=mbar-remote: one mbarrier op on a global or a
-// remote lane; the stage's assert must abort the run.
+// --mode=mbar-remote (mbarrier builds, two cores): arrive, arrive_tx,
+// expect_tx and complete_tx on remote lanes leave as remote AMOs, flagged
+// remote, at the peer's address, opcode unchanged, counted by the remote-access
+// tracker; a release arrive is held behind its warp's unacknowledged remote
+// store, a relaxed one is not.
+// --mode=mbar-global / --mode=mbar-remote-wait / --mode=mbar-remote-trywait:
+// an arrive on a global lane, or a wait on a remote lane; the stage's assert
+// must abort the run.
 // --mode=all: directed, random, sched, fence, then rl (and mbar).
 
 #include "vl_simulator.h"
@@ -382,8 +388,14 @@ public:
   #endif
       this->run_mbar();
     }
-    if (opts_.mode == "mbar-global" || opts_.mode == "mbar-remote") {
-      this->run_mbar_neg(opts_.mode == "mbar-remote");
+    if (opts_.mode == "mbar-remote") {
+      this->run_mbar_remote();
+    }
+    if (opts_.mode == "mbar-global") {
+      this->run_mbar_neg(false, kMbarArrive);
+    }
+    if (opts_.mode == "mbar-remote-wait" || opts_.mode == "mbar-remote-trywait") {
+      this->run_mbar_neg(true, opts_.mode == "mbar-remote-wait" ? kMbarTestWait : kMbarTestWait + 1);
     }
     if (failures_ != 0) {
       std::printf("FAILED: %u check(s) failed\n", failures_);
@@ -985,6 +997,7 @@ private:
           last_addr0_   = get_bits(t->out_addr, b * nl_ * aw_, aw_);
           last_remote0_ = get_bits(t->out_remote, b * nl_, 1);
           last_oob0_    = get_bits(t->out_oob, b * nl_, 1);
+          last_attr0_   = get_field(t->out_attr, b * nl_ * attr_w_, attr_w_);
         }
         if (sched_) {
           if (sched_q_[b].size() >= sched_cap_) {
@@ -1564,11 +1577,12 @@ private:
   // An AMO right behind its warp's access (kind 0 store, 1 load, 2 AMO) with
   // the access's completion withheld: a release AMO is held until the
   // completion, then leaves in the cycle the tracker's flag rises; a plain one
-  // leaves right behind the access. rl_op/plain_op make them mbarrier ops.
+  // leaves right behind the access. rl_op/plain_op make them mbarrier ops;
+  // remote_amo sends both AMOs to rank 1.
   void rl_case(const char* what, bool remote_st, uint64_t st_addr, uint32_t w, uint32_t w2, int kind = 0,
-               uint32_t rl_op = 0, uint32_t plain_op = 0) {
+               uint32_t rl_op = 0, uint32_t plain_op = 0, bool remote_amo = false) {
     const uint32_t hold = 20;
-    const uint64_t amo_addr = cfg_.lmem_base + 24;
+    const uint64_t amo_addr = remote_amo ? cfg_.dlmem_base + (uint64_t(1) << lmem_log_) + 24 : cfg_.lmem_base + 24;
     auto withhold = [&](bool on) {
       (remote_st ? ack_pct_ : commit_pct_) = on ? 0 : 100;
     };
@@ -1620,8 +1634,8 @@ private:
     const FenceObs& po = fobs_[pa.seq];   // watched, so its fire cycle is recorded
     uint64_t c1 = cycle_;
     this->offer_all({store(), pa}, 6);
-    // The plain AMO is local, so it counts beside a local access.
-    const uint64_t want_pending = remote_st ? 1 : 2;
+    // The plain AMO counts beside the access when both are local or both remote.
+    const uint64_t want_pending = (remote_st == remote_amo) ? 2 : 1;
     if (po.held_cycles != 0 || po.fire_cycle != c1 + 2 || pending() != want_pending) {
       this->fail(strf("rl: plain AMO after a %s: held %" PRIu64 " cycles, fired in %" PRId64 " (expected 2), %"
                       PRIu64 " pending (expected %" PRIu64 ")", what, po.held_cycles, int64_t(po.fire_cycle - c1),
@@ -1723,12 +1737,70 @@ private:
   #endif
   }
 
+  void run_mbar_remote() {
+  #ifdef VX_CFG_EXT_MBAR_ENABLE
+    if (ncc_ < 2 || maxc_ < 2) {
+      this->fail("mbar-remote mode needs a cluster of at least two cores");
+      return;
+    }
+    this->drain();
+    this->rl_table(true);
+    const uint32_t peer = (my_core_ + 1) % ncc_;
+    const uint64_t rank1 = cfg_.dlmem_base + (uint64_t(1) << lmem_log_);
+    // Rank 1 is slot 1 of the peer core: slot base 64 at the table's stride.
+    const uint64_t want0 = (cfg_.dlmem_base | (uint64_t(peer) << lmem_log_) | 64) >> 3;
+    uint32_t n = 0;
+    for (uint32_t op = kMbarArrive; op <= kMbarArrive + 3; ++op) {
+      for (bool rl : {true, false}) {
+        if (rl && op > kMbarArrive + 1) {
+          continue;
+        }
+        Request q = this->fence_req(0, false, false, 0);
+        q.mask = ref::low_mask(nl_);
+        q.rl = rl;
+        for (uint32_t i = 0; i < nl_; ++i) {
+          q.addr[i] = (rank1 + 8 * i) >> 3;
+          set_bits(q.attr[i], attr_local_pos_, 1, 0);
+        }
+        this->mark_mbar(q, op);
+        const uint64_t rd0 = n_wt_reads_, lanes0 = n_lacc_lanes_, outs0 = n_out_;
+        last_remote0_ = false;
+        lane0_ = true;
+        this->offer_all({q}, 4);
+        lane0_ = false;
+        uint32_t got_op = uint32_t(get_bits(last_attr0_, kAttrAmoOp, 4));
+        if (n_out_ != outs0 + 1 || this->busy() || n_wt_reads_ - rd0 != nl_ || n_lacc_lanes_ != lanes0
+         || !last_remote0_ || !get_bits(last_attr0_, attr_remote_pos_, 1)
+         || !get_bits(last_attr0_, kAttrAmoValid, 1) || got_op != op || last_addr0_ != want0) {
+          this->fail(strf("mbar-remote: %s op %u on %u remote lanes: %" PRIu64 " left, %" PRIu64
+                          " remote and %" PRIu64 " local lanes counted, lane 0 remote=%d op %u addr 0x%" PRIx64
+                          " (expected 0x%" PRIx64 ")", rl ? "release" : "relaxed", op, nl_, n_out_ - outs0,
+                          n_wt_reads_ - rd0, n_lacc_lanes_ - lanes0, last_remote0_, got_op, last_addr0_ << 3,
+                          want0 << 3));
+        }
+        this->drain();
+        ++n;
+      }
+    }
+    std::printf("mbar-remote: %u arrive/tx ops (release and relaxed) on every lane left as remote AMOs to core %u, "
+                "opcode unchanged, counted as remote accesses\n", n, peer);
+    const uint32_t w2 = (nw_ > nb_) ? nb_ : 0;
+    this->rl_case("remote store, then a remote arrive", true, rank1 + 8, 0, w2, 0, kMbarArrive, kMbarArrive, true);
+    this->rl_case("remote store, then a remote arrive_tx", true, rank1 + 8, 0, w2, 0, kMbarArrive + 1,
+                  kMbarArrive + 1, true);
+    this->rl_case("remote store, then a remote arrive and expect_tx", true, rank1 + 8, 0, w2, 0, kMbarArrive,
+                  kMbarExpectTx, true);
+  #else
+    this->fail("mbar modes need an mbarrier build");
+  #endif
+  }
+
   // One mbarrier op on a global or a remote lane; the build's assert must abort.
-  void run_mbar_neg(bool remote) {
+  void run_mbar_neg(bool remote, uint32_t op) {
   #ifdef VX_CFG_EXT_MBAR_ENABLE
     const bool two = (ncc_ >= 2 && maxc_ >= 2);
     if (remote && !two) {
-      this->fail("mbar-remote mode needs a cluster of at least two cores");
+      this->fail("mbar-remote-wait modes need a cluster of at least two cores");
       return;
     }
     this->rl_table(two);
@@ -1736,14 +1808,15 @@ private:
     for (auto& at : q.attr) {
       set_bits(at, attr_local_pos_, 1, 0);
     }
-    this->mark_mbar(q, kMbarArrive);
-    std::printf("mbar: issuing an arrive on a %s lane; the stage's assert must abort here\n",
+    this->mark_mbar(q, op);
+    std::printf("mbar: issuing mbarrier op %u on a %s lane; the stage's assert must abort here\n", op,
                 remote ? "remote" : "global");
     std::fflush(stdout);
     this->offer_all({q}, 6);
     this->fail("the mbarrier op on a " + std::string(remote ? "remote" : "global") + " lane did not abort the run");
   #else
     (void)remote;
+    (void)op;
     this->fail("mbar modes need an mbarrier build");
   #endif
   }
@@ -1754,6 +1827,7 @@ private:
   static constexpr uint32_t kAttrAmoOp    = 5;   // amo_req_t.amo_op, above amo_valid
   static constexpr uint32_t kMbarArrive   = 10;  // amo_op_e AMO_OP_MBAR_ARRIVE
   static constexpr uint32_t kMbarExpectTx = 12;
+  static constexpr uint32_t kMbarTestWait = 14;
 
   Options opts_;
   std::mt19937_64 rng_;
@@ -1823,6 +1897,7 @@ private:
   uint64_t last_addr0_ = 0;
   bool     last_remote0_ = false;
   bool     last_oob0_ = false;
+  Bits     last_attr0_;
   uint64_t next_seq_ = 0;
 
   uint64_t n_in_ = 0, n_out_ = 0, n_fence_ = 0, n_writes_ = 0, n_stall_ = 0;
@@ -1834,8 +1909,9 @@ private:
 };
 
 static void usage(const char* prog) {
-  std::printf("usage: %s [--mode=all|directed|random|sched|oob|remote|fence|rl|mbar|mbar-global|mbar-remote] [--seed=N] "
-              "[--launches=N] [--cycles=N] [--watchdog=N] [--no-oob]\n", prog);
+  std::printf("usage: %s [--mode=all|directed|random|sched|oob|remote|fence|rl|mbar|mbar-global|mbar-remote|"
+              "mbar-remote-wait|mbar-remote-trywait] [--seed=N] [--launches=N] [--cycles=N] [--watchdog=N] "
+              "[--no-oob]\n", prog);
 }
 
 int main(int argc, char** argv) {
@@ -1868,7 +1944,8 @@ int main(int argc, char** argv) {
   }
   if (opts.mode != "all" && opts.mode != "directed" && opts.mode != "random" && opts.mode != "sched"
    && opts.mode != "oob" && opts.mode != "remote" && opts.mode != "fence" && opts.mode != "rl"
-   && opts.mode != "mbar" && opts.mode != "mbar-global" && opts.mode != "mbar-remote") {
+   && opts.mode != "mbar" && opts.mode != "mbar-global" && opts.mode != "mbar-remote"
+   && opts.mode != "mbar-remote-wait" && opts.mode != "mbar-remote-trywait") {
     usage(argv[0]);
     return 2;
   }

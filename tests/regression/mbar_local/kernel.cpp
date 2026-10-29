@@ -411,7 +411,7 @@ __kernel void neg_k(mbar_arg_t* __UNIFORM__ arg) {
       break;
     case NEG_REMOTE:
       if (vx_cluster_block_rank() == 0)
-        vx_mbar_arrive(static_cast<uint64_t*>(vx_cluster_map_shared_rank(x.lm + OBJ_BAR, 1)), 1);
+        vx_mbar_test_wait(static_cast<uint64_t*>(vx_cluster_map_shared_rank(x.lm + OBJ_BAR, 1)), 0);
       break;
     default:
       break;

@@ -5,9 +5,11 @@ PROJECT := dlmem_ep
 
 SIMX_DIR := $(ROOT_DIR)/sim/simx
 
-# The endpoints belong to the DLMEM extension and carry AMOs: always build with both.
+# The endpoints belong to the DLMEM extension and carry AMOs, mbarrier ops
+# among them: always build with all three.
 CONFIGS := $(if $(findstring -DVX_CFG_EXT_DLMEM_ENABLE,$(CONFIGS)),$(CONFIGS),$(CONFIGS) -DVX_CFG_EXT_DLMEM_ENABLE)
 CONFIGS := $(if $(findstring -DVX_CFG_EXT_A_ENABLE,$(CONFIGS)),$(CONFIGS),$(CONFIGS) -DVX_CFG_EXT_A_ENABLE)
+CONFIGS := $(if $(findstring -DVX_CFG_EXT_MBAR_ENABLE,$(CONFIGS)),$(CONFIGS),$(CONFIGS) -DVX_CFG_EXT_MBAR_ENABLE)
 
 # The RTL bench's shapes (sockets x socket size x LSU blocks x LSU lanes). Each
 # builds into its own SimX output directory, so the shapes never share objects

@@ -23,8 +23,8 @@
 //             wait, and the phase must then be complete); no streamers
 //   -x neg    a run that must stop the simulator: underflow (arrive past
 //             pending), txrange (tx past its range), global (an arrive on a
-//             global address), remote (an arrive on another block's object;
-//             a SPREAD cluster of 2, so 2 cores)
+//             global address), remote (a test_wait on another block's
+//             object; a SPREAD cluster of 2, so 2 cores)
 //   -v        print every thread with an error
 //
 // The host replays each object's ops with mbar_ref and checks the final words,
@@ -268,7 +268,7 @@ int main(int argc, char** argv) {
     return 1;
   }
   if (neg == NEG_REMOTE && (cores < 2 || max_cluster < 2)) {
-    std::printf("Error: a remote arrive needs a cluster of 2 on 2 cores (%u cores, largest cluster %u)\nFAILED!\n",
+    std::printf("Error: a remote wait needs a cluster of 2 on 2 cores (%u cores, largest cluster %u)\nFAILED!\n",
                 (uint32_t)cores, (uint32_t)max_cluster);
     return 1;
   }

@@ -59,6 +59,10 @@ MemOp to_memop(uint8_t kind, uint8_t amo_op) {
   case ep::OP_MIN:  return MemOp::AMO_MIN;
   case ep::OP_MAX:  return MemOp::AMO_MAX;
   case ep::OP_CAS:  return MemOp::AMO_CAS;
+  case ep::OP_MBAR_ARRIVE:      return MemOp::MBAR_ARRIVE;
+  case ep::OP_MBAR_ARRIVE_TX:   return MemOp::MBAR_ARRIVE_TX;
+  case ep::OP_MBAR_EXPECT_TX:   return MemOp::MBAR_EXPECT_TX;
+  case ep::OP_MBAR_COMPLETE_TX: return MemOp::MBAR_COMPLETE_TX;
   default: break;
   }
   std::abort();
@@ -76,6 +80,10 @@ uint8_t to_amo_op(MemOp op) {
   case MemOp::AMO_MIN:  return ep::OP_MIN;
   case MemOp::AMO_MAX:  return ep::OP_MAX;
   case MemOp::AMO_CAS:  return ep::OP_CAS;
+  case MemOp::MBAR_ARRIVE:      return ep::OP_MBAR_ARRIVE;
+  case MemOp::MBAR_ARRIVE_TX:   return ep::OP_MBAR_ARRIVE_TX;
+  case MemOp::MBAR_EXPECT_TX:   return ep::OP_MBAR_EXPECT_TX;
+  case MemOp::MBAR_COMPLETE_TX: return ep::OP_MBAR_COMPLETE_TX;
   default:              return 0;
   }
 }
@@ -259,7 +267,7 @@ public:
         uint64_t lb = req.addr - ep::LMEM_BASE;
         q.fire = true;
         q.rw = (req.op == MemOp::ST);
-        q.amo = memop_is_amo_rmw(req.op);
+        q.amo = memop_is_amo_rmw(req.op) || memop_is_mbar(req.op);
         q.amo_op = to_amo_op(req.op);
         q.uns = req.flags.amo_unsigned;
         q.local = req.flags.local;

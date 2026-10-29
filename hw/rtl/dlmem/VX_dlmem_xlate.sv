@@ -20,11 +20,11 @@
 // encoding can alias a global address once the core field outgrows the rank
 // field. Out-of-bounds lanes go to the issuer's own slot base, keeping their
 // 64-byte line offset like every other lane. A fence, and every packet of an
-// AMO with .rl (an mbarrier arrive included), waits at the stage output until
-// its warp's remote accesses are performed (stores acknowledged, loads and AMOs
-// answered) and its local accesses (loads, stores, AMOs, LR/SC, mbarrier ops)
-// have committed in their banks, so it orders them before every later access of
-// the warp. Earlier global accesses need a fence.
+// AMO with .rl (a release mbarrier arrive included), waits at the stage output
+// until its warp's remote accesses are performed (stores acknowledged, loads and
+// AMOs answered) and its local accesses (loads, stores, AMOs, LR/SC, mbarrier
+// ops) have committed in their banks, so it orders them before every later
+// access of the warp. Earlier global accesses need a fence.
 module VX_dlmem_xlate import VX_gpu_pkg::*, VX_dlmem_pkg::*; #(
     parameter `STRING INSTANCE_ID = "",
     // Global core id (hart id core field); the core's index in its cluster is CORE_ID % DLMEM_NCC.
@@ -140,7 +140,7 @@ module VX_dlmem_xlate import VX_gpu_pkg::*, VX_dlmem_pkg::*; #(
     wire [NUM_LANES-1:0][DLMEM_CORE_W-1:0]   lane_core;
     wire [NUM_LANES-1:0]                     lane_lacc;
 `ifdef VX_CFG_EXT_MBAR_ENABLE
-    wire [NUM_LANES-1:0]                     lane_mbar_global, lane_mbar_remote;
+    wire [NUM_LANES-1:0]                     lane_mbar_global, lane_mbar_rwait;
 `endif
 
     for (genvar i = 0; i < NUM_LANES; ++i) begin : g_lanes
@@ -203,7 +203,7 @@ module VX_dlmem_xlate import VX_gpu_pkg::*, VX_dlmem_pkg::*; #(
     `ifdef VX_CFG_EXT_MBAR_ENABLE
         wire is_mbar = attr.amo.amo_valid && (attr.amo.amo_op >= AMO_OP_MBAR_ARRIVE);
         assign lane_mbar_global[i] = act && is_mbar && ~attr.is_addr_local && ~rem;
-        assign lane_mbar_remote[i] = act && is_mbar && rem;
+        assign lane_mbar_rwait[i]  = act && attr.amo.amo_valid && (attr.amo.amo_op >= AMO_OP_MBAR_TEST_WAIT) && rem;
     `endif
 
         assign out_remote[i] = rem;
@@ -274,9 +274,11 @@ module VX_dlmem_xlate import VX_gpu_pkg::*, VX_dlmem_pkg::*; #(
     `RUNTIME_ASSERT (~(out_fire && (| lane_mbar_global)),
         ("%t: %s mbarrier op on a global address: wid=%0d lanes=0x%0h (#%0d)",
             $time, INSTANCE_ID, hdr_r.wid, lane_mbar_global, hdr_r.uuid))
-    `RUNTIME_ASSERT (~(out_fire && (| lane_mbar_remote)),
-        ("%t: %s remote mbarrier ops are not supported yet: wid=%0d lanes=0x%0h (#%0d)",
-            $time, INSTANCE_ID, hdr_r.wid, lane_mbar_remote, hdr_r.uuid))
+    // A wait reads its own block's object: the waiter table that releases a
+    // suspended try_wait only sees its own core's banks.
+    `RUNTIME_ASSERT (~(out_fire && (| lane_mbar_rwait)),
+        ("%t: %s remote mbarrier wait is not supported: wid=%0d lanes=0x%0h (#%0d)",
+            $time, INSTANCE_ID, hdr_r.wid, lane_mbar_rwait, hdr_r.uuid))
 `endif
 
 endmodule

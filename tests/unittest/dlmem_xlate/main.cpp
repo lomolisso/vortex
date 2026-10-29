@@ -1282,7 +1282,10 @@ const char* op_name(MemOp op) {
 #ifdef VX_CFG_EXT_MBAR_ENABLE
   case MemOp::MBAR_ARRIVE:    return "mbar_arrive";
   case MemOp::MBAR_ARRIVE_TX: return "mbar_arrive_tx";
+  case MemOp::MBAR_EXPECT_TX:   return "mbar_expect_tx";
+  case MemOp::MBAR_COMPLETE_TX: return "mbar_complete_tx";
   case MemOp::MBAR_TEST_WAIT: return "mbar_test_wait";
+  case MemOp::MBAR_TRY_WAIT:  return "mbar_try_wait";
 #endif
   default:             return "op";
   }
@@ -1609,6 +1612,148 @@ void run_rl_hold(MemOp first, MemOp rel) {
             << " a plain AMO and a drained warp's release op do not: ok" << std::endl;
 }
 
+#ifdef VX_CFG_EXT_MBAR_ENABLE
+// Arrive and tx ops on rank 1 (core 1): each leaves the next tick as a remote
+// AMO, flagged remote, at core 1's address of the word, op and rl unchanged,
+// counted by the remote tracker only. Behind the warp's unacknowledged remote
+// store, a release arrive (or arrive_tx) waits for the drain like a fence; a
+// relaxed one and an expect_tx leave right behind the store.
+void run_mbar_remote() {
+  auto& platform = SimPlatform::instance();
+  platform.set_num_workers(1);
+  constexpr uint32_t kBanks = 4;
+  auto cfg = make_cfg(2, 4, 2, 14);
+  const uint64_t db = cfg.dlmem_base;
+  const uint64_t sram = uint64_t(1) << cfg.lmem_log;
+  const uint64_t stride = 0x1000;
+  const uint64_t rank1 = db + sram + 0x300;
+  const std::string ctx = "mbar-remote";
+  auto dut = DlmemXlate::Create("mbar-remote", cfg, 0, 1, true, false);
+  auto wt = DlmemWTrack::Create("mbar-remote-wtrack", 1, cfg.nw, 255);
+  auto lacc = DlmemWTrack::Create("mbar-remote-lacc", 1, cfg.nw, 255, kBanks);
+  dut->WtIncOut.at(0).bind(&wt->IncIn.at(0));
+  dut->LaccIncOut.at(0).bind(&lacc->IncIn.at(0));
+  dut->set_drained_query([w = wt.get(), l = lacc.get()](uint32_t wid) { return w->drained(wid) && l->drained(wid); });
+  platform.reset();
+
+  uint64_t cycle = 0;
+  std::vector<int64_t> left(64, -1);
+  std::vector<LsuReq> out_reqs(64, LsuReq(2));
+  auto step = [&](uint32_t n = 1) {
+    for (uint32_t k = 0; k < n; ++k) {
+      platform.tick();
+      auto& out = dut->ReqOut.at(0);
+      while (!out.empty()) {
+        left.at(out.peek().uuid) = cycle;
+        out_reqs.at(out.peek().uuid) = out.peek();
+        out.pop();
+      }
+      ++cycle;
+    }
+  };
+  auto mbar = [&](uint64_t uuid, MemOp op, bool rl) {
+    LsuReq req = window_req(uuid, 2, rank1, op);
+    req.amo_rl = rl;
+    return req;
+  };
+  auto ack_all = [&]() {
+    for (uint32_t k = wt->count(2); k != 0; --k) {
+      wt->DecIn.send(2, 1);
+      step();
+    }
+    step(2);
+  };
+
+  // Slot 2: rank 0 is this core (slot 2), rank 1 is slot 3 of core 1.
+  dut->PeerWrIn.send({2, dlmem_ref::Row{2, {{0, 2}, {1, 3}}}, uint32_t(stride)}, 1);
+  step();
+
+  struct OpCase {
+    MemOp op;
+    bool rl;
+  };
+  const OpCase ops[] = {
+    {MemOp::MBAR_ARRIVE, true}, {MemOp::MBAR_ARRIVE, false},
+    {MemOp::MBAR_ARRIVE_TX, true}, {MemOp::MBAR_ARRIVE_TX, false},
+    {MemOp::MBAR_EXPECT_TX, false}, {MemOp::MBAR_COMPLETE_TX, false},
+  };
+  uint64_t uuid = 1;
+  for (auto& c : ops) {
+    const std::string what = std::string(c.rl ? "release " : "relaxed ") + op_name(c.op);
+    const uint64_t id = uuid++;
+    const uint64_t sent = cycle;
+    dut->ReqIn.at(0).send(mbar(id, c.op, c.rl), 1);
+    step(3);
+    const LsuReq& r = out_reqs.at(id);
+    if (left[id] != int64_t(sent) + 1 || r.op != c.op || r.amo_rl != c.rl) {
+      fail(ctx, what + ": left at tick " + std::to_string(left[id]) + " (expected " + std::to_string(sent + 1)
+                + ") as " + op_name(r.op) + " rl=" + std::to_string(r.amo_rl));
+    }
+    for (uint32_t i = 0; i < 2; ++i) {
+      const uint64_t want = dlmem_ref::remote_addr(cfg, 1, 3 * stride + 0x300 + 8 * i);
+      if (!r.dlmem_remote.test(i) || r.dlmem_oob.test(i) || r.dlmem_core.at(i) != 1 || r.addrs.at(i) != want) {
+        fail(ctx, what + ": lane " + std::to_string(i) + " left remote=" + std::to_string(r.dlmem_remote.test(i))
+                  + " core=" + std::to_string(r.dlmem_core.at(i)) + " addr=" + hex(r.addrs.at(i))
+                  + ", expected a remote lane to core 1 at " + hex(want));
+      }
+    }
+    if (wt->count(2) != 2 || lacc->count(2) != 0 || r.flags.lacc) {
+      fail(ctx, what + ": " + std::to_string(wt->count(2)) + " remote and " + std::to_string(lacc->count(2))
+                + " local lanes counted, expected 2 and 0");
+    }
+    ack_all();
+  }
+
+  // Behind an unacknowledged remote store.
+  const OpCase behind[] = {
+    {MemOp::MBAR_ARRIVE, true}, {MemOp::MBAR_ARRIVE_TX, true},
+    {MemOp::MBAR_ARRIVE, false}, {MemOp::MBAR_ARRIVE_TX, false}, {MemOp::MBAR_EXPECT_TX, false},
+  };
+  for (auto& c : behind) {
+    const std::string what = std::string(c.rl ? "release " : "relaxed ") + op_name(c.op) + " behind a remote store";
+    const uint64_t st = uuid++, id = uuid++;
+    dut->ReqIn.at(0).send(window_req(st, 2, db + sram + 0x40, MemOp::ST), 1);
+    step();
+    dut->ReqIn.at(0).send(mbar(id, c.op, c.rl), 1);
+    step(6);
+    if (left[st] < 0) {
+      fail(ctx, what + ": the store did not leave");
+    }
+    if (!c.rl) {
+      if (left[id] != left[st] + 1) {
+        fail(ctx, what + ": left at tick " + std::to_string(left[id]) + ", expected right behind the store at "
+                  + std::to_string(left[st] + 1));
+      }
+      ack_all();
+      continue;
+    }
+    if (left[id] >= 0) {
+      fail(ctx, what + ": left at tick " + std::to_string(left[id]) + " with " + std::to_string(wt->count(2))
+                + " remote lanes outstanding");
+    }
+    int64_t ack = -1;
+    for (uint32_t k = 0; k < 2; ++k) {
+      ack = cycle;
+      wt->DecIn.send(2, 1);
+      step();
+    }
+    step(4);
+    if (left[id] != ack + 2) {
+      fail(ctx, what + ": last ack sent at " + std::to_string(ack) + ", left at " + std::to_string(left[id])
+                + ", expected +2");
+    }
+    ack_all();
+  }
+  if (!dut->empty() || !wt->empty() || !lacc->empty() || !platform.idle()) {
+    fail(ctx, "stage or trackers not empty at the end");
+  }
+  platform.finalize();
+  std::cout << ctx << ": arrive, arrive_tx, expect_tx and complete_tx leave as remote AMOs to core 1, op unchanged,"
+            << " counted as remote accesses; behind a remote store a release arrive waits for the drain, a relaxed"
+            << " one does not: ok" << std::endl;
+}
+#endif
+
 ///////////////////////////////////////////////////////////////////////////////
 // Out-of-bounds and remote aborts, each in a child process
 
@@ -1711,31 +1856,40 @@ void run_abort() {
     run_abort_case(c.name, c.row, bad, c.abort_on_remote, c.expect_abort, c.expect, 2);
   }
 #ifdef VX_CFG_EXT_MBAR_ENABLE
-  // An mbarrier op aborts on a global lane and on a remote lane, whatever the
-  // stage's remote setting; on local lanes it passes.
+  // An mbarrier op aborts on a global lane, and a wait on a remote lane,
+  // whatever the stage's remote setting; arrive and tx ops on remote lanes
+  // are remote accesses like any AMO, and local lanes pass.
   const dlmem_ref::Row two{2, {{0, 2}, {1, 3}}};
   struct MbarCase {
     const char* name;
+    MemOp op;
     uint64_t addr0, addr1;
     bool abort_on_remote;
+    uint32_t want_wt;
     std::string expect;
   };
   const MbarCase mcases[] = {
-    {"mbar-global", 0x10040, 0x10048, false,
+    {"mbar-global", MemOp::MBAR_ARRIVE, 0x10040, 0x10048, false, 0,
      std::string(mbar_ref::MSG_GLOBAL) + ": wid=2 cta=2 lane=0 addr=0x10040 (#8)"},
-    {"mbar-global-lane1", db + 0x40, 0x10048, false,
+    {"mbar-global-lane1", MemOp::MBAR_ARRIVE, db + 0x40, 0x10048, false, 0,
      std::string(mbar_ref::MSG_GLOBAL) + ": wid=2 cta=2 lane=1 addr=0x10048 (#8)"},
-    {"mbar-remote", rem, rem + 8, false,
+    {"mbar-remote", MemOp::MBAR_ARRIVE, rem, rem + 8, false, 2, ""},
+    {"mbar-remote-lane1", MemOp::MBAR_COMPLETE_TX, cfg.lmem_base + 0x40, rem + 8, false, 1, ""},
+    {"mbar-remote-unsupported", MemOp::MBAR_ARRIVE_TX, rem, rem + 8, true, 0,
+     "remote DLMEM access is not supported yet: wid=2 cta=2 lane=0 addr=" + hex(rem) + " core=1 (#8)"},
+    {"mbar-remote-wait", MemOp::MBAR_TEST_WAIT, rem, rem + 8, false, 0,
      std::string(mbar_ref::MSG_REMOTE) + ": wid=2 cta=2 lane=0 addr=" + hex(rem) + " core=1 (#8)"},
-    {"mbar-remote-lane1", cfg.lmem_base + 0x40, rem + 8, true,
+    {"mbar-remote-trywait", MemOp::MBAR_TRY_WAIT, rem, rem + 8, false, 0,
+     std::string(mbar_ref::MSG_REMOTE) + ": wid=2 cta=2 lane=0 addr=" + hex(rem) + " core=1 (#8)"},
+    {"mbar-remote-wait-lane1", MemOp::MBAR_TEST_WAIT, cfg.lmem_base + 0x40, rem + 8, true, 0,
      std::string(mbar_ref::MSG_REMOTE) + ": wid=2 cta=2 lane=1 addr=" + hex(rem + 8) + " core=1 (#8)"},
-    {"mbar-local", db + 0x40, cfg.lmem_base + 0x48, true, ""},
+    {"mbar-local", MemOp::MBAR_ARRIVE, db + 0x40, cfg.lmem_base + 0x48, true, 0, ""},
   };
   for (auto& c : mcases) {
-    LsuReq bad = window_req(8, 2, c.addr0, MemOp::MBAR_ARRIVE);
+    LsuReq bad = window_req(8, 2, c.addr0, c.op);
     bad.addrs[1] = c.addr1;
-    bad.amo_rl = true;
-    run_abort_case(c.name, two, bad, c.abort_on_remote, !c.expect.empty(), c.expect, 0);
+    bad.amo_rl = (c.op == MemOp::MBAR_ARRIVE || c.op == MemOp::MBAR_ARRIVE_TX);
+    run_abort_case(c.name, two, bad, c.abort_on_remote, !c.expect.empty(), c.expect, c.want_wt);
   }
 #endif
 }
@@ -1755,7 +1909,7 @@ void run_abort_case(const char* name, const dlmem_ref::Row& row, const LsuReq& b
 }
 
 void usage() {
-  std::cout << "usage: dlmem_xlate_test [--mode=vectors|timing|fence|rl|random|abort|all] [--seed=N]\n"
+  std::cout << "usage: dlmem_xlate_test [--mode=vectors|timing|fence|rl|mbar-remote|random|abort|all] [--seed=N]\n"
                "                        [--reqs=N] [--workers=N]\n";
 }
 
@@ -1786,7 +1940,7 @@ int main(int argc, char** argv) {
     }
   }
   if (mode != "all" && mode != "vectors" && mode != "timing" && mode != "fence" && mode != "rl"
-   && mode != "random" && mode != "abort") {
+   && mode != "mbar-remote" && mode != "random" && mode != "abort") {
     usage();
     return 2;
   }
@@ -1825,6 +1979,11 @@ int main(int argc, char** argv) {
     run_rl_hold(MemOp::AMO_ADD, MemOp::MBAR_ARRIVE_TX);
 #endif
   }
+#ifdef VX_CFG_EXT_MBAR_ENABLE
+  if (mode == "all" || mode == "mbar-remote") {
+    run_mbar_remote();
+  }
+#endif
   if (mode == "all" || mode == "random") {
     run_random_all(seed, reqs, workers);
   }

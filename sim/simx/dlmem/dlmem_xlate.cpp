@@ -209,7 +209,7 @@ uint32_t DlmemXlate::translate(LsuReq& req, const dlmem_ref::Row& row) {
               << " (#" << req.uuid << ")" << std::endl;
     std::abort();
   }
-  if (is_mbar && remote_lane >= 0) {
+  if (is_mbar && (req.op == MemOp::MBAR_TEST_WAIT || req.op == MemOp::MBAR_TRY_WAIT) && remote_lane >= 0) {
     std::cerr << SimPlatform::instance().cycles() << ": " << this->name() << " " << mbar_ref::MSG_REMOTE
               << ": wid=" << req.wid << " cta=" << req.cta_id << " lane=" << remote_lane << " addr=0x" << std::hex
               << remote_addr << std::dec << " core=" << remote_core << " (#" << req.uuid << ")" << std::endl;

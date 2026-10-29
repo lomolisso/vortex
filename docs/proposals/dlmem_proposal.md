@@ -425,10 +425,73 @@ socket and a crossbar across sockets, connect them
   check does not cover the scheduler's `EXT_SCHED_STALL_TIMEOUT` override
   (`VX_scheduler.sv`), which can set a stall timeout below four time limits.
   No wait on a
-  remote mbarrier; PTX allows waits only on the executing CTA's objects, and
-  remote mbarrier ops still assert. The limit counts core cycles, not
-  nanoseconds. Wake-ups by DXA completion and by remote arrives will come
-  through the same flip events once those ops reach the banks.
+  remote mbarrier (below). The limit counts core cycles, not
+  nanoseconds. Wake-ups by DXA completion will come through the same flip
+  events once that op reaches the banks.
+
+## Remote mbarrier ops
+
+- **What is allowed.** `arrive`, `arrive_tx`, `expect_tx` and `complete_tx`
+  may target a peer block's object, through the address
+  `vx_cluster_map_shared_rank()` gives (`cluster.map_shared_rank(&bar, r)` in
+  CUDA, PTX `mbarrier.*.shared::cluster`). There is no new API: the same
+  functions and `vortex::mbarrier` take the window address. A peer on the
+  caller's core takes the local path; a remote one travels as a remote
+  atomic (`amo_op` 10–13 in a `DLMEM_OP_AMO` packet) to the peer's bank,
+  whose atomic unit runs it like a local op. The response carries the old
+  word, which is no token: only the owner's own ops give tokens.
+- **Wake-ups.** A remote op that completes a phase raises the bank's flip
+  event like a local one, so the peer's sleeping waiters wake on the same
+  T+1 unlock and T+2 schedule (checked on debug traces of both models).
+- **Initialisation.** `vx_mbar_init()` is a plain store: peers may use the
+  object only after a `vx_cluster_sync()` that follows it, which stands in
+  for `fence.mbarrier_init.release.cluster`.
+- **Ordering.** A remote arrive is held at the translation stage like any
+  `.rl` atomic, until the warp's earlier remote accesses are performed and
+  its local accesses committed, behind a CTA fence; the warp's remote-access
+  count covers the arrive until its answer returns, so a later fence,
+  barrier or exit waits for it. `expect_tx` and `complete_tx` are not held.
+  That is the PTX default, a CTA-scope release: window and local data are
+  visible to the waiter, but global stores are ordered only at the arriver's
+  L1, and the waiter's L1 may hold stale lines. For
+  a waiter on another core, `vx_mbar_arrive_release_cluster()` puts
+  `vx_fence()` (a drain to the shared level) before the arrive, and
+  `vx_mbar_try_wait_acquire_cluster()` puts one (an L1 invalidate) after a
+  true result, as PTX `mbarrier.arrive.release.cluster` and
+  `try_wait.acquire.cluster`; `vortex::mbarrier` has them as
+  `arrive_release_cluster()`, `try_wait_acquire_cluster()` and
+  `wait_acquire_cluster()`.
+- **Relaxed arrive.** `vx_mbar_arrive_relaxed()` and
+  `vx_mbar_arrive_tx_relaxed()` (custom-2 `funct7 = 1`, `funct3` 0 or 1) are
+  PTX `mbarrier.arrive.relaxed`, local or remote: no CTA fence and no hold,
+  so they order nothing. The warp's remote-access and local-access counts
+  still track them, so a later fence or release covers them. Other `funct7`
+  values stay reserved.
+- **Rejected.** Waits are allowed only on the caller's own object, as in
+  PTX. A `test_wait` or `try_wait` on a peer's object on another core stops
+  the simulation with `remote mbarrier wait is not supported` (RTL assertion
+  at the translation stage, SimX abort). An mbarrier op on a global address
+  still stops it with `mbarrier op on a global address`.
+- **Tests.** [`mbar_remote`](../../tests/regression/mbar_remote) (SPREAD
+  clusters): all-to-all arrivals with a late rank per phase, a window-store
+  ring released by remote arrives, a global ring with the `_cluster` forms,
+  remote tx accounting with a negative tx, same-core peers in DEFAULT
+  clusters, relaxed arrives with a check that a relaxed arrive behind window
+  stores costs less than a release one, and the `-x wait` negative. The host
+  checks which op completed every phase and that each late remote completion
+  woke the waiting warps. Parity: `parity-mbar-remote`, and
+  `parity-mbar-remote-relaxed` with a relaxed arrive behind the stores.
+- **Gaps.** Remote ops from DXA (`complete_tx` for a remote destination) and
+  `st.async` completion come with the DXA steps. The answer of a remote
+  arrive costs a response packet that PTX does not need. No
+  `fence.mbarrier_init`; the cluster sync stands in for it. A remote
+  `try_wait` in a build without assertions would reach the target bank and
+  could put a foreign warp id in its waiter table (rejected in simulation;
+  PTX forbids it). The release-side fence of the `_cluster` forms cannot be
+  tested in any legal multi-core build: the A extension needs a shared L2
+  (or L3), and then the L1 must be write-through, so global stores reach
+  the shared cache without it. `mbar_remote -m global` tests the acquire
+  side (a plain wait there reads stale lines).
 
 ## Exclusions
 
