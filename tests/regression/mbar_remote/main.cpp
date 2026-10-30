@@ -50,6 +50,9 @@
 // the waiting block slept and was woken before the time limit. SPREAD runs
 // need such a peer on another core, self runs need every peer on the
 // caller's core. tx runs must see a negative tx.
+//
+// A device the clusters do not fit prints SKIPPED when the run was launched
+// without options, and fails when any option asked for a run.
 
 #include <vortex2.h>
 #include <VX_types.h>
@@ -103,6 +106,7 @@ bool     unfenced = false;
 bool     parity  = false;
 bool     neg_wait = false;
 bool     verbose = false;
+bool     requested = false;
 
 void usage() {
   std::printf("Usage: [-m all|data|global|tx|self] [-k K] [-n clusters] [-w warps] [-r phases] [-d delay]"
@@ -121,6 +125,7 @@ uint32_t parse_count(const char* s) {
 }
 
 void parse_args(int argc, char** argv) {
+  requested = (argc > 1);
   int c;
   while ((c = getopt(argc, argv, "m:k:n:w:r:d:e:b:i:s:RFpx:vh")) != -1) {
     switch (c) {
@@ -451,10 +456,13 @@ int main(int argc, char** argv) {
     return 1;
   }
   if (self ? k * req_w > caps.num_warps : (k > caps.max_cluster || caps.num_cores < 2 || req_w > caps.num_warps)) {
-    std::printf("Error: %s clusters of %u blocks of %u warps do not fit %u cores of %u warps (largest cluster %u)\n"
-                "FAILED!\n", self ? "DEFAULT" : "SPREAD", k, req_w, (uint32_t)caps.num_cores,
+    std::printf("%s: %s clusters of %u blocks of %u warps do not fit %u cores of %u warps (largest cluster %u)\n",
+                requested ? "Error" : "SKIPPED", self ? "DEFAULT" : "SPREAD", k, req_w, (uint32_t)caps.num_cores,
                 (uint32_t)caps.num_warps, (uint32_t)caps.max_cluster);
-    return 1;
+    vx_queue_release(q);
+    vx_device_release(dev);
+    std::printf(requested ? "FAILED!\n" : "PASSED!\n");
+    return requested ? 1 : 0;
   }
 
   vx_module_h mod = nullptr;
