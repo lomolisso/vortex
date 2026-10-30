@@ -25,15 +25,18 @@ uint32_t K = 16;
 uint32_t tileM = 64;
 uint32_t tileN = 16;
 uint32_t tileK = 16;
+bool mbar_mode = false;
 
 vx_device_h device = nullptr;
 vx_buffer_h srcA_buffer = nullptr;
 vx_buffer_h srcB_buffer = nullptr;
 vx_buffer_h dst_buffer = nullptr;
+vx_buffer_h err_buffer = nullptr;
 vx_queue_h  queue = nullptr;
 vx_module_h module_ = nullptr;
 vx_kernel_h kernel = nullptr;
 kernel_arg_t kernel_arg = {};
+mbar_arg_t mbar_arg = {};
 
 static void parse_args(int argc, char** argv) {
   for (int i = 1; i < argc; ++i) {
@@ -43,6 +46,8 @@ static void parse_args(int argc, char** argv) {
     if (strcmp(argv[i], "-tM") == 0 && i + 1 < argc) { tileM = atoi(argv[++i]); continue; }
     if (strcmp(argv[i], "-tN") == 0 && i + 1 < argc) { tileN = atoi(argv[++i]); continue; }
     if (strcmp(argv[i], "-tK") == 0 && i + 1 < argc) { tileK = atoi(argv[++i]); continue; }
+    // -m: both copies complete on one mbarrier (complete_tx of each box's bytes).
+    if (strcmp(argv[i], "-m") == 0) { mbar_mode = true; continue; }
   }
 }
 
@@ -51,6 +56,7 @@ void cleanup() {
     if (srcA_buffer) vx_buffer_release(srcA_buffer);
     if (srcB_buffer) vx_buffer_release(srcB_buffer);
     if (dst_buffer)  vx_buffer_release(dst_buffer);
+    if (err_buffer)  vx_buffer_release(err_buffer);
     if (kernel)  vx_kernel_release(kernel);
     if (module_) vx_module_release(module_);
     if (queue)   vx_queue_release(queue);
@@ -78,7 +84,13 @@ int main(int argc, char* argv[]) {
 
   std::cout << "M=" << M << " N=" << N << " K=" << K
             << " tileM=" << tileM << " tileN=" << tileN << " tileK=" << tileK
-            << " num_cta=" << num_cta << "\n";
+            << " num_cta=" << num_cta << (mbar_mode ? " completion=mbarrier" : "") << "\n";
+#ifndef VX_CFG_EXT_MBAR_ENABLE
+  if (mbar_mode) {
+    std::cerr << "Error: -m needs a device built with VX_CFG_EXT_MBAR_ENABLE\n";
+    return -1;
+  }
+#endif
 
   RT_CHECK(vx_device_open(0, &device));
   vx_queue_info_t qi = { sizeof(qi), nullptr, VX_QUEUE_PRIORITY_NORMAL, 0 };
@@ -134,19 +146,30 @@ int main(int argc, char* argv[]) {
   (void)kDescA_host; (void)kDescB_host;
 
   RT_CHECK(vx_module_load_file(device, kernel_file, &module_));
-  RT_CHECK(vx_module_get_kernel(module_, "main", &kernel));
+  RT_CHECK(vx_module_get_kernel(module_, mbar_mode ? "kmajor_mbar" : "main", &kernel));
+
+  const uint32_t block_threads = 4 * VX_CFG_NUM_THREADS;
+  std::vector<uint32_t> h_err;
+  if (mbar_mode) {
+    h_err.assign(num_cta * block_threads, ~0u);
+    const uint32_t err_bytes = h_err.size() * sizeof(uint32_t);
+    RT_CHECK(vx_buffer_create(device, err_bytes, VX_MEM_READ_WRITE, &err_buffer));
+    RT_CHECK(vx_enqueue_write(queue, err_buffer, 0, h_err.data(), err_bytes, 0, nullptr, nullptr));
+    mbar_arg.base = kernel_arg;
+    RT_CHECK(vx_buffer_address(err_buffer, &mbar_arg.err_addr));
+  }
 
   vx_event_h launch_ev = nullptr;
   vx_launch_info_t li = {};
   li.struct_size  = sizeof(li);
   li.kernel       = kernel;
-  li.args_host    = &kernel_arg;
-  li.args_size    = sizeof(kernel_arg);
+  li.args_host    = mbar_mode ? (const void*)&mbar_arg : (const void*)&kernel_arg;
+  li.args_size    = mbar_mode ? sizeof(mbar_arg) : sizeof(kernel_arg);
   li.ndim         = 1;
   li.grid_dim[0]  = num_cta;
   // Match sgemm_tcu_wg_dxa per-CTA shape: warps_per_cta = ISSUE_WIDTH.
-  li.block_dim[0] = 4 * VX_CFG_NUM_THREADS;
-  li.lmem_size    = cta_bytes;
+  li.block_dim[0] = block_threads;
+  li.lmem_size    = mbar_mode ? ((cta_bytes + 7) & ~7u) + sizeof(uint64_t) : cta_bytes;
   RT_CHECK(vx_enqueue_launch(queue, &li, 0, nullptr, &launch_ev));
   RT_CHECK(vx_event_wait_value(launch_ev, 1, VX_TIMEOUT_INFINITE));
   vx_event_release(launch_ev);
@@ -155,6 +178,26 @@ int main(int argc, char* argv[]) {
   RT_CHECK(vx_enqueue_read(queue, h_dst.data(), dst_buffer, 0, dst_bytes, 0, nullptr, &read_ev));
   RT_CHECK(vx_event_wait_value(read_ev, 1, VX_TIMEOUT_INFINITE));
   vx_event_release(read_ev);
+
+  if (mbar_mode) {
+    RT_CHECK(vx_enqueue_read(queue, h_err.data(), err_buffer, 0, h_err.size() * sizeof(uint32_t), 0, nullptr, &read_ev));
+    RT_CHECK(vx_event_wait_value(read_ev, 1, VX_TIMEOUT_INFINITE));
+    vx_event_release(read_ev);
+    uint32_t waits = 0, unfinished = 0;
+    for (uint32_t v : h_err) {
+      unfinished += (v == ~0u);
+      waits += (v == 1);
+    }
+    if (waits || unfinished) {
+      if (waits)
+        std::cout << "*** error: mbarrier phase did not complete (" << waits << " threads gave up)\n";
+      if (unfinished)
+        std::cout << "*** error: " << unfinished << " threads did not finish\n";
+      std::cout << "FAILED\n";
+      cleanup();
+      return 1;
+    }
+  }
 
   // Verify each CTA's dump:
   //   A region: row-major. cta dump[0 .. a_bytes/2) → A_smem.

@@ -17,6 +17,10 @@
 #include <vx_intrinsics.h>
 #include <stdint.h>
 
+#ifdef VX_CFG_EXT_MBAR_ENABLE
+#include <vx_mbar.h>
+#endif
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -26,7 +30,9 @@ extern "C" {
 
 // Packed launch metadata:
 // meta[3:0]   = descriptor slot (up to 16 descriptors)
-// meta[30:4]  = raw barrier id payload
+// meta[30]    = completion mode: 0 = barrier event, 1 = mbarrier complete_tx
+// meta[29:4]  = mode 0: raw barrier id payload;
+//               mode 1: the mbarrier's doubleword offset in the core's local memory
 // meta[31]    = packed marker
 
 // R type: .insn r opcode7, funct3, funct7, rd, rs1, rs2
@@ -157,6 +163,53 @@ inline void vx_dxa_issue_5d_wg(uint32_t desc_slot,
       : "i"(VX_DXA_EXT_OPCODE), "i"(VX_DXA_FUNCT7), "r"(a0), "r"(a1)
       : "memory");
 }
+
+#ifdef VX_CFG_EXT_MBAR_ENABLE
+// mbarrier completion, like a TMA load with .mbarrier::complete_tx::bytes:
+// once the box (tile0 x .. x tile4 x elem_bytes, out-of-bounds fill
+// included) has landed, the engine applies complete_tx(box bytes) to `mbar`,
+// an object in the issuing block's own local memory. The kernel declares the
+// bytes with vx_mbar_arrive_tx() or vx_mbar_expect_tx(). No multicast.
+
+// meta[29:4] for the object, with meta[30] set (bit 26 of the payload).
+inline uint32_t __vx_dxa_mbar_payload(const uint64_t* mbar) {
+  const uint32_t off = (uint32_t)(((uintptr_t)mbar - (uintptr_t)VX_MEM_LMEM_BASE_ADDR) >> 3);
+  return (1u << 26) | (off & ((1u << (VX_CFG_LMEM_LOG_SIZE - 3)) - 1u));
+}
+
+inline uint32_t vx_dxa_pack_meta_mbar(uint32_t desc_slot, const uint64_t* mbar) {
+  return vx_dxa_pack_meta(desc_slot, __vx_dxa_mbar_payload(mbar));
+}
+
+inline void vx_dxa_issue_1d_mbar(uint32_t desc_slot, uint64_t* mbar, void* smem_addr,
+                                 uint32_t coord0) {
+  vx_dxa_issue_1d_wg(desc_slot, __vx_dxa_mbar_payload(mbar), smem_addr, coord0);
+}
+
+inline void vx_dxa_issue_2d_mbar(uint32_t desc_slot, uint64_t* mbar, void* smem_addr,
+                                 uint32_t coord0, uint32_t coord1) {
+  vx_dxa_issue_2d_wg(desc_slot, __vx_dxa_mbar_payload(mbar), smem_addr, coord0, coord1);
+}
+
+inline void vx_dxa_issue_3d_mbar(uint32_t desc_slot, uint64_t* mbar, void* smem_addr,
+                                 uint32_t coord0, uint32_t coord1, uint32_t coord2) {
+  vx_dxa_issue_3d_wg(desc_slot, __vx_dxa_mbar_payload(mbar), smem_addr, coord0, coord1, coord2);
+}
+
+inline void vx_dxa_issue_4d_mbar(uint32_t desc_slot, uint64_t* mbar, void* smem_addr,
+                                 uint32_t coord0, uint32_t coord1, uint32_t coord2,
+                                 uint32_t coord3) {
+  vx_dxa_issue_4d_wg(desc_slot, __vx_dxa_mbar_payload(mbar), smem_addr,
+                     coord0, coord1, coord2, coord3);
+}
+
+inline void vx_dxa_issue_5d_mbar(uint32_t desc_slot, uint64_t* mbar, void* smem_addr,
+                                 uint32_t coord0, uint32_t coord1, uint32_t coord2,
+                                 uint32_t coord3, uint32_t coord4) {
+  vx_dxa_issue_5d_wg(desc_slot, __vx_dxa_mbar_payload(mbar), smem_addr,
+                     coord0, coord1, coord2, coord3, coord4);
+}
+#endif // VX_CFG_EXT_MBAR_ENABLE
 
 // Multicast DXA issues read GMEM once and replay SMEM writes to multiple
 // CTAs within the same SM core.

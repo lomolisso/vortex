@@ -64,6 +64,12 @@ public:
 	// DxaUnit is a plain helper sub-class).
 	SimChannel<DxaReq> dxa_req_out;
 #endif
+#ifdef DXA_MBAR_ENABLE
+	// The core's CTA slots, for the slot and generation a DXA request records.
+	SimChannel<CtaSlotEvt> dxa_slot_in;
+#else
+#line 66
+#endif
 
 #ifdef VX_CFG_EXT_TEX_ENABLE
 	// Outbound TEX request / inbound TEX response channels. Cluster binds

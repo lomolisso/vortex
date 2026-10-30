@@ -161,6 +161,38 @@ else
 	@echo "run-mbar-waiters: mbarriers are RV64 only; nothing to run at XLEN $(XLEN)"
 endif
 
+# The DXA completion unit (RV64 only, DXA with mbarriers): directed release and
+# complete_tx timings, bursts of last beats, the two modes behind a stalled head,
+# a full queue holding the DMA port's last beat, then random traffic against a
+# model of the queue; at the default shape, with 8 warps, 8 banks and a 256 KB
+# local memory, and with 2 warps (the shallowest queue). A beat or complete_tx
+# for a freed or re-admitted slot, and an mbarrier outside the issuing block,
+# must stop the last build with their asserts; the final clean keeps a plain
+# `run` from reusing it.
+# $(1)=CONFIGS $(2)=OPTS
+define dxa_completion_case
+	$(MAKE) -C dxa_completion clean
+	$(MAKE) -C dxa_completion CONFIGS="$(MBAR_LMEM) -DVX_CFG_EXT_DXA_ENABLE $(1)"
+	$(MAKE) -C dxa_completion run CONFIGS="$(MBAR_LMEM) -DVX_CFG_EXT_DXA_ENABLE $(1)" OPTS="$(2)"
+endef
+run-dxa-completion:
+ifeq ($(XLEN),64)
+	$(call dxa_completion_case,,--seed=1)
+	$(call dxa_completion_case,-DVX_CFG_NUM_WARPS=8 -DVX_CFG_LMEM_NUM_BANKS=8 -DVX_CFG_LMEM_LOG_SIZE=18,--seed=2)
+	$(call dxa_completion_case,-DVX_CFG_NUM_WARPS=2,--seed=3)
+	! dxa_completion/dxa_completion --neg=retired > dxa_completion/neg_retired.log 2>&1
+	grep -q "DXA write into a retired CTA slot" dxa_completion/neg_retired.log
+	! dxa_completion/dxa_completion --neg=gen > dxa_completion/neg_gen.log 2>&1
+	grep -q "DXA write into a retired CTA slot" dxa_completion/neg_gen.log
+	! dxa_completion/dxa_completion --neg=compl > dxa_completion/neg_compl.log 2>&1
+	grep -q "DXA write into a retired CTA slot" dxa_completion/neg_compl.log
+	! dxa_completion/dxa_completion --neg=bounds > dxa_completion/neg_bounds.log 2>&1
+	grep -q "mbarrier offset outside the block" dxa_completion/neg_bounds.log
+	$(MAKE) -C dxa_completion clean
+else
+	@echo "run-dxa-completion: mbarriers are RV64 only; nothing to run at XLEN $(XLEN)"
+endif
+
 # CTA launch path: the KMU's cluster walk under launch-bus back-pressure, and
 # the dispatcher's slot placement across launches checked against SimX's
 # per-launch pointer reset, with 4 and 8 CTA slots. With DLMEM (RV64 only) both

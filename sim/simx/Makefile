@@ -67,6 +67,7 @@ endif
 ifneq ($(filter -DVX_CFG_EXT_DXA_ENABLE, $(XCONFIGS)),)
 	SRCS += $(SRC_DIR)/dxa/dxa_core.cpp
 	SRCS += $(SRC_DIR)/dxa/dxa_unit.cpp
+	SRCS += $(SRC_DIR)/dxa/dxa_compl.cpp
 endif
 
 # Add DLMEM extension sources; a unit joins once its source exists.
@@ -183,6 +184,8 @@ LMEM_SWITCH_TEST_OBJ := $(OBJ_DIR)/tests/lmem_switch_test.o
 LMEM_SWITCH_TEST     := $(DESTDIR)/lmem_switch_test
 MBAR_WAITERS_TEST_OBJ := $(OBJ_DIR)/tests/mbar_waiters_test.o
 MBAR_WAITERS_TEST     := $(DESTDIR)/mbar_waiters_test
+DXA_COMPL_TEST_OBJ := $(OBJ_DIR)/tests/dxa_compl_test.o
+DXA_COMPL_TEST     := $(DESTDIR)/dxa_compl_test
 
 DEPS := $(OBJS:.o=.d) $(MAIN_OBJ:.o=.d) $(DXA_OOO_TEST_OBJ:.o=.d) $(RVC_TEST_OBJ:.o=.d)
 DEPS += $(DLMEM_NOC_OBJS:.o=.d) $(DLMEM_NOC_TEST_OBJ:.o=.d)
@@ -191,6 +194,7 @@ DEPS += $(DLMEM_XLATE_OBJS:.o=.d) $(DLMEM_XLATE_TEST_OBJ:.o=.d)
 DEPS += $(DLMEM_EP_OBJS:.o=.d) $(DLMEM_EP_TEST_OBJ:.o=.d)
 DEPS += $(LMEM_SWITCH_TEST_OBJ:.o=.d)
 DEPS += $(MBAR_WAITERS_TEST_OBJ:.o=.d)
+DEPS += $(DXA_COMPL_TEST_OBJ:.o=.d)
 
 # generate .d files alongside .o files
 CXXFLAGS += -MMD -MP -MF $(@:.o=.d)
@@ -213,7 +217,7 @@ PROJECT := simx
 VORTEX_LIB := libvortex.so
 VORTEX_GEM5_LIB := libvortex-gem5.so
 
-.PHONY: all force test-dxa-ooo test-rvc-decompress test-dlmem-noc test-cta-gang test-dlmem-xlate test-dlmem-ep test-lmem-switch test-mbar-waiters clean clean-lib clean-exe clean-obj libvortex clean-libvortex libvortex-gem5 clean-libvortex-gem5
+.PHONY: all force test-dxa-ooo test-rvc-decompress test-dlmem-noc test-cta-gang test-dlmem-xlate test-dlmem-ep test-lmem-switch test-mbar-waiters test-dxa-compl clean clean-lib clean-exe clean-obj libvortex clean-libvortex libvortex-gem5 clean-libvortex-gem5
 
 ifeq ($(USE_SST), 1)
 all: $(DESTDIR)/$(PROJECT) $(DESTDIR)/$(VORTEX_LIB)
@@ -280,6 +284,10 @@ $(MBAR_WAITERS_TEST_OBJ): $(VORTEX_HOME)/tests/unittest/mbar_waiters/main.cpp $(
 	@mkdir -p $(@D)
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
+$(DXA_COMPL_TEST_OBJ): $(VORTEX_HOME)/tests/unittest/dxa_compl/main.cpp $(CONFIG_FILE)
+	@mkdir -p $(@D)
+	$(CXX) $(CXXFLAGS) -c $< -o $@
+
 # Main executable
 $(DESTDIR)/$(PROJECT): $(OBJS) $(MAIN_OBJ)
 	$(CXX) $(CXXFLAGS) $^ $(LDFLAGS) -o $@
@@ -330,6 +338,12 @@ test-mbar-waiters: $(MBAR_WAITERS_TEST)
 	$(MBAR_WAITERS_TEST) $(MBAR_WAITERS_OPTS)
 
 $(MBAR_WAITERS_TEST): $(OBJS) $(MBAR_WAITERS_TEST_OBJ)
+	$(CXX) $(CXXFLAGS) $^ $(LDFLAGS) -o $@
+
+test-dxa-compl: $(DXA_COMPL_TEST)
+	$(DXA_COMPL_TEST) $(DXA_COMPL_OPTS)
+
+$(DXA_COMPL_TEST): $(OBJS) $(DXA_COMPL_TEST_OBJ)
 	$(CXX) $(CXXFLAGS) $^ $(LDFLAGS) -o $@
 
 # Shared library

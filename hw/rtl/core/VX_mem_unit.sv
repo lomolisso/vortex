@@ -51,6 +51,13 @@ module VX_mem_unit import VX_gpu_pkg::*; #(
     output wire [`VX_CFG_NUM_WARPS-1:0]                  mbar_unlock_mask,
 `endif
 
+`ifdef DXA_MBAR_ENABLE
+    // The core's CTA slots, for the DXA's retired-slot and bounds checks
+    input wire [`VX_CFG_NUM_WARPS-1:0]                    cta_slot_valid,
+    input wire [`VX_CFG_NUM_WARPS-1:0][DXA_CTA_GEN_W-1:0] cta_slot_gen,
+    input wire [`VX_CFG_LMEM_LOG_SIZE:0]                  cta_slot_stride,
+`endif
+
     output wire             empty,
 
     VX_lsu_mem_if.slave     lsu_mem_if [`VX_CFG_NUM_LSU_BLOCKS],
@@ -138,10 +145,27 @@ module VX_mem_unit import VX_gpu_pkg::*; #(
     // The DLMEM ingress is one more input after the LSU lanes, in their round-robin.
     localparam LMEM_INGRESS_IDX = LSU_NUM_REQS;
 
+`ifdef DXA_MBAR_ENABLE
+    // The DXA completion's complete_tx requests are one more input, after the ingress.
+    localparam LMEM_DXA_COMPL_IDX = LSU_NUM_REQS + 1;
+
+    VX_mem_bus_if #(
+        .DATA_SIZE (LSU_WORD_SIZE),
+        .TAG_WIDTH (LSU_TAG_WIDTH)
+    ) lmem_adapt_if[LSU_NUM_REQS + 2]();
+
+    VX_mem_bus_if #(
+        .DATA_SIZE (LSU_WORD_SIZE),
+        .TAG_WIDTH (LSU_TAG_WIDTH)
+    ) dxa_compl_if();
+
+    `ASSIGN_VX_MEM_BUS_IF (lmem_adapt_if[LMEM_DXA_COMPL_IDX], dxa_compl_if);
+`else
     VX_mem_bus_if #(
         .DATA_SIZE (LSU_WORD_SIZE),
         .TAG_WIDTH (LSU_TAG_WIDTH)
     ) lmem_adapt_if[LSU_NUM_REQS + 1]();
+`endif
 
     `STATIC_ASSERT($bits(dlmem_lmem_if.req_data.addr) == LMEM_ADDR_WIDTH, ("invalid parameter"))
     `STATIC_ASSERT($bits(dlmem_lmem_if.req_data.tag) == LSU_TAG_WIDTH, ("invalid parameter"))
@@ -224,7 +248,33 @@ module VX_mem_unit import VX_gpu_pkg::*; #(
         // DXA issues LMEM-relative word addresses directly (issuer_lmem_base + intra,
         // with multicast replay adding r×smem_stride per beat), so no per-slot
         // address translation is needed here.
+    `ifdef DXA_MBAR_ENABLE
+        // A last beat waits here while the completion queue is full, so no
+        // completion is ever dropped; it reaches neither the arbiter nor a bank.
+        wire dxa_compl_full;
+        dxa_lmem_attr_t dxa_in_attr;
+        assign dxa_in_attr = dxa_lmem_attr_t'(dxa_lmem_bus_if.req_data.attr);
+        wire dxa_last_hold = dxa_in_attr.last && dxa_compl_full;
+        `UNUSED_VAR (dxa_in_attr)
+
+        VX_mem_bus_if #(
+            .DATA_SIZE   (LMEM_DMA_DATA_SIZE),
+            .TAG_WIDTH   (DXA_LMEM_OUT_TAG_W),
+            .ATTR_WIDTH  (DXA_LMEM_ATTR_W),
+            .ADDR_WIDTH  (LMEM_DMA_ADDR_WIDTH)
+        ) dxa_held_if();
+
+        assign dxa_held_if.req_valid     = dxa_lmem_bus_if.req_valid && ~dxa_last_hold;
+        assign dxa_held_if.req_data      = dxa_lmem_bus_if.req_data;
+        assign dxa_lmem_bus_if.req_ready = dxa_held_if.req_ready && ~dxa_last_hold;
+        assign dxa_lmem_bus_if.rsp_valid = dxa_held_if.rsp_valid;
+        assign dxa_lmem_bus_if.rsp_data  = dxa_held_if.rsp_data;
+        assign dxa_held_if.rsp_ready     = dxa_lmem_bus_if.rsp_ready;
+
+        `ASSIGN_VX_MEM_BUS_IF_EX (dma_arb_in_if[LMEM_DMA_DXA_IDX], dxa_held_if, LMEM_DMA_IN_TAG_W, DXA_LMEM_OUT_TAG_W, UUID_WIDTH);
+    `else
         `ASSIGN_VX_MEM_BUS_IF_EX (dma_arb_in_if[LMEM_DMA_DXA_IDX], dxa_lmem_bus_if, LMEM_DMA_IN_TAG_W, DXA_LMEM_OUT_TAG_W, UUID_WIDTH);
+    `endif
     `endif
     `ifdef VX_CFG_TCU_WGMMA_ENABLE
         `ASSIGN_VX_MEM_BUS_IF_EX (dma_arb_in_if[LMEM_DMA_TCU_IDX], tcu_lmem_if, LMEM_DMA_IN_TAG_W, TCU_LMEM_TAG_W, UUID_WIDTH);
@@ -265,6 +315,13 @@ module VX_mem_unit import VX_gpu_pkg::*; #(
             .reset         (reset),
             .bank_wr_fire  (dxa_bank_wr_fire),
             .bank_wr_attr  (DXA_LMEM_ATTR_W'(lmem_dma_if.req_data.attr)),
+        `ifdef DXA_MBAR_ENABLE
+            .full          (dxa_compl_full),
+            .slot_valid    (cta_slot_valid),
+            .slot_gen      (cta_slot_gen),
+            .slot_stride   (cta_slot_stride),
+            .compl_bus_if  (dxa_compl_if),
+        `endif
             .txbar_bus_if  (dxa_txbar_bus_if)
         );
 
@@ -302,7 +359,11 @@ module VX_mem_unit import VX_gpu_pkg::*; #(
     VX_local_mem #(
         .INSTANCE_ID (`SFORMATF(("%s-lmem", INSTANCE_ID))),
         .SIZE        (1 << `VX_CFG_LMEM_LOG_SIZE),
-    `ifdef VX_CFG_EXT_DLMEM_ENABLE
+    `ifdef DXA_MBAR_ENABLE
+        .NUM_REQS    (LSU_NUM_REQS + 2),
+        .STORE_ACK_MASK ((LSU_NUM_REQS + 2)'(1) << LMEM_INGRESS_IDX),
+        .COMMIT_MASK (((LSU_NUM_REQS + 2)'(1) << LMEM_INGRESS_IDX) - (LSU_NUM_REQS + 2)'(1)),
+    `elsif VX_CFG_EXT_DLMEM_ENABLE
         .NUM_REQS    (LSU_NUM_REQS + 1),
         .STORE_ACK_MASK ((LSU_NUM_REQS + 1)'(1) << LMEM_INGRESS_IDX),
         .COMMIT_MASK (((LSU_NUM_REQS + 1)'(1) << LMEM_INGRESS_IDX) - (LSU_NUM_REQS + 1)'(1)),

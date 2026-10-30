@@ -23,3 +23,11 @@ struct kernel_arg_t {
   uint32_t b_bytes;     // tileN * tileK * sizeof(elem_t)
   uint32_t cta_bytes;   // a_bytes + b_bytes (per-CTA dst slot)
 };
+
+// -m: both copies complete on one mbarrier, at cta_bytes in local memory.
+struct mbar_arg_t {
+  kernel_arg_t base;
+  uint64_t err_addr;    // one word per thread: 1 when the phase did not complete
+};
+
+#define WAIT_LIMIT 64   // try_waits before a thread gives the phase up

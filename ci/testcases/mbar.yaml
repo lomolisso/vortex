@@ -507,6 +507,159 @@ tests:
     shape: {cores: 2, l2cache: true}
     args: "-m data -p -R -r 16 -e 16"
 
+  # --- DXA copies completing on an mbarrier ---
+  # dxa_mbar: one block fills the core. Per round warp 0 arrives on the
+  # mbarrier declaring the box bytes and issues a 1-D copy into local memory;
+  # warps 0 and 1 wait with try_wait, which the copy's complete_tx must wake
+  # (at least once for warp 1); then the tile's last word must already hold
+  # the copied value (spins=0) while the other warps load, store and add
+  # atomically on that word's bank, and the whole tile must match. -l: the
+  # same probe with the copy completing on a barrier event. 16 banks make a
+  # 128-byte row, which a DMA beat writes as two blocks. The final object word
+  # is checked against mbar_ref.
+  - id: dxa_mbar
+    app: dxa_mbar
+    drivers: [simx, rtlsim]
+    configs+: "-DVX_CFG_EXT_DXA_ENABLE"
+    touches: &dxa_mbar_touches [hw/rtl/dxa, sim/simx/dxa, hw/rtl/core/VX_mem_unit.sv,
+              hw/rtl/mem/VX_local_mem.sv, hw/rtl/core/VX_cta_dispatch.sv, hw/rtl/core/VX_core.sv,
+              hw/rtl/core/VX_execute.sv, hw/rtl/core/VX_sfu_unit.sv, hw/rtl/core/VX_wctl_unit.sv,
+              hw/rtl/core/VX_bar_unit.sv, hw/rtl/VX_socket.sv, hw/rtl/VX_gpu_pkg.sv,
+              hw/rtl/VX_define.vh, hw/rtl/cache/VX_amo_alu.sv, hw/rtl/cache/VX_amo_unit.sv,
+              hw/rtl/dlmem/VX_mbar_waiters.sv, hw/rtl/interfaces, sim/simx/mem/local_mem,
+              sim/simx/core, sim/simx/socket, sim/simx/cta_dispatcher, sim/simx/types.h,
+              sim/simx/mbar_waiters, sim/simx/amo, sim/simx/scheduler, sim/simx/barrier_unit,
+              sim/simx/sfu_unit, sim/simx/Makefile, hw/rtl/core/VX_scheduler.sv,
+              sw/common/mbar_ref.h, sw/kernel/include/vx_dxa.h, sw/kernel/include/vx_mbar.h,
+              tests/regression/dxa_mbar, tests/regression/dxa_copy,
+              tests/regression/dxa_kmajor_check, VX_config.toml]
+    args: "-r 8"
+  - id: dxa_mbar-legacy
+    app: dxa_mbar
+    drivers: [simx, rtlsim]
+    configs+: "-DVX_CFG_EXT_DXA_ENABLE"
+    touches: *dxa_mbar_touches
+    args: "-l -r 8"
+  - id: dxa_mbar-rows
+    app: dxa_mbar
+    drivers: [simx, rtlsim]
+    configs+: "-DVX_CFG_EXT_DXA_ENABLE -DVX_CFG_LMEM_NUM_BANKS=16"
+    touches: *dxa_mbar_touches
+    args: "-r 8"
+  - id: dxa_mbar-rows-legacy
+    app: dxa_mbar
+    drivers: [simx, rtlsim]
+    configs+: "-DVX_CFG_EXT_DXA_ENABLE -DVX_CFG_LMEM_NUM_BANKS=16"
+    touches: *dxa_mbar_touches
+    args: "-l -r 8"
+  # The completion queue full: both waiter warps issue 12 copies of 1 KB back
+  # to back on four DXA workers fed from the L2, all completing on the one
+  # mbarrier, while the other warps hammer its bank. The copies' beats win the
+  # bank ahead of the complete_tx requests, so more than the queue's 4 entries
+  # land before one leaves, and the core's DXA input holds the next copy's
+  # last beat (with the beats behind it) until an entry leaves.
+  - id: dxa_mbar-queue
+    app: dxa_mbar
+    drivers: [simx, rtlsim]
+    configs+: "-DVX_CFG_EXT_DXA_ENABLE -DVX_CFG_NUM_DXA_CORES=4"
+    shape: {l2cache: true}
+    touches: *dxa_mbar_touches
+    args: "-q -e 256 -r 2"
+  # dxa_copy -m: ranks 1-5, each block's copy completing on an mbarrier in its
+  # own local memory, read back and compared byte for byte; -o ends the
+  # descriptor half a tile early along an outer dimension (the fill counts in
+  # the box bytes and is checked byte for byte), -c puts canary words after
+  # the tile. dxa_kmajor_check -m: a row-major and a K-major copy completing
+  # on one mbarrier that expects both boxes.
+  - id: dxa_copy-mbar-d1
+    app: dxa_copy
+    drivers: [simx, rtlsim]
+    configs+: "-DVX_CFG_EXT_DXA_ENABLE"
+    touches: *dxa_mbar_touches
+    args: "-m -d1"
+  - id: dxa_copy-mbar-d2
+    app: dxa_copy
+    drivers: [simx, rtlsim]
+    configs+: "-DVX_CFG_EXT_DXA_ENABLE"
+    touches: *dxa_mbar_touches
+    args: "-m -d2"
+  - id: dxa_copy-mbar-d3
+    app: dxa_copy
+    drivers: [simx, rtlsim]
+    configs+: "-DVX_CFG_EXT_DXA_ENABLE"
+    touches: *dxa_mbar_touches
+    args: "-m -d3"
+  - id: dxa_copy-mbar-d4
+    app: dxa_copy
+    drivers: [simx, rtlsim]
+    configs+: "-DVX_CFG_EXT_DXA_ENABLE"
+    touches: *dxa_mbar_touches
+    args: "-m -d4"
+  - id: dxa_copy-mbar-d5
+    app: dxa_copy
+    drivers: [simx, rtlsim]
+    configs+: "-DVX_CFG_EXT_DXA_ENABLE"
+    touches: *dxa_mbar_touches
+    args: "-m -d5"
+  - id: dxa_copy-mbar-oob-canary-d2
+    app: dxa_copy
+    drivers: [simx, rtlsim]
+    configs+: "-DVX_CFG_EXT_DXA_ENABLE"
+    touches: *dxa_mbar_touches
+    args: "-m -o -c -d2"
+  - id: dxa_copy-mbar-oob-canary-d5
+    app: dxa_copy
+    drivers: [simx, rtlsim]
+    configs+: "-DVX_CFG_EXT_DXA_ENABLE"
+    touches: *dxa_mbar_touches
+    args: "-m -o -c -d5"
+  # One elected thread issues while the DXA operands cross two packets.
+  - id: dxa_copy-mbar-elect-simd2
+    app: dxa_copy
+    drivers: [simx, rtlsim]
+    tier: nightly
+    configs+: "-DVX_CFG_EXT_DXA_ENABLE -DVX_CFG_SIMD_WIDTH=2"
+    touches: *dxa_mbar_touches
+    args: "-m -e -c -d3"
+  - id: dxa_kmajor_check-mbar
+    app: dxa_kmajor_check
+    drivers: [simx, rtlsim]
+    configs+: "-DVX_CFG_EXT_DXA_ENABLE"
+    touches: *dxa_mbar_touches
+    args: "-m"
+
+  # Parity of the mbarrier completion at XLEN 64: dxa_copy -m at rank 1, and
+  # dxa_mbar with a fixed amount of contention, where every wait is one
+  # try_wait (a 4096-cycle time limit keeps the first, cold copy well within
+  # it). That try_wait finds the phase complete or sleeps until the
+  # completion wakes it, which one depends on timing, and both run the same
+  # instructions. The bank commit of the copy's last beat, the complete_tx
+  # behind it and the wake-up set the timing.
+  - id: parity-dxa-copy-mbar
+    check: model_parity
+    app: dxa_copy
+    xlen: [64]
+    configs+: "-DVX_CFG_EXT_DXA_ENABLE"
+    touches: *dxa_mbar_touches
+    args: "-m -d1"
+  - id: parity-dxa-mbar
+    check: model_parity
+    app: dxa_mbar
+    xlen: [64]
+    configs+: "-DVX_CFG_EXT_DXA_ENABLE -DVX_CFG_MBAR_SUSPEND_CYCLES=4096"
+    touches: *dxa_mbar_touches
+    args: "-p -r 8"
+  # dxa_mbar-queue with a fixed amount of contention: the held last beats
+  # and the complete_tx requests that free their entries set the timing.
+  - id: parity-dxa-mbar-queue
+    check: model_parity
+    app: dxa_mbar
+    xlen: [64]
+    configs+: "-DVX_CFG_EXT_DXA_ENABLE -DVX_CFG_NUM_DXA_CORES=4"
+    shape: {l2cache: true}
+    touches: *dxa_mbar_touches
+    args: "-q -p -e 256 -r 2"
+
   # Each must stop the simulation with the exact message: an arrive past
   # pending, tx past its 21-bit range, an mbarrier op on a global address, and
   # a wait on another block's object through the window (a SPREAD cluster of 2
@@ -587,6 +740,68 @@ tests:
     driver: rtlsim
     configs+: "-DVX_CFG_NUM_CORES=2 -DVX_CFG_L2_ENABLE"
     env: {DRIVER: rtlsim, APP: mbar_remote, ARGS: "-x wait", EXPECT: "remote mbarrier wait is not supported"}
+    run: *expect_fail_run
+
+  # DXA copies completing on an mbarrier that must stop the run: an arrive
+  # declaring 16 bytes more than the box, so the phase never completes and
+  # the app's bounded wait gives up; a block that exits before its copy lands,
+  # while the next block holds its slot; an mbarrier past the block's local
+  # memory; and an mbarrier-mode copy with a multicast mask.
+  - id: dxa_mbar-expect
+    via: script
+    driver: simx
+    configs+: "-DVX_CFG_EXT_DXA_ENABLE"
+    touches: *dxa_mbar_touches
+    env: {DRIVER: simx, APP: dxa_mbar, ARGS: "-x expect", EXPECT: "mbarrier phase did not complete"}
+    run: *expect_fail_run
+  - id: dxa_mbar-expect
+    via: script
+    driver: rtlsim
+    configs+: "-DVX_CFG_EXT_DXA_ENABLE"
+    touches: *dxa_mbar_touches
+    env: {DRIVER: rtlsim, APP: dxa_mbar, ARGS: "-x expect", EXPECT: "mbarrier phase did not complete"}
+    run: *expect_fail_run
+  - id: dxa_mbar-retired
+    via: script
+    driver: simx
+    configs+: "-DVX_CFG_EXT_DXA_ENABLE"
+    touches: *dxa_mbar_touches
+    env: {DRIVER: simx, APP: dxa_mbar, ARGS: "-x retired -e 2048", EXPECT: "DXA write into a retired CTA slot"}
+    run: *expect_fail_run
+  - id: dxa_mbar-retired
+    via: script
+    driver: rtlsim
+    configs+: "-DVX_CFG_EXT_DXA_ENABLE"
+    touches: *dxa_mbar_touches
+    env: {DRIVER: rtlsim, APP: dxa_mbar, ARGS: "-x retired -e 2048", EXPECT: "DXA write into a retired CTA slot"}
+    run: *expect_fail_run
+  - id: dxa_mbar-bounds
+    via: script
+    driver: simx
+    configs+: "-DVX_CFG_EXT_DXA_ENABLE"
+    touches: *dxa_mbar_touches
+    env: {DRIVER: simx, APP: dxa_mbar, ARGS: "-x bounds", EXPECT: "mbarrier offset outside the block"}
+    run: *expect_fail_run
+  - id: dxa_mbar-bounds
+    via: script
+    driver: rtlsim
+    configs+: "-DVX_CFG_EXT_DXA_ENABLE"
+    touches: *dxa_mbar_touches
+    env: {DRIVER: rtlsim, APP: dxa_mbar, ARGS: "-x bounds", EXPECT: "mbarrier offset outside the block"}
+    run: *expect_fail_run
+  - id: dxa_mbar-mcast
+    via: script
+    driver: simx
+    configs+: "-DVX_CFG_EXT_DXA_ENABLE"
+    touches: *dxa_mbar_touches
+    env: {DRIVER: simx, APP: dxa_mbar, ARGS: "-x mcast", EXPECT: "DXA multicast with an mbarrier is not supported"}
+    run: *expect_fail_run
+  - id: dxa_mbar-mcast
+    via: script
+    driver: rtlsim
+    configs+: "-DVX_CFG_EXT_DXA_ENABLE"
+    touches: *dxa_mbar_touches
+    env: {DRIVER: rtlsim, APP: dxa_mbar, ARGS: "-x mcast", EXPECT: "DXA multicast with an mbarrier is not supported"}
     run: *expect_fail_run
 
   # The knob without its prerequisites must stop the build, in SimX (the

@@ -15,6 +15,9 @@
 #include "core.h"
 #include "constants.h"
 #include "debug.h"
+#ifdef DXA_MBAR_ENABLE
+#include <iostream>
+#endif
 
 using namespace vortex;
 
@@ -50,7 +53,19 @@ instr_trace_t* DxaUnit::process(instr_trace_t* trace) {
   };
   uint32_t cta_mask  = rs2.at(3).u;
   uint32_t desc_slot = meta & 0x0fu;
+#ifdef DXA_MBAR_ENABLE
+  // meta[30] selects the completion; meta[29:4] is its barrier or mbarrier.
+  const bool mode    = (meta >> 30) & 1u;
+  uint32_t raw_bar   = mode ? 0u : ((meta >> 4) & 0x03ffffffu);
+  if (mode && __builtin_popcount(cta_mask) > 1) {
+    std::cerr << SimPlatform::instance().cycles() << ": *** core" << core_->id()
+              << " DXA multicast with an mbarrier is not supported: wid=" << trace->wid
+              << " cta_mask=0x" << std::hex << cta_mask << std::dec << std::endl;
+    std::abort();
+  }
+#else
   uint32_t raw_bar   = (meta >> 4) & 0x07ffffffu;
+#endif
 
   DxaReq req;
   req.core      = core_;
@@ -64,6 +79,12 @@ instr_trace_t* DxaUnit::process(instr_trace_t* trace) {
   req.cta_mask  = cta_mask;
   req.smem_addr = smem_addr;
   for (int i = 0; i < 5; ++i) req.coords[i] = coords[i];
+#ifdef DXA_MBAR_ENABLE
+  req.mode      = mode;
+  req.mbar_off  = mode ? ((meta >> 4) & ((1u << (VX_CFG_LMEM_LOG_SIZE - 3)) - 1u)) : 0u;
+  req.slot      = warp_slot_.at(trace->wid);
+  req.gen       = slot_gen_.at(req.slot);
+#endif
 
   // Barrier pre-registration is the kernel's responsibility via
   // vx_barrier_expect_tx(). The DXA pipeline only emits release events on
@@ -76,3 +97,13 @@ instr_trace_t* DxaUnit::process(instr_trace_t* trace) {
      << ", cta_mask=0x" << std::hex << cta_mask << std::dec);
   return trace;
 }
+
+#ifdef DXA_MBAR_ENABLE
+void DxaUnit::slot_evt(const CtaSlotEvt& e) {
+  switch (e.kind) {
+  case CtaSlotEvt::ADMIT: slot_gen_.at(e.slot) = e.gen; break;
+  case CtaSlotEvt::WARP:  warp_slot_.at(e.wid) = e.slot; break;
+  default: break;
+  }
+}
+#endif

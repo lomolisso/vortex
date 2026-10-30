@@ -133,6 +133,13 @@ public:
 			simobject->Inputs.at(i).bind(&mem_xbar_->ReqIn.at(i));
 			mem_xbar_->RspOut.at(i).bind(&simobject->Outputs.at(i));
 		}
+#ifdef VX_CFG_EXT_DXA_ENABLE
+		this->dxa_gate_init(simobject, num_banks);
+#elif defined(VX_CFG_EXT_MBAR_ENABLE)
+#line 133
+#else
+#line 124
+#endif
 	}
 
 	virtual ~Impl() {}
@@ -150,6 +157,13 @@ public:
 #endif
 #ifdef VX_CFG_EXT_MBAR_ENABLE
 		std::fill(evt_due_.begin(), evt_due_.end(), 0);
+#else
+#line 139
+#endif
+#ifdef VX_CFG_EXT_DXA_ENABLE
+		this->dxa_gate_reset();
+#elif defined(VX_CFG_EXT_MBAR_ENABLE)
+#line 153
 #else
 #line 139
 #endif
@@ -200,6 +214,124 @@ public:
 #line 159
 #endif
 
+#ifdef VX_CFG_EXT_DXA_ENABLE
+	// A DXA write reaches the completion unit in the cycle its bank commits it.
+	void dxa_commit(const MemReq& req) {
+		DxaWrCommit c;
+		c.tag    = req.dxa;
+		c.notify = req.flags.dxa_notify_done;
+		c.bar_id = req.flags.dxa_notify_bar_id;
+		c.uuid   = req.uuid;
+		simobject_->DxaWrOut.send(c, 0);
+		if (c.notify) {
+			++dxa_done_finals_;
+		}
+	}
+
+	void dxa_free(uint32_t free) {
+		dxa_free_ = free;
+	}
+
+private:
+	static bool is_dxa_write(const MemReq& req) {
+		return req.flags.dma && req.is_write();
+	}
+
+	static bool beat_before(uint32_t a, uint32_t b) {
+		return int32_t(a - b) < 0;
+	}
+
+	// The RTL holds a beat that ends a copy at its DMA input while the
+	// completion queue is full: the whole beat, and the beats behind it. A
+	// write the crossbar forwards in cycle c commits at c+1, the RTL's accept
+	// cycle, so the gate counts the entries the queue will hold in c+1.
+	void dxa_gate_init(LocalMem* simobject, uint32_t num_banks) {
+		simobject->DxaFreeIn.bind(simobject, &LocalMem::on_dxa_free);
+		mem_xbar_->set_input_gate(
+			[this](const std::vector<SimChannel<MemReq>>& inputs) { this->dxa_gate_begin(inputs); },
+			[this](uint32_t input, const MemReq& req) { return this->dxa_gate_admit(input, req); });
+		for (uint32_t b = 0; b < num_banks; ++b) {
+			mem_xbar_->ReqOut.at(b).tx_callback([this](const MemReq& req, uint64_t) {
+				if (is_dxa_write(req) && req.flags.dxa_notify_done) {
+					++dxa_fwd_finals_;
+				}
+			});
+		}
+	}
+
+	void dxa_gate_reset() {
+		dxa_free_        = UINT32_MAX;
+		dxa_fwd_finals_  = 0;
+		dxa_done_finals_ = 0;
+		dxa_hold_        = false;
+		dxa_hold_beat_   = 0;
+	}
+
+	void dxa_gate_begin(const std::vector<SimChannel<MemReq>>& inputs) {
+		dxa_fwd_finals_ -= dxa_done_finals_;
+		dxa_done_finals_ = 0;
+		dxa_hold_ = false;
+		if (dxa_free_ == UINT32_MAX)
+			return;
+		std::vector<uint32_t> finals;   // the final beats at the inputs, oldest first
+		for (uint32_t i = config_.dma_begin; i < config_.num_reqs; ++i) {
+			const auto& ch = inputs.at(i);
+			if (ch.empty() || !is_dxa_write(ch.peek()) || !ch.peek().dxa.last)
+				continue;
+			const uint32_t beat = ch.peek().dxa.beat;
+			auto it = std::find_if(finals.begin(), finals.end(),
+			                       [beat](uint32_t f) { return !beat_before(f, beat); });
+			if (it == finals.end() || *it != beat) {
+				finals.insert(it, beat);
+			}
+		}
+		const int64_t room = int64_t(dxa_free_) - int64_t(dxa_fwd_finals_);
+		auto first_held = [&](int64_t n) -> const uint32_t* {
+			const size_t k = size_t(std::max<int64_t>(n, 0));
+			return (k < finals.size()) ? &finals[k] : nullptr;
+		};
+		const uint32_t* held = first_held(room);
+#ifdef DXA_MBAR_ENABLE
+		// The complete_tx at the queue head frees an entry if it wins its bank
+		// this cycle, which a beat released for that entry must not take first.
+		if (held != nullptr) {
+			const uint32_t* next = first_held(room + 1);
+			auto absent = [&](uint32_t i) {
+				if (i < config_.dma_begin || next == nullptr || inputs.at(i).empty())
+					return false;
+				const auto& req = inputs.at(i).peek();
+				return is_dxa_write(req) && !beat_before(req.dxa.beat, *next);
+			};
+			if (mem_xbar_->would_win(config_.dxa_compl_port, absent)) {
+				held = next;
+			}
+		}
+#endif
+		if (held != nullptr) {
+			dxa_hold_      = true;
+			dxa_hold_beat_ = *held;
+			DT(2, simobject_->name() << " dxa hold: beat=" << *held << ", free=" << dxa_free_
+			   << ", forwarded finals=" << dxa_fwd_finals_);
+		}
+	}
+
+	bool dxa_gate_admit(uint32_t input, const MemReq& req) const {
+		return !dxa_hold_ || input < config_.dma_begin || !is_dxa_write(req)
+		    || beat_before(req.dxa.beat, dxa_hold_beat_);
+	}
+
+	uint32_t dxa_free_;         // the completion queue's free entries in the next cycle
+	uint32_t dxa_fwd_finals_;   // final writes forwarded to a bank that dxa_free_ does not count yet
+	uint32_t dxa_done_finals_;  // final writes committed since the gate last counted
+	bool     dxa_hold_;
+	uint32_t dxa_hold_beat_;    // the oldest beat held back this cycle
+
+public:
+#elif defined(VX_CFG_EXT_MBAR_ENABLE)
+#line 200
+#else
+#line 160
+#endif
 	void tick() {
 		// process bank requets from xbar
 		uint32_t num_banks = (1 << config_.B);
@@ -389,6 +521,17 @@ public:
 			// update perf counters
 			perf_stats_.reads += !bank_req.is_write();
 			perf_stats_.writes += bank_req.is_write();
+#ifdef VX_CFG_EXT_DXA_ENABLE
+			if (bank_req.flags.dma && bank_req.is_write()) {
+				this->dxa_commit(bank_req);
+			}
+#elif defined(VX_CFG_EXT_MBAR_ENABLE)
+#line 387
+#elif VX_CFG_EXT_A_ENABLED
+#line 340
+#else
+#line 349
+#endif
 
 #ifdef VX_CFG_EXT_DLMEM_ENABLE
 			// The store is written and the load has read its data now.
@@ -423,6 +566,14 @@ LocalMem::LocalMem(const SimContext& ctx, const char* name, const Config& config
 #else
 #line 371
 #endif
+#ifdef VX_CFG_EXT_DXA_ENABLE
+	, DxaWrOut(this, 2u << config.B)
+	, DxaFreeIn(this)
+#elif defined(VX_CFG_EXT_MBAR_ENABLE)
+#line 423
+#else
+#line 371
+#endif
 	, impl_(new Impl(this, config))
 {}
 
@@ -441,3 +592,9 @@ void LocalMem::on_tick() {
 const LocalMem::PerfStats& LocalMem::perf_stats() const {
   return impl_->perf_stats();
 }
+
+#ifdef VX_CFG_EXT_DXA_ENABLE
+void LocalMem::on_dxa_free(const uint32_t& free) {
+  impl_->dxa_free(free);
+}
+#endif

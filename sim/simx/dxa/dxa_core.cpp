@@ -18,6 +18,10 @@
 #include <cstring>
 #include <deque>
 #include <vector>
+#ifdef DXA_MBAR_ENABLE
+#include <iostream>
+#include <string>
+#endif
 #include "core.h"
 #include "socket.h"
 #include "socket.h"
@@ -123,6 +127,14 @@ public:
     uint32_t                mc_cta_idx = 0;      // 0..cta_indices.size()
     uint32_t                km_elem_idx = 0;     // 0..km_num_elems (K-major scatter)
     uint32_t                writes_emitted = 0;  // count for perf
+
+    // Completion: the copy into each receiving block has its own id and
+    // write count; its final write carries the count.
+    uint32_t                xfer_base = 0;
+    std::vector<uint32_t>   rcv_writes;
+#ifdef DXA_MBAR_ENABLE
+    uint32_t                tx_bytes = 0;        // the box, out-of-bounds fill included
+#endif
   };
 
   // ── Constructor ──────────────────────────────────────────────────────
@@ -139,6 +151,7 @@ public:
   void reset() {
     cycle_ = 0;
     queue_.clear();
+    std::fill(beat_seq_.begin(), beat_seq_.end(), 0);
     perf_stats_ = DxaCore::PerfStats();
     for (auto& w : workers_) {
       w.state = WState::IDLE;
@@ -357,6 +370,14 @@ private:
       }
     }
 
+    uint32_t num_rcv = w.is_multicast ? uint32_t(w.cta_indices.size()) : 1u;
+    if (xfer_seq_ == 0 || xfer_seq_ + num_rcv < xfer_seq_) {
+      xfer_seq_ = 1;
+    }
+    w.xfer_base = xfer_seq_;
+    xfer_seq_ += num_rcv;
+    w.rcv_writes.assign(num_rcv, 0);
+
     if (req.desc_slot >= VX_DCR_DXA_DESC_COUNT) {
       // Invalid descriptor — release barrier(s) directly without any LMEM write.
       release_all_barriers(w);
@@ -367,7 +388,18 @@ private:
     w.desc = descriptors_.at(req.desc_slot);
     w.smem_stride = w.desc.smem_stride;
 
+#ifdef DXA_MBAR_ENABLE
+    if (req.mode) {
+      w.tx_bytes = this->box_bytes(w);
+    }
+#endif
+
     enumerate_work_list(w);
+#ifdef DXA_MBAR_ENABLE
+    if (req.mode && w.work_list.empty()) {
+      this->dxa_abort(w, "invalid DXA rank: no work for the box");
+    }
+#endif
     if (w.work_list.empty()) {
       // No work — same edge case as above.
       release_all_barriers(w);
@@ -649,6 +681,12 @@ private:
 
     constexpr uint64_t kRowMask = ~uint64_t(DxaCore::LMEM_ROW_SIZE - 1);
     uint64_t beat_row = UINT64_MAX;
+    // The beat's writes go out together, so that each carries whether the
+    // beat ends a copy: the core's DXA input holds such a beat whole.
+    std::array<MemReq, DxaCore::LMEM_PORTS_PER_CORE> beat;
+    std::array<uint32_t, DxaCore::LMEM_PORTS_PER_CORE> beat_port;
+    uint32_t beat_writes = 0;
+    bool beat_last = false;
 
     for (uint32_t emitted = 0; emitted < DxaCore::LMEM_PORTS_PER_CORE; ++emitted) {
       slot = w.drain_slot;
@@ -715,7 +753,11 @@ private:
           : 0u;
       auto& lmem_ch = simobject_->lmem_req_out.at(
           socket_local_cid * DxaCore::LMEM_PORTS_PER_CORE + half);
-      if (lmem_ch.full()) {
+      uint32_t port_queued = 0;
+      for (uint32_t k = 0; k < beat_writes; ++k) {
+        port_queued += (beat_port.at(k) == socket_local_cid * DxaCore::LMEM_PORTS_PER_CORE + half);
+      }
+      if (lmem_ch.size() + port_queued >= lmem_ch.capacity()) {
         break; // backpressure
       }
 
@@ -760,12 +802,26 @@ private:
       bool is_last_elem   = (ee == num_elems);
       bool is_last_work   = lw.last;
       bool is_last_replay = !w.is_multicast || (w.mc_cta_idx + 1 == w.cta_indices.size());
+      const uint32_t rcv  = w.is_multicast ? w.mc_cta_idx : 0u;
+      req.dxa.xfer = w.xfer_base + rcv;
+#ifdef DXA_MBAR_ENABLE
+      req.dxa.mode     = w.req.mode;
+      req.dxa.mbar_off = w.req.mbar_off;
+      req.dxa.tx_bytes = w.tx_bytes;
+      req.dxa.slot     = w.req.slot;
+      req.dxa.gen      = w.req.gen;
+#endif
       if (is_last_work && is_last_elem && (w.is_multicast || is_last_replay)) {
         req.flags.dxa_notify_done   = 1;
         req.flags.dxa_notify_bar_id = w.req.bar_id + (w.is_multicast ? cta_warp_idx : 0u);
+        req.dxa.writes = w.rcv_writes.at(rcv) + 1;
+        beat_last = true;
       }
+      ++w.rcv_writes.at(rcv);
 
-      lmem_ch.send(req);
+      beat.at(beat_writes) = req;
+      beat_port.at(beat_writes) = socket_local_cid * DxaCore::LMEM_PORTS_PER_CORE + half;
+      ++beat_writes;
       ++w.writes_emitted;
       // Count write transactions, not port requests: one per banked-row beat.
       // A beat spans LMEM_PORTS_PER_CORE ports of the same row, so only its
@@ -794,18 +850,57 @@ private:
         }
       }
     } // per-tick row-beat emission loop
+
+    if (beat_writes != 0) {
+      const uint32_t id = beat_seq_.at(socket_local_cid)++;
+      for (uint32_t k = 0; k < beat_writes; ++k) {
+        beat.at(k).dxa.beat = id;
+        beat.at(k).dxa.last = beat_last;
+        simobject_->lmem_req_out.at(beat_port.at(k)).send(beat.at(k));
+      }
+    }
   }
 
+#ifdef DXA_MBAR_ENABLE
+  [[noreturn]] void dxa_abort(const Worker& w, const std::string& msg) {
+    std::cerr << SimPlatform::instance().cycles() << ": *** " << simobject_->name()
+              << "[" << w.worker_id << "] " << msg << ": core=" << w.req.core->id()
+              << " wid=" << w.req.wid << " desc=" << w.req.desc_slot
+              << " (#" << w.req.uuid << ")" << std::endl;
+    std::abort();
+  }
+
+  // The bytes an mbarrier copy completes with: the full box, rank-limited,
+  // out-of-bounds fill included.
+  uint32_t box_bytes(const Worker& w) {
+    const uint32_t meta = w.desc.meta;
+    const uint32_t rank = (meta >> DXA_DESC_META_DIM_LSB) & ((1u << DXA_DESC_META_DIM_BITS) - 1u);
+    if (rank < 1 || rank > 5) {
+      this->dxa_abort(w, "invalid DXA rank: " + std::to_string(rank));
+    }
+    uint64_t bytes = desc_elem_bytes(meta);
+    for (uint32_t d = 0; d < rank; ++d) {
+      bytes *= w.desc.tile_sizes[d];
+    }
+    if (bytes == 0) {
+      this->dxa_abort(w, "invalid DXA rank: empty box");
+    }
+    if (bytes > (uint64_t(1) << VX_CFG_LMEM_LOG_SIZE)) {
+      this->dxa_abort(w, "DXA box exceeds local memory: " + std::to_string(bytes) + " bytes");
+    }
+    return uint32_t(bytes);
+  }
+#endif
+
+  // The barriers go raw to the issuing core's completion unit.
   void release_all_barriers(Worker& w) {
-    // bar_id is RAW (encoded); decode at release call site.
+    auto& ch = simobject_->compl_release_out.at(w.req.core->id() % kCoresPerSocket);
     if (w.is_multicast) {
       for (uint32_t cta : w.cta_indices) {
-        uint32_t decoded = bar_decode_id(w.req.bar_id + cta, VX_CFG_NUM_BARRIERS);
-        w.req.core->barrier_event_release(decoded);
+        ch.send(w.req.bar_id + cta);
       }
     } else {
-      uint32_t decoded = bar_decode_id(w.req.bar_id, VX_CFG_NUM_BARRIERS);
-      w.req.core->barrier_event_release(decoded);
+      ch.send(w.req.bar_id);
     }
   }
 
@@ -836,6 +931,8 @@ private:
   std::deque<DxaReq>     queue_;
   std::vector<Worker>    workers_;
   uint32_t               rr_req_ = 0;
+  uint32_t               xfer_seq_ = 1;
+  std::vector<uint32_t>  beat_seq_ = std::vector<uint32_t>(kCoresPerSocket, 0);  // per core
   uint64_t               cycle_;
   DxaCore::PerfStats     perf_stats_;
 };
@@ -850,6 +947,7 @@ DxaCore::DxaCore(const SimContext& ctx, const char* name, Socket* socket)
   , gmem_req_out(kDxaMemPorts, this)
   , gmem_rsp_in(kDxaMemPorts, this)
   , lmem_req_out(kCoresPerSocket * LMEM_PORTS_PER_CORE, this)
+  , compl_release_out(kCoresPerSocket, this)
 {
   __unused(socket);
 

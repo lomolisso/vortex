@@ -59,6 +59,9 @@ module VX_dxa_worker import VX_gpu_pkg::*, VX_dxa_pkg::*; #(
     wire [NW_WIDTH-1:0]         active_wid;
     wire [BAR_ADDR_W-1:0]       active_bar_addr;
     wire                        active_notify_smem_done;
+`ifdef DXA_MBAR_ENABLE
+    dxa_compl_t                 active_compl;
+`endif
     wire                        active_is_multicast;
     wire [`VX_CFG_NUM_WARPS-1:0]       active_cta_mask;
     wire [31:0]                 active_smem_stride;
@@ -138,6 +141,9 @@ module VX_dxa_worker import VX_gpu_pkg::*, VX_dxa_pkg::*; #(
         .active_wid           (active_wid),
         .active_bar_addr      (active_bar_addr),
         .active_notify_smem_done (active_notify_smem_done),
+    `ifdef DXA_MBAR_ENABLE
+        .active_compl         (active_compl),
+    `endif
         .active_is_multicast  (active_is_multicast),
         .active_cta_mask      (active_cta_mask),
         .active_smem_stride   (active_smem_stride)
@@ -253,6 +259,9 @@ module VX_dxa_worker import VX_gpu_pkg::*, VX_dxa_pkg::*; #(
         .active_uuid           (active_uuid),
         .active_bar_addr       (active_bar_addr),
         .active_notify_smem_done (active_notify_smem_done),
+    `ifdef DXA_MBAR_ENABLE
+        .active_compl          (active_compl),
+    `endif
         .sw_valid              (sw_valid),
         .sw_ready              (sw_ready),
         .sw_tag                (sw_tag),

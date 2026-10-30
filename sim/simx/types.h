@@ -1349,6 +1349,54 @@ inline uint32_t make_hart_id(uint32_t cid, uint32_t wid, uint32_t tid) {
        | tid;
 }
 
+#ifdef VX_CFG_EXT_DXA_ENABLE
+#ifdef VX_CFG_EXT_MBAR_ENABLE
+// DXA copies that can complete on an mbarrier transaction count.
+#define DXA_MBAR_ENABLE
+#endif
+
+// What a DXA write into a local memory carries for the copy's completion.
+struct DxaWrTag {
+  uint32_t xfer   = 0;  // the copy into one block it belongs to, unique per engine
+  uint32_t writes = 0;  // on the copy's final write: all the writes of the copy
+  uint32_t beat   = 0;      // the engine's row beat into this core, in emission order
+  bool     last   = false;  // on every write of a copy's final beat
+#ifdef DXA_MBAR_ENABLE
+  bool     mode     = false;  // complete_tx on an mbarrier instead of a barrier event
+  uint32_t mbar_off = 0;      // the mbarrier's doubleword offset in the local memory
+  uint32_t tx_bytes = 0;
+  uint32_t slot     = 0;      // the issuing block's CTA slot and its generation
+  uint32_t gen      = 0;
+#endif
+};
+
+// A DXA write the local memory has committed at its bank.
+struct DxaWrCommit {
+  DxaWrTag tag;
+  bool     notify = false;  // the copy's final write; bar_id is then its raw barrier
+  uint32_t bar_id = 0;
+  uint64_t uuid   = 0;
+};
+
+#ifdef DXA_MBAR_ENABLE
+constexpr uint32_t DXA_CTA_GEN_BITS = 4;
+
+// A CTA slot change, from the dispatcher to the DXA's mirrors of the slots.
+struct CtaSlotEvt {
+  enum Kind : uint8_t { ADMIT, FREE, WARP };
+  Kind     kind   = ADMIT;
+  uint32_t slot   = 0;
+  uint32_t gen    = 0;  // ADMIT: the slot's new generation
+  uint32_t stride = 0;  // ADMIT: the slot pitch, in bytes
+  uint32_t wid    = 0;  // WARP: a warp the block runs on
+};
+#endif
+
+#elif defined(VX_CFG_EXT_MBAR_ENABLE)
+#line 1275
+#else
+#line 1267
+#endif
 struct MemReq {
   MemOp    op;
   uint64_t addr;
@@ -1361,6 +1409,13 @@ struct MemReq {
   uint32_t hart_id;
   uint64_t uuid;
   MemFlags flags;
+#ifdef VX_CFG_EXT_DXA_ENABLE
+  DxaWrTag dxa;
+#elif defined(VX_CFG_EXT_MBAR_ENABLE)
+#line 1287
+#else
+#line 1279
+#endif
 
   MemReq(MemOp _op = MemOp::LD,
          uint64_t _addr = 0,
@@ -1748,6 +1803,51 @@ public:
   uint64_t collisions() const {
     return collisions_;
   }
+#ifdef VX_CFG_EXT_DXA_ENABLE
+
+  // A gate holding inputs back: `begin` sees the inputs before each cycle's
+  // arbitration, and an input `admit` refuses sits that cycle out.
+  void set_input_gate(std::function<void(const std::vector<SimChannel<ReqType>>&)> begin,
+                      std::function<bool(uint32_t, const ReqType&)> admit) {
+    gate_begin_ = std::move(begin);
+    gate_admit_ = std::move(admit);
+  }
+
+  // Whether `input` would win its output this cycle, with the inputs `absent`
+  // names left out of the arbitration.
+  bool would_win(uint32_t input, const std::function<bool(uint32_t)>& absent) const {
+    const auto& rin = Inputs.at(input);
+    if (rin.empty() || absent(input)) {
+      return false;
+    }
+    const uint32_t I = Inputs.size();
+    const uint32_t o = (lg2_outputs_ != 0) ? output_sel_(rin.peek()) : 0;
+    if (Outputs.at(o).full()) {
+      return false;
+    }
+    const uint32_t P = prio_begin_;
+    const uint32_t num_prio = I - P;
+    for (uint32_t k = 0; k < I; ++k) {
+      uint32_t i = (k < num_prio) ? (P + k) : (rr_next_[o] + (k - num_prio));
+      if (k >= num_prio && i >= P) {
+        i -= P;
+      }
+      const auto& req_in = Inputs.at(i);
+      if (req_in.empty() || absent(i)) {
+        continue;
+      }
+      if (lg2_outputs_ != 0 && output_sel_(req_in.peek()) != o) {
+        continue;
+      }
+      return i == input;
+    }
+    return false;
+  }
+#elif defined(VX_CFG_EXT_MBAR_ENABLE)
+#line 1674
+#else
+#line 1666
+#endif
 
 protected:
   void on_reset() {
@@ -1763,6 +1863,14 @@ protected:
   uint32_t prio_begin_;
   std::vector<uint32_t> rr_next_; // per output: first arbitrated input to scan
   uint64_t collisions_;
+#ifdef VX_CFG_EXT_DXA_ENABLE
+  std::function<void(const std::vector<SimChannel<ReqType>>&)> gate_begin_;
+  std::function<bool(uint32_t, const ReqType&)> gate_admit_;
+#elif defined(VX_CFG_EXT_MBAR_ENABLE)
+#line 1689
+#else
+#line 1681
+#endif
 
   friend class SimObject<TxCrossBar<Type>>;
 };
@@ -1778,6 +1886,15 @@ void TxCrossBar<Type>::on_tick() {
 
   uint32_t P = prio_begin_;
   uint32_t num_prio = I - P;
+#ifdef VX_CFG_EXT_DXA_ENABLE
+  if (gate_begin_) {
+    gate_begin_(Inputs);
+  }
+#elif defined(VX_CFG_EXT_MBAR_ENABLE)
+#line 1704
+#else
+#line 1696
+#endif
 
   // process incoming requests
   for (uint32_t o = 0; o < O; ++o) {
@@ -1803,6 +1920,15 @@ void TxCrossBar<Type>::on_tick() {
       if (lg2_outputs_ != 0 && output_sel_(req_in.peek()) != o) {
         continue;
       }
+#ifdef VX_CFG_EXT_DXA_ENABLE
+      if (gate_admit_ && !gate_admit_(i, req_in.peek())) {
+        continue;
+      }
+#elif defined(VX_CFG_EXT_MBAR_ENABLE)
+#line 1729
+#else
+#line 1721
+#endif
       if (input_idx != -1) {
         has_collision = true;
         break;
@@ -2040,6 +2166,23 @@ public:
     }
     return 0;
   }
+#ifdef VX_CFG_EXT_DXA_ENABLE
+
+  void set_input_gate(std::function<void(const std::vector<SimChannel<Req>>&)> begin,
+                      std::function<bool(uint32_t, const Req&)> admit) {
+    if (crossbar_) {
+      crossbar_->set_input_gate(std::move(begin), std::move(admit));
+    }
+  }
+
+  bool would_win(uint32_t input, const std::function<bool(uint32_t)>& absent) const {
+    return crossbar_ && crossbar_->would_win(input, absent);
+  }
+#elif defined(VX_CFG_EXT_MBAR_ENABLE)
+#line 1966
+#else
+#line 1958
+#endif
 
 protected:
   void on_reset() {

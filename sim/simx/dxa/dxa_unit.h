@@ -35,6 +35,12 @@ struct DxaReq {
   uint32_t cta_mask;      // multicast warp mask (>1 bit ⇒ multicast)
   uint64_t smem_addr;
   uint32_t coords[5];
+#ifdef DXA_MBAR_ENABLE
+  bool     mode;          // meta[30]: complete_tx on an mbarrier
+  uint32_t mbar_off;      // the mbarrier's doubleword offset in the local memory
+  uint32_t slot;          // the issuing block's CTA slot and its generation
+  uint32_t gen;
+#endif
 };
 
 // DXA sub-unit of the SFU. Plain (non-SimObject) class owned by SfuUnit;
@@ -52,9 +58,18 @@ public:
   // (caller retries next cycle without side effects).
   instr_trace_t* process(instr_trace_t* trace);
 
+#ifdef DXA_MBAR_ENABLE
+  // Mirrors the dispatcher's slot generations and the warps' slots.
+  void slot_evt(const CtaSlotEvt& e);
+#endif
+
 private:
   Core*               core_;
   SimChannel<DxaReq>& req_out_;
+#ifdef DXA_MBAR_ENABLE
+  std::vector<uint32_t> warp_slot_ = std::vector<uint32_t>(VX_CFG_NUM_WARPS, 0);
+  std::vector<uint32_t> slot_gen_  = std::vector<uint32_t>(VX_CFG_NUM_WARPS, 0);
+#endif
 };
 
 } // namespace vortex

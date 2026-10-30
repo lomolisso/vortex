@@ -56,6 +56,15 @@ public:
   void global_resume(uint32_t bar_id);
   void event_attach(uint32_t bar_id, uint32_t count = 1);
   void event_release(uint32_t bar_id);
+#ifdef VX_CFG_EXT_DXA_ENABLE
+  // A DXA copy's completion: one event of a barrier (its flat id) is released.
+  SimEventLink<uint32_t> TxbarIn;
+private:
+  void on_txbar(const uint32_t& bar_id);
+public:
+#else
+#line 58
+#endif
 #ifdef VX_CFG_EXT_DLMEM_ENABLE
   // Sends a SPREAD block's done event to the cluster's gang unit, through the
   // same request queue the global barrier arrivals use.

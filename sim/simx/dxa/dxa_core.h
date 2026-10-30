@@ -74,6 +74,14 @@ public:
   // LMEM_PORTS_PER_CORE, core-major). The socket binds each core's
   // LocalMem::Inputs[port_dxa + p] here. Write-only — no rsp.
   std::vector<SimChannel<MemReq>>  lmem_req_out;
+#ifdef VX_CFG_EXT_DXA_ENABLE
+
+  // Per core, the raw barriers of copies finished without a write, to its
+  // DXA completion unit.
+  std::vector<SimChannel<uint32_t>> compl_release_out;
+#else
+#line 76
+#endif
 
   DxaCore(const SimContext& ctx, const char* name, Socket* socket);
   virtual ~DxaCore();

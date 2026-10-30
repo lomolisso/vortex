@@ -261,6 +261,12 @@ module VX_core import VX_gpu_pkg::*, VX_tlb_pkg::*; #(
     dlmem_row_t                    peer_wr_row;
     wire [`VX_CFG_LMEM_LOG_SIZE:0] peer_wr_stride;
 `endif
+`ifdef DXA_MBAR_ENABLE
+    // CTA slot state, for the DXA's retired-slot checks
+    wire [`VX_CFG_NUM_WARPS-1:0]                    cta_slot_valid;
+    wire [`VX_CFG_NUM_WARPS-1:0][DXA_CTA_GEN_W-1:0] cta_slot_gen;
+    wire [`VX_CFG_NUM_WARPS-1:0][NW_WIDTH-1:0]      cta_warp_slot;
+`endif
 
     VX_scheduler #(
         .INSTANCE_ID (`SFORMATF(("%s-scheduler", INSTANCE_ID))),
@@ -302,6 +308,11 @@ module VX_core import VX_gpu_pkg::*, VX_tlb_pkg::*; #(
     `ifdef VX_CFG_EXT_MBAR_ENABLE
         .mbar_unlock_valid (mbar_unlock_valid),
         .mbar_unlock_mask (mbar_unlock_mask),
+    `endif
+    `ifdef DXA_MBAR_ENABLE
+        .cta_slot_valid (cta_slot_valid),
+        .cta_slot_gen   (cta_slot_gen),
+        .cta_warp_slot  (cta_warp_slot),
     `endif
 
         .busy           (sched_busy)
@@ -412,6 +423,10 @@ module VX_core import VX_gpu_pkg::*, VX_tlb_pkg::*; #(
     `ifdef VX_CFG_EXT_DXA_ENABLE
         .dxa_req_bus_if (dxa_req_bus_if),
         .dxa_txbar_bus_if(dxa_txbar_bus_if),
+    `endif
+    `ifdef DXA_MBAR_ENABLE
+        .cta_warp_slot  (cta_warp_slot),
+        .cta_slot_gen   (cta_slot_gen),
     `endif
     `ifdef VX_CFG_EXT_TEX_ENABLE
         .tex_bus_if     (tex_bus_if),
@@ -599,6 +614,11 @@ module VX_core import VX_gpu_pkg::*, VX_tlb_pkg::*; #(
         .mbar_retire_wid (mbar_retire_wid),
         .mbar_unlock_valid (mbar_unlock_valid),
         .mbar_unlock_mask (mbar_unlock_mask),
+    `endif
+    `ifdef DXA_MBAR_ENABLE
+        .cta_slot_valid (cta_slot_valid),
+        .cta_slot_gen   (cta_slot_gen),
+        .cta_slot_stride (peer_wr_stride),
     `endif
         .empty         (mem_unit_empty),
         .lsu_mem_if    (lsu_mem_if),

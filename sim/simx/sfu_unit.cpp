@@ -35,6 +35,11 @@ SfuUnit::SfuUnit(const SimContext& ctx, const char* name, Core* core)
 #ifdef VX_CFG_EXT_DXA_ENABLE
 	, dxa_req_out(this)
 #endif
+#ifdef DXA_MBAR_ENABLE
+	, dxa_slot_in(this, 4 * VX_CFG_NUM_WARPS + 8)
+#else
+#line 37
+#endif
 #ifdef VX_CFG_EXT_TEX_ENABLE
 	, tex_req_out(this)
 	, tex_rsp_in(this)
@@ -83,6 +88,14 @@ bool SfuUnit::rtu_trace2_reserve_slot(uint32_t wid) {
 
 
 void SfuUnit::on_tick() {
+#ifdef DXA_MBAR_ENABLE
+	while (!dxa_slot_in.empty()) {
+		dxa_unit_->slot_evt(dxa_slot_in.peek());
+		dxa_slot_in.pop();
+	}
+#else
+#line 85
+#endif
 #ifdef VX_CFG_EXT_RTU_ENABLE
 	// Drain RTU rsps. Two flavors, both completing the warp's parked WAIT
 	// through the same writeback path (candidate-return, no async trap):

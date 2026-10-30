@@ -52,6 +52,9 @@ module VX_dxa_setup import VX_gpu_pkg::*, VX_dxa_pkg::*; (
     output wire [NW_WIDTH-1:0]         active_wid,
     output wire [BAR_ADDR_W-1:0]       active_bar_addr,
     output wire                        active_notify_smem_done,
+`ifdef DXA_MBAR_ENABLE
+    output wire dxa_compl_t            active_compl,
+`endif
 
     // Multicast (always available; active when cta_mask has >1 bit set).
     output wire                        active_is_multicast,
@@ -152,6 +155,19 @@ module VX_dxa_setup import VX_gpu_pkg::*, VX_dxa_pkg::*; (
     `RUNTIME_ASSERT(!launch_accept || !dec_dest_kmajor || (dec_rank <= 2),
         ("DXA K-major (LAYOUT=1) requires rank ≤ 2, got rank=%0d", dec_rank))
 
+`ifdef DXA_MBAR_ENABLE
+    // The tx count is the full box, out-of-bounds fill included.
+    wire dec_mbar_mode = req_data.meta[30];
+    `RUNTIME_ASSERT(!launch_accept || !dec_mbar_mode
+                 || ((128'(dec_tile0) * 128'(dec_tile1) * 128'(dec_tile2) * 128'(dec_tile3) * 128'(dec_tile4)) != 0),
+        ("invalid DXA rank: empty box, tiles=%0d,%0d,%0d,%0d,%0d", dec_tile0, dec_tile1, dec_tile2, dec_tile3, dec_tile4))
+    `RUNTIME_ASSERT(!launch_accept || !dec_mbar_mode
+                 || (((128'(dec_tile0) * 128'(dec_tile1) * 128'(dec_tile2) * 128'(dec_tile3) * 128'(dec_tile4)) << esize_enc)
+                     <= 128'(1 << `VX_CFG_LMEM_LOG_SIZE)),
+        ("DXA box exceeds local memory: tiles=%0d,%0d,%0d,%0d,%0d elem_bytes=%0d", dec_tile0, dec_tile1, dec_tile2,
+         dec_tile3, dec_tile4, dec_elem_bytes))
+`endif
+
     // K-major per-lane SMEM stride = tile1 * elem_bytes. Since elem_bytes is
     // always a power of 2 (encoded as esize_enc), this collapses to a shift.
     // tile1 ≤ 32 and elem_bytes ≤ 8, so 16 bits is sufficient.
@@ -205,6 +221,9 @@ module VX_dxa_setup import VX_gpu_pkg::*, VX_dxa_pkg::*; (
     reg [3:0]                              r_lg_tcN;
     reg [3:0]                              r_lg_nsteps;
     reg [3:0]                              r_lg_bkK;
+`ifdef DXA_MBAR_ENABLE
+    dxa_compl_t                            r_compl;
+`endif
 
     // ════════════════════════════════════════════════════════════════════
     // Staged result registers (filled by the setup engine for the next
@@ -234,6 +253,9 @@ module VX_dxa_setup import VX_gpu_pkg::*, VX_dxa_pkg::*; (
     reg [3:0]                              s_lg_tcN;
     reg [3:0]                              s_lg_nsteps;
     reg [3:0]                              s_lg_bkK;
+`ifdef DXA_MBAR_ENABLE
+    dxa_compl_t                            s_compl;
+`endif
 
     assign active_core_id          = r_core_id;
     assign active_uuid             = r_uuid;
@@ -243,6 +265,9 @@ module VX_dxa_setup import VX_gpu_pkg::*, VX_dxa_pkg::*; (
     assign active_is_multicast     = r_is_multicast;
     assign active_cta_mask         = r_cta_mask;
     assign active_smem_stride      = r_smem_stride;
+`ifdef DXA_MBAR_ENABLE
+    assign active_compl            = r_compl;
+`endif
 
     // ════════════════════════════════════════════════════════════════════
     // Setup pipeline: 2 parallel DSP multipliers, multi-phase.
@@ -314,6 +339,17 @@ module VX_dxa_setup import VX_gpu_pkg::*, VX_dxa_pkg::*; (
 
     // Latched dim tiles (for wrap-delta computation).
     reg [31:0] lat_tile1, lat_tile2, lat_tile3;
+`ifdef DXA_MBAR_ENABLE
+    // Box bytes = (tile0 x elem_bytes) x tile1 x .. x tile4, one product per
+    // cycle in phase-0 cycles ctr 0..3, which every rank runs; the box fits the
+    // local memory, so DXA_TX_BYTES_W bits keep the exact count.
+    reg  [DXA_TX_BYTES_W-1:0] lat_tile4;
+    wire [DXA_TX_BYTES_W-1:0] tx_tile = (ctr_r == 4'd0) ? DXA_TX_BYTES_W'(lat_tile1)
+                                      : (ctr_r == 4'd1) ? DXA_TX_BYTES_W'(lat_tile2)
+                                      : (ctr_r == 4'd2) ? DXA_TX_BYTES_W'(lat_tile3)
+                                      :                   lat_tile4;
+    wire [DXA_TX_BYTES_W-1:0] tx_prod = s_compl.tx_bytes * tx_tile;
+`endif
 
     // Multiplier input mux (driven by ctr_r and lat_rank).
     //   mul_off: dim offset coordN×stride(N-1), one per phase.
@@ -441,6 +477,9 @@ module VX_dxa_setup import VX_gpu_pkg::*, VX_dxa_pkg::*; (
                 r_lg_tcN            <= s_lg_tcN;
                 r_lg_nsteps         <= s_lg_nsteps;
                 r_lg_bkK            <= s_lg_bkK;
+            `ifdef DXA_MBAR_ENABLE
+                r_compl             <= s_compl;
+            `endif
                 state_r             <= TS_ACTIVE;
                 pipeline_start_r    <= 1'b1;
                 setup_state_r       <= SS_IDLE;
@@ -476,6 +515,14 @@ module VX_dxa_setup import VX_gpu_pkg::*, VX_dxa_pkg::*; (
                     s_lg_tcN            <= dec_lg_tcN;
                     s_lg_nsteps         <= dec_lg_nsteps;
                     s_lg_bkK            <= dec_lg_bkK;
+                `ifdef DXA_MBAR_ENABLE
+                    s_compl.mode        <= dec_mbar_mode;
+                    s_compl.mbar_off    <= req_data.meta[4 +: DXA_MBAR_OFF_W];
+                    s_compl.tx_bytes    <= DXA_TX_BYTES_W'(dec_row_len_bytes);
+                    s_compl.slot        <= req_data.slot;
+                    s_compl.gen         <= req_data.gen;
+                    lat_tile4           <= DXA_TX_BYTES_W'(dec_tile4);
+                `endif
                     // Rolling-cursor deltas: delta[0] is the inner-dim step.
                     // Higher deltas are precomputed below (Phase 1-3 captures).
                     s_delta[0]          <= dec_stride0;
@@ -517,6 +564,11 @@ module VX_dxa_setup import VX_gpu_pkg::*, VX_dxa_pkg::*; (
             end
             SS_RUNNING: begin
                 ctr_r <= ctr_r + 4'd1;
+            `ifdef DXA_MBAR_ENABLE
+                if (ctr_r <= 4'd3) begin
+                    s_compl.tx_bytes <= tx_prod;
+                end
+            `endif
 
                 // ── Phase 0 capture at ctr=3 (operand reg adds +1 cycle) ──
                 //   dim1 offset (coord1×stride0). row_len + dim0 offset were

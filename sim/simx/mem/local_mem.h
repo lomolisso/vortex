@@ -40,6 +40,11 @@ public:
 #ifdef VX_CFG_EXT_DLMEM_ENABLE
     uint32_t commit_ports = 0; // counted accesses (flags.lacc) from ports [0, commit_ports) pulse CommitOut
 #endif
+#ifdef DXA_MBAR_ENABLE
+    uint32_t dxa_compl_port = 0; // the DXA completion unit's complete_tx requests
+#else
+#line 42
+#endif
   };
 
   struct PerfStats {
@@ -66,6 +71,20 @@ public:
   // Per bank, at most one per cycle: an insert 1 cycle after the bank takes the
   // try_wait (its read), a flip 2 cycles after it takes the op (its write-back).
   std::vector<SimChannel<MbarBankEvt>> MbarEvtOut;
+#endif
+#ifdef VX_CFG_EXT_DXA_ENABLE
+  // The DXA writes the banks commit, in the cycle they commit, toward the
+  // core's DXA completion unit.
+  SimChannel<DxaWrCommit> DxaWrOut;
+
+  // The free entries the completion queue will have next cycle. A copy's
+  // final beat waits at the DXA input while it has none, so none is dropped.
+  SimEventLink<uint32_t> DxaFreeIn;
+private:
+  void on_dxa_free(const uint32_t& free);
+public:
+#else
+#line 69
 #endif
 
   LocalMem(const SimContext& ctx, const char* name, const Config& config);

@@ -61,6 +61,13 @@
 #else
 #line 58
 #endif
+#ifdef VX_CFG_EXT_DXA_ENABLE
+#include "dxa_compl.h"
+#elif defined(VX_CFG_EXT_DLMEM_ENABLE)
+#line 61
+#else
+#line 58
+#endif
 
 using namespace vortex;
 
@@ -155,6 +162,13 @@ public:
       false
     #ifdef VX_CFG_EXT_DLMEM_ENABLE
       , LSU_NUM_REQS
+    #endif
+    #ifdef DXA_MBAR_ENABLE
+      , LMEM_DXA_COMPL_PORT
+    #elif defined(VX_CFG_EXT_DLMEM_ENABLE)
+    #line 156
+    #else
+    #line 153
     #endif
     });
 
@@ -358,6 +372,29 @@ public:
       return wtrack->drained(wid) && lacc->drained(wid);
     });
     scheduler_->peer_wr_out().bind(&dlmem_xlate_->PeerWrIn);
+  #else
+  #line 336
+  #endif
+  #ifdef VX_CFG_EXT_DXA_ENABLE
+    // Created after the local memory, so it sees a bank's DXA commit in the
+    // cycle the bank makes it.
+    snprintf(sname, 100, "%s-dxa_compl", name.c_str());
+    dxa_compl_ = DxaCompl::Create(sname, VX_CFG_LMEM_NUM_BANKS);
+    local_mem_->DxaWrOut.bind(&dxa_compl_->WrIn);
+    dxa_compl_->TxbarOut.bind(&scheduler_->barrier_unit().TxbarIn);
+    dxa_compl_->FreeOut.bind(&local_mem_->DxaFreeIn);
+  #ifdef DXA_MBAR_ENABLE
+    dxa_compl_->ReqOut.bind(&local_mem_->Inputs.at(LMEM_DXA_COMPL_PORT));
+    local_mem_->Outputs.at(LMEM_DXA_COMPL_PORT).bind(&dxa_compl_->RspIn);
+    {
+      auto sfu = std::static_pointer_cast<SfuUnit>(func_units_.at((int)FUType::SFU));
+      auto cta = scheduler_->cta_dispatcher();
+      cta->DxaSlotOut.at(0).bind(&dxa_compl_->SlotIn);
+      cta->DxaSlotOut.at(1).bind(&sfu->dxa_slot_in);
+    }
+  #endif
+  #elif defined(VX_CFG_EXT_DLMEM_ENABLE)
+  #line 361
   #else
   #line 336
   #endif
@@ -1267,6 +1304,16 @@ private:
 #else
 #line 1245
 #endif
+#ifdef VX_CFG_EXT_DXA_ENABLE
+  DxaCompl::Ptr dxa_compl_;
+
+public:
+  const DxaCompl::Ptr& dxa_compl() const { return dxa_compl_; }
+#elif defined(VX_CFG_EXT_DLMEM_ENABLE)
+#line 1267
+#else
+#line 1245
+#endif
 };
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -1470,4 +1517,10 @@ Word Core::flush_warp_pipeline(uint32_t wid) {
 
 #ifdef VX_CFG_VM_ENABLE
 void Core::set_satp(uint64_t satp) { impl_->set_satp(satp); }
+#endif
+
+#ifdef VX_CFG_EXT_DXA_ENABLE
+const std::shared_ptr<DxaCompl>& Core::dxa_compl() const {
+  return impl_->dxa_compl();
+}
 #endif

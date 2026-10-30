@@ -48,6 +48,9 @@ module VX_dxa_smem_wr import VX_gpu_pkg::*, VX_dxa_pkg::*; #(
     input  wire [UUID_WIDTH-1:0]       active_uuid,
     input  wire [BAR_ADDR_W-1:0]       active_bar_addr,
     input  wire                        active_notify_smem_done,
+`ifdef DXA_MBAR_ENABLE
+    input  wire dxa_compl_t            active_compl,
+`endif
 
     // Direct drain channel (from gmem_req).
     input  wire                        sw_valid,
@@ -731,7 +734,20 @@ module VX_dxa_smem_wr import VX_gpu_pkg::*, VX_dxa_pkg::*; #(
     assign smem_bus_if.req_data.addr   = smem_wr_addr;
     assign smem_bus_if.req_data.data   = fb_word_data;
     assign smem_bus_if.req_data.byteen = fb_word_byteen;
+`ifdef DXA_MBAR_ENABLE
+    // Multicast is legacy only, so an mbarrier transfer has one last beat.
+    dxa_lmem_attr_t smem_wr_attr;
+    assign smem_wr_attr.last     = smem_wr_attr_last;
+    assign smem_wr_attr.mode     = active_compl.mode;
+    assign smem_wr_attr.payload  = active_compl.mode ? DXA_ATTR_PAYLOAD_W'(active_compl.mbar_off)
+                                                     : DXA_ATTR_PAYLOAD_W'(smem_wr_attr_bar);
+    assign smem_wr_attr.tx_bytes = active_compl.tx_bytes;
+    assign smem_wr_attr.slot     = active_compl.slot;
+    assign smem_wr_attr.gen      = active_compl.gen;
+    assign smem_bus_if.req_data.attr   = smem_wr_attr;
+`else
     assign smem_bus_if.req_data.attr   = {smem_wr_attr_last, smem_wr_attr_bar};
+`endif
     assign smem_bus_if.req_data.tag.uuid  = active_uuid;   // tag DXA write with its issuing uuid
     assign smem_bus_if.req_data.tag.value = SMEM_TAG_VALUE_W'(active_core_id) << ENGINE_VALUE_W;
     assign smem_bus_if.rsp_ready       = 1'b0;

@@ -34,6 +34,11 @@ class SfuUnit;
 class LocalMem;
 class LocalMemSwitch;
 class MemCoalescer;
+#ifdef VX_CFG_EXT_DXA_ENABLE
+class DxaCompl;
+#else
+#line 36
+#endif
 
 class Core : public SimObject<Core> {
 public:
@@ -130,17 +135,32 @@ public:
     return socket_;
   }
 
-#ifdef VX_CFG_EXT_DLMEM_ENABLE
+#if defined(VX_CFG_EXT_DXA_ENABLE) && defined(VX_CFG_EXT_MBAR_ENABLE)
+  // LocalMem ports: the LSU's; the DLMEM ingress and the DXA completion's
+  // complete_tx requests in their round-robin class; then the DXA's from
+  // here, then the TCU tile buffer.
+  static constexpr uint32_t LMEM_INGRESS_PORT = LSU_NUM_REQS;
+  static constexpr uint32_t LMEM_DXA_COMPL_PORT = LSU_NUM_REQS + 1;
+  static constexpr uint32_t LMEM_DXA_PORT = LSU_NUM_REQS + 2;
+#elif defined(VX_CFG_EXT_DLMEM_ENABLE)
+#line 134
   // LocalMem ports: the LSU's, the DLMEM ingress in their round-robin class,
   // then the DXA's from here, then the TCU tile buffer.
   static constexpr uint32_t LMEM_INGRESS_PORT = LSU_NUM_REQS;
   static constexpr uint32_t LMEM_DXA_PORT = LSU_NUM_REQS + 1;
-#else
-  // LocalMem ports: the LSU's, then the DXA's from here, then the TCU tile buffer.
+#else // LocalMem ports: the LSU's, then the DXA's from here, then the TCU tile buffer.
+#line 140
   static constexpr uint32_t LMEM_DXA_PORT = LSU_NUM_REQS;
 #endif
 
   const std::shared_ptr<LocalMem>& local_mem() const;
+#ifdef VX_CFG_EXT_DXA_ENABLE
+
+  // The core's DXA completion unit.
+  const std::shared_ptr<DxaCompl>& dxa_compl() const;
+#else
+#line 143
+#endif
 
   const std::shared_ptr<MemCoalescer>& mem_coalescer(uint32_t idx) const;
 

@@ -55,10 +55,26 @@ package VX_dxa_pkg;
         logic [UUID_WIDTH-1:0]    uuid;
         logic [NW_WIDTH-1:0]      wid;
         logic [DXA_SMEM_ADDR_W-1:0]      smem_addr;   // from lane 0 rs1; LMEM byte address
-        logic [31:0]                     meta;        // from lane 1 rs1 (desc[3:0], bar[30:4], 1[31]); 32-bit ABI word
+        logic [31:0]                     meta;        // from lane 1 rs1 (desc[3:0], barrier or mbarrier offset[29:4], mode[30], 1[31]); 32-bit ABI word
         logic [4:0][31:0]                coords;      // [0]=lane2.rs1,[1]=lane3.rs1,[2]=lane0.rs2,[3]=lane1.rs2,[4]=lane2.rs2; element indices, 32-bit ABI
         logic [`VX_CFG_NUM_WARPS-1:0]    cta_mask;     // from rs2 lane 3
+    `ifdef DXA_MBAR_ENABLE
+        logic [NW_WIDTH-1:0]             slot;         // the issuing warp's CTA slot
+        logic [DXA_CTA_GEN_W-1:0]        gen;          // and its generation
+    `endif
     } dxa_req_data_t;
+
+`ifdef DXA_MBAR_ENABLE
+    // Completion of the transfer in flight: meta[30] selects an mbarrier, and
+    // meta[29:4] is then the mbarrier's local-memory word offset.
+    typedef struct packed {
+        logic                      mode;
+        logic [DXA_MBAR_OFF_W-1:0] mbar_off;
+        logic [DXA_TX_BYTES_W-1:0] tx_bytes;
+        logic [NW_WIDTH-1:0]       slot;
+        logic [DXA_CTA_GEN_W-1:0]  gen;
+    } dxa_compl_t;
+`endif
 
     // Descriptor table read output — all fields for one slot.
     typedef struct packed {

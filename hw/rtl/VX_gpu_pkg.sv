@@ -1546,7 +1546,30 @@ package VX_gpu_pkg;
     } lsu_rsp_data_t;
 
     // DXA lmem tag and attr widths for DMA arb.
+`ifdef DXA_MBAR_ENABLE
+    // Generation of a CTA slot, bumped at each admission into it.
+    localparam DXA_CTA_GEN_W      = 4;
+    // An mbarrier is a doubleword of the local memory.
+    localparam DXA_MBAR_OFF_W     = `VX_CFG_LMEM_LOG_SIZE - 3;
+    // A box fits the local memory, so its byte count never exceeds the local memory size.
+    localparam DXA_TX_BYTES_W     = `VX_CFG_LMEM_LOG_SIZE + 1;
+    localparam DXA_ATTR_PAYLOAD_W = `MAX(BAR_ADDR_W, DXA_MBAR_OFF_W);
+
+    // Every beat carries its issuer's slot for the retired-slot check; the
+    // completion fields matter on the last beat only. `last` stays the MSB.
+    typedef struct packed {
+        logic                          last;
+        logic                          mode;     // 1: complete_tx on an mbarrier
+        logic [DXA_ATTR_PAYLOAD_W-1:0] payload;  // barrier address, or mbarrier word offset
+        logic [DXA_TX_BYTES_W-1:0]     tx_bytes;
+        logic [NW_WIDTH-1:0]           slot;
+        logic [DXA_CTA_GEN_W-1:0]      gen;
+    } dxa_lmem_attr_t;
+
+    localparam DXA_LMEM_ATTR_W = $bits(dxa_lmem_attr_t);
+`else
     localparam DXA_LMEM_ATTR_W = (BAR_ADDR_W + 1);
+`endif
     localparam DXA_LMEM_ENGINE_TAG_W = UUID_WIDTH + 1;
     localparam DXA_LMEM_TAG_W = DXA_LMEM_ENGINE_TAG_W + NC_BITS;
     localparam DXA_LMEM_OUT_TAG_W = DXA_LMEM_TAG_W + `ARB_SEL_BITS(`VX_CFG_NUM_DXA_CORES, 1);

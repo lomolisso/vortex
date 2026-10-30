@@ -65,6 +65,11 @@ module VX_execute import VX_gpu_pkg::*; #(
     VX_dxa_req_bus_if.master dxa_req_bus_if,
     VX_txbar_bus_if.slave  dxa_txbar_bus_if,
 `endif
+`ifdef DXA_MBAR_ENABLE
+    // each warp's CTA slot and the slots' generations, recorded by a DXA issue
+    input wire [`VX_CFG_NUM_WARPS-1:0][NW_WIDTH-1:0] cta_warp_slot,
+    input wire [`VX_CFG_NUM_WARPS-1:0][DXA_CTA_GEN_W-1:0] cta_slot_gen,
+`endif
 
 `ifdef VX_CFG_EXT_TEX_ENABLE
     VX_tex_bus_if.master    tex_bus_if,
@@ -185,6 +190,10 @@ module VX_execute import VX_gpu_pkg::*; #(
     `ifdef VX_CFG_EXT_DXA_ENABLE
         .dxa_req_bus_if (dxa_req_bus_if),
         .dxa_txbar_bus_if(dxa_txbar_bus_if),
+    `endif
+    `ifdef DXA_MBAR_ENABLE
+        .cta_warp_slot  (cta_warp_slot),
+        .cta_slot_gen   (cta_slot_gen),
     `endif
     `ifdef VX_CFG_EXT_TEX_ENABLE
         .tex_bus_if     (tex_bus_if),

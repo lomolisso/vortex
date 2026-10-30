@@ -133,6 +133,13 @@
 `endif
 `endif
 
+// DXA transfers that complete on an mbarrier transaction count.
+`ifdef VX_CFG_EXT_DXA_ENABLE
+`ifdef VX_CFG_EXT_MBAR_ENABLE
+    `define DXA_MBAR_ENABLE
+`endif
+`endif
+
 // Integer mul/div via DPI: simulation only (not synthesis) with DPI enabled.
 // Internal derived macros — not VX_CFG_* knobs.
 `ifndef SYNTHESIS

@@ -60,6 +60,12 @@ module VX_scheduler import VX_gpu_pkg::*; #(
     input wire              mbar_unlock_valid,
     input wire [`VX_CFG_NUM_WARPS-1:0] mbar_unlock_mask,
 `endif
+`ifdef DXA_MBAR_ENABLE
+    // CTA slot state, for the DXA's retired-slot checks
+    output wire [`VX_CFG_NUM_WARPS-1:0] cta_slot_valid,
+    output wire [`VX_CFG_NUM_WARPS-1:0][DXA_CTA_GEN_W-1:0] cta_slot_gen,
+    output wire [`VX_CFG_NUM_WARPS-1:0][NW_WIDTH-1:0] cta_warp_slot,
+`endif
 
     // status
     output wire             busy
@@ -148,6 +154,11 @@ module VX_scheduler import VX_gpu_pkg::*; #(
         .cbar_wr_valid  (cbar_wr_valid),
         .cbar_wr_slot   (cbar_wr_slot),
         .cbar_wr_info   (cbar_wr_info),
+    `endif
+    `ifdef DXA_MBAR_ENABLE
+        .slot_valid     (cta_slot_valid),
+        .slot_gen       (cta_slot_gen),
+        .warp_slot      (cta_warp_slot),
     `endif
         .busy       (cta_dispatcher_busy)
     );

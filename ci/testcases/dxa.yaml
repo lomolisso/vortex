@@ -9,7 +9,9 @@ defaults:
   touches: [hw/rtl/dxa, sim/simx/dxa]
 tests:
 - id: dxa_copy-1
-  touches: &copy_touches [hw/rtl/dxa, sim/simx/dxa, tests/regression/dxa_copy]
+  touches: &copy_touches [hw/rtl/dxa, sim/simx/dxa, tests/regression/dxa_copy,
+            sim/simx/mem/local_mem, sim/simx/socket.cpp, sim/simx/types.h, sim/simx/barrier_unit,
+            sim/simx/core.cpp, hw/rtl/core/VX_mem_unit.sv]
   via: blackbox
   drivers:
   - simx
@@ -117,7 +119,8 @@ tests:
             hw/rtl/core/VX_alu_int.sv, hw/rtl/core/VX_alu_unit.sv, hw/rtl/core/VX_sfu_unit.sv,
             hw/rtl/core/VX_lane_dispatch.sv, hw/rtl/core/VX_opc_unit.sv,
             sim/simx/alu_unit, sim/simx/dispatcher, sw/kernel/include/vx_dxa.h,
-            sw/kernel/include/vx_intrinsics.h]
+            sw/kernel/include/vx_intrinsics.h, sim/simx/mem/local_mem, sim/simx/socket.cpp,
+            sim/simx/types.h, sim/simx/barrier_unit, sim/simx/core.cpp, hw/rtl/core/VX_mem_unit.sv]
   via: blackbox
   drivers:
   - simx
@@ -219,6 +222,63 @@ tests:
   app: dxa_copy
   configs: -DVX_CFG_EXT_DXA_ENABLE -DVX_CFG_NUM_ALU_LANES=2 -DVX_CFG_NUM_SFU_LANES=2
   args: -e -d3
+# Landed-data checks at XLEN 32: -o ends the descriptor half a tile early
+# along an outer dimension, so the last tiles are partly out of bounds and
+# must read back the descriptor's fill byte for byte; -c puts canary words
+# right after the tile in local memory, which the copy must leave alone.
+- id: dxa_copy-oob-d2
+  touches: &copy_check_touches [hw/rtl/dxa, sim/simx/dxa, tests/regression/dxa_copy,
+            sw/kernel/include/vx_dxa.h, sw/runtime/include/dxa.h, sim/simx/mem/local_mem,
+            sim/simx/socket.cpp, sim/simx/types.h, sim/simx/barrier_unit, sim/simx/core.cpp,
+            hw/rtl/core/VX_mem_unit.sv]
+  via: blackbox
+  xlen: [32]
+  drivers:
+  - simx
+  - rtlsim
+  app: dxa_copy
+  configs: -DVX_CFG_EXT_DXA_ENABLE
+  args: -o -d2
+- id: dxa_copy-oob-d3
+  touches: *copy_check_touches
+  via: blackbox
+  xlen: [32]
+  drivers:
+  - simx
+  - rtlsim
+  app: dxa_copy
+  configs: -DVX_CFG_EXT_DXA_ENABLE
+  args: -o -d3
+- id: dxa_copy-oob-d5
+  touches: *copy_check_touches
+  via: blackbox
+  xlen: [32]
+  drivers:
+  - simx
+  - rtlsim
+  app: dxa_copy
+  configs: -DVX_CFG_EXT_DXA_ENABLE
+  args: -o -d5
+- id: dxa_copy-canary-d1
+  touches: *copy_check_touches
+  via: blackbox
+  xlen: [32]
+  drivers:
+  - simx
+  - rtlsim
+  app: dxa_copy
+  configs: -DVX_CFG_EXT_DXA_ENABLE
+  args: -c -d1
+- id: dxa_copy-canary-oob-d4
+  touches: *copy_check_touches
+  via: blackbox
+  xlen: [32]
+  drivers:
+  - simx
+  - rtlsim
+  app: dxa_copy
+  configs: -DVX_CFG_EXT_DXA_ENABLE
+  args: -c -o -d4
 - id: dxa_copy_mcast-1
   via: blackbox
   drivers:
@@ -644,11 +704,13 @@ tests:
     threads: [4, 16]
 - id: model_parity-wgmma-dxa
   check: model_parity
-  # Instructions match exactly; cycles diverge ~6% (RTL faster). The gap is
+  # Instructions match exactly; cycles diverge ~20%, SimX faster (measured
+  # 2026-10-30: simx 32680 vs rtlsim 41397 cycles, 21.1%, at bbc7df045; simx
+  # 32998, 20.3%, once the DXA completion follows the bank commit). The gap is
   # insensitive to every issue/commit/execution-window mechanism the SimX
   # timing model carries, which points at the DXA producer path's own
   # timing. Tracked with its wgmma siblings as DXA-path follow-up.
-  known_issue: "SimX over-serializes the DXA-fed warp-group pipeline (instrs match; cycles ~6%)"
+  known_issue: "SimX under-models the DXA-fed warp-group pipeline (instrs match; cycles ~20%, SimX faster)"
   via: blackbox
   app: sgemm_tcu_wg_dxa
   args: -m 128 -n 128 -k 64

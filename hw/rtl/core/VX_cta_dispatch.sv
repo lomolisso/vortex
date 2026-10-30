@@ -70,6 +70,14 @@ module VX_cta_dispatch import VX_gpu_pkg::*; #(
     output cbar_slot_t              cbar_wr_info,
 `endif
 
+`ifdef DXA_MBAR_ENABLE
+    // Slot occupancy and generation, and each warp's slot, for the DXA's
+    // retired-slot checks.
+    output wire [`VX_CFG_NUM_WARPS-1:0] slot_valid,
+    output wire [`VX_CFG_NUM_WARPS-1:0][DXA_CTA_GEN_W-1:0] slot_gen,
+    output wire [`VX_CFG_NUM_WARPS-1:0][NW_WIDTH-1:0] warp_slot,
+`endif
+
     output wire                     busy
 );
     `UNUSED_SPARAM (INSTANCE_ID)
@@ -806,6 +814,23 @@ module VX_cta_dispatch import VX_gpu_pkg::*; #(
     `RUNTIME_ASSERT (~(admit_fire && is_pinned) || (32'(kmu_req.args.compute.dlmem.row.k) < (1 << CK_W)),
         ("%t: %s cluster of %0d blocks does not fit the slot record's count", $time, INSTANCE_ID,
          kmu_req.args.compute.dlmem.row.k))
+`endif
+
+`ifdef DXA_MBAR_ENABLE
+    // A generation per slot, bumped at each admission: a transfer that names
+    // its issuer's generation can tell a re-admitted slot from its own.
+    reg [NUM_CTA_SLOTS-1:0][DXA_CTA_GEN_W-1:0] slot_gen_r;
+    always @(posedge clk) begin
+        if (reset) begin
+            slot_gen_r <= '0;
+        end else if (kmu_bus_if_fire && (state == IDLE)) begin
+            slot_gen_r[base_slot] <= slot_gen_r[base_slot] + DXA_CTA_GEN_W'(1);
+        end
+    end
+
+    assign slot_valid = slot_valid_r;
+    assign slot_gen   = slot_gen_r;
+    assign warp_slot  = cta_slot_per_warp_r;
 `endif
 
     // -------------------------------------------------------------------------

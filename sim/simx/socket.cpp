@@ -19,8 +19,11 @@
 #include "types.h"
 #ifdef VX_CFG_EXT_DXA_ENABLE
 #include "dxa_core.h"
+#include "dxa_compl.h"
 #include "local_mem.h"
 #include "sfu_unit.h"
+#else
+#line 24
 #endif
 #ifdef VX_CFG_EXT_TEX_ENABLE
 #include "tex_core.h"
@@ -395,25 +398,19 @@ public:
       sfu->dxa_req_out.bind(&dxa_core_->dxa_req_in.at(c));
     }
 
-    // DxaCore::lmem_req_out[c] → core's LocalMem.Inputs[port_dxa].
-    // A tx_callback on the channel fires barrier_event_release for each
-    // DXA-write packet carrying notify_done at the cycle LMEM receives it.
+    // DxaCore::lmem_req_out[c] → core's LocalMem.Inputs[port_dxa]. The
+    // core's DXA completion unit sees each write commit at its bank.
     uint32_t port_dxa = Core::LMEM_DXA_PORT;
     for (uint32_t c = 0; c < cores_per_socket; ++c) {
       Core* core = cores_.at(c).get();
       for (uint32_t p = 0; p < DxaCore::LMEM_PORTS_PER_CORE; ++p) {
         auto& ch = dxa_core_->lmem_req_out.at(c * DxaCore::LMEM_PORTS_PER_CORE + p);
         ch.bind(&core->local_mem()->Inputs.at(port_dxa + p));
-        ch.tx_callback([core](const MemReq& req, uint64_t /*cycles*/) {
-          if (req.is_write() && req.flags.dxa_notify_done) {
-            // notify_bar_id arrives in raw (encoded) form: low byte = cta_no,
-            // bits[30:8] = bar_no. Decode to flat barrier index before release.
-            uint32_t decoded = bar_decode_id(req.flags.dxa_notify_bar_id, VX_CFG_NUM_BARRIERS);
-            core->barrier_event_release(decoded);
-          }
-        });
       }
+      dxa_core_->compl_release_out.at(c).bind(&core->dxa_compl()->ReleaseIn);
     }
+#else
+#line 417
 #endif
   }
 

@@ -29,6 +29,11 @@ CtaDispatcher::CtaDispatcher(const SimContext& ctx, const char* name, Core* core
 #ifdef VX_CFG_EXT_DLMEM_ENABLE
   , PeerWrOut(this)
 #endif
+#ifdef DXA_MBAR_ENABLE
+  , DxaSlotOut(2, SimChannel<CtaSlotEvt>(this, 4 * VX_CFG_NUM_WARPS + 8))
+#else
+#line 31
+#endif
   , core_(core)
   , num_threads_(VX_CFG_NUM_THREADS)
   , num_warps_(VX_CFG_NUM_WARPS)
@@ -63,6 +68,11 @@ CtaDispatcher::CtaDispatcher(const SimContext& ctx, const char* name, Core* core
   , cbar_wr_valid_(false)
   , cbar_wr_slot_(0)
 #endif
+#ifdef DXA_MBAR_ENABLE
+  , dxa_gen_(VX_CFG_NUM_WARPS, 0)
+#else
+#line 65
+#endif
 {
   thread_idx_[0] = thread_idx_[1] = thread_idx_[2] = 0;
   for (auto& lanes : warp_init_lanes_) {
@@ -93,6 +103,11 @@ void CtaDispatcher::on_reset() {
   }
   legacy_base_ = 0;
   cbar_wr_valid_ = false;
+#endif
+#ifdef DXA_MBAR_ENABLE
+  std::fill(dxa_gen_.begin(), dxa_gen_.end(), 0);
+#else
+#line 96
 #endif
   // warp_init_lanes_ and cur_ctx_id_ are excluded: which lanes of a slot have
   // already run the startup is keyed on the context, and a launch is not a
@@ -172,6 +187,11 @@ bool CtaDispatcher::step(const WarpMask& active_warps, uint32_t* wid_out, cta_wa
         inited.set(t);
       }
       wid_to_slot_[free_wid] = cur_slot_;
+#ifdef DXA_MBAR_ENABLE
+      this->dxa_slot_evt({CtaSlotEvt::WARP, cur_slot_, 0, 0, uint32_t(free_wid)}, 1, false);
+#else
+#line 174
+#endif
       dispatched_.set(free_wid);
       fire_wid_  = uint32_t(free_wid);
       fire_last_ = (rank_ >= cta_size_);
@@ -309,6 +329,12 @@ void CtaDispatcher::admit(uint64_t now) {
 #else
   tail_slot_ = (base + 1) % max_slots;
 #endif
+#ifdef DXA_MBAR_ENABLE
+  dxa_gen_[base] = (dxa_gen_[base] + 1) & ((1u << DXA_CTA_GEN_BITS) - 1);
+  this->dxa_slot_evt({CtaSlotEvt::ADMIT, base, dxa_gen_[base], stride, 0}, 1, true);
+#else
+#line 311
+#endif
 
   dispatched_.reset();
   has_cta_ = true;
@@ -334,6 +360,14 @@ void CtaDispatcher::warp_done(uint32_t wid) {
   if (--slot_rem_warps_[slot] == 0) {
     slot_free_at_[slot] = now + RETIRE_DELAY;
   }
+#ifdef DXA_MBAR_ENABLE
+  if (slot_rem_warps_[slot] == 0) {
+    // The slot is free once its warp count is written back.
+    this->dxa_slot_evt({CtaSlotEvt::FREE, slot, 0, 0, 0}, RETIRE_DELAY + (evt_[slot] ? 1 : 0), true);
+  }
+#else
+#line 336
+#endif
 #ifdef VX_CFG_EXT_DLMEM_ENABLE
   if (slot_rem_warps_[slot] != 0 || !evt_[slot]) {
     return std::nullopt;
@@ -427,3 +461,12 @@ void CtaDispatcher::next_warp(bool do_init, cta_warp_record_t* out) {
 
   ++rank_;
 }
+
+#ifdef DXA_MBAR_ENABLE
+void CtaDispatcher::dxa_slot_evt(const CtaSlotEvt& e, uint64_t delay, bool to_compl) {
+  if (to_compl) {
+    DxaSlotOut.at(0).send(e, delay);
+  }
+  DxaSlotOut.at(1).send(e, delay);
+}
+#endif

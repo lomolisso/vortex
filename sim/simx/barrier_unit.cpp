@@ -23,6 +23,11 @@ using namespace vortex;
 
 BarrierUnit::BarrierUnit(const SimContext& ctx, const char* name, Core* core, Scheduler* scheduler)
   : SimObject<BarrierUnit>(ctx, name)
+#ifdef VX_CFG_EXT_DXA_ENABLE
+  , TxbarIn(this)
+#else
+#line 25
+#endif
   , gbar_send_next_(0)
   , core_(core)
   , scheduler_(scheduler)
@@ -35,6 +40,11 @@ BarrierUnit::BarrierUnit(const SimContext& ctx, const char* name, Core* core, Sc
   cwait_.resize(VX_CFG_NUM_WARPS);
   cpend_.resize(VX_CFG_NUM_WARPS);
   cphase_.resize(VX_CFG_NUM_WARPS);
+#endif
+#ifdef VX_CFG_EXT_DXA_ENABLE
+  TxbarIn.bind(this, &BarrierUnit::on_txbar);
+#else
+#line 38
 #endif
 }
 
@@ -373,3 +383,9 @@ void BarrierUnit::event_release(uint32_t bar_id) {
     }
   }
 }
+
+#ifdef VX_CFG_EXT_DXA_ENABLE
+void BarrierUnit::on_txbar(const uint32_t& bar_id) {
+  this->event_release(bar_id);
+}
+#endif

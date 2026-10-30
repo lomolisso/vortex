@@ -43,3 +43,46 @@ __kernel void kernel_main(kernel_arg_t* __UNIFORM__ arg) {
   }
   __syncthreads();
 }
+
+#ifdef VX_CFG_EXT_MBAR_ENABLE
+#include <vx_mbar.h>
+
+// -m: the same two copies, completed on one mbarrier that expects both boxes.
+__kernel void kmajor_mbar(mbar_arg_t* __UNIFORM__ marg) {
+  const kernel_arg_t* arg = &marg->base;
+  const uint32_t tid     = threadIdx.x;
+  const uint32_t cta_id  = blockIdx.x;
+  const uint32_t grid_n  = arg->N / arg->tileN;
+  const uint32_t cta_row = cta_id / grid_n;
+  const uint32_t cta_col = cta_id % grid_n;
+
+  auto A_smem = reinterpret_cast<uint8_t*>(__local_mem());
+  auto B_smem = A_smem + arg->a_bytes;
+  auto mbar   = reinterpret_cast<uint64_t*>(A_smem + ((arg->cta_bytes + 7) & ~7u));
+
+  if (tid == 0) {
+    vx_mbar_init(mbar, 1);
+  }
+  __syncthreads();
+  if (get_sub_group_id() == 0) {
+    if (tid == 0) {
+      vx_mbar_arrive_tx(mbar, arg->a_bytes + arg->b_bytes);
+    }
+    vx_dxa_issue_2d_mbar(kDescA, mbar, A_smem, 0, cta_row * arg->tileM);
+    vx_dxa_issue_2d_mbar(kDescB, mbar, B_smem, cta_col * arg->tileN, 0);
+  }
+  uint32_t err = 0;
+  for (uint32_t n = 1; !vx_mbar_try_wait_parity(mbar, 0); ++n) {
+    if (n >= WAIT_LIMIT) {
+      err = 1;
+      break;
+    }
+  }
+
+  auto pDst = reinterpret_cast<uint8_t*>(arg->dst_addr) + cta_id * arg->cta_bytes;
+  for (uint32_t i = tid; i < arg->cta_bytes; i += blockDim.x) {
+    pDst[i] = A_smem[i];
+  }
+  reinterpret_cast<uint32_t*>(marg->err_addr)[cta_id * blockDim.x + tid] = err;
+}
+#endif

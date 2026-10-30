@@ -22,6 +22,10 @@ module VX_dxa_unit import VX_gpu_pkg::*, VX_dxa_pkg::*; #(
 
     VX_execute_if.slave     execute_if,
     VX_result_if.master     result_if,
+`ifdef DXA_MBAR_ENABLE
+    input wire [`VX_CFG_NUM_WARPS-1:0][NW_WIDTH-1:0] cta_warp_slot,
+    input wire [`VX_CFG_NUM_WARPS-1:0][DXA_CTA_GEN_W-1:0] cta_slot_gen,
+`endif
     VX_dxa_req_bus_if.master dxa_req_bus_if
 );
     `UNUSED_SPARAM (INSTANCE_ID)
@@ -120,6 +124,12 @@ module VX_dxa_unit import VX_gpu_pkg::*, VX_dxa_pkg::*; #(
     assign dxa_req_data_in.coords[3] = lane1_rs2[31:0];
     assign dxa_req_data_in.coords[4] = lane2_rs2[31:0];
     assign dxa_req_data_in.cta_mask  = lane3_rs2[`VX_CFG_NUM_WARPS-1:0];
+`ifdef DXA_MBAR_ENABLE
+    // The issuer's slot and generation, checked wherever the transfer writes.
+    wire [NW_WIDTH-1:0] issue_slot = cta_warp_slot[execute_if.data.header.wid];
+    assign dxa_req_data_in.slot      = issue_slot;
+    assign dxa_req_data_in.gen       = cta_slot_gen[issue_slot];
+`endif
     // smem_addr (LMEM byte width) and meta/coords (32-bit ABI) take low bits;
     // high bits unused when XLEN exceeds the field width
     `UNUSED_VAR (lmem_rel_byte_addr)
@@ -138,6 +148,12 @@ module VX_dxa_unit import VX_gpu_pkg::*, VX_dxa_pkg::*; #(
     wire fire   = execute_if.valid && accept;
 
     assign execute_if.ready = accept;
+
+`ifdef DXA_MBAR_ENABLE
+    `RUNTIME_ASSERT(~(fire && is_send && dxa_req_data_in.meta[30] && ($countones(dxa_req_data_in.cta_mask) > 1)),
+        ("%t: *** %s DXA multicast with an mbarrier is not supported: wid=%0d cta_mask=0x%0h",
+         $time, INSTANCE_ID, execute_if.data.header.wid, dxa_req_data_in.cta_mask))
+`endif
 
     VX_elastic_buffer #(
         .DATAW   ($bits(dxa_req_data_t)),

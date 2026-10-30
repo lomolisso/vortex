@@ -73,6 +73,13 @@ public:
   // The admitted block's peer row, for the core's aperture translation table.
   SimChannel<dlmem_ref::RowWrite> PeerWrOut;
 #endif
+#ifdef DXA_MBAR_ENABLE
+  // Slot admissions and frees, and the warps' slots: [0] to the core's DXA
+  // completion unit, [1] to the SFU that issues the DXA requests.
+  std::vector<SimChannel<CtaSlotEvt>> DxaSlotOut;
+#else
+#line 75
+#endif
 
   CtaDispatcher(const SimContext& ctx, const char* name, Core* core);
   ~CtaDispatcher();
@@ -189,6 +196,12 @@ private:
   bool     cbar_wr_valid_;
   uint32_t cbar_wr_slot_;
   CbarSlot cbar_wr_info_;
+#endif
+#ifdef DXA_MBAR_ENABLE
+  std::vector<uint32_t> dxa_gen_;   // per slot, bumped at each admission
+  void dxa_slot_evt(const CtaSlotEvt& e, uint64_t delay, bool to_compl);
+#else
+#line 192
 #endif
 
   // Cluster co-residency: the first CTA of a cluster reserves K consecutive
