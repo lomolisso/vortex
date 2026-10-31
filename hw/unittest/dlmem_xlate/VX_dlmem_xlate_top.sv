@@ -57,6 +57,16 @@ module VX_dlmem_xlate_top import VX_gpu_pkg::*; #(
     output wire [NW-1:0][LMEM_LOG-1:0]          tbl_slot_base,
     output wire [LMEM_LOG:0]                    tbl_stride,
 
+`ifdef DXA_MBAR_ENABLE
+    // The table's DXA read port.
+    input  wire [NW_WIDTH-1:0]                  dxa_rd_slot,
+    output wire [K_W-1:0]                       dxa_rd_k,
+    output wire [MAXC-1:0][CORE_W-1:0]          dxa_rd_core,
+    output wire [MAXC-1:0][NW_WIDTH-1:0]        dxa_rd_pslot,
+    output wire [NW-1:0][LMEM_LOG-1:0]          dxa_slot_base,
+    output wire [LMEM_LOG:0]                    dxa_stride,
+`endif
+
     // Requests from the LSU, per block.
     input  wire [NB-1:0]                        in_valid,
     input  wire [NB-1:0]                        in_rw,
@@ -175,6 +185,10 @@ module VX_dlmem_xlate_top import VX_gpu_pkg::*; #(
         assign wr_row.peers[r].slot = wr_pslot[r];
     end
 
+`ifdef DXA_MBAR_ENABLE
+    dlmem_row_t dxa_rd_row;
+`endif
+
     VX_lsu_sched_if in_if  [NB]();
     VX_lsu_sched_if out_if [NB]();
 
@@ -242,8 +256,22 @@ module VX_dlmem_xlate_top import VX_gpu_pkg::*; #(
         .lacc_inc_valid (lacc_inc_valid),
         .lacc_inc_wid   (lacc_inc_wid),
         .lacc_inc_cnt   (lacc_inc_cnt),
+    `ifdef DXA_MBAR_ENABLE
+        .dxa_rd_slot    (dxa_rd_slot),
+        .dxa_rd_row     (dxa_rd_row),
+        .dxa_slot_base  (dxa_slot_base),
+        .dxa_stride     (dxa_stride),
+    `endif
         .empty          (empty)
     );
+
+`ifdef DXA_MBAR_ENABLE
+    assign dxa_rd_k = dxa_rd_row.k;
+    for (genvar r = 0; r < MAXC; ++r) begin : g_dxa_rd_row
+        assign dxa_rd_core[r]  = dxa_rd_row.peers[r].core;
+        assign dxa_rd_pslot[r] = dxa_rd_row.peers[r].slot;
+    end
+`endif
 
     // Internal table state and row selects, observed by the testbench only.
 `ifdef SYNTHESIS

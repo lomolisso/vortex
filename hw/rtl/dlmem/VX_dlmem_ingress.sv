@@ -18,6 +18,10 @@
 // which reserves its response, so the local-memory response port never stalls
 // on the network; responses leave in local-memory completion order. A store's
 // response is its acknowledgement, sent once the bank has committed it.
+// With DXA mbarriers, a remote copy's posted row flits arrive in order: a data
+// word goes straight to the local memory's DMA port, which commits it as it
+// accepts it, so the copy's completion, a complete_tx taken in a slot after
+// it, reaches its bank later; neither sends a response.
 module VX_dlmem_ingress import VX_gpu_pkg::*, VX_dlmem_pkg::*; #(
     parameter `STRING INSTANCE_ID = "",
     parameter NUM_SLOTS = DLMEM_INGRESS_SLOTS,
@@ -29,6 +33,12 @@ module VX_dlmem_ingress import VX_gpu_pkg::*, VX_dlmem_pkg::*; #(
     VX_dlmem_bus_if.slave   req_in_if,
     VX_mem_bus_if.master    lmem_bus_if,
     VX_dlmem_bus_if.master  rsp_out_if,
+
+`ifdef DXA_MBAR_ENABLE
+    // The core's occupied CTA slots, and its local memory's DMA port.
+    input wire [`VX_CFG_NUM_WARPS-1:0] slot_valid,
+    VX_mem_bus_if.master    dma_out_if,
+`endif
 
     output wire             empty
 );
@@ -64,20 +74,67 @@ module VX_dlmem_ingress import VX_gpu_pkg::*, VX_dlmem_pkg::*; #(
     dlmem_req_pkt_t req_pkt;
     assign req_pkt = dlmem_req_pkt_t'(req_in_if.data);
 
+`ifdef DXA_MBAR_ENABLE
+    wire is_row   = (req_pkt.op == DLMEM_OP_DXA);
+    wire is_data  = is_row && ~req_pkt.amo_unsigned;
+    wire is_compl = is_row && req_pkt.amo_unsigned;
+
+    wire lmem_req_valid = req_in_if.valid && ~is_data && free_valid;
+    wire lmem_req_ready;
+    wire req_fire = lmem_req_valid && lmem_req_ready;
+
+    assign req_in_if.ready = is_data ? dma_out_if.req_ready : (free_valid && lmem_req_ready);
+    `UNUSED_VAR (req_in_if.dst)
+
+    // A data word is one bank's lane of a DMA beat.
+    localparam NUM_BANKS = `VX_CFG_LMEM_NUM_BANKS;
+    localparam BANK_BITS = `CLOG2(NUM_BANKS);
+    wire [`UP(BANK_BITS)-1:0] row_bank;
+    if (BANK_BITS != 0) begin : g_row_bank
+        assign row_bank = req_pkt.addr[BANK_BITS-1:0];
+    end else begin : g_row_bank0
+        assign row_bank = '0;
+    end
+
+    dxa_lmem_attr_t row_attr;
+    always @(*) begin
+        row_attr        = '0;
+        row_attr.slot   = NW_WIDTH'(req_pkt.tag);
+        row_attr.remote = 1'b1;
+    end
+
+    assign dma_out_if.req_valid       = req_in_if.valid && is_data;
+    assign dma_out_if.req_data.rw     = 1'b1;
+    assign dma_out_if.req_data.addr   = $bits(dma_out_if.req_data.addr)'(req_pkt.addr >> BANK_BITS);
+    assign dma_out_if.req_data.data   = {NUM_BANKS{req_pkt.data}};
+    assign dma_out_if.req_data.byteen = $bits(dma_out_if.req_data.byteen)'(req_pkt.byteen) << (32'(row_bank) * LSU_WORD_SIZE);
+    assign dma_out_if.req_data.attr   = $bits(dma_out_if.req_data.attr)'(row_attr);
+    assign dma_out_if.req_data.tag    = '0;
+    assign dma_out_if.rsp_ready       = 1'b1;
+    `UNUSED_VAR (dma_out_if.rsp_valid)
+    `UNUSED_VAR (dma_out_if.rsp_data)
+`else
     wire lmem_req_valid = req_in_if.valid && free_valid;
     wire lmem_req_ready;
     wire req_fire = lmem_req_valid && lmem_req_ready;
 
     assign req_in_if.ready = free_valid && lmem_req_ready;
     `UNUSED_VAR (req_in_if.dst)
+`endif
 
     mem_bus_attr_t lmem_attr;
     always @(*) begin
         lmem_attr                  = '0;
         lmem_attr.is_addr_local    = 1'b1;
+    `ifdef DXA_MBAR_ENABLE
+        lmem_attr.amo.amo_valid    = (req_pkt.op == DLMEM_OP_AMO) || is_compl;
+        lmem_attr.amo.amo_op       = req_pkt.amo_op;
+        lmem_attr.amo.amo_unsigned = req_pkt.amo_unsigned && ~is_compl;
+    `else
         lmem_attr.amo.amo_valid    = (req_pkt.op == DLMEM_OP_AMO);
         lmem_attr.amo.amo_op       = req_pkt.amo_op;
         lmem_attr.amo.amo_unsigned = req_pkt.amo_unsigned;
+    `endif
         lmem_attr.amo.hart_id      = req_pkt.hart_id;
     `ifdef VX_CFG_EXT_ZACAS_ENABLE
         lmem_attr.amo.amo_cmp      = req_pkt.amo_cmp;
@@ -119,7 +176,14 @@ module VX_dlmem_ingress import VX_gpu_pkg::*, VX_dlmem_pkg::*; #(
     wire [SLOT_W-1:0] head_slot;
     wire              cpl_empty, cpl_full;
     wire              rsp_buf_ready;
+`ifdef DXA_MBAR_ENABLE
+    // A completion's slot frees in turn without a response.
+    reg [NUM_SLOTS-1:0] posted_r;
+    wire              rsp_send = ~cpl_empty && ~posted_r[head_slot];
+    wire              rsp_fire = ~cpl_empty && (posted_r[head_slot] || rsp_buf_ready);
+`else
     wire              rsp_fire = ~cpl_empty && rsp_buf_ready;
+`endif
 
     VX_fifo_queue #(
         .DATAW (SLOT_W),
@@ -155,6 +219,9 @@ module VX_dlmem_ingress import VX_gpu_pkg::*, VX_dlmem_pkg::*; #(
                 done_r[s] <= 1'b0;
             end
             if (alloc_s) begin
+            `ifdef DXA_MBAR_ENABLE
+                posted_r[s] <= is_compl;
+            `endif
                 ack_r[s] <= (req_pkt.op == DLMEM_OP_ST);
                 src_r[s] <= req_pkt.src;
                 tag_r[s] <= req_pkt.tag;
@@ -182,7 +249,11 @@ module VX_dlmem_ingress import VX_gpu_pkg::*, VX_dlmem_pkg::*; #(
     ) rsp_buf (
         .clk       (clk),
         .reset     (reset),
+    `ifdef DXA_MBAR_ENABLE
+        .valid_in  (rsp_send),
+    `else
         .valid_in  (~cpl_empty),
+    `endif
         .ready_in  (rsp_buf_ready),
         .data_in   ({src_r[head_slot], rsp_pkt}),
         .data_out  ({rsp_out_if.dst, rsp_out_if.data}),
@@ -198,7 +269,28 @@ module VX_dlmem_ingress import VX_gpu_pkg::*, VX_dlmem_pkg::*; #(
         ("%t: *** %s completion queue overflow", $time, INSTANCE_ID))
     `RUNTIME_ASSERT (~(rsp_fire && ~done_r[head_slot]),
         ("%t: *** %s response for an incomplete slot: slot=%0d", $time, INSTANCE_ID, head_slot))
+`ifdef DXA_MBAR_ENABLE
+    wire row_fire = req_in_if.valid && req_in_if.ready && is_row;
+    wire [NW_WIDTH-1:0] row_slot = NW_WIDTH'(req_pkt.tag);
+    `RUNTIME_ASSERT (~(row_fire && ~slot_valid[row_slot]),
+        ("%t: *** %s DXA write into a retired CTA slot: slot=%0d %s from core %0d, addr=0x%0h",
+         $time, INSTANCE_ID, row_slot, (is_compl ? "completion" : "data"), req_pkt.src, req_pkt.addr))
+
+`ifdef DBG_TRACE_DXA
+    always @(posedge clk) begin
+        if (~reset && row_fire && is_data) begin
+            $write("DXA_TL,%0d,ROW_DATA_IN,%s,src=%0d,addr=0x%0h,byteen=0x%0h,slot=%0d\n",
+                $time, INSTANCE_ID, req_pkt.src, req_pkt.addr, req_pkt.byteen, row_slot);
+        end
+        if (~reset && row_fire && is_compl) begin
+            $write("DXA_TL,%0d,ROW_COMPL_IN,%s,src=%0d,off=0x%0h,bytes=%0d,slot=%0d\n",
+                $time, INSTANCE_ID, req_pkt.src, req_pkt.addr, req_pkt.data, row_slot);
+        end
+    end
+`endif
+`else
     `RUNTIME_ASSERT (~(req_in_if.valid && (req_pkt.op == 2'd3)),
         ("%t: *** %s invalid request opcode", $time, INSTANCE_ID))
+`endif
 
 endmodule

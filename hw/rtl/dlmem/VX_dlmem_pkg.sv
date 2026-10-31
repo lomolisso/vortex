@@ -51,6 +51,12 @@ package VX_dlmem_pkg;
     localparam [1:0] DLMEM_OP_LD  = 2'd0;
     localparam [1:0] DLMEM_OP_ST  = 2'd1;
     localparam [1:0] DLMEM_OP_AMO = 2'd2;
+`ifdef DXA_MBAR_ENABLE
+    // A posted row flit of a remote DXA copy: amo_unsigned 0 is a word of
+    // data, 1 the copy's completion (a complete_tx on addr, data = box bytes).
+    // tag carries the destination CTA slot, and nothing answers either kind.
+    localparam [1:0] DLMEM_OP_DXA = 2'd3;
+`endif
 
     // Request network packet; the fabric dst is the target core.
     typedef struct packed {

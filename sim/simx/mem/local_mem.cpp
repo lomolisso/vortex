@@ -217,6 +217,15 @@ public:
 #ifdef VX_CFG_EXT_DXA_ENABLE
 	// A DXA write reaches the completion unit in the cycle its bank commits it.
 	void dxa_commit(const MemReq& req) {
+#ifdef DXA_MBAR_ENABLE
+		// A peer's word: its copy completes through the DLMEM ingress.
+		if (req.dxa.remote) {
+			--row_words_;
+			return;
+		}
+#else
+#line 163
+#endif
 		DxaWrCommit c;
 		c.tag    = req.dxa;
 		c.notify = req.flags.dxa_notify_done;
@@ -234,6 +243,12 @@ public:
 
 private:
 	static bool is_dxa_write(const MemReq& req) {
+#ifdef DXA_MBAR_ENABLE
+		if (req.dxa.remote)
+			return false;
+#else
+#line 180
+#endif
 		return req.flags.dma && req.is_write();
 	}
 
@@ -255,6 +270,13 @@ private:
 				if (is_dxa_write(req) && req.flags.dxa_notify_done) {
 					++dxa_fwd_finals_;
 				}
+#ifdef DXA_MBAR_ENABLE
+				if (req.flags.dma && req.dxa.remote) {
+					++row_words_;
+				}
+#else
+#line 201
+#endif
 			});
 		}
 	}
@@ -265,9 +287,19 @@ private:
 		dxa_done_finals_ = 0;
 		dxa_hold_        = false;
 		dxa_hold_beat_   = 0;
+#ifdef DXA_MBAR_ENABLE
+		row_words_       = 0;
+#else
+#line 211
+#endif
 	}
 
 	void dxa_gate_begin(const std::vector<SimChannel<MemReq>>& inputs) {
+#ifdef DXA_MBAR_ENABLE
+		dxa_inputs_ = &inputs;
+#else
+#line 214
+#endif
 		dxa_fwd_finals_ -= dxa_done_finals_;
 		dxa_done_finals_ = 0;
 		dxa_hold_ = false;
@@ -316,6 +348,17 @@ private:
 	}
 
 	bool dxa_gate_admit(uint32_t input, const MemReq& req) const {
+#ifdef DXA_MBAR_ENABLE
+		// The row port is a DMA port; a unit without one leaves it at 0.
+		if (input >= config_.dma_begin && input == config_.dxa_row_port
+		 && (this->dxa_row_wait() || this->dxa_row_amo_wait(req)))
+			return false;
+		// A copy's completion follows its words into the banks.
+		if (row_words_ != 0 && req.dxa.remote && req.op == MemOp::MBAR_COMPLETE_TX)
+			return false;
+#else
+#line 262
+#endif
 		return !dxa_hold_ || input < config_.dma_begin || !is_dxa_write(req)
 		    || beat_before(req.dxa.beat, dxa_hold_beat_);
 	}
@@ -325,6 +368,36 @@ private:
 	uint32_t dxa_done_finals_;  // final writes committed since the gate last counted
 	bool     dxa_hold_;
 	uint32_t dxa_hold_beat_;    // the oldest beat held back this cycle
+#ifdef DXA_MBAR_ENABLE
+
+	// The RTL's DMA port takes one request a cycle, a peer's DXA word only when
+	// no other DMA input presents one: the arbiter's last, priority input.
+	bool dxa_row_wait() const {
+		for (uint32_t i = config_.dma_begin; i < config_.dxa_row_port; ++i) {
+			const auto& ch = dxa_inputs_->at(i);
+			if (!ch.empty() && this->dxa_gate_admit(i, ch.peek()))
+				return true;
+		}
+		return false;
+	}
+
+	// The RTL's DMA port refuses a write while the bank has an atomic in flight,
+	// which keeps a peer's word at the ingress and the flits behind it waiting.
+	// A word forwarded now meets its bank next cycle: the in-flight atomic must
+	// have written back by then, and none may start this cycle.
+	bool dxa_row_amo_wait(const MemReq& req) const {
+		const uint32_t bank = uint32_t(req.addr >> log2ceil(config_.line_size)) & ((1u << config_.B) - 1);
+		if (amo_busy_[bank] != 0)
+			return amo_busy_[bank] > 1;
+		const auto& queue = mem_xbar_->ReqOut.at(bank);
+		return !queue.empty() && (memop_is_atomic(queue.peek().op) || memop_is_mbar(queue.peek().op));
+	}
+
+	const std::vector<SimChannel<MemReq>>* dxa_inputs_ = nullptr;
+	uint32_t row_words_ = 0;    // a peer's words forwarded to a bank and not yet committed
+#else
+#line 271
+#endif
 
 public:
 #elif defined(VX_CFG_EXT_MBAR_ENABLE)

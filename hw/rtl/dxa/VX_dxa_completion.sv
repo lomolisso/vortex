@@ -145,7 +145,8 @@ module VX_dxa_completion import VX_gpu_pkg::*, VX_dxa_pkg::*; #(
     wire [BOUND_W-1:0] blk_lo  = BOUND_W'(head.slot) * BOUND_W'(slot_stride);
     wire [BOUND_W-1:0] blk_hi  = blk_lo + BOUND_W'(slot_stride);
     wire [BOUND_W-1:0] mbar_ba = BOUND_W'(head.payload[DXA_MBAR_OFF_W-1:0]) << 3;
-    wire beat_live  = slot_valid[wr_attr.slot] && (slot_gen[wr_attr.slot] == wr_attr.gen);
+    // A remote copy's data words are checked at the ingress, without a generation.
+    wire beat_live  = wr_attr.remote || (slot_valid[wr_attr.slot] && (slot_gen[wr_attr.slot] == wr_attr.gen));
     wire compl_live = slot_valid[head.slot] && (slot_gen[head.slot] == head.gen);
     `UNUSED_VAR (wr_attr)
     `UNUSED_VAR (head)

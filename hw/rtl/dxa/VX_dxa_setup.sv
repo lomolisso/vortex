@@ -166,6 +166,11 @@ module VX_dxa_setup import VX_gpu_pkg::*, VX_dxa_pkg::*; (
                      <= 128'(1 << `VX_CFG_LMEM_LOG_SIZE)),
         ("DXA box exceeds local memory: tiles=%0d,%0d,%0d,%0d,%0d elem_bytes=%0d", dec_tile0, dec_tile1, dec_tile2,
          dec_tile3, dec_tile4, dec_elem_bytes))
+    `RUNTIME_ASSERT(!launch_accept || !req_data.win
+                 || (((128'(dec_tile0) * 128'(dec_tile1) * 128'(dec_tile2) * 128'(dec_tile3) * 128'(dec_tile4)) << esize_enc)
+                     <= 128'(req_data.win_room)),
+        ("DXA box exceeds the destination block: tiles=%0d,%0d,%0d,%0d,%0d elem_bytes=%0d room=%0d", dec_tile0,
+         dec_tile1, dec_tile2, dec_tile3, dec_tile4, dec_elem_bytes, req_data.win_room))
 `endif
 
     // K-major per-lane SMEM stride = tile1 * elem_bytes. Since elem_bytes is
@@ -517,10 +522,12 @@ module VX_dxa_setup import VX_gpu_pkg::*, VX_dxa_pkg::*; (
                     s_lg_bkK            <= dec_lg_bkK;
                 `ifdef DXA_MBAR_ENABLE
                     s_compl.mode        <= dec_mbar_mode;
-                    s_compl.mbar_off    <= req_data.meta[4 +: DXA_MBAR_OFF_W];
+                    s_compl.mbar_off    <= req_data.mbar_off;
                     s_compl.tx_bytes    <= DXA_TX_BYTES_W'(dec_row_len_bytes);
-                    s_compl.slot        <= req_data.slot;
+                    s_compl.slot        <= req_data.remote ? req_data.dst_slot : req_data.slot;
                     s_compl.gen         <= req_data.gen;
+                    s_compl.remote      <= req_data.remote;
+                    s_compl.dst_core    <= req_data.dst_core;
                     lat_tile4           <= DXA_TX_BYTES_W'(dec_tile4);
                 `endif
                     // Rolling-cursor deltas: delta[0] is the inner-dim step.

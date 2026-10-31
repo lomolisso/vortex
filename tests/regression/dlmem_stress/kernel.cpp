@@ -5,6 +5,9 @@
 #ifdef VX_CFG_EXT_DXA_ENABLE
 #include <vx_dxa.h>
 #include <vx_barrier.h>
+#ifdef VX_CFG_EXT_MBAR_ENABLE
+#include <vx_mbar.h>
+#endif
 #endif
 
 namespace {
@@ -142,15 +145,38 @@ __kernel void stress_k(stress_arg_t* __UNIFORM__ arg) {
   const bool dxa = (arg->flags & FLAG_DXA) != 0;
   vortex::barrier dxa_bar(0);
   auto dxa_dst = x.own + dxa_off(x.k, x.nt, warps) / sizeof(uint32_t);
+#ifdef VX_CFG_EXT_MBAR_ENABLE
+  // The previous rank's copies land in rdxa; each completes a phase of rmbar.
+  const bool rdxa = (arg->flags & FLAG_RDXA) != 0;
+  auto rdxa_dst = x.own + rdxa_off(x.k, x.nt, warps) / sizeof(uint32_t);
+  auto rmbar = reinterpret_cast<uint64_t*>(const_cast<uint32_t*>(x.own) + rmbar_off(x.k, x.nt, warps) / sizeof(uint32_t));
+  const uint32_t next = (x.rank + 1) % x.k;
+  uint32_t rphase = 0;
+  if (rdxa && x.tid == 0)
+    vx_mbar_init(rmbar, 1);
+#endif
 #endif
   x.cl.sync();
   for (uint32_t p = 0; p < arg->phases; ++p) {
 #ifdef VX_CFG_EXT_DXA_ENABLE
-    const uint32_t tile = (p * gridDim.x + x.b) % DXA_TILES;
+    const uint32_t tile = dxa_tile(p, gridDim.x, x.b);
     if (dxa && x.warp == 0) {
       dxa_bar.expect_tx(1);
       vx_dxa_issue_1d_wg(0, dxa_bar.id(), const_cast<uint32_t*>(dxa_dst), tile * DXA_WORDS);
     }
+#ifdef VX_CFG_EXT_MBAR_ENABLE
+    const bool remote = rdxa && rdxa_phase(x.seed, x.c, p);
+    if (remote) {
+      if (x.tid == 0)
+        vx_mbar_arrive_tx(rmbar, 4 * DXA_WORDS);
+      if (x.warp == 0) {
+        auto peer = x.window(next);
+        vx_dxa_issue_1d_mbar_cluster(0, reinterpret_cast<uint64_t*>(const_cast<uint8_t*>(peer + rmbar_off(x.k, x.nt, warps))),
+                                     const_cast<uint8_t*>(peer + rdxa_off(x.k, x.nt, warps)),
+                                     rdxa_tile(p, gridDim.x, x.b) * DXA_WORDS);
+      }
+    }
+#endif
 #endif
     for (uint32_t s = 0; s < arg->steps; ++s) {
       st_step_t st;
@@ -161,6 +187,19 @@ __kernel void stress_k(stress_arg_t* __UNIFORM__ arg) {
       if (st.op != OPC_ST && st.op != OPC_CTR && st.op != OPC_FENCE)
         x.check(TEST_STEP, (p << 24) | (st.op << 16) | s, got, st.want);
     }
+#if defined(VX_CFG_EXT_DXA_ENABLE) && defined(VX_CFG_EXT_MBAR_ENABLE)
+    // Before the phase end: the next remote copy follows a cluster.sync() after it.
+    if (remote) {
+      uint32_t tries = 0;
+      while (!vx_mbar_try_wait_parity(rmbar, rphase & 1) && ++tries < RDXA_TRY_LIMIT) {}
+      x.check(TEST_RDXA, (p << 24) | 0xFFFFFFu, tries < RDXA_TRY_LIMIT, 1);
+      const uint32_t from = x.b - x.rank + (x.rank + x.k - 1) % x.k;
+      const uint32_t rtile = rdxa_tile(p, gridDim.x, from);
+      for (uint32_t e = x.tid; e < DXA_WORDS; e += x.nt)
+        x.check(TEST_RDXA, (p << 24) | e, rdxa_dst[e], dxa_word(x.seed, rtile * DXA_WORDS + e));
+      ++rphase;
+    }
+#endif
     auto sig = reinterpret_cast<volatile uint32_t*>(x.window((x.rank + 1) % x.k) + sig_off(x.k, x.nt));
     sig[(p % SIG_SLOTS) * x.nt + x.tid] = st_sig(x.seed, x.c, p, x.rank, x.tid);
     switch (st_end(x.seed, x.c, p)) {

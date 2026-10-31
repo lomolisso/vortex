@@ -53,7 +53,8 @@ tests:
               hw/rtl/core/VX_mem_unit.sv, hw/rtl/core/VX_core.sv, hw/rtl/VX_socket.sv,
               hw/rtl/VX_cluster.sv, hw/unittest/dlmem_noc, hw/unittest/dlmem_ep,
               hw/unittest/dlmem_xlate, hw/unittest/core, hw/unittest/Makefile,
-              sim/simx/dlmem, tests/unittest/dlmem_noc, tests/unittest/dlmem_ep,
+              sim/simx/dlmem, sim/simx/types.h, sim/simx/cta_dispatcher,
+              tests/unittest/dlmem_noc, tests/unittest/dlmem_ep,
               tests/unittest/dlmem_xlate, hw/rtl/VX_define.vh, sw/common/mbar_ref.h]
   # Last-level cache bank (VX_cache_top): a held fill released at every cycle
   # offset around a racing atomic, store or load (also with memory refusing

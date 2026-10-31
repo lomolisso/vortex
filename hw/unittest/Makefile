@@ -343,7 +343,9 @@ endif
 # accesses. The bound-assert build must abort on an out-of-bounds lane; a build
 # with mbarriers counts their ops on local lanes, holds an arrive like a
 # release AMO, sends arrive and tx ops on remote lanes as remote AMOs, and must
-# abort on an op on a global lane and on a wait on a remote lane; the last
+# abort on an op on a global lane and on a wait on a remote lane; a build with
+# DXA and mbarriers also reads a random slot's row, bases and stride on the
+# table's DXA port every cycle and checks them against the rows written; the last
 # build sends a remote lane, holds a fence until its store is acknowledged and
 # a local access's fence until its bank commit, and holds a release AMO the
 # same way; the final clean keeps a plain `run` from reusing it.
@@ -392,6 +394,8 @@ ifeq ($(XLEN),64)
 	grep -q "remote mbarrier wait is not supported" dlmem_xlate/mbar_remote_wait.log
 	! dlmem_xlate/dlmem_xlate --mode=mbar-remote-trywait > dlmem_xlate/mbar_remote_trywait.log 2>&1
 	grep -q "remote mbarrier wait is not supported" dlmem_xlate/mbar_remote_trywait.log
+	$(call dlmem_xlate_case,-DVX_CFG_NUM_CORES=4 -DVX_CFG_SOCKET_SIZE=2 -DVX_CFG_NUM_WARPS=8 \
+		-DVX_CFG_LMEM_LOG_SIZE=16 -DVX_CFG_EXT_A_ENABLE -DVX_CFG_EXT_MBAR_ENABLE -DVX_CFG_EXT_DXA_ENABLE,2,0,--seed=11,--mode=mbar,--mode=remote)
 	$(call dlmem_xlate_case,-DVX_CFG_NUM_CORES=2 -DVX_CFG_SOCKET_SIZE=1 -DVX_CFG_NUM_WARPS=4 \
 		-DVX_CFG_LMEM_LOG_SIZE=14,0,0,--mode=remote,--mode=fence,--mode=rl)
 	$(MAKE) -C dlmem_xlate clean
@@ -426,6 +430,26 @@ define dlmem_ep_case
 	python3 $(VORTEX_HOME)/hw/unittest/dlmem_ep/compare_latency.py \
 		dlmem_ep/latency_$(1).csv dlmem_ep/simx_latency_$(1).csv
 endef
+# Posted row flits of remote DXA copies (DXA with mbarriers), injected at each
+# socket's row port: every data word on its core's DMA port and every copy's
+# completion on its local-memory port after the copy's words, in send order
+# per socket and core, with no response; random copies under DMA and
+# local-memory stalls, the endpoints' own random traffic in the same build, and
+# the fixed row schedule, whose CSV must match the SimX endpoints' run row for
+# row. A flit into a free CTA slot must stop the last build.
+# $(1)=shape tag of the SimX test $(2)=that shape's CONFIGS $(3)=seed
+DLMEM_EP_ROWS_CFG := $(DLMEM_EP_CFG) -DVX_CFG_EXT_DXA_ENABLE
+define dlmem_ep_rows_case
+	$(MAKE) -C dlmem_ep clean
+	$(MAKE) -C dlmem_ep CONFIGS="$(DLMEM_EP_ROWS_CFG) $(2)"
+	$(MAKE) -C dlmem_ep run CONFIGS="$(DLMEM_EP_ROWS_CFG) $(2)" OPTS="--mode=rows-random --seed=$(3)"
+	$(MAKE) -C dlmem_ep run CONFIGS="$(DLMEM_EP_ROWS_CFG) $(2)" OPTS="--mode=random --seed=$(3)"
+	$(MAKE) -C dlmem_ep run CONFIGS="$(DLMEM_EP_ROWS_CFG) $(2)" OPTS="--mode=rows --csv=rows_$(1).csv"
+	$(MAKE) -C $(DLMEM_EP_SIMX) run SHAPES=$(1) CONFIGS="$(DLMEM_EP_ROWS_CFG) -DVX_CFG_EXT_MBAR_ENABLE" \
+		OPTS="--mode=rows --csv=$(CURDIR)/dlmem_ep/simx_rows_$(1).csv"
+	python3 $(VORTEX_HOME)/hw/unittest/dlmem_ep/compare_latency.py \
+		dlmem_ep/rows_$(1).csv dlmem_ep/simx_rows_$(1).csv
+endef
 run-dlmem-ep:
 ifeq ($(XLEN),64)
 	$(call dlmem_ep_case,s1214,-DVX_CFG_NUM_CORES=2 -DVX_CFG_SOCKET_SIZE=2 -DVX_CFG_NUM_LSU_LANES=4,1)
@@ -442,6 +466,13 @@ ifeq ($(XLEN),64)
 	$(MAKE) -C dlmem_ep CONFIGS="$(DLMEM_EP_CFG) -DVX_CFG_NUM_CORES=2 -DVX_CFG_SOCKET_SIZE=2" LRSC_ASSERT=1
 	! dlmem_ep/dlmem_ep --mode=lrsc > dlmem_ep/lrsc_assert.log 2>&1
 	grep -q "remote LR/SC is not supported" dlmem_ep/lrsc_assert.log
+	$(call dlmem_ep_rows_case,s1214,-DVX_CFG_NUM_CORES=2 -DVX_CFG_SOCKET_SIZE=2 -DVX_CFG_NUM_LSU_LANES=4,11)
+	$(call dlmem_ep_rows_case,s2114,-DVX_CFG_NUM_CORES=2 -DVX_CFG_SOCKET_SIZE=1 -DVX_CFG_NUM_LSU_LANES=4,12)
+	$(call dlmem_ep_rows_case,s2224,-DVX_CFG_NUM_CORES=4 -DVX_CFG_SOCKET_SIZE=2 -DVX_CFG_ISSUE_WIDTH=2 \
+		-DVX_CFG_NUM_LSU_BLOCKS=2 -DVX_CFG_NUM_LSU_LANES=4,13)
+	$(call dlmem_ep_rows_case,s4214,-DVX_CFG_NUM_CORES=8 -DVX_CFG_SOCKET_SIZE=2 -DVX_CFG_NUM_LSU_LANES=4,14)
+	! dlmem_ep/dlmem_ep --mode=rows-retired > dlmem_ep/rows_retired.log 2>&1
+	grep -q "DXA write into a retired CTA slot" dlmem_ep/rows_retired.log
 	$(MAKE) -C dlmem_ep clean
 endif
 

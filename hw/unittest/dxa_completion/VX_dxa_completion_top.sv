@@ -66,6 +66,8 @@ module VX_dxa_completion_top import VX_gpu_pkg::*; #(
     assign attr.tx_bytes = DXA_TX_BYTES_W'(in_tx_bytes);
     assign attr.slot     = NW_WIDTH'(in_slot);
     assign attr.gen      = DXA_CTA_GEN_W'(in_gen);
+    assign attr.remote   = 1'b0;
+    assign attr.dst_core = '0;
 
     wire [`VX_CFG_NUM_WARPS-1:0][DXA_CTA_GEN_W-1:0] slot_gen_w;
     for (genvar i = 0; i < `VX_CFG_NUM_WARPS; ++i) begin : g_gen

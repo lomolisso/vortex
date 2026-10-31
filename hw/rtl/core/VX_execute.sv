@@ -69,6 +69,11 @@ module VX_execute import VX_gpu_pkg::*; #(
     // each warp's CTA slot and the slots' generations, recorded by a DXA issue
     input wire [`VX_CFG_NUM_WARPS-1:0][NW_WIDTH-1:0] cta_warp_slot,
     input wire [`VX_CFG_NUM_WARPS-1:0][DXA_CTA_GEN_W-1:0] cta_slot_gen,
+    // the DLMEM peer table's DXA read port, for cluster destinations
+    output wire [NW_WIDTH-1:0]                       dxa_peer_rd_slot,
+    input  dlmem_row_t                               dxa_peer_row,
+    input wire [`VX_CFG_NUM_WARPS-1:0][`VX_CFG_LMEM_LOG_SIZE-1:0] dxa_peer_slot_base,
+    input wire [`VX_CFG_LMEM_LOG_SIZE:0]             dxa_peer_stride,
 `endif
 
 `ifdef VX_CFG_EXT_TEX_ENABLE
@@ -194,6 +199,10 @@ module VX_execute import VX_gpu_pkg::*; #(
     `ifdef DXA_MBAR_ENABLE
         .cta_warp_slot  (cta_warp_slot),
         .cta_slot_gen   (cta_slot_gen),
+        .dxa_peer_rd_slot (dxa_peer_rd_slot),
+        .dxa_peer_row   (dxa_peer_row),
+        .dxa_peer_slot_base (dxa_peer_slot_base),
+        .dxa_peer_stride (dxa_peer_stride),
     `endif
     `ifdef VX_CFG_EXT_TEX_ENABLE
         .tex_bus_if     (tex_bus_if),

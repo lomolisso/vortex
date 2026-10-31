@@ -44,6 +44,15 @@ public:
   SimChannel<MemReq>      LmemReqOut;   // the OUT_BUF=3 request buffer
   SimChannel<MemRsp>      LmemRspIn;    // never refused
   SimChannel<DlmemRspPkt> NetRspOut;
+#ifdef DXA_MBAR_ENABLE
+  // A peer's DXA row flits: a DATA word is a DMA-class write on LmemDmaOut,
+  // which has no buffer of its own, so the next flit waits until the local
+  // memory has taken it toward its bank; the COMPL then becomes a posted
+  // complete_tx on LmemReqOut. Must tick before the local memory.
+  SimChannel<MemReq>     LmemDmaOut;
+  // The core's CTA slot admissions and frees, for the flits' occupancy check.
+  SimChannel<CtaSlotEvt> SlotIn;
+#endif
 
   DlmemIngress(const SimContext& ctx, const char* name, const Config& config);
 
@@ -63,11 +72,21 @@ private:
     bool ack = false;
     std::shared_ptr<mem_block_t> data;
     uint64_t uuid = 0;
+#ifdef DXA_MBAR_ENABLE
+    bool posted = false;   // a COMPL's complete_tx: its response is dropped
+#endif
   };
 
   Config config_;
   std::vector<Slot> slots_;
   std::deque<uint32_t> done_;   // completion FIFO of slot indices
+#ifdef DXA_MBAR_ENABLE
+  // Takes the head DXA flit if it can; false leaves it at the head.
+  bool accept_dxa(const DlmemReqPkt& pkt);
+  void check_slot(const DlmemReqPkt& pkt) const;
+
+  std::vector<bool> slot_valid_;
+#endif
 
   friend class SimObject<DlmemIngress>;
 };

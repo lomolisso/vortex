@@ -159,6 +159,18 @@ module VX_dxa_core_top import VX_gpu_pkg::*, VX_dxa_pkg::*; #(
 
     `UNUSED_PARAM (ENABLE)
 
+`ifdef DXA_MBAR_ENABLE
+    VX_dlmem_bus_if #(
+        .DATAW (VX_dlmem_pkg::DLMEM_REQ_DATAW),
+        .DST_W (DLMEM_CORE_W)
+    ) row_out_if();
+
+    assign row_out_if.ready = 1'b1;
+    `UNUSED_VAR (row_out_if.valid)
+    `UNUSED_VAR (row_out_if.data)
+    `UNUSED_VAR (row_out_if.dst)
+`endif
+
     VX_dxa_core #(
         .INSTANCE_ID     (INSTANCE_ID),
         .NUM_REQS        (1),
@@ -173,6 +185,9 @@ module VX_dxa_core_top import VX_gpu_pkg::*, VX_dxa_pkg::*; #(
         .req_bus_if        (req_bus_if),
         .smem_bus_if       (lmem_bus_if),
         .gmem_bus_if       (gmem_bus_if),
+    `ifdef DXA_MBAR_ENABLE
+        .row_out_if        (row_out_if),
+    `endif
         .busy              (busy)
     );
 

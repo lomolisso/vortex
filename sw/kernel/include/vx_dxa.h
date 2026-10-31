@@ -32,7 +32,9 @@ extern "C" {
 // meta[3:0]   = descriptor slot (up to 16 descriptors)
 // meta[30]    = completion mode: 0 = barrier event, 1 = mbarrier complete_tx
 // meta[29:4]  = mode 0: raw barrier id payload;
-//               mode 1: the mbarrier's doubleword offset in the core's local memory
+//               mode 1: the mbarrier's doubleword offset in the core's local memory;
+//               with meta[29] set (_cluster forms), meta[28:24] is its cluster
+//               rank and the offset is in that block
 // meta[31]    = packed marker
 
 // R type: .insn r opcode7, funct3, funct7, rd, rs1, rs2
@@ -207,6 +209,49 @@ inline void vx_dxa_issue_5d_mbar(uint32_t desc_slot, uint64_t* mbar, void* smem_
                                  uint32_t coord0, uint32_t coord1, uint32_t coord2,
                                  uint32_t coord3, uint32_t coord4) {
   vx_dxa_issue_5d_wg(desc_slot, __vx_dxa_mbar_payload(mbar), smem_addr,
+                     coord0, coord1, coord2, coord3, coord4);
+}
+
+// The _cluster forms, like cp.async.bulk.tensor.shared::cluster: `smem_addr`
+// and `mbar` are window addresses (vx_cluster_map_shared_rank) of one block of
+// the issuer's cluster, which may be the issuer itself. A local pointer is
+// undefined.
+
+// meta[29:4] for a window object: the window flag, its rank and its
+// doubleword offset in that block.
+inline uint32_t __vx_dxa_mbar_payload_cluster(const uint64_t* mbar) {
+  const uintptr_t a = (uintptr_t)mbar;
+  return (1u << 26) | (1u << 25) | (((uint32_t)(a >> VX_CFG_LMEM_LOG_SIZE) & 0x1Fu) << 20)
+       | ((uint32_t)(a >> 3) & ((1u << (VX_CFG_LMEM_LOG_SIZE - 3)) - 1u));
+}
+
+inline void vx_dxa_issue_1d_mbar_cluster(uint32_t desc_slot, uint64_t* mbar, void* smem_addr,
+                                         uint32_t coord0) {
+  vx_dxa_issue_1d_wg(desc_slot, __vx_dxa_mbar_payload_cluster(mbar), smem_addr, coord0);
+}
+
+inline void vx_dxa_issue_2d_mbar_cluster(uint32_t desc_slot, uint64_t* mbar, void* smem_addr,
+                                         uint32_t coord0, uint32_t coord1) {
+  vx_dxa_issue_2d_wg(desc_slot, __vx_dxa_mbar_payload_cluster(mbar), smem_addr, coord0, coord1);
+}
+
+inline void vx_dxa_issue_3d_mbar_cluster(uint32_t desc_slot, uint64_t* mbar, void* smem_addr,
+                                         uint32_t coord0, uint32_t coord1, uint32_t coord2) {
+  vx_dxa_issue_3d_wg(desc_slot, __vx_dxa_mbar_payload_cluster(mbar), smem_addr,
+                     coord0, coord1, coord2);
+}
+
+inline void vx_dxa_issue_4d_mbar_cluster(uint32_t desc_slot, uint64_t* mbar, void* smem_addr,
+                                         uint32_t coord0, uint32_t coord1, uint32_t coord2,
+                                         uint32_t coord3) {
+  vx_dxa_issue_4d_wg(desc_slot, __vx_dxa_mbar_payload_cluster(mbar), smem_addr,
+                     coord0, coord1, coord2, coord3);
+}
+
+inline void vx_dxa_issue_5d_mbar_cluster(uint32_t desc_slot, uint64_t* mbar, void* smem_addr,
+                                         uint32_t coord0, uint32_t coord1, uint32_t coord2,
+                                         uint32_t coord3, uint32_t coord4) {
+  vx_dxa_issue_5d_wg(desc_slot, __vx_dxa_mbar_payload_cluster(mbar), smem_addr,
                      coord0, coord1, coord2, coord3, coord4);
 }
 #endif // VX_CFG_EXT_MBAR_ENABLE

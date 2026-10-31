@@ -60,6 +60,14 @@ module VX_dlmem_lsu_xlate import VX_gpu_pkg::*; #(
     output wire [NB-1:0][NW_WIDTH-1:0]      lacc_inc_wid,
     output wire [NB-1:0][CNT_W-1:0]         lacc_inc_cnt,
 
+`ifdef DXA_MBAR_ENABLE
+    // One more table read port, for the DXA unit's cluster destinations.
+    input  wire [NW_WIDTH-1:0]              dxa_rd_slot,
+    output dlmem_row_t                      dxa_rd_row,
+    output wire [NW-1:0][LMEM_LOG-1:0]      dxa_slot_base,
+    output wire [LMEM_LOG:0]                dxa_stride,
+`endif
+
     output wire [NB-1:0]                    empty
 );
     wire [NB-1:0][NW_WIDTH-1:0] row_slot;
@@ -67,6 +75,29 @@ module VX_dlmem_lsu_xlate import VX_gpu_pkg::*; #(
     wire [`VX_CFG_NUM_WARPS-1:0][LMEM_LOG-1:0] slot_base;
     wire [LMEM_LOG:0]           stride;
 
+`ifdef DXA_MBAR_ENABLE
+    dlmem_row_t [NB:0]          rd_row;
+
+    VX_dlmem_peer_tbl #(
+        .NUM_RD (NB + 1)
+    ) peer_tbl (
+        .clk       (clk),
+        .reset     (reset),
+        .wr_valid  (peer_wr_valid),
+        .wr_slot   (peer_wr_slot),
+        .wr_row    (peer_wr_row),
+        .wr_stride (peer_wr_stride),
+        .rd_slot   ({dxa_rd_slot, row_slot}),
+        .rd_row    (rd_row),
+        .slot_base (slot_base),
+        .stride    (stride)
+    );
+
+    assign row           = rd_row[NB-1:0];
+    assign dxa_rd_row    = rd_row[NB];
+    assign dxa_slot_base = slot_base;
+    assign dxa_stride    = stride;
+`else
     VX_dlmem_peer_tbl #(
         .NUM_RD (NB)
     ) peer_tbl (
@@ -81,6 +112,7 @@ module VX_dlmem_lsu_xlate import VX_gpu_pkg::*; #(
         .slot_base (slot_base),
         .stride    (stride)
     );
+`endif
 
     for (genvar b = 0; b < NB; ++b) begin : g_blocks
         VX_dlmem_xlate #(

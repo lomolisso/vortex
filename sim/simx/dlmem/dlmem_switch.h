@@ -93,6 +93,13 @@ public:
   SimChannel<Pkt> UplinkOut;
   SimEventLink<uint32_t> UplinkCreditIn;
   SimEventLink<uint32_t> UplinkCreditOut;
+#ifdef DXA_MBAR_ENABLE
+  // Input only, the last arbiter input: the socket DXA engine's row flits,
+  // routed like a core's packets. Nothing is addressed to it.
+  SimChannel<Pkt> DxaIn;
+#else
+#line 95
+#endif
 
   DlmemSocketSwitch(const SimContext& ctx,
                     const char* name,
@@ -106,6 +113,11 @@ public:
     , UplinkOut(this)
     , UplinkCreditIn(this)
     , UplinkCreditOut(this)
+#ifdef DXA_MBAR_ENABLE
+    , DxaIn(this)
+#else
+#line 108
+#endif
     , map_(socket_id, socket_size, num_sockets)
     , arbiter_(map_.num_ports(), map_.num_ports())
     , route_(map_.num_ports())
@@ -114,6 +126,12 @@ public:
     , uplink_credits_(DLMEM_BUF_DEPTH)
     , collisions_(0) {
     UplinkCreditIn.bind(this, &DlmemSocketSwitch<Pkt>::on_uplink_credit);
+#ifdef DXA_MBAR_ENABLE
+    arbiter_ = DlmemArbiter(map_.num_ports() + 1, map_.num_ports());
+    route_.resize(map_.num_ports() + 1);
+#else
+#line 116
+#endif
   }
 
   uint32_t socket_id() const {
@@ -149,6 +167,12 @@ protected:
       busy |= (in.size() != 0);
       route_[i] = in.empty() ? -1 : int32_t(map_.route(i, in.peek().dst));
     }
+#ifdef DXA_MBAR_ENABLE
+    busy |= (DxaIn.size() != 0);
+    route_[P] = DxaIn.empty() ? -1 : int32_t(map_.route(P, DxaIn.peek().dst));
+#else
+#line 151
+#endif
     for (uint32_t o = 0; o < P; ++o) {
       ready_[o] = (o < S) ? !CoreOut.at(o).full() : (uplink_credits_ != 0);
     }
@@ -161,6 +185,13 @@ protected:
       auto& in = this->input(i);
       Pkt pkt = in.peek();
       in.pop();
+#ifdef DXA_MBAR_ENABLE
+      if (i == P) {
+        // A row flit: posted, it returns no uplink credit.
+      } else
+#else
+#line 163
+#endif
       if (i == S) {
         UplinkCreditOut.send(map_.socket_id());
       }
@@ -179,6 +210,13 @@ protected:
 
 private:
   SimChannel<Pkt>& input(uint32_t i) {
+#ifdef DXA_MBAR_ENABLE
+    if (i == map_.num_ports()) {
+      return DxaIn;
+    }
+#else
+#line 181
+#endif
     return (i < CoreIn.size()) ? CoreIn.at(i) : UplinkIn;
   }
 

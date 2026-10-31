@@ -6,10 +6,11 @@ PROJECT := dlmem_ep
 SIMX_DIR := $(ROOT_DIR)/sim/simx
 
 # The endpoints belong to the DLMEM extension and carry AMOs, mbarrier ops
-# among them: always build with all three.
-CONFIGS := $(if $(findstring -DVX_CFG_EXT_DLMEM_ENABLE,$(CONFIGS)),$(CONFIGS),$(CONFIGS) -DVX_CFG_EXT_DLMEM_ENABLE)
-CONFIGS := $(if $(findstring -DVX_CFG_EXT_A_ENABLE,$(CONFIGS)),$(CONFIGS),$(CONFIGS) -DVX_CFG_EXT_A_ENABLE)
-CONFIGS := $(if $(findstring -DVX_CFG_EXT_MBAR_ENABLE,$(CONFIGS)),$(CONFIGS),$(CONFIGS) -DVX_CFG_EXT_MBAR_ENABLE)
+# among them: always build with all three, also under a command-line CONFIGS
+# (a DXA build adds the row flits of remote copies, --mode=rows*).
+override CONFIGS := $(if $(findstring -DVX_CFG_EXT_DLMEM_ENABLE,$(CONFIGS)),$(CONFIGS),$(CONFIGS) -DVX_CFG_EXT_DLMEM_ENABLE)
+override CONFIGS := $(if $(findstring -DVX_CFG_EXT_A_ENABLE,$(CONFIGS)),$(CONFIGS),$(CONFIGS) -DVX_CFG_EXT_A_ENABLE)
+override CONFIGS := $(if $(findstring -DVX_CFG_EXT_MBAR_ENABLE,$(CONFIGS)),$(CONFIGS),$(CONFIGS) -DVX_CFG_EXT_MBAR_ENABLE)
 
 # The RTL bench's shapes (sockets x socket size x LSU blocks x LSU lanes). Each
 # builds into its own SimX output directory, so the shapes never share objects
@@ -38,10 +39,24 @@ all:
 # With the assert on, a remote LR/SC must abort, as it does in the core.
 LRSC_BUILD := simx_$(firstword $(SHAPES))
 
+# Without DXA in CONFIGS, run also adds a DXA build per ROWS_SHAPES for the
+# row flits of remote copies: the fixed schedule, random copies under stalls,
+# and a flit into a free CTA slot, which must stop the run.
+ROWS_SHAPES ?= s2114 s2224
+ROWS_RUN := $(if $(findstring -DVX_CFG_EXT_DXA_ENABLE,$(CONFIGS)),,$(ROWS_SHAPES))
+ROWS_BUILD := simx_rows_$(firstword $(ROWS_SHAPES))
+rows_cfg = $(CONFIGS) -DVX_CFG_EXT_DXA_ENABLE $(SHAPE_$(1))
+
 run:
 	$(foreach b,$(BUILDS),$(MAKE) -C $(SIMX_DIR) DESTDIR=$(CURDIR)/simx_$(b) test-dlmem-ep CONFIGS="$(call cfg_of,$(b))" DLMEM_EP_OPTS="$(OPTS)" &&) true
 	! $(CURDIR)/$(LRSC_BUILD)/dlmem_ep_test --mode=lrsc --lrsc-assert > $(LRSC_BUILD)/lrsc_assert.log 2>&1
 	grep -q "remote LR/SC is not supported" $(LRSC_BUILD)/lrsc_assert.log
+ifneq ($(ROWS_RUN),)
+	$(foreach s,$(ROWS_RUN),$(MAKE) -C $(SIMX_DIR) DESTDIR=$(CURDIR)/simx_rows_$(s) test-dlmem-ep CONFIGS="$(call rows_cfg,$(s))" DLMEM_EP_OPTS="--mode=rows" && \
+		$(MAKE) -C $(SIMX_DIR) DESTDIR=$(CURDIR)/simx_rows_$(s) test-dlmem-ep CONFIGS="$(call rows_cfg,$(s))" DLMEM_EP_OPTS="--mode=rows-random" &&) true
+	! $(CURDIR)/$(ROWS_BUILD)/dlmem_ep_test --mode=rows-retired > $(ROWS_BUILD)/rows_retired.log 2>&1
+	grep -q "DXA write into a retired CTA slot" $(ROWS_BUILD)/rows_retired.log
+endif
 
 clean:
 	rm -rf simx_*

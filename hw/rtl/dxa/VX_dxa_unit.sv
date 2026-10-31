@@ -25,6 +25,11 @@ module VX_dxa_unit import VX_gpu_pkg::*, VX_dxa_pkg::*; #(
 `ifdef DXA_MBAR_ENABLE
     input wire [`VX_CFG_NUM_WARPS-1:0][NW_WIDTH-1:0] cta_warp_slot,
     input wire [`VX_CFG_NUM_WARPS-1:0][DXA_CTA_GEN_W-1:0] cta_slot_gen,
+    // The issuing block's DLMEM peer row and the launch's slot bases.
+    output wire [NW_WIDTH-1:0]                       peer_rd_slot,
+    input  dlmem_row_t                               peer_row,
+    input wire [`VX_CFG_NUM_WARPS-1:0][`VX_CFG_LMEM_LOG_SIZE-1:0] peer_slot_base,
+    input wire [`VX_CFG_LMEM_LOG_SIZE:0]             peer_stride,
 `endif
     VX_dxa_req_bus_if.master dxa_req_bus_if
 );
@@ -116,7 +121,9 @@ module VX_dxa_unit import VX_gpu_pkg::*, VX_dxa_pkg::*; #(
     assign dxa_req_data_in.core_id   = NC_WIDTH'(CORE_ID);
     assign dxa_req_data_in.uuid      = execute_if.data.header.uuid;
     assign dxa_req_data_in.wid       = execute_if.data.header.wid;
+`ifndef DXA_MBAR_ENABLE
     assign dxa_req_data_in.smem_addr = lmem_rel_byte_addr[DXA_SMEM_ADDR_W-1:0];
+`endif
     assign dxa_req_data_in.meta      = lane1_rs1[31:0];
     assign dxa_req_data_in.coords[0] = lane2_rs1[31:0];
     assign dxa_req_data_in.coords[1] = lane3_rs1[31:0];
@@ -125,10 +132,63 @@ module VX_dxa_unit import VX_gpu_pkg::*, VX_dxa_pkg::*; #(
     assign dxa_req_data_in.coords[4] = lane2_rs2[31:0];
     assign dxa_req_data_in.cta_mask  = lane3_rs2[`VX_CFG_NUM_WARPS-1:0];
 `ifdef DXA_MBAR_ENABLE
-    // The issuer's slot and generation, checked wherever the transfer writes.
+    // A DLMEM window address names a block of the issuer's cluster, as the LSU's
+    // aperture decodes it: rank r maps to peer r of the issuing block's row. A
+    // block on this core takes the local path at its slot's base, any other
+    // the DLMEM network. A window mbarrier (payload bit 25) carries its rank
+    // in payload[24:20] and a block-relative word offset.
+    localparam LMEM_LOG = `VX_CFG_LMEM_LOG_SIZE;
+    localparam RB       = DLMEM_RANK_BITS;
+    localparam RB_W     = `UP(RB);
+    localparam WIN_LSB  = LMEM_LOG + RB;
+    localparam MY_CORE  = CORE_ID % DLMEM_NCC;
+    localparam [`VX_CFG_XLEN-1:0] DLMEM_BASE_B = `VX_CFG_XLEN'(`VX_MEM_DLMEM_BASE_ADDR);
+
     wire [NW_WIDTH-1:0] issue_slot = cta_warp_slot[execute_if.data.header.wid];
-    assign dxa_req_data_in.slot      = issue_slot;
-    assign dxa_req_data_in.gen       = cta_slot_gen[issue_slot];
+    assign peer_rd_slot = issue_slot;
+
+    wire [RB_W-1:0] dst_rank;
+    if (RB != 0) begin : g_dst_rank
+        assign dst_rank = lane0_rs1[LMEM_LOG +: RB];
+    end else begin : g_dst_rank0
+        assign dst_rank = '0;
+    end
+    wire [LMEM_LOG-1:0] dst_off = lane0_rs1[LMEM_LOG-1:0];
+    wire dst_win = ((lane0_rs1 >> WIN_LSB) == (DLMEM_BASE_B >> WIN_LSB));
+
+    wire mbar_mode = lane1_rs1[30];
+    wire mbar_win  = mbar_mode && lane1_rs1[29];
+    wire [4:0] mbar_rank = lane1_rs1[28:24];
+    wire [DXA_MBAR_OFF_W-1:0] mbar_off_w = lane1_rs1[4 +: DXA_MBAR_OFF_W];
+
+    dlmem_peer_t dst_peer, mbar_peer;
+    assign dst_peer  = peer_row.peers[dst_rank];
+    assign mbar_peer = peer_row.peers[RB_W'(mbar_rank)];
+
+    wire dst_remote = dst_win && (dst_peer.core != DLMEM_CORE_W'(MY_CORE));
+    wire [NW_WIDTH-1:0] dst_slot = dst_win ? dst_peer.slot : issue_slot;
+    wire [LMEM_LOG-1:0] dst_base = peer_slot_base[dst_peer.slot];
+    wire [LMEM_LOG-1:0] mbar_base = peer_slot_base[mbar_peer.slot];
+    `UNUSED_VAR (mbar_base[2:0])
+
+    assign dxa_req_data_in.smem_addr = dst_win ? (dst_base + dst_off) : lmem_rel_byte_addr[DXA_SMEM_ADDR_W-1:0];
+    assign dxa_req_data_in.slot      = dst_slot;
+    assign dxa_req_data_in.gen       = cta_slot_gen[dst_slot];
+    assign dxa_req_data_in.remote    = dst_remote;
+    assign dxa_req_data_in.dst_core  = dst_peer.core;
+    assign dxa_req_data_in.dst_slot  = dst_peer.slot;
+    assign dxa_req_data_in.mbar_off  = mbar_win ? (mbar_base[LMEM_LOG-1:3] + mbar_off_w) : mbar_off_w;
+    assign dxa_req_data_in.win       = dst_win;
+    assign dxa_req_data_in.win_room  = peer_stride - (LMEM_LOG+1)'(dst_off);
+
+    // Issue-time checks, simulation only.
+    wire dst_oob  = dst_win && ((32'(dst_rank) >= 32'(peer_row.k)) || ({1'b0, dst_off} >= peer_stride));
+    wire mbar_oob = mbar_win && ((32'(mbar_rank) >= 32'(peer_row.k))
+                              || ({1'b0, mbar_off_w, 3'b0} >= (LMEM_LOG+1)'(peer_stride)));
+    wire [DLMEM_CORE_W-1:0] dst_blk_core  = dst_win  ? dst_peer.core  : DLMEM_CORE_W'(MY_CORE);
+    wire [DLMEM_CORE_W-1:0] mbar_blk_core = mbar_win ? mbar_peer.core : DLMEM_CORE_W'(MY_CORE);
+    wire [NW_WIDTH-1:0]     mbar_blk_slot = mbar_win ? mbar_peer.slot : issue_slot;
+    wire mbar_elsewhere = mbar_mode && ((dst_blk_core != mbar_blk_core) || (dst_slot != mbar_blk_slot));
 `endif
     // smem_addr (LMEM byte width) and meta/coords (32-bit ABI) take low bits;
     // high bits unused when XLEN exceeds the field width
@@ -150,9 +210,20 @@ module VX_dxa_unit import VX_gpu_pkg::*, VX_dxa_pkg::*; #(
     assign execute_if.ready = accept;
 
 `ifdef DXA_MBAR_ENABLE
-    `RUNTIME_ASSERT(~(fire && is_send && dxa_req_data_in.meta[30] && ($countones(dxa_req_data_in.cta_mask) > 1)),
+    wire issue_fire = fire && is_send;
+    wire is_mcast   = ($countones(dxa_req_data_in.cta_mask) > 1);
+    `RUNTIME_ASSERT(~(issue_fire && (dxa_req_data_in.meta[30] || dst_win) && is_mcast),
         ("%t: *** %s DXA multicast with an mbarrier is not supported: wid=%0d cta_mask=0x%0h",
          $time, INSTANCE_ID, execute_if.data.header.wid, dxa_req_data_in.cta_mask))
+    `RUNTIME_ASSERT(~(issue_fire && (dst_oob || mbar_oob)),
+        ("%t: *** %s DXA destination rank outside the cluster: wid=%0d smem=0x%0h meta=0x%0h k=%0d stride=0x%0h",
+         $time, INSTANCE_ID, execute_if.data.header.wid, lane0_rs1, lane1_rs1, peer_row.k, peer_stride))
+    `RUNTIME_ASSERT(~(issue_fire && ~dst_oob && ~mbar_oob && mbar_elsewhere),
+        ("%t: *** %s DXA mbarrier must be in the destination block: wid=%0d smem=0x%0h meta=0x%0h",
+         $time, INSTANCE_ID, execute_if.data.header.wid, lane0_rs1, lane1_rs1))
+    `RUNTIME_ASSERT(~(issue_fire && dst_win && ~mbar_mode),
+        ("%t: *** %s DXA cluster destination needs an mbarrier: wid=%0d smem=0x%0h meta=0x%0h",
+         $time, INSTANCE_ID, execute_if.data.header.wid, lane0_rs1, lane1_rs1))
 `endif
 
     VX_elastic_buffer #(
@@ -198,6 +269,13 @@ module VX_dxa_unit import VX_gpu_pkg::*, VX_dxa_pkg::*; #(
                 dxa_req_bus_if.req_data.coords[0], dxa_req_bus_if.req_data.coords[1],
                 dxa_req_bus_if.req_data.coords[2], dxa_req_bus_if.req_data.coords[3],
                 dxa_req_bus_if.req_data.coords[4]))
+        `ifdef DXA_MBAR_ENABLE
+            if (dxa_req_bus_if.req_data.remote) begin
+                `TRACE(1, ("%t: %s dxa-req-remote: wid=%0d, dst_core=%0d, dst_slot=%0d, mbar_off=0x%0h\n",
+                    $time, INSTANCE_ID, dxa_req_bus_if.req_data.wid, dxa_req_bus_if.req_data.dst_core,
+                    dxa_req_bus_if.req_data.dst_slot, dxa_req_bus_if.req_data.mbar_off))
+            end
+        `endif
         end
     end
 `endif

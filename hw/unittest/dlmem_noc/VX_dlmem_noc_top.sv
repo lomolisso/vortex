@@ -14,7 +14,8 @@
 `include "VX_define.vh"
 
 // One cluster's DLMEM network: a switch per socket plus the cluster crossbar,
-// with flat injection (in_*) and ejection (out_*) ports indexed by core.
+// with flat injection (in_*) and ejection (out_*) ports indexed by core, and
+// with DXA mbarriers a row injection port (row_*) per socket.
 module VX_dlmem_noc_top import VX_gpu_pkg::*, VX_dlmem_pkg::*; #(
     parameter DATAW   = 160,
     parameter OUT_BUF = 3,
@@ -30,6 +31,14 @@ module VX_dlmem_noc_top import VX_gpu_pkg::*, VX_dlmem_pkg::*; #(
     input  wire [NCC-1:0][DATAW-1:0]    in_data,
     input  wire [NCC-1:0][DST_W-1:0]    in_dst,
     output wire [NCC-1:0]               in_ready,
+
+`ifdef DXA_MBAR_ENABLE
+    // Per socket, the DXA row egress's input-only port.
+    input  wire [NUM_SOCKETS-1:0]            row_valid,
+    input  wire [NUM_SOCKETS-1:0][DATAW-1:0] row_data,
+    input  wire [NUM_SOCKETS-1:0][DST_W-1:0] row_dst,
+    output wire [NUM_SOCKETS-1:0]            row_ready,
+`endif
 
     output wire [NCC-1:0]               out_valid,
     output wire [NCC-1:0][DATAW-1:0]    out_data,
@@ -75,18 +84,36 @@ module VX_dlmem_noc_top import VX_gpu_pkg::*, VX_dlmem_pkg::*; #(
             assign core_out_if[c].ready = out_ready[i];
         end
 
+    `ifdef DXA_MBAR_ENABLE
+        VX_dlmem_bus_if #(
+            .DATAW (DATAW),
+            .DST_W (DST_W)
+        ) row_in_if();
+
+        assign row_in_if.valid = row_valid[s];
+        assign row_in_if.data  = row_data[s];
+        assign row_in_if.dst   = row_dst[s];
+        assign row_ready[s]    = row_in_if.ready;
+    `endif
+
         VX_dlmem_socket_switch #(
             .SOCKET_SIZE (SOCKET_SIZE),
             .NUM_SOCKETS (NUM_SOCKETS),
             .SOCKET_IDX  (s),
             .DATAW       (DATAW),
             .DST_W       (DST_W),
+        `ifdef DXA_MBAR_ENABLE
+            .ROW_IN      (1),
+        `endif
             .OUT_BUF     (OUT_BUF)
         ) socket_switch (
             .clk           (clk),
             .reset         (reset),
             .core_in_if    (core_in_if),
             .core_out_if   (core_out_if),
+        `ifdef DXA_MBAR_ENABLE
+            .row_in_if     (row_in_if),
+        `endif
             .uplink_in_if  (uplink_down_if[s]),
             .uplink_out_if (uplink_up_if[s])
         );

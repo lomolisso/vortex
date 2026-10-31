@@ -53,6 +53,11 @@
 #define SIMX_MT 0
 #endif
 #include "constants.h"
+#if defined(VX_CFG_EXT_DXA_ENABLE) && defined(VX_CFG_EXT_MBAR_ENABLE)
+#include <dlmem_ref.h>
+#else
+#line 55
+#endif
 
 namespace vortex {
 
@@ -1367,6 +1372,13 @@ struct DxaWrTag {
   uint32_t tx_bytes = 0;
   uint32_t slot     = 0;      // the issuing block's CTA slot and its generation
   uint32_t gen      = 0;
+  // A word a peer core's engine sent over the DLMEM network, which completes
+  // through the ingress and not through this core's completion unit.
+  bool     remote   = false;
+  uint32_t src_core = 0;      // a copy into a peer core's block: the cluster-relative cores
+  uint32_t dst_core = 0;
+#else
+#line 1286
 #endif
 };
 
@@ -1389,7 +1401,10 @@ struct CtaSlotEvt {
   uint32_t gen    = 0;  // ADMIT: the slot's new generation
   uint32_t stride = 0;  // ADMIT: the slot pitch, in bytes
   uint32_t wid    = 0;  // WARP: a warp the block runs on
+  dlmem_ref::Row row;   // ADMIT: the block's peer row
 };
+#else
+#line 1309
 #endif
 
 #elif defined(VX_CFG_EXT_MBAR_ENABLE)

@@ -42,6 +42,7 @@ public:
 #endif
 #ifdef DXA_MBAR_ENABLE
     uint32_t dxa_compl_port = 0; // the DXA completion unit's complete_tx requests
+    uint32_t dxa_row_port = 0;   // a peer's DXA words from the DLMEM ingress: the last DMA port
 #else
 #line 42
 #endif

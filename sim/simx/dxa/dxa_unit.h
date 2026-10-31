@@ -37,9 +37,18 @@ struct DxaReq {
   uint32_t coords[5];
 #ifdef DXA_MBAR_ENABLE
   bool     mode;          // meta[30]: complete_tx on an mbarrier
-  uint32_t mbar_off;      // the mbarrier's doubleword offset in the local memory
-  uint32_t slot;          // the issuing block's CTA slot and its generation
+  uint32_t mbar_off;      // the mbarrier's doubleword offset in the destination's local memory
+  uint32_t slot;          // the destination block's CTA slot and its generation
   uint32_t gen;
+  // A destination block on another core of the cluster: the rows travel over
+  // the DLMEM network, and smem_addr is in that core's local memory.
+  bool     remote;
+  uint32_t src_core;      // the issuing and the destination core, cluster-relative
+  uint32_t dst_core;
+  bool     win;           // a DLMEM window destination
+  uint32_t win_room;      // and its bytes up to its block's end
+#else
+#line 43
 #endif
 };
 
@@ -67,8 +76,18 @@ private:
   Core*               core_;
   SimChannel<DxaReq>& req_out_;
 #ifdef DXA_MBAR_ENABLE
+  // Resolves a DLMEM window destination and mbarrier through the issuing
+  // block's peer row, as the RTL reads it from the core's peer table.
+  void translate(const instr_trace_t* trace, uint32_t meta, uint32_t cta_mask, DxaReq& req) const;
+
+  [[noreturn]] void issue_abort(const instr_trace_t* trace, const char* msg) const;
+
   std::vector<uint32_t> warp_slot_ = std::vector<uint32_t>(VX_CFG_NUM_WARPS, 0);
   std::vector<uint32_t> slot_gen_  = std::vector<uint32_t>(VX_CFG_NUM_WARPS, 0);
+  std::vector<dlmem_ref::Row> slot_row_ = std::vector<dlmem_ref::Row>(VX_CFG_NUM_WARPS);
+  uint32_t stride_ = 0;
+#else
+#line 72
 #endif
 };
 

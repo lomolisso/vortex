@@ -29,7 +29,10 @@ module VX_dlmem_ep_top import VX_gpu_pkg::*, VX_dlmem_pkg::*; #(
     localparam NW  = `VX_CFG_NUM_WARPS,
     localparam NP  = NCC * NB,
     localparam WS  = LSU_WORD_SIZE,
-    localparam XW  = `VX_CFG_XLEN
+    localparam XW  = `VX_CFG_XLEN,
+    localparam NS  = NUM_SOCKETS,
+    localparam DMA_DW = LMEM_DMA_DATA_SIZE * 8,
+    localparam DMA_BW = LMEM_DMA_DATA_SIZE
 ) (
     input wire clk,
     input wire reset,
@@ -101,7 +104,40 @@ module VX_dlmem_ep_top import VX_gpu_pkg::*, VX_dlmem_pkg::*; #(
     output wire [NCC-1:0]                   rsp_ej_fire,    // response network -> egress
     output wire [NCC-1:0]                   rsp_ej_ack,
     output wire [NCC-1:0]                   rsp_ej_ready
+
+`ifdef DXA_MBAR_ENABLE
+    ,
+    // Posted row flits of each socket's DXA egress, as packet fields: a data
+    // word, or with row_compl the copy's complete_tx.
+    input  wire [NS-1:0]                    row_valid,
+    input  wire [NS-1:0][7:0]               row_dst,
+    input  wire [NS-1:0][7:0]               row_src,
+    input  wire [NS-1:0]                    row_compl,
+    input  wire [NS-1:0][31:0]              row_addr,
+    input  wire [NS-1:0][WS-1:0]            row_byteen,
+    input  wire [NS-1:0][XW-1:0]            row_data,
+    input  wire [NS-1:0][7:0]               row_slot,
+    output wire [NS-1:0]                    row_ready,
+
+    // Each core's occupied CTA slots, and its local memory's DMA port.
+    input  wire [NCC-1:0][NW-1:0]           slot_valid,
+    output wire [NCC-1:0]                   dma_valid,
+    output wire [NCC-1:0][31:0]             dma_addr,
+    output wire [NCC-1:0][DMA_DW-1:0]       dma_data,
+    output wire [NCC-1:0][DMA_BW-1:0]       dma_byteen,
+    output wire [NCC-1:0][7:0]              dma_slot,
+    output wire [NCC-1:0]                   dma_remote,
+    output wire [NCC-1:0]                   dma_last,
+    input  wire [NCC-1:0]                   dma_ready,
+
+    output wire [31:0]                      cfg_amo_complete_tx
+`endif
 );
+`ifndef DXA_MBAR_ENABLE
+    `UNUSED_PARAM (NS)
+    `UNUSED_PARAM (DMA_DW)
+    `UNUSED_PARAM (DMA_BW)
+`endif
     localparam TAGV_W = LSU_TAG_WIDTH - UUID_WIDTH;
     localparam CNT_W  = `CLOG2(NL + 1);
 
@@ -130,6 +166,34 @@ module VX_dlmem_ep_top import VX_gpu_pkg::*, VX_dlmem_pkg::*; #(
     wire [NCC-1:0][DLMEM_RSP_DATAW-1:0]  rspn_out_data;
     wire [NCC-1:0][DLMEM_CORE_W-1:0]     rspn_out_dst;
 
+`ifdef DXA_MBAR_ENABLE
+    `STATIC_ASSERT (DXA_CTA_GEN_W <= 8 && NW_WIDTH <= 8, ("dlmem_ep_top: slot container too small"))
+    assign cfg_amo_complete_tx = 32'(AMO_OP_MBAR_COMPLETE_TX);
+
+    wire [NS-1:0][DLMEM_REQ_DATAW-1:0] row_pkt_data;
+    wire [NS-1:0][DLMEM_CORE_W-1:0]    row_pkt_dst;
+    for (genvar s = 0; s < NS; ++s) begin : g_row_pkts
+        dlmem_req_pkt_t pkt;
+        always @(*) begin
+            pkt              = '0;
+            pkt.src          = DLMEM_CORE_W'(row_src[s]);
+            pkt.op           = DLMEM_OP_DXA;
+            pkt.addr         = DLMEM_LMEM_AW'(row_addr[s]);
+            pkt.byteen       = row_byteen[s];
+            pkt.data         = row_data[s];
+            pkt.amo_op       = row_compl[s] ? AMO_OP_MBAR_COMPLETE_TX : amo_op_e'(0);
+            pkt.amo_unsigned = row_compl[s];
+            pkt.tag          = DLMEM_TAG_W'(row_slot[s]);
+        end
+        assign row_pkt_data[s] = pkt;
+        assign row_pkt_dst[s]  = DLMEM_CORE_W'(row_dst[s]);
+        `UNUSED_VAR (row_src[s])
+        `UNUSED_VAR (row_dst[s])
+        `UNUSED_VAR (row_addr[s])
+        `UNUSED_VAR (row_slot[s])
+    end
+`endif
+
     VX_dlmem_noc_top #(
         .DATAW   (DLMEM_REQ_DATAW),
         .OUT_BUF (OUT_BUF)
@@ -140,6 +204,12 @@ module VX_dlmem_ep_top import VX_gpu_pkg::*, VX_dlmem_pkg::*; #(
         .in_data   (reqn_in_data),
         .in_dst    (reqn_in_dst),
         .in_ready  (reqn_in_ready),
+    `ifdef DXA_MBAR_ENABLE
+        .row_valid (row_valid),
+        .row_data  (row_pkt_data),
+        .row_dst   (row_pkt_dst),
+        .row_ready (row_ready),
+    `endif
         .out_valid (reqn_out_valid),
         .out_data  (reqn_out_data),
         .out_dst   (reqn_out_dst),
@@ -156,6 +226,12 @@ module VX_dlmem_ep_top import VX_gpu_pkg::*, VX_dlmem_pkg::*; #(
         .in_data   (rspn_in_data),
         .in_dst    (rspn_in_dst),
         .in_ready  (rspn_in_ready),
+    `ifdef DXA_MBAR_ENABLE
+        .row_valid ('0),
+        .row_data  ('0),
+        .row_dst   ('0),
+        `UNUSED_PIN (row_ready),
+    `endif
         .out_valid (rspn_out_valid),
         .out_data  (rspn_out_data),
         .out_dst   (rspn_out_dst),
@@ -287,6 +363,32 @@ module VX_dlmem_ep_top import VX_gpu_pkg::*, VX_dlmem_pkg::*; #(
             .ADDR_WIDTH (DLMEM_LMEM_AW)
         ) lmem_bus_if();
 
+    `ifdef DXA_MBAR_ENABLE
+        VX_mem_bus_if #(
+            .DATA_SIZE  (LMEM_DMA_DATA_SIZE),
+            .TAG_WIDTH  (LMEM_DMA_IN_TAG_MAX),
+            .ATTR_WIDTH (LMEM_DMA_ATTR_W),
+            .ADDR_WIDTH (LMEM_DMA_ADDR_WIDTH)
+        ) dma_if();
+
+        dxa_lmem_attr_t dma_attr;
+        assign dma_attr = dxa_lmem_attr_t'(dma_if.req_data.attr);
+
+        assign dma_valid[c]    = dma_if.req_valid;
+        assign dma_addr[c]     = 32'(dma_if.req_data.addr);
+        assign dma_data[c]     = dma_if.req_data.data;
+        assign dma_byteen[c]   = dma_if.req_data.byteen;
+        assign dma_slot[c]     = 8'(dma_attr.slot);
+        assign dma_remote[c]   = dma_attr.remote && dma_if.req_data.rw;
+        assign dma_last[c]     = dma_attr.last;
+        assign dma_if.req_ready = dma_ready[c];
+        assign dma_if.rsp_valid = 1'b0;
+        assign dma_if.rsp_data  = '0;
+        `UNUSED_VAR (dma_attr)
+        `UNUSED_VAR (dma_if.req_data.tag)
+        `UNUSED_VAR (dma_if.rsp_ready)
+    `endif
+
         VX_dlmem_ingress #(
             .INSTANCE_ID ($sformatf("dlmem-ingress%0d", c)),
             .OUT_BUF     (OUT_BUF)
@@ -296,6 +398,10 @@ module VX_dlmem_ep_top import VX_gpu_pkg::*, VX_dlmem_pkg::*; #(
             .req_in_if   (req_in_if),
             .lmem_bus_if (lmem_bus_if),
             .rsp_out_if  (rsp_out_if),
+        `ifdef DXA_MBAR_ENABLE
+            .slot_valid  (slot_valid[c]),
+            .dma_out_if  (dma_if),
+        `endif
             .empty       (ingress_empty[c])
         );
 

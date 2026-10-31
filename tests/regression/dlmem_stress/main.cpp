@@ -22,7 +22,11 @@
 //   -s S     steps per phase (default 32)
 //   -r seed  the seed (default 1)
 //   -d       a DXA copy into each block's own local memory every phase
-//            (a device built with VX_CFG_EXT_DXA_ENABLE)
+//            (a device built with VX_CFG_EXT_DXA_ENABLE); built with
+//            VX_CFG_EXT_MBAR_ENABLE too, also a copy into the next rank's
+//            local memory through the window, completing on an mbarrier
+//            there, in the first phase and after each cluster.sync() phase
+//            end; the receiver waits for it and checks it before its phase end
 //   -c       control run: DEFAULT (same-core) clusters through the same
 //            window, so nothing crosses the network
 //   -v       print every cluster's placement (core:slot by rank)
@@ -113,6 +117,14 @@ void parse_args(int argc, char** argv) {
   }
 }
 
+uint32_t dxa_flags() {
+#ifdef VX_CFG_EXT_MBAR_ENABLE
+  return use_dxa ? FLAG_DXA | FLAG_RDXA : 0;
+#else
+  return use_dxa ? FLAG_DXA : 0;
+#endif
+}
+
 uint64_t footprint(uint32_t lmem) {
   return ((uint64_t)lmem + VX_CFG_MEM_BLOCK_SIZE - 1) / VX_CFG_MEM_BLOCK_SIZE * VX_CFG_MEM_BLOCK_SIZE;
 }
@@ -140,7 +152,7 @@ std::string infeasible(const Caps& caps, const Launch& L) {
     std::snprintf(buf, sizeof(buf), "%u warps per block, the core has %u", L.w, (uint32_t)caps.num_warps);
     return buf;
   }
-  const uint32_t need = lmem_needed(L.k, nt, L.w, use_dxa);
+  const uint32_t need = lmem_needed(L.k, nt, L.w, dxa_flags());
   if (L.lmem < need || L.lmem % 64 != 0 || L.lmem > caps.lmem_size) {
     std::snprintf(buf, sizeof(buf), "%u bytes of local memory: needs a multiple of 64 from %u up to %u",
                   L.lmem, need, (uint32_t)caps.lmem_size);
@@ -165,7 +177,8 @@ int run_launch(vx_device_h dev, vx_queue_h q, vx_kernel_h kernel, const Caps& ca
   const uint32_t dw = dump_words(L.k, nt);
   std::printf("dlmem_stress: %s K=%u, %u clusters, %u warps and %u bytes of local memory per"
               " block, %u phases of %u steps, seed %#x%s\n", control ? "DEFAULT" : "SPREAD", L.k,
-              L.g, L.w, L.lmem, req_phases, req_steps, seed, use_dxa ? ", DXA copies" : "");
+              L.g, L.w, L.lmem, req_phases, req_steps, seed,
+              ((dxa_flags() & FLAG_RDXA) ? ", DXA copies, also into the next rank" : use_dxa ? ", DXA copies" : ""));
 
   const size_t err_words  = (size_t)threads * ERR_WORDS;
   const size_t rec_words  = (size_t)num_blocks * REC_WORDS;
@@ -197,7 +210,7 @@ int run_launch(vx_device_h dev, vx_queue_h q, vx_kernel_h kernel, const Caps& ca
   arg.phases      = req_phases;
   arg.steps       = req_steps;
   arg.num_threads = (uint32_t)caps.num_threads;
-  arg.flags       = use_dxa ? FLAG_DXA : 0;
+  arg.flags       = dxa_flags();
 
   vx_buffer_h dxa_buf = nullptr;
   // The queued write reads it when the queue runs it, so it lives until the read completes.
@@ -397,7 +410,7 @@ int main(int argc, char** argv) {
   std::vector<Launch> launches;
   for (uint32_t k : requested ? std::vector<uint32_t>{req_k} : std::vector<uint32_t>{2, 4}) {
     const uint32_t nt = req_w * (uint32_t)caps.num_threads;
-    const uint32_t lmem = req_lmem ? req_lmem : ((lmem_needed(k, nt, req_w, use_dxa) + 63) & ~63u);
+    const uint32_t lmem = req_lmem ? req_lmem : ((lmem_needed(k, nt, req_w, dxa_flags()) + 63) & ~63u);
     launches.push_back({k, req_g, req_w, lmem, requested});
   }
   for (size_t i = 0; i < launches.size(); ++i) {

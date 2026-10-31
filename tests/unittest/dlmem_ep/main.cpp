@@ -24,6 +24,10 @@
 #include "dlmem/dlmem_xbar.h"
 #include "mem_block_pool.h"
 #include "dlmem_ep_bench.h"
+#ifdef DXA_MBAR_ENABLE
+// The row-flit schedule the RTL testbench runs, shared with it.
+#include "../../../hw/unittest/dlmem_ep/dlmem_rows_bench.h"
+#endif
 
 using namespace vortex;
 
@@ -360,6 +364,238 @@ private:
   std::vector<std::vector<bool>> slot_store_;
 };
 
+#ifdef DXA_MBAR_ENABLE
+// The same endpoints and networks driven by the row-flit bench: each socket's
+// row port is its request switch's DXA input, each core's ingress writes a data
+// word on its DMA output and a completion on its local-memory output. The
+// bench is the local memory: a DMA write it takes commits at once, as the
+// RTL's DMA port does.
+class RowsDut final : public rows::Dut {
+public:
+  using ReqSwitch = DlmemSocketSwitch<DlmemReqPkt>;
+  using RspSwitch = DlmemSocketSwitch<DlmemRspPkt>;
+  using ReqXbar = DlmemXbar<DlmemReqPkt>;
+  using RspXbar = DlmemXbar<DlmemRspPkt>;
+
+  explicit RowsDut(Variant variant)
+    : row_sent_(rows::NUM_SOCKETS, false)
+    , had_lmem_(rows::NCC, false)
+    , slot_mask_(rows::NCC, 0) {
+    auto& platform = SimPlatform::instance();
+    platform.set_num_workers(variant == Variant::Threads ? SIMX_NUM_WORKERS : 1);
+    const uint32_t S = rows::SOCKET_SIZE;
+    for (uint32_t s = 0; s < rows::NUM_SOCKETS; ++s) {
+      uint32_t domain = (variant == Variant::Flat) ? 0 : platform.alloc_domain();
+      SimPlatform::DomainScope scope(domain);
+      for (uint32_t i = 0; i < S; ++i) {
+        uint32_t c = s * S + i;
+        DlmemEgress::Config cfg;
+        cfg.core_id = c;
+        cfg.ncc = rows::NCC;
+        cfg.lmem_log = ep::LMEM_LOG;
+        cfg.dlmem_base = ep::DLMEM_BASE;
+        cfg.num_blocks = ep::NB;
+        cfg.num_lanes = ep::NL;
+        cfg.store_credits = ep::CREDITS;
+        cfg.pending_size = ep::PENDING;
+        cfg.lrsc_assert = true;
+        egress_.push_back(DlmemEgress::Create(("dlmem-egress" + std::to_string(c)).c_str(), cfg));
+      }
+      req_sw_.push_back(ReqSwitch::Create(("dlmem-req-switch" + std::to_string(s)).c_str(), s, S, rows::NUM_SOCKETS));
+      for (uint32_t i = 0; i < S; ++i) {
+        uint32_t c = s * S + i;
+        DlmemIngress::Config cfg;
+        cfg.num_slots = ep::SLOTS;
+        cfg.lmem_base = ep::LMEM_BASE;
+        ingress_.push_back(DlmemIngress::Create(("dlmem-ingress" + std::to_string(c)).c_str(), cfg));
+      }
+      rsp_sw_.push_back(RspSwitch::Create(("dlmem-rsp-switch" + std::to_string(s)).c_str(), s, S, rows::NUM_SOCKETS));
+      for (uint32_t i = 0; i < S; ++i) {
+        uint32_t c = s * S + i;
+        egress_[c]->NetReqOut.bind(&req_sw_[s]->CoreIn.at(i));
+        req_sw_[s]->CoreOut.at(i).bind(&ingress_[c]->NetReqIn);
+        ingress_[c]->NetRspOut.bind(&rsp_sw_[s]->CoreIn.at(i));
+        rsp_sw_[s]->CoreOut.at(i).bind(&egress_[c]->NetRspIn);
+      }
+    }
+    if (rows::NUM_SOCKETS > 1) {
+      req_xbar_ = ReqXbar::Create("dlmem-req-xbar", S, rows::NUM_SOCKETS);
+      rsp_xbar_ = RspXbar::Create("dlmem-rsp-xbar", S, rows::NUM_SOCKETS);
+      for (uint32_t s = 0; s < rows::NUM_SOCKETS; ++s) {
+        dlmem_connect(req_sw_[s].get(), req_xbar_.get(), s);
+        dlmem_connect(rsp_sw_[s].get(), rsp_xbar_.get(), s);
+      }
+    }
+    platform.reset();
+  }
+
+  ~RowsDut() override {
+    egress_.clear();
+    ingress_.clear();
+    req_sw_.clear();
+    rsp_sw_.clear();
+    req_xbar_.reset();
+    rsp_xbar_.reset();
+    SimPlatform::instance().finalize();
+  }
+
+  uint32_t amo_complete_tx() const override {
+    return ep::OP_MBAR_COMPLETE_TX;
+  }
+
+  void cycle(const rows::In& in, rows::Out& out) override {
+    auto& platform = SimPlatform::instance();
+    const uint32_t S = rows::SOCKET_SIZE;
+    for (uint32_t s = 0; s < rows::NUM_SOCKETS; ++s) {
+      const rows::Flit* f = in.row[s];
+      if (f && !row_sent_[s]) {
+        req_sw_[s]->DxaIn.send(this->make_flit(*f), 0);
+        row_sent_[s] = true;
+      }
+    }
+    for (uint32_t c = 0; c < rows::NCC; ++c) {
+      auto& ig = ingress_[c];
+      // The dispatcher's slot events, as the RTL ingress reads slot_valid.
+      for (uint32_t w = 0; w < rows::NW; ++w) {
+        bool now = (in.slot_valid[c] >> w) & 1;
+        bool was = (slot_mask_[c] >> w) & 1;
+        if (now != was) {
+          CtaSlotEvt e;
+          e.kind = now ? CtaSlotEvt::ADMIT : CtaSlotEvt::FREE;
+          e.slot = w;
+          ig->SlotIn.send(e, 0);
+        }
+      }
+      slot_mask_[c] = in.slot_valid[c];
+      had_lmem_[c] = !ig->LmemReqOut.empty();
+      if (in.lrsp_valid[c]) {
+        ig->LmemRspIn.send(MemRsp(in.lrsp_tag[c]), 0);
+      }
+    }
+
+    platform.tick();
+
+    for (uint32_t s = 0; s < rows::NUM_SOCKETS; ++s) {
+      out.row_fire[s] = row_sent_[s] && req_sw_[s]->DxaIn.empty();
+      if (out.row_fire[s]) {
+        row_sent_[s] = false;
+      }
+    }
+    for (uint32_t c = 0; c < rows::NCC; ++c) {
+      auto& ig = ingress_[c];
+      auto& d = out.dma[c];
+      d = rows::DmaV();
+      if (!ig->LmemDmaOut.empty() && in.dma_ready[c]) {
+        const auto req = ig->LmemDmaOut.peek();
+        ig->LmemDmaOut.pop();
+        const uint64_t lb = req.addr - ep::LMEM_BASE;
+        const uint32_t waddr = uint32_t(lb >> 3);
+        const uint32_t bank = waddr % rows::NBANKS;
+        d.fire = true;
+        d.addr = waddr / rows::NBANKS;
+        d.byteen[bank] = uint8_t(req.byteen >> word_off(waddr));
+        d.word[bank] = load_word(req.data, word_off(waddr));
+        d.slot = req.dxa.slot;
+        d.remote = req.dxa.remote;
+        d.last = req.dxa.last;
+      }
+      auto& q = out.lmem[c];
+      q = rows::LmemV();
+      if (had_lmem_[c] && in.lmem_ready[c]) {
+        const auto req = ig->LmemReqOut.peek();
+        ig->LmemReqOut.pop();
+        q.fire = true;
+        q.rw = (req.op == MemOp::ST);
+        q.amo = memop_is_amo_rmw(req.op) || memop_is_mbar(req.op);
+        q.amo_op = to_amo_op(req.op);
+        q.uns = req.flags.amo_unsigned;
+        q.waddr = uint32_t((req.addr - ep::LMEM_BASE) >> 3);
+        q.byteen = uint8_t(req.byteen >> word_off(q.waddr));
+        q.data = load_word(req.data, word_off(q.waddr));
+        q.hart = req.hart_id;
+        q.tag = req.tag;
+      }
+      out.rsp_inj[c] = (rsp_sw_[c / S]->CoreIn.at(c % S).size() != 0);
+      out.in_empty[c] = ig->empty();
+    }
+  }
+
+private:
+  DlmemReqPkt make_flit(const rows::Flit& f) {
+    DlmemReqPkt p;
+    p.dst = f.dst;
+    p.src = f.src;
+    p.op = f.compl_ ? MemOp::MBAR_COMPLETE_TX : MemOp::ST;
+    p.lmem_addr = uint64_t(f.addr) * 8;
+    auto blk = make_mem_block();
+    std::memset(blk->data(), 0, blk->size());
+    std::memcpy(blk->data() + word_off(f.addr), &f.data, 8);
+    p.data = blk;
+    p.byteen = uint64_t(f.byteen) << word_off(f.addr);
+    p.hart_id = 0;
+    p.tag = f.slot;
+    p.dxa = true;
+    p.flags.amo_unsigned = f.compl_;
+    return p;
+  }
+
+  std::vector<DlmemEgress::Ptr> egress_;
+  std::vector<DlmemIngress::Ptr> ingress_;
+  std::vector<ReqSwitch::Ptr> req_sw_;
+  std::vector<RspSwitch::Ptr> rsp_sw_;
+  ReqXbar::Ptr req_xbar_;
+  RspXbar::Ptr rsp_xbar_;
+  std::vector<bool> row_sent_;
+  std::vector<bool> had_lmem_;
+  std::vector<uint32_t> slot_mask_;
+};
+
+// Runs a row mode on every variant; all must write the same latency rows.
+int run_rows(const std::string& mode, const std::vector<uint32_t>& seeds, uint32_t copies,
+             const std::vector<Variant>& variants, const std::string& csv) {
+  for (auto seed : (mode == "rows") ? std::vector<uint32_t>{seeds.front()} : seeds) {
+    std::string ref_csv;
+    std::string names;
+    for (auto variant : variants) {
+      rows::Options opts;
+      opts.mode = mode;
+      opts.seed = seed;
+      opts.copies = copies;
+      RowsDut dut(variant);
+      rows::Bench bench(dut, opts);
+      uint32_t failures = bench.run();
+      if (failures != 0) {
+        std::cout << "FAILED: mode " << mode << " seed " << seed << " (" << variant_name(variant) << "): "
+                  << bench.first_failure() << " [" << failures << " check(s)]" << std::endl;
+        return 1;
+      }
+      const std::string path = csv.empty() ? std::string("rows_tmp.csv") : csv;
+      bench.write_csv(path);
+      std::ifstream ifs(path);
+      std::string text((std::istreambuf_iterator<char>(ifs)), std::istreambuf_iterator<char>());
+      if (csv.empty()) {
+        std::remove(path.c_str());
+      }
+      names += (names.empty() ? "" : "=") + std::string(variant_name(variant));
+      if (variant == Variant::Flat) {
+        ref_csv = text;
+        std::cout << "mode " << mode << " seed " << seed << ": cycles=" << bench.cycles() << " flits=" << bench.flits()
+                  << " completions=" << bench.compls() << " row_stalls=" << bench.stalls();
+      } else if (text != ref_csv) {
+        std::cout << std::endl << "FAILED: mode " << mode << " seed " << seed << ": variant '"
+                  << variant_name(variant) << "' differs from 'flat'" << std::endl;
+        return 1;
+      }
+    }
+    std::cout << " (" << names << ")" << std::endl;
+    if (mode == "rows" && !csv.empty()) {
+      std::cout << "wrote " << csv << std::endl;
+    }
+  }
+  return 0;
+}
+#endif
+
 struct Result {
   uint32_t failures = 0;
   std::string failure;
@@ -402,7 +638,11 @@ bool same_lat(const std::vector<ep::LatRow>& a, const std::vector<ep::LatRow>& b
 }
 
 void usage() {
-  std::cout << "usage: dlmem_ep_test [--mode=random|hotspot|storeflood|loadflood|backpressure|lrsc|latency|all]\n"
+  std::cout << "usage: dlmem_ep_test [--mode=random|hotspot|storeflood|loadflood|backpressure|lrsc|latency|all"
+#ifdef DXA_MBAR_ENABLE
+               "|rows|rows-random|rows-retired"
+#endif
+               "]\n"
                "                     [--seed=N] [--reqs=N] [--csv=FILE] [--trace=FILE] [--lrsc-assert]\n"
                "  --lrsc-assert: a remote LR/SC aborts, as in the core, instead of the defined fallback\n";
 }
@@ -416,6 +656,7 @@ int main(int argc, char** argv) {
   std::string csv;
   std::string trace_path;
   bool lrsc_assert = false;
+  std::string row_mode;
   for (int a = 1; a < argc; ++a) {
     std::string arg = argv[a];
     auto val = [&](const char* k) -> const char* {
@@ -423,6 +664,12 @@ int main(int argc, char** argv) {
       return (arg.compare(0, n, k) == 0) ? arg.c_str() + n : nullptr;
     };
     if (auto v = val("--mode=")) {
+#ifdef DXA_MBAR_ENABLE
+      if (std::string(v).compare(0, 4, "rows") == 0) {
+        row_mode = v;
+        continue;
+      }
+#endif
       if (std::string(v) != "all") {
         if (std::find(modes.begin(), modes.end(), v) == modes.end()) {
           usage();
@@ -457,6 +704,27 @@ int main(int argc, char** argv) {
       variants.push_back(Variant::Threads);
     }
   }
+
+#ifdef DXA_MBAR_ENABLE
+  if (!row_mode.empty()) {
+    std::cout << "dlmem_ep rows: sockets=" << rows::NUM_SOCKETS << " socket_size=" << rows::SOCKET_SIZE
+              << " banks=" << rows::NBANKS << " warps=" << rows::NW << " workers=" << SIMX_NUM_WORKERS << std::endl;
+    if (row_mode == "rows-retired") {
+      rows::Options opts;
+      opts.mode = row_mode;
+      RowsDut dut(Variant::Flat);
+      rows::Bench bench(dut, opts);
+      bench.run();
+      std::cout << "FAILED: a flit into a free CTA slot did not stop the run" << std::endl;
+      return 1;
+    }
+    if (run_rows(row_mode, seeds, reqs, variants, csv) != 0) {
+      return 1;
+    }
+    std::cout << "PASSED" << std::endl;
+    return 0;
+  }
+#endif
 
   std::cout << "dlmem_ep: sockets=" << ep::NUM_SOCKETS << " socket_size=" << ep::SOCKET_SIZE
             << " blocks=" << ep::NB << " lanes=" << ep::NL << " warps=" << ep::NW

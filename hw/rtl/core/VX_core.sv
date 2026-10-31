@@ -266,6 +266,11 @@ module VX_core import VX_gpu_pkg::*, VX_tlb_pkg::*; #(
     wire [`VX_CFG_NUM_WARPS-1:0]                    cta_slot_valid;
     wire [`VX_CFG_NUM_WARPS-1:0][DXA_CTA_GEN_W-1:0] cta_slot_gen;
     wire [`VX_CFG_NUM_WARPS-1:0][NW_WIDTH-1:0]      cta_warp_slot;
+    // The peer table's DXA read port
+    wire [NW_WIDTH-1:0]                             dxa_peer_rd_slot;
+    dlmem_row_t                                     dxa_peer_row;
+    wire [`VX_CFG_NUM_WARPS-1:0][`VX_CFG_LMEM_LOG_SIZE-1:0] dxa_peer_slot_base;
+    wire [`VX_CFG_LMEM_LOG_SIZE:0]                  dxa_peer_stride;
 `endif
 
     VX_scheduler #(
@@ -427,6 +432,10 @@ module VX_core import VX_gpu_pkg::*, VX_tlb_pkg::*; #(
     `ifdef DXA_MBAR_ENABLE
         .cta_warp_slot  (cta_warp_slot),
         .cta_slot_gen   (cta_slot_gen),
+        .dxa_peer_rd_slot (dxa_peer_rd_slot),
+        .dxa_peer_row   (dxa_peer_row),
+        .dxa_peer_slot_base (dxa_peer_slot_base),
+        .dxa_peer_stride (dxa_peer_stride),
     `endif
     `ifdef VX_CFG_EXT_TEX_ENABLE
         .tex_bus_if     (tex_bus_if),
@@ -491,6 +500,12 @@ module VX_core import VX_gpu_pkg::*, VX_tlb_pkg::*; #(
         .lacc_inc_valid (xlate_lacc_inc_valid),
         .lacc_inc_wid   (xlate_lacc_inc_wid),
         .lacc_inc_cnt   (xlate_lacc_inc_cnt),
+    `ifdef DXA_MBAR_ENABLE
+        .dxa_rd_slot    (dxa_peer_rd_slot),
+        .dxa_rd_row     (dxa_peer_row),
+        .dxa_slot_base  (dxa_peer_slot_base),
+        .dxa_stride     (dxa_peer_stride),
+    `endif
         .empty          (xlate_empty)
     );
     // The remote lanes reach the egress through the local-memory switches, flagged in their attributes.
@@ -586,6 +601,14 @@ module VX_core import VX_gpu_pkg::*, VX_tlb_pkg::*; #(
     wire [`VX_CFG_LMEM_NUM_BANKS-1:0]               lmem_commit_valid;
     wire [`VX_CFG_LMEM_NUM_BANKS-1:0][NW_WIDTH-1:0] lmem_commit_wid;
 `endif
+`ifdef DXA_MBAR_ENABLE
+    VX_mem_bus_if #(
+        .DATA_SIZE  (LMEM_DMA_DATA_SIZE),
+        .TAG_WIDTH  (LMEM_DMA_IN_TAG_MAX),
+        .ATTR_WIDTH (LMEM_DMA_ATTR_W),
+        .ADDR_WIDTH (LMEM_DMA_ADDR_WIDTH)
+    ) dlmem_dma_if();
+`endif
 
     VX_mem_unit #(
         .INSTANCE_ID (INSTANCE_ID)
@@ -619,6 +642,7 @@ module VX_core import VX_gpu_pkg::*, VX_tlb_pkg::*; #(
         .cta_slot_valid (cta_slot_valid),
         .cta_slot_gen   (cta_slot_gen),
         .cta_slot_stride (peer_wr_stride),
+        .dlmem_dma_if  (dlmem_dma_if),
     `endif
         .empty         (mem_unit_empty),
         .lsu_mem_if    (lsu_mem_if),
@@ -661,6 +685,10 @@ module VX_core import VX_gpu_pkg::*, VX_tlb_pkg::*; #(
         .req_in_if   (dlmem_req_in_if),
         .lmem_bus_if (dlmem_lmem_if),
         .rsp_out_if  (dlmem_rsp_out_if),
+    `ifdef DXA_MBAR_ENABLE
+        .slot_valid  (cta_slot_valid),
+        .dma_out_if  (dlmem_dma_if),
+    `endif
         .empty       (dlmem_ingress_empty)
     );
 

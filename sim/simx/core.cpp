@@ -153,6 +153,15 @@ public:
     uint32_t lmem_tcu_port = LMEM_DXA_PORT
         + VX_CFG_EXT_DXA_ENABLED * DxaCore::LMEM_PORTS_PER_CORE;
     uint32_t lmem_num_reqs = lmem_tcu_port + VX_CFG_EXT_TCU_ENABLED;
+#ifdef DXA_MBAR_ENABLE
+    static_assert(LMEM_DXA_ROW_PORT == LMEM_DXA_PORT + DxaCore::LMEM_PORTS_PER_CORE + VX_CFG_EXT_TCU_ENABLED,
+                  "the DXA row port follows the DXA's and the TCU's");
+    lmem_num_reqs = LMEM_DXA_ROW_PORT + 1;
+#elif defined(VX_CFG_EXT_DXA_ENABLE)
+#line 148
+#else
+#line 143
+#endif
     local_mem_ = LocalMem::Create(sname, LocalMem::Config{
       (1 << VX_CFG_LMEM_LOG_SIZE),
       LSU_WORD_SIZE,
@@ -165,6 +174,7 @@ public:
     #endif
     #ifdef DXA_MBAR_ENABLE
       , LMEM_DXA_COMPL_PORT
+      , LMEM_DXA_ROW_PORT
     #elif defined(VX_CFG_EXT_DLMEM_ENABLE)
     #line 156
     #else

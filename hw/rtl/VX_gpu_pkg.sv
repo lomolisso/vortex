@@ -1562,8 +1562,10 @@ package VX_gpu_pkg;
         logic                          mode;     // 1: complete_tx on an mbarrier
         logic [DXA_ATTR_PAYLOAD_W-1:0] payload;  // barrier address, or mbarrier word offset
         logic [DXA_TX_BYTES_W-1:0]     tx_bytes;
-        logic [NW_WIDTH-1:0]           slot;
+        logic [NW_WIDTH-1:0]           slot;     // a row flit's: the destination slot
         logic [DXA_CTA_GEN_W-1:0]      gen;
+        logic                          remote;   // the copy's rows leave on the DLMEM network
+        logic [DLMEM_CORE_W-1:0]       dst_core;
     } dxa_lmem_attr_t;
 
     localparam DXA_LMEM_ATTR_W = $bits(dxa_lmem_attr_t);
@@ -1591,7 +1593,13 @@ package VX_gpu_pkg;
     localparam LMEM_DMA_ATTR_W     = `MAX(DXA_LMEM_ATTR_W, TCU_LMEM_ATTR_W);
     localparam LMEM_DMA_DXA_IDX    = 0;
     localparam LMEM_DMA_TCU_IDX    = LMEM_DMA_DXA_IDX + `VX_CFG_EXT_DXA_ENABLED;
+`ifdef DXA_MBAR_ENABLE
+    // Row flits of remote DXA copies, from the DLMEM ingress, last in priority.
+    localparam LMEM_DMA_ROW_IDX    = LMEM_DMA_TCU_IDX + `VX_CFG_TCU_WGMMA_ENABLED;
+    localparam LMEM_DMA_INPUTS     = LMEM_DMA_ROW_IDX + 1;
+`else
     localparam LMEM_DMA_INPUTS     = `VX_CFG_EXT_DXA_ENABLED + `VX_CFG_TCU_WGMMA_ENABLED;
+`endif
     localparam LMEM_DMA_IN_TAG_MAX = `MAX(DXA_LMEM_OUT_TAG_W, TCU_LMEM_TAG_W);
     localparam LMEM_DMA_TAG_WIDTH  = LMEM_DMA_IN_TAG_MAX + `ARB_SEL_BITS(LMEM_DMA_INPUTS, 1);
 

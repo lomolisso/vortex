@@ -748,6 +748,10 @@ private:
       }
       set_bits(t->wr_stride, 0, lmem_log_ + 1, wr_stride_);
     }
+  #if defined(VX_CFG_EXT_DXA_ENABLE) && defined(VX_CFG_EXT_MBAR_ENABLE)
+    dxa_slot_ = below(nw_);
+    set_bits(t->dxa_rd_slot, 0, nw_w_, dxa_slot_);
+  #endif
     for (uint32_t w = 0; w < nw_; ++w) {
       set_bits(t->drained, w, 1, drained_[w]);
       set_bits(t->lmem_acc_drained, w, 1, lacc_drained_[w]);
@@ -880,6 +884,28 @@ private:
         this->fail(strf("slot_base[%u] = 0x%" PRIx64 ", expected 0x%" PRIx64, s, got, want));
       }
     }
+  #if defined(VX_CFG_EXT_DXA_ENABLE) && defined(VX_CFG_EXT_MBAR_ENABLE)
+    // The DXA read port: any slot's row, the same bases and stride.
+    {
+      const TblRow& row = rows_[dxa_slot_];
+      if (get_bits(t->dxa_rd_k, 0, k_w_) != row.k) {
+        this->fail(strf("dxa port: slot %u k=%" PRIu64 ", expected %u", dxa_slot_, get_bits(t->dxa_rd_k, 0, k_w_), row.k));
+      }
+      for (uint32_t r = 0; r < row.k; ++r) {
+        uint64_t core = get_bits(t->dxa_rd_core, r * core_w_, core_w_);
+        uint64_t slot = get_bits(t->dxa_rd_pslot, r * nw_w_, nw_w_);
+        if (core != row.peers[r].core || slot != row.peers[r].slot) {
+          this->fail(strf("dxa port: slot %u peer %u = {core %" PRIu64 ", slot %" PRIu64 "}, expected {%u, %u}",
+                          dxa_slot_, r, core, slot, row.peers[r].core, row.peers[r].slot));
+        }
+      }
+      if (get_field(t->dxa_slot_base, 0, nw_ * lmem_log_) != get_field(t->tbl_slot_base, 0, nw_ * lmem_log_)
+       || get_bits(t->dxa_stride, 0, lmem_log_ + 1) != stride_) {
+        this->fail("dxa port: slot bases or stride differ from the table's");
+      }
+      n_dxa_reads_ += (row.k != 0);
+    }
+  #endif
 
     for (uint32_t b = 0; b < nb_; ++b) {
       auto& q = queue_[b];
@@ -1218,6 +1244,9 @@ private:
     std::printf("random: %" PRIu64 " cycles, %" PRIu64 " requests in, %" PRIu64 " out, %" PRIu64 " fences, "
                 "%" PRIu64 " row writes, %" PRIu64 " stalled output cycles, max occupancy %zu\n",
                 cycle_, n_in_, n_out_, n_fence_, n_writes_, n_stall_, max_occ_);
+  #if defined(VX_CFG_EXT_DXA_ENABLE) && defined(VX_CFG_EXT_MBAR_ENABLE)
+    std::printf("random: %" PRIu64 " DXA port reads of a written row\n", n_dxa_reads_);
+  #endif
     std::printf("random: %" PRIu64 " fences held for %" PRIu64 " cycles, %" PRIu64 " right behind their warp's "
                 "remote access, %" PRIu64 " acknowledgements\n", n_fence_held_, n_held_cycles_, n_b2b_, n_acks_);
     std::printf("random: lanes NONE %" PRIu64 ", LOCAL %" PRIu64 ", REMOTE %" PRIu64 ", OOB %" PRIu64
@@ -1847,6 +1876,8 @@ private:
   uint32_t stride_ = 0;
   std::optional<std::pair<uint32_t, TblRow>> wr_;
   uint32_t wr_stride_ = 0;
+  uint32_t dxa_slot_ = 0;
+  uint64_t n_dxa_reads_ = 0;
 
   std::vector<std::optional<Request>> offer_;
   std::vector<std::deque<Request>> queue_;

@@ -16,6 +16,11 @@
 #include <memory>
 #include "types.h"
 #include "dxa_unit.h"
+#ifdef DXA_MBAR_ENABLE
+#include "dlmem/dlmem_types.h"
+#else
+#line 18
+#endif
 
 namespace vortex {
 
@@ -79,6 +84,14 @@ public:
   // Per core, the raw barriers of copies finished without a write, to its
   // DXA completion unit.
   std::vector<SimChannel<uint32_t>> compl_release_out;
+#ifdef DXA_MBAR_ENABLE
+
+  // The row egress: the flits of copies into a block on another core of the
+  // cluster, posted into the socket's DLMEM request switch, one per cycle.
+  SimChannel<DlmemReqPkt> row_out;
+#else
+#line 81
+#endif
 #else
 #line 76
 #endif

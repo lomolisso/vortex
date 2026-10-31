@@ -27,6 +27,10 @@ module VX_dxa_core import VX_gpu_pkg::*, VX_dxa_pkg::*; #(
     VX_dxa_req_bus_if.slave req_bus_if[NUM_REQS],
     VX_mem_bus_if.master gmem_bus_if[GMEM_OUT_PORTS],
     VX_mem_bus_if.master smem_bus_if[1],
+`ifdef DXA_MBAR_ENABLE
+    // Rows of copies into another core's block, as DLMEM request flits.
+    VX_dlmem_bus_if.master row_out_if,
+`endif
     output wire busy
 );
     `UNUSED_SPARAM (INSTANCE_ID)
@@ -194,6 +198,15 @@ module VX_dxa_core import VX_gpu_pkg::*, VX_dxa_pkg::*; #(
         .bus_out_if (gmem_bus_if)
     );
 
+`ifdef DXA_MBAR_ENABLE
+    VX_mem_bus_if #(
+        .DATA_SIZE   (DXA_LMEM_WORD_SIZE),
+        .TAG_WIDTH   (DXA_LMEM_OUT_TAG_W),
+        .ATTR_WIDTH  (DXA_LMEM_ATTR_W),
+        .ADDR_WIDTH  (DXA_LMEM_ADDR_W)
+    ) lmem_arb_out_if[1]();
+`endif
+
     VX_mem_bus_arb #(
         .NUM_INPUTS  (`VX_CFG_NUM_DXA_CORES),
         .NUM_OUTPUTS (1),
@@ -212,8 +225,43 @@ module VX_dxa_core import VX_gpu_pkg::*, VX_dxa_pkg::*; #(
         .clk        (clk),
         .reset      (reset),
         .bus_in_if  (worker_smem_bus_if),
+    `ifdef DXA_MBAR_ENABLE
+        .bus_out_if (lmem_arb_out_if)
+    `else
         .bus_out_if (smem_bus_if)
+    `endif
     );
+
+`ifdef DXA_MBAR_ENABLE
+    // A remote copy's beats leave through the row egress, the rest to the cores.
+    dxa_lmem_attr_t arb_out_attr;
+    assign arb_out_attr = dxa_lmem_attr_t'(lmem_arb_out_if[0].req_data.attr);
+    wire arb_out_remote = arb_out_attr.remote;
+    wire row_beat_ready;
+
+    assign smem_bus_if[0].req_valid = lmem_arb_out_if[0].req_valid && ~arb_out_remote;
+    assign smem_bus_if[0].req_data  = lmem_arb_out_if[0].req_data;
+    assign lmem_arb_out_if[0].req_ready = arb_out_remote ? row_beat_ready : smem_bus_if[0].req_ready;
+    assign lmem_arb_out_if[0].rsp_valid = smem_bus_if[0].rsp_valid;
+    assign lmem_arb_out_if[0].rsp_data  = smem_bus_if[0].rsp_data;
+    assign smem_bus_if[0].rsp_ready = lmem_arb_out_if[0].rsp_ready;
+
+    VX_dlmem_row_egress #(
+        .INSTANCE_ID (`SFORMATF(("%s-row-egress", INSTANCE_ID))),
+        .TAG_WIDTH   (DXA_LMEM_OUT_TAG_W)
+    ) row_egress (
+        .clk         (clk),
+        .reset       (reset),
+        .beat_valid  (lmem_arb_out_if[0].req_valid && arb_out_remote),
+        .beat_addr   (lmem_arb_out_if[0].req_data.addr),
+        .beat_data   (lmem_arb_out_if[0].req_data.data),
+        .beat_byteen (lmem_arb_out_if[0].req_data.byteen),
+        .beat_attr   (arb_out_attr),
+        .beat_tag    (lmem_arb_out_if[0].req_data.tag),
+        .beat_ready  (row_beat_ready),
+        .row_out_if  (row_out_if)
+    );
+`endif
 
     // ================================================================
     // Busy / perf

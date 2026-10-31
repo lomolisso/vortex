@@ -56,6 +56,8 @@ module VX_mem_unit import VX_gpu_pkg::*; #(
     input wire [`VX_CFG_NUM_WARPS-1:0]                    cta_slot_valid,
     input wire [`VX_CFG_NUM_WARPS-1:0][DXA_CTA_GEN_W-1:0] cta_slot_gen,
     input wire [`VX_CFG_LMEM_LOG_SIZE:0]                  cta_slot_stride,
+    // Data words of remote DXA copies, from the DLMEM ingress
+    VX_mem_bus_if.slave                                   dlmem_dma_if,
 `endif
 
     output wire             empty,
@@ -278,6 +280,11 @@ module VX_mem_unit import VX_gpu_pkg::*; #(
     `endif
     `ifdef VX_CFG_TCU_WGMMA_ENABLE
         `ASSIGN_VX_MEM_BUS_IF_EX (dma_arb_in_if[LMEM_DMA_TCU_IDX], tcu_lmem_if, LMEM_DMA_IN_TAG_W, TCU_LMEM_TAG_W, UUID_WIDTH);
+    `endif
+    `ifdef DXA_MBAR_ENABLE
+        // No buffer: the ingress takes the next flit only once the bank has
+        // committed this one, which keeps a copy's completion behind its data.
+        `ASSIGN_VX_MEM_BUS_IF (dma_arb_in_if[LMEM_DMA_ROW_IDX], dlmem_dma_if);
     `endif
 
         VX_mem_bus_arb #(

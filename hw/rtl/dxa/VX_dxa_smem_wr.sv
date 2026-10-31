@@ -744,6 +744,8 @@ module VX_dxa_smem_wr import VX_gpu_pkg::*, VX_dxa_pkg::*; #(
     assign smem_wr_attr.tx_bytes = active_compl.tx_bytes;
     assign smem_wr_attr.slot     = active_compl.slot;
     assign smem_wr_attr.gen      = active_compl.gen;
+    assign smem_wr_attr.remote   = active_compl.remote;
+    assign smem_wr_attr.dst_core = active_compl.dst_core;
     assign smem_bus_if.req_data.attr   = smem_wr_attr;
 `else
     assign smem_bus_if.req_data.attr   = {smem_wr_attr_last, smem_wr_attr_bar};

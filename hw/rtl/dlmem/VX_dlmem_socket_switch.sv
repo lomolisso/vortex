@@ -23,6 +23,11 @@ module VX_dlmem_socket_switch #(
     parameter SOCKET_IDX  = 0,
     parameter DATAW       = 1,
     parameter DST_W       = 1,
+`ifdef DXA_MBAR_ENABLE
+    // 1: the socket's DXA row egress is one more input, after the uplink.
+    // Nothing is addressed to it, so it has no output.
+    parameter ROW_IN      = 0,
+`endif
     parameter OUT_BUF     = 3
 ) (
     input wire              clk,
@@ -30,6 +35,10 @@ module VX_dlmem_socket_switch #(
 
     VX_dlmem_bus_if.slave   core_in_if [SOCKET_SIZE],
     VX_dlmem_bus_if.master  core_out_if [SOCKET_SIZE],
+
+`ifdef DXA_MBAR_ENABLE
+    VX_dlmem_bus_if.slave   row_in_if,
+`endif
 
     VX_dlmem_bus_if.slave   uplink_in_if,
     VX_dlmem_bus_if.master  uplink_out_if
@@ -40,6 +49,10 @@ module VX_dlmem_socket_switch #(
     localparam UPLINK     = SOCKET_SIZE;
     localparam SEL_W      = `LOG2UP(NUM_PORTS);
     localparam PKT_W      = DST_W + DATAW;
+`ifdef DXA_MBAR_ENABLE
+    localparam NUM_IN     = NUM_PORTS + ROW_IN;
+    localparam ROW_PORT   = NUM_PORTS;
+`endif
 
     `STATIC_ASSERT (SOCKET_IDX < NUM_SOCKETS, ("invalid parameter"))
     `STATIC_ASSERT (DST_W >= `CLOG2(NCC), ("invalid parameter"))
@@ -52,10 +65,17 @@ module VX_dlmem_socket_switch #(
         in_socket = ((32'(dst) / SOCKET_SIZE) == SOCKET_IDX);
     endfunction
 
+`ifdef DXA_MBAR_ENABLE
+    wire [NUM_IN-1:0]                valid_in;
+    wire [NUM_IN-1:0][PKT_W-1:0]     data_in;
+    wire [NUM_IN-1:0][SEL_W-1:0]     sel_in;
+    wire [NUM_IN-1:0]                ready_in;
+`else
     wire [NUM_PORTS-1:0]             valid_in;
     wire [NUM_PORTS-1:0][PKT_W-1:0]  data_in;
     wire [NUM_PORTS-1:0][SEL_W-1:0]  sel_in;
     wire [NUM_PORTS-1:0]             ready_in;
+`endif
 
     wire [NUM_PORTS-1:0]             valid_out;
     wire [NUM_PORTS-1:0][PKT_W-1:0]  data_out;
@@ -110,10 +130,36 @@ module VX_dlmem_socket_switch #(
             ("%t: dlmem switch %0d: packet on the uplink of a single-socket cluster", $time, SOCKET_IDX))
     end
 
+`ifdef DXA_MBAR_ENABLE
+    if (ROW_IN != 0) begin : g_row_in
+        wire [DST_W-1:0] row_dst = row_in_if.dst;
+        assign valid_in[ROW_PORT] = row_in_if.valid;
+        assign data_in[ROW_PORT]  = {row_dst, row_in_if.data};
+        if (HAS_UPLINK) begin : g_route
+            assign sel_in[ROW_PORT] = in_socket(row_dst) ? core_port(row_dst) : SEL_W'(UPLINK);
+        end else begin : g_local
+            assign sel_in[ROW_PORT] = core_port(row_dst);
+        end
+        assign row_in_if.ready = ready_in[ROW_PORT];
+
+        `RUNTIME_ASSERT (~row_in_if.valid || (32'(row_dst) < NCC),
+            ("%t: dlmem switch %0d: DXA rows sent to core %0d, outside the cluster (%0d cores)", $time, SOCKET_IDX, row_dst, NCC))
+    end else begin : g_no_row_in
+        assign row_in_if.ready = 1'b0;
+        `UNUSED_VAR (row_in_if.valid)
+        `UNUSED_VAR (row_in_if.data)
+        `UNUSED_VAR (row_in_if.dst)
+    end
+`endif
+
     // MAX_FANOUT 0: one flat arbiter per output at any port count, so a hop
     // stays one registered stage; the fan-out tree adds a stage above 12 ports.
     VX_stream_xbar #(
+    `ifdef DXA_MBAR_ENABLE
+        .NUM_INPUTS  (NUM_IN),
+    `else
         .NUM_INPUTS  (NUM_PORTS),
+    `endif
         .NUM_OUTPUTS (NUM_PORTS),
         .DATAW       (PKT_W),
         .ARBITER     ("R"),

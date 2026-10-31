@@ -30,7 +30,7 @@ CtaDispatcher::CtaDispatcher(const SimContext& ctx, const char* name, Core* core
   , PeerWrOut(this)
 #endif
 #ifdef DXA_MBAR_ENABLE
-  , DxaSlotOut(2, SimChannel<CtaSlotEvt>(this, 4 * VX_CFG_NUM_WARPS + 8))
+  , DxaSlotOut(3, SimChannel<CtaSlotEvt>(this, 4 * VX_CFG_NUM_WARPS + 8))
 #else
 #line 31
 #endif
@@ -188,7 +188,7 @@ bool CtaDispatcher::step(const WarpMask& active_warps, uint32_t* wid_out, cta_wa
       }
       wid_to_slot_[free_wid] = cur_slot_;
 #ifdef DXA_MBAR_ENABLE
-      this->dxa_slot_evt({CtaSlotEvt::WARP, cur_slot_, 0, 0, uint32_t(free_wid)}, 1, false);
+      this->dxa_slot_evt({CtaSlotEvt::WARP, cur_slot_, 0, 0, uint32_t(free_wid), {}}, 1, false);
 #else
 #line 174
 #endif
@@ -331,7 +331,7 @@ void CtaDispatcher::admit(uint64_t now) {
 #endif
 #ifdef DXA_MBAR_ENABLE
   dxa_gen_[base] = (dxa_gen_[base] + 1) & ((1u << DXA_CTA_GEN_BITS) - 1);
-  this->dxa_slot_evt({CtaSlotEvt::ADMIT, base, dxa_gen_[base], stride, 0}, 1, true);
+  this->dxa_slot_evt({CtaSlotEvt::ADMIT, base, dxa_gen_[base], stride, 0, peer_row_[base]}, 1, true);
 #else
 #line 311
 #endif
@@ -363,7 +363,7 @@ void CtaDispatcher::warp_done(uint32_t wid) {
 #ifdef DXA_MBAR_ENABLE
   if (slot_rem_warps_[slot] == 0) {
     // The slot is free once its warp count is written back.
-    this->dxa_slot_evt({CtaSlotEvt::FREE, slot, 0, 0, 0}, RETIRE_DELAY + (evt_[slot] ? 1 : 0), true);
+    this->dxa_slot_evt({CtaSlotEvt::FREE, slot, 0, 0, 0, {}}, RETIRE_DELAY + (evt_[slot] ? 1 : 0), true);
   }
 #else
 #line 336
@@ -466,6 +466,7 @@ void CtaDispatcher::next_warp(bool do_init, cta_warp_record_t* out) {
 void CtaDispatcher::dxa_slot_evt(const CtaSlotEvt& e, uint64_t delay, bool to_compl) {
   if (to_compl) {
     DxaSlotOut.at(0).send(e, delay);
+    DxaSlotOut.at(2).send(e, delay);
   }
   DxaSlotOut.at(1).send(e, delay);
 }

@@ -151,6 +151,12 @@ public:
   void reset() {
     cycle_ = 0;
     queue_.clear();
+#ifdef DXA_MBAR_ENABLE
+    stream_.clear();
+    row_flits_.clear();
+#else
+#line 153
+#endif
     std::fill(beat_seq_.begin(), beat_seq_.end(), 0);
     perf_stats_ = DxaCore::PerfStats();
     for (auto& w : workers_) {
@@ -239,6 +245,11 @@ public:
       }
     }
 
+#ifdef DXA_MBAR_ENABLE
+    this->tick_stream();
+#else
+#line 241
+#endif
     // 2) Tick workers (smem_wr drain → gmem_req issue).
     for (auto& w : workers_) {
       if (w.state == WState::RUNNING) {
@@ -391,6 +402,10 @@ private:
 #ifdef DXA_MBAR_ENABLE
     if (req.mode) {
       w.tx_bytes = this->box_bytes(w);
+      if (req.win && w.tx_bytes > req.win_room) {
+        this->dxa_abort(w, "DXA box exceeds the destination block: " + std::to_string(w.tx_bytes)
+                        + " bytes, room " + std::to_string(req.win_room));
+      }
     }
 #endif
 
@@ -662,6 +677,13 @@ private:
 
     // Determine destination core's LMEM port group.
     uint32_t socket_local_cid = w.req.core->id() % kCoresPerSocket;
+#ifdef DXA_MBAR_ENABLE
+    // A beat for the row egress, or one behind a beat still in the socket's
+    // stream, queues in that stream; any other goes straight to its core.
+    const bool to_stream = w.req.remote || !stream_.empty();
+#else
+#line 664
+#endif
 
     // One drain beat per cycle covers one aligned LMEM row
     // (DxaCore::LMEM_ROW_SIZE bytes — the full banked row the RTL writes in
@@ -674,11 +696,16 @@ private:
     // never half-written. The row spans LMEM_PORTS_PER_CORE channels that fill
     // independently, so gate the beat on the whole group being ready instead of
     // stranding the half already sent.
+#ifdef DXA_MBAR_ENABLE
+    if (to_stream ? stream_.full() : !this->core_inputs_ready(socket_local_cid))
+      return;
+#else
+#line 676
     for (uint32_t p = 0; p < DxaCore::LMEM_PORTS_PER_CORE; ++p) {
       if (simobject_->lmem_req_out.at(socket_local_cid * DxaCore::LMEM_PORTS_PER_CORE + p).full())
         return;
     }
-
+#endif
     constexpr uint64_t kRowMask = ~uint64_t(DxaCore::LMEM_ROW_SIZE - 1);
     uint64_t beat_row = UINT64_MAX;
     // The beat's writes go out together, so that each carries whether the
@@ -751,6 +778,21 @@ private:
       uint32_t half = (DxaCore::LMEM_PORTS_PER_CORE > 1)
           ? uint32_t((dword / kLmemWordSize) & (DxaCore::LMEM_PORTS_PER_CORE - 1))
           : 0u;
+#ifdef DXA_MBAR_ENABLE
+      // A stream beat takes one entry whole, checked above.
+      if (!to_stream) {
+        auto& lmem_ch = simobject_->lmem_req_out.at(
+            socket_local_cid * DxaCore::LMEM_PORTS_PER_CORE + half);
+        uint32_t port_queued = 0;
+        for (uint32_t k = 0; k < beat_writes; ++k) {
+          port_queued += (beat_port.at(k) == socket_local_cid * DxaCore::LMEM_PORTS_PER_CORE + half);
+        }
+        if (lmem_ch.size() + port_queued >= lmem_ch.capacity()) {
+          break; // backpressure
+        }
+      }
+#else
+#line 753
       auto& lmem_ch = simobject_->lmem_req_out.at(
           socket_local_cid * DxaCore::LMEM_PORTS_PER_CORE + half);
       uint32_t port_queued = 0;
@@ -760,7 +802,7 @@ private:
       if (lmem_ch.size() + port_queued >= lmem_ch.capacity()) {
         break; // backpressure
       }
-
+#endif
       // Build LMEM MemReq with TLM payload.
       MemReq req;
       req.addr   = dword;
@@ -810,6 +852,11 @@ private:
       req.dxa.tx_bytes = w.tx_bytes;
       req.dxa.slot     = w.req.slot;
       req.dxa.gen      = w.req.gen;
+      req.dxa.remote   = w.req.remote;
+      req.dxa.src_core = w.req.src_core;
+      req.dxa.dst_core = w.req.dst_core;
+#else
+#line 813
 #endif
       if (is_last_work && is_last_elem && (w.is_multicast || is_last_replay)) {
         req.flags.dxa_notify_done   = 1;
@@ -851,6 +898,26 @@ private:
       }
     } // per-tick row-beat emission loop
 
+#ifdef DXA_MBAR_ENABLE
+    if (to_stream && beat_writes != 0) {
+      StreamBeat sb;
+      sb.remote = w.req.remote;
+      sb.core   = socket_local_cid;
+      sb.count  = beat_writes;
+      sb.ready  = cycle_ + 1;
+      const uint32_t id = w.req.remote ? 0 : beat_seq_.at(socket_local_cid)++;
+      for (uint32_t k = 0; k < beat_writes; ++k) {
+        beat.at(k).dxa.beat = id;
+        beat.at(k).dxa.last = beat_last;
+        sb.writes.at(k) = beat.at(k);
+        sb.ports.at(k)  = beat_port.at(k);
+      }
+      stream_.push(sb);
+      return;
+    }
+#else
+#line 853
+#endif
     if (beat_writes != 0) {
       const uint32_t id = beat_seq_.at(socket_local_cid)++;
       for (uint32_t k = 0; k < beat_writes; ++k) {
@@ -868,6 +935,131 @@ private:
               << " wid=" << w.req.wid << " desc=" << w.req.desc_slot
               << " (#" << w.req.uuid << ")" << std::endl;
     std::abort();
+  }
+
+  // A beat of the socket's stream (below).
+  struct StreamBeat {
+    std::array<MemReq, DxaCore::LMEM_PORTS_PER_CORE>   writes;
+    std::array<uint32_t, DxaCore::LMEM_PORTS_PER_CORE> ports;   // a local beat's core inputs
+    uint32_t count  = 0;
+    uint32_t core   = 0;
+    bool     remote = false;
+    uint64_t ready  = 0;   // the cycle it reaches the arbiter output
+  };
+
+  bool core_inputs_ready(uint32_t core) const {
+    for (uint32_t p = 0; p < DxaCore::LMEM_PORTS_PER_CORE; ++p) {
+      if (simobject_->lmem_req_out.at(core * DxaCore::LMEM_PORTS_PER_CORE + p).full())
+        return false;
+    }
+    return true;
+  }
+
+  bool core_inputs_empty() const {
+    for (const auto& ch : simobject_->lmem_req_out) {
+      if (ch.size() != 0)
+        return false;
+    }
+    return true;
+  }
+
+  // The RTL engine's beats leave through one arbiter output, two deep, split at
+  // its head between the cores' DMA ports and the row egress. While a beat is
+  // in this stream every later beat queues behind it; with the stream empty a
+  // local beat goes straight to its core, as before. A local head moves to its
+  // core's DXA input. A remote head starts once the beats ahead of it have left
+  // the core inputs, and the row egress keeps it until its last flit has gone:
+  // one flit per cycle, a DATA flit per bank word the beat writes, in bank
+  // order, and after a copy's final beat its COMPL. A flit's send is its offer
+  // at the request switch's DXA input, which holds two, as the RTL egress's
+  // output buffer does.
+  void tick_stream() {
+    auto& out = simobject_->row_out;
+    if (!row_flits_.empty()) {
+      if (out.full())
+        return;
+      DT(3, simobject_->name() << " row flit: " << row_flits_.front());
+      out.send(row_flits_.front(), 0);
+      row_flits_.pop_front();
+      if (!row_flits_.empty())
+        return;
+      stream_.pop();
+    }
+    if (stream_.empty() || stream_.front().ready > cycle_)
+      return;
+    const StreamBeat& head = stream_.front();
+    if (!head.remote) {
+      if (!this->core_inputs_ready(head.core))
+        return;
+      for (uint32_t k = 0; k < head.count; ++k) {
+        simobject_->lmem_req_out.at(head.ports.at(k)).send(head.writes.at(k), 0);
+      }
+      stream_.pop();
+      return;
+    }
+    if (!this->core_inputs_empty())
+      return;
+    this->load_row_beat(head);
+    // A beat with neither data nor a completion leaves at once.
+    if (row_flits_.empty()) {
+      stream_.pop();
+    }
+  }
+
+  void load_row_beat(const StreamBeat& head) {
+    std::vector<const MemReq*> writes;
+    for (uint32_t k = 0; k < head.count; ++k) {
+      writes.push_back(&head.writes.at(k));
+    }
+    std::sort(writes.begin(), writes.end(),
+              [](const MemReq* a, const MemReq* b) { return a->addr < b->addr; });
+    constexpr uint64_t lmem_mask = (uint64_t(1) << VX_CFG_LMEM_LOG_SIZE) - 1;
+    constexpr uint32_t word = VX_CFG_XLEN / 8;
+    for (const MemReq* wr : writes) {
+      for (uint32_t off = 0; off < VX_CFG_MEM_BLOCK_SIZE; off += word) {
+        const uint64_t be = (wr->byteen >> off) & ((uint64_t(1) << word) - 1);
+        if (be == 0) {
+          continue;
+        }
+        auto blk = make_mem_block();
+        std::memset(blk->data(), 0, blk->size());
+        std::memcpy(blk->data() + off, wr->data->data() + off, word);
+        DlmemReqPkt f;
+        f.dst       = wr->dxa.dst_core;
+        f.src       = wr->dxa.src_core;
+        f.op        = MemOp::ST;
+        f.lmem_addr = (wr->addr + off) & lmem_mask;
+        f.data      = blk;
+        f.byteen    = be << off;
+        f.hart_id   = 0;
+        f.tag       = wr->dxa.slot;
+        f.uuid      = wr->uuid;
+        f.dxa       = true;
+        row_flits_.push_back(f);
+      }
+    }
+    const MemReq& last = *writes.back();
+    if (last.dxa.last) {
+      const uint64_t addr = uint64_t(last.dxa.mbar_off) << 3;
+      const uint32_t off  = uint32_t(addr & (VX_CFG_MEM_BLOCK_SIZE - 1));
+      auto blk = make_mem_block();
+      std::memset(blk->data(), 0, blk->size());
+      const uint64_t bytes = last.dxa.tx_bytes;
+      std::memcpy(blk->data() + off, &bytes, sizeof(bytes));
+      DlmemReqPkt f;
+      f.dst       = last.dxa.dst_core;
+      f.src       = last.dxa.src_core;
+      f.op        = MemOp::MBAR_COMPLETE_TX;
+      f.lmem_addr = addr & lmem_mask;
+      f.data      = blk;
+      f.byteen    = uint64_t(0xff) << off;
+      f.hart_id   = 0;
+      f.tag       = last.dxa.slot;
+      f.uuid      = last.uuid;
+      f.dxa       = true;
+      f.flags.amo_unsigned = 1;
+      row_flits_.push_back(f);
+    }
   }
 
   // The bytes an mbarrier copy completes with: the full box, rank-limited,
@@ -933,6 +1125,12 @@ private:
   uint32_t               rr_req_ = 0;
   uint32_t               xfer_seq_ = 1;
   std::vector<uint32_t>  beat_seq_ = std::vector<uint32_t>(kCoresPerSocket, 0);  // per core
+#ifdef DXA_MBAR_ENABLE
+  RingQueue<StreamBeat>   stream_{2};
+  std::deque<DlmemReqPkt> row_flits_;   // the row egress's flits of its head beat
+#else
+#line 935
+#endif
   uint64_t               cycle_;
   DxaCore::PerfStats     perf_stats_;
 };
@@ -948,6 +1146,11 @@ DxaCore::DxaCore(const SimContext& ctx, const char* name, Socket* socket)
   , gmem_rsp_in(kDxaMemPorts, this)
   , lmem_req_out(kCoresPerSocket * LMEM_PORTS_PER_CORE, this)
   , compl_release_out(kCoresPerSocket, this)
+#ifdef DXA_MBAR_ENABLE
+  , row_out(this)
+#else
+#line 950
+#endif
 {
   __unused(socket);
 

@@ -22,6 +22,12 @@
 #include "dxa_compl.h"
 #include "local_mem.h"
 #include "sfu_unit.h"
+#ifdef DXA_MBAR_ENABLE
+#include "scheduler.h"
+#include "cta_dispatcher.h"
+#else
+#line 24
+#endif
 #else
 #line 24
 #endif
@@ -409,6 +415,20 @@ public:
       }
       dxa_core_->compl_release_out.at(c).bind(&core->dxa_compl()->ReleaseIn);
     }
+#ifdef DXA_MBAR_ENABLE
+    // Copies into a block on another core of the cluster: the engine's row
+    // egress feeds the DLMEM request switch, and each core's ingress writes a
+    // peer's DXA words through a DMA port of its local memory.
+    dxa_core_->row_out.bind(&dlmem_req_switch_->DxaIn);
+    for (uint32_t c = 0; c < cores_per_socket; ++c) {
+      Core* core = cores_.at(c).get();
+      auto& ingress = dlmem_ingress_.at(c);
+      ingress->LmemDmaOut.bind(&core->local_mem()->Inputs.at(Core::LMEM_DXA_ROW_PORT));
+      core->scheduler().cta_dispatcher()->DxaSlotOut.at(2).bind(&ingress->SlotIn);
+    }
+#else
+#line 411
+#endif
 #else
 #line 417
 #endif

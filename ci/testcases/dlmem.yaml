@@ -603,6 +603,270 @@ tests:
     shape: {clusters: 2, cores: 2, warps: 8, l3cache: true}
     args: "-k 2 -w 2 -n 2 -i 4 -s 16 -r 9"
 
+  # --- DXA copies into a peer block (dlmem_dxa) ---
+  # Block r copies a tile from global memory into rank (r + 1) % K through the
+  # window, completing on an mbarrier in the destination block, which armed it
+  # with arrive_tx of the box bytes before the cluster barrier and then waits
+  # for the phase. A copy to another core travels as word flits over the
+  # request network; one to the issuer's own core takes the local path into
+  # the peer's slot. The host checks every block's whole local memory byte for
+  # byte (the tile, and canaries everywhere else) and the final mbarrier word
+  # against mbar_ref. Tiles with odd extents end rows inside a bank word.
+  - id: dlmem_dxa-2c
+    app: dlmem_dxa
+    drivers: [simx, rtlsim]
+    configs+: "-DVX_CFG_EXT_A_ENABLE -DVX_CFG_EXT_MBAR_ENABLE -DVX_CFG_EXT_DXA_ENABLE"
+    touches: &dlmem_dxa_touches [hw/rtl/dxa, hw/rtl/dlmem, hw/rtl/VX_socket.sv,
+              hw/rtl/VX_gpu_pkg.sv, hw/rtl/VX_define.vh, hw/rtl/core/VX_core.sv,
+              hw/rtl/core/VX_execute.sv, hw/rtl/core/VX_sfu_unit.sv,
+              hw/rtl/core/VX_mem_unit.sv, hw/rtl/core/VX_cta_dispatch.sv,
+              hw/rtl/core/VX_wctl_unit.sv, hw/rtl/core/VX_bar_unit.sv,
+              hw/rtl/core/VX_scheduler.sv, hw/rtl/core/VX_lsu_slice.sv,
+              hw/rtl/mem/VX_local_mem.sv, hw/rtl/mem/VX_lmem_switch.sv,
+              hw/rtl/cache/VX_amo_alu.sv, hw/rtl/cache/VX_amo_unit.sv, hw/rtl/interfaces,
+              hw/rtl/VX_kmu.sv, hw/rtl/Vortex.sv, hw/rtl/VX_cluster.sv,
+              sim/simx/dxa, sim/simx/dlmem, sim/simx/core, sim/simx/socket,
+              sim/simx/cluster, sim/simx/processor.cpp, sim/simx/cta_dispatcher,
+              sim/simx/kmu, sim/simx/mem/local_mem, sim/simx/types.h, sim/simx/mbar_waiters,
+              sim/simx/amo, sim/simx/sfu_unit, sim/simx/scheduler, sim/simx/barrier_unit,
+              sim/simx/lsu_unit, sim/simx/Makefile, sw/kernel/include/vx_dxa.h,
+              sw/kernel/include/vx_mbar.h, sw/kernel/include/vx_dlmem.h,
+              sw/common/mbar_ref.h, sw/common/dlmem_ref.h, sw/runtime/include/dxa.h,
+              tests/regression/dlmem_dxa, tests/regression/dlmem_stress, VX_config.toml]
+    shape: {cores: 2, l2cache: true}
+    args: "-k 2 -n 2"
+  - id: dlmem_dxa-4c
+    app: dlmem_dxa
+    drivers: [simx, rtlsim]
+    configs+: "-DVX_CFG_EXT_A_ENABLE -DVX_CFG_EXT_MBAR_ENABLE -DVX_CFG_EXT_DXA_ENABLE"
+    touches: *dlmem_dxa_touches
+    shape: {cores: 4, l2cache: true}
+    args: "-k 4 -n 2"
+  # Two sockets of two cores: K = 4 crosses the cluster crossbar, K = 2 pairs
+  # also stay inside one socket's switch.
+  - id: dlmem_dxa-4c-s2
+    app: dlmem_dxa
+    drivers: [simx, rtlsim]
+    configs+: "-DVX_CFG_EXT_A_ENABLE -DVX_CFG_EXT_MBAR_ENABLE -DVX_CFG_EXT_DXA_ENABLE -DVX_CFG_SOCKET_SIZE=2"
+    touches: *dlmem_dxa_touches
+    shape: {cores: 4, l2cache: true}
+    args: "-k 4 -n 2"
+  - id: dlmem_dxa-4c-s2-k2
+    app: dlmem_dxa
+    drivers: [simx, rtlsim]
+    configs+: "-DVX_CFG_EXT_A_ENABLE -DVX_CFG_EXT_MBAR_ENABLE -DVX_CFG_EXT_DXA_ENABLE -DVX_CFG_SOCKET_SIZE=2"
+    touches: *dlmem_dxa_touches
+    shape: {cores: 4, l2cache: true}
+    args: "-k 2 -n 4"
+  # DEFAULT clusters: both blocks on one core, so each copy goes to the other
+  # slot of the issuer's core.
+  - id: dlmem_dxa-samecore
+    app: dlmem_dxa
+    drivers: [simx, rtlsim]
+    configs+: "-DVX_CFG_EXT_A_ENABLE -DVX_CFG_EXT_MBAR_ENABLE -DVX_CFG_EXT_DXA_ENABLE"
+    touches: *dlmem_dxa_touches
+    shape: {cores: 2, l2cache: true}
+    args: "-p default -k 2 -n 2"
+  # Many to one: every rank issues three copies back to back into rank 0
+  # (rank 0 into itself through its own window address), whose one phase
+  # expects all twelve.
+  - id: dlmem_dxa-many
+    app: dlmem_dxa
+    drivers: [simx, rtlsim]
+    configs+: "-DVX_CFG_EXT_A_ENABLE -DVX_CFG_EXT_MBAR_ENABLE -DVX_CFG_EXT_DXA_ENABLE -DVX_CFG_SOCKET_SIZE=2"
+    touches: *dlmem_dxa_touches
+    shape: {cores: 4, l2cache: true}
+    args: "-m many -k 4 -c 3 -n 1"
+  # Tensor ranks 2-5 (rank 1 above), and 1- and 2-byte elements.
+  - id: dlmem_dxa-d2
+    app: dlmem_dxa
+    drivers: [simx, rtlsim]
+    configs+: "-DVX_CFG_EXT_A_ENABLE -DVX_CFG_EXT_MBAR_ENABLE -DVX_CFG_EXT_DXA_ENABLE"
+    touches: *dlmem_dxa_touches
+    shape: {cores: 2, l2cache: true}
+    args: "-d 2 -k 2 -n 2"
+  - id: dlmem_dxa-d3
+    app: dlmem_dxa
+    drivers: [simx, rtlsim]
+    configs+: "-DVX_CFG_EXT_A_ENABLE -DVX_CFG_EXT_MBAR_ENABLE -DVX_CFG_EXT_DXA_ENABLE"
+    touches: *dlmem_dxa_touches
+    shape: {cores: 2, l2cache: true}
+    args: "-d 3 -k 2 -n 2"
+  - id: dlmem_dxa-d4
+    app: dlmem_dxa
+    drivers: [simx, rtlsim]
+    configs+: "-DVX_CFG_EXT_A_ENABLE -DVX_CFG_EXT_MBAR_ENABLE -DVX_CFG_EXT_DXA_ENABLE"
+    touches: *dlmem_dxa_touches
+    shape: {cores: 2, l2cache: true}
+    args: "-d 4 -k 2 -n 2"
+  - id: dlmem_dxa-d5
+    app: dlmem_dxa
+    drivers: [simx, rtlsim]
+    configs+: "-DVX_CFG_EXT_A_ENABLE -DVX_CFG_EXT_MBAR_ENABLE -DVX_CFG_EXT_DXA_ENABLE"
+    touches: *dlmem_dxa_touches
+    shape: {cores: 2, l2cache: true}
+    args: "-d 5 -k 2 -n 2"
+  - id: dlmem_dxa-b1-d2
+    app: dlmem_dxa
+    drivers: [simx, rtlsim]
+    configs+: "-DVX_CFG_EXT_A_ENABLE -DVX_CFG_EXT_MBAR_ENABLE -DVX_CFG_EXT_DXA_ENABLE"
+    touches: *dlmem_dxa_touches
+    shape: {cores: 2, l2cache: true}
+    args: "-b 1 -d 2 -k 2 -n 2"
+  - id: dlmem_dxa-b2-d4
+    app: dlmem_dxa
+    drivers: [simx, rtlsim]
+    configs+: "-DVX_CFG_EXT_A_ENABLE -DVX_CFG_EXT_MBAR_ENABLE -DVX_CFG_EXT_DXA_ENABLE"
+    touches: *dlmem_dxa_touches
+    shape: {cores: 2, l2cache: true}
+    args: "-b 2 -d 4 -k 2 -n 2"
+  # 16 banks: a 128-byte row, written by the remote path as up to 16 word flits.
+  - id: dlmem_dxa-banks16
+    app: dlmem_dxa
+    drivers: [simx, rtlsim]
+    configs+: "-DVX_CFG_EXT_A_ENABLE -DVX_CFG_EXT_MBAR_ENABLE -DVX_CFG_EXT_DXA_ENABLE -DVX_CFG_LMEM_NUM_BANKS=16"
+    touches: *dlmem_dxa_touches
+    shape: {cores: 2, l2cache: true}
+    args: "-k 2 -n 2"
+  # The control: each block copies into its own local memory through local
+  # pointers, the single-block path, with the same checks.
+  - id: dlmem_dxa-self
+    app: dlmem_dxa
+    drivers: [simx, rtlsim]
+    configs+: "-DVX_CFG_EXT_A_ENABLE -DVX_CFG_EXT_MBAR_ENABLE -DVX_CFG_EXT_DXA_ENABLE"
+    touches: *dlmem_dxa_touches
+    shape: {cores: 2, l2cache: true}
+    args: "-m self -k 2 -n 2"
+  - id: dlmem_dxa-2cl
+    app: dlmem_dxa
+    drivers: [simx, rtlsim]
+    tier: nightly
+    configs+: "-DVX_CFG_EXT_A_ENABLE -DVX_CFG_EXT_MBAR_ENABLE -DVX_CFG_EXT_DXA_ENABLE"
+    touches: *dlmem_dxa_touches
+    shape: {clusters: 2, cores: 2, l3cache: true}
+    args: "-k 2 -n 4"
+  # dlmem_stress -d on an mbarrier device: besides each block's own copy, a
+  # copy into the next rank's local memory in the first phase and after each
+  # cluster.sync() phase end, beside the window loads, stores and atomics.
+  - id: dlmem_stress-dxa-remote
+    app: dlmem_stress
+    drivers: [simx, rtlsim]
+    configs+: "-DVX_CFG_EXT_A_ENABLE -DVX_CFG_EXT_MBAR_ENABLE -DVX_CFG_EXT_DXA_ENABLE"
+    touches: *dlmem_dxa_touches
+    shape: {cores: 4, l2cache: true}
+    args: "-k 4 -n 2 -i 6 -s 16 -d -r 5"
+  - id: dlmem_stress-dxa-remote-s2
+    app: dlmem_stress
+    drivers: [simx, rtlsim]
+    tier: nightly
+    configs+: "-DVX_CFG_EXT_A_ENABLE -DVX_CFG_EXT_MBAR_ENABLE -DVX_CFG_EXT_DXA_ENABLE -DVX_CFG_SOCKET_SIZE=2"
+    touches: *dlmem_dxa_touches
+    shape: {cores: 4, l2cache: true}
+    args: "-k 2 -n 4 -i 8 -s 16 -d -r 7"
+  # Parity of the remote copy at XLEN 64: one SPREAD cluster of four blocks on
+  # four cores, two copies each into the next rank. Every wait is one try_wait
+  # (a 4096-cycle time limit), which the destination's complete_tx wakes. The
+  # word flits through the network, the destination's DMA writes, the
+  # completion behind them and the wake-up set the timing.
+  - id: parity-dlmem-dxa
+    check: model_parity
+    app: dlmem_dxa
+    xlen: [64]
+    configs+: "-DVX_CFG_EXT_A_ENABLE -DVX_CFG_EXT_MBAR_ENABLE -DVX_CFG_EXT_DXA_ENABLE -DVX_CFG_MBAR_SUSPEND_CYCLES=4096"
+    touches: *dlmem_dxa_touches
+    shape: {cores: 4, l2cache: true}
+    args: "-k 4 -n 1 -c 2"
+  # Remote copies that must stop the simulation with the exact message, on a
+  # SPREAD cluster of two blocks on four cores: a destination rank past the
+  # cluster; an mbarrier in the issuer's block; a window destination
+  # completing on a barrier event; one with a multicast mask; a copy that
+  # reaches a block that has exited; and a box that starts inside the
+  # destination block and runs past its end.
+  - id: dlmem_dxa-x-rank
+    via: script
+    driver: simx
+    configs+: &dlmem_dxa_neg "-DVX_CFG_EXT_A_ENABLE -DVX_CFG_EXT_MBAR_ENABLE -DVX_CFG_EXT_DXA_ENABLE -DVX_CFG_NUM_CORES=4 -DVX_CFG_L2_ENABLE"
+    touches: *dlmem_dxa_touches
+    env: {DRIVER: simx, APP: dlmem_dxa, ARGS: "-x rank", EXPECT: "DXA destination rank outside the cluster"}
+    run: *expect_fail_run
+  - id: dlmem_dxa-x-rank
+    via: script
+    driver: rtlsim
+    configs+: *dlmem_dxa_neg
+    touches: *dlmem_dxa_touches
+    env: {DRIVER: rtlsim, APP: dlmem_dxa, ARGS: "-x rank", EXPECT: "DXA destination rank outside the cluster"}
+    run: *expect_fail_run
+  - id: dlmem_dxa-x-mbar
+    via: script
+    driver: simx
+    configs+: *dlmem_dxa_neg
+    touches: *dlmem_dxa_touches
+    env: {DRIVER: simx, APP: dlmem_dxa, ARGS: "-x mbar", EXPECT: "DXA mbarrier must be in the destination block"}
+    run: *expect_fail_run
+  - id: dlmem_dxa-x-mbar
+    via: script
+    driver: rtlsim
+    configs+: *dlmem_dxa_neg
+    touches: *dlmem_dxa_touches
+    env: {DRIVER: rtlsim, APP: dlmem_dxa, ARGS: "-x mbar", EXPECT: "DXA mbarrier must be in the destination block"}
+    run: *expect_fail_run
+  - id: dlmem_dxa-x-legacy
+    via: script
+    driver: simx
+    configs+: *dlmem_dxa_neg
+    touches: *dlmem_dxa_touches
+    env: {DRIVER: simx, APP: dlmem_dxa, ARGS: "-x legacy", EXPECT: "DXA cluster destination needs an mbarrier"}
+    run: *expect_fail_run
+  - id: dlmem_dxa-x-legacy
+    via: script
+    driver: rtlsim
+    configs+: *dlmem_dxa_neg
+    touches: *dlmem_dxa_touches
+    env: {DRIVER: rtlsim, APP: dlmem_dxa, ARGS: "-x legacy", EXPECT: "DXA cluster destination needs an mbarrier"}
+    run: *expect_fail_run
+  - id: dlmem_dxa-x-mcast
+    via: script
+    driver: simx
+    configs+: *dlmem_dxa_neg
+    touches: *dlmem_dxa_touches
+    env: {DRIVER: simx, APP: dlmem_dxa, ARGS: "-x mcast", EXPECT: "DXA multicast with an mbarrier is not supported"}
+    run: *expect_fail_run
+  - id: dlmem_dxa-x-mcast
+    via: script
+    driver: rtlsim
+    configs+: *dlmem_dxa_neg
+    touches: *dlmem_dxa_touches
+    env: {DRIVER: rtlsim, APP: dlmem_dxa, ARGS: "-x mcast", EXPECT: "DXA multicast with an mbarrier is not supported"}
+    run: *expect_fail_run
+  - id: dlmem_dxa-x-retired
+    via: script
+    driver: simx
+    configs+: *dlmem_dxa_neg
+    touches: *dlmem_dxa_touches
+    env: {DRIVER: simx, APP: dlmem_dxa, ARGS: "-x retired", EXPECT: "DXA write into a retired CTA slot"}
+    run: *expect_fail_run
+  - id: dlmem_dxa-x-retired
+    via: script
+    driver: rtlsim
+    configs+: *dlmem_dxa_neg
+    touches: *dlmem_dxa_touches
+    env: {DRIVER: rtlsim, APP: dlmem_dxa, ARGS: "-x retired", EXPECT: "DXA write into a retired CTA slot"}
+    run: *expect_fail_run
+  - id: dlmem_dxa-x-box
+    via: script
+    driver: simx
+    configs+: *dlmem_dxa_neg
+    touches: *dlmem_dxa_touches
+    env: {DRIVER: simx, APP: dlmem_dxa, ARGS: "-x box", EXPECT: "DXA box exceeds the destination block"}
+    run: *expect_fail_run
+  - id: dlmem_dxa-x-box
+    via: script
+    driver: rtlsim
+    configs+: *dlmem_dxa_neg
+    touches: *dlmem_dxa_touches
+    env: {DRIVER: rtlsim, APP: dlmem_dxa, ARGS: "-x box", EXPECT: "DXA box exceeds the destination block"}
+    run: *expect_fail_run
+
   # --- remote loads ---
   # Each block fills its own slice, cluster.sync(), and reads every slice at
   # every width with its sign or zero extension; ping-pong between ranks 2i and

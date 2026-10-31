@@ -33,6 +33,11 @@
 #include "dlmem_ep_bench.h"
 #include "dlmem_ref.h"
 
+#if defined(VX_CFG_EXT_DXA_ENABLE) && defined(VX_CFG_EXT_MBAR_ENABLE)
+#define DLMEM_EP_ROWS
+#include "dlmem_rows_bench.h"
+#endif
+
 #include <iostream>
 #include <type_traits>
 
@@ -203,7 +208,17 @@ private:
       set_bits(t->lmem_rsp_valid, c, 1, in.lrsp_valid[c]);
       set_bits(t->lmem_rsp_tag, c * 8, 8, in.lrsp_tag[c]);
       set_bits(t->lmem_rsp_data, c * 64, 64, in.lrsp_data[c]);
+    #ifdef DLMEM_EP_ROWS
+      // No row flits: every slot occupied, the DMA port always ready.
+      set_bits(t->slot_valid, c * NW, NW, ~0ull);
+      set_bits(t->dma_ready, c, 1, 1);
+    #endif
     }
+  #ifdef DLMEM_EP_ROWS
+    for (uint32_t s = 0; s < ep::NUM_SOCKETS; ++s) {
+      set_bits(t->row_valid, s, 1, 0);
+    }
+  #endif
   }
 
   vl_simulator<VVX_dlmem_ep_top> sim_;
@@ -213,8 +228,135 @@ private:
   std::vector<uint32_t> slot_out_;
 };
 
+#ifdef DLMEM_EP_ROWS
+// The same endpoints driven by the row-flit bench: row ports per socket, the
+// DMA and local-memory ports per core; the LSU ports stay idle.
+class RowRtlDut final : public rows::Dut {
+public:
+  RowRtlDut() {
+    auto* t = sim_.operator->();
+    t->reset = 1;
+    this->drive(rows::In());
+    for (int i = 0; i < 8; ++i) {
+      tick_ = sim_.step(tick_, 2);
+    }
+    t->reset = 0;
+    t->eval();
+    amo_ctx_ = t->cfg_amo_complete_tx;
+  }
+
+  uint32_t amo_complete_tx() const override {
+    return amo_ctx_;
+  }
+
+  void cycle(const rows::In& in, rows::Out& out) override {
+    auto* t = sim_.operator->();
+    this->drive(in);
+    t->eval();
+
+    for (uint32_t s = 0; s < rows::NUM_SOCKETS; ++s) {
+      out.row_fire[s] = (in.row[s] != nullptr) && get_bits(t->row_ready, s, 1);
+    }
+    for (uint32_t c = 0; c < NCC; ++c) {
+      auto& d = out.dma[c];
+      d.fire = get_bits(t->dma_valid, c, 1) && in.dma_ready[c];
+      d.addr = uint32_t(get_bits(t->dma_addr, c * 32, 32));
+      for (uint32_t b = 0; b < rows::NBANKS; ++b) {
+        d.word[b] = get_bits(t->dma_data, (c * rows::NBANKS + b) * 64, 64);
+        d.byteen[b] = uint8_t(get_bits(t->dma_byteen, (c * rows::NBANKS + b) * 8, 8));
+      }
+      d.slot = uint32_t(get_bits(t->dma_slot, c * 8, 8));
+      d.remote = get_bits(t->dma_remote, c, 1);
+      d.last = get_bits(t->dma_last, c, 1);
+
+      auto& q = out.lmem[c];
+      q.fire = get_bits(t->lmem_req_valid, c, 1) && in.lmem_ready[c];
+      q.rw = get_bits(t->lmem_req_rw, c, 1);
+      q.amo = get_bits(t->lmem_req_amo, c, 1);
+      q.uns = get_bits(t->lmem_req_amo_unsigned, c, 1);
+      q.amo_op = uint32_t(get_bits(t->lmem_req_amo_op, c * 4, 4));
+      q.byteen = uint8_t(get_bits(t->lmem_req_byteen, c * 8, 8));
+      q.waddr = uint32_t(get_bits(t->lmem_req_addr, c * 32, 32));
+      q.hart = uint32_t(get_bits(t->lmem_req_hart_id, c * 32, 32));
+      q.tag = uint32_t(get_bits(t->lmem_req_tag, c * 8, 8));
+      q.data = get_bits(t->lmem_req_data, c * 64, 64);
+
+      out.rsp_inj[c] = get_bits(t->rsp_inj_fire, c, 1);
+    }
+
+    tick_ = sim_.step(tick_, 2);
+    t->eval();
+
+    for (uint32_t c = 0; c < NCC; ++c) {
+      out.in_empty[c] = get_bits(t->ingress_empty, c, 1);
+    }
+  }
+
+private:
+  void drive(const rows::In& in) {
+    auto* t = sim_.operator->();
+    for (uint32_t p = 0; p < NP; ++p) {
+      set_bits(t->lsu_req_valid, p, 1, 0);
+      set_bits(t->lsu_rsp_ready, p, 1, 1);
+      set_bits(t->wt_inc_valid, p, 1, 0);
+    }
+    for (uint32_t s = 0; s < rows::NUM_SOCKETS; ++s) {
+      const rows::Flit* f = in.row[s];
+      set_bits(t->row_valid, s, 1, f != nullptr);
+      set_bits(t->row_dst, s * 8, 8, f ? f->dst : 0);
+      set_bits(t->row_src, s * 8, 8, f ? f->src : 0);
+      set_bits(t->row_compl, s, 1, f && f->compl_);
+      set_bits(t->row_addr, s * 32, 32, f ? f->addr : 0);
+      set_bits(t->row_byteen, s * 8, 8, f ? f->byteen : 0);
+      set_bits(t->row_data, s * 64, 64, f ? f->data : 0);
+      set_bits(t->row_slot, s * 8, 8, f ? f->slot : 0);
+    }
+    for (uint32_t c = 0; c < NCC; ++c) {
+      set_bits(t->slot_valid, c * NW, NW, in.slot_valid[c]);
+      set_bits(t->dma_ready, c, 1, in.dma_ready[c]);
+      set_bits(t->lmem_req_ready, c, 1, in.lmem_ready[c]);
+      set_bits(t->lmem_rsp_valid, c, 1, in.lrsp_valid[c]);
+      set_bits(t->lmem_rsp_tag, c * 8, 8, in.lrsp_tag[c]);
+      set_bits(t->lmem_rsp_data, c * 64, 64, 0);
+    }
+  }
+
+  vl_simulator<VVX_dlmem_ep_top> sim_;
+  uint64_t tick_ = 0;
+  uint32_t amo_ctx_ = 0;
+};
+
+int run_rows(const std::string& mode, const std::vector<uint32_t>& seeds, uint32_t copies, const std::string& csv) {
+  for (auto seed : (mode == "rows") ? std::vector<uint32_t>{seeds.front()} : seeds) {
+    rows::Options opts;
+    opts.mode = mode;
+    opts.seed = seed;
+    opts.copies = copies;
+    RowRtlDut dut;
+    rows::Bench bench(dut, opts);
+    uint32_t failures = bench.run();
+    if (failures != 0) {
+      std::cout << "FAILED: mode " << mode << " seed " << seed << ": " << bench.first_failure()
+                << " [" << failures << " check(s)]" << std::endl;
+      return 1;
+    }
+    std::cout << "mode " << mode << " seed " << seed << ": cycles=" << bench.cycles() << " flits=" << bench.flits()
+              << " completions=" << bench.compls() << " row_stalls=" << bench.stalls() << std::endl;
+    if (mode == "rows" && !csv.empty()) {
+      bench.write_csv(csv);
+      std::cout << "wrote " << csv << std::endl;
+    }
+  }
+  return 0;
+}
+#endif
+
 void usage(const char* prog) {
-  std::cerr << "usage: " << prog << " [--mode=random|hotspot|storeflood|loadflood|backpressure|lrsc|latency|all]\n"
+  std::cerr << "usage: " << prog << " [--mode=random|hotspot|storeflood|loadflood|backpressure|lrsc|latency|all"
+#ifdef DLMEM_EP_ROWS
+               "|rows|rows-random|rows-retired"
+#endif
+               "]\n"
                "       [--seed=N] [--reqs=N] [--csv=FILE] [--trace=FILE]" << std::endl;
 }
 
@@ -228,6 +370,7 @@ int main(int argc, char** argv) {
   uint32_t reqs = 0;
   std::string csv;
   std::string trace_path;
+  std::string row_mode;
   for (int i = 1; i < argc; ++i) {
     const char* a = argv[i];
     if (a[0] == '+') {
@@ -236,6 +379,12 @@ int main(int argc, char** argv) {
     if (std::strncmp(a, "--mode=", 7) == 0) {
       std::string m = a + 7;
       if (m != "all") {
+      #ifdef DLMEM_EP_ROWS
+        if (m.compare(0, 4, "rows") == 0) {
+          row_mode = m;
+          continue;
+        }
+      #endif
         if (std::find(modes.begin(), modes.end(), m) == modes.end()) {
           usage(argv[0]);
           return 2;
@@ -259,6 +408,18 @@ int main(int argc, char** argv) {
     std::cerr << "--trace needs a single --mode and --seed" << std::endl;
     return 2;
   }
+
+#ifdef DLMEM_EP_ROWS
+  if (!row_mode.empty()) {
+    std::cout << "dlmem_ep rows: sockets=" << rows::NUM_SOCKETS << " socket_size=" << rows::SOCKET_SIZE
+              << " banks=" << rows::NBANKS << " warps=" << NW << std::endl;
+    if (run_rows(row_mode, seeds, reqs, csv) != 0) {
+      return 1;
+    }
+    std::cout << "PASSED" << std::endl;
+    return 0;
+  }
+#endif
 
   std::cout << "dlmem_ep: sockets=" << ep::NUM_SOCKETS << " socket_size=" << ep::SOCKET_SIZE
             << " blocks=" << NB << " lanes=" << NL << " warps=" << NW << " zacas=" << ep::ZACAS

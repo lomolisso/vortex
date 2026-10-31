@@ -64,8 +64,20 @@ struct DlmemReqPkt {
   MemFlags flags;
   uint32_t tag = 0;                    // LD/AMO: source pending index; ST: source warp id
   uint64_t uuid = 0;                   // trace only; the RTL packet carries none
+#ifdef DXA_MBAR_ENABLE
+  // A posted flit of a peer's DXA copy, VX_dlmem_pkg's op 3 (DLMEM_OP_DXA):
+  // a DATA word write (op ST), or the COMPL that ends the copy
+  // (flags.amo_unsigned, op MBAR_COMPLETE_TX on the mbarrier word). The tag is
+  // the destination slot.
+  bool     dxa = false;
+#endif
 
   friend std::ostream& operator<<(std::ostream& os, const DlmemReqPkt& p) {
+#ifdef DXA_MBAR_ENABLE
+    if (p.dxa) {
+      os << "dxa-" << (p.flags.amo_unsigned ? "compl" : "data") << ", ";
+    }
+#endif
     os << "src=" << p.src << ", dst=" << p.dst << ", op=" << p.op
        << ", addr=0x" << std::hex << p.lmem_addr << std::dec
        << ", tag=" << p.tag << " (#" << p.uuid << ")";

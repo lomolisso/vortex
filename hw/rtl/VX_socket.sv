@@ -706,6 +706,14 @@ module VX_socket import VX_gpu_pkg::*, VX_tlb_pkg::*;
     assign per_core_dcr_bus_if[SOCKET_DCR_DXA_IDX].rsp_valid = dxa_dcr_bus_if.rsp_valid;
     assign per_core_dcr_bus_if[SOCKET_DCR_DXA_IDX].rsp_data  = dxa_dcr_bus_if.rsp_data;
 
+`ifdef DXA_MBAR_ENABLE
+    // The engine's rows into other cores' blocks, an input of the DLMEM request switch.
+    VX_dlmem_bus_if #(
+        .DATAW (VX_dlmem_pkg::DLMEM_REQ_DATAW),
+        .DST_W (DLMEM_CORE_W)
+    ) dxa_row_if();
+`endif
+
     VX_dxa_core #(
         .INSTANCE_ID    (`SFORMATF(("%s-dxa", INSTANCE_ID))),
         .NUM_REQS       (`VX_CFG_SOCKET_SIZE),
@@ -720,6 +728,9 @@ module VX_socket import VX_gpu_pkg::*, VX_tlb_pkg::*;
         .req_bus_if       (per_core_dxa_req_bus_if),
         .smem_bus_if      (dxa_lmem_bus_if),
         .gmem_bus_if      (dxa_gmem_bus_if),
+    `ifdef DXA_MBAR_ENABLE
+        .row_out_if       (dxa_row_if),
+    `endif
         `UNUSED_PIN (busy)
     );
 
@@ -870,15 +881,33 @@ module VX_socket import VX_gpu_pkg::*, VX_tlb_pkg::*;
         .SOCKET_IDX  (SOCKET_ID % NUM_SOCKETS),
         .DATAW       (VX_dlmem_pkg::DLMEM_REQ_DATAW),
         .DST_W       (DLMEM_CORE_W),
+    `ifdef DXA_MBAR_ENABLE
+        .ROW_IN      (1),
+    `endif
         .OUT_BUF     (3)
     ) dlmem_req_switch (
         .clk           (clk),
         .reset         (reset),
         .core_in_if    (per_core_dlmem_req_out_if),
         .core_out_if   (per_core_dlmem_req_in_if),
+    `ifdef DXA_MBAR_ENABLE
+        .row_in_if     (dxa_row_if),
+    `endif
         .uplink_in_if  (dlmem_req_down_if),
         .uplink_out_if (dlmem_req_up_if)
     );
+
+`ifdef DXA_MBAR_ENABLE
+    // Responses have no row input.
+    VX_dlmem_bus_if #(
+        .DATAW (VX_dlmem_pkg::DLMEM_RSP_DATAW),
+        .DST_W (DLMEM_CORE_W)
+    ) dlmem_rsp_no_row_if();
+    assign dlmem_rsp_no_row_if.valid = 1'b0;
+    assign dlmem_rsp_no_row_if.data  = '0;
+    assign dlmem_rsp_no_row_if.dst   = '0;
+    `UNUSED_VAR (dlmem_rsp_no_row_if.ready)
+`endif
 
     VX_dlmem_socket_switch #(
         .SOCKET_SIZE (`VX_CFG_SOCKET_SIZE),
@@ -892,6 +921,9 @@ module VX_socket import VX_gpu_pkg::*, VX_tlb_pkg::*;
         .reset         (reset),
         .core_in_if    (per_core_dlmem_rsp_out_if),
         .core_out_if   (per_core_dlmem_rsp_in_if),
+    `ifdef DXA_MBAR_ENABLE
+        .row_in_if     (dlmem_rsp_no_row_if),
+    `endif
         .uplink_in_if  (dlmem_rsp_down_if),
         .uplink_out_if (dlmem_rsp_up_if)
     );

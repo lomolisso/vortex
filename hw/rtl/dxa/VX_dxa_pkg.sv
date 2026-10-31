@@ -59,20 +59,28 @@ package VX_dxa_pkg;
         logic [4:0][31:0]                coords;      // [0]=lane2.rs1,[1]=lane3.rs1,[2]=lane0.rs2,[3]=lane1.rs2,[4]=lane2.rs2; element indices, 32-bit ABI
         logic [`VX_CFG_NUM_WARPS-1:0]    cta_mask;     // from rs2 lane 3
     `ifdef DXA_MBAR_ENABLE
-        logic [NW_WIDTH-1:0]             slot;         // the issuing warp's CTA slot
+        logic [NW_WIDTH-1:0]             slot;         // the destination block's CTA slot on this core
         logic [DXA_CTA_GEN_W-1:0]        gen;          // and its generation
+        logic                            remote;       // the destination block is on another core
+        logic [DLMEM_CORE_W-1:0]         dst_core;     // that core, in the cluster
+        logic [NW_WIDTH-1:0]             dst_slot;     // and the block's CTA slot there
+        logic [DXA_MBAR_OFF_W-1:0]       mbar_off;     // mbarrier word offset in the destination's local memory
+        logic                            win;          // a DLMEM window destination
+        logic [`VX_CFG_LMEM_LOG_SIZE:0]  win_room;     // and its bytes up to its block's end
     `endif
     } dxa_req_data_t;
 
 `ifdef DXA_MBAR_ENABLE
-    // Completion of the transfer in flight: meta[30] selects an mbarrier, and
-    // meta[29:4] is then the mbarrier's local-memory word offset.
+    // Completion of the transfer in flight: meta[30] selects an mbarrier at
+    // mbar_off; a remote transfer's slot is the destination slot on dst_core.
     typedef struct packed {
         logic                      mode;
         logic [DXA_MBAR_OFF_W-1:0] mbar_off;
         logic [DXA_TX_BYTES_W-1:0] tx_bytes;
         logic [NW_WIDTH-1:0]       slot;
         logic [DXA_CTA_GEN_W-1:0]  gen;
+        logic                      remote;
+        logic [DLMEM_CORE_W-1:0]   dst_core;
     } dxa_compl_t;
 `endif
 

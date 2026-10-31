@@ -19,11 +19,13 @@ typedef struct {
 } stress_arg_t;
 
 #define FLAG_DXA      1u  // a DXA copy into the block's own local memory each phase
+#define FLAG_RDXA     2u  // and, after each cluster.sync() phase end, one into the next rank
 
 #define TEST_STEP     1   // a load or atomic returned other than the thread's model
 #define TEST_SIG      2   // the previous rank's signature after a phase end
 #define TEST_RING     3   // the ring flag never came
 #define TEST_DXA      4   // a word of the phase's DXA copy
+#define TEST_RDXA     5   // a word of the previous rank's DXA copy, or (index ~0) its mbarrier phase never completed
 #define TEST_SETUP    7   // the launch itself: the cluster size
 
 #define ERR_COUNT     0   // mismatches; ~0 if the thread never ran
@@ -51,6 +53,8 @@ typedef struct {
 
 // Polls of a ring flag before the kernel reports the previous rank as stuck.
 #define SPIN_LIMIT    (1u << 16)
+// try_waits on a remote copy's mbarrier phase before the kernel gives it up.
+#define RDXA_TRY_LIMIT 64
 
 // The slice, in bytes: the cells of every thread of the cluster, the signatures
 // from the previous rank, the counters, a ring flag per warp, then the DXA tile.
@@ -61,8 +65,16 @@ static inline uint32_t flag_off(uint32_t k, uint32_t nt) { return ctr_off(k, nt)
 static inline uint32_t dxa_off(uint32_t k, uint32_t nt, uint32_t warps) {
   return (flag_off(k, nt) + 4 * warps + 63) & ~63u;
 }
-static inline uint32_t lmem_needed(uint32_t k, uint32_t nt, uint32_t warps, uint32_t dxa) {
-  return dxa_off(k, nt, warps) + (dxa ? 4 * DXA_WORDS : 0);
+// FLAG_RDXA: the tile the previous rank copies in, then its mbarrier.
+static inline uint32_t rdxa_off(uint32_t k, uint32_t nt, uint32_t warps) {
+  return dxa_off(k, nt, warps) + 4 * DXA_WORDS;
+}
+static inline uint32_t rmbar_off(uint32_t k, uint32_t nt, uint32_t warps) {
+  return rdxa_off(k, nt, warps) + 4 * DXA_WORDS;
+}
+static inline uint32_t lmem_needed(uint32_t k, uint32_t nt, uint32_t warps, uint32_t flags) {
+  return (flags & FLAG_RDXA) ? rmbar_off(k, nt, warps) + 8
+       : dxa_off(k, nt, warps) + ((flags & FLAG_DXA) ? 4 * DXA_WORDS : 0);
 }
 // Cell j of thread t of rank r: slice (r + 1 + j) % k, doubleword (r * nt + t) * ST_CELLS + j.
 static inline uint32_t cell_rank(uint32_t r, uint32_t j, uint32_t k) { return (r + 1 + j) % k; }
@@ -112,6 +124,19 @@ static inline uint32_t st_sig(uint32_t seed, uint32_t c, uint32_t p, uint32_t r,
 }
 static inline uint32_t dxa_word(uint32_t seed, uint32_t i) {
   return hash3(seed ^ 0x44000000u, 0xD7Au, i);
+}
+// The tile block b copies in phase p: into itself, and (FLAG_RDXA) into the next rank.
+static inline uint32_t dxa_tile(uint32_t p, uint32_t blocks, uint32_t b) {
+  return (p * blocks + b) % DXA_TILES;
+}
+static inline uint32_t rdxa_tile(uint32_t p, uint32_t blocks, uint32_t b) {
+  return (p * blocks + b + DXA_TILES / 2 + 1) % DXA_TILES;
+}
+// Whether phase p has remote copies: the first, and those after a
+// cluster.sync(), which orders the receiver's checks of the last one before
+// the next one is issued.
+static inline uint32_t rdxa_phase(uint32_t seed, uint32_t c, uint32_t p) {
+  return p == 0 || st_end(seed, c, p - 1) == END_SYNC;
 }
 
 #define OPC_ST        0   // store of `size` bytes at `off`

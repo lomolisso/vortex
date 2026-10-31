@@ -17,6 +17,9 @@
 #include "debug.h"
 #ifdef DXA_MBAR_ENABLE
 #include <iostream>
+#include "kmu/cta_gang.h"
+#else
+#line 20
 #endif
 
 using namespace vortex;
@@ -84,6 +87,14 @@ instr_trace_t* DxaUnit::process(instr_trace_t* trace) {
   req.mbar_off  = mode ? ((meta >> 4) & ((1u << (VX_CFG_LMEM_LOG_SIZE - 3)) - 1u)) : 0u;
   req.slot      = warp_slot_.at(trace->wid);
   req.gen       = slot_gen_.at(req.slot);
+  req.src_core  = core_->id() % dlmem_cfg().ncc;
+  req.dst_core  = req.src_core;
+  req.remote    = false;
+  req.win       = false;
+  req.win_room  = 0;
+  this->translate(trace, meta, cta_mask, req);
+#else
+#line 87
 #endif
 
   // Barrier pre-registration is the kernel's responsibility via
@@ -101,9 +112,73 @@ instr_trace_t* DxaUnit::process(instr_trace_t* trace) {
 #ifdef DXA_MBAR_ENABLE
 void DxaUnit::slot_evt(const CtaSlotEvt& e) {
   switch (e.kind) {
-  case CtaSlotEvt::ADMIT: slot_gen_.at(e.slot) = e.gen; break;
+  case CtaSlotEvt::ADMIT:
+    slot_gen_.at(e.slot) = e.gen;
+    slot_row_.at(e.slot) = e.row;
+    stride_ = e.stride;
+    break;
   case CtaSlotEvt::WARP:  warp_slot_.at(e.wid) = e.slot; break;
   default: break;
   }
+}
+
+void DxaUnit::issue_abort(const instr_trace_t* trace, const char* msg) const {
+  std::cerr << SimPlatform::instance().cycles() << ": *** core" << core_->id() << " " << msg
+            << ": wid=" << trace->wid << " (#" << trace->uuid << ")" << std::endl;
+  std::abort();
+}
+
+// A window destination selects rank a[LMEM_LOG +: RANK_BITS] at block offset
+// a[LMEM_LOG-1:0]; a window mbarrier carries its rank in meta[28:24] and its
+// block-relative doubleword offset in the low payload bits. Both resolve
+// through the issuing block's peer row. A block on this core keeps the local
+// path at that block's slot; another core's block is remote.
+void DxaUnit::translate(const instr_trace_t* trace, uint32_t meta, uint32_t cta_mask, DxaReq& req) const {
+  const auto cfg = dlmem_cfg();
+  const uint32_t rbits = dlmem_ref::rank_bits(cfg);
+  const uint32_t wl = cfg.lmem_log + rbits;
+  const bool dst_win  = (req.smem_addr >> wl) == (cfg.dlmem_base >> wl);
+  const bool mbar_win = req.mode && ((meta >> 29) & 1u);
+  if (dst_win && __builtin_popcount(cta_mask) > 1) {
+    this->issue_abort(trace, "DXA multicast with an mbarrier is not supported");
+  }
+  if (!dst_win && !mbar_win) {
+    return;
+  }
+  const uint32_t issue_slot = req.slot;
+  const auto& row = slot_row_.at(issue_slot);
+  const uint32_t rank   = uint32_t((req.smem_addr >> cfg.lmem_log) & dlmem_ref::low_mask(rbits));
+  const uint64_t off    = req.smem_addr & dlmem_ref::low_mask(cfg.lmem_log);
+  const uint32_t m_rank = (meta >> 24) & 0x1fu;
+  const uint64_t m_off  = uint64_t(req.mbar_off) << 3;
+  const bool dst_oob  = dst_win && (rank >= row.k || off >= stride_);
+  const bool mbar_oob = mbar_win && (m_rank >= row.k || m_off >= stride_);
+  if (dst_oob || mbar_oob) {
+    this->issue_abort(trace, "DXA destination rank outside the cluster");
+  }
+  const dlmem_ref::Peer self{req.src_core, issue_slot};
+  const dlmem_ref::Peer dst  = dst_win ? row.peers.at(rank) : self;
+  const dlmem_ref::Peer mbar = mbar_win ? row.peers.at(m_rank) : self;
+  if (req.mode && (dst.core != mbar.core || dst.slot != mbar.slot)) {
+    this->issue_abort(trace, "DXA mbarrier must be in the destination block");
+  }
+  if (!req.mode) {
+    this->issue_abort(trace, "DXA cluster destination needs an mbarrier");
+  }
+  if (dst_win) {
+    req.smem_addr = cfg.lmem_base + uint64_t(dst.slot) * stride_ + off;
+    req.win       = true;
+    req.win_room  = uint32_t(stride_ - off);
+  }
+  if (mbar_win) {
+    req.mbar_off = uint32_t(((uint64_t(mbar.slot) * stride_) >> 3) + req.mbar_off);
+  }
+  req.slot     = dst.slot;
+  req.gen      = slot_gen_.at(dst.slot);
+  req.dst_core = dst.core;
+  req.remote   = (dst.core != req.src_core);
+  DT(4, "dxa-unit window: core=" << core_->id() << ", wid=" << trace->wid << ", rank=" << rank
+     << ", dst={core=" << dst.core << ", slot=" << dst.slot << "}, off=0x" << std::hex << off
+     << ", mbar_off=0x" << req.mbar_off << std::dec << ", remote=" << req.remote);
 }
 #endif
