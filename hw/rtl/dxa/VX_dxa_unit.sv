@@ -171,15 +171,39 @@ module VX_dxa_unit import VX_gpu_pkg::*, VX_dxa_pkg::*; #(
     wire [LMEM_LOG-1:0] mbar_base = peer_slot_base[mbar_peer.slot];
     `UNUSED_VAR (mbar_base[2:0])
 
-    assign dxa_req_data_in.smem_addr = dst_win ? (dst_base + dst_off) : lmem_rel_byte_addr[DXA_SMEM_ADDR_W-1:0];
+    // A multicast in mbarrier mode names cluster ranks: every masked rank gets
+    // the data and its mbarrier at the issuer's own block-relative offsets.
+    wire mc_mode    = mbar_mode && (lane3_rs2[31:0] != '0);
+    wire mc_cluster = mc_mode && ~dst_win && ~mbar_win;
+    wire [LMEM_LOG-1:0] own_base = peer_slot_base[issue_slot];
+    wire [LMEM_LOG-1:0] mc_off   = lmem_rel_byte_addr[LMEM_LOG-1:0] - own_base;
+    wire [DXA_MBAR_OFF_W-1:0] mc_mbar_rel = mbar_off_w - own_base[LMEM_LOG-1:3];
+    wire [LMEM_LOG:0] mc_room = ({1'b0, mc_off} < peer_stride) ? (peer_stride - (LMEM_LOG+1)'(mc_off)) : '0;
+
+    dxa_mc_peer_t [DLMEM_MAX_CLUSTER-1:0] mc_peers;
+    wire [DLMEM_MAX_CLUSTER-1:0] row_other;
+    for (genvar r = 0; r < DLMEM_MAX_CLUSTER; ++r) begin : g_mc_peers
+        assign mc_peers[r].remote = (peer_row.peers[r].core != DLMEM_CORE_W'(MY_CORE));
+        assign mc_peers[r].core   = peer_row.peers[r].core;
+        assign mc_peers[r].slot   = peer_row.peers[r].slot;
+        assign mc_peers[r].gen    = cta_slot_gen[peer_row.peers[r].slot];
+        assign row_other[r] = (32'(r) < 32'(peer_row.k)) && mc_peers[r].remote;
+    end
+
+    assign dxa_req_data_in.smem_addr = mc_cluster ? mc_off
+                                     : (dst_win ? (dst_base + dst_off) : lmem_rel_byte_addr[DXA_SMEM_ADDR_W-1:0]);
     assign dxa_req_data_in.slot      = dst_slot;
     assign dxa_req_data_in.gen       = cta_slot_gen[dst_slot];
     assign dxa_req_data_in.remote    = dst_remote;
     assign dxa_req_data_in.dst_core  = dst_peer.core;
     assign dxa_req_data_in.dst_slot  = dst_peer.slot;
-    assign dxa_req_data_in.mbar_off  = mbar_win ? (mbar_base[LMEM_LOG-1:3] + mbar_off_w) : mbar_off_w;
+    assign dxa_req_data_in.mbar_off  = mc_cluster ? mc_mbar_rel
+                                     : (mbar_win ? (mbar_base[LMEM_LOG-1:3] + mbar_off_w) : mbar_off_w);
     assign dxa_req_data_in.win       = dst_win;
-    assign dxa_req_data_in.win_room  = peer_stride - (LMEM_LOG+1)'(dst_off);
+    assign dxa_req_data_in.win_room  = mc_cluster ? mc_room : (peer_stride - (LMEM_LOG+1)'(dst_off));
+    assign dxa_req_data_in.mc_cluster = mc_cluster;
+    assign dxa_req_data_in.mc_mask   = lane3_rs2[DLMEM_MAX_CLUSTER-1:0];
+    assign dxa_req_data_in.mc_peers  = mc_peers;
 
     // Issue-time checks, simulation only.
     wire dst_oob  = dst_win && ((32'(dst_rank) >= 32'(peer_row.k)) || ({1'b0, dst_off} >= peer_stride));
@@ -212,13 +236,24 @@ module VX_dxa_unit import VX_gpu_pkg::*, VX_dxa_pkg::*; #(
 `ifdef DXA_MBAR_ENABLE
     wire issue_fire = fire && is_send;
     wire is_mcast   = ($countones(dxa_req_data_in.cta_mask) > 1);
-    `RUNTIME_ASSERT(~(issue_fire && (dxa_req_data_in.meta[30] || dst_win) && is_mcast),
-        ("%t: *** %s DXA multicast with an mbarrier is not supported: wid=%0d cta_mask=0x%0h",
+    wire mc_rank_oob = ((lane3_rs2[31:0] >> peer_row.k) != '0);
+    wire mc_mbar_oob = ({1'b0, mc_mbar_rel, 3'b0} >= (LMEM_LOG+1)'(peer_stride));
+    `RUNTIME_ASSERT(~(issue_fire && mc_mode && (dst_win || mbar_win)),
+        ("%t: *** %s DXA multicast needs a local address: wid=%0d smem=0x%0h meta=0x%0h cta_mask=0x%0h",
+         $time, INSTANCE_ID, execute_if.data.header.wid, lane0_rs1, lane1_rs1, lane3_rs2))
+    `RUNTIME_ASSERT(~(issue_fire && mc_mode && mc_rank_oob),
+        ("%t: *** %s DXA multicast rank outside the cluster: wid=%0d cta_mask=0x%0h k=%0d",
+         $time, INSTANCE_ID, execute_if.data.header.wid, lane3_rs2, peer_row.k))
+    `RUNTIME_ASSERT(~(issue_fire && mc_cluster && mc_mbar_oob),
+        ("%t: *** %s mbarrier offset outside the block: wid=%0d meta=0x%0h stride=0x%0h",
+         $time, INSTANCE_ID, execute_if.data.header.wid, lane1_rs1, peer_stride))
+    `RUNTIME_ASSERT(~(issue_fire && ~mbar_mode && is_mcast && (| row_other)),
+        ("%t: *** %s DXA barrier multicast into a cluster spread over cores: wid=%0d cta_mask=0x%0h",
          $time, INSTANCE_ID, execute_if.data.header.wid, dxa_req_data_in.cta_mask))
-    `RUNTIME_ASSERT(~(issue_fire && (dst_oob || mbar_oob)),
+    `RUNTIME_ASSERT(~(issue_fire && ~mc_mode && (dst_oob || mbar_oob)),
         ("%t: *** %s DXA destination rank outside the cluster: wid=%0d smem=0x%0h meta=0x%0h k=%0d stride=0x%0h",
          $time, INSTANCE_ID, execute_if.data.header.wid, lane0_rs1, lane1_rs1, peer_row.k, peer_stride))
-    `RUNTIME_ASSERT(~(issue_fire && ~dst_oob && ~mbar_oob && mbar_elsewhere),
+    `RUNTIME_ASSERT(~(issue_fire && ~mc_mode && ~dst_oob && ~mbar_oob && mbar_elsewhere),
         ("%t: *** %s DXA mbarrier must be in the destination block: wid=%0d smem=0x%0h meta=0x%0h",
          $time, INSTANCE_ID, execute_if.data.header.wid, lane0_rs1, lane1_rs1))
     `RUNTIME_ASSERT(~(issue_fire && dst_win && ~mbar_mode),
@@ -274,6 +309,11 @@ module VX_dxa_unit import VX_gpu_pkg::*, VX_dxa_pkg::*; #(
                 `TRACE(1, ("%t: %s dxa-req-remote: wid=%0d, dst_core=%0d, dst_slot=%0d, mbar_off=0x%0h\n",
                     $time, INSTANCE_ID, dxa_req_bus_if.req_data.wid, dxa_req_bus_if.req_data.dst_core,
                     dxa_req_bus_if.req_data.dst_slot, dxa_req_bus_if.req_data.mbar_off))
+            end
+            if (dxa_req_bus_if.req_data.mc_cluster) begin
+                `TRACE(1, ("%t: %s dxa-req-mcast: wid=%0d, mask=0x%0h, off=0x%0h, mbar_rel=0x%0h\n",
+                    $time, INSTANCE_ID, dxa_req_bus_if.req_data.wid, dxa_req_bus_if.req_data.mc_mask,
+                    dxa_req_bus_if.req_data.smem_addr, dxa_req_bus_if.req_data.mbar_off))
             end
         `endif
         end

@@ -2,6 +2,10 @@
 // Adapted from sgemm2_dxa: single-warp CTAs (block = tile_size × 1) so that
 // `mc_group_size` CTAs fit co-resident on one core. CTAs in the same
 // blockIdx.y form a multicast group sharing one B column-block.
+//
+// -s K: the SPREAD variant, on a DLMEM device with mbarriers: clusters of K
+// blocks on different cores, the B column block multicast across them by
+// rank mask with vortex::dxa_multicast_cluster_2d.
 
 #include <algorithm>
 #include <cstdlib>
@@ -46,6 +50,7 @@ const char* kernel_file = "kernel.vxbin";
 uint32_t size      = 16;
 uint32_t tile_size = 4;     // = VX_CFG_NUM_THREADS (1 warp per CTA)
 uint32_t verify    = 1;
+uint32_t spread_k  = 0;     // -s: SPREAD clusters of this many blocks
 
 vx_device_h device = nullptr;
 vx_buffer_h A_buffer = nullptr, B_buffer = nullptr, C_buffer = nullptr;
@@ -57,16 +62,17 @@ constexpr uint32_t kDescA = 0;
 constexpr uint32_t kDescB = 1;
 
 static void show_usage() {
-  std::cout << "Usage: [-k kernel] [-n size] [-t tile_size] [-q skip_verify] [-h]\n";
+  std::cout << "Usage: [-k kernel] [-n size] [-t tile_size] [-s spread cluster size] [-q skip_verify] [-h]\n";
 }
 
 static void parse_args(int argc, char** argv) {
   int c;
-  while ((c = getopt(argc, argv, "n:t:k:qh")) != -1) {
+  while ((c = getopt(argc, argv, "n:t:k:s:qh")) != -1) {
     switch (c) {
       case 'n': size = atoi(optarg); break;
       case 't': tile_size = atoi(optarg); break;
       case 'k': kernel_file = optarg; break;
+      case 's': spread_k = atoi(optarg); break;
       case 'q': verify = 0; break;
       case 'h': show_usage(); exit(0);
       default:  show_usage(); exit(-1);
@@ -116,7 +122,18 @@ int main(int argc, char* argv[]) {
   // `mc_group_size` CTAs co-resident on one core. With single-warp CTAs,
   // this == VX_CFG_NUM_WARPS. The grid is laid out so blockIdx.x walks rows and
   // every mc_group_size consecutive rows form a multicast group sharing B.
-  const uint32_t mc_group_size = (uint32_t)num_warps;
+  const uint32_t mc_group_size = spread_k ? spread_k : (uint32_t)num_warps;
+  if (spread_k) {
+    uint64_t num_cores = 0, max_cluster = 0;
+    RT_CHECK(vx_device_query(device, VX_CAPS_NUM_CORES, &num_cores));
+    RT_CHECK(vx_device_query(device, VX_CAPS_DLMEM_MAX_CLUSTER, &max_cluster));
+    if (spread_k < 2 || spread_k > max_cluster || num_cores < 2) {
+      std::cout << "Error: SPREAD clusters of " << spread_k << " blocks need 2 to " << max_cluster
+                << " (the largest cluster) on a DLMEM device of at least 2 cores\n";
+      cleanup();
+      return -1;
+    }
+  }
   if (size % mc_group_size != 0) {
     std::cout << "Error: size must be divisible by mc_group_size ("
               << mc_group_size << ")\n";
@@ -126,9 +143,12 @@ int main(int argc, char* argv[]) {
 
   const uint32_t chunk_k = size;  // full-K (matches descriptor below)
   const uint32_t buf_bytes = size * size * sizeof(TYPE);
-  const uint32_t local_mem = (chunk_k + chunk_k * tile_size) * sizeof(TYPE);
+  // SPREAD: two mbarriers after the B tile, 8-byte aligned.
+  const uint32_t local_mem = spread_k
+      ? ((chunk_k + chunk_k * tile_size) * sizeof(TYPE) + 7) / 8 * 8 + 2 * sizeof(uint64_t)
+      : (chunk_k + chunk_k * tile_size) * sizeof(TYPE);
 
-  std::cout << "sgemm2_dxa_mcast (intra-core multicast)\n";
+  std::cout << (spread_k ? "sgemm2_dxa_mcast (SPREAD cluster multicast)\n" : "sgemm2_dxa_mcast (intra-core multicast)\n");
   std::cout << "  size=" << size << ", tile_size=" << tile_size
             << ", chunk_k=" << chunk_k << ", mc_group_size=" << mc_group_size << "\n";
   std::cout << "  block=" << tile_size << "x1, grid=" << size << "x" << (size/tile_size) << "\n";
@@ -166,7 +186,8 @@ int main(int argc, char* argv[]) {
 
   // Multicast attr: each receiver CTA's SMEM is the same chunk_k*tile_size
   // region (B is read into the same offset on each receiver's LMEM).
-  RT_CHECK(vortex::dxa::set_multicast(device, kDescB, local_mem));
+  if (!spread_k)
+    RT_CHECK(vortex::dxa::set_multicast(device, kDescB, local_mem));
 
   kernel_arg.size          = size;
   kernel_arg.tile_size     = tile_size;
@@ -177,7 +198,7 @@ int main(int argc, char* argv[]) {
   uint32_t block_dim[2] = { tile_size, 1 };
 
   RT_CHECK(vx_module_load_file(device, kernel_file, &module_));
-  RT_CHECK(vx_module_get_kernel(module_, "main", &kernel));
+  RT_CHECK(vx_module_get_kernel(module_, spread_k ? "spread_k" : "main", &kernel));
 
   std::cout << "start\n";
   vx_event_h launch_ev = nullptr;
@@ -198,6 +219,10 @@ int main(int argc, char* argv[]) {
     // B-tile that one CTA fetches.
     li.cluster_dim[0] = mc_group_size;
     li.cluster_dim[1] = 1;
+    if (spread_k) {
+      li.cluster_dim[2] = 1;
+      li.cluster_policy = VX_CLUSTER_POLICY_SPREAD;
+    }
     RT_CHECK(vx_enqueue_launch(queue, &li, 0, nullptr, &launch_ev));
   }
 

@@ -79,6 +79,15 @@ tests:
     via: script
     run: "make -C hw/unittest run-tcu-dsp"
     touches: [hw/rtl/tcu, hw/unittest/tcu_fedp]
+  # DXA core: legacy multicast copies through VX_dxa_core with dense and
+  # sparse cta masks; the receiver of bit r gets the tile at issuer + r x the
+  # stride and its barrier release at barrier + r. The `hw` lane above only
+  # builds this bench.
+  - id: hw-dxa-core
+    via: script
+    run: "make -C hw/unittest/dxa_core clean && make -C hw/unittest/dxa_core run"
+    touches: [hw/rtl/dxa, hw/rtl/VX_gpu_pkg.sv, hw/rtl/VX_define.vh, hw/unittest/dxa_core,
+              hw/unittest/common.mk]
   # DXA completion (RV64, DXA with mbarriers): the RTL completion unit in both
   # modes, a barrier event per copy and an mbarrier complete_tx of the box
   # bytes into the local memory, under back-pressure and in bursts; then the

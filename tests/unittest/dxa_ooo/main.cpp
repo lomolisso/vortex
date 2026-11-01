@@ -74,6 +74,75 @@ void check_write(const MemReq &write, uint64_t expected_addr,
     fail("response carried an unexpected completion flag");
 }
 
+// A barrier multicast replays each beat to the receivers of its warp mask in
+// increasing bit order: bit j writes at the issuer's address + j * smem_stride
+// and releases barrier + j, whatever bits are clear below it.
+void check_sparse_mask(DxaCore *dxa, Core *core, uint32_t mask) {
+  constexpr uint32_t slot = 1;
+  constexpr uint32_t line_size = VX_CFG_L1_LINE_SIZE;
+  constexpr uint32_t stride = 4 * line_size;
+  constexpr uint32_t gmem_base = 64 * line_size;
+  constexpr uint32_t smem_base = 2 * line_size;
+  constexpr uint32_t raw_bar = (3u << 8) | 0x10u;
+  constexpr uint32_t dcr = VX_DCR_DXA_DESC_BASE + slot * VX_DCR_DXA_DESC_STRIDE;
+  dxa->dcr_write(dcr + VX_DCR_DXA_DESC_BASE_LO_OFF, gmem_base);
+  dxa->dcr_write(dcr + VX_DCR_DXA_DESC_BASE_HI_OFF, 0);
+  dxa->dcr_write(dcr + VX_DCR_DXA_DESC_SIZE0_OFF, line_size);
+  dxa->dcr_write(dcr + VX_DCR_DXA_DESC_META_OFF, 1);
+  dxa->dcr_write(dcr + VX_DCR_DXA_DESC_ESTRIDE0_OFF, 1);
+  dxa->dcr_write(dcr + VX_DCR_DXA_DESC_TILESIZE01_OFF, line_size);
+  dxa->dcr_write(dcr + VX_DCR_DXA_DESC_SMEM_STRIDE_OFF, stride);
+
+  DxaReq req{};
+  req.core = core;
+  req.uuid = 2;
+  req.desc_slot = slot;
+  req.bar_id = raw_bar;
+  req.cta_mask = mask;
+  req.smem_addr = smem_base;
+  dxa->dxa_req_in.at(0).send(req);
+
+  MemReq read;
+  bool have_read = false;
+  for (uint32_t i = 0; i < 100 && !have_read; ++i) {
+    tick();
+    auto &output = dxa->gmem_req_out.at(0);
+    if (!output.empty()) {
+      read = output.peek();
+      output.pop();
+      have_read = true;
+    }
+  }
+  if (!have_read || read.addr != gmem_base)
+    fail("sparse mask: expected one GMEM read of the line");
+  send_response(dxa, read, 0x5a);
+
+  std::vector<uint32_t> bits;
+  for (uint32_t j = 0; j < 32; ++j) {
+    if ((mask >> j) & 1)
+      bits.push_back(j);
+  }
+  uint32_t rcv = 0;
+  for (uint32_t n = 0; n < 64 && rcv < bits.size(); ++n) {
+    MemReq write = wait_for_lmem_write(dxa);
+    const uint64_t base = smem_base + uint64_t(bits.at(rcv)) * stride;
+    if (write.addr < base || write.addr >= base + line_size)
+      fail("sparse mask: data of a receiver not at the issuer's address + bit * smem_stride");
+    if (!write.data || write.byteen == 0 || write.data->at(__builtin_ctzll(write.byteen)) != 0x5a)
+      fail("sparse mask: unexpected data");
+    if (write.flags.dxa_notify_done) {
+      if (write.flags.dxa_notify_bar_id != raw_bar + bits.at(rcv))
+        fail("sparse mask: a receiver's release is not barrier + bit");
+      ++rcv;
+    }
+  }
+  if (rcv != bits.size())
+    fail("sparse mask: a receiver got no completion");
+  tick(8);
+  if (!dxa->lmem_req_out.at(0).empty())
+    fail("sparse mask: a write past the last receiver");
+}
+
 } // namespace
 
 int main() {
@@ -138,6 +207,11 @@ int main() {
   check_write(wait_for_lmem_write(dxa.get()), smem_base, 0xaa, false);
   check_write(wait_for_lmem_write(dxa.get()), smem_base + 2 * line_size, 0xcc,
               true);
+
+  tick(8);
+  check_sparse_mask(dxa.get(), core, 0x5);
+  check_sparse_mask(dxa.get(), core, 0xa);
+  check_sparse_mask(dxa.get(), core, 0xf);
 
   std::cout << "PASSED" << std::endl;
   return 0;

@@ -50,6 +50,8 @@ module VX_dxa_smem_wr import VX_gpu_pkg::*, VX_dxa_pkg::*; #(
     input  wire                        active_notify_smem_done,
 `ifdef DXA_MBAR_ENABLE
     input  wire dxa_compl_t            active_compl,
+    // Each socket core's slot stride, a launch constant.
+    input  wire [`VX_CFG_SOCKET_SIZE-1:0][`VX_CFG_LMEM_LOG_SIZE:0] slot_stride,
 `endif
 
     // Direct drain channel (from gmem_req).
@@ -606,27 +608,48 @@ module VX_dxa_smem_wr import VX_gpu_pkg::*, VX_dxa_pkg::*; #(
     // LOG2UP (not CLOG2): NUM_WARPS=1 would make CLOG2 0 and the index vector
     // [-1:0]. VX_priority_encoder.index_out is `LOG2UP(N)` wide — match it.
     localparam MC_NW_BITS = `LOG2UP(`VX_CFG_NUM_WARPS);
+    // The dispatcher starts every slot on a DMA word and a memory block, so a
+    // descriptor stride rounds up the same way.
+    localparam MC_STRIDE_ALIGN = `MAX(`VX_CFG_MEM_BLOCK_SIZE, SMEM_WORD_SIZE);
+    wire [31:0] desc_stride = (smem_stride + 32'(MC_STRIDE_ALIGN - 1)) & ~32'(MC_STRIDE_ALIGN - 1);
+`ifdef DXA_MBAR_ENABLE
+    // A cluster multicast walks the ranks of its mask, a legacy one the
+    // issuer's consecutive slots.
+    localparam MC_W = `MAX(`VX_CFG_NUM_WARPS, DLMEM_MAX_CLUSTER);
+    wire mc_cluster = active_compl.cluster;
+    wire [MC_W-1:0] replay_mask = mc_cluster ? MC_W'(active_compl.mask) : MC_W'(cta_mask);
+    // The issuing core's, whose block the transfer came from.
+    wire [`VX_CFG_LMEM_LOG_SIZE:0] own_stride;
+    if (`VX_CFG_SOCKET_SIZE > 1) begin : g_own_stride
+        assign own_stride = slot_stride[active_core_id[`CLOG2(`VX_CFG_SOCKET_SIZE)-1:0]];
+    end else begin : g_own_stride
+        assign own_stride = slot_stride[0];
+    end
+    wire [31:0] tbl_stride = mc_cluster ? 32'(own_stride) : desc_stride;
+`else
+    localparam MC_W = `VX_CFG_NUM_WARPS;
+    wire [MC_W-1:0] replay_mask = cta_mask;
+    wire [31:0] tbl_stride = desc_stride;
+`endif
+    localparam MC_BITS = `LOG2UP(MC_W);
 
     // ════════════════════════════════════════════════════════════════════
     // Pipelined multicast replay control
     // ════════════════════════════════════════════════════════════════════
-    // cta_mask/smem_stride are stable per transfer, so the replay walk is a
-    // deterministic iteration over the set bits of a fixed mask. The
-    // NUM_WARPS-wide priority encoder + popcount are kept in the
+    // The mask and strides are stable per transfer, so the replay walk is a
+    // deterministic iteration over the set bits of a fixed mask in increasing
+    // order. The priority encoder and the receiver lookups are kept in the
     // register-input path; only registered control reaches the drain-ready
     // feedback, so smem_wr_ready_internal does not traverse the PE.
-    reg  [`VX_CFG_NUM_WARPS-1:0] replay_vec_r;       // active remaining mask
-    reg  [MC_NW_BITS-1:0]        replay_next_idx_r;  // PE index of replay_vec_r
-    reg  [`VX_CFG_NUM_WARPS-1:0] replay_onehot_r;    // PE onehot of replay_vec_r
+    reg  [MC_W-1:0]              replay_vec_r;       // active remaining mask
+    reg  [MC_BITS-1:0]           replay_next_idx_r;  // PE index of replay_vec_r
+    reg  [MC_W-1:0]              replay_onehot_r;    // PE onehot of replay_vec_r
     reg                          replay_has_rem_r;   // PE valid of replay_vec_r
     reg                          replay_is_last_r;   // replay_vec_r is one bit
-    // Per-receiver SMEM word offset = stride_words × (receivers serviced so far
-    // in this word). Maintained as a running accumulator instead of a multiply:
-    // +stride_words per serviced receiver, reset at each word boundary. Removes
-    // both the popcount and the address-path multiply.
+    // The serviced receiver's word offset from the transfer's base address.
     reg  [SMEM_ADDR_WIDTH-1:0]   beat_offset_r;
 
-    wire [MC_NW_BITS-1:0]  replay_next_idx      = replay_next_idx_r;
+    wire [MC_BITS-1:0]     replay_next_idx      = replay_next_idx_r;
     wire                   replay_has_remaining = replay_has_rem_r;
     wire                   replay_is_last       = replay_is_last_r;
 
@@ -638,33 +661,22 @@ module VX_dxa_smem_wr import VX_gpu_pkg::*, VX_dxa_pkg::*; #(
         : smem_bus_if.req_ready;
 
     // Next-cycle replay mask: clear the bit that fires this beat, reload
-    // cta_mask at word boundaries (after the last receiver) and whenever the
+    // the mask at word boundaries (after the last receiver) and whenever the
     // engine is idle, so the first beat of any word starts from the full mask
     // without a reload bubble (reproduces the old combinational reload_now).
     wire replay_beat_fire = mc_write_fire && replay_has_remaining;
-    wire [`VX_CFG_NUM_WARPS-1:0] replay_vec_next =
-          ~drain_valid      ? cta_mask                          // idle: keep primed
+    wire [MC_W-1:0] replay_vec_next =
+          ~drain_valid      ? replay_mask                       // idle: keep primed
         : ~replay_beat_fire ? replay_vec_r                      // stalled mid-word
-        : replay_is_last    ? cta_mask                          // word done: reload
+        : replay_is_last    ? replay_mask                       // word done: reload
         :                     (replay_vec_r & ~replay_onehot_r); // advance in word
 
-    // stride_words: smem_stride is byte units on the bus; convert to word units
-    // (SMEM_OFF_W = log2(SMEM_WORD_SIZE)). The accumulator mirrors the
-    // replay_vec_next state machine: 0 when idle/word-boundary, hold on stall,
-    // +stride_words per serviced receiver.
-    wire [SMEM_ADDR_WIDTH-1:0] stride_words = SMEM_ADDR_WIDTH'(smem_stride >> SMEM_OFF_W);
-    wire [SMEM_ADDR_WIDTH-1:0] beat_offset_next =
-          ~drain_valid      ? '0                              // idle: prime to 0
-        : ~replay_beat_fire ? beat_offset_r                   // stalled mid-word
-        : replay_is_last    ? '0                              // word done: reset
-        :                     (beat_offset_r + stride_words); // advance one receiver
-
     // Pre-decode the next mask for the registered control.
-    wire [MC_NW_BITS-1:0]        replay_idx_next;
-    wire [`VX_CFG_NUM_WARPS-1:0] replay_onehot_next;
+    wire [MC_BITS-1:0]           replay_idx_next;
+    wire [MC_W-1:0]              replay_onehot_next;
     wire                         replay_hasrem_next;
     VX_priority_encoder #(
-        .N (`VX_CFG_NUM_WARPS)
+        .N (MC_W)
     ) replay_pe (
         .data_in    (replay_vec_next),
         .onehot_out (replay_onehot_next),
@@ -674,9 +686,39 @@ module VX_dxa_smem_wr import VX_gpu_pkg::*, VX_dxa_pkg::*; #(
     wire replay_islast_next = replay_hasrem_next
                            && (replay_vec_next == replay_onehot_next);
 
+    // Word offset of each slot index from slot 0: legacy receiver i sits i
+    // descriptor strides past the issuer, a cluster rank at its slot's base.
+    // Both strides are whole DMA words, so the byte->word shift is lossless.
+    // Constant multiples, rebuilt every cycle from the per-transfer stride,
+    // keep any multiply off the beat path.
+    wire [SMEM_ADDR_WIDTH-1:0] stride_words = SMEM_ADDR_WIDTH'(tbl_stride >> SMEM_OFF_W);
+    reg  [`VX_CFG_NUM_WARPS-1:0][SMEM_ADDR_WIDTH-1:0] off_tbl_r;
+    always @(posedge clk) begin
+        for (integer i = 0; i < `VX_CFG_NUM_WARPS; ++i) begin
+            off_tbl_r[i] <= SMEM_ADDR_WIDTH'(i) * stride_words;
+        end
+    end
+`ifdef DXA_MBAR_ENABLE
+    dxa_mc_peer_t peer_next;
+    assign peer_next = active_compl.peers[`LOG2UP(DLMEM_MAX_CLUSTER)'(replay_idx_next)];
+    wire [MC_NW_BITS-1:0] off_idx_next = mc_cluster ? MC_NW_BITS'(peer_next.slot) : MC_NW_BITS'(replay_idx_next);
+`else
+    wire [MC_NW_BITS-1:0] off_idx_next = MC_NW_BITS'(replay_idx_next);
+`endif
+    wire [SMEM_ADDR_WIDTH-1:0] beat_offset_next = off_tbl_r[off_idx_next];
+`ifdef DXA_MBAR_ENABLE
+    // The serviced cluster receiver and its mbarrier, at the issuer's
+    // block-relative offset in the receiver's block.
+    `STATIC_ASSERT (SMEM_OFF_W >= 3, ("invalid parameter"))
+    dxa_mc_peer_t            cur_peer_r;
+    reg [DXA_MBAR_OFF_W-1:0] cur_mbar_r;
+    wire [DXA_MBAR_OFF_W-1:0] mbar_next = DXA_MBAR_OFF_W'(32'(beat_offset_next) << (SMEM_OFF_W - 3))
+                                        + active_compl.mbar_off;
+`endif
+
     always @(posedge clk) begin
         if (reset || transfer_start) begin
-            replay_vec_r      <= cta_mask;
+            replay_vec_r      <= replay_mask;
             replay_next_idx_r <= '0;
             replay_onehot_r   <= '0;
             replay_has_rem_r  <= 1'b0;
@@ -690,17 +732,21 @@ module VX_dxa_smem_wr import VX_gpu_pkg::*, VX_dxa_pkg::*; #(
             replay_is_last_r  <= replay_islast_next;
             beat_offset_r     <= beat_offset_next;
         end
+    `ifdef DXA_MBAR_ENABLE
+        if (transfer_active && is_multicast) begin
+            cur_peer_r <= peer_next;
+            cur_mbar_r <= mbar_next;
+        end
+    `endif
     end
 
     // Base word addr per beat: km_word_addr in K-major (per-elem scatter),
-    // fb_word_addr_r in row-major (streamed). Replay adds the per-receiver
-    // offset accumulated in beat_offset_r (the dispatcher guarantees smem_stride
-    // is word-aligned — a multiple of MEM_BLOCK_SIZE ≥ SMEM_WORD_SIZE — so the
-    // byte→word shift in stride_words is lossless).
+    // fb_word_addr_r in row-major (streamed). Replay adds the serviced
+    // receiver's offset.
     wire [SMEM_ADDR_WIDTH-1:0] base_word_addr = scatter ? km_word_addr : fb_word_addr_r;
     wire [SMEM_ADDR_WIDTH-1:0] replay_addr  = base_word_addr + beat_offset_r;
-    // Only the low SMEM_ADDR_WIDTH+SMEM_OFF_W bits of smem_stride are used.
-    `UNUSED_VAR (smem_stride)
+    // Only the low SMEM_ADDR_WIDTH+SMEM_OFF_W bits of the stride are used.
+    `UNUSED_VAR (tbl_stride)
     // per_lane_stride_bytes is LMEM-bounded; only the low DXA_SMEM_ADDR_W bits feed fb_byte_addr_r.
     // Wide LMEM configurations consume the whole field, leaving no high bits to tag.
     if (DXA_SMEM_ADDR_W < 16) begin : g_stride_hi_unused
@@ -735,17 +781,18 @@ module VX_dxa_smem_wr import VX_gpu_pkg::*, VX_dxa_pkg::*; #(
     assign smem_bus_if.req_data.data   = fb_word_data;
     assign smem_bus_if.req_data.byteen = fb_word_byteen;
 `ifdef DXA_MBAR_ENABLE
-    // Multicast is legacy only, so an mbarrier transfer has one last beat.
+    // A cluster multicast's receivers each take their last beat with their
+    // own block, mbarrier and route; any other mbarrier transfer has one.
     dxa_lmem_attr_t smem_wr_attr;
     assign smem_wr_attr.last     = smem_wr_attr_last;
     assign smem_wr_attr.mode     = active_compl.mode;
-    assign smem_wr_attr.payload  = active_compl.mode ? DXA_ATTR_PAYLOAD_W'(active_compl.mbar_off)
+    assign smem_wr_attr.payload  = active_compl.mode ? DXA_ATTR_PAYLOAD_W'(mc_cluster ? cur_mbar_r : active_compl.mbar_off)
                                                      : DXA_ATTR_PAYLOAD_W'(smem_wr_attr_bar);
     assign smem_wr_attr.tx_bytes = active_compl.tx_bytes;
-    assign smem_wr_attr.slot     = active_compl.slot;
-    assign smem_wr_attr.gen      = active_compl.gen;
-    assign smem_wr_attr.remote   = active_compl.remote;
-    assign smem_wr_attr.dst_core = active_compl.dst_core;
+    assign smem_wr_attr.slot     = mc_cluster ? cur_peer_r.slot   : active_compl.slot;
+    assign smem_wr_attr.gen      = mc_cluster ? cur_peer_r.gen    : active_compl.gen;
+    assign smem_wr_attr.remote   = mc_cluster ? cur_peer_r.remote : active_compl.remote;
+    assign smem_wr_attr.dst_core = mc_cluster ? cur_peer_r.core   : active_compl.dst_core;
     assign smem_bus_if.req_data.attr   = smem_wr_attr;
 `else
     assign smem_bus_if.req_data.attr   = {smem_wr_attr_last, smem_wr_attr_bar};
@@ -797,6 +844,13 @@ module VX_dxa_smem_wr import VX_gpu_pkg::*, VX_dxa_pkg::*; #(
                 $write("DXA_PIPE,%0d,SMEM_WR,addr=0x%0h,byteen=0x%0h,last=%0d\n",
                     $time, smem_wr_addr, fb_word_byteen, smem_wr_last_pkt);
             end
+        `ifdef DXA_MBAR_ENABLE
+            if (smem_req_fire && mc_cluster) begin
+                $write("DXA_TL,%0d,MC_BEAT,rank=%0d,remote=%0d,core=%0d,slot=%0d,addr=0x%0h,last=%0d,mbar=0x%0h\n",
+                    $time, replay_next_idx, cur_peer_r.remote, cur_peer_r.core, cur_peer_r.slot,
+                    smem_wr_addr, smem_wr_attr_last, cur_mbar_r);
+            end
+        `endif
         end
     end
 `endif

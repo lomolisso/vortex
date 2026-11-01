@@ -47,6 +47,20 @@ struct DxaReq {
   uint32_t dst_core;
   bool     win;           // a DLMEM window destination
   uint32_t win_room;      // and its bytes up to its block's end
+  // A cluster multicast (meta[30] with a rank mask): one copy into each masked
+  // rank's block, in increasing rank, each at the issuer's block-relative
+  // offset and completing on the mbarrier at the issuer's mbarrier offset.
+  struct Rcv {
+    uint32_t core;        // cluster-relative
+    uint32_t slot;
+    uint32_t gen;
+    uint64_t smem_addr;
+    uint32_t mbar_off;
+    bool     remote;
+  };
+  bool     cluster;
+  uint32_t num_rcv;
+  std::array<Rcv, VX_CFG_DLMEM_MAX_CLUSTER> rcvs;
 #else
 #line 43
 #endif
@@ -79,6 +93,7 @@ private:
   // Resolves a DLMEM window destination and mbarrier through the issuing
   // block's peer row, as the RTL reads it from the core's peer table.
   void translate(const instr_trace_t* trace, uint32_t meta, uint32_t cta_mask, DxaReq& req) const;
+  void cluster_receivers(const instr_trace_t* trace, uint32_t meta, uint32_t cta_mask, DxaReq& req) const;
 
   [[noreturn]] void issue_abort(const instr_trace_t* trace, const char* msg) const;
 

@@ -29,6 +29,9 @@ module VX_dxa_worker import VX_gpu_pkg::*, VX_dxa_pkg::*; #(
 `endif
     VX_dxa_worker_req_if.slave req_if,
     VX_mem_bus_if.master gmem_bus_if,
+`ifdef DXA_MBAR_ENABLE
+    input wire [`VX_CFG_SOCKET_SIZE-1:0][`VX_CFG_LMEM_LOG_SIZE:0] slot_stride,
+`endif
     VX_mem_bus_if.master smem_bus_if
 );
     `UNUSED_SPARAM (INSTANCE_ID)
@@ -261,6 +264,7 @@ module VX_dxa_worker import VX_gpu_pkg::*, VX_dxa_pkg::*; #(
         .active_notify_smem_done (active_notify_smem_done),
     `ifdef DXA_MBAR_ENABLE
         .active_compl          (active_compl),
+        .slot_stride           (slot_stride),
     `endif
         .sw_valid              (sw_valid),
         .sw_ready              (sw_ready),

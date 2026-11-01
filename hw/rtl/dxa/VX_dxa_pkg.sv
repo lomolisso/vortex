@@ -49,6 +49,16 @@ package VX_dxa_pkg;
     // encoder packs it into the 32-bit meta ABI word, checked in VX_dxa_setup.
     localparam DXA_DESC_META_TOTAL_BITS     = DXA_DESC_META_L2PROMO_LSB + DXA_DESC_META_L2PROMO_BITS;
 
+`ifdef DXA_MBAR_ENABLE
+    // A cluster rank's block, as a multicast receiver.
+    typedef struct packed {
+        logic                      remote;   // on another core than the issuer
+        logic [DLMEM_CORE_W-1:0]   core;
+        logic [NW_WIDTH-1:0]       slot;
+        logic [DXA_CTA_GEN_W-1:0]  gen;      // a local receiver's slot generation
+    } dxa_mc_peer_t;
+
+`endif
     // DXA request data — core → DXA control path.
     typedef struct packed {
         logic [NC_WIDTH-1:0]      core_id;
@@ -64,9 +74,12 @@ package VX_dxa_pkg;
         logic                            remote;       // the destination block is on another core
         logic [DLMEM_CORE_W-1:0]         dst_core;     // that core, in the cluster
         logic [NW_WIDTH-1:0]             dst_slot;     // and the block's CTA slot there
-        logic [DXA_MBAR_OFF_W-1:0]       mbar_off;     // mbarrier word offset in the destination's local memory
+        logic [DXA_MBAR_OFF_W-1:0]       mbar_off;     // mbarrier word offset in the destination's local memory, block-relative for a cluster multicast
         logic                            win;          // a DLMEM window destination
         logic [`VX_CFG_LMEM_LOG_SIZE:0]  win_room;     // and its bytes up to its block's end
+        logic                            mc_cluster;   // a multicast to the cluster ranks of mc_mask
+        logic [DLMEM_MAX_CLUSTER-1:0]    mc_mask;
+        dxa_mc_peer_t [DLMEM_MAX_CLUSTER-1:0] mc_peers; // by rank
     `endif
     } dxa_req_data_t;
 
@@ -81,6 +94,10 @@ package VX_dxa_pkg;
         logic [DXA_CTA_GEN_W-1:0]  gen;
         logic                      remote;
         logic [DLMEM_CORE_W-1:0]   dst_core;
+        // A cluster multicast: mbar_off is relative to each receiver's block.
+        logic                      cluster;
+        logic [DLMEM_MAX_CLUSTER-1:0] mask;
+        dxa_mc_peer_t [DLMEM_MAX_CLUSTER-1:0] peers;
     } dxa_compl_t;
 `endif
 

@@ -6,7 +6,8 @@ defaults:
   - 64
   tier: smoke
   configs: "-DVX_CFG_EXT_DXA_ENABLE"
-  touches: [hw/rtl/dxa, sim/simx/dxa]
+  touches: [hw/rtl/dxa, sim/simx/dxa, sw/kernel/include/vx_dxa.h,
+            tests/regression/dxa_copy_mcast, tests/regression/sgemm2_dxa_mcast]
 tests:
 - id: dxa_copy-1
   touches: &copy_touches [hw/rtl/dxa, sim/simx/dxa, tests/regression/dxa_copy,
@@ -319,7 +320,7 @@ tests:
   touches: [hw/rtl/VX_kmu.sv, hw/rtl/interfaces/VX_kmu_bus_if.sv,
             hw/rtl/core/VX_kmu_bus_arb.sv, hw/rtl/core/VX_cta_dispatch.sv,
             sim/simx/kmu/, sim/simx/cta_dispatcher.cpp,
-            hw/rtl/dxa, sim/simx/dxa]
+            hw/rtl/dxa, sim/simx/dxa, tests/regression/dxa_copy_mcast]
   via: blackbox
   drivers:
   - simx
@@ -333,7 +334,7 @@ tests:
   touches: [hw/rtl/VX_kmu.sv, hw/rtl/interfaces/VX_kmu_bus_if.sv,
             hw/rtl/core/VX_kmu_bus_arb.sv, hw/rtl/core/VX_cta_dispatch.sv,
             sim/simx/kmu/, sim/simx/cta_dispatcher.cpp,
-            hw/rtl/dxa, sim/simx/dxa]
+            hw/rtl/dxa, sim/simx/dxa, tests/regression/dxa_copy_mcast]
   via: blackbox
   drivers:
   - simx
@@ -420,7 +421,7 @@ tests:
   touches: [hw/rtl/VX_kmu.sv, hw/rtl/interfaces/VX_kmu_bus_if.sv,
             hw/rtl/core/VX_kmu_bus_arb.sv, hw/rtl/core/VX_cta_dispatch.sv,
             sim/simx/kmu/, sim/simx/cta_dispatcher.cpp,
-            hw/rtl/dxa, sim/simx/dxa]
+            hw/rtl/dxa, sim/simx/dxa, tests/regression/sgemm2_dxa_mcast]
   via: blackbox
   drivers:
   - simx

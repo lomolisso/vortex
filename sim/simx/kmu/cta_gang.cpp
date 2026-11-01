@@ -45,7 +45,14 @@ uint32_t cluster_size(const kmu_req_t& req) {
 
 // The dispatcher's slot pitch: the footprint rounded up to a memory block.
 uint32_t slot_stride(const kmu_req_t& req) {
+#if defined(VX_CFG_EXT_DXA_ENABLE) && (VX_CFG_LMEM_NUM_BANKS * (VX_CFG_XLEN / 8) > VX_CFG_MEM_BLOCK_SIZE)
+  // A DXA build starts every slot on a DMA word, as the dispatcher does.
+  constexpr uint32_t kSlotAlign = VX_CFG_LMEM_NUM_BANKS * (VX_CFG_XLEN / 8);
+  return (req.lmem_size + kSlotAlign - 1u) & ~(kSlotAlign - 1u);
+#else
   return (req.lmem_size + VX_CFG_MEM_BLOCK_SIZE - 1u) & ~uint32_t(VX_CFG_MEM_BLOCK_SIZE - 1u);
+#endif
+#line 49
 }
 
 } // namespace

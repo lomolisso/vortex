@@ -707,6 +707,8 @@ module VX_socket import VX_gpu_pkg::*, VX_tlb_pkg::*;
     assign per_core_dcr_bus_if[SOCKET_DCR_DXA_IDX].rsp_data  = dxa_dcr_bus_if.rsp_data;
 
 `ifdef DXA_MBAR_ENABLE
+    // Each core's slot stride, for the engine's cluster multicasts.
+    wire [`VX_CFG_SOCKET_SIZE-1:0][`VX_CFG_LMEM_LOG_SIZE:0] per_core_slot_stride;
     // The engine's rows into other cores' blocks, an input of the DLMEM request switch.
     VX_dlmem_bus_if #(
         .DATAW (VX_dlmem_pkg::DLMEM_REQ_DATAW),
@@ -730,6 +732,7 @@ module VX_socket import VX_gpu_pkg::*, VX_tlb_pkg::*;
         .gmem_bus_if      (dxa_gmem_bus_if),
     `ifdef DXA_MBAR_ENABLE
         .row_out_if       (dxa_row_if),
+        .slot_stride      (per_core_slot_stride),
     `endif
         `UNUSED_PIN (busy)
     );
@@ -965,6 +968,9 @@ module VX_socket import VX_gpu_pkg::*, VX_tlb_pkg::*;
         `ifdef VX_CFG_EXT_DXA_ENABLE
             .dxa_req_bus_if (per_core_dxa_req_bus_if[core_id]),
             .dxa_lmem_bus_if(per_core_dxa_lmem_bus_if[core_id]),
+        `endif
+        `ifdef DXA_MBAR_ENABLE
+            .dxa_slot_stride(per_core_slot_stride[core_id]),
         `endif
 
         `ifdef VX_CFG_EXT_TEX_ENABLE

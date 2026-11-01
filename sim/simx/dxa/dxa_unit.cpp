@@ -60,13 +60,8 @@ instr_trace_t* DxaUnit::process(instr_trace_t* trace) {
   // meta[30] selects the completion; meta[29:4] is its barrier or mbarrier.
   const bool mode    = (meta >> 30) & 1u;
   uint32_t raw_bar   = mode ? 0u : ((meta >> 4) & 0x03ffffffu);
-  if (mode && __builtin_popcount(cta_mask) > 1) {
-    std::cerr << SimPlatform::instance().cycles() << ": *** core" << core_->id()
-              << " DXA multicast with an mbarrier is not supported: wid=" << trace->wid
-              << " cta_mask=0x" << std::hex << cta_mask << std::dec << std::endl;
-    std::abort();
-  }
 #else
+#line 67
   uint32_t raw_bar   = (meta >> 4) & 0x07ffffffu;
 #endif
 
@@ -92,7 +87,13 @@ instr_trace_t* DxaUnit::process(instr_trace_t* trace) {
   req.remote    = false;
   req.win       = false;
   req.win_room  = 0;
-  this->translate(trace, meta, cta_mask, req);
+  req.cluster   = false;
+  req.num_rcv   = 0;
+  if (mode && cta_mask != 0) {
+    this->cluster_receivers(trace, meta, cta_mask, req);
+  } else {
+    this->translate(trace, meta, cta_mask, req);
+  }
 #else
 #line 87
 #endif
@@ -139,8 +140,13 @@ void DxaUnit::translate(const instr_trace_t* trace, uint32_t meta, uint32_t cta_
   const uint32_t wl = cfg.lmem_log + rbits;
   const bool dst_win  = (req.smem_addr >> wl) == (cfg.dlmem_base >> wl);
   const bool mbar_win = req.mode && ((meta >> 29) & 1u);
-  if (dst_win && __builtin_popcount(cta_mask) > 1) {
-    this->issue_abort(trace, "DXA multicast with an mbarrier is not supported");
+  if (!req.mode && __builtin_popcount(cta_mask) > 1) {
+    // A barrier multicast replays into consecutive slots of this core.
+    for (const auto& p : slot_row_.at(req.slot).peers) {
+      if (p.core != req.src_core) {
+        this->issue_abort(trace, "DXA barrier multicast into a cluster spread over cores");
+      }
+    }
   }
   if (!dst_win && !mbar_win) {
     return;
@@ -180,5 +186,49 @@ void DxaUnit::translate(const instr_trace_t* trace, uint32_t meta, uint32_t cta_
   DT(4, "dxa-unit window: core=" << core_->id() << ", wid=" << trace->wid << ", rank=" << rank
      << ", dst={core=" << dst.core << ", slot=" << dst.slot << "}, off=0x" << std::hex << off
      << ", mbar_off=0x" << req.mbar_off << std::dec << ", remote=" << req.remote);
+}
+
+// A cluster multicast lands at the issuer's block-relative offsets in every
+// masked rank's block. Receivers on this core take the local path at their own
+// slot; the others are remote.
+void DxaUnit::cluster_receivers(const instr_trace_t* trace, uint32_t meta, uint32_t cta_mask, DxaReq& req) const {
+  const auto cfg = dlmem_cfg();
+  const uint32_t wl = cfg.lmem_log + dlmem_ref::rank_bits(cfg);
+  const bool dst_win  = (req.smem_addr >> wl) == (cfg.dlmem_base >> wl);
+  const bool mbar_win = (meta >> 29) & 1u;
+  if (dst_win || mbar_win) {
+    this->issue_abort(trace, "DXA multicast needs a local address");
+  }
+  const auto& row = slot_row_.at(req.slot);
+  if ((uint64_t(cta_mask) >> row.k) != 0) {
+    this->issue_abort(trace, "DXA multicast rank outside the cluster");
+  }
+  // Block-relative offsets, modulo the local memory as the RTL computes them.
+  const uint64_t lmem_mask = dlmem_ref::low_mask(cfg.lmem_log);
+  const uint64_t base      = uint64_t(req.slot) * stride_;
+  const uint64_t off       = (req.smem_addr - cfg.lmem_base - base) & lmem_mask;
+  const uint32_t mbar_rel  = uint32_t((req.mbar_off - (base >> 3)) & (lmem_mask >> 3));
+  if ((uint64_t(mbar_rel) << 3) >= stride_) {
+    this->issue_abort(trace, "mbarrier offset outside the block");
+  }
+  req.cluster  = true;
+  req.win      = true;
+  req.win_room = (off < stride_) ? uint32_t(stride_ - off) : 0u;
+  for (uint32_t r = 0; r < row.k; ++r) {
+    if (((cta_mask >> r) & 1u) == 0)
+      continue;
+    const auto& p  = row.peers.at(r);
+    const uint64_t pbase = uint64_t(p.slot) * stride_;
+    auto& rcv     = req.rcvs.at(req.num_rcv++);
+    rcv.core      = p.core;
+    rcv.slot      = p.slot;
+    rcv.gen       = slot_gen_.at(p.slot);
+    rcv.smem_addr = cfg.lmem_base + pbase + off;
+    rcv.mbar_off  = uint32_t(pbase >> 3) + mbar_rel;
+    rcv.remote    = (p.core != req.src_core);
+    DT(4, "dxa-unit multicast: core=" << core_->id() << ", wid=" << trace->wid << ", rank=" << r
+       << ", dst={core=" << p.core << ", slot=" << p.slot << "}, off=0x" << std::hex << off
+       << ", mbar_off=0x" << rcv.mbar_off << std::dec << ", remote=" << rcv.remote);
+  }
 }
 #endif

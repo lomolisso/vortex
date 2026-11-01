@@ -8,8 +8,11 @@ PROJECT := dxa_copy_mcast
 SRC_DIR := $(VORTEX_HOME)/tests/regression/$(PROJECT)
 
 SRCS := $(SRC_DIR)/main.cpp
+HDRS := $(SRC_DIR)/common.h $(SW_COMMON_DIR)/mbar_ref.h
 
 VX_SRCS := $(SRC_DIR)/kernel.cpp
+VX_HDRS := $(SRC_DIR)/common.h $(VORTEX_HOME)/sw/kernel/include/vx_dxa.h \
+           $(VORTEX_HOME)/sw/kernel/include/vx_mbar.h $(VORTEX_HOME)/sw/kernel/include/vx_dlmem.h
 
 OPTS ?= -r16 -c16 -R16 -C4
 

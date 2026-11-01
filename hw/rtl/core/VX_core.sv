@@ -49,6 +49,10 @@ module VX_core import VX_gpu_pkg::*, VX_tlb_pkg::*; #(
     VX_dxa_req_bus_if.master dxa_req_bus_if,
     VX_mem_bus_if.slave     dxa_lmem_bus_if,
 `endif
+`ifdef DXA_MBAR_ENABLE
+    // The launch's slot stride, for the socket DXA's cluster multicasts.
+    output wire [`VX_CFG_LMEM_LOG_SIZE:0] dxa_slot_stride,
+`endif
 
 `ifdef VX_CFG_EXT_TEX_ENABLE
     VX_tex_bus_if.master    tex_bus_if,
@@ -271,6 +275,7 @@ module VX_core import VX_gpu_pkg::*, VX_tlb_pkg::*; #(
     dlmem_row_t                                     dxa_peer_row;
     wire [`VX_CFG_NUM_WARPS-1:0][`VX_CFG_LMEM_LOG_SIZE-1:0] dxa_peer_slot_base;
     wire [`VX_CFG_LMEM_LOG_SIZE:0]                  dxa_peer_stride;
+    assign dxa_slot_stride = dxa_peer_stride;
 `endif
 
     VX_scheduler #(

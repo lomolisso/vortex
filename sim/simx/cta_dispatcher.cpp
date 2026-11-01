@@ -218,7 +218,15 @@ void CtaDispatcher::admit(uint64_t now) {
   // and the LMEM model is block-addressed (byteen-masked), so a non-aligned
   // stride would truncate the destination; the descriptor handler rounds
   // its stride the same way to stay consistent.
+#if defined(VX_CFG_EXT_DXA_ENABLE) && (VX_CFG_LMEM_NUM_BANKS * (VX_CFG_XLEN / 8) > VX_CFG_MEM_BLOCK_SIZE)
+  // A DXA multicast offsets its receivers by whole DMA words (a banked
+  // local-memory row), so every slot must start on one.
+  constexpr uint32_t kSlotAlign = VX_CFG_LMEM_NUM_BANKS * (VX_CFG_XLEN / 8);
+  uint32_t stride = (next.lmem_size + kSlotAlign - 1u) & ~(kSlotAlign - 1u);
+#else
   uint32_t stride = (next.lmem_size + VX_CFG_MEM_BLOCK_SIZE - 1u) & ~uint32_t(VX_CFG_MEM_BLOCK_SIZE - 1u);
+#endif
+#line 202
   uint32_t max_slots = usable_slots(stride);
 
   // Round-robin slot allocation over the usable range. Normalize the tail in

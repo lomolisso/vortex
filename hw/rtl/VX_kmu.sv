@@ -100,11 +100,17 @@ module VX_kmu import VX_gpu_pkg::*; import VX_trace_pkg::*; #(
     // core's dispatcher (identical for all cores, stable for the whole kernel).
     //   cluster_size : K = cluster_dim product, bounded by the largest cluster;
     //                  each dim is sliced to that width.
-    //   aligned_lmem_size : per-CTA LMEM footprint rounded up to MEM_BLOCK_SIZE.
+    //   aligned_lmem_size : per-CTA LMEM footprint rounded up to MEM_BLOCK_SIZE
+    //                       (and to the DXA DMA word in a DXA build).
     // Registered so the broadcast path is flop-driven; DCRs are written before
     // `start`, so both values are settled before the first CTA is dispatched.
     reg [`KMU_CLUSTER_MSB:0]                 cluster_size_r;
     reg [`VX_CFG_LMEM_LOG_SIZE:0]    aligned_lmem_size_r;
+`ifdef VX_CFG_EXT_DXA_ENABLE
+    // A DXA multicast offsets its receivers by whole DMA words (a banked
+    // local-memory row), so every slot must start on one.
+    localparam SLOT_ALIGN = `MAX(`VX_CFG_MEM_BLOCK_SIZE, `VX_CFG_LMEM_NUM_BANKS * (`VX_CFG_XLEN / 8));
+`endif
     always_ff @(posedge clk) begin
         if (reset) begin
             cluster_size_r      <= (`KMU_CLUSTER_MSB+1)'(1);
@@ -112,9 +118,15 @@ module VX_kmu import VX_gpu_pkg::*; import VX_trace_pkg::*; #(
         end else begin
             cluster_size_r <= (`KMU_CLUSTER_MSB+1)'(dcr_cluster_dim[0] * dcr_cluster_dim[1]
                                           * dcr_cluster_dim[2]);
+`ifdef VX_CFG_EXT_DXA_ENABLE
+            aligned_lmem_size_r <=
+                ((`VX_CFG_LMEM_LOG_SIZE+1)'(dcr_lmem_size) + (`VX_CFG_LMEM_LOG_SIZE+1)'(SLOT_ALIGN - 1))
+                & ~((`VX_CFG_LMEM_LOG_SIZE+1)'(SLOT_ALIGN - 1));
+`else
             aligned_lmem_size_r <=
                 ((`VX_CFG_LMEM_LOG_SIZE+1)'(dcr_lmem_size) + (`VX_CFG_LMEM_LOG_SIZE+1)'(`VX_CFG_MEM_BLOCK_SIZE - 1))
                 & ~((`VX_CFG_LMEM_LOG_SIZE+1)'(`VX_CFG_MEM_BLOCK_SIZE - 1));
+`endif
         end
     end
 

@@ -279,6 +279,9 @@ module VX_core_top import VX_gpu_pkg::*;
         .dxa_req_bus_if (dxa_req_bus_if),
         .dxa_lmem_bus_if(dxa_lmem_bus_if),
     `endif
+    `ifdef DXA_MBAR_ENABLE
+        `UNUSED_PIN (dxa_slot_stride),
+    `endif
 
     `ifdef VX_CFG_EXT_TEX_ENABLE
         .tex_bus_if     (tex_bus_if),

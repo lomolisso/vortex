@@ -30,10 +30,16 @@ module VX_dxa_core import VX_gpu_pkg::*, VX_dxa_pkg::*; #(
 `ifdef DXA_MBAR_ENABLE
     // Rows of copies into another core's block, as DLMEM request flits.
     VX_dlmem_bus_if.master row_out_if,
+    // Each requesting core's slot stride, a launch constant.
+    input wire [`VX_CFG_SOCKET_SIZE-1:0][`VX_CFG_LMEM_LOG_SIZE:0] slot_stride,
 `endif
     output wire busy
 );
     `UNUSED_SPARAM (INSTANCE_ID)
+`ifdef DXA_MBAR_ENABLE
+    // A transfer's core id indexes slot_stride by its socket-local bits.
+    `STATIC_ASSERT (NUM_REQS == `VX_CFG_SOCKET_SIZE, ("invalid parameter"))
+`endif
 
     // ================================================================
     // Descriptor table (single read port, driven by dispatch queue)
@@ -177,6 +183,9 @@ module VX_dxa_core import VX_gpu_pkg::*, VX_dxa_pkg::*; #(
         `endif
             .req_if         (worker_req_if[i]),
             .gmem_bus_if    (worker_gmem_bus_if[i]),
+        `ifdef DXA_MBAR_ENABLE
+            .slot_stride    (slot_stride),
+        `endif
             .smem_bus_if    (worker_smem_bus_if[i])
         );
     end

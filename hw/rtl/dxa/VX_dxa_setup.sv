@@ -166,7 +166,7 @@ module VX_dxa_setup import VX_gpu_pkg::*, VX_dxa_pkg::*; (
                      <= 128'(1 << `VX_CFG_LMEM_LOG_SIZE)),
         ("DXA box exceeds local memory: tiles=%0d,%0d,%0d,%0d,%0d elem_bytes=%0d", dec_tile0, dec_tile1, dec_tile2,
          dec_tile3, dec_tile4, dec_elem_bytes))
-    `RUNTIME_ASSERT(!launch_accept || !req_data.win
+    `RUNTIME_ASSERT(!launch_accept || !(req_data.win || req_data.mc_cluster)
                  || (((128'(dec_tile0) * 128'(dec_tile1) * 128'(dec_tile2) * 128'(dec_tile3) * 128'(dec_tile4)) << esize_enc)
                      <= 128'(req_data.win_room)),
         ("DXA box exceeds the destination block: tiles=%0d,%0d,%0d,%0d,%0d elem_bytes=%0d room=%0d", dec_tile0,
@@ -507,7 +507,11 @@ module VX_dxa_setup import VX_gpu_pkg::*, VX_dxa_pkg::*; (
                 `else
                     s_notify_smem_done  <= 1'b0;
                 `endif
+                `ifdef DXA_MBAR_ENABLE
+                    s_is_multicast      <= req_data.mc_cluster || ($countones(req_data.cta_mask) > 1);
+                `else
                     s_is_multicast      <= ($countones(req_data.cta_mask) > 1);
+                `endif
                     s_cta_mask          <= req_data.cta_mask;
                     s_smem_stride       <= desc_data.smem_stride;
                     s_initial_smem_base <= req_data.smem_addr;
@@ -528,6 +532,9 @@ module VX_dxa_setup import VX_gpu_pkg::*, VX_dxa_pkg::*; (
                     s_compl.gen         <= req_data.gen;
                     s_compl.remote      <= req_data.remote;
                     s_compl.dst_core    <= req_data.dst_core;
+                    s_compl.cluster     <= req_data.mc_cluster;
+                    s_compl.mask        <= req_data.mc_mask;
+                    s_compl.peers       <= req_data.mc_peers;
                     lat_tile4           <= DXA_TX_BYTES_W'(dec_tile4);
                 `endif
                     // Rolling-cursor deltas: delta[0] is the inner-dim step.

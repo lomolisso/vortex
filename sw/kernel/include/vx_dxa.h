@@ -19,6 +19,7 @@
 
 #ifdef VX_CFG_EXT_MBAR_ENABLE
 #include <vx_mbar.h>
+#include <vx_dlmem.h>
 #endif
 
 #ifdef __cplusplus
@@ -171,7 +172,7 @@ inline void vx_dxa_issue_5d_wg(uint32_t desc_slot,
 // once the box (tile0 x .. x tile4 x elem_bytes, out-of-bounds fill
 // included) has landed, the engine applies complete_tx(box bytes) to `mbar`,
 // an object in the issuing block's own local memory. The kernel declares the
-// bytes with vx_mbar_arrive_tx() or vx_mbar_expect_tx(). No multicast.
+// bytes with vx_mbar_arrive_tx() or vx_mbar_expect_tx().
 
 // meta[29:4] for the object, with meta[30] set (bit 26 of the payload).
 inline uint32_t __vx_dxa_mbar_payload(const uint64_t* mbar) {
@@ -379,6 +380,48 @@ inline void vx_dxa_issue_5d_multicast_wg(uint32_t desc_slot,
       : "memory");
 }
 
+#ifdef VX_CFG_EXT_MBAR_ENABLE
+// Cluster multicast, like cp.async.bulk.tensor.shared::cluster with
+// .multicast::cluster and .mbarrier::complete_tx::bytes: one read of the box,
+// landing in every block of the issuer's cluster whose rank r has bit r set in
+// `cta_mask`, at the block-relative offset of `smem_addr`; the engine then
+// applies complete_tx(box bytes) to the object at the block-relative offset
+// of `mbar` in that block. `smem_addr` and `mbar` are the issuer's own local
+// pointers, not window addresses. The issuer may leave itself out of the
+// mask, and then its own object is not credited.
+
+inline void vx_dxa_issue_1d_mbar_multicast(uint32_t desc_slot, uint64_t* mbar, void* smem_addr,
+                                           uint32_t cta_mask, uint32_t coord0) {
+  vx_dxa_issue_1d_multicast_wg(desc_slot, __vx_dxa_mbar_payload(mbar), smem_addr, coord0, cta_mask);
+}
+
+inline void vx_dxa_issue_2d_mbar_multicast(uint32_t desc_slot, uint64_t* mbar, void* smem_addr,
+                                           uint32_t cta_mask, uint32_t coord0, uint32_t coord1) {
+  vx_dxa_issue_2d_multicast_wg(desc_slot, __vx_dxa_mbar_payload(mbar), smem_addr, coord0, coord1, cta_mask);
+}
+
+inline void vx_dxa_issue_3d_mbar_multicast(uint32_t desc_slot, uint64_t* mbar, void* smem_addr,
+                                           uint32_t cta_mask, uint32_t coord0, uint32_t coord1,
+                                           uint32_t coord2) {
+  vx_dxa_issue_3d_multicast_wg(desc_slot, __vx_dxa_mbar_payload(mbar), smem_addr,
+                               coord0, coord1, coord2, cta_mask);
+}
+
+inline void vx_dxa_issue_4d_mbar_multicast(uint32_t desc_slot, uint64_t* mbar, void* smem_addr,
+                                           uint32_t cta_mask, uint32_t coord0, uint32_t coord1,
+                                           uint32_t coord2, uint32_t coord3) {
+  vx_dxa_issue_4d_multicast_wg(desc_slot, __vx_dxa_mbar_payload(mbar), smem_addr,
+                               coord0, coord1, coord2, coord3, cta_mask);
+}
+
+inline void vx_dxa_issue_5d_mbar_multicast(uint32_t desc_slot, uint64_t* mbar, void* smem_addr,
+                                           uint32_t cta_mask, uint32_t coord0, uint32_t coord1,
+                                           uint32_t coord2, uint32_t coord3, uint32_t coord4) {
+  vx_dxa_issue_5d_multicast_wg(desc_slot, __vx_dxa_mbar_payload(mbar), smem_addr,
+                               coord0, coord1, coord2, coord3, coord4, cta_mask);
+}
+#endif // VX_CFG_EXT_MBAR_ENABLE
+
 #ifdef __cplusplus
 }
 #endif
@@ -551,6 +594,103 @@ private:
   vortex::barrier&        local_bar_;
   vortex::group_barrier&  group_bar_;
 };
+
+#ifdef VX_CFG_EXT_MBAR_ENABLE
+// ════════════════════════════════════════════════════════════════════════
+//  C++ helper API — vortex::dxa_multicast_cluster_Nd
+//
+//  The cluster-multicast idiom on mbarriers, for a cluster of any placement.
+//  Every warp of every block of the cluster calls sync_and_issue() once per
+//  copy: each block whose rank is in the mask arms its own mbarrier with
+//  arrive_tx(box_bytes) from one thread, the cluster barrier then orders
+//  every receiver's declaration before the copy, and warp 0 of rank `issuer`
+//  fires the multicast. The kernel initializes `mbar` beforehand, from
+//  thread 0 or followed by __syncthreads(), and every receiver waits on its
+//  own object afterwards, as with cuda::barrier.
+// ════════════════════════════════════════════════════════════════════════
+
+class dxa_multicast_cluster_base {
+protected:
+  dxa_multicast_cluster_base(uint32_t desc_slot, uint32_t cta_mask, uint32_t issuer,
+                             uint64_t* mbar, uint32_t box_bytes)
+    : desc_slot_(desc_slot), mask_(cta_mask), issuer_(issuer), mbar_(mbar),
+      box_bytes_(box_bytes) {}
+
+  // True in the warp that issues.
+  bool arm_and_sync() const {
+    const uint32_t rank = vx_cluster_block_rank();
+    const bool warp0 = (::get_sub_group_id() == 0);
+    if (warp0 && vx_thread_id() == 0 && ((mask_ >> rank) & 1u))
+      vx_mbar_arrive_tx(mbar_, box_bytes_);
+    vx_cluster_sync();
+    return warp0 && rank == issuer_;
+  }
+
+  uint32_t  desc_slot_;
+  uint32_t  mask_;
+  uint32_t  issuer_;
+  uint64_t* mbar_;
+  uint32_t  box_bytes_;
+};
+
+class dxa_multicast_cluster_1d : dxa_multicast_cluster_base {
+public:
+  dxa_multicast_cluster_1d(uint32_t desc_slot, uint32_t cta_mask, uint32_t issuer,
+                           uint64_t* mbar, uint32_t box_bytes)
+    : dxa_multicast_cluster_base(desc_slot, cta_mask, issuer, mbar, box_bytes) {}
+  void sync_and_issue(void* smem, uint32_t coord0) const {
+    if (arm_and_sync())
+      vx_dxa_issue_1d_mbar_multicast(desc_slot_, mbar_, smem, mask_, coord0);
+  }
+};
+
+class dxa_multicast_cluster_2d : dxa_multicast_cluster_base {
+public:
+  dxa_multicast_cluster_2d(uint32_t desc_slot, uint32_t cta_mask, uint32_t issuer,
+                           uint64_t* mbar, uint32_t box_bytes)
+    : dxa_multicast_cluster_base(desc_slot, cta_mask, issuer, mbar, box_bytes) {}
+  void sync_and_issue(void* smem, uint32_t coord0, uint32_t coord1) const {
+    if (arm_and_sync())
+      vx_dxa_issue_2d_mbar_multicast(desc_slot_, mbar_, smem, mask_, coord0, coord1);
+  }
+};
+
+class dxa_multicast_cluster_3d : dxa_multicast_cluster_base {
+public:
+  dxa_multicast_cluster_3d(uint32_t desc_slot, uint32_t cta_mask, uint32_t issuer,
+                           uint64_t* mbar, uint32_t box_bytes)
+    : dxa_multicast_cluster_base(desc_slot, cta_mask, issuer, mbar, box_bytes) {}
+  void sync_and_issue(void* smem, uint32_t coord0, uint32_t coord1, uint32_t coord2) const {
+    if (arm_and_sync())
+      vx_dxa_issue_3d_mbar_multicast(desc_slot_, mbar_, smem, mask_, coord0, coord1, coord2);
+  }
+};
+
+class dxa_multicast_cluster_4d : dxa_multicast_cluster_base {
+public:
+  dxa_multicast_cluster_4d(uint32_t desc_slot, uint32_t cta_mask, uint32_t issuer,
+                           uint64_t* mbar, uint32_t box_bytes)
+    : dxa_multicast_cluster_base(desc_slot, cta_mask, issuer, mbar, box_bytes) {}
+  void sync_and_issue(void* smem, uint32_t coord0, uint32_t coord1, uint32_t coord2,
+                      uint32_t coord3) const {
+    if (arm_and_sync())
+      vx_dxa_issue_4d_mbar_multicast(desc_slot_, mbar_, smem, mask_, coord0, coord1, coord2, coord3);
+  }
+};
+
+class dxa_multicast_cluster_5d : dxa_multicast_cluster_base {
+public:
+  dxa_multicast_cluster_5d(uint32_t desc_slot, uint32_t cta_mask, uint32_t issuer,
+                           uint64_t* mbar, uint32_t box_bytes)
+    : dxa_multicast_cluster_base(desc_slot, cta_mask, issuer, mbar, box_bytes) {}
+  void sync_and_issue(void* smem, uint32_t coord0, uint32_t coord1, uint32_t coord2,
+                      uint32_t coord3, uint32_t coord4) const {
+    if (arm_and_sync())
+      vx_dxa_issue_5d_mbar_multicast(desc_slot_, mbar_, smem, mask_, coord0, coord1, coord2,
+                                     coord3, coord4);
+  }
+};
+#endif // VX_CFG_EXT_MBAR_ENABLE
 
 } // namespace vortex
 

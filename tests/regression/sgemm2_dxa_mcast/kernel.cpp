@@ -79,3 +79,55 @@ __kernel void kernel_main(kernel_arg_t* arg) {
 
   (void)arg->A_addr; (void)arg->B_addr;  // descriptors carry addresses
 }
+
+// The SPREAD variant exists only on an mbarrier device, so every other build
+// keeps the kernel binary above unchanged.
+#ifdef VX_CFG_EXT_MBAR_ENABLE
+#include <vx_dlmem.h>
+#include <vx_mbar.h>
+
+// sgemm2_dxa_mcast on SPREAD clusters: the `mc_group_size` blocks of a
+// cluster sit on different cores, and rank 0 multicasts the shared B column
+// block into all of them with vortex::dxa_multicast_cluster_2d. Each block
+// fetches its own A row into its local memory; both copies complete on
+// mbarriers, which sit after the B tile.
+__kernel void spread_k(kernel_arg_t* __UNIFORM__ arg) {
+  auto C = reinterpret_cast<TYPE*>(arg->C_addr);
+  const uint32_t size      = arg->size;
+  const uint32_t tile_size = arg->tile_size;
+  const uint32_t chunk_k   = arg->chunk_k;
+  const uint32_t row       = blockIdx.x;
+  const uint32_t col_blk   = blockIdx.y;
+
+  auto shmem = reinterpret_cast<TYPE*>(__local_mem());
+  TYPE* shA = shmem;
+  TYPE* shB = shmem + chunk_k;
+  auto mbars = reinterpret_cast<uint64_t*>(
+      ((uintptr_t)(shB + chunk_k * tile_size) + 7) & ~(uintptr_t)7);
+  uint64_t* mbar_A = mbars;
+  uint64_t* mbar_B = mbars + 1;
+
+  const bool loader = (get_sub_group_id() == 0);
+  if (threadIdx.x == 0) {
+    vx_mbar_init(mbar_A, 1);
+    vx_mbar_init(mbar_B, 1);
+    vx_mbar_arrive_tx(mbar_A, chunk_k * sizeof(TYPE));
+  }
+  if (loader)
+    vx_dxa_issue_2d_mbar(kDescA, mbar_A, shA, /*col=*/0, /*row=*/row);
+
+  vortex::dxa_multicast_cluster_2d mc_B(kDescB, (1u << arg->mc_group_size) - 1u, /*issuer=*/0, mbar_B,
+                                        chunk_k * tile_size * sizeof(TYPE));
+  mc_B.sync_and_issue(shB, /*coord0=*/col_blk * tile_size, /*coord1=*/0);
+
+  vortex::mbarrier(mbar_A).wait_parity(0);
+  vortex::mbarrier(mbar_B).wait_parity(0);
+
+  const uint32_t l_col = threadIdx.x;
+  TYPE sum(0);
+  for (uint32_t k = 0; k < chunk_k; ++k) {
+    sum += shA[k] * shB[k * tile_size + l_col];
+  }
+  C[row * size + col_blk * tile_size + l_col] = sum;
+}
+#endif // VX_CFG_EXT_MBAR_ENABLE

@@ -779,7 +779,8 @@ tests:
   # Remote copies that must stop the simulation with the exact message, on a
   # SPREAD cluster of two blocks on four cores: a destination rank past the
   # cluster; an mbarrier in the issuer's block; a window destination
-  # completing on a barrier event; one with a multicast mask; a copy that
+  # completing on a barrier event; one with a multicast mask, which takes
+  # local addresses only; a copy that
   # reaches a block that has exited; and a box that starts inside the
   # destination block and runs past its end.
   - id: dlmem_dxa-x-rank
@@ -829,14 +830,14 @@ tests:
     driver: simx
     configs+: *dlmem_dxa_neg
     touches: *dlmem_dxa_touches
-    env: {DRIVER: simx, APP: dlmem_dxa, ARGS: "-x mcast", EXPECT: "DXA multicast with an mbarrier is not supported"}
+    env: {DRIVER: simx, APP: dlmem_dxa, ARGS: "-x mcast", EXPECT: "DXA multicast needs a local address"}
     run: *expect_fail_run
   - id: dlmem_dxa-x-mcast
     via: script
     driver: rtlsim
     configs+: *dlmem_dxa_neg
     touches: *dlmem_dxa_touches
-    env: {DRIVER: rtlsim, APP: dlmem_dxa, ARGS: "-x mcast", EXPECT: "DXA multicast with an mbarrier is not supported"}
+    env: {DRIVER: rtlsim, APP: dlmem_dxa, ARGS: "-x mcast", EXPECT: "DXA multicast needs a local address"}
     run: *expect_fail_run
   - id: dlmem_dxa-x-retired
     via: script
@@ -865,6 +866,238 @@ tests:
     configs+: *dlmem_dxa_neg
     touches: *dlmem_dxa_touches
     env: {DRIVER: rtlsim, APP: dlmem_dxa, ARGS: "-x box", EXPECT: "DXA box exceeds the destination block"}
+    run: *expect_fail_run
+
+  # --- DXA cluster multicast (dxa_copy_mcast -M) ---
+  # One read of the box lands in every block of the cluster whose rank is in
+  # the mask, at the issuer's block offsets, and completes on each receiver's
+  # own mbarrier, which armed itself with arrive_tx before the cluster barrier.
+  # SPREAD clusters of four blocks on four cores: the issuer's own copy takes
+  # the local path, the others travel as row flits. The host checks every
+  # block's whole local memory byte for byte and every mbarrier word: a
+  # non-receiver, an excluded issuer included, must stay untouched.
+  - id: dxa_copy_mcast-cluster
+    app: dxa_copy_mcast
+    drivers: [simx, rtlsim]
+    configs+: "-DVX_CFG_EXT_A_ENABLE -DVX_CFG_EXT_MBAR_ENABLE -DVX_CFG_EXT_DXA_ENABLE"
+    touches: &dxa_mcast_touches [hw/rtl/dxa, hw/rtl/dlmem, hw/rtl/VX_socket.sv,
+              hw/rtl/VX_gpu_pkg.sv, hw/rtl/VX_define.vh, hw/rtl/core/VX_core.sv,
+              hw/rtl/core/VX_mem_unit.sv, hw/rtl/core/VX_cta_dispatch.sv,
+              hw/rtl/core/VX_bar_unit.sv, hw/rtl/mem/VX_local_mem.sv,
+              hw/rtl/mem/VX_lmem_switch.sv, hw/rtl/interfaces, hw/rtl/VX_kmu.sv,
+              hw/rtl/Vortex.sv, hw/rtl/VX_cluster.sv, sim/simx/dxa, sim/simx/dlmem,
+              sim/simx/core, sim/simx/socket, sim/simx/cluster, sim/simx/processor.cpp,
+              sim/simx/cta_dispatcher, sim/simx/kmu, sim/simx/mem/local_mem, sim/simx/types.h,
+              sim/simx/mbar_waiters, sim/simx/amo, sim/simx/barrier_unit, sim/simx/Makefile,
+              sw/kernel/include/vx_dxa.h, sw/kernel/include/vx_mbar.h,
+              sw/kernel/include/vx_dlmem.h, sw/kernel/include/vx_barrier.h,
+              sw/common/mbar_ref.h, sw/common/dlmem_ref.h, sw/runtime/include/dxa.h,
+              tests/regression/dxa_copy_mcast, VX_config.toml]
+    shape: {cores: 4, l2cache: true}
+    args: "-M 0xF -s 4 -g 2"
+  - id: dxa_copy_mcast-cluster-sparse5
+    app: dxa_copy_mcast
+    drivers: [simx, rtlsim]
+    tier: nightly
+    configs+: "-DVX_CFG_EXT_A_ENABLE -DVX_CFG_EXT_MBAR_ENABLE -DVX_CFG_EXT_DXA_ENABLE"
+    touches: *dxa_mcast_touches
+    shape: {cores: 4, l2cache: true}
+    args: "-M 0x5 -s 4 -d 3"
+  # Sparse and without the issuer (rank 0), two multicasts back to back.
+  - id: dxa_copy_mcast-cluster-sparseA
+    app: dxa_copy_mcast
+    drivers: [simx, rtlsim]
+    configs+: "-DVX_CFG_EXT_A_ENABLE -DVX_CFG_EXT_MBAR_ENABLE -DVX_CFG_EXT_DXA_ENABLE"
+    touches: *dxa_mcast_touches
+    shape: {cores: 4, l2cache: true}
+    args: "-M 0xA -s 4 -n 2 -d 1"
+  - id: dxa_copy_mcast-cluster-noissuer
+    app: dxa_copy_mcast
+    drivers: [simx, rtlsim]
+    configs+: "-DVX_CFG_EXT_A_ENABLE -DVX_CFG_EXT_MBAR_ENABLE -DVX_CFG_EXT_DXA_ENABLE"
+    touches: *dxa_mcast_touches
+    shape: {cores: 4, l2cache: true}
+    args: "-M 0x6 -s 4 -i 3 -d 4 -b 2"
+  # A one-bit mask is a cluster multicast too: a copy into rank 2 only.
+  - id: dxa_copy_mcast-cluster-one
+    app: dxa_copy_mcast
+    drivers: [simx, rtlsim]
+    configs+: "-DVX_CFG_EXT_A_ENABLE -DVX_CFG_EXT_MBAR_ENABLE -DVX_CFG_EXT_DXA_ENABLE"
+    touches: *dxa_mcast_touches
+    shape: {cores: 4, l2cache: true}
+    args: "-M 0x4 -s 4 -i 1 -b 1"
+  # Two sockets of two cores: receivers on the issuer's socket and across the
+  # cluster crossbar.
+  - id: dxa_copy_mcast-cluster-s2
+    app: dxa_copy_mcast
+    drivers: [simx, rtlsim]
+    configs+: "-DVX_CFG_EXT_A_ENABLE -DVX_CFG_EXT_MBAR_ENABLE -DVX_CFG_EXT_DXA_ENABLE -DVX_CFG_SOCKET_SIZE=2"
+    touches: *dxa_mcast_touches
+    shape: {cores: 4, l2cache: true}
+    args: "-M 0xF -s 4 -g 2 -d 5"
+  - id: dxa_copy_mcast-cluster-s2-sparse
+    app: dxa_copy_mcast
+    drivers: [simx, rtlsim]
+    tier: nightly
+    configs+: "-DVX_CFG_EXT_A_ENABLE -DVX_CFG_EXT_MBAR_ENABLE -DVX_CFG_EXT_DXA_ENABLE -DVX_CFG_SOCKET_SIZE=2"
+    touches: *dxa_mcast_touches
+    shape: {cores: 4, l2cache: true}
+    args: "-M 0x9 -s 4 -i 1 -d 2 -b 8"
+  # Through vortex::dxa_multicast_cluster_2d, two copies on one mbarrier.
+  - id: dxa_copy_mcast-cluster-helper
+    app: dxa_copy_mcast
+    drivers: [simx, rtlsim]
+    configs+: "-DVX_CFG_EXT_A_ENABLE -DVX_CFG_EXT_MBAR_ENABLE -DVX_CFG_EXT_DXA_ENABLE"
+    touches: *dxa_mcast_touches
+    shape: {cores: 4, l2cache: true}
+    args: "-M 0xF -s 4 -H -n 2"
+  # A DEFAULT cluster: every receiver is another slot of the issuer's core.
+  - id: dxa_copy_mcast-cluster-samecore
+    app: dxa_copy_mcast
+    drivers: [simx, rtlsim]
+    configs+: "-DVX_CFG_EXT_A_ENABLE -DVX_CFG_EXT_MBAR_ENABLE -DVX_CFG_EXT_DXA_ENABLE"
+    touches: *dxa_mcast_touches
+    shape: {cores: 4, l2cache: true}
+    args: "-M 0xD -s 4 -p default -d 2"
+  # Legacy barrier multicast with a sparse mask: bit j selects the slot
+  # issuer + j, for the data as for the barrier, in a DEFAULT cluster of four
+  # single-warp blocks on one core; non-receivers stay untouched. The dense
+  # mask is the control.
+  - id: dxa_copy_mcast-legacy-sparse5
+    app: dxa_copy_mcast
+    drivers: [simx, rtlsim]
+    configs+: "-DVX_CFG_EXT_A_ENABLE -DVX_CFG_EXT_MBAR_ENABLE -DVX_CFG_EXT_DXA_ENABLE"
+    touches: *dxa_mcast_touches
+    shape: {cores: 4, l2cache: true}
+    args: "-m 0x5"
+  - id: dxa_copy_mcast-legacy-sparseA
+    app: dxa_copy_mcast
+    drivers: [simx, rtlsim]
+    tier: nightly
+    configs+: "-DVX_CFG_EXT_A_ENABLE -DVX_CFG_EXT_MBAR_ENABLE -DVX_CFG_EXT_DXA_ENABLE"
+    touches: *dxa_mcast_touches
+    shape: {cores: 4, l2cache: true}
+    args: "-m 0xA -g 2 -d 1"
+  - id: dxa_copy_mcast-legacy-dense
+    app: dxa_copy_mcast
+    drivers: [simx, rtlsim]
+    configs+: "-DVX_CFG_EXT_A_ENABLE -DVX_CFG_EXT_MBAR_ENABLE -DVX_CFG_EXT_DXA_ENABLE"
+    touches: *dxa_mcast_touches
+    shape: {cores: 4, l2cache: true}
+    args: "-m 0xF -d 3"
+  # Sixteen threads make a 128-byte DMA word, more than a memory block: the
+  # slots start on DMA words, so the block of 448 bytes takes a 512-byte slot,
+  # and both multicasts reach each receiver's data and mbarrier or barrier at
+  # the issuer's offsets.
+  - id: dxa_copy_mcast-cluster-t16
+    app: dxa_copy_mcast
+    drivers: [simx, rtlsim]
+    configs+: "-DVX_CFG_EXT_A_ENABLE -DVX_CFG_EXT_MBAR_ENABLE -DVX_CFG_EXT_DXA_ENABLE"
+    touches: *dxa_mcast_touches
+    shape: {cores: 2, threads: 16, l2cache: true}
+    args: "-M 0x3 -s 2 -p default -d 2"
+  - id: dxa_copy_mcast-legacy-t16
+    app: dxa_copy_mcast
+    drivers: [simx, rtlsim]
+    configs+: "-DVX_CFG_EXT_A_ENABLE -DVX_CFG_EXT_MBAR_ENABLE -DVX_CFG_EXT_DXA_ENABLE"
+    touches: *dxa_mcast_touches
+    shape: {cores: 2, threads: 16, l2cache: true}
+    args: "-m 0x5 -d 2"
+  # Parity of the cluster multicast at XLEN 64: one SPREAD cluster of four
+  # blocks on four cores, two multicasts into every rank. Every wait is one
+  # try_wait, which the receiver's complete_tx wakes: the replay of each beat
+  # to the receivers, the row flits and the completions behind them set the
+  # timing.
+  - id: parity-dxa-mcast-cluster
+    check: model_parity
+    app: dxa_copy_mcast
+    xlen: [64]
+    configs+: "-DVX_CFG_EXT_A_ENABLE -DVX_CFG_EXT_MBAR_ENABLE -DVX_CFG_EXT_DXA_ENABLE -DVX_CFG_MBAR_SUSPEND_CYCLES=4096"
+    touches: *dxa_mcast_touches
+    shape: {cores: 4, l2cache: true}
+    args: "-M 0xF -s 4 -n 2"
+  # sgemm2_dxa_mcast on SPREAD clusters: the B column block multicast by rank
+  # mask across the cores with vortex::dxa_multicast_cluster_2d.
+  - id: sgemm2_dxa_mcast-spread
+    app: sgemm2_dxa_mcast
+    drivers: [simx, rtlsim]
+    configs+: "-DVX_CFG_EXT_A_ENABLE -DVX_CFG_EXT_MBAR_ENABLE -DVX_CFG_EXT_DXA_ENABLE"
+    touches: &sgemm2_mcast_touches [tests/regression/sgemm2_dxa_mcast, hw/rtl/dxa, hw/rtl/dlmem,
+              hw/rtl/VX_socket.sv, hw/rtl/VX_gpu_pkg.sv, hw/rtl/core/VX_mem_unit.sv,
+              hw/rtl/core/VX_cta_dispatch.sv, hw/rtl/mem/VX_local_mem.sv, hw/rtl/VX_kmu.sv,
+              hw/rtl/VX_cluster.sv, sim/simx/dxa, sim/simx/dlmem, sim/simx/core, sim/simx/socket,
+              sim/simx/cluster, sim/simx/cta_dispatcher, sim/simx/kmu, sim/simx/mem/local_mem,
+              sim/simx/types.h, sw/kernel/include/vx_dxa.h, sw/kernel/include/vx_mbar.h,
+              sw/kernel/include/vx_dlmem.h, VX_config.toml]
+    shape: {cores: 4, l2cache: true}
+    args: "-n16 -t4 -s 4"
+  - id: sgemm2_dxa_mcast-spread-s2
+    app: sgemm2_dxa_mcast
+    drivers: [simx, rtlsim]
+    tier: nightly
+    configs+: "-DVX_CFG_EXT_A_ENABLE -DVX_CFG_EXT_MBAR_ENABLE -DVX_CFG_EXT_DXA_ENABLE -DVX_CFG_SOCKET_SIZE=2"
+    touches: *sgemm2_mcast_touches
+    shape: {cores: 4, l2cache: true}
+    args: "-n32 -t4 -s 2"
+  # Cluster multicasts that must stop the simulation with the exact message,
+  # on a SPREAD cluster of two blocks on four cores: a mask bit past the
+  # cluster; a legacy barrier multicast from a SPREAD block; a box that runs
+  # past the end of the receivers' blocks; and a receiver that has exited.
+  - id: dxa_copy_mcast-x-rank
+    via: script
+    driver: simx
+    configs+: *dlmem_dxa_neg
+    touches: *dxa_mcast_touches
+    env: {DRIVER: simx, APP: dxa_copy_mcast, ARGS: "-x rank", EXPECT: "DXA multicast rank outside the cluster"}
+    run: *expect_fail_run
+  - id: dxa_copy_mcast-x-rank
+    via: script
+    driver: rtlsim
+    configs+: *dlmem_dxa_neg
+    touches: *dxa_mcast_touches
+    env: {DRIVER: rtlsim, APP: dxa_copy_mcast, ARGS: "-x rank", EXPECT: "DXA multicast rank outside the cluster"}
+    run: *expect_fail_run
+  - id: dxa_copy_mcast-x-spread
+    via: script
+    driver: simx
+    configs+: *dlmem_dxa_neg
+    touches: *dxa_mcast_touches
+    env: {DRIVER: simx, APP: dxa_copy_mcast, ARGS: "-x spread", EXPECT: "DXA barrier multicast into a cluster spread over cores"}
+    run: *expect_fail_run
+  - id: dxa_copy_mcast-x-spread
+    via: script
+    driver: rtlsim
+    configs+: *dlmem_dxa_neg
+    touches: *dxa_mcast_touches
+    env: {DRIVER: rtlsim, APP: dxa_copy_mcast, ARGS: "-x spread", EXPECT: "DXA barrier multicast into a cluster spread over cores"}
+    run: *expect_fail_run
+  - id: dxa_copy_mcast-x-box
+    via: script
+    driver: simx
+    configs+: *dlmem_dxa_neg
+    touches: *dxa_mcast_touches
+    env: {DRIVER: simx, APP: dxa_copy_mcast, ARGS: "-x box", EXPECT: "DXA box exceeds the destination block"}
+    run: *expect_fail_run
+  - id: dxa_copy_mcast-x-box
+    via: script
+    driver: rtlsim
+    configs+: *dlmem_dxa_neg
+    touches: *dxa_mcast_touches
+    env: {DRIVER: rtlsim, APP: dxa_copy_mcast, ARGS: "-x box", EXPECT: "DXA box exceeds the destination block"}
+    run: *expect_fail_run
+  - id: dxa_copy_mcast-x-retired
+    via: script
+    driver: simx
+    configs+: *dlmem_dxa_neg
+    touches: *dxa_mcast_touches
+    env: {DRIVER: simx, APP: dxa_copy_mcast, ARGS: "-x retired", EXPECT: "DXA write into a retired CTA slot"}
+    run: *expect_fail_run
+  - id: dxa_copy_mcast-x-retired
+    via: script
+    driver: rtlsim
+    configs+: *dlmem_dxa_neg
+    touches: *dxa_mcast_touches
+    env: {DRIVER: rtlsim, APP: dxa_copy_mcast, ARGS: "-x retired", EXPECT: "DXA write into a retired CTA slot"}
     run: *expect_fail_run
 
   # --- remote loads ---

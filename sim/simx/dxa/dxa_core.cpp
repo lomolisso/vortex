@@ -134,6 +134,21 @@ public:
     std::vector<uint32_t>   rcv_writes;
 #ifdef DXA_MBAR_ENABLE
     uint32_t                tx_bytes = 0;        // the box, out-of-bounds fill included
+    // One entry per receiving block, in replay order: its offset from the
+    // issuer's destination, its barrier index and its completion fields.
+    struct Rcv {
+      uint64_t off      = 0;
+      uint32_t bar_idx  = 0;
+      uint32_t mbar_off = 0;
+      uint32_t slot     = 0;
+      uint32_t gen      = 0;
+      uint32_t dst_core = 0;
+      bool     remote   = false;
+    };
+    std::vector<Rcv>        rcvs;
+    uint32_t                km_byte_off = 0;     // cluster replay: bytes of element km_elem_idx written
+#else
+#line 137
 #endif
   };
 
@@ -213,7 +228,13 @@ public:
       // block. The dispatcher applies the same rounding to per-CTA LMEM
       // allocations so the host-visible "same offset in receiver LMEM"
       // contract holds end-to-end.
+#if VX_CFG_LMEM_NUM_BANKS * (VX_CFG_XLEN / 8) > VX_CFG_MEM_BLOCK_SIZE
+      // The slots start on DMA words there, so the stride rounds to one too.
+      d.smem_stride = (value + DxaCore::LMEM_ROW_SIZE - 1u) & ~uint32_t(DxaCore::LMEM_ROW_SIZE - 1u);
+#else
       d.smem_stride = (value + kLmemWordSize - 1u) & ~uint32_t(kLmemWordSize - 1u);
+#endif
+#line 232
       break;
     default: break;
     }
@@ -381,6 +402,11 @@ private:
       }
     }
 
+#ifdef DXA_MBAR_ENABLE
+    this->load_receivers(w, req);
+#else
+#line 372
+#endif
     uint32_t num_rcv = w.is_multicast ? uint32_t(w.cta_indices.size()) : 1u;
     if (xfer_seq_ == 0 || xfer_seq_ + num_rcv < xfer_seq_) {
       xfer_seq_ = 1;
@@ -680,7 +706,8 @@ private:
 #ifdef DXA_MBAR_ENABLE
     // A beat for the row egress, or one behind a beat still in the socket's
     // stream, queues in that stream; any other goes straight to its core.
-    const bool to_stream = w.req.remote || !stream_.empty();
+    const uint32_t beat_rcv = w.is_multicast ? w.mc_cta_idx : 0u;
+    const bool to_stream = w.rcvs.at(beat_rcv).remote || !stream_.empty();
 #else
 #line 664
 #endif
@@ -699,6 +726,10 @@ private:
 #ifdef DXA_MBAR_ENABLE
     if (to_stream ? stream_.full() : !this->core_inputs_ready(socket_local_cid))
       return;
+    if (w.req.cluster) {
+      this->emit_cluster_beat(w, socket_local_cid, to_stream);
+      return;
+    }
 #else
 #line 676
     for (uint32_t p = 0; p < DxaCore::LMEM_PORTS_PER_CORE; ++p) {
@@ -736,12 +767,23 @@ private:
       const uint32_t e0        = w.km_elem_idx;
       const uint32_t wlen      = lw.valid_length;
 
+#ifdef DXA_MBAR_ENABLE
+      const auto& rcv_e = w.rcvs.at(w.is_multicast ? w.mc_cta_idx : 0u);
       uint32_t cta_warp_idx = 0;
       uint64_t cta_off = 0;
       if (w.is_multicast) {
         cta_warp_idx = w.cta_indices.at(w.mc_cta_idx);
         cta_off = uint64_t(cta_warp_idx) * w.smem_stride;
       }
+#else
+#line 711
+      uint32_t cta_warp_idx = 0;
+      uint64_t cta_off = 0;
+      if (w.is_multicast) {
+        cta_warp_idx = w.cta_indices.at(w.mc_cta_idx);
+        cta_off = uint64_t(cta_warp_idx) * w.smem_stride;
+      }
+#endif
 
       // Per-element SMEM byte destination. K-major: uniform lane stride from a
       // span base. Tiled (Flat/BlockMajor): permuted index from the WGMMA
@@ -848,13 +890,13 @@ private:
       req.dxa.xfer = w.xfer_base + rcv;
 #ifdef DXA_MBAR_ENABLE
       req.dxa.mode     = w.req.mode;
-      req.dxa.mbar_off = w.req.mbar_off;
+      req.dxa.mbar_off = rcv_e.mbar_off;
       req.dxa.tx_bytes = w.tx_bytes;
-      req.dxa.slot     = w.req.slot;
-      req.dxa.gen      = w.req.gen;
-      req.dxa.remote   = w.req.remote;
+      req.dxa.slot     = rcv_e.slot;
+      req.dxa.gen      = rcv_e.gen;
+      req.dxa.remote   = rcv_e.remote;
       req.dxa.src_core = w.req.src_core;
-      req.dxa.dst_core = w.req.dst_core;
+      req.dxa.dst_core = rcv_e.dst_core;
 #else
 #line 813
 #endif
@@ -901,11 +943,11 @@ private:
 #ifdef DXA_MBAR_ENABLE
     if (to_stream && beat_writes != 0) {
       StreamBeat sb;
-      sb.remote = w.req.remote;
+      sb.remote = w.rcvs.at(beat_rcv).remote;
       sb.core   = socket_local_cid;
       sb.count  = beat_writes;
       sb.ready  = cycle_ + 1;
-      const uint32_t id = w.req.remote ? 0 : beat_seq_.at(socket_local_cid)++;
+      const uint32_t id = sb.remote ? 0 : beat_seq_.at(socket_local_cid)++;
       for (uint32_t k = 0; k < beat_writes; ++k) {
         beat.at(k).dxa.beat = id;
         beat.at(k).dxa.last = beat_last;
@@ -1059,6 +1101,182 @@ private:
       f.dxa       = true;
       f.flags.amo_unsigned = 1;
       row_flits_.push_back(f);
+    }
+  }
+
+  // A cluster multicast replays each LMEM row of a line to every receiver,
+  // in increasing rank, before the next row, as the RTL replays each drained
+  // word: a beat is one row of one receiver. A local receiver's beat goes to
+  // this core, a remote one's to the row egress through the stream.
+  void emit_cluster_beat(Worker& w, uint32_t cid, bool to_stream) {
+    constexpr uint64_t kRowMask = ~uint64_t(DxaCore::LMEM_ROW_SIZE - 1);
+    const uint32_t slot = w.drain_slot;
+    auto& s = w.inflight[slot];
+    const LineWork& lw = s.work;
+    const uint32_t num_elems = lw.km_num_elems ? lw.km_num_elems : 1;
+    const uint32_t wlen      = lw.valid_length;
+    const uint32_t rcv_idx   = w.mc_cta_idx;
+    const auto& rcv          = w.rcvs.at(rcv_idx);
+    const bool     tiled     = desc_dest_tiled(w.desc.meta);
+    const uint32_t t_eb      = desc_elem_bytes(w.desc.meta);
+    const uint32_t t_ratio   = tiled ? std::max<uint32_t>(1u, 4u / t_eb) : 1u;
+    const uint32_t t_tcN     = tiled ? desc_geo_tcn(w.desc) : 1u;
+    const uint32_t t_bkK     = tiled ? desc_geo_bkk(w.desc) : 1u;
+    const uint32_t t_nsteps  = tiled ? std::max<uint32_t>(1u, uint32_t(w.desc.tile_sizes[0]) / t_tcN) : 1u;
+    auto dest_byte_of = [&](uint32_t idx) -> uint64_t {
+      if (tiled) {
+        uint32_t de = tiled_dest_elem(DestLayout(lw.dest_layout), lw.tile_k_row,
+                                      lw.tile_n_base + idx, t_ratio, t_tcN, t_nsteps, t_bkK);
+        return w.req.smem_addr + uint64_t(de) * t_eb + rcv.off;
+      }
+      return lw.smem_word_addr + lw.smem_byte_offset + uint64_t(idx) * lw.km_lane_stride + rcv.off;
+    };
+
+    uint32_t e = w.km_elem_idx;
+    uint32_t b = w.km_byte_off;
+    const uint64_t row = (dest_byte_of(e) + b) & kRowMask;
+    std::array<MemReq, DxaCore::LMEM_PORTS_PER_CORE> beat;
+    std::array<uint32_t, DxaCore::LMEM_PORTS_PER_CORE> beat_port;
+    uint32_t n = 0;
+    while (e < num_elems) {
+      const uint64_t dest = dest_byte_of(e) + b;
+      if ((dest & kRowMask) != row)
+        break;
+      const uint64_t dword = dest & ~uint64_t(kLmemWordSize - 1);
+      if (n == 0 || beat.at(n - 1).addr != dword) {
+        if (n == DxaCore::LMEM_PORTS_PER_CORE)
+          break;
+        MemReq req;
+        req.addr      = dword;
+        req.op        = MemOp::ST;
+        req.tag       = w.req.core->id();
+        req.hart_id   = w.req.core->id();
+        req.uuid      = w.req.uuid;
+        req.flags.dma = 1;
+        req.byteen    = 0;
+        req.data      = make_mem_block();
+        beat.at(n) = req;
+        beat_port.at(n) = cid * DxaCore::LMEM_PORTS_PER_CORE
+                        + ((DxaCore::LMEM_PORTS_PER_CORE > 1)
+                           ? uint32_t((dword / kLmemWordSize) & (DxaCore::LMEM_PORTS_PER_CORE - 1)) : 0u);
+        ++n;
+      }
+      auto& req = beat.at(n - 1);
+      const uint64_t lim = std::min((dest & kRowMask) + DxaCore::LMEM_ROW_SIZE, dword + kLmemWordSize);
+      const uint32_t len = uint32_t(std::min<uint64_t>(wlen - b, lim - dest));
+      const uint32_t doff = uint32_t(dest - dword);
+      for (uint32_t k = 0; k < len; ++k) {
+        req.byteen |= uint64_t(1) << (doff + k);
+        (*req.data)[doff + k] = s.rsp_data
+            ? (*s.rsp_data)[lw.cl_byte_offset + e * wlen + b + k]
+            : uint8_t((lw.cfill >> (((b + k) & 3) * 8)) & 0xff);
+      }
+      b += len;
+      if (b == wlen) {
+        ++e;
+        b = 0;
+      }
+    }
+
+    const bool copy_end = lw.last && (e == num_elems);
+    for (uint32_t k = 0; k < n; ++k) {
+      auto& req = beat.at(k);
+      req.dxa.xfer     = w.xfer_base + rcv_idx;
+      req.dxa.mode     = w.req.mode;
+      req.dxa.mbar_off = rcv.mbar_off;
+      req.dxa.tx_bytes = w.tx_bytes;
+      req.dxa.slot     = rcv.slot;
+      req.dxa.gen      = rcv.gen;
+      req.dxa.remote   = rcv.remote;
+      req.dxa.src_core = w.req.src_core;
+      req.dxa.dst_core = rcv.dst_core;
+      req.dxa.last     = copy_end;
+      if (copy_end && k + 1 == n) {
+        req.flags.dxa_notify_done   = 1;
+        req.flags.dxa_notify_bar_id = w.req.bar_id + rcv.bar_idx;
+        req.dxa.writes = w.rcv_writes.at(rcv_idx) + 1;
+      }
+      ++w.rcv_writes.at(rcv_idx);
+      ++w.writes_emitted;
+    }
+    ++perf_stats_.lmem_writes;
+
+    if (to_stream) {
+      StreamBeat sb;
+      sb.remote = rcv.remote;
+      sb.core   = cid;
+      sb.count  = n;
+      sb.ready  = cycle_ + 1;
+      const uint32_t id = sb.remote ? 0 : beat_seq_.at(cid)++;
+      for (uint32_t k = 0; k < n; ++k) {
+        beat.at(k).dxa.beat = id;
+        sb.writes.at(k) = beat.at(k);
+        sb.ports.at(k)  = beat_port.at(k);
+      }
+      stream_.push(sb);
+    } else {
+      const uint32_t id = beat_seq_.at(cid)++;
+      for (uint32_t k = 0; k < n; ++k) {
+        beat.at(k).dxa.beat = id;
+        simobject_->lmem_req_out.at(beat_port.at(k)).send(beat.at(k));
+      }
+    }
+
+    // The same row to the next receiver; after the last one, the next row.
+    if (rcv_idx + 1 < w.rcvs.size()) {
+      ++w.mc_cta_idx;
+      return;
+    }
+    w.mc_cta_idx = 0;
+    w.km_elem_idx = e;
+    w.km_byte_off = b;
+    if (e < num_elems)
+      return;
+    w.km_elem_idx = 0;
+    w.km_byte_off = 0;
+    s.allocated = false;
+    s.rsp_arrived = false;
+    s.rsp_data.reset();
+    auto it = std::find(w.issued_order.begin(), w.issued_order.end(), slot);
+    if (it != w.issued_order.end()) w.issued_order.erase(it);
+    w.drain_slot = UINT32_MAX;
+  }
+
+  // The receivers in replay order: a cluster multicast's masked ranks, in
+  // increasing rank; else the issuer's own copy or its barrier multicast
+  // replays, which share the request's completion fields.
+  void load_receivers(Worker& w, const DxaReq& req) {
+    w.rcvs.clear();
+    w.km_byte_off = 0;
+    if (req.cluster) {
+      w.is_multicast = (req.num_rcv > 1);
+      w.cta_indices.clear();
+      for (uint32_t i = 0; i < req.num_rcv; ++i) {
+        const auto& r = req.rcvs.at(i);
+        Worker::Rcv e;
+        e.off      = r.smem_addr - req.smem_addr;
+        e.bar_idx  = i;
+        e.mbar_off = r.mbar_off;
+        e.slot     = r.slot;
+        e.gen      = r.gen;
+        e.dst_core = r.core;
+        e.remote   = r.remote;
+        w.rcvs.push_back(e);
+        if (w.is_multicast) {
+          w.cta_indices.push_back(i);
+        }
+      }
+      return;
+    }
+    const uint32_t n = w.is_multicast ? uint32_t(w.cta_indices.size()) : 1u;
+    for (uint32_t i = 0; i < n; ++i) {
+      Worker::Rcv e;
+      e.mbar_off = req.mbar_off;
+      e.slot     = req.slot;
+      e.gen      = req.gen;
+      e.dst_core = req.dst_core;
+      e.remote   = req.remote;
+      w.rcvs.push_back(e);
     }
   }
 

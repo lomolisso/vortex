@@ -747,7 +747,8 @@ tests:
   # declaring 16 bytes more than the box, so the phase never completes and
   # the app's bounded wait gives up; a block that exits before its copy lands,
   # while the next block holds its slot; an mbarrier past the block's local
-  # memory; and an mbarrier-mode copy with a multicast mask.
+  # memory; and an mbarrier-mode copy whose multicast mask names rank 1 of a
+  # block launched without a cluster.
   - id: dxa_mbar-expect
     via: script
     driver: simx
@@ -795,14 +796,14 @@ tests:
     driver: simx
     configs+: "-DVX_CFG_EXT_DXA_ENABLE"
     touches: *dxa_mbar_touches
-    env: {DRIVER: simx, APP: dxa_mbar, ARGS: "-x mcast", EXPECT: "DXA multicast with an mbarrier is not supported"}
+    env: {DRIVER: simx, APP: dxa_mbar, ARGS: "-x mcast", EXPECT: "DXA multicast rank outside the cluster"}
     run: *expect_fail_run
   - id: dxa_mbar-mcast
     via: script
     driver: rtlsim
     configs+: "-DVX_CFG_EXT_DXA_ENABLE"
     touches: *dxa_mbar_touches
-    env: {DRIVER: rtlsim, APP: dxa_mbar, ARGS: "-x mcast", EXPECT: "DXA multicast with an mbarrier is not supported"}
+    env: {DRIVER: rtlsim, APP: dxa_mbar, ARGS: "-x mcast", EXPECT: "DXA multicast rank outside the cluster"}
     run: *expect_fail_run
 
   # The knob without its prerequisites must stop the build, in SimX (the
