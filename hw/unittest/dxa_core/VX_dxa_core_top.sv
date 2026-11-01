@@ -67,6 +67,16 @@ module VX_dxa_core_top import VX_gpu_pkg::*, VX_dxa_pkg::*; #(
     output wire [`VX_CFG_SOCKET_SIZE-1:0][DXA_LMEM_WORD_SIZE-1:0] lmem_req_byteen,
     output wire [`VX_CFG_SOCKET_SIZE-1:0][DXA_LMEM_ATTR_W-1:0]  lmem_req_attr,
     input  wire [`VX_CFG_SOCKET_SIZE-1:0]                       lmem_req_ready,
+`ifdef DXA_MBAR_ENABLE
+    // Bulk copies read local memory: their tags and responses.
+    output wire [`VX_CFG_SOCKET_SIZE-1:0][DXA_LMEM_TAG_W-1:0]   lmem_req_tag,
+    input  wire [`VX_CFG_SOCKET_SIZE-1:0]                       lmem_rsp_valid,
+    input  wire [`VX_CFG_SOCKET_SIZE-1:0][DXA_LMEM_WORD_SIZE*8-1:0] lmem_rsp_data,
+    input  wire [`VX_CFG_SOCKET_SIZE-1:0][DXA_LMEM_TAG_W-1:0]   lmem_rsp_tag,
+    output wire [`VX_CFG_SOCKET_SIZE-1:0]                       lmem_rsp_ready,
+    // Each requesting core's slot stride (cluster multicasts).
+    input  wire [`VX_CFG_SOCKET_SIZE-1:0][`VX_CFG_LMEM_LOG_SIZE:0] slot_stride,
+`endif
 
     // -----------------------------------------------------------------------
     // Global memory bus (master, GMEM_OUT_PORTS ports)
@@ -120,8 +130,16 @@ module VX_dxa_core_top import VX_gpu_pkg::*, VX_dxa_pkg::*; #(
         assign lmem_req_byteen[i]        = lmem_bus_if[i].req_data.byteen;
         assign lmem_req_attr[i]         = lmem_bus_if[i].req_data.attr;
         assign lmem_bus_if[i].req_ready  = lmem_req_ready[i];
+    `ifdef DXA_MBAR_ENABLE
+        assign lmem_req_tag[i]               = lmem_bus_if[i].req_data.tag;
+        assign lmem_bus_if[i].rsp_valid      = lmem_rsp_valid[i];
+        assign lmem_bus_if[i].rsp_data.data  = lmem_rsp_data[i];
+        assign lmem_bus_if[i].rsp_data.tag   = lmem_rsp_tag[i];
+        assign lmem_rsp_ready[i]             = lmem_bus_if[i].rsp_ready;
+    `else
         assign lmem_bus_if[i].rsp_valid  = 1'b0;
         assign lmem_bus_if[i].rsp_data   = '0;
+    `endif
     end
 
     VX_mem_bus_if #(
@@ -187,6 +205,7 @@ module VX_dxa_core_top import VX_gpu_pkg::*, VX_dxa_pkg::*; #(
         .gmem_bus_if       (gmem_bus_if),
     `ifdef DXA_MBAR_ENABLE
         .row_out_if        (row_out_if),
+        .slot_stride       (slot_stride),
     `endif
         .busy              (busy)
     );

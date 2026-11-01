@@ -289,6 +289,9 @@ private:
 		dxa_hold_beat_   = 0;
 #ifdef DXA_MBAR_ENABLE
 		row_words_       = 0;
+		bulk_stall_      = false;
+		bulk_hold_rec_   = 0;
+		bulk_hold_       = 0;
 #else
 #line 211
 #endif
@@ -297,6 +300,8 @@ private:
 	void dxa_gate_begin(const std::vector<SimChannel<MemReq>>& inputs) {
 #ifdef DXA_MBAR_ENABLE
 		dxa_inputs_ = &inputs;
+		bulk_hold_     = bulk_hold_rec_;
+		bulk_hold_rec_ = 0;
 #else
 #line 214
 #endif
@@ -356,6 +361,12 @@ private:
 		// A copy's completion follows its words into the banks.
 		if (row_words_ != 0 && req.dxa.remote && req.op == MemOp::MBAR_COMPLETE_TX)
 			return false;
+		// A bulk copy's access waits at the DMA input while an atomic would own
+		// one of its banks, as the RTL's waits in the engine's output buffer.
+		if (input >= config_.dma_begin && is_bulk_dma(req) && this->bulk_amo_wait(req)) {
+			bulk_hold_rec_ |= this->bulk_touched(req);
+			return false;
+		}
 #else
 #line 262
 #endif
@@ -395,6 +406,111 @@ private:
 
 	const std::vector<SimChannel<MemReq>>* dxa_inputs_ = nullptr;
 	uint32_t row_words_ = 0;    // a peer's words forwarded to a bank and not yet committed
+
+	// A bulk copy's DMA access, the RTL's DMA port at once on every bank it
+	// touches: a read every bank, a write those its bytes do.
+	static bool is_bulk_dma(const MemReq& req) {
+		return req.flags.dma && req.dxa.bulk;
+	}
+
+	uint64_t bulk_touched(const MemReq& req) const {
+		const uint32_t num_banks = 1u << config_.B;
+		if (!req.is_write())
+			return ~uint64_t(0) >> (64 - num_banks);
+		const uint32_t lg_word = log2ceil(config_.line_size);
+		const uint64_t block = req.addr & ~uint64_t(VX_CFG_MEM_BLOCK_SIZE - 1);
+		uint64_t banks = 0;
+		for (uint32_t w = 0; w < VX_CFG_MEM_BLOCK_SIZE / config_.line_size; ++w) {
+			if ((req.byteen >> (w * config_.line_size)) & ((uint64_t(1) << config_.line_size) - 1)) {
+				banks |= uint64_t(1) << (((block >> lg_word) + w) & (num_banks - 1));
+			}
+		}
+		return banks;
+	}
+
+	// An access forwarded now meets its banks next cycle: an atomic in flight
+	// on one of them must have written back by then, and none may start this
+	// cycle (as dxa_row_amo_wait); one cannot on a bank a waiting access holds.
+	bool bulk_amo_wait(const MemReq& req) const {
+		const uint64_t banks = this->bulk_touched(req);
+		for (uint32_t b = 0; b < (1u << config_.B); ++b) {
+			if (!((banks >> b) & 1))
+				continue;
+			if (amo_busy_[b] > 1)
+				return true;
+			const auto& queue = mem_xbar_->ReqOut.at(b);
+			if (amo_busy_[b] == 0 && !((bulk_hold_ >> b) & 1) && !queue.empty()
+			 && (memop_is_atomic(queue.peek().op) || memop_is_mbar(queue.peek().op)))
+				return true;
+		}
+		return false;
+	}
+
+	// The banks the bulk DMA accesses at the heads of the bank queues hold
+	// this cycle, LSU requests and other DMA traffic off; an atomic owning
+	// any of them stalls the accesses, which hold the banks still.
+	uint64_t bulk_dma_banks() {
+		const uint32_t num_banks = 1u << config_.B;
+		uint64_t banks = 0;
+		for (uint32_t b = 0; b < num_banks; ++b) {
+			const auto& queue = mem_xbar_->ReqOut.at(b);
+			if (!queue.empty() && is_bulk_dma(queue.peek())) {
+				banks |= this->bulk_touched(queue.peek());
+			}
+		}
+		bulk_stall_ = false;
+		for (uint32_t b = 0; b < num_banks; ++b) {
+			bulk_stall_ |= ((banks >> b) & 1) && (amo_busy_[b] != 0);
+		}
+		return banks;
+	}
+
+	// The access at bank b's queue head, as the bank serves a DMA access
+	// below.
+	void serve_bulk_dma(uint32_t b) {
+		auto& queue = mem_xbar_->ReqOut.at(b);
+		const MemReq& req = queue.peek();
+		const uint64_t block = to_local_addr(req.addr) & ~uint64_t(VX_CFG_MEM_BLOCK_SIZE - 1);
+		if (req.is_write()) {
+			for (uint32_t k = 0; k < VX_CFG_MEM_BLOCK_SIZE; ++k) {
+				if (req.byteen & (1ull << k)) {
+					ram_.write(&(*req.data)[k], block + k, 1);
+				}
+			}
+			const uint64_t word_mask = config_.line_size - 1;
+			const uint64_t word_en   = (uint64_t(1) << config_.line_size) - 1;
+			amo_unit_.invalidate_if([&](uint64_t addr) {
+				if ((addr & ~uint64_t(VX_CFG_MEM_BLOCK_SIZE - 1)) != block) {
+					return false;
+				}
+				return ((req.byteen >> ((addr & ~word_mask) - block)) & word_en) != 0;
+			});
+			this->dxa_commit(req);
+		} else {
+			// The DMA port's response pipe, apart from the crossbar's responses:
+			// the read goes back on its input's output, a cycle later.
+			const uint32_t lg_inputs = log2ceil(config_.num_reqs);
+			const uint32_t input = uint32_t(req.tag & ((1u << lg_inputs) - 1));
+			auto& out = simobject_->Outputs.at(input);
+			if (out.full())
+				return;
+			MemRsp rsp{req.tag >> lg_inputs, req.hart_id, req.uuid};
+			rsp.data = make_mem_block();
+			ram_.read(rsp.data->data(), block, VX_CFG_MEM_BLOCK_SIZE);
+			out.send(rsp, 1);
+		}
+		DT(4, simobject_->name() << "-bank" << b << " bulk : " << req);
+		perf_stats_.reads  += !req.is_write();
+		perf_stats_.writes += req.is_write();
+		queue.pop();
+	}
+
+	bool bulk_stall_ = false;
+	// The banks a bulk access waiting at the DMA input holds next cycle (rec)
+	// and this one: the RTL's DMA port holds LSU requests off them while it
+	// waits.
+	mutable uint64_t bulk_hold_rec_ = 0;
+	uint64_t bulk_hold_ = 0;
 #else
 #line 271
 #endif
@@ -408,6 +524,15 @@ public:
 	void tick() {
 		// process bank requets from xbar
 		uint32_t num_banks = (1 << config_.B);
+#ifdef DXA_MBAR_ENABLE
+		const uint64_t bulk_banks = this->bulk_dma_banks() | bulk_hold_;
+#elif defined(VX_CFG_EXT_DXA_ENABLE)
+#line 281
+#elif defined(VX_CFG_EXT_MBAR_ENABLE)
+#line 205
+#else
+#line 163
+#endif
 		for (uint32_t i = 0; i < num_banks; ++i) {
 #if VX_CFG_EXT_A_ENABLED
 			// Cycles an in-flight atomic owns; the bank serves nothing else.
@@ -424,6 +549,20 @@ public:
 			amo_rdw_valid_[i] = false;
 #endif
 			auto& xbar_req_out = mem_xbar_->ReqOut.at(i);
+#ifdef DXA_MBAR_ENABLE
+			if ((bulk_banks >> i) & 1) {
+				if (!bulk_stall_ && !xbar_req_out.empty() && is_bulk_dma(xbar_req_out.peek())) {
+					this->serve_bulk_dma(i);
+				}
+				continue;
+			}
+#elif defined(VX_CFG_EXT_DXA_ENABLE)
+#line 297
+#elif defined(VX_CFG_EXT_MBAR_ENABLE)
+#line 221
+#else
+#line 179
+#endif
 			if (xbar_req_out.empty())
 				continue;
 

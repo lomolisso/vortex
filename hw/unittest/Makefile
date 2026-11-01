@@ -193,6 +193,28 @@ else
 	@echo "run-dxa-completion: mbarriers are RV64 only; nothing to run at XLEN $(XLEN)"
 endif
 
+# DXA bulk copies (RV64 only, DXA with mbarriers): the engine reads each
+# source line from the issuer's local memory with a word narrower than, as wide
+# as and wider than the line, under request back-pressure and in-order
+# responses after a random delay; every local-memory byte and each copy's
+# completion beat are checked. The final clean keeps a plain `run` from reusing
+# the build.
+# $(1)=CONFIGS
+define dxa_bulk_case
+	$(MAKE) -C dxa_core clean
+	$(MAKE) -C dxa_core CONFIGS="$(MBAR_LMEM) -DVX_CFG_EXT_DXA_ENABLE $(1)"
+	$(MAKE) -C dxa_core run CONFIGS="$(MBAR_LMEM) -DVX_CFG_EXT_DXA_ENABLE $(1)"
+endef
+run-dxa-bulk:
+ifeq ($(XLEN),64)
+	$(call dxa_bulk_case,-DVX_CFG_LMEM_NUM_BANKS=4)
+	$(call dxa_bulk_case,-DVX_CFG_LMEM_NUM_BANKS=8)
+	$(call dxa_bulk_case,-DVX_CFG_LMEM_NUM_BANKS=16 -DVX_CFG_NUM_WARPS=8)
+	$(MAKE) -C dxa_core clean
+else
+	@echo "run-dxa-bulk: mbarriers are RV64 only; nothing to run at XLEN $(XLEN)"
+endif
+
 # CTA launch path: the KMU's cluster walk under launch-bus back-pressure, and
 # the dispatcher's slot placement across launches checked against SimX's
 # per-launch pointer reset, with 4 and 8 CTA slots. With DLMEM (RV64 only) both

@@ -419,6 +419,19 @@ module VX_decode import
                     rd_xregs[XREG_1] = 1'b1;
                 `endif
                 end
+            `ifdef DXA_MBAR_ENABLE
+                if (funct7 == 7'd1 && funct3 == 3'd7) begin
+                    // vx_fence_proxy_async: the warp waits until the fence retires,
+                    // so a later DXA read of local memory sees its earlier stores.
+                    ex_type = EX_LSU;
+                    op_type = INST_LSU_PFENCE;
+                    op_args.lsu.is_store = 0;
+                    op_args.lsu.is_float = 0;
+                    op_args.lsu.pack     = 0;
+                    op_args.lsu.offset   = 0;
+                    is_wstall = 1;
+                end
+            `endif
             `ifdef VX_CFG_EXT_MBAR_ENABLE
                 // mbarrier ops: a .D AMO on a local-memory object, the op in funct3.
                 // funct7 1 is the relaxed arrive/arrive_tx; other funct7 are reserved.
@@ -813,6 +826,9 @@ module VX_decode import
                         // Expanded into micro-ops by VX_dxa_uops.
                         ex_type = EX_SFU;
                         op_type = INST_OP_BITS'(INST_SFU_DXA);
+                    `ifdef DXA_MBAR_ENABLE
+                        op_args.dxa.bulk = (funct3 == 3'd1);
+                    `endif
                         `USED_IREG (rs1);
                         `USED_IREG (rs2);
                     end

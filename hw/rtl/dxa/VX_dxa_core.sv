@@ -134,7 +134,20 @@ module VX_dxa_core import VX_gpu_pkg::*, VX_dxa_pkg::*; #(
 
     assign dispatch_in_if[0].valid     = (fetch_state_r == FETCH_PRESENT);
     assign dispatch_in_if[0].req_data  = queue_out_bus_if[0].req_data;
+`ifdef DXA_MBAR_ENABLE
+    // A bulk copy reads no descriptor: it runs as a rank-1 box of size / 8
+    // doublewords at its source, the issuer core's local-memory byte address.
+    dxa_desc_t bulk_desc;
+    always @(*) begin
+        bulk_desc           = '0;
+        bulk_desc.base_addr = `VX_CFG_MEM_ADDR_WIDTH'(queue_out_bus_if[0].req_data.src_addr);
+        bulk_desc.meta      = (32'd1 << DXA_DESC_META_DIM_LSB) | (32'd3 << DXA_DESC_META_ELEMSZ_LSB);
+        bulk_desc.tile01    = 32'(queue_out_bus_if[0].req_data.size >> 3);
+    end
+    assign dispatch_in_if[0].desc_data = queue_out_bus_if[0].req_data.bulk ? bulk_desc : desc_read_data;
+`else
     assign dispatch_in_if[0].desc_data = desc_read_data;
+`endif
 
     VX_dxa_worker_req_if worker_req_if[`VX_CFG_NUM_DXA_CORES]();
 

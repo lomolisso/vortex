@@ -216,6 +216,7 @@ struct Request {
   uint64_t mask = 0;
   bool     fence = false;
   bool     rl = false;              // release AMO
+  bool     pfence = false;          // with fence: the proxy fence, which the stage answers
   uint32_t wid = 0;
   uint32_t cta = 0;
   uint32_t pid = 0;
@@ -759,6 +760,9 @@ private:
     for (uint32_t b = 0; b < nb_; ++b) {
       const auto& o = offer_[b];
       set_bits(t->in_valid, b, 1, o.has_value());
+  #if defined(VX_CFG_EXT_DXA_ENABLE) && defined(VX_CFG_EXT_MBAR_ENABLE)
+      set_bits(t->in_pfence, b, 1, o.has_value() && o->pfence);
+  #endif
       set_bits(t->out_ready, b, 1, ready_[b]);
       set_bits(t->mem_rsp_valid, b, 1, rsp_valid_[b]);
       put_field(t->mem_rsp_data, b * rsp_w_, rsp_w_, rsp_data_[b]);
@@ -834,8 +838,8 @@ private:
   void clock() {
     auto* t = sim_.operator->();
     for (uint32_t b = 0; b < nb_; ++b) {
-      rsp_valid_[b] = chance(50);
-      rsp_ready_[b] = chance(50);
+      rsp_valid_[b] = chance(rsp_pct_);
+      rsp_ready_[b] = chance(rsp_rdy_pct_);
       rsp_data_[b]  = this->rand_bits(rsp_w_);
     }
     // The tracker takes at most one acknowledgement per cycle.
@@ -910,7 +914,8 @@ private:
     for (uint32_t b = 0; b < nb_; ++b) {
       auto& q = queue_[b];
       bool empty = get_bits(t->empty, b, 1);
-      if (empty != q.empty()) {
+      // A proxy fence's pending answer keeps the stage busy.
+      if (empty != (q.empty() && !pf_rsp_[b])) {
         this->fail(strf("block %u: empty=%d with %zu request(s) in the stage", b, empty, q.size()));
       }
       if (sched_) {
@@ -919,11 +924,28 @@ private:
         n_handoff_ += empty && !sched_empty && fired_prev_[b];
       }
 
-      // Responses are wires.
-      if (get_bits(t->core_rsp_valid, b, 1) != rsp_valid_[b]
-       || get_field(t->core_rsp_data, b * rsp_w_, rsp_w_) != rsp_data_[b]
-       || get_bits(t->mem_rsp_ready, b, 1) != rsp_ready_[b]) {
-        this->fail(strf("block %u: response path is not a passthrough", b));
+      // Responses are wires, but for a proxy fence's answer, which goes
+      // when no translated access's response does.
+      auto& pf = pf_rsp_[b];
+      if (rsp_valid_[b] || !pf) {
+        if (get_bits(t->core_rsp_valid, b, 1) != rsp_valid_[b]
+         || get_field(t->core_rsp_data, b * rsp_w_, rsp_w_) != rsp_data_[b]
+         || get_bits(t->mem_rsp_ready, b, 1) != rsp_ready_[b]) {
+          this->fail(strf("block %u: response path is not a passthrough", b));
+        }
+      } else {
+        Bits rsp = get_field(t->core_rsp_data, b * rsp_w_, rsp_w_);
+        if (!get_bits(t->core_rsp_valid, b, 1) || get_field(rsp, 2, tag_w_) != pf->tag_eff
+         || get_bits(rsp, 0, 2) != 3 || get_bits(rsp, rsp_w_ - nl_, nl_) != pf->mask) {
+          this->fail(strf("block %u seq %" PRIu64 ": proxy fence answer missing or wrong", b, pf->seq));
+        }
+        if (rsp_ready_[b]) {
+          pf_ans_[pf->seq] = cycle_;
+          pf.reset();
+        }
+      }
+      if (rsp_valid_[b] && pf) {
+        ++n_pf_yield_;
       }
 
       bool valid = get_bits(t->out_valid, b, 1);
@@ -932,9 +954,19 @@ private:
       if (valid_prev_[b] && !ready_prev_[b] && !valid) {
         this->fail(strf("block %u: output dropped while stalled", b));
       }
+      // A released proxy fence goes no further: the stage takes it for its
+      // answer, once the previous answer has gone.
+      const bool pf_head = !q.empty() && q.front().pfence;
+      bool pf_take = false;
+      if (pf_head && !held) {
+        if (valid) {
+          this->fail(strf("block %u seq %" PRIu64 ": proxy fence sent on", b, q.front().seq));
+        }
+        pf_take = !pf_was_[b];
+      }
       if (entered_prev_[b] && ready_prev_[b]) {
         // Accepted last cycle while the output drained: it is the head now.
-        if (valid == held || q.empty() || q.front().seq != *entered_prev_[b]) {
+        if ((pf_head ? valid : valid == held) || q.empty() || q.front().seq != *entered_prev_[b]) {
           this->fail(strf("block %u: seq %" PRIu64 " is not at the output one cycle after entering", b,
                           *entered_prev_[b]));
         }
@@ -970,6 +1002,13 @@ private:
       }
       rem_st_prev_[b].reset();
       lacc_prev_[b].reset();
+      if (pf_take) {
+        fobs_[q.front().seq].fire_cycle = cycle_;
+        pf = q.front();
+        q.pop_front();
+        progress = true;
+      }
+      pf_was_[b] = pf.has_value();
       bool fire = false;
       if (valid) {
         if (q.empty()) {
@@ -1072,7 +1111,7 @@ private:
       valid_prev_[b] = valid && !fire;
       fired_prev_[b] = fire;
       // What the stage's buffer sees: a held fence keeps it from draining.
-      ready_prev_[b] = ready_[b] && !held;
+      ready_prev_[b] = pf_head ? pf_take : (ready_[b] && !held);
       n_stall_ += valid && !ready_[b];
     }
 
@@ -1544,6 +1583,60 @@ private:
       std::printf("fence: a store-flagged fence counted no local access\n");
     }
 
+  #if defined(VX_CFG_EXT_DXA_ENABLE) && defined(VX_CFG_EXT_MBAR_ENABLE)
+    // A proxy fence behind a plain local store whose commit is withheld, and
+    // a load of another warp behind it: held as a fence is, then taken in the
+    // cycle lmem_acc_drained rises and answered by the stage a cycle later,
+    // never sent on; the load follows. With translated accesses' responses
+    // in every cycle the answer waits for a free one.
+    for (bool busy : {false, true}) {
+      ack_pct_ = 100;
+      commit_pct_ = 0;
+      rsp_pct_ = 0;
+      rsp_rdy_pct_ = 100;
+      Request st = this->fence_req(w, false, true, cfg_.lmem_base + 16);
+      for (auto& at : st.attr) {
+        set_bits(at, attr_local_pos_, 1, 1);
+      }
+      Request pf = this->fence_req(w, true, false, 0);
+      pf.pfence = true;
+      Request ld = this->fence_req(w2, false, false, local);
+      fobs_[ld.seq];   // watched, so its fire cycle is recorded
+      this->offer_all({st, pf, ld}, hold);
+      const FenceObs& fo = fobs_[pf.seq];
+      if (fo.fire_cycle != ~uint64_t(0) || fo.held_cycles + 3 < hold || queue_[0].size() != 2
+       || queue_[0].front().seq != pf.seq || pf_ans_.count(pf.seq)) {
+        this->fail(strf("proxy fence after a plain local store: held %" PRIu64 " of %u cycles, released at %" PRId64
+                        ", %zu request(s) in the stage", fo.held_cycles, hold, int64_t(fo.fire_cycle),
+                        queue_[0].size()));
+      }
+      commit_pct_ = 100;
+      rsp_pct_ = busy ? 100 : 0;
+      const uint64_t yields = n_pf_yield_;
+      const uint64_t c_commit = cycle_;
+      this->offer_all({}, 4);
+      rsp_pct_ = 0;
+      this->offer_all({}, 4);
+      const uint64_t rel = fo.fire_cycle;
+      const uint64_t ans = pf_ans_.count(pf.seq) ? pf_ans_[pf.seq] : ~uint64_t(0);
+      const uint64_t ld_fire = fobs_[ld.seq].fire_cycle;
+      if (rel != c_commit + 1 || lacc_rise_[w] != rel || ans == ~uint64_t(0)
+       || (busy ? (ans != c_commit + 4 || n_pf_yield_ == yields) : (ans != rel + 1))
+       || ld_fire == ~uint64_t(0) || ld_fire <= rel) {
+        this->fail(strf("proxy fence%s: committed in cycle %" PRIu64 ", released in %" PRId64 ", answered in %"
+                        PRId64 ", the load behind it out in %" PRId64, busy ? " under responses" : "",
+                        c_commit, int64_t(rel), int64_t(ans), int64_t(ld_fire)));
+      }
+      this->drain();
+      std::printf("fence: proxy fence held %" PRIu64 " cycles with the commit withheld, released %" PRId64
+                  " cycle(s) after the commit, answered %" PRId64 " cycle(s) after its release%s, never sent on\n",
+                  fo.held_cycles, int64_t(rel - c_commit), int64_t(ans - rel),
+                  busy ? " behind the translated accesses' responses" : "");
+    }
+    rsp_pct_ = 50;
+    rsp_rdy_pct_ = 50;
+  #endif
+
     if (!two) {
       std::printf("fence: the remote cases need a cluster of at least two cores, skipped\n");
       return;
@@ -1918,8 +2011,15 @@ private:
 
   struct FenceObs {
     uint64_t held_cycles = 0;
-    uint64_t fire_cycle = ~uint64_t(0);
+    uint64_t fire_cycle = ~uint64_t(0);   // a proxy fence's: its release
   };
+  // Per block: the proxy fence the stage holds the answer of, whether it
+  // held one at the cycle's start; the cycle each answer went.
+  std::vector<std::optional<Request>> pf_rsp_ = std::vector<std::optional<Request>>(VX_CFG_NUM_LSU_BLOCKS);
+  std::vector<bool> pf_was_ = std::vector<bool>(VX_CFG_NUM_LSU_BLOCKS, false);
+  std::map<uint64_t, uint64_t> pf_ans_;
+  uint64_t n_pf_yield_ = 0;
+  uint32_t rsp_pct_ = 50, rsp_rdy_pct_ = 50;
   std::map<uint64_t, FenceObs> fobs_;
   uint64_t n_fence_held_ = 0, n_held_cycles_ = 0, n_b2b_ = 0, n_acks_ = 0;
   uint64_t n_rl_ = 0, n_rl_held_ = 0, n_b2b_rl_ = 0;

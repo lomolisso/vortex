@@ -422,6 +422,11 @@ public:
     dxa_core_->row_out.bind(&dlmem_req_switch_->DxaIn);
     for (uint32_t c = 0; c < cores_per_socket; ++c) {
       Core* core = cores_.at(c).get();
+      // A bulk copy's source rows answer on the DXA ports.
+      for (uint32_t p = 0; p < DxaCore::LMEM_PORTS_PER_CORE; ++p) {
+        core->local_mem()->Outputs.at(port_dxa + p).bind(
+            &dxa_core_->lmem_rsp_in.at(c * DxaCore::LMEM_PORTS_PER_CORE + p));
+      }
       auto& ingress = dlmem_ingress_.at(c);
       ingress->LmemDmaOut.bind(&core->local_mem()->Inputs.at(Core::LMEM_DXA_ROW_PORT));
       core->scheduler().cta_dispatcher()->DxaSlotOut.at(2).bind(&ingress->SlotIn);

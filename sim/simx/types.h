@@ -390,6 +390,13 @@ enum class LsuType {
   // completes on that block's mbarrier, which is the instruction's rs3.
   , ST_ASYNC
   , RED_ASYNC
+#ifdef VX_CFG_EXT_DXA_ENABLE
+  // fence.proxy.async: the warp's earlier local-memory stores are committed
+  // and its remote ones acknowledged before a later DXA copy reads them.
+  , PFENCE
+#else
+#line 387
+#endif
 #else
 #line 382
 #endif
@@ -414,6 +421,11 @@ inline std::ostream &operator<<(std::ostream &os, const LsuType& type) {
 #ifdef VX_CFG_EXT_MBAR_ENABLE
   case LsuType::ST_ASYNC:  os << "ST_ASYNC"; break;
   case LsuType::RED_ASYNC: os << "RED_ASYNC"; break;
+#ifdef VX_CFG_EXT_DXA_ENABLE
+  case LsuType::PFENCE:    os << "PFENCE"; break;
+#else
+#line 411
+#endif
 #else
 #line 400
 #endif
@@ -518,6 +530,12 @@ struct MemFlags {
 #ifdef VX_CFG_EXT_MBAR_ENABLE
       // async: an st.async / red.async, whose amo_cmp lane is its mbarrier.
       uint32_t async             : 1;   // bit 25
+#ifdef VX_CFG_EXT_DXA_ENABLE
+      // fence_proxy: with fence, a proxy fence, which the translation answers.
+      uint32_t fence_proxy       : 1;   // bit 26
+#else
+#line 515
+#endif
 #else
 #line 469
 #endif
@@ -722,6 +740,11 @@ inline std::ostream &operator<<(std::ostream &os, const WctlType& type) {
 
 enum class DxaType {
   ISSUE
+#ifdef VX_CFG_EXT_MBAR_ENABLE
+  , BULK  // cp.async.bulk from the block's local memory into a cluster block
+#else
+#line 637
+#endif
 };
 
 struct IntrDxaArgs {};
@@ -729,11 +752,22 @@ struct IntrDxaArgs {};
 inline std::ostream &operator<<(std::ostream &os, const DxaType& type) {
   switch (type) {
   case DxaType::ISSUE: os << "DXA.ISSUE"; break;
+#ifdef VX_CFG_EXT_MBAR_ENABLE
+  case DxaType::BULK:  os << "DXA.BULK"; break;
+#else
+#line 644
+#endif
   default: os << "?"; break;
   }
   return os;
 }
 
+#endif
+#if defined(VX_CFG_EXT_DXA_ENABLE) && defined(VX_CFG_EXT_MBAR_ENABLE)
+#elif defined(VX_CFG_EXT_MBAR_ENABLE)
+#line 730
+#else
+#line 650
 #endif
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -1397,6 +1431,8 @@ struct DxaWrTag {
   bool     remote   = false;
   uint32_t src_core = 0;      // a copy into a peer core's block: the cluster-relative cores
   uint32_t dst_core = 0;
+  // A bulk copy's access, which holds every bank it touches at once.
+  bool     bulk     = false;
 #else
 #line 1286
 #endif

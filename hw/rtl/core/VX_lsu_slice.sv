@@ -477,7 +477,12 @@ module VX_lsu_slice import VX_gpu_pkg::*; #(
     // pack memory request tag
 `ifdef VX_CFG_EXT_DLMEM_ENABLE
     wire req_aq, req_rl;
-`ifdef VX_CFG_EXT_A_ENABLE
+`ifdef DXA_MBAR_ENABLE
+    // A proxy fence unlocks its warp as an acquire does, when it retires.
+    assign req_aq = (execute_if.data.op_args.lsu.amo_valid && execute_if.data.op_args.lsu.amo_aq)
+                 || (execute_if.data.op_type == INST_LSU_PFENCE);
+    assign req_rl = execute_if.data.op_args.lsu.amo_valid && execute_if.data.op_args.lsu.amo_rl;
+`elsif VX_CFG_EXT_A_ENABLE
     assign req_aq = execute_if.data.op_args.lsu.amo_valid && execute_if.data.op_args.lsu.amo_aq;
     assign req_rl = execute_if.data.op_args.lsu.amo_valid && execute_if.data.op_args.lsu.amo_rl;
 `else
@@ -590,9 +595,16 @@ module VX_lsu_slice import VX_gpu_pkg::*; #(
         end else begin
             // A new warp has no earlier write for its first release to order.
             gdirty <= gdirty & ~warp_spawn;
+        `ifdef DXA_MBAR_ENABLE
+            // A proxy fence drains no cache, so the warp's global writes stay unfenced.
+            if (mem_rsp_fire && rsp_is_fence && mem_rsp_eop_pkt && (rsp_op_type != INST_LSU_PFENCE)) begin
+                gdirty[rsp_hdr.wid] <= 1'b0;
+            end
+        `else
             if (mem_rsp_fire && rsp_is_fence && mem_rsp_eop_pkt) begin
                 gdirty[rsp_hdr.wid] <= 1'b0;
             end
+        `endif
             if (mem_req_fire && req_has_global && req_writes) begin
                 gdirty[execute_if.data.header.wid] <= 1'b1;
             end

@@ -64,6 +64,7 @@ module VX_dxa_worker import VX_gpu_pkg::*, VX_dxa_pkg::*; #(
     wire                        active_notify_smem_done;
 `ifdef DXA_MBAR_ENABLE
     dxa_compl_t                 active_compl;
+    wire                        active_bulk;
 `endif
     wire                        active_is_multicast;
     wire [`VX_CFG_NUM_WARPS-1:0]       active_cta_mask;
@@ -118,6 +119,25 @@ module VX_dxa_worker import VX_gpu_pkg::*, VX_dxa_pkg::*; #(
     wire                        gmem_req_fire;
     wire                        stall_no_slot;
 
+`ifdef DXA_MBAR_ENABLE
+    // gmem_req ↔ lmem_rd (a bulk copy's line reads), smem_wr → lmem_rd (its beats)
+    wire                        lr_req_valid;
+    wire [GMEM_ADDR_WIDTH-1:0]  lr_req_addr;
+    wire [TAG_W-1:0]            lr_req_tag;
+    wire                        lr_req_ready;
+    wire                        lr_rsp_valid;
+    wire [GMEM_DATAW-1:0]       lr_rsp_data;
+    wire [TAG_W-1:0]            lr_rsp_tag;
+    wire                        lr_rsp_ready;
+
+    VX_mem_bus_if #(
+        .DATA_SIZE   (DXA_LMEM_WORD_SIZE),
+        .TAG_WIDTH   (DXA_LMEM_TAG_W),
+        .ATTR_WIDTH  (DXA_LMEM_ATTR_W),
+        .ADDR_WIDTH  (DXA_LMEM_ADDR_W)
+    ) wr_bus_if();
+`endif
+
 `ifdef PERF_ENABLE
     wire [31:0]                 perf_gmem_reqs;
     wire [31:0]                 perf_gmem_span_cycles;
@@ -146,6 +166,7 @@ module VX_dxa_worker import VX_gpu_pkg::*, VX_dxa_pkg::*; #(
         .active_notify_smem_done (active_notify_smem_done),
     `ifdef DXA_MBAR_ENABLE
         .active_compl         (active_compl),
+        .active_bulk          (active_bulk),
     `endif
         .active_is_multicast  (active_is_multicast),
         .active_cta_mask      (active_cta_mask),
@@ -218,6 +239,17 @@ module VX_dxa_worker import VX_gpu_pkg::*, VX_dxa_pkg::*; #(
         .ag_last            (ag_last),
         .ag_k_row           (ag_k_row),
         .ag_n_base          (ag_n_base),
+    `ifdef DXA_MBAR_ENABLE
+        .bulk               (active_bulk),
+        .lmem_rd_valid      (lr_req_valid),
+        .lmem_rd_addr       (lr_req_addr),
+        .lmem_rd_tag        (lr_req_tag),
+        .lmem_rd_ready      (lr_req_ready),
+        .lmem_rsp_valid     (lr_rsp_valid),
+        .lmem_rsp_data      (lr_rsp_data),
+        .lmem_rsp_tag       (lr_rsp_tag),
+        .lmem_rsp_ready     (lr_rsp_ready),
+    `endif
         .gmem_bus_if        (gmem_bus_if),
         .sw_valid           (sw_valid),
         .sw_ready           (sw_ready),
@@ -280,7 +312,11 @@ module VX_dxa_worker import VX_gpu_pkg::*, VX_dxa_pkg::*; #(
         .sw_outstanding        (sw_outstanding),
         .release_en            (sw_release_en),
         .release_tag           (sw_release_tag),
+    `ifdef DXA_MBAR_ENABLE
+        .smem_bus_if           (wr_bus_if),
+    `else
         .smem_bus_if           (smem_bus_if),
+    `endif
         .transfer_done         (transfer_done),
         .wr_done_count         (wr_done_count),
         .smem_req_fire         (smem_req_fire),
@@ -298,6 +334,41 @@ module VX_dxa_worker import VX_gpu_pkg::*, VX_dxa_pkg::*; #(
         .smem_base             (ag_smem_base)
     );
 
+`ifdef DXA_MBAR_ENABLE
+    // ════════════════════════════════════════════════════════════════════
+    // Local-memory line reader (bulk copies); merges smem_wr's beats onto
+    // the worker's bus.
+    // ════════════════════════════════════════════════════════════════════
+
+    // The line reader's entries, apart from the DXA_MAX_INFLIGHT line tags:
+    // the fewest with the throughput of 8 at 4, 8 and 16 banks.
+    localparam LMEM_RD_DEPTH = 7;
+
+    VX_dxa_lmem_rd #(
+        .INSTANCE_ID     (`SFORMATF(("%s-lmem-rd", INSTANCE_ID))),
+        .MAX_OUTSTANDING (MAX_OUTSTANDING),
+        .DEPTH           (LMEM_RD_DEPTH),
+        .CL_SIZE         (GMEM_BYTES),
+        .WORD_SIZE       (SMEM_BYTES),
+        .LINE_ADDR_W     (GMEM_ADDR_WIDTH)
+    ) lmem_rd (
+        .clk            (clk),
+        .reset          (reset),
+        .core_id        (active_core_id),
+        .uuid           (active_uuid),
+        .line_req_valid (lr_req_valid),
+        .line_req_addr  (lr_req_addr),
+        .line_req_tag   (lr_req_tag),
+        .line_req_ready (lr_req_ready),
+        .line_rsp_valid (lr_rsp_valid),
+        .line_rsp_data  (lr_rsp_data),
+        .line_rsp_tag   (lr_rsp_tag),
+        .line_rsp_ready (lr_rsp_ready),
+        .wr_bus_if      (wr_bus_if),
+        .smem_bus_if    (smem_bus_if)
+    );
+
+`endif
     // ════════════════════════════════════════════════════════════════════
     // Watchdog
     // ════════════════════════════════════════════════════════════════════

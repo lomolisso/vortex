@@ -147,6 +147,32 @@ public:
     };
     std::vector<Rcv>        rcvs;
     uint32_t                km_byte_off = 0;     // cluster replay: bytes of element km_elem_idx written
+    // A bulk copy's line reader (VX_dxa_lmem_rd): its entries, in order, one
+    // per line the address generator took. Their word reads to the issuing
+    // core take the worker's bus ahead of its write beats; the responses fill
+    // the entries in order, and each filled line leaves, in order, when
+    // smem_wr captures it, which frees its entry.
+    struct RdLine {
+      uint64_t addr      = 0;  // the line, in the issuing core's local memory
+      uint32_t slot      = 0;
+      uint64_t taken     = 0;  // its reads go from the next cycle
+      uint64_t filled_at = 0;  // its last response; it leaves from the next cycle
+      uint32_t issued    = 0;  // word reads sent
+      // Per block of a word: responses landed. A word wider than a block is
+      // read on several ports, which may answer in different cycles.
+      std::array<uint32_t, DxaCore::LMEM_PORTS_PER_CORE> filled{};
+    };
+    std::deque<RdLine>      rd_lines;
+    // smem_wr's capture registers, pend and defer (the copy's last line while
+    // others are outstanding), and its fill buffer, drain_slot: a line
+    // captured in a cycle loads the fill buffer from the next one, whose beats
+    // go from the cycle after.
+    uint32_t                pend_slot  = UINT32_MAX;
+    uint32_t                defer_slot = UINT32_MAX;
+    uint64_t                fb_at      = 0;   // the cycle drain_slot was loaded
+    // The cycle's start, as smem_wr's registers hold it.
+    bool                    st_fb = false, st_pend = false, st_defer = false;
+    uint32_t                st_outstanding = 0;
 #else
 #line 137
 #endif
@@ -169,6 +195,15 @@ public:
 #ifdef DXA_MBAR_ENABLE
     stream_.clear();
     row_flits_.clear();
+    for (auto& w : workers_) {
+      w.rd_lines.clear();
+      w.pend_slot  = UINT32_MAX;
+      w.defer_slot = UINT32_MAX;
+    }
+    for (auto& q : cs_q_) {
+      q.clear();
+    }
+    lmem_rr_ = 0;
 #else
 #line 153
 #endif
@@ -267,14 +302,39 @@ public:
     }
 
 #ifdef DXA_MBAR_ENABLE
+    this->drain_lmem_rsp();
+    this->tick_core_switch();
     this->tick_stream();
+    // While a bulk copy runs, the workers' bus operations pass the RTL's
+    // lmem_arb one a cycle, in round-robin order.
+    lmem_arb_ = false;
+    for (auto& w : workers_) {
+      lmem_arb_ |= (w.state == WState::RUNNING && w.req.bulk);
+    }
+    if (lmem_arb_) {
+      this->tick_lmem_arb();
+    }
 #else
 #line 241
 #endif
     // 2) Tick workers (smem_wr drain → gmem_req issue).
     for (auto& w : workers_) {
       if (w.state == WState::RUNNING) {
+#ifdef DXA_MBAR_ENABLE
+        const uint32_t writes = w.writes_emitted;
+        if (!lmem_arb_)
+#else
+#line 244
+#endif
         tick_worker_smem_wr(w);
+#ifdef DXA_MBAR_ENABLE
+        // lmem_arb's grant follows the beats here too.
+        if (!lmem_arb_ && w.writes_emitted != writes) {
+          lmem_rr_ = (w.worker_id + 1) % uint32_t(workers_.size());
+        }
+#else
+#line 245
+#endif
         tick_worker_gmem_req(w);
       }
     }
@@ -404,6 +464,10 @@ private:
 
 #ifdef DXA_MBAR_ENABLE
     this->load_receivers(w, req);
+    if (req.bulk) {
+      this->start_bulk(w);
+      return;
+    }
 #else
 #line 372
 #endif
@@ -609,6 +673,13 @@ private:
 
   // ── gmem_req: issue MemReqs with available inflight slots ────────────
   void tick_worker_gmem_req(Worker& w) {
+#ifdef DXA_MBAR_ENABLE
+    if (w.req.bulk) {
+      return;
+    }
+#else
+#line 574
+#endif
     // One AGU step per cycle: advance ag_idx by at most one, issuing at most
     // one GMEM read to this worker's ReqIn port (or one OOB skip). A while-loop
     // here would issue many reads to a single port in one cycle.
@@ -724,6 +795,11 @@ private:
     // independently, so gate the beat on the whole group being ready instead of
     // stranding the half already sent.
 #ifdef DXA_MBAR_ENABLE
+    if (lmem_arb_) {
+      if (lmem_taken_)
+        return;
+      lmem_taken_ = true;
+    }
     if (to_stream ? stream_.full() : !this->core_inputs_ready(socket_local_cid))
       return;
     if (w.req.cluster) {
@@ -1030,16 +1106,20 @@ private:
     if (stream_.empty() || stream_.front().ready > cycle_)
       return;
     const StreamBeat& head = stream_.front();
+    // At a larger socket a bulk copy's local accesses leaving the stream pass
+    // the core switch's register, and its remote beats wait only for the
+    // accesses ahead of them to leave the engine's output stage (cs_q_).
+    const bool switched = (kCoreSwitchRegs != 0) && head.writes.at(0).dxa.bulk;
     if (!head.remote) {
       if (!this->core_inputs_ready(head.core))
         return;
       for (uint32_t k = 0; k < head.count; ++k) {
-        simobject_->lmem_req_out.at(head.ports.at(k)).send(head.writes.at(k), 0);
+        simobject_->lmem_req_out.at(head.ports.at(k)).send(head.writes.at(k), switched ? 1 : 0);
       }
       stream_.pop();
       return;
     }
-    if (!this->core_inputs_empty())
+    if (switched ? !this->core_switch_empty() : !this->core_inputs_empty())
       return;
     this->load_row_beat(head);
     // A beat with neither data nor a completion leaves at once.
@@ -1191,6 +1271,12 @@ private:
       req.dxa.src_core = w.req.src_core;
       req.dxa.dst_core = rcv.dst_core;
       req.dxa.last     = copy_end;
+      req.dxa.bulk     = w.req.bulk;
+      // A bulk beat reaches the bank queue of the first word it writes, one
+      // that it holds, as the RTL's DMA port meets only the banks it writes.
+      if (w.req.bulk && !rcv.remote) {
+        req.addr += uint64_t(__builtin_ctzll(req.byteen)) & ~uint64_t(VX_CFG_XLEN / 8 - 1);
+      }
       if (copy_end && k + 1 == n) {
         req.flags.dxa_notify_done   = 1;
         req.flags.dxa_notify_bar_id = w.req.bar_id + rcv.bar_idx;
@@ -1200,6 +1286,9 @@ private:
       ++w.writes_emitted;
     }
     ++perf_stats_.lmem_writes;
+    DT(3, simobject_->name() << "[" << w.worker_id << "] " << (w.req.bulk ? "bulk wr" : "cluster wr") << ": addr=0x"
+       << std::hex << beat.at(0).addr << ", byteen=0x" << beat.at(0).byteen << std::dec << ", writes=" << n
+       << ", last=" << copy_end << " (#" << w.req.uuid << ")");
 
     if (to_stream) {
       StreamBeat sb;
@@ -1214,6 +1303,18 @@ private:
         sb.ports.at(k)  = beat_port.at(k);
       }
       stream_.push(sb);
+    } else if (w.req.bulk) {
+      StreamBeat sb;
+      sb.core  = cid;
+      sb.count = n;
+      sb.ready = cycle_ + 1;
+      const uint32_t id = beat_seq_.at(cid)++;
+      for (uint32_t k = 0; k < n; ++k) {
+        beat.at(k).dxa.beat = id;
+        sb.writes.at(k) = beat.at(k);
+        sb.ports.at(k)  = beat_port.at(k);
+      }
+      this->bulk_send(sb);
     } else {
       const uint32_t id = beat_seq_.at(cid)++;
       for (uint32_t k = 0; k < n; ++k) {
@@ -1300,6 +1401,346 @@ private:
     }
     return uint32_t(bytes);
   }
+
+  // A bulk copy: the lines covering [src_addr, src_addr + size) of the
+  // issuing core's local memory, each landing at the same distance from the
+  // destination as from the source. Its writes are those of a one-receiver
+  // cluster copy, completing with complete_tx(size).
+  void start_bulk(Worker& w) {
+    const DxaReq& req = w.req;
+    if (xfer_seq_ == 0 || xfer_seq_ + 1 < xfer_seq_) {
+      xfer_seq_ = 1;
+    }
+    w.xfer_base = xfer_seq_++;
+    w.rcv_writes.assign(1, 0);
+    w.desc = Descriptor{};
+    w.smem_stride = 0;
+    w.tx_bytes = req.size;
+    if (w.tx_bytes > req.win_room) {
+      this->dxa_abort(w, "DXA box exceeds the destination block: " + std::to_string(w.tx_bytes)
+                      + " bytes, room " + std::to_string(req.win_room));
+    }
+    w.rd_lines.clear();
+    w.pend_slot  = UINT32_MAX;
+    w.defer_slot = UINT32_MAX;
+    const uint64_t end = req.src_addr + req.size;
+    for (uint64_t la = req.src_addr & kGmemLineMask; la < end; la += kGmemLineSize) {
+      const uint64_t b0  = std::max(la, req.src_addr);
+      const uint64_t b1  = std::min(la + kGmemLineSize, end);
+      const uint64_t dst = req.smem_addr + (b0 - req.src_addr);
+      LineWork lw{};
+      lw.gmem_cl_addr     = la;
+      lw.smem_word_addr   = dst & ~uint64_t(kLmemWordSize - 1);
+      lw.smem_byte_offset = uint32_t(dst - lw.smem_word_addr);
+      lw.cl_byte_offset   = uint32_t(b0 - la);
+      lw.valid_length     = uint32_t(b1 - b0);
+      lw.km_num_elems     = 1;
+      w.work_list.push_back(lw);
+    }
+    w.work_list.back().last = true;
+    w.state = WState::RUNNING;
+    DT(3, simobject_->name() << "[" << w.worker_id << "] bulk start: core=" << req.core->id()
+       << ", wid=" << req.wid << ", src=0x" << std::hex << req.src_addr << ", dst=0x" << req.smem_addr
+       << ", size=0x" << req.size << ", mbar_off=0x" << req.mbar_off << std::dec << ", lines="
+       << w.work_list.size() << ", remote=" << req.remote << ", dst_core=" << req.dst_core);
+  }
+
+  // A line's reads: the local-memory words (DxaCore::LMEM_ROW_SIZE bytes) of
+  // the line, or the one word holding it. A word wider than a block is read as
+  // its blocks, on their ports, as a row is written.
+  static constexpr uint32_t kRowSize    = DxaCore::LMEM_ROW_SIZE;
+  static constexpr uint32_t kLineReads  = (kGmemLineSize > kRowSize) ? (kGmemLineSize / kRowSize) : 1u;
+  static constexpr uint32_t kWordBlocks = DxaCore::LMEM_PORTS_PER_CORE;
+  static_assert(kGmemLineSize <= kLmemWordSize, "a source line fits a local-memory block");
+
+  static uint64_t bulk_word(uint64_t line, uint32_t k) {
+    return (kGmemLineSize > kRowSize) ? (line + uint64_t(k) * kRowSize) : (line & ~uint64_t(kRowSize - 1));
+  }
+
+  // The RTL's 1D setup ahead of a copy's first line, counted from the cycle
+  // the request left the unit: the descriptor fetch hands it to the worker 2
+  // cycles later, the rank-1 setup takes 4 and its promotion 2, and the
+  // address generator emits the first line the cycle after. Behind a running
+  // copy the setup overlaps it, as the RTL stages the next request.
+  static constexpr uint64_t kBulkFirstLine = 2 + 4 + 2 + 1;
+
+  // At a socket of several cores, the core switch registers a bulk copy's
+  // accesses on their way to a core, and a read's response on its way back
+  // (VX_socket dxa_lmem_core_switch); at a socket of one, there is none.
+  static constexpr uint32_t kCoreSwitchRegs = (kCoresPerSocket > 1) ? 1u : 0u;
+  static constexpr uint32_t kCoreSwitchDepth = 2;
+
+  // Whether a bulk access to core `cid` can leave the worker's bus now.
+  bool bulk_bus_ready(uint32_t cid) const {
+    return (kCoreSwitchRegs != 0) ? (cs_q_.at(cid).size() < kCoreSwitchDepth) : this->core_inputs_ready(cid);
+  }
+
+  void bulk_send(const StreamBeat& sb) {
+    if (kCoreSwitchRegs != 0) {
+      cs_q_.at(sb.core).push_back(sb);
+      return;
+    }
+    for (uint32_t k = 0; k < sb.count; ++k) {
+      simobject_->lmem_req_out.at(sb.ports.at(k)).send(sb.writes.at(k));
+    }
+  }
+
+  bool core_switch_empty() const {
+    for (const auto& q : cs_q_) {
+      if (!q.empty())
+        return false;
+    }
+    return true;
+  }
+
+  // The core switch's registers: each core's oldest access moves on to the
+  // core's DXA input once it has spent its cycle there.
+  void tick_core_switch() {
+    if (kCoreSwitchRegs == 0)
+      return;
+    for (uint32_t c = 0; c < kCoresPerSocket; ++c) {
+      auto& q = cs_q_.at(c);
+      if (q.empty() || q.front().ready > cycle_ || !this->core_inputs_ready(c))
+        continue;
+      for (uint32_t k = 0; k < q.front().count; ++k) {
+        simobject_->lmem_req_out.at(q.front().ports.at(k)).send(q.front().writes.at(k));
+      }
+      q.pop_front();
+    }
+  }
+
+  // The address generator: one line a cycle, which takes a slot and an entry
+  // of the line reader, as their registers stand at the cycle's start.
+  void tick_bulk_agu(Worker& w) {
+    if (w.ag_idx >= w.work_list.size())
+      return;
+    if (SimPlatform::instance().cycles() < w.req.sent + kBulkFirstLine)
+      return;
+    uint32_t slot = UINT32_MAX;
+    for (uint32_t s = 0; s < w.inflight.size(); ++s) {
+      if (!w.inflight[s].allocated) {
+        slot = s;
+        break;
+      }
+    }
+    if (slot == UINT32_MAX) {
+      ++perf_stats_.noslot_stalls;
+      return;
+    }
+    if (w.rd_lines.size() >= DxaCore::LMEM_RD_DEPTH)
+      return;
+    const LineWork& lw = w.work_list[w.ag_idx];
+    auto& s = w.inflight[slot];
+    s.allocated   = true;
+    s.rsp_arrived = false;
+    s.rsp_data    = make_mem_block();
+    std::memset(s.rsp_data->data(), 0, s.rsp_data->size());
+    s.work        = lw;
+    w.issued_order.push_back(slot);
+    Worker::RdLine e;
+    e.addr  = lw.gmem_cl_addr;
+    e.slot  = slot;
+    e.taken = cycle_;
+    w.rd_lines.push_back(e);
+    ++w.ag_idx;
+    DT(3, simobject_->name() << "[" << w.worker_id << "] bulk line: addr=0x" << std::hex << lw.gmem_cl_addr
+       << std::dec << ", slot=" << slot << " (#" << w.req.uuid << ")");
+  }
+
+  // A cycle in which a bulk copy runs, as the RTL's lmem_arb sees it: each
+  // bulk worker's address generator and smem_wr registers act on the cycle's
+  // start; the first worker in round-robin order with a bus operation is
+  // granted the bus, even when the bus cannot take it this cycle, and the
+  // grant moves past it once it goes; then the bulk workers' smem_wr
+  // registers load.
+  void tick_lmem_arb() {
+    for (auto& w : workers_) {
+      if (w.state != WState::RUNNING || !w.req.bulk)
+        continue;
+      if (w.issued_order.empty() && w.ag_idx == w.work_list.size()) {
+        this->finish_worker(w);
+        continue;
+      }
+      w.st_fb          = (w.drain_slot != UINT32_MAX);
+      w.st_pend        = (w.pend_slot != UINT32_MAX);
+      w.st_defer       = (w.defer_slot != UINT32_MAX);
+      w.st_outstanding = uint32_t(w.issued_order.size());
+      this->tick_bulk_agu(w);
+    }
+    lmem_taken_ = false;
+    const uint32_t n = uint32_t(workers_.size());
+    for (uint32_t k = 0; k < n; ++k) {
+      auto& w = workers_.at((lmem_rr_ + k) % n);
+      if (w.state != WState::RUNNING)
+        continue;
+      const uint32_t writes = w.writes_emitted;
+      lmem_sent_ = false;
+      if (w.req.bulk) {
+        this->bulk_bus_op(w);
+      } else {
+        this->tick_worker_smem_wr(w);
+      }
+      if (lmem_sent_ || w.writes_emitted != writes) {
+        lmem_rr_ = (w.worker_id + 1) % n;
+      }
+    }
+    for (auto& w : workers_) {
+      if (w.state == WState::RUNNING && w.req.bulk) {
+        this->bulk_capture(w);
+      }
+    }
+  }
+
+  // The worker's bus operation: the next read of the oldest entry with reads
+  // left, which holds the writer back while it is not taken
+  // (VX_dxa_lmem_rd); else a beat of the fill buffer, loaded in an earlier
+  // cycle.
+  void bulk_bus_op(Worker& w) {
+    const uint32_t cid = w.req.core->id() % kCoresPerSocket;
+    Worker::RdLine* e = nullptr;
+    for (auto& l : w.rd_lines) {
+      if (l.issued < kLineReads) {
+        e = &l;
+        break;
+      }
+    }
+    if (e != nullptr && e->taken < cycle_) {
+      if (lmem_taken_)
+        return;
+      lmem_taken_ = true;
+      this->bulk_read(w, *e, cid);
+      return;
+    }
+    if (w.drain_slot == UINT32_MAX || w.fb_at >= cycle_ || lmem_taken_)
+      return;
+    lmem_taken_ = true;
+    const bool to_stream = w.rcvs.at(0).remote || !stream_.empty();
+    if (to_stream ? stream_.full() : !this->bulk_bus_ready(cid))
+      return;
+    this->emit_cluster_beat(w, cid, to_stream);
+    lmem_sent_ = true;
+  }
+
+  // One word read; a read behind a beat in the socket's stream queues behind
+  // it.
+  void bulk_read(Worker& w, Worker::RdLine& e, uint32_t cid) {
+    const uint64_t word = bulk_word(e.addr, e.issued);
+    const bool to_stream = !stream_.empty();
+    if (to_stream ? stream_.full() : !this->bulk_bus_ready(cid))
+      return;
+    StreamBeat sb;
+    sb.core  = cid;
+    sb.count = kWordBlocks;
+    sb.ready = cycle_ + 1;
+    for (uint32_t p = 0; p < kWordBlocks; ++p) {
+      MemReq req;
+      req.op        = MemOp::LD;
+      req.addr      = word + uint64_t(p) * kLmemWordSize;
+      req.tag       = w.worker_id * VX_CFG_DXA_MAX_INFLIGHT + e.slot;
+      req.hart_id   = w.req.core->id();
+      req.uuid      = w.req.uuid;
+      req.flags.dma = 1;
+      req.dxa.bulk  = true;
+      sb.writes.at(p) = req;
+      sb.ports.at(p)  = cid * kWordBlocks + p;
+    }
+    if (to_stream) {
+      stream_.push(sb);
+    } else {
+      this->bulk_send(sb);
+    }
+    DT(3, simobject_->name() << "[" << w.worker_id << "] bulk rd: addr=0x" << std::hex << word << std::dec
+       << ", slot=" << e.slot << ", word=" << e.issued << " (#" << w.req.uuid << ")");
+    ++e.issued;
+    lmem_sent_ = true;
+  }
+
+  // smem_wr's registers at the cycle's end (VX_dxa_smem_wr): the fill buffer,
+  // emptied by this cycle's beat or idle, loads pend, else the deferred last
+  // line once it is the only one left; and the line reader's oldest filled
+  // line is captured into pend, or into defer if it is the copy's last line
+  // while others are outstanding, which frees its entry.
+  void bulk_capture(Worker& w) {
+    const bool emptied  = w.st_fb && w.drain_slot == UINT32_MAX;
+    const bool fb_empty = emptied || !w.st_fb;
+    if (w.st_pend && fb_empty) {
+      w.drain_slot = w.pend_slot;
+      w.fb_at      = cycle_;
+      w.pend_slot  = UINT32_MAX;
+    } else if (w.st_defer && fb_empty && !w.st_pend
+               && (w.st_outstanding == 1 || (w.st_outstanding == 2 && emptied))) {
+      w.drain_slot = w.defer_slot;
+      w.fb_at      = cycle_;
+      w.defer_slot = UINT32_MAX;
+    }
+    if (w.rd_lines.empty())
+      return;
+    const auto& h = w.rd_lines.front();
+    if (!bulk_filled(h) || h.filled_at >= cycle_)
+      return;
+    const bool to_defer = w.inflight.at(h.slot).work.last && w.st_outstanding > 1;
+    if (to_defer ? w.st_defer : w.st_pend)
+      return;
+    (to_defer ? w.defer_slot : w.pend_slot) = h.slot;
+    w.inflight.at(h.slot).rsp_arrived = true;
+    DT(3, simobject_->name() << "[" << w.worker_id << "] bulk sw-rx: slot=" << h.slot << ", path="
+       << (to_defer ? "defer" : "pend") << " (#" << w.req.uuid << ")");
+    w.rd_lines.pop_front();
+  }
+
+  static bool bulk_filled(const Worker::RdLine& e) {
+    for (uint32_t f : e.filled) {
+      if (f != kLineReads)
+        return false;
+    }
+    return true;
+  }
+
+  // Each port's responses fill its block of the entries' words in order, one
+  // a cycle. A response reaches the worker the cycle after its bank access,
+  // which is the cycle the RTL's lands at a socket of one core: SimX's DMA
+  // accesses meet their bank a cycle after the RTL's, as its writes do. At a
+  // larger socket the core switch holds it a cycle more.
+  void drain_lmem_rsp() {
+    for (uint32_t p = 0; p < simobject_->lmem_rsp_in.size(); ++p) {
+      auto& ch = simobject_->lmem_rsp_in.at(p);
+      if (ch.empty())
+        continue;
+      this->bulk_fill(p, ch.peek(), cycle_ - 1 + kCoreSwitchRegs);
+      ch.pop();
+    }
+  }
+
+  void bulk_fill(uint32_t p, const MemRsp& rsp, uint64_t at) {
+    const uint32_t blk = p % kWordBlocks;
+    auto& w = workers_.at(uint32_t(rsp.tag) / VX_CFG_DXA_MAX_INFLIGHT);
+    Worker::RdLine* e = nullptr;
+    for (auto& l : w.rd_lines) {
+      if (l.filled.at(blk) < kLineReads) {
+        e = &l;
+        break;
+      }
+    }
+    __assert(e != nullptr && e->slot == uint32_t(rsp.tag) % VX_CFG_DXA_MAX_INFLIGHT
+             && e->filled.at(blk) < e->issued && rsp.data,
+             simobject_->name() << " DXA local-memory read response without a read: tag=0x"
+             << std::hex << rsp.tag);
+    const uint64_t word = bulk_word(e->addr, e->filled.at(blk));
+    auto& line = w.inflight.at(e->slot).rsp_data;
+    if (kGmemLineSize > kRowSize) {
+      std::memcpy(line->data() + (word - e->addr), rsp.data->data() + (word & (kLmemWordSize - 1)), kRowSize);
+    } else if (word + uint64_t(blk) * kLmemWordSize == (e->addr & ~uint64_t(kLmemWordSize - 1))) {
+      std::memcpy(line->data(), rsp.data->data() + (e->addr & (kLmemWordSize - 1)), kGmemLineSize);
+    }
+    ++e->filled.at(blk);
+    if (bulk_filled(*e)) {
+      e->filled_at = at;
+      DT(3, simobject_->name() << "[" << w.worker_id << "] bulk filled: slot=" << e->slot << ", cycles ago="
+         << (cycle_ - at) << " (#" << rsp.uuid << ")");
+    }
+  }
+#else
+#line 1194
 #endif
 
   // The barriers go raw to the issuing core's completion unit.
@@ -1346,6 +1787,15 @@ private:
 #ifdef DXA_MBAR_ENABLE
   RingQueue<StreamBeat>   stream_{2};
   std::deque<DlmemReqPkt> row_flits_;   // the row egress's flits of its head beat
+  // lmem_arb while a bulk copy runs: the worker its scan starts from, whether
+  // a worker was granted the bus this cycle, and whether its operation went.
+  uint32_t                lmem_rr_    = 0;
+  bool                    lmem_arb_   = false;
+  bool                    lmem_taken_ = false;
+  bool                    lmem_sent_  = false;
+  // Per core: a bulk copy's accesses in the engine's output stage at a
+  // larger socket, a cycle each before the core switch takes them.
+  std::vector<std::deque<StreamBeat>> cs_q_ = std::vector<std::deque<StreamBeat>>(kCoresPerSocket);
 #else
 #line 935
 #endif
@@ -1366,6 +1816,7 @@ DxaCore::DxaCore(const SimContext& ctx, const char* name, Socket* socket)
   , compl_release_out(kCoresPerSocket, this)
 #ifdef DXA_MBAR_ENABLE
   , row_out(this)
+  , lmem_rsp_in(kCoresPerSocket * LMEM_PORTS_PER_CORE, this)
 #else
 #line 950
 #endif

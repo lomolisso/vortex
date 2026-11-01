@@ -514,6 +514,10 @@ package VX_gpu_pkg;
     // CTA-scope fence: drains the warp's global accesses at the first cache level, skipped when it has none.
     localparam INST_LSU_CFENCE = 4'b1110;
 `endif
+`ifdef DXA_MBAR_ENABLE
+    // Proxy fence: held like a DLMEM fence, then answered by the translation stage; it reaches no cache.
+    localparam INST_LSU_PFENCE = 4'b1101;
+`endif
     localparam INST_LSU_BITS =   4;
 
     localparam INST_FENCE_BITS = 1;
@@ -529,7 +533,9 @@ package VX_gpu_pkg;
     endfunction
 
     function automatic logic inst_lsu_is_fence(input logic [INST_LSU_BITS-1:0] op);
-`ifdef VX_CFG_EXT_DLMEM_ENABLE
+`ifdef DXA_MBAR_ENABLE
+        return (op == INST_LSU_FENCE) || (op == INST_LSU_CFENCE) || (op == INST_LSU_PFENCE);
+`elsif VX_CFG_EXT_DLMEM_ENABLE
         return (op == INST_LSU_FENCE) || (op == INST_LSU_CFENCE);
 `else
         return (op == INST_LSU_FENCE);
@@ -1079,9 +1085,16 @@ package VX_gpu_pkg;
     `PACKAGE_ASSERT($bits(wctl_args_t) == INST_ARGS_BITS)
 
 `ifdef VX_CFG_EXT_DXA_ENABLE
+`ifdef DXA_MBAR_ENABLE
+    typedef struct packed {
+        logic [INST_ARGS_BITS-2:0] __padding;
+        logic bulk;     // an LMEM-to-LMEM bulk copy (funct3 = 1)
+    } dxa_args_t;
+`else
     typedef struct packed {
         logic [INST_ARGS_BITS-1:0] __padding;
     } dxa_args_t;
+`endif
     `PACKAGE_ASSERT($bits(dxa_args_t) == INST_ARGS_BITS)
 `endif
 

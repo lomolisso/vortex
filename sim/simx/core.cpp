@@ -377,6 +377,13 @@ public:
       }
       mbar_waiters_->UnlockOut.bind(&scheduler_->MbarUnlockIn);
     #endif
+    #ifdef DXA_MBAR_ENABLE
+      for (uint32_t b = 0; b < VX_CFG_NUM_LSU_BLOCKS; ++b) {
+        dlmem_xlate_->PfRspOut.at(b).bind(&lsu->PfRspIn.at(b));
+      }
+    #else
+    #line 355
+    #endif
     }
     dlmem_xlate_->set_drained_query([wtrack = dlmem_wtrack_.get(), lacc = lmem_acc_track_.get()](uint32_t wid) {
       return wtrack->drained(wid) && lacc->drained(wid);

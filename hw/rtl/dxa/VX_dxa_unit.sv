@@ -124,6 +124,18 @@ module VX_dxa_unit import VX_gpu_pkg::*, VX_dxa_pkg::*; #(
 `ifndef DXA_MBAR_ENABLE
     assign dxa_req_data_in.smem_addr = lmem_rel_byte_addr[DXA_SMEM_ADDR_W-1:0];
 `endif
+`ifdef DXA_MBAR_ENABLE
+    // A bulk copy names no descriptor and no box: an mbarrier-mode meta of
+    // descriptor 0, zero coordinates and no multicast.
+    wire is_bulk = execute_if.data.op_args.dxa.bulk;
+    assign dxa_req_data_in.meta      = is_bulk ? 32'hC0000000 : lane1_rs1[31:0];
+    assign dxa_req_data_in.coords[0] = is_bulk ? 32'd0 : lane2_rs1[31:0];
+    assign dxa_req_data_in.coords[1] = is_bulk ? 32'd0 : lane3_rs1[31:0];
+    assign dxa_req_data_in.coords[2] = is_bulk ? 32'd0 : lane0_rs2[31:0];
+    assign dxa_req_data_in.coords[3] = is_bulk ? 32'd0 : lane1_rs2[31:0];
+    assign dxa_req_data_in.coords[4] = is_bulk ? 32'd0 : lane2_rs2[31:0];
+    assign dxa_req_data_in.cta_mask  = is_bulk ? '0 : lane3_rs2[`VX_CFG_NUM_WARPS-1:0];
+`else
     assign dxa_req_data_in.meta      = lane1_rs1[31:0];
     assign dxa_req_data_in.coords[0] = lane2_rs1[31:0];
     assign dxa_req_data_in.coords[1] = lane3_rs1[31:0];
@@ -131,6 +143,7 @@ module VX_dxa_unit import VX_gpu_pkg::*, VX_dxa_pkg::*; #(
     assign dxa_req_data_in.coords[3] = lane1_rs2[31:0];
     assign dxa_req_data_in.coords[4] = lane2_rs2[31:0];
     assign dxa_req_data_in.cta_mask  = lane3_rs2[`VX_CFG_NUM_WARPS-1:0];
+`endif
 `ifdef DXA_MBAR_ENABLE
     // A DLMEM window address names a block of the issuer's cluster, as the LSU's
     // aperture decodes it: rank r maps to peer r of the issuing block's row. A
@@ -173,7 +186,7 @@ module VX_dxa_unit import VX_gpu_pkg::*, VX_dxa_pkg::*; #(
 
     // A multicast in mbarrier mode names cluster ranks: every masked rank gets
     // the data and its mbarrier at the issuer's own block-relative offsets.
-    wire mc_mode    = mbar_mode && (lane3_rs2[31:0] != '0);
+    wire mc_mode    = ~is_bulk && mbar_mode && (lane3_rs2[31:0] != '0);
     wire mc_cluster = mc_mode && ~dst_win && ~mbar_win;
     wire [LMEM_LOG-1:0] own_base = peer_slot_base[issue_slot];
     wire [LMEM_LOG-1:0] mc_off   = lmem_rel_byte_addr[LMEM_LOG-1:0] - own_base;
@@ -197,13 +210,37 @@ module VX_dxa_unit import VX_gpu_pkg::*, VX_dxa_pkg::*; #(
     assign dxa_req_data_in.remote    = dst_remote;
     assign dxa_req_data_in.dst_core  = dst_peer.core;
     assign dxa_req_data_in.dst_slot  = dst_peer.slot;
-    assign dxa_req_data_in.mbar_off  = mc_cluster ? mc_mbar_rel
+    // A bulk copy's lane 1 is a raw mbarrier pointer, decoded like lane 0:
+    // a window rank of the issuer's cluster, or a local address.
+    localparam [`VX_CFG_XLEN-1:0] LMEM_BASE_B = `VX_CFG_XLEN'(`VX_MEM_LMEM_BASE_ADDR);
+    wire [RB_W-1:0] bk_mb_rank;
+    if (RB != 0) begin : g_bk_mb_rank
+        assign bk_mb_rank = lane1_rs1[LMEM_LOG +: RB];
+    end else begin : g_bk_mb_rank0
+        assign bk_mb_rank = '0;
+    end
+    wire [LMEM_LOG-1:0] bk_mb_off = lane1_rs1[LMEM_LOG-1:0];
+    wire bk_mb_win = ((lane1_rs1 >> WIN_LSB) == (DLMEM_BASE_B >> WIN_LSB));
+    dlmem_peer_t bk_mb_peer;
+    assign bk_mb_peer = peer_row.peers[bk_mb_rank];
+    wire [LMEM_LOG-1:0] bk_mb_base = peer_slot_base[bk_mb_peer.slot];
+    wire [`VX_CFG_XLEN-1:0] bk_mb_rel  = lane1_rs1 - LMEM_BASE_B;
+    wire [`VX_CFG_XLEN-1:0] bk_src_rel = lane2_rs1 - LMEM_BASE_B;
+    wire [`VX_CFG_XLEN-1:0] bk_size    = lane3_rs1;
+    wire [LMEM_LOG-1:0] bk_mb_lmem = bk_mb_win ? (bk_mb_base + bk_mb_off) : bk_mb_rel[LMEM_LOG-1:0];
+    `UNUSED_VAR (bk_mb_lmem[2:0])
+
+    assign dxa_req_data_in.mbar_off  = is_bulk ? bk_mb_lmem[LMEM_LOG-1:3]
+                                     : mc_cluster ? mc_mbar_rel
                                      : (mbar_win ? (mbar_base[LMEM_LOG-1:3] + mbar_off_w) : mbar_off_w);
     assign dxa_req_data_in.win       = dst_win;
     assign dxa_req_data_in.win_room  = mc_cluster ? mc_room : (peer_stride - (LMEM_LOG+1)'(dst_off));
     assign dxa_req_data_in.mc_cluster = mc_cluster;
     assign dxa_req_data_in.mc_mask   = lane3_rs2[DLMEM_MAX_CLUSTER-1:0];
     assign dxa_req_data_in.mc_peers  = mc_peers;
+    assign dxa_req_data_in.bulk      = is_bulk;
+    assign dxa_req_data_in.src_addr  = bk_src_rel[LMEM_LOG-1:0];
+    assign dxa_req_data_in.size      = bk_size[LMEM_LOG:0];
 
     // Issue-time checks, simulation only.
     wire dst_oob  = dst_win && ((32'(dst_rank) >= 32'(peer_row.k)) || ({1'b0, dst_off} >= peer_stride));
@@ -213,6 +250,22 @@ module VX_dxa_unit import VX_gpu_pkg::*, VX_dxa_pkg::*; #(
     wire [DLMEM_CORE_W-1:0] mbar_blk_core = mbar_win ? mbar_peer.core : DLMEM_CORE_W'(MY_CORE);
     wire [NW_WIDTH-1:0]     mbar_blk_slot = mbar_win ? mbar_peer.slot : issue_slot;
     wire mbar_elsewhere = mbar_mode && ((dst_blk_core != mbar_blk_core) || (dst_slot != mbar_blk_slot));
+
+    // Bulk copy checks: a local address must lie in the issuer's own block.
+    wire [`VX_CFG_XLEN-1:0] own_lo = `VX_CFG_XLEN'(own_base);
+    wire [`VX_CFG_XLEN-1:0] own_hi = own_lo + `VX_CFG_XLEN'(peer_stride);
+    wire [`VX_CFG_XLEN-1:0] bk_dst_off = dst_win ? `VX_CFG_XLEN'(dst_off) : (lmem_rel_byte_addr - own_lo);
+    wire bk_src_in  = (bk_src_rel >= own_lo) && (bk_src_rel < own_hi);
+    wire bk_mb_in   = (bk_mb_rel >= own_lo) && (bk_mb_rel < own_hi);
+    wire bk_align   = (bk_size == '0) || (bk_size[3:0] != '0) || (bk_src_rel[3:0] != '0) || (bk_dst_off[3:0] != '0);
+    wire bk_src_out = ~bk_src_in || (bk_size > (own_hi - bk_src_rel));
+    wire bk_mb_oob  = bk_mb_win && ((32'(bk_mb_rank) >= 32'(peer_row.k)) || ({1'b0, bk_mb_off} >= peer_stride));
+    wire bk_rank    = dst_oob || bk_mb_oob;
+    wire [DLMEM_CORE_W-1:0] bk_mb_core = bk_mb_win ? bk_mb_peer.core : DLMEM_CORE_W'(MY_CORE);
+    wire [NW_WIDTH-1:0]     bk_mb_slot = bk_mb_win ? bk_mb_peer.slot : issue_slot;
+    wire bk_mbar    = (~bk_mb_win && ~bk_mb_in) || (dst_blk_core != bk_mb_core) || (dst_slot != bk_mb_slot);
+    wire bk_box     = (bk_dst_off >= `VX_CFG_XLEN'(peer_stride))
+                   || (bk_size > (`VX_CFG_XLEN'(peer_stride) - bk_dst_off));
 `endif
     // smem_addr (LMEM byte width) and meta/coords (32-bit ABI) take low bits;
     // high bits unused when XLEN exceeds the field width
@@ -234,7 +287,8 @@ module VX_dxa_unit import VX_gpu_pkg::*, VX_dxa_pkg::*; #(
     assign execute_if.ready = accept;
 
 `ifdef DXA_MBAR_ENABLE
-    wire issue_fire = fire && is_send;
+    wire bulk_fire  = fire && is_send && is_bulk;
+    wire issue_fire = fire && is_send && ~is_bulk;
     wire is_mcast   = ($countones(dxa_req_data_in.cta_mask) > 1);
     wire mc_rank_oob = ((lane3_rs2[31:0] >> peer_row.k) != '0);
     wire mc_mbar_oob = ({1'b0, mc_mbar_rel, 3'b0} >= (LMEM_LOG+1)'(peer_stride));
@@ -259,6 +313,21 @@ module VX_dxa_unit import VX_gpu_pkg::*, VX_dxa_pkg::*; #(
     `RUNTIME_ASSERT(~(issue_fire && dst_win && ~mbar_mode),
         ("%t: *** %s DXA cluster destination needs an mbarrier: wid=%0d smem=0x%0h meta=0x%0h",
          $time, INSTANCE_ID, execute_if.data.header.wid, lane0_rs1, lane1_rs1))
+    `RUNTIME_ASSERT(~(bulk_fire && bk_align),
+        ("%t: *** %s DXA bulk copy needs 16-byte size and alignment: wid=%0d dst=0x%0h src=0x%0h size=%0d",
+         $time, INSTANCE_ID, execute_if.data.header.wid, lane0_rs1, lane2_rs1, lane3_rs1))
+    `RUNTIME_ASSERT(~(bulk_fire && ~bk_align && bk_src_out),
+        ("%t: *** %s DXA bulk copy source outside the block: wid=%0d src=0x%0h size=%0d stride=0x%0h",
+         $time, INSTANCE_ID, execute_if.data.header.wid, lane2_rs1, lane3_rs1, peer_stride))
+    `RUNTIME_ASSERT(~(bulk_fire && ~bk_align && ~bk_src_out && bk_rank),
+        ("%t: *** %s DXA destination rank outside the cluster: wid=%0d dst=0x%0h mbar=0x%0h k=%0d stride=0x%0h",
+         $time, INSTANCE_ID, execute_if.data.header.wid, lane0_rs1, lane1_rs1, peer_row.k, peer_stride))
+    `RUNTIME_ASSERT(~(bulk_fire && ~bk_align && ~bk_src_out && ~bk_rank && bk_mbar),
+        ("%t: *** %s DXA mbarrier must be in the destination block: wid=%0d dst=0x%0h mbar=0x%0h",
+         $time, INSTANCE_ID, execute_if.data.header.wid, lane0_rs1, lane1_rs1))
+    `RUNTIME_ASSERT(~(bulk_fire && ~bk_align && ~bk_src_out && ~bk_rank && ~bk_mbar && bk_box),
+        ("%t: *** %s DXA box exceeds the destination block: wid=%0d dst=0x%0h size=%0d stride=0x%0h",
+         $time, INSTANCE_ID, execute_if.data.header.wid, lane0_rs1, lane3_rs1, peer_stride))
 `endif
 
     VX_elastic_buffer #(

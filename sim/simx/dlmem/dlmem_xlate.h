@@ -42,6 +42,13 @@ public:
   SimChannel<dlmem_ref::RowWrite> PeerWrIn;
   std::vector<SimChannel<WtInc>>  WtIncOut; // remote lanes, in the cycle of the output fire
   std::vector<SimChannel<WtInc>>  LaccIncOut; // local-access lanes, likewise
+#ifdef DXA_MBAR_ENABLE
+  // A proxy fence goes no further: once its hold releases it, the stage
+  // answers it here a cycle later, one at a time per block.
+  std::vector<SimChannel<LsuRsp>> PfRspOut;
+#else
+#line 44
+#endif
 
   // drained(wid): both trackers' registered drained[wid] as the RTL stage reads them.
   using DrainedQuery = std::function<bool(uint32_t)>;

@@ -80,6 +80,11 @@ package VX_dxa_pkg;
         logic                            mc_cluster;   // a multicast to the cluster ranks of mc_mask
         logic [DLMEM_MAX_CLUSTER-1:0]    mc_mask;
         dxa_mc_peer_t [DLMEM_MAX_CLUSTER-1:0] mc_peers; // by rank
+        // A bulk copy reads no descriptor: size bytes from src_addr, the
+        // issuer core's LMEM byte address, to smem_addr.
+        logic                            bulk;
+        logic [`VX_CFG_LMEM_LOG_SIZE-1:0] src_addr;
+        logic [`VX_CFG_LMEM_LOG_SIZE:0]  size;
     `endif
     } dxa_req_data_t;
 
@@ -215,7 +220,15 @@ package VX_dxa_pkg;
     );
         `UNUSED_VAR (op_type)
         `UNUSED_VAR (op_args)
+    `ifdef DXA_MBAR_ENABLE
+        if (op_args.dxa.bulk) begin
+            `TRACE(level, ("DXA.BULK"))
+        end else begin
+            `TRACE(level, ("DXA.ISSUE"))
+        end
+    `else
         `TRACE(level, ("DXA.ISSUE"))
+    `endif
     endtask
 
 endpackage

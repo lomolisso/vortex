@@ -77,7 +77,7 @@ public:
 
   // Per-core LMEM write ports (size = VX_CFG_SOCKET_SIZE *
   // LMEM_PORTS_PER_CORE, core-major). The socket binds each core's
-  // LocalMem::Inputs[port_dxa + p] here. Write-only — no rsp.
+  // LocalMem::Inputs[port_dxa + p] here; a bulk copy's reads answer below.
   std::vector<SimChannel<MemReq>>  lmem_req_out;
 #ifdef VX_CFG_EXT_DXA_ENABLE
 
@@ -89,6 +89,14 @@ public:
   // The row egress: the flits of copies into a block on another core of the
   // cluster, posted into the socket's DLMEM request switch, one per cycle.
   SimChannel<DlmemReqPkt> row_out;
+
+  // A bulk copy's row reads of its source, answered by the issuing core's
+  // LocalMem on the DXA ports of lmem_req_out (same indexing).
+  std::vector<SimChannel<MemRsp>>  lmem_rsp_in;
+
+  // The line reader's entries per worker (VX_dxa_lmem_rd DEPTH), apart from
+  // the DXA_MAX_INFLIGHT tags of its lines.
+  static constexpr uint32_t LMEM_RD_DEPTH = 7;
 #else
 #line 81
 #endif

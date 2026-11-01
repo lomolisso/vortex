@@ -61,6 +61,12 @@ struct DxaReq {
   bool     cluster;
   uint32_t num_rcv;
   std::array<Rcv, VX_CFG_DLMEM_MAX_CLUSTER> rcvs;
+  // A bulk copy (funct3 = 1), which reads no descriptor: `size` bytes from
+  // src_addr, a local-memory address of the issuing core, to smem_addr.
+  bool     bulk;
+  uint64_t src_addr;
+  uint32_t size;
+  uint64_t sent;          // the cycle it left the unit
 #else
 #line 43
 #endif
@@ -94,6 +100,7 @@ private:
   // block's peer row, as the RTL reads it from the core's peer table.
   void translate(const instr_trace_t* trace, uint32_t meta, uint32_t cta_mask, DxaReq& req) const;
   void cluster_receivers(const instr_trace_t* trace, uint32_t meta, uint32_t cta_mask, DxaReq& req) const;
+  void translate_bulk(const instr_trace_t* trace, DxaReq& req) const;
 
   [[noreturn]] void issue_abort(const instr_trace_t* trace, const char* msg) const;
 

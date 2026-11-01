@@ -868,6 +868,309 @@ tests:
     env: {DRIVER: rtlsim, APP: dlmem_dxa, ARGS: "-x box", EXPECT: "DXA box exceeds the destination block"}
     run: *expect_fail_run
 
+  # --- DXA bulk copies from local memory (dlmem_bulk) ---
+  # cp.async.bulk.shared::cluster.shared::cta: block r copies byte ranges of
+  # its own local memory into rank (r + 1) % K through the window, completing
+  # on an mbarrier in the destination block, which armed it with arrive_tx of
+  # the incoming bytes before the cluster barrier and then waits for the
+  # phase. Every block fills its sources with plain stores and orders them
+  # with vx_fence_proxy_async() before the cluster barrier. By default each
+  # block issues four copies back to back into one destination, of 16, 48,
+  # 208 and 720 bytes (rotated by rank), whose source and destination offsets
+  # differ by an odd multiple of 16 bytes, thus modulo the 32-byte row and the
+  # 64-byte line. The engine reads the source as lines from the issuer's local
+  # memory and writes the destination's rows: on the issuer's core, through
+  # the socket's core switch, or as row flits over the request network. The
+  # host checks every block's whole local memory byte for byte (sources,
+  # destinations, canaries everywhere else) and every mbarrier word against
+  # mbar_ref.
+  - id: dlmem_bulk-2c
+    app: dlmem_bulk
+    drivers: [simx, rtlsim]
+    configs+: "-DVX_CFG_EXT_A_ENABLE -DVX_CFG_EXT_MBAR_ENABLE -DVX_CFG_EXT_DXA_ENABLE"
+    touches: &dlmem_bulk_touches [hw/rtl/dxa, hw/rtl/dlmem, hw/rtl/VX_socket.sv,
+              hw/rtl/VX_gpu_pkg.sv, hw/rtl/VX_define.vh, hw/rtl/VX_trace_pkg.sv,
+              hw/rtl/core/VX_core.sv, hw/rtl/core/VX_decode.sv, hw/rtl/core/VX_execute.sv,
+              hw/rtl/core/VX_sfu_unit.sv, hw/rtl/core/VX_mem_unit.sv,
+              hw/rtl/core/VX_cta_dispatch.sv, hw/rtl/core/VX_wctl_unit.sv,
+              hw/rtl/core/VX_bar_unit.sv, hw/rtl/core/VX_scheduler.sv,
+              hw/rtl/core/VX_lsu_slice.sv, hw/rtl/core/VX_lsu_unit.sv,
+              hw/rtl/core/VX_uop_sequencer.sv, hw/rtl/mem/VX_local_mem.sv,
+              hw/rtl/mem/VX_lmem_switch.sv, hw/rtl/cache/VX_amo_alu.sv,
+              hw/rtl/cache/VX_amo_unit.sv, hw/rtl/interfaces, hw/rtl/VX_kmu.sv,
+              hw/rtl/Vortex.sv, hw/rtl/VX_cluster.sv, sim/simx/dxa, sim/simx/dlmem,
+              sim/simx/core, sim/simx/socket, sim/simx/cluster, sim/simx/processor.cpp,
+              sim/simx/cta_dispatcher, sim/simx/kmu, sim/simx/mem/local_mem,
+              sim/simx/types.h, sim/simx/instr.h, sim/simx/decode.cpp,
+              sim/simx/sequencer, sim/simx/mbar_waiters, sim/simx/amo, sim/simx/sfu_unit,
+              sim/simx/scheduler, sim/simx/barrier_unit, sim/simx/lsu_unit,
+              sim/simx/Makefile, sw/kernel/include/vx_dxa.h, sw/kernel/include/vx_mbar.h,
+              sw/kernel/include/vx_dlmem.h, sw/common/mbar_ref.h, sw/common/dlmem_ref.h,
+              tests/regression/dlmem_bulk, VX_config.toml]
+    shape: {cores: 2, l2cache: true}
+    args: "-k 2 -n 2"
+  # Two sockets of two cores: K = 4 crosses the cluster crossbar; K = 2 pairs
+  # stay on one socket, where a copy into the other core's block is remote
+  # all the same and leaves through the row egress, not the core switch.
+  - id: dlmem_bulk-4c-s2
+    app: dlmem_bulk
+    drivers: [simx, rtlsim]
+    configs+: "-DVX_CFG_EXT_A_ENABLE -DVX_CFG_EXT_MBAR_ENABLE -DVX_CFG_EXT_DXA_ENABLE -DVX_CFG_SOCKET_SIZE=2"
+    touches: *dlmem_bulk_touches
+    shape: {cores: 4, l2cache: true}
+    args: "-k 4 -n 2"
+  - id: dlmem_bulk-4c-s2-k2
+    app: dlmem_bulk
+    drivers: [simx, rtlsim]
+    configs+: "-DVX_CFG_EXT_A_ENABLE -DVX_CFG_EXT_MBAR_ENABLE -DVX_CFG_EXT_DXA_ENABLE -DVX_CFG_SOCKET_SIZE=2"
+    touches: *dlmem_bulk_touches
+    shape: {cores: 4, l2cache: true}
+    args: "-k 2 -n 4"
+  # Local pointers into the issuer's own block.
+  - id: dlmem_bulk-self
+    app: dlmem_bulk
+    drivers: [simx, rtlsim]
+    configs+: "-DVX_CFG_EXT_A_ENABLE -DVX_CFG_EXT_MBAR_ENABLE -DVX_CFG_EXT_DXA_ENABLE"
+    touches: *dlmem_bulk_touches
+    shape: {cores: 2, l2cache: true}
+    args: "-m self -k 2 -n 2"
+  # DEFAULT clusters: each copy goes to the other slot of the issuer's core.
+  - id: dlmem_bulk-samecore
+    app: dlmem_bulk
+    drivers: [simx, rtlsim]
+    configs+: "-DVX_CFG_EXT_A_ENABLE -DVX_CFG_EXT_MBAR_ENABLE -DVX_CFG_EXT_DXA_ENABLE"
+    touches: *dlmem_bulk_touches
+    shape: {cores: 2, l2cache: true}
+    args: "-p default -k 2 -n 2"
+  # Many to one: every rank issues two copies back to back into rank 0 (rank 0
+  # into itself through its own window address), whose one phase expects all
+  # eight, from four engines across both sockets.
+  - id: dlmem_bulk-many
+    app: dlmem_bulk
+    drivers: [simx, rtlsim]
+    configs+: "-DVX_CFG_EXT_A_ENABLE -DVX_CFG_EXT_MBAR_ENABLE -DVX_CFG_EXT_DXA_ENABLE -DVX_CFG_SOCKET_SIZE=2"
+    touches: *dlmem_bulk_touches
+    shape: {cores: 4, l2cache: true}
+    args: "-m many -k 4 -c 2 -n 1"
+  # Eight 16-byte copies in flight into one destination.
+  - id: dlmem_bulk-16b
+    app: dlmem_bulk
+    drivers: [simx, rtlsim]
+    configs+: "-DVX_CFG_EXT_A_ENABLE -DVX_CFG_EXT_MBAR_ENABLE -DVX_CFG_EXT_DXA_ENABLE"
+    touches: *dlmem_bulk_touches
+    shape: {cores: 2, l2cache: true}
+    args: "-k 2 -n 2 -c 8 -s 16"
+  # Full tiles: two 2 KB copies per block, and one 4 KB copy per block across
+  # sockets with the source 48 bytes into its line.
+  - id: dlmem_bulk-tile
+    app: dlmem_bulk
+    drivers: [simx, rtlsim]
+    configs+: "-DVX_CFG_EXT_A_ENABLE -DVX_CFG_EXT_MBAR_ENABLE -DVX_CFG_EXT_DXA_ENABLE"
+    touches: *dlmem_bulk_touches
+    shape: {cores: 2, l2cache: true}
+    args: "-k 2 -n 1 -c 2 -s 2048"
+  - id: dlmem_bulk-tile-s2
+    app: dlmem_bulk
+    drivers: [simx, rtlsim]
+    configs+: "-DVX_CFG_EXT_A_ENABLE -DVX_CFG_EXT_MBAR_ENABLE -DVX_CFG_EXT_DXA_ENABLE -DVX_CFG_SOCKET_SIZE=2"
+    touches: *dlmem_bulk_touches
+    shape: {cores: 4, l2cache: true}
+    args: "-k 4 -n 1 -c 1 -s 4096 -o 3"
+  # Equal source and destination offsets, and offsets 32 bytes apart (the same
+  # within the row, not within the line).
+  - id: dlmem_bulk-aligned
+    app: dlmem_bulk
+    drivers: [simx, rtlsim]
+    configs+: "-DVX_CFG_EXT_A_ENABLE -DVX_CFG_EXT_MBAR_ENABLE -DVX_CFG_EXT_DXA_ENABLE"
+    touches: *dlmem_bulk_touches
+    shape: {cores: 2, l2cache: true}
+    args: "-k 2 -n 2 -o 0 -O 0"
+  # 16 banks: a 128-byte row, wider than the 64-byte line the engine reads,
+  # written by the remote path as up to 16 word flits.
+  - id: dlmem_bulk-banks16
+    app: dlmem_bulk
+    drivers: [simx, rtlsim]
+    configs+: "-DVX_CFG_EXT_A_ENABLE -DVX_CFG_EXT_MBAR_ENABLE -DVX_CFG_EXT_DXA_ENABLE -DVX_CFG_LMEM_NUM_BANKS=16"
+    touches: *dlmem_bulk_touches
+    shape: {cores: 2, l2cache: true}
+    args: "-k 2 -n 2"
+  # The mbarriers one doubleword into their blocks, in bank 1: every
+  # complete_tx's atomic owns that bank while the engine reads the next
+  # copy's source, and a DMA read waits for an atomic on any bank and holds
+  # every bank while it waits.
+  - id: dlmem_bulk-mbar-bank
+    app: dlmem_bulk
+    drivers: [simx, rtlsim]
+    configs+: "-DVX_CFG_EXT_A_ENABLE -DVX_CFG_EXT_MBAR_ENABLE -DVX_CFG_EXT_DXA_ENABLE"
+    touches: *dlmem_bulk_touches
+    shape: {cores: 2, l2cache: true}
+    args: "-p default -k 2 -n 2 -c 4 -b 1"
+  # Two engine workers per socket: both blocks of a DEFAULT cluster copy at
+  # once, and their reads and beats share the engine's local-memory port one
+  # a cycle, in round-robin order.
+  - id: dlmem_bulk-2dxa
+    app: dlmem_bulk
+    drivers: [simx, rtlsim]
+    configs+: "-DVX_CFG_EXT_A_ENABLE -DVX_CFG_EXT_MBAR_ENABLE -DVX_CFG_EXT_DXA_ENABLE -DVX_CFG_NUM_DXA_CORES=2"
+    touches: *dlmem_bulk_touches
+    shape: {cores: 2, l2cache: true}
+    args: "-p default -k 2 -n 2 -c 2 -s 256"
+  # The proxy fence: per round warp 0 stores the round's words into its source,
+  # calls vx_fence_proxy_async() and copies the source into its own local
+  # memory at once, while three other warps load and store their own words
+  # on every bank and the core's other block does the same, keeping its DXA
+  # busy. Every destination byte must hold the round's value. The unfenced
+  # run (no -f) only reports its stale bytes and is not a catalog case.
+  - id: dlmem_bulk-race-fence
+    app: dlmem_bulk
+    drivers: [simx, rtlsim]
+    configs+: "-DVX_CFG_EXT_A_ENABLE -DVX_CFG_EXT_MBAR_ENABLE -DVX_CFG_EXT_DXA_ENABLE"
+    touches: *dlmem_bulk_touches
+    shape: {cores: 2, warps: 8, l2cache: true}
+    args: "-m race -f -k 2 -n 2 -w 4 -r 8"
+  - id: dlmem_bulk-2cl
+    app: dlmem_bulk
+    drivers: [simx, rtlsim]
+    tier: nightly
+    configs+: "-DVX_CFG_EXT_A_ENABLE -DVX_CFG_EXT_MBAR_ENABLE -DVX_CFG_EXT_DXA_ENABLE"
+    touches: *dlmem_bulk_touches
+    shape: {clusters: 2, cores: 2, l3cache: true}
+    args: "-k 2 -n 4"
+  # Parity of the bulk copy at XLEN 64: one SPREAD cluster of four blocks on
+  # four single-core sockets, four copies of the size mix each into the next
+  # rank, with the mbarriers in bank 1. Every wait is one try_wait (a
+  # 4096-cycle time limit), which the destination's complete_tx wakes. The
+  # engine's line reads from local memory, the realignment, the row flits, the
+  # destination's DMA writes, the completion behind them, its atomic against
+  # the engine's reads of the same core and the wake-up set the timing.
+  - id: parity-dlmem-bulk
+    check: model_parity
+    app: dlmem_bulk
+    xlen: [64]
+    configs+: "-DVX_CFG_EXT_A_ENABLE -DVX_CFG_EXT_MBAR_ENABLE -DVX_CFG_EXT_DXA_ENABLE -DVX_CFG_MBAR_SUSPEND_CYCLES=4096"
+    touches: *dlmem_bulk_touches
+    shape: {cores: 4, l2cache: true}
+    args: "-k 4 -n 1 -c 4 -b 1"
+  # Bulk copies that must stop the simulation with the exact message, on a
+  # SPREAD cluster of two blocks on four cores, rank 0 copying into rank 1: a
+  # size that is not a multiple of 16; a source, then a destination, 8 bytes
+  # off a 16-byte boundary; a source running past the issuer's block; a
+  # destination rank past the cluster; an mbarrier in the issuer's block; a
+  # copy running past the destination block; and a copy that reaches a block
+  # that has exited.
+  - id: dlmem_bulk-x-size
+    via: script
+    driver: simx
+    configs+: *dlmem_dxa_neg
+    touches: *dlmem_bulk_touches
+    env: {DRIVER: simx, APP: dlmem_bulk, ARGS: "-x size", EXPECT: "DXA bulk copy needs 16-byte size and alignment"}
+    run: *expect_fail_run
+  - id: dlmem_bulk-x-size
+    via: script
+    driver: rtlsim
+    configs+: *dlmem_dxa_neg
+    touches: *dlmem_bulk_touches
+    env: {DRIVER: rtlsim, APP: dlmem_bulk, ARGS: "-x size", EXPECT: "DXA bulk copy needs 16-byte size and alignment"}
+    run: *expect_fail_run
+  - id: dlmem_bulk-x-align
+    via: script
+    driver: simx
+    configs+: *dlmem_dxa_neg
+    touches: *dlmem_bulk_touches
+    env: {DRIVER: simx, APP: dlmem_bulk, ARGS: "-x align", EXPECT: "DXA bulk copy needs 16-byte size and alignment"}
+    run: *expect_fail_run
+  - id: dlmem_bulk-x-align
+    via: script
+    driver: rtlsim
+    configs+: *dlmem_dxa_neg
+    touches: *dlmem_bulk_touches
+    env: {DRIVER: rtlsim, APP: dlmem_bulk, ARGS: "-x align", EXPECT: "DXA bulk copy needs 16-byte size and alignment"}
+    run: *expect_fail_run
+  - id: dlmem_bulk-x-dalign
+    via: script
+    driver: simx
+    configs+: *dlmem_dxa_neg
+    touches: *dlmem_bulk_touches
+    env: {DRIVER: simx, APP: dlmem_bulk, ARGS: "-x dalign", EXPECT: "DXA bulk copy needs 16-byte size and alignment"}
+    run: *expect_fail_run
+  - id: dlmem_bulk-x-dalign
+    via: script
+    driver: rtlsim
+    configs+: *dlmem_dxa_neg
+    touches: *dlmem_bulk_touches
+    env: {DRIVER: rtlsim, APP: dlmem_bulk, ARGS: "-x dalign", EXPECT: "DXA bulk copy needs 16-byte size and alignment"}
+    run: *expect_fail_run
+  - id: dlmem_bulk-x-src
+    via: script
+    driver: simx
+    configs+: *dlmem_dxa_neg
+    touches: *dlmem_bulk_touches
+    env: {DRIVER: simx, APP: dlmem_bulk, ARGS: "-x src", EXPECT: "DXA bulk copy source outside the block"}
+    run: *expect_fail_run
+  - id: dlmem_bulk-x-src
+    via: script
+    driver: rtlsim
+    configs+: *dlmem_dxa_neg
+    touches: *dlmem_bulk_touches
+    env: {DRIVER: rtlsim, APP: dlmem_bulk, ARGS: "-x src", EXPECT: "DXA bulk copy source outside the block"}
+    run: *expect_fail_run
+  - id: dlmem_bulk-x-rank
+    via: script
+    driver: simx
+    configs+: *dlmem_dxa_neg
+    touches: *dlmem_bulk_touches
+    env: {DRIVER: simx, APP: dlmem_bulk, ARGS: "-x rank", EXPECT: "DXA destination rank outside the cluster"}
+    run: *expect_fail_run
+  - id: dlmem_bulk-x-rank
+    via: script
+    driver: rtlsim
+    configs+: *dlmem_dxa_neg
+    touches: *dlmem_bulk_touches
+    env: {DRIVER: rtlsim, APP: dlmem_bulk, ARGS: "-x rank", EXPECT: "DXA destination rank outside the cluster"}
+    run: *expect_fail_run
+  - id: dlmem_bulk-x-mbar
+    via: script
+    driver: simx
+    configs+: *dlmem_dxa_neg
+    touches: *dlmem_bulk_touches
+    env: {DRIVER: simx, APP: dlmem_bulk, ARGS: "-x mbar", EXPECT: "DXA mbarrier must be in the destination block"}
+    run: *expect_fail_run
+  - id: dlmem_bulk-x-mbar
+    via: script
+    driver: rtlsim
+    configs+: *dlmem_dxa_neg
+    touches: *dlmem_bulk_touches
+    env: {DRIVER: rtlsim, APP: dlmem_bulk, ARGS: "-x mbar", EXPECT: "DXA mbarrier must be in the destination block"}
+    run: *expect_fail_run
+  - id: dlmem_bulk-x-box
+    via: script
+    driver: simx
+    configs+: *dlmem_dxa_neg
+    touches: *dlmem_bulk_touches
+    env: {DRIVER: simx, APP: dlmem_bulk, ARGS: "-x box", EXPECT: "DXA box exceeds the destination block"}
+    run: *expect_fail_run
+  - id: dlmem_bulk-x-box
+    via: script
+    driver: rtlsim
+    configs+: *dlmem_dxa_neg
+    touches: *dlmem_bulk_touches
+    env: {DRIVER: rtlsim, APP: dlmem_bulk, ARGS: "-x box", EXPECT: "DXA box exceeds the destination block"}
+    run: *expect_fail_run
+  - id: dlmem_bulk-x-retired
+    via: script
+    driver: simx
+    configs+: *dlmem_dxa_neg
+    touches: *dlmem_bulk_touches
+    env: {DRIVER: simx, APP: dlmem_bulk, ARGS: "-x retired", EXPECT: "DXA write into a retired CTA slot"}
+    run: *expect_fail_run
+  - id: dlmem_bulk-x-retired
+    via: script
+    driver: rtlsim
+    configs+: *dlmem_dxa_neg
+    touches: *dlmem_bulk_touches
+    env: {DRIVER: rtlsim, APP: dlmem_bulk, ARGS: "-x retired", EXPECT: "DXA write into a retired CTA slot"}
+    run: *expect_fail_run
+
   # --- DXA cluster multicast (dxa_copy_mcast -M) ---
   # One read of the box lands in every block of the cluster whose rank is in
   # the mask, at the issuer's block offsets, and completes on each receiver's

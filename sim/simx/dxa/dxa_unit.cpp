@@ -89,7 +89,13 @@ instr_trace_t* DxaUnit::process(instr_trace_t* trace) {
   req.win_room  = 0;
   req.cluster   = false;
   req.num_rcv   = 0;
-  if (mode && cta_mask != 0) {
+  req.bulk      = false;
+  req.src_addr  = 0;
+  req.size      = 0;
+  req.sent      = SimPlatform::instance().cycles();
+  if (std::get<DxaType>(trace->op_type) == DxaType::BULK) {
+    this->translate_bulk(trace, req);
+  } else if (mode && cta_mask != 0) {
     this->cluster_receivers(trace, meta, cta_mask, req);
   } else {
     this->translate(trace, meta, cta_mask, req);
@@ -230,5 +236,78 @@ void DxaUnit::cluster_receivers(const instr_trace_t* trace, uint32_t meta, uint3
        << ", dst={core=" << p.core << ", slot=" << p.slot << "}, off=0x" << std::hex << off
        << ", mbar_off=0x" << rcv.mbar_off << std::dec << ", remote=" << rcv.remote);
   }
+}
+
+// A bulk copy's lanes are rs1 = {dst, mbar, src, size}. dst and mbar are each a
+// window address, resolved through the issuing block's peer row, or a local
+// address in the issuer's own block; src is local. The bound of dst's offset
+// plus the size against its block is the engine's, as for a box.
+void DxaUnit::translate_bulk(const instr_trace_t* trace, DxaReq& req) const {
+  const auto& rs1 = trace->src_data[0];
+  const uint64_t dst  = static_cast<uint64_t>(rs1.at(0).u);
+  const uint64_t mbar = static_cast<uint64_t>(rs1.at(1).u);
+  const uint64_t src  = static_cast<uint64_t>(rs1.at(2).u);
+  const uint64_t size = static_cast<uint64_t>(rs1.at(3).u);
+  const auto cfg = dlmem_cfg();
+  const uint32_t rbits = dlmem_ref::rank_bits(cfg);
+  const uint32_t wl = cfg.lmem_log + rbits;
+  const uint32_t own = req.slot;
+  const auto& row = slot_row_.at(own);
+  const uint64_t own_base = cfg.lmem_base + uint64_t(own) * stride_;
+  const uint64_t lmem_mask = dlmem_ref::low_mask(cfg.lmem_log);
+
+  struct Ptr {
+    bool     win;
+    uint32_t rank;
+    uint64_t off;   // in the block
+  };
+  auto decode = [&](uint64_t a) {
+    if ((a >> wl) == (cfg.dlmem_base >> wl)) {
+      return Ptr{true, uint32_t((a >> cfg.lmem_log) & dlmem_ref::low_mask(rbits)), a & lmem_mask};
+    }
+    // Below the block it wraps past the stride, as above it.
+    return Ptr{false, 0, a - own_base};
+  };
+  const Ptr d = decode(dst);
+  const Ptr m = decode(mbar);
+  const uint64_t s_off = src - own_base;
+
+  if (size == 0 || (size % 16) != 0 || (src % 16) != 0 || (d.off % 16) != 0) {
+    this->issue_abort(trace, "DXA bulk copy needs 16-byte size and alignment");
+  }
+  if (s_off >= stride_ || size > stride_ - s_off) {
+    this->issue_abort(trace, "DXA bulk copy source outside the block");
+  }
+  if ((d.win && (d.rank >= row.k || d.off >= stride_))
+   || (m.win && (m.rank >= row.k || m.off >= stride_))) {
+    this->issue_abort(trace, "DXA destination rank outside the cluster");
+  }
+  const dlmem_ref::Peer self{req.src_core, own};
+  const dlmem_ref::Peer dblk = d.win ? row.peers.at(d.rank) : self;
+  const dlmem_ref::Peer mblk = m.win ? row.peers.at(m.rank) : self;
+  const bool m_own = m.win || m.off < stride_;
+  if (!m_own || dblk.core != mblk.core || dblk.slot != mblk.slot) {
+    this->issue_abort(trace, "DXA mbarrier must be in the destination block");
+  }
+
+  req.bulk      = true;
+  req.mode      = true;
+  req.src_addr  = src;
+  req.size      = uint32_t(size & dlmem_ref::low_mask(VX_CFG_LMEM_LOG_SIZE + 1));
+  req.desc_slot = 0;
+  req.bar_id    = 0;
+  req.cta_mask  = 0;
+  for (auto& c : req.coords) c = 0;
+  req.smem_addr = cfg.lmem_base + uint64_t(dblk.slot) * stride_ + d.off;
+  req.mbar_off  = uint32_t((uint64_t(mblk.slot) * stride_ + m.off) >> 3);
+  req.slot      = dblk.slot;
+  req.gen       = slot_gen_.at(dblk.slot);
+  req.dst_core  = dblk.core;
+  req.remote    = (dblk.core != req.src_core);
+  req.win       = true;
+  req.win_room  = (d.off < stride_) ? uint32_t(stride_ - d.off) : 0u;
+  DT(4, "dxa-unit bulk: core=" << core_->id() << ", wid=" << trace->wid << ", src=0x" << std::hex << src
+     << ", size=0x" << size << ", dst={core=" << std::dec << dblk.core << ", slot=" << dblk.slot << "}, off=0x"
+     << std::hex << d.off << ", mbar_off=0x" << req.mbar_off << std::dec << ", remote=" << req.remote);
 }
 #endif

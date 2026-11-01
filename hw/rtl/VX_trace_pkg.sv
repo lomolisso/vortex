@@ -205,6 +205,9 @@ package VX_trace_pkg;
                 `ifdef VX_CFG_EXT_DLMEM_ENABLE
                     INST_LSU_CFENCE:`TRACE(level,("CFENCE"))
                 `endif
+                `ifdef DXA_MBAR_ENABLE
+                    INST_LSU_PFENCE:`TRACE(level,("PFENCE"))
+                `endif
                     default:     `TRACE(level, ("?"))
                 endcase
             end

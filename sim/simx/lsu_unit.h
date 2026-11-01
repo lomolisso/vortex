@@ -113,6 +113,16 @@ public:
 	// sees the retire one cycle later and applies it as the earlier cycle's.
 	static constexpr uint32_t MBAR_RETIRE_DELAY = 1;
 #endif
+#ifdef DXA_MBAR_ENABLE
+	// Per block: a proxy fence's answer from the translation stage, which
+	// yields to the switch's responses.
+	std::vector<SimChannel<LsuRsp>> PfRspIn;
+private:
+	void process_pfence_rsp(uint32_t b);
+public:
+#else
+#line 115
+#endif
 
 	// Returns true when all LSU blocks have no in-flight requests.
 	bool drained() const;

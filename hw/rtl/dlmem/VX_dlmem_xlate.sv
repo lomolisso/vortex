@@ -252,7 +252,48 @@ module VX_dlmem_xlate import VX_gpu_pkg::*, VX_dlmem_pkg::*; #(
     // before its fence is already visible to it.
     wire order_hold = (is_fence_r || is_rl_r) && ~(drained[hdr_r.wid] && lmem_acc_drained[hdr_r.wid]);
 
+`ifdef DXA_MBAR_ENABLE
+    // A proxy fence sends nothing on: released by the hold above, it is
+    // answered here a cycle later, so it reaches no cache. Its slice holds one
+    // fence at a time, so the answer register is free when the next arrives.
+    wire [INST_LSU_BITS-1:0] op_r = req_r.tag[LSU_CLIENT_TAG_WIDTH-1-HDR_W -: INST_LSU_BITS];
+    wire is_pfence_r = is_fence_r && (op_r == INST_LSU_PFENCE);
+    reg            pf_rsp_valid_r;
+    lsu_rsp_data_t pf_rsp_r;
+    wire pf_ready = ~order_hold && ~pf_rsp_valid_r;
+    wire pf_fire  = req_valid_r && is_pfence_r && pf_ready;
+    // Translated accesses' responses pass first.
+    wire pf_rsp_fire = pf_rsp_valid_r && ~out_if.rsp_valid && in_if.rsp_ready;
+
+    always @(posedge clk) begin
+        if (reset) begin
+            pf_rsp_valid_r <= 1'b0;
+        end else if (pf_fire) begin
+            pf_rsp_valid_r <= 1'b1;
+        end else if (pf_rsp_fire) begin
+            pf_rsp_valid_r <= 1'b0;
+        end
+        if (pf_fire) begin
+            pf_rsp_r.mask <= req_r.mask;
+            pf_rsp_r.data <= '0;
+            pf_rsp_r.tag  <= req_r.tag;
+            pf_rsp_r.sop  <= 1'b1;
+            pf_rsp_r.eop  <= 1'b1;
+        end
+    end
+
+`ifdef DBG_TRACE_MEM
+    always @(posedge clk) begin
+        if (~reset && pf_fire) begin
+            `TRACE(2, ("%t: %s pfence-release: wid=%0d (#%0d)\n", $time, INSTANCE_ID, hdr_r.wid, hdr_r.uuid))
+        end
+    end
+`endif
+
+    assign out_if.req_valid       = req_valid_r && ~order_hold && ~is_pfence_r;
+`else
     assign out_if.req_valid       = req_valid_r && ~order_hold;
+`endif
     assign out_if.req_data.rw     = req_r.rw;
     assign out_if.req_data.mask   = req_r.mask;
     assign out_if.req_data.byteen = req_r.byteen;
@@ -265,11 +306,19 @@ module VX_dlmem_xlate import VX_gpu_pkg::*, VX_dlmem_pkg::*; #(
     assign out_if.req_data.mbar_addr = '0;
 `endif
     assign out_if.req_data.tag    = req_r.tag;
+`ifdef DXA_MBAR_ENABLE
+    assign req_ready_r            = is_pfence_r ? pf_ready : (out_if.req_ready && ~order_hold);
+
+    assign in_if.rsp_valid  = out_if.rsp_valid || pf_rsp_valid_r;
+    assign in_if.rsp_data   = (pf_rsp_valid_r && ~out_if.rsp_valid) ? pf_rsp_r : out_if.rsp_data;
+    assign out_if.rsp_ready = in_if.rsp_ready;
+`else
     assign req_ready_r            = out_if.req_ready && ~order_hold;
 
     assign in_if.rsp_valid  = out_if.rsp_valid;
     assign in_if.rsp_data   = out_if.rsp_data;
     assign out_if.rsp_ready = in_if.rsp_ready;
+`endif
 
     wire out_fire = out_if.req_valid && out_if.req_ready;
 
@@ -290,7 +339,11 @@ module VX_dlmem_xlate import VX_gpu_pkg::*, VX_dlmem_pkg::*; #(
     assign lacc_inc_wid   = hdr_r.wid;
     `POP_COUNT(lacc_inc_cnt, lane_lacc);
 
+`ifdef DXA_MBAR_ENABLE
+    assign empty = ~req_valid_r && ~pf_rsp_valid_r;
+`else
     assign empty = ~req_valid_r;
+`endif
 
     `UNUSED_VAR (hdr_r)
 

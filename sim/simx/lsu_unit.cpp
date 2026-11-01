@@ -87,6 +87,11 @@ LsuUnit::LsuUnit(const SimContext& ctx, const char* name, Core* core)
 	, SpawnIn(this)
 #ifdef VX_CFG_EXT_MBAR_ENABLE
 	, MbarRetireOut(VX_CFG_NUM_LSU_BLOCKS, SimChannel<uint32_t>(this))
+#ifdef VX_CFG_EXT_DXA_ENABLE
+	, PfRspIn(VX_CFG_NUM_LSU_BLOCKS, SimChannel<LsuRsp>(this))
+#else
+#line 89
+#endif
 #else
 #line 87
 #endif
@@ -203,6 +208,16 @@ void LsuUnit::on_reset() {
 
 #ifdef VX_CFG_EXT_DLMEM_ENABLE
 bool LsuUnit::is_acquire_amo(const instr_trace_t* trace) {
+#ifdef DXA_MBAR_ENABLE
+	// A proxy fence releases its warp as an acquire does, when it retires.
+	auto* lsu_type = std::get_if<LsuType>(&trace->op_type);
+	if (lsu_type && *lsu_type == LsuType::PFENCE)
+		return true;
+#elif defined(VX_CFG_EXT_MBAR_ENABLE)
+#line 203
+#else
+#line 170
+#endif
 	return std::get_if<AmoType>(&trace->op_type)
 	    && std::get<IntrAmoArgs>(trace->instr_ptr->get_args()).aq;
 }
@@ -243,6 +258,31 @@ bool LsuUnit::is_try_wait(const instr_trace_t* trace) {
 static bool is_async(const LsuType* type) {
 	return type && (*type == LsuType::ST_ASYNC || *type == LsuType::RED_ASYNC);
 }
+#ifdef VX_CFG_EXT_DXA_ENABLE
+
+// The translation answers a proxy fence's token itself; no cache drained, so
+// the warp's global writes stay unfenced.
+void LsuUnit::process_pfence_rsp(uint32_t b) {
+	auto& rsp_in = PfRspIn.at(b);
+	auto& output = Outputs.at(b);
+	if (output.full())
+		return; // stall
+	auto& state = states_.at(b);
+	const auto& rsp = rsp_in.peek();
+	auto& entry = state.pending_reqs.at(rsp.tag);
+	auto trace = entry.trace;
+	DT(3, this->name() << " pfence-rsp: " << rsp);
+	__assert(entry.is_fence && entry.eop && entry.count == rsp.mask.count(),
+	         this->name() << " partial proxy fence answer: " << rsp);
+	state.pending_reqs.release(rsp.tag);
+	output.send(trace, 2);
+	this->mark_unlock(b, trace, true);
+	state.fence.token_returned();
+	rsp_in.pop();
+}
+#else
+#line 245
+#endif
 #else
 #line 184
 #endif
@@ -369,6 +409,18 @@ void LsuUnit::compute_addrs(uint32_t b, instr_trace_t* trace) {
 // formatter (sign-extend, NaN-box) and the response demux that
 // matches each fragment back to its in-flight request entry.
 void LsuUnit::process_response_step(uint32_t b) {
+#ifdef DXA_MBAR_ENABLE
+	if (core_->lmem_switch(b)->RspOut.empty() && !PfRspIn.at(b).empty()) {
+		this->process_pfence_rsp(b);
+		return;
+	}
+#elif defined(VX_CFG_EXT_MBAR_ENABLE)
+#line 367
+#elif defined(VX_CFG_EXT_DLMEM_ENABLE)
+#line 284
+#else
+#line 278
+#endif
 	auto& lsu_rsp_in = core_->lmem_switch(b)->RspOut;
 	if (lsu_rsp_in.empty())
 		return;
@@ -521,6 +573,12 @@ void LsuUnit::ingest_inputs(uint32_t b) {
 	if (is_try_wait(trace)) {
 		trace->resume_warp = false;
 	}
+#ifdef VX_CFG_EXT_DXA_ENABLE
+	if (lsu_type_tag && *lsu_type_tag == LsuType::PFENCE && !state.req_queue.empty())
+		return;
+#else
+#line 523
+#endif
 #else
 #line 431
 #endif
@@ -547,6 +605,15 @@ void LsuUnit::issue_fence(uint32_t b, instr_trace_t* trace) {
 	lsu_req.cta_id = trace->cta_id;
 	auto lsu_type = std::get_if<LsuType>(&trace->op_type);
 	lsu_req.flags.fence_cta = (lsu_type && *lsu_type == LsuType::CFENCE);
+#endif
+#if defined(DXA_MBAR_ENABLE)
+	lsu_req.flags.fence_proxy = (lsu_type && *lsu_type == LsuType::PFENCE);
+#elif defined(VX_CFG_EXT_MBAR_ENABLE)
+#line 546
+#elif defined(VX_CFG_EXT_DLMEM_ENABLE)
+#line 453
+#else
+#line 447
 #endif
 	uint32_t last = 0;
 	for (uint32_t t = 0; t < VX_CFG_NUM_THREADS; ++t) {
@@ -722,6 +789,18 @@ void LsuUnit::process_request_step(uint32_t b) {
 		this->process_cfence(b, trace);
 		return;
 	}
+#endif
+#if defined(DXA_MBAR_ENABLE)
+	if (lsu_tag && *lsu_tag == LsuType::PFENCE) {
+		this->issue_fence(b, trace);
+		return;
+	}
+#elif defined(VX_CFG_EXT_MBAR_ENABLE)
+#line 721
+#elif defined(VX_CFG_EXT_DLMEM_ENABLE)
+#line 618
+#else
+#line 612
 #endif
 
 	// check pending queue capacity. AMO always needs a return → reserve

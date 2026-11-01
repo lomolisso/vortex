@@ -81,6 +81,9 @@ module VX_dlmem_xlate_top import VX_gpu_pkg::*; #(
     input  wire [NB-1:0][PID_W-1:0]             in_pid,
     input  wire [NB-1:0]                        in_fence,
     input  wire [NB-1:0]                        in_rl,
+`ifdef DXA_MBAR_ENABLE
+    input  wire [NB-1:0]                        in_pfence,   // a fence's op field names the proxy fence
+`endif
     output wire [NB-1:0][TAG_W-1:0]             in_tag_eff,
     output wire [NB-1:0]                        in_ready,
     output wire [NB-1:0][NW_WIDTH-1:0]          row_slot,
@@ -200,7 +203,16 @@ module VX_dlmem_xlate_top import VX_gpu_pkg::*; #(
             hdr.cta_id = NCTA_WIDTH'(in_cta[b]);
             hdr.pid    = in_pid[b];
         end
+    `ifdef DXA_MBAR_ENABLE
+        // A random op field names the proxy fence, which the stage answers
+        // itself, only when the bench asks for one.
+        wire [INST_LSU_BITS-1:0] op_raw = in_tag[b][TAG_W-HDR_W-1 -: INST_LSU_BITS];
+        wire [INST_LSU_BITS-1:0] op_eff = in_pfence[b] ? INST_LSU_PFENCE
+                                        : ((op_raw == INST_LSU_PFENCE) ? INST_LSU_FENCE : op_raw);
+        assign in_tag_eff[b] = {hdr, op_eff, in_tag[b][TAG_W-HDR_W-INST_LSU_BITS-1:2], in_rl[b], in_fence[b]};
+    `else
         assign in_tag_eff[b] = {hdr, in_tag[b][TAG_W-HDR_W-1:2], in_rl[b], in_fence[b]};
+    `endif
         `UNUSED_VAR (in_tag[b][1:0])
 
         assign in_if[b].req_valid       = in_valid[b];

@@ -255,6 +255,35 @@ inline void vx_dxa_issue_5d_mbar_cluster(uint32_t desc_slot, uint64_t* mbar, voi
   vx_dxa_issue_5d_wg(desc_slot, __vx_dxa_mbar_payload_cluster(mbar), smem_addr,
                      coord0, coord1, coord2, coord3, coord4);
 }
+
+// Bulk copy, like cp.async.bulk.shared::cluster.shared::cta
+// .mbarrier::complete_tx::bytes: the engine copies `size` bytes from `src` in
+// the issuer's own block to `dst`, then applies complete_tx(size) to `mbar`.
+// `dst` and `mbar` are each a local pointer into the issuer's own block or a
+// window address (vx_cluster_map_shared_rank) of one block of its cluster,
+// the issuer's own included, and `mbar` must be in the block of `dst`.
+// `size` is a nonzero multiple of 16, `src` and `dst` are 16-byte aligned, and
+// overlapping ranges are undefined. The DXA reads `src` as the async proxy:
+// order earlier stores to it with vx_fence_proxy_async(). Same issue rules as
+// the tensor issue: rs1 = wgather(dst, mbar, src, size), funct3 = 1.
+inline void vx_dxa_bulk_copy(void* dst, const void* src, uint32_t size, uint64_t* mbar) {
+  const size_t a0 = vx_wgather((size_t)(uintptr_t)dst,
+                               (size_t)(uintptr_t)mbar,
+                               (size_t)(uintptr_t)src,
+                               (size_t)size);
+  __asm__ volatile (
+      ".insn r %0, 1, %1, x0, %2, x0\n\t"
+      :
+      : "i"(VX_DXA_EXT_OPCODE), "i"(VX_DXA_FUNCT7), "r"(a0)
+      : "memory");
+}
+
+// fence.proxy.async: holds the warp until its earlier stores to local memory
+// have been performed and its earlier window stores acknowledged, so that a
+// later DXA access of the same bytes observes them. Nothing reaches the caches.
+inline void vx_fence_proxy_async(void) {
+  __asm__ volatile (".insn r %0, 7, 1, x0, x0, x0" :: "i"(RISCV_CUSTOM2) : "memory");
+}
 #endif // VX_CFG_EXT_MBAR_ENABLE
 
 // Multicast DXA issues read GMEM once and replay SMEM writes to multiple

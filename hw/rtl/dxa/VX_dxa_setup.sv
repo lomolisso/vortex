@@ -54,6 +54,8 @@ module VX_dxa_setup import VX_gpu_pkg::*, VX_dxa_pkg::*; (
     output wire                        active_notify_smem_done,
 `ifdef DXA_MBAR_ENABLE
     output wire dxa_compl_t            active_compl,
+    // The transfer is a bulk copy: its lines come from the issuer's local memory.
+    output wire                        active_bulk,
 `endif
 
     // Multicast (always available; active when cta_mask has >1 bit set).
@@ -228,6 +230,7 @@ module VX_dxa_setup import VX_gpu_pkg::*, VX_dxa_pkg::*; (
     reg [3:0]                              r_lg_bkK;
 `ifdef DXA_MBAR_ENABLE
     dxa_compl_t                            r_compl;
+    reg                                    r_bulk;
 `endif
 
     // ════════════════════════════════════════════════════════════════════
@@ -260,6 +263,7 @@ module VX_dxa_setup import VX_gpu_pkg::*, VX_dxa_pkg::*; (
     reg [3:0]                              s_lg_bkK;
 `ifdef DXA_MBAR_ENABLE
     dxa_compl_t                            s_compl;
+    reg                                    s_bulk;
 `endif
 
     assign active_core_id          = r_core_id;
@@ -272,6 +276,7 @@ module VX_dxa_setup import VX_gpu_pkg::*, VX_dxa_pkg::*; (
     assign active_smem_stride      = r_smem_stride;
 `ifdef DXA_MBAR_ENABLE
     assign active_compl            = r_compl;
+    assign active_bulk             = r_bulk;
 `endif
 
     // ════════════════════════════════════════════════════════════════════
@@ -452,6 +457,9 @@ module VX_dxa_setup import VX_gpu_pkg::*, VX_dxa_pkg::*; (
             s_lg_tcN           <= '0;
             s_lg_nsteps        <= '0;
             s_lg_bkK           <= '0;
+        `ifdef DXA_MBAR_ENABLE
+            r_bulk             <= 1'b0;
+        `endif
         end else begin
             // Default: pipeline_start is a 1-cycle pulse.
             pipeline_start_r <= 1'b0;
@@ -484,6 +492,7 @@ module VX_dxa_setup import VX_gpu_pkg::*, VX_dxa_pkg::*; (
                 r_lg_bkK            <= s_lg_bkK;
             `ifdef DXA_MBAR_ENABLE
                 r_compl             <= s_compl;
+                r_bulk              <= s_bulk;
             `endif
                 state_r             <= TS_ACTIVE;
                 pipeline_start_r    <= 1'b1;
@@ -536,6 +545,7 @@ module VX_dxa_setup import VX_gpu_pkg::*, VX_dxa_pkg::*; (
                     s_compl.mask        <= req_data.mc_mask;
                     s_compl.peers       <= req_data.mc_peers;
                     lat_tile4           <= DXA_TX_BYTES_W'(dec_tile4);
+                    s_bulk              <= req_data.bulk;
                 `endif
                     // Rolling-cursor deltas: delta[0] is the inner-dim step.
                     // Higher deltas are precomputed below (Phase 1-3 captures).
@@ -654,5 +664,10 @@ module VX_dxa_setup import VX_gpu_pkg::*, VX_dxa_pkg::*; (
 
     `UNUSED_VAR (desc_data.size0)
     `UNUSED_VAR (req_data.meta)
+`ifdef DXA_MBAR_ENABLE
+    // A bulk copy's source and size arrive in its descriptor.
+    `UNUSED_VAR (req_data.src_addr)
+    `UNUSED_VAR (req_data.size)
+`endif
 
 endmodule

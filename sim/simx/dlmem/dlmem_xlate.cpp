@@ -36,6 +36,11 @@ DlmemXlate::DlmemXlate(const SimContext& ctx,
   , PeerWrIn(this)
   , WtIncOut(num_blocks, SimChannel<WtInc>(this))
   , LaccIncOut(num_blocks, SimChannel<WtInc>(this))
+#ifdef DXA_MBAR_ENABLE
+  , PfRspOut(num_blocks, SimChannel<LsuRsp>(this))
+#else
+#line 38
+#endif
   , cfg_(cfg)
   , my_core_(0)
   , num_blocks_(num_blocks)
@@ -63,6 +68,15 @@ bool DlmemXlate::empty() const {
       return false;
     }
   }
+#ifdef DXA_MBAR_ENABLE
+  for (auto& out : PfRspOut) {
+    if (out.size() != 0) {
+      return false;
+    }
+  }
+#else
+#line 65
+#endif
   return true;
 }
 
@@ -104,6 +118,27 @@ void DlmemXlate::on_tick() {
     // A fence or release AMO waits at the stage output, so the requests behind it wait too.
     bool hold = !in.empty() && (in.peek().flags.fence || in.peek().amo_rl)
              && drained_ && !drained_(in.peek().wid);
+#ifdef DXA_MBAR_ENABLE
+    if (!in.empty() && in.peek().flags.fence_proxy) {
+      auto& pf_out = PfRspOut.at(b);
+      if (!hold && pf_out.size() == 0) {
+        const LsuReq& req = in.peek();
+        LsuRsp rsp(req.mask.size());
+        rsp.mask = req.mask;
+        rsp.tag  = req.tag;
+        rsp.cid  = req.cid;
+        rsp.uuid = req.uuid;
+        DT(3, this->name() << " block" << b << " pfence-release: wid=" << req.wid << " (#" << req.uuid << ")");
+        pf_out.send(rsp, 1);
+        in.pop();
+        entry_rows_.at(b).pop_front();
+      }
+      busy |= (in.size() != 0);
+      continue;
+    }
+#else
+#line 106
+#endif
     if (!in.empty() && !out.full() && !hold) {
       auto& entry_rows = entry_rows_.at(b);
       __assert(!entry_rows.empty(), "block " << b << " request without its entry row");

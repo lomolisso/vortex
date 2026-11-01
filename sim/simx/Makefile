@@ -186,6 +186,8 @@ MBAR_WAITERS_TEST_OBJ := $(OBJ_DIR)/tests/mbar_waiters_test.o
 MBAR_WAITERS_TEST     := $(DESTDIR)/mbar_waiters_test
 DXA_COMPL_TEST_OBJ := $(OBJ_DIR)/tests/dxa_compl_test.o
 DXA_COMPL_TEST     := $(DESTDIR)/dxa_compl_test
+DXA_BULK_TEST_OBJ  := $(OBJ_DIR)/tests/dxa_bulk_test.o
+DXA_BULK_TEST      := $(DESTDIR)/dxa_bulk_test
 
 DEPS := $(OBJS:.o=.d) $(MAIN_OBJ:.o=.d) $(DXA_OOO_TEST_OBJ:.o=.d) $(RVC_TEST_OBJ:.o=.d)
 DEPS += $(DLMEM_NOC_OBJS:.o=.d) $(DLMEM_NOC_TEST_OBJ:.o=.d)
@@ -195,6 +197,7 @@ DEPS += $(DLMEM_EP_OBJS:.o=.d) $(DLMEM_EP_TEST_OBJ:.o=.d)
 DEPS += $(LMEM_SWITCH_TEST_OBJ:.o=.d)
 DEPS += $(MBAR_WAITERS_TEST_OBJ:.o=.d)
 DEPS += $(DXA_COMPL_TEST_OBJ:.o=.d)
+DEPS += $(DXA_BULK_TEST_OBJ:.o=.d)
 
 # generate .d files alongside .o files
 CXXFLAGS += -MMD -MP -MF $(@:.o=.d)
@@ -217,7 +220,7 @@ PROJECT := simx
 VORTEX_LIB := libvortex.so
 VORTEX_GEM5_LIB := libvortex-gem5.so
 
-.PHONY: all force test-dxa-ooo test-rvc-decompress test-dlmem-noc test-cta-gang test-dlmem-xlate test-dlmem-ep test-lmem-switch test-mbar-waiters test-dxa-compl clean clean-lib clean-exe clean-obj libvortex clean-libvortex libvortex-gem5 clean-libvortex-gem5
+.PHONY: all force test-dxa-ooo test-rvc-decompress test-dlmem-noc test-cta-gang test-dlmem-xlate test-dlmem-ep test-lmem-switch test-mbar-waiters test-dxa-compl test-dxa-bulk clean clean-lib clean-exe clean-obj libvortex clean-libvortex libvortex-gem5 clean-libvortex-gem5
 
 ifeq ($(USE_SST), 1)
 all: $(DESTDIR)/$(PROJECT) $(DESTDIR)/$(VORTEX_LIB)
@@ -288,6 +291,10 @@ $(DXA_COMPL_TEST_OBJ): $(VORTEX_HOME)/tests/unittest/dxa_compl/main.cpp $(CONFIG
 	@mkdir -p $(@D)
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
+$(DXA_BULK_TEST_OBJ): $(VORTEX_HOME)/tests/unittest/dxa_bulk/main.cpp $(CONFIG_FILE)
+	@mkdir -p $(@D)
+	$(CXX) $(CXXFLAGS) -c $< -o $@
+
 # Main executable
 $(DESTDIR)/$(PROJECT): $(OBJS) $(MAIN_OBJ)
 	$(CXX) $(CXXFLAGS) $^ $(LDFLAGS) -o $@
@@ -344,6 +351,12 @@ test-dxa-compl: $(DXA_COMPL_TEST)
 	$(DXA_COMPL_TEST) $(DXA_COMPL_OPTS)
 
 $(DXA_COMPL_TEST): $(OBJS) $(DXA_COMPL_TEST_OBJ)
+	$(CXX) $(CXXFLAGS) $^ $(LDFLAGS) -o $@
+
+test-dxa-bulk: $(DXA_BULK_TEST)
+	$(DXA_BULK_TEST) $(DXA_BULK_OPTS)
+
+$(DXA_BULK_TEST): $(OBJS) $(DXA_BULK_TEST_OBJ)
 	$(CXX) $(CXXFLAGS) $^ $(LDFLAGS) -o $@
 
 # Shared library

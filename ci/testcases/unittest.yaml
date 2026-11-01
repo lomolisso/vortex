@@ -88,6 +88,22 @@ tests:
     run: "make -C hw/unittest/dxa_core clean && make -C hw/unittest/dxa_core run"
     touches: [hw/rtl/dxa, hw/rtl/VX_gpu_pkg.sv, hw/rtl/VX_define.vh, hw/unittest/dxa_core,
               hw/unittest/common.mk]
+  # DXA bulk copy (RV64, DXA with mbarriers): the engine's LMEM line reader at
+  # DMA words narrower than, equal to and wider than a line, under random
+  # back-pressure and response delay; byte-exact memory and completion attr; then
+  # the throughput of 4 KB copies, aligned and misaligned, at both read latencies.
+  - id: hw-dxa-bulk
+    via: script
+    xlen: [64]
+    run: "make -C hw/unittest run-dxa-bulk"
+    touches: [hw/rtl/dxa, hw/rtl/VX_gpu_pkg.sv, hw/rtl/VX_define.vh, hw/rtl/dlmem/VX_dlmem_pkg.sv,
+              hw/unittest/dxa_core, hw/unittest/Makefile, hw/unittest/common.mk]
+  # The SimX twin of the line reader at 4, 8 and 16 banks.
+  - id: sw-dxa-bulk
+    via: script
+    xlen: [64]
+    run: "make -C tests/unittest/dxa_bulk run"
+    touches: [sim/simx/dxa, sim/simx/types.h, sim/simx/Makefile, tests/unittest/dxa_bulk, tests/unittest/Makefile]
   # DXA completion (RV64, DXA with mbarriers): the RTL completion unit in both
   # modes, a barrier event per copy and an mbarrier complete_tx of the box
   # bytes into the local memory, under back-pressure and in bursts; then the

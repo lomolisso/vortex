@@ -15,7 +15,12 @@
 // mbarriers) legacy multicast copies with dense and sparse cta masks. The
 // receiver of mask bit r must get the tile at issuer + r * smem_stride and its
 // barrier release at barrier + r warps, the receivers of each local-memory
-// word in increasing bit order.
+// word in increasing bit order. With DXA mbarriers, bulk copies instead: the
+// engine reads the source lines from the issuer's local memory, whose
+// responses come back in order after a random delay under random request
+// back-pressure, and must write exactly the destination bytes, complete with
+// one last beat carrying the mbarrier, the byte count and the slot, and never
+// refuse a read response.
 
 #include <iostream>
 #include <cassert>
@@ -24,6 +29,7 @@
 #include <deque>
 #include <map>
 #include <vector>
+#include <type_traits>
 #include <VX_config.h>
 #include <VX_types.h>
 #include "VVX_dxa_core_top.h"
@@ -293,6 +299,263 @@ static bool run_multicast() {
 
 #endif
 
+#if defined(VX_CFG_EXT_MBAR_ENABLE)
+
+static constexpr int clog2(int n) {
+    int b = 0;
+    while ((1 << b) < n) ++b;
+    return b;
+}
+static constexpr int up1(int b) { return b > 0 ? b : 1; }
+static constexpr int max2(int a, int b) { return a > b ? a : b; }
+
+static constexpr int LMEM_LOG   = VX_CFG_LMEM_LOG_SIZE;
+static constexpr int LMEM_BYTES = 1 << LMEM_LOG;
+static constexpr int WORD_BYTES = VX_CFG_LMEM_NUM_BANKS * (VX_CFG_XLEN / 8);
+static constexpr int NW_W       = up1(clog2(VX_CFG_NUM_WARPS));
+static constexpr int NCC        = max2(1, VX_CFG_NUM_CORES / VX_CFG_SOCKET_SIZE) * VX_CFG_SOCKET_SIZE;
+static constexpr int CORE_W     = up1(clog2(NCC));
+static constexpr int MAXC       = VX_CFG_DLMEM_MAX_CLUSTER;
+static constexpr int PEER_W     = 1 + CORE_W + NW_W + 4;
+static constexpr int BAR_W      = up1(clog2(VX_CFG_NUM_WARPS) + clog2(VX_CFG_NUM_BARRIERS));
+static constexpr int PAY_W      = max2(BAR_W, LMEM_LOG - 3);
+
+// dxa_req_data_t from its last (lowest) field up, as far as the bench sets it.
+static constexpr int R_SIZE   = 0;
+static constexpr int R_SRC    = R_SIZE + LMEM_LOG + 1;
+static constexpr int R_BULK   = R_SRC + LMEM_LOG;
+static constexpr int R_PEERS  = R_BULK + 1;
+static constexpr int R_MCMASK = R_PEERS + MAXC * PEER_W;
+static constexpr int R_MCCL   = R_MCMASK + MAXC;
+static constexpr int R_ROOM   = R_MCCL + 1;
+static constexpr int R_WIN    = R_ROOM + LMEM_LOG + 1;
+static constexpr int R_MBAR   = R_WIN + 1;
+static constexpr int R_DSLOT  = R_MBAR + LMEM_LOG - 3;
+static constexpr int R_DCORE  = R_DSLOT + NW_W;
+static constexpr int R_REMOTE = R_DCORE + CORE_W;
+static constexpr int R_GEN    = R_REMOTE + 1;
+static constexpr int R_SLOT   = R_GEN + 4;
+static constexpr int R_MASK   = R_SLOT + NW_W;
+static constexpr int R_COORDS = R_MASK + VX_CFG_NUM_WARPS;
+static constexpr int R_META   = R_COORDS + 5 * 32;
+static constexpr int R_SMEM   = R_META + 32;
+static constexpr int R_WID    = R_SMEM + LMEM_LOG;
+
+// dxa_lmem_attr_t from its last field up.
+static constexpr int A_REMOTE = CORE_W;
+static constexpr int A_GEN    = A_REMOTE + 1;
+static constexpr int A_SLOT   = A_GEN + 4;
+static constexpr int A_TX     = A_SLOT + NW_W;
+static constexpr int A_PAY    = A_TX + LMEM_LOG + 1;
+static constexpr int A_MODE   = A_PAY + PAY_W;
+static constexpr int A_LAST   = A_MODE + 1;
+
+template <typename W>
+static void set_bits(W& w, int lsb, int width, uint64_t value) {
+    for (int i = 0; i < width; ++i) {
+        int b = lsb + i;
+        uint32_t bit = (value >> i) & 1;
+        w[b / 32] = (w[b / 32] & ~(1u << (b % 32))) | (bit << (b % 32));
+    }
+}
+
+// Bit b of a Verilator port, scalar or wide.
+template <typename T>
+static uint32_t port_bit(const T& v, int b) {
+    if constexpr (std::is_integral<T>::value) {
+        return uint32_t((uint64_t(v) >> b) & 1);
+    } else {
+        return (v[b / 32] >> (b % 32)) & 1;
+    }
+}
+
+static uint64_t field(uint64_t v, int lsb, int width) {
+    return (v >> lsb) & ((width >= 64) ? ~0ull : ((1ull << width) - 1));
+}
+
+static uint64_t rng_state = 1;
+static uint32_t rnd() {
+    rng_state = rng_state * 6364136223846793005ull + 1442695040888963407ull;
+    return uint32_t(rng_state >> 33);
+}
+
+static uint8_t pattern(uint32_t i) { return uint8_t((i * 37u + (i >> 8) * 11u + 5u) ^ 0xa5u); }
+
+struct RdRsp {
+    uint32_t addr;
+    uint64_t tag;
+    uint64_t due;
+};
+
+struct BulkCopy {
+    uint32_t src, dst, size, mbar_off, slot, gen;
+};
+
+// One or more bulk copies queued back to back; checks every byte of the local
+// memory and each copy's completion beat. A read's response comes min_lat to
+// max_lat cycles after the request is taken.
+static bool run_bulk(const char* name, const std::vector<BulkCopy>& copies, int ready_pct, int max_lat,
+                     int min_lat = 1) {
+    std::vector<uint8_t> mem(LMEM_BYTES), ref(LMEM_BYTES);
+    for (int i = 0; i < LMEM_BYTES; ++i)
+        mem[i] = ref[i] = pattern(i);
+    for (auto& c : copies)
+        for (uint32_t i = 0; i < c.size; ++i)
+            ref[c.dst + i] = pattern(c.src + i);
+
+    std::deque<RdRsp> rsps;
+    size_t next_req = 0, lasts = 0;
+    uint64_t reads = 0, writes = 0, cyc = 0;
+    bool ok = true;
+
+    auto load_req = [&](const BulkCopy& c) {
+        for (size_t i = 0; i < sizeof(dut->dxa_req_data) / sizeof(dut->dxa_req_data[0]); ++i)
+            dut->dxa_req_data[i] = 0;
+        set_bits(dut->dxa_req_data, R_SIZE, LMEM_LOG + 1, c.size);
+        set_bits(dut->dxa_req_data, R_SRC, LMEM_LOG, c.src);
+        set_bits(dut->dxa_req_data, R_BULK, 1, 1);
+        set_bits(dut->dxa_req_data, R_MBAR, LMEM_LOG - 3, c.mbar_off);
+        set_bits(dut->dxa_req_data, R_GEN, 4, c.gen);
+        set_bits(dut->dxa_req_data, R_SLOT, NW_W, c.slot);
+        set_bits(dut->dxa_req_data, R_META, 32, 0xC0000000u);
+        set_bits(dut->dxa_req_data, R_SMEM, LMEM_LOG, c.dst);
+        dut->dxa_req_valid = 1;
+    };
+    load_req(copies[0]);
+
+    for (; cyc < 200000 && lasts < copies.size(); ++cyc) {
+        bool rsp = !rsps.empty() && rsps.front().due <= cyc;
+        dut->lmem_rsp_valid = rsp;
+        if (rsp) {
+            const auto& r = rsps.front();
+            for (int w = 0; w < WORD_BYTES / 4; ++w) {
+                uint32_t v = 0;
+                for (int b = 0; b < 4; ++b)
+                    v |= uint32_t(mem[r.addr * WORD_BYTES + w * 4 + b]) << (8 * b);
+                dut->lmem_rsp_data[w] = v;
+            }
+            dut->lmem_rsp_tag = r.tag;
+        }
+        dut->lmem_req_ready = (int(rnd() % 100) < ready_pct) ? 1 : 0;
+        dut->eval();
+        if (rsp && !(dut->lmem_rsp_ready & 1)) {
+            printf("%s: read response refused at cycle %lu\n", name, (unsigned long)cyc);
+            ok = false;
+        }
+        bool req_taken = dut->dxa_req_valid && dut->dxa_req_ready;
+        if ((dut->lmem_req_valid & 1) && (dut->lmem_req_ready & 1)) {
+            uint32_t addr = dut->lmem_req_addr;
+            if (!(dut->lmem_req_rw & 1)) {
+                ++reads;
+                uint64_t prev = rsps.empty() ? cyc : rsps.back().due;
+                uint64_t due = cyc + min_lat + rnd() % (max_lat - min_lat + 1);
+                rsps.push_back({addr, (uint64_t)dut->lmem_req_tag, due > prev ? due : prev});
+            } else {
+                ++writes;
+                for (int b = 0; b < WORD_BYTES; ++b) {
+                    if (port_bit(dut->lmem_req_byteen, b)) {
+                        uint32_t w = dut->lmem_req_data[b / 4];
+                        mem[addr * WORD_BYTES + b] = uint8_t(w >> (8 * (b % 4)));
+                    }
+                }
+                uint64_t attr = dut->lmem_req_attr;
+                if (field(attr, A_LAST, 1)) {
+                    const auto& c = copies[lasts];
+                    if (!field(attr, A_MODE, 1) || field(attr, A_PAY, PAY_W) != c.mbar_off
+                     || field(attr, A_TX, LMEM_LOG + 1) != c.size || field(attr, A_SLOT, NW_W) != c.slot
+                     || field(attr, A_GEN, 4) != c.gen || field(attr, A_REMOTE, 1)) {
+                        printf("%s: copy %zu completion attr 0x%lx: mode=%lu mbar=0x%lx tx=%lu slot=%lu gen=%lu\n",
+                               name, lasts, (unsigned long)attr, (unsigned long)field(attr, A_MODE, 1),
+                               (unsigned long)field(attr, A_PAY, PAY_W), (unsigned long)field(attr, A_TX, LMEM_LOG + 1),
+                               (unsigned long)field(attr, A_SLOT, NW_W), (unsigned long)field(attr, A_GEN, 4));
+                        ok = false;
+                    }
+                    ++lasts;
+                }
+            }
+        }
+        if (rsp && (dut->lmem_rsp_ready & 1))
+            rsps.pop_front();
+        clock_cycle();
+        if (req_taken) {
+            if (++next_req < copies.size())
+                load_req(copies[next_req]);
+            else
+                dut->dxa_req_valid = 0;
+        }
+    }
+    dut->dxa_req_valid  = 0;
+    dut->lmem_rsp_valid = 0;
+    dut->lmem_req_ready = 1;
+    for (int i = 0; i < 50; ++i) {
+        dut->eval();
+        if (dut->lmem_req_valid & 1) {
+            printf("%s: local-memory request after the copies\n", name);
+            ok = false;
+        }
+        clock_cycle();
+    }
+    if (lasts != copies.size()) {
+        printf("%s: %zu of %zu copies completed\n", name, lasts, copies.size());
+        return false;
+    }
+    if (!rsps.empty()) {
+        printf("%s: %zu reads never answered\n", name, rsps.size());
+        ok = false;
+    }
+    // Every line of each source is read once, whole.
+    uint64_t exp_reads = 0;
+    for (auto& c : copies) {
+        uint64_t lines = (c.src + c.size + VX_CFG_L1_LINE_SIZE - 1) / VX_CFG_L1_LINE_SIZE - c.src / VX_CFG_L1_LINE_SIZE;
+        exp_reads += lines * ((VX_CFG_L1_LINE_SIZE > WORD_BYTES) ? (VX_CFG_L1_LINE_SIZE / WORD_BYTES) : 1);
+    }
+    if (reads != exp_reads) {
+        printf("%s: %lu local-memory reads, expected %lu\n", name, (unsigned long)reads, (unsigned long)exp_reads);
+        ok = false;
+    }
+    for (int i = 0; i < LMEM_BYTES; ++i) {
+        if (mem[i] != ref[i]) {
+            printf("%s: byte 0x%x = 0x%02x, expected 0x%02x\n", name, i, mem[i], ref[i]);
+            ok = false;
+            break;
+        }
+    }
+    if (ok)
+        printf("%s: %zu copies, %lu reads, %lu writes in %lu cycles OK\n", name, copies.size(),
+               (unsigned long)reads, (unsigned long)writes, (unsigned long)cyc);
+    return ok;
+}
+
+static bool run_bulk_all() {
+    static_assert(R_WID + NW_W <= int(sizeof(((VVX_dxa_core_top*)nullptr)->dxa_req_data)) * 8,
+                  "request layout wider than the port");
+    const uint32_t q = LMEM_BYTES / 4;
+    bool ok = true;
+    ok = run_bulk("bulk-16", {{0x100, q + 0x200, 16, 0x21, 1, 3}}, 100, 1) && ok;
+    ok = run_bulk("bulk-16-off", {{0x110, q + 0x230, 16, 0x22, 2, 7}}, 100, 1) && ok;
+    ok = run_bulk("bulk-48", {{0x1d0, q + 0x310, 48, 0x23, 1, 1}}, 100, 3) && ok;
+    ok = run_bulk("bulk-208", {{0x1f0, q + 0x420, 208, 0x24, 3, 15}}, 80, 4) && ok;
+    ok = run_bulk("bulk-2064", {{0x40, q + 0x830, 2064, 0x25, 0, 2}}, 70, 5) && ok;
+    ok = run_bulk("bulk-tile", {{0, 2 * q, 4096 < q ? 4096u : q, 0x26, 1, 4}}, 100, 2) && ok;
+    ok = run_bulk("bulk-stream", {{0x30, q + 0x10, 160, 0x27, 1, 5},
+                                  {0x200, q + 0x400, 336, 0x28, 2, 6},
+                                  {0x610, 2 * q + 0x20, 1040, 0x29, 3, 9}}, 60, 6) && ok;
+    // Throughput of 4 KB copies, aligned and misaligned, with the read latency
+    // of a socket of one core (1 cycle past the engine's output buffer) and of
+    // a larger one (3, through the core switch's registers).
+    const uint32_t big = 4096 < q ? 4096u : q;
+    for (int lat : {1, 3}) {
+        char nm[64];
+        snprintf(nm, sizeof(nm), "tput-aligned-lat%d", lat);
+        ok = run_bulk(nm, {{0, 2 * q, big, 0x2a, 1, 4}}, 100, lat, lat) && ok;
+        snprintf(nm, sizeof(nm), "tput-misaligned-lat%d", lat);
+        ok = run_bulk(nm, {{0x30, 2 * q + 0x10, big - 0x40, 0x2b, 1, 4}}, 100, lat, lat) && ok;
+    }
+    return ok;
+}
+
+#endif
+
 int main(int argc, char** argv) {
     Verilated::commandArgs(argc, argv);
 
@@ -322,6 +585,10 @@ int main(int argc, char** argv) {
     dut->gmem_req_ready = ~0ULL; // all ready
     dut->gmem_rsp_valid = 0;
     dut->lmem_req_ready = ~0ULL; // all ready
+#if defined(VX_CFG_EXT_MBAR_ENABLE)
+    dut->lmem_rsp_valid = 0;
+    dut->slot_stride    = 0x400;
+#endif
 
     reset_dut();
 
@@ -332,6 +599,8 @@ int main(int argc, char** argv) {
     bool ok = true;
 #if !defined(VX_CFG_EXT_MBAR_ENABLE)
     ok = run_multicast();
+#else
+    ok = run_bulk_all();
 #endif
 
     std::cout << (ok ? "PASSED" : "FAILED") << std::endl;

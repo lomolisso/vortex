@@ -55,6 +55,19 @@ module VX_dxa_gmem_req import VX_gpu_pkg::*, VX_dxa_pkg::*; #(
     input  wire [15:0]                 ag_k_row,    // tiled scatter: K-row of this CL
     input  wire [15:0]                 ag_n_base,   // tiled scatter: N index of CL element 0
 
+`ifdef DXA_MBAR_ENABLE
+    // A bulk copy reads its lines from local memory, with the same tags.
+    input  wire                        bulk,
+    output wire                        lmem_rd_valid,
+    output wire [GMEM_ADDR_WIDTH-1:0]  lmem_rd_addr,
+    output wire [TAG_W-1:0]            lmem_rd_tag,
+    input  wire                        lmem_rd_ready,
+    input  wire                        lmem_rsp_valid,
+    input  wire [GMEM_DATAW-1:0]       lmem_rsp_data,
+    input  wire [TAG_W-1:0]            lmem_rsp_tag,
+    output wire                        lmem_rsp_ready,
+
+`endif
     // GMEM bus interface (reads only).
     VX_mem_bus_if.master               gmem_bus_if,
 
@@ -153,7 +166,12 @@ module VX_dxa_gmem_req import VX_gpu_pkg::*, VX_dxa_pkg::*; #(
 
     wire can_alloc = have_free_tag;
 
+`ifdef DXA_MBAR_ENABLE
+    wire line_req_ready = bulk ? lmem_rd_ready : mem_bus_w.req_ready;
+    wire normal_fire = ag_valid && ~ag_oob && can_alloc && line_req_ready;
+`else
     wire normal_fire = ag_valid && ~ag_oob && can_alloc && mem_bus_w.req_ready;
+`endif
     wire oob_fire    = ag_valid &&  ag_oob && can_alloc;
     wire accept      = normal_fire || oob_fire;
 
@@ -169,8 +187,13 @@ module VX_dxa_gmem_req import VX_gpu_pkg::*, VX_dxa_pkg::*; #(
     // ready). OOB-synthetic CLs fill in cycles when there's no bus rsp.
     // ════════════════════════════════════════════════════════════════════
 
+`ifdef DXA_MBAR_ENABLE
+    wire bus_rsp_present = bulk ? lmem_rsp_valid : mem_bus_w.rsp_valid;
+    wire [TAG_W-1:0] bus_rsp_tag = bulk ? lmem_rsp_tag : TAG_W'(mem_bus_w.rsp_data.tag.value);
+`else
     wire bus_rsp_present = mem_bus_w.rsp_valid;
     wire [TAG_W-1:0] bus_rsp_tag = TAG_W'(mem_bus_w.rsp_data.tag.value);
+`endif
     wire             present_oob = ~bus_rsp_present && have_oob;
 
     wire [TAG_W-1:0] present_tag = bus_rsp_present ? bus_rsp_tag : oob_tag;
@@ -179,7 +202,11 @@ module VX_dxa_gmem_req import VX_gpu_pkg::*, VX_dxa_pkg::*; #(
 
     assign sw_valid          = bus_rsp_present || present_oob;
     assign sw_tag            = present_tag;
+`ifdef DXA_MBAR_ENABLE
+    assign sw_data           = bulk ? lmem_rsp_data : mem_bus_w.rsp_data.data;  // don't-care when sw_oob.
+`else
     assign sw_data           = mem_bus_w.rsp_data.data;  // don't-care when sw_oob.
+`endif
     assign sw_smem_byte_addr = present_slot.smem_byte_addr;
     assign sw_byte_offset    = present_slot.byte_offset;
     assign sw_valid_length   = present_slot.valid_length;
@@ -191,12 +218,24 @@ module VX_dxa_gmem_req import VX_gpu_pkg::*, VX_dxa_pkg::*; #(
 
     // The bus is accepted by smem_wr (via sw_ready) only when we present
     // a real rsp; OOB presentations don't touch the bus port.
+`ifdef DXA_MBAR_ENABLE
+    assign mem_bus_w.rsp_ready = sw_ready && bus_rsp_present && ~bulk;
+    assign lmem_rsp_ready      = sw_ready && bus_rsp_present && bulk;
+`else
     assign mem_bus_w.rsp_ready = sw_ready && bus_rsp_present;
+`endif
 
     // ════════════════════════════════════════════════════════════════════
     // GMEM bus wiring (read-only requests)
     // ════════════════════════════════════════════════════════════════════
+`ifdef DXA_MBAR_ENABLE
+    assign mem_bus_w.req_valid       = ag_valid && ~ag_oob && can_alloc && ~bulk;
+    assign lmem_rd_valid             = ag_valid && ~ag_oob && can_alloc && bulk;
+    assign lmem_rd_addr              = ag_cl_addr;
+    assign lmem_rd_tag               = alloc_tag;
+`else
     assign mem_bus_w.req_valid       = ag_valid && ~ag_oob && can_alloc;
+`endif
     assign mem_bus_w.req_data.rw     = 1'b0;
     assign mem_bus_w.req_data.addr   = ag_cl_addr;
     assign mem_bus_w.req_data.data   = '0;

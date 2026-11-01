@@ -311,6 +311,11 @@ static op_string_t op_string(const Instr &instr) {
 #ifdef VX_CFG_EXT_MBAR_ENABLE
       case LsuType::ST_ASYNC:  return {(std::get<IntrLsuArgs>(instrArgs).width == 3) ? "ST.ASYNC.B64" : "ST.ASYNC.B32", ""};
       case LsuType::RED_ASYNC: return {(std::get<IntrLsuArgs>(instrArgs).width == 3) ? "RED.ASYNC.ADD.U64" : "RED.ASYNC.ADD.U32", ""};
+#ifdef VX_CFG_EXT_DXA_ENABLE
+      case LsuType::PFENCE: return {"FENCE.PROXY.ASYNC", ""};
+#else
+#line 313
+#endif
 #endif
 #if defined(VX_CFG_EXT_MBAR_ENABLE)
 #elif defined(VX_CFG_EXT_DLMEM_ENABLE)
@@ -416,8 +421,20 @@ static op_string_t op_string(const Instr &instr) {
     }
 #ifdef VX_CFG_EXT_DXA_ENABLE
     ,[&](DxaType /*dxa_type*/)-> op_string_t {
+#ifdef DXA_MBAR_ENABLE
+      if (std::get<DxaType>(instr.get_op_type()) == DxaType::BULK)
+        return {"DXA.BULK", ""};
+#else
+#line 408
+#endif
       return {"DXA.ISSUE", ""};
     }
+#endif
+#if defined(DXA_MBAR_ENABLE)
+#elif defined(VX_CFG_EXT_MBAR_ENABLE)
+#line 419
+#else
+#line 411
 #endif
   #ifdef VX_CFG_EXT_TCU_ENABLE
     ,[&](TcuType tcu_type)-> op_string_t {
@@ -934,9 +951,26 @@ Instr::Ptr Decoder::decode(uint32_t code, uint64_t uuid) {
       IntrDxaArgs dxaArgs{};
       instr->set_args(dxaArgs);
       instr->set_op_type(DxaType::ISSUE);
+#ifdef DXA_MBAR_ENABLE
+      // funct3 = 1 is the bulk copy; any other value stays the tensor issue.
+      if (funct3 == 1)
+        instr->set_op_type(DxaType::BULK);
+#elif defined(VX_CFG_EXT_DLMEM_ENABLE)
+#line 924
+#else
+#line 906
+#endif
       instr->set_src_reg(0, rs1, RegType::Integer);
       instr->set_src_reg(1, rs2, RegType::Integer);
     } break;
+#endif
+#if defined(DXA_MBAR_ENABLE)
+#elif defined(VX_CFG_EXT_MBAR_ENABLE)
+#line 936
+#elif defined(VX_CFG_EXT_DLMEM_ENABLE)
+#line 928
+#else
+#line 910
 #endif
   #ifdef VX_CFG_EXT_TCU_ENABLE
     case 2: {
@@ -1187,6 +1221,19 @@ Instr::Ptr Decoder::decode(uint32_t code, uint64_t uuid) {
       instr->set_src_reg(2, rs3, RegType::Integer);
       break;
     }
+  #ifdef VX_CFG_EXT_DXA_ENABLE
+    // funct7 = 1, funct3 = 7 is fence.proxy.async.
+    if (funct7 == 1 && funct3 == 7) {
+      instr->set_fu_type(FUType::LSU);
+      instr->set_op_type(LsuType::PFENCE);
+      instr->set_args(IntrLsuArgs{0, 0, 0});
+      // the warp issues nothing more until the fence retires
+      instr->set_wstall(true);
+      break;
+    }
+  #else
+  #line 1189
+  #endif
     // funct7 = 1 is the relaxed form of arrive and arrive_tx.
     if (funct7 > 1 || (funct7 == 1 && funct3 > 1))
       std::abort();
@@ -1226,6 +1273,14 @@ Instr::Ptr Decoder::decode(uint32_t code, uint64_t uuid) {
     instr->set_src_reg(1, rs2, RegType::Integer);
   #endif
   } break;
+#endif
+#if defined(DXA_MBAR_ENABLE)
+#elif defined(VX_CFG_EXT_MBAR_ENABLE)
+#line 1225
+#elif defined(VX_CFG_EXT_DLMEM_ENABLE)
+#line 1198
+#else
+#line 1199
 #endif
   default:
     std::abort();
