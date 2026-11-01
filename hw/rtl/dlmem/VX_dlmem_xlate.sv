@@ -141,6 +141,10 @@ module VX_dlmem_xlate import VX_gpu_pkg::*, VX_dlmem_pkg::*; #(
     wire [NUM_LANES-1:0]                     lane_lacc;
 `ifdef VX_CFG_EXT_MBAR_ENABLE
     wire [NUM_LANES-1:0]                     lane_mbar_global, lane_mbar_rwait;
+    // st.async/red.async lanes: every one leaves through the egress, its own core's included.
+    wire [NUM_LANES-1:0]                     lane_async, async_nowin, async_mbad;
+    `STATIC_ASSERT (DLMEM_ASYNC_MB_LSB + LMEM_AW <= DLMEM_ASYNC_BIT, ("no room for the async lane encoding"))
+    `STATIC_ASSERT (DLMEM_ASYNC_BIT > WIN_LSB, ("the async flag overlaps the DLMEM window"))
 `endif
 
     for (genvar i = 0; i < NUM_LANES; ++i) begin : g_lanes
@@ -155,7 +159,24 @@ module VX_dlmem_xlate import VX_gpu_pkg::*, VX_dlmem_pkg::*; #(
 
         wire act  = req_r.mask[i] && ~is_fence_r;
         wire win  = act && (a[LSU_ADDR_WIDTH-1:WIN_LSB] == DLMEM_BASE_W[LSU_ADDR_WIDTH-1:WIN_LSB]);
+    `ifdef VX_CFG_EXT_MBAR_ENABLE
+        // The mbarrier must name the same rank as the address.
+        wire [LSU_ADDR_WIDTH-1:0] ma = req_r.mbar_addr[i];
+        wire [RB_W-1:0] mrank;
+        if (RB != 0) begin : g_mrank
+            assign mrank = ma[LMEM_AW +: RB];
+        end else begin : g_mrank0
+            assign mrank = '0;
+        end
+        wire [LMEM_AW-1:0] moffw = ma[LMEM_AW-1:0];
+        wire async_act = act && req_r.is_async;
+        wire mwin  = (ma[LSU_ADDR_WIDTH-1:WIN_LSB] == DLMEM_BASE_W[LSU_ADDR_WIDTH-1:WIN_LSB]);
+        wire mbad  = async_act && win && (~mwin || (mrank != rank));
+        wire moob  = async_act && win && ~mbad && ({1'b0, moffw, WA'(0)} >= stride);
+        wire oob  = (win && ((DLMEM_K_W'(rank) >= row_r.k) || ({1'b0, offw, WA'(0)} >= stride))) || moob;
+    `else
         wire oob  = win && ((DLMEM_K_W'(rank) >= row_r.k) || ({1'b0, offw, WA'(0)} >= stride));
+    `endif
 
         dlmem_peer_t peer;
         assign peer = row_r.peers[rank];
@@ -163,13 +184,29 @@ module VX_dlmem_xlate import VX_gpu_pkg::*, VX_dlmem_pkg::*; #(
         wire [LMEM_AW-1:0] line_off = LMEM_AW'(offw[LINE_W-1:0]);
         wire [LMEM_AW-1:0] lw = oob ? (own_base + line_off) : (peer_base + offw);
         wire is_self = (peer.core == DLMEM_CORE_W'(MY_CORE));
+    `ifdef VX_CFG_EXT_MBAR_ENABLE
+        wire rem  = win && ~oob && ~mbad && (~is_self || async_act);
+    `else
         wire rem  = win && ~oob && ~is_self;
+    `endif
 
         wire [LSU_ADDR_WIDTH-1:0] rem_addr = DLMEM_BASE_W
                                            | (LSU_ADDR_WIDTH'(peer.core) << LMEM_AW)
                                            | LSU_ADDR_WIDTH'(lw);
         wire [LSU_ADDR_WIDTH-1:0] loc_addr = LMEM_BASE_W | LSU_ADDR_WIDTH'(lw);
+    `ifdef VX_CFG_EXT_MBAR_ENABLE
+        wire [LMEM_AW-1:0] mlw = peer_base + moffw;
+        wire [LSU_ADDR_WIDTH-1:0] async_addr = (LSU_ADDR_WIDTH'(1) << DLMEM_ASYNC_BIT)
+                                             | (LSU_ADDR_WIDTH'(mlw) << DLMEM_ASYNC_MB_LSB)
+                                             | (LSU_ADDR_WIDTH'(peer.core) << LMEM_AW)
+                                             | LSU_ADDR_WIDTH'(lw);
+        assign addr_out[i] = win ? (rem ? (async_act ? async_addr : rem_addr) : loc_addr) : a;
+        assign lane_async[i]  = async_act && rem;
+        assign async_nowin[i] = async_act && ~win;
+        assign async_mbad[i]  = mbad;
+    `else
         assign addr_out[i] = win ? (rem ? rem_addr : loc_addr) : a;
+    `endif
 
         // Lane i of packet pid carries warp thread pid * NUM_LANES + i.
         wire [HART_ID_WIDTH-1:0] lane_tid = (PID_BITS != 0)
@@ -222,6 +259,11 @@ module VX_dlmem_xlate import VX_gpu_pkg::*, VX_dlmem_pkg::*; #(
     assign out_if.req_data.addr   = addr_out;
     assign out_if.req_data.attr   = attr_out;
     assign out_if.req_data.data   = req_r.data;
+`ifdef VX_CFG_EXT_MBAR_ENABLE
+    // The async lanes' mbarriers ride in their translated addresses from here on.
+    assign out_if.req_data.is_async  = req_r.is_async;
+    assign out_if.req_data.mbar_addr = '0;
+`endif
     assign out_if.req_data.tag    = req_r.tag;
     assign req_ready_r            = out_if.req_ready && ~order_hold;
 
@@ -232,9 +274,17 @@ module VX_dlmem_xlate import VX_gpu_pkg::*, VX_dlmem_pkg::*; #(
     wire out_fire = out_if.req_valid && out_if.req_ready;
 
     // A fence does not wait for responses, so loads and AMOs are tracked as stores are.
+`ifdef VX_CFG_EXT_MBAR_ENABLE
+    // Async accesses order through their mbarrier, so nothing waits for them.
+    wire [NUM_LANES-1:0] wt_lanes = out_remote & ~lane_async;
+    assign wt_inc_valid = out_fire && (| wt_lanes);
+    assign wt_inc_wid   = hdr_r.wid;
+    `POP_COUNT(wt_inc_cnt, wt_lanes);
+`else
     assign wt_inc_valid = out_fire && (| out_remote);
     assign wt_inc_wid   = hdr_r.wid;
     `POP_COUNT(wt_inc_cnt, out_remote);
+`endif
 
     assign lacc_inc_valid = out_fire && (| lane_lacc);
     assign lacc_inc_wid   = hdr_r.wid;
@@ -279,6 +329,12 @@ module VX_dlmem_xlate import VX_gpu_pkg::*, VX_dlmem_pkg::*; #(
     `RUNTIME_ASSERT (~(out_fire && (| lane_mbar_rwait)),
         ("%t: %s remote mbarrier wait is not supported: wid=%0d lanes=0x%0h (#%0d)",
             $time, INSTANCE_ID, hdr_r.wid, lane_mbar_rwait, hdr_r.uuid))
+    `RUNTIME_ASSERT (~(out_fire && (| async_nowin)),
+        ("%t: %s st.async needs a cluster window address: wid=%0d lanes=0x%0h (#%0d)",
+            $time, INSTANCE_ID, hdr_r.wid, async_nowin, hdr_r.uuid))
+    `RUNTIME_ASSERT (~(out_fire && (| async_mbad)),
+        ("%t: %s st.async mbarrier must be in the destination block: wid=%0d lanes=0x%0h (#%0d)",
+            $time, INSTANCE_ID, hdr_r.wid, async_mbad, hdr_r.uuid))
 `endif
 
 endmodule

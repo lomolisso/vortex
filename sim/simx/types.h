@@ -385,6 +385,14 @@ enum class LsuType {
   FENCE
 #ifdef VX_CFG_EXT_DLMEM_ENABLE
   , CFENCE  // conditional CTA fence: the first uop of a release
+#ifdef VX_CFG_EXT_MBAR_ENABLE
+  // st.async / red.async.add: a store or add into a cluster block that
+  // completes on that block's mbarrier, which is the instruction's rs3.
+  , ST_ASYNC
+  , RED_ASYNC
+#else
+#line 382
+#endif
 #else
 #line 380
 #endif
@@ -403,6 +411,12 @@ inline std::ostream &operator<<(std::ostream &os, const LsuType& type) {
   case LsuType::FENCE:  os << "FENCE"; break;
 #ifdef VX_CFG_EXT_DLMEM_ENABLE
   case LsuType::CFENCE: os << "CFENCE"; break;
+#ifdef VX_CFG_EXT_MBAR_ENABLE
+  case LsuType::ST_ASYNC:  os << "ST_ASYNC"; break;
+  case LsuType::RED_ASYNC: os << "RED_ASYNC"; break;
+#else
+#line 400
+#endif
 #else
 #line 393
 #endif
@@ -501,6 +515,12 @@ struct MemFlags {
       // fence_cta: with fence, a CTA fence; the first cache level drains it, nothing below sees it.
       uint32_t lacc              : 1;   // bit 23
       uint32_t fence_cta         : 1;   // bit 24
+#ifdef VX_CFG_EXT_MBAR_ENABLE
+      // async: an st.async / red.async, whose amo_cmp lane is its mbarrier.
+      uint32_t async             : 1;   // bit 25
+#else
+#line 469
+#endif
 #else
 #line 464
 #endif
@@ -1213,8 +1233,8 @@ struct LsuReq {
   std::vector<uint64_t> addrs;
   std::vector<std::shared_ptr<mem_block_t>> data;
   std::vector<uint64_t> byteen;
-  // Comparand per lane. Only compare-and-swap reads it; it is a separate
-  // field because the data operand is already carrying the swap value.
+  // The third operand per lane: compare-and-swap's comparand (the data
+  // carries the swap value), or the mbarrier of an st.async / red.async.
   std::vector<uint64_t> amo_cmp;
   BitVector<> mask;
   std::vector<uint32_t> tids;

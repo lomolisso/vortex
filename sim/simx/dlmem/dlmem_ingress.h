@@ -75,6 +75,16 @@ private:
 #ifdef DXA_MBAR_ENABLE
     bool posted = false;   // a COMPL's complete_tx: its response is dropped
 #endif
+#ifdef VX_CFG_EXT_MBAR_ENABLE
+    // An st.async / red.async: complete_tx of `bytes` on the mbarrier at
+    // mbar_addr follows its access's commit, before its ack.
+    bool     mbar = false;
+    uint64_t mbar_addr = 0;
+    uint32_t bytes = 0;
+    bool     cx_sent = false;
+#else
+#line 77
+#endif
   };
 
   Config config_;
@@ -86,6 +96,12 @@ private:
   void check_slot(const DlmemReqPkt& pkt) const;
 
   std::vector<bool> slot_valid_;
+#endif
+#ifdef VX_CFG_EXT_MBAR_ENABLE
+  bool cx_valid() const;
+  MemReq complete_tx(uint32_t s) const;
+#else
+#line 89
 #endif
 
   friend class SimObject<DlmemIngress>;

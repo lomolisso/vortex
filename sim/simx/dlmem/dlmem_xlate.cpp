@@ -173,6 +173,14 @@ uint32_t DlmemXlate::translate(LsuReq& req, const dlmem_ref::Row& row) {
       global_lane = i;
     }
 #endif
+#ifdef VX_CFG_EXT_MBAR_ENABLE
+    if (req.flags.async) {
+      this->translate_async(req, i, x);
+      continue;
+    }
+#else
+#line 175
+#endif
     if (x.kind == dlmem_ref::NONE)
       continue;
     req.addrs.at(i) = x.out_addr;
@@ -225,3 +233,45 @@ uint32_t DlmemXlate::translate(LsuReq& req, const dlmem_ref::Row& row) {
   }
   return remote;
 }
+
+#ifdef VX_CFG_EXT_MBAR_ENABLE
+// An st.async / red.async lane names a block of the cluster, which may be on
+// this core, and an mbarrier in that same block. Every such lane leaves through
+// the egress, the issuer's own core included, and none is counted by the
+// trackers: no fence, barrier or exit waits for it.
+void DlmemXlate::translate_async(LsuReq& req, uint32_t lane,
+                                 const dlmem_ref::Xlate& x) {
+  const uint64_t addr = req.addrs.at(lane);
+  const uint64_t mbar = req.amo_cmp.at(lane);
+  const uint32_t rbits = dlmem_ref::rank_bits(cfg_);
+  const uint32_t wl = cfg_.lmem_log + rbits;
+  auto report = [&](const char* msg, uint64_t a) {
+    std::cerr << SimPlatform::instance().cycles() << ": " << this->name() << " " << msg
+              << ": wid=" << req.wid << " cta=" << req.cta_id << " lane=" << lane << " addr=0x" << std::hex
+              << (a & ~uint64_t(LSU_WORD_SIZE - 1)) << std::dec << " (#" << req.uuid << ")" << std::endl;
+  };
+  if (x.kind == dlmem_ref::NONE) {
+    report("st.async needs a cluster window address", addr);
+    std::abort();
+  }
+  // The mbarrier must name the address's rank, at an offset inside its block.
+  const bool mwin  = (mbar >> wl) == (cfg_.dlmem_base >> wl);
+  const bool mbad  = !mwin || (((addr ^ mbar) >> cfg_.lmem_log) & dlmem_ref::low_mask(rbits)) != 0;
+  const uint64_t moff = mbar & dlmem_ref::low_mask(cfg_.lmem_log);
+  const bool moob  = !mbad && moff >= stride_;
+  if (x.kind == dlmem_ref::OOB || moob) {
+    report("DLMEM access out of bounds", (x.kind == dlmem_ref::OOB) ? addr : mbar);
+  }
+  if (mbad) {
+    report("st.async mbarrier must be in the destination block", mbar);
+  }
+  if (x.kind == dlmem_ref::OOB || moob || mbad) {
+    std::abort();
+  }
+  const uint64_t peer_base = x.lmem_byte - (addr & dlmem_ref::low_mask(cfg_.lmem_log));
+  req.addrs.at(lane)   = dlmem_ref::remote_addr(cfg_, x.core, x.lmem_byte);
+  req.amo_cmp.at(lane) = (peer_base + moff) & ~uint64_t(LSU_WORD_SIZE - 1);
+  req.dlmem_remote.set(lane);
+  req.dlmem_core.at(lane) = x.core;
+}
+#endif

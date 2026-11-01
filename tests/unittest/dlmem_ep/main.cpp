@@ -24,10 +24,13 @@
 #include "dlmem/dlmem_xbar.h"
 #include "mem_block_pool.h"
 #include "dlmem_ep_bench.h"
+#include <iterator>
 #ifdef DXA_MBAR_ENABLE
 // The row-flit schedule the RTL testbench runs, shared with it.
 #include "../../../hw/unittest/dlmem_ep/dlmem_rows_bench.h"
 #endif
+// The st.async / red.async schedule the RTL testbench runs, shared with it.
+#include "../../../hw/unittest/dlmem_ep/dlmem_async_bench.h"
 
 using namespace vortex;
 
@@ -596,6 +599,257 @@ int run_rows(const std::string& mode, const std::vector<uint32_t>& seeds, uint32
 }
 #endif
 
+// The same endpoints and networks driven by the st.async / red.async bench:
+// each core's first LSU block offers translated async lanes to its egress,
+// which sends every one through the network, its own core's included; the
+// bench is the local memory behind each ingress. A response lands in the
+// egress at the end of a cycle, and its sink takes it in the next one: that is
+// its ejection.
+class AsyncDut final : public async::Dut {
+public:
+  using ReqSwitch = DlmemSocketSwitch<DlmemReqPkt>;
+  using RspSwitch = DlmemSocketSwitch<DlmemRspPkt>;
+  using ReqXbar = DlmemXbar<DlmemReqPkt>;
+  using RspXbar = DlmemXbar<DlmemRspPkt>;
+
+  explicit AsyncDut(Variant variant)
+    : req_sent_(ep::NCC, false)
+    , had_lmem_(ep::NCC, false)
+    , ack_ej_(ep::NCC, 0)
+    , data_ej_(ep::NCC, 0)
+    , ack_land_(ep::NCC, 0)
+    , data_land_(ep::NCC, 0)
+    , slot_op_(ep::NCC, std::vector<MemOp>(2 * ep::SLOTS, MemOp::ST)) {
+    auto& platform = SimPlatform::instance();
+    platform.set_num_workers(variant == Variant::Threads ? SIMX_NUM_WORKERS : 1);
+    const uint32_t S = ep::SOCKET_SIZE;
+    for (uint32_t s = 0; s < ep::NUM_SOCKETS; ++s) {
+      uint32_t domain = (variant == Variant::Flat) ? 0 : platform.alloc_domain();
+      SimPlatform::DomainScope scope(domain);
+      for (uint32_t i = 0; i < S; ++i) {
+        uint32_t c = s * S + i;
+        DlmemEgress::Config cfg;
+        cfg.core_id = c;
+        cfg.ncc = ep::NCC;
+        cfg.lmem_log = ep::LMEM_LOG;
+        cfg.dlmem_base = ep::DLMEM_BASE;
+        cfg.num_blocks = ep::NB;
+        cfg.num_lanes = ep::NL;
+        cfg.store_credits = ep::CREDITS;
+        cfg.pending_size = ep::PENDING;
+        cfg.lrsc_assert = false;
+        egress_.push_back(DlmemEgress::Create(("dlmem-egress" + std::to_string(c)).c_str(), cfg));
+      }
+      req_sw_.push_back(ReqSwitch::Create(("dlmem-req-switch" + std::to_string(s)).c_str(), s, S, ep::NUM_SOCKETS));
+      for (uint32_t i = 0; i < S; ++i) {
+        uint32_t c = s * S + i;
+        DlmemIngress::Config cfg;
+        cfg.num_slots = ep::SLOTS;
+        cfg.lmem_base = ep::LMEM_BASE;
+        ingress_.push_back(DlmemIngress::Create(("dlmem-ingress" + std::to_string(c)).c_str(), cfg));
+      }
+      rsp_sw_.push_back(RspSwitch::Create(("dlmem-rsp-switch" + std::to_string(s)).c_str(), s, S, ep::NUM_SOCKETS));
+      for (uint32_t i = 0; i < S; ++i) {
+        uint32_t c = s * S + i;
+        egress_[c]->NetReqOut.bind(&req_sw_[s]->CoreIn.at(i));
+        req_sw_[s]->CoreOut.at(i).bind(&ingress_[c]->NetReqIn);
+        ingress_[c]->NetRspOut.bind(&rsp_sw_[s]->CoreIn.at(i));
+        rsp_sw_[s]->CoreOut.at(i).bind(&egress_[c]->NetRspIn);
+        rsp_sw_[s]->CoreOut.at(i).tx_callback([this, c](const DlmemRspPkt& rsp, uint64_t) {
+          (rsp.ack ? ack_land_ : data_land_).at(c) = 1;
+        });
+      }
+    }
+    if (ep::NUM_SOCKETS > 1) {
+      req_xbar_ = ReqXbar::Create("dlmem-req-xbar", S, ep::NUM_SOCKETS);
+      rsp_xbar_ = RspXbar::Create("dlmem-rsp-xbar", S, ep::NUM_SOCKETS);
+      for (uint32_t s = 0; s < ep::NUM_SOCKETS; ++s) {
+        dlmem_connect(req_sw_[s].get(), req_xbar_.get(), s);
+        dlmem_connect(rsp_sw_[s].get(), rsp_xbar_.get(), s);
+      }
+    }
+    platform.reset();
+  }
+
+  ~AsyncDut() override {
+    egress_.clear();
+    ingress_.clear();
+    req_sw_.clear();
+    rsp_sw_.clear();
+    req_xbar_.reset();
+    rsp_xbar_.reset();
+    SimPlatform::instance().finalize();
+  }
+
+  uint32_t amo_add() const override {
+    return ep::OP_ADD;
+  }
+
+  uint32_t amo_complete_tx() const override {
+    return ep::OP_MBAR_COMPLETE_TX;
+  }
+
+  void cycle(const async::In& in, async::Out& out) override {
+    auto& platform = SimPlatform::instance();
+    for (uint32_t c = 0; c < ep::NCC; ++c) {
+      if (in.req[c] && !req_sent_[c]) {
+        egress_[c]->ReqIn.at(0).send(this->make_req(c, *in.req[c]), 0);
+        req_sent_[c] = true;
+      }
+      had_lmem_[c] = !ingress_[c]->LmemReqOut.empty();
+      if (in.lrsp_valid[c]) {
+        uint32_t tag = in.lrsp_tag[c];
+        MemRsp rsp(tag);
+        if (slot_op_[c].at(tag) != MemOp::ST) {
+          auto blk = make_mem_block();
+          std::memset(blk->data(), 0, blk->size());
+          rsp.data = blk;
+        }
+        ingress_[c]->LmemRspIn.send(rsp, 0);
+      }
+      ack_ej_[c] = ack_land_[c];
+      data_ej_[c] = data_land_[c];
+      ack_land_[c] = 0;
+      data_land_[c] = 0;
+    }
+
+    platform.tick();
+
+    for (uint32_t c = 0; c < ep::NCC; ++c) {
+      out.req_fire[c] = req_sent_[c] && egress_[c]->ReqIn.at(0).empty();
+      if (out.req_fire[c]) {
+        req_sent_[c] = false;
+      }
+      auto& q = out.lmem[c];
+      q = async::LmemV();
+      if (had_lmem_[c] && in.lmem_ready[c]) {
+        auto req = ingress_[c]->LmemReqOut.peek();
+        ingress_[c]->LmemReqOut.pop();
+        uint64_t lb = req.addr - ep::LMEM_BASE;
+        q.fire = true;
+        q.rw = (req.op == MemOp::ST);
+        q.amo = memop_is_amo_rmw(req.op) || memop_is_mbar(req.op);
+        q.amo_op = to_amo_op(req.op);
+        q.uns = req.flags.amo_unsigned;
+        q.waddr = uint32_t(lb >> 3);
+        q.byteen = uint8_t(req.byteen >> word_off(q.waddr));
+        q.data = load_word(req.data, word_off(q.waddr));
+        q.hart = req.hart_id;
+        q.tag = req.tag;
+        slot_op_[c].at(q.tag) = req.op;
+      }
+      out.ack_ej[c] = ack_ej_[c];
+      out.data_ej[c] = data_ej_[c];
+      out.wt_ack[c] = 0;
+      while (!egress_[c]->AckOut.empty()) {
+        egress_[c]->AckOut.pop();
+        out.wt_ack[c] = 1;
+      }
+      while (!egress_[c]->DoneOut.empty()) {
+        egress_[c]->DoneOut.pop();
+      }
+      out.eg_empty[c] = egress_[c]->empty();
+      out.in_empty[c] = ingress_[c]->empty();
+    }
+  }
+
+private:
+  LsuReq make_req(uint32_t c, const async::Req& v) {
+    LsuReq r(ep::NL);
+    const async::Lane* first = v.lanes.at(__builtin_ctz(v.mask));
+    r.op = first->red ? MemOp::AMO_ADD : MemOp::ST;
+    r.flags.async = 1;
+    for (uint32_t l = 0; l < ep::NL; ++l) {
+      const async::Lane* lv = v.lanes[l];
+      if (!lv) {
+        continue;
+      }
+      uint64_t lb = uint64_t(lv->waddr) * 8 + __builtin_ctz(lv->byteen);
+      uint32_t off = word_off(lv->waddr);
+      r.mask.set(l);
+      r.addrs[l] = ep::DLMEM_BASE | (uint64_t(lv->dst) << ep::LMEM_LOG) | lb;
+      r.byteen[l] = uint64_t(lv->byteen) << off;
+      auto blk = make_mem_block();
+      std::memset(blk->data(), 0, blk->size());
+      for (uint32_t i = 0; i < 8; ++i) {
+        if (lv->byteen >> i & 1) {
+          (*blk)[off + i] = uint8_t(lv->data >> (8 * i));
+        }
+      }
+      r.data[l] = blk;
+      r.amo_cmp[l] = uint64_t(lv->mbar) * 8;
+      r.tids[l] = l;
+      r.dlmem_remote.set(l);
+      r.dlmem_core[l] = lv->dst;
+    }
+    r.cid = c;
+    r.wid = v.wid;
+    return r;
+  }
+
+  std::vector<DlmemEgress::Ptr> egress_;
+  std::vector<DlmemIngress::Ptr> ingress_;
+  std::vector<ReqSwitch::Ptr> req_sw_;
+  std::vector<RspSwitch::Ptr> rsp_sw_;
+  ReqXbar::Ptr req_xbar_;
+  RspXbar::Ptr rsp_xbar_;
+  std::vector<bool> req_sent_;
+  std::vector<bool> had_lmem_;
+  std::vector<uint8_t> ack_ej_;
+  std::vector<uint8_t> data_ej_;
+  std::vector<uint8_t> ack_land_;
+  std::vector<uint8_t> data_land_;
+  std::vector<std::vector<MemOp>> slot_op_;   // core, local-memory tag -> op
+};
+
+// Runs an async mode on every variant; all must write the same latency rows.
+int run_async(const std::string& mode, const std::vector<uint32_t>& seeds, uint32_t reqs,
+              const std::vector<Variant>& variants, const std::string& csv) {
+  for (auto seed : (mode == "async") ? std::vector<uint32_t>{seeds.front()} : seeds) {
+    std::string ref_csv;
+    for (auto variant : variants) {
+      async::Options opts;
+      opts.mode = mode;
+      opts.seed = seed;
+      opts.reqs = reqs;
+      AsyncDut dut(variant);
+      async::Bench bench(dut, opts);
+      uint32_t failures = bench.run();
+      if (failures != 0) {
+        std::cout << "FAILED: mode " << mode << " seed " << seed << " (" << variant_name(variant) << "): "
+                  << bench.first_failure() << " [" << failures << " check(s)]" << std::endl;
+        return 1;
+      }
+      std::string path = csv.empty() ? std::string("async_tmp.csv") : csv;
+      if (variant != Variant::Flat) {
+        path += std::string(".") + variant_name(variant);
+      }
+      bench.write_csv(path);
+      std::ifstream ifs(path);
+      std::string text((std::istreambuf_iterator<char>(ifs)), std::istreambuf_iterator<char>());
+      if (variant == Variant::Flat) {
+        ref_csv = text;
+        std::cout << "mode " << mode << " seed " << seed << ": cycles=" << bench.cycles() << " lanes=" << bench.lanes()
+                  << " max_pending=" << bench.max_inflight();
+      } else {
+        std::remove(path.c_str());
+        if (text != ref_csv) {
+          std::cout << std::endl << "FAILED: mode " << mode << " seed " << seed << ": variant '"
+                    << variant_name(variant) << "' differs from 'flat'" << std::endl;
+          return 1;
+        }
+      }
+    }
+    std::cout << std::endl;
+    if (mode == "async" && !csv.empty()) {
+      std::cout << "wrote " << csv << std::endl;
+    } else {
+      std::remove(csv.empty() ? "async_tmp.csv" : csv.c_str());
+    }
+  }
+  return 0;
+}
+
 struct Result {
   uint32_t failures = 0;
   std::string failure;
@@ -642,7 +896,7 @@ void usage() {
 #ifdef DXA_MBAR_ENABLE
                "|rows|rows-random|rows-retired"
 #endif
-               "]\n"
+               "|async|async-random]\n"
                "                     [--seed=N] [--reqs=N] [--csv=FILE] [--trace=FILE] [--lrsc-assert]\n"
                "  --lrsc-assert: a remote LR/SC aborts, as in the core, instead of the defined fallback\n";
 }
@@ -657,6 +911,7 @@ int main(int argc, char** argv) {
   std::string trace_path;
   bool lrsc_assert = false;
   std::string row_mode;
+  std::string async_mode;
   for (int a = 1; a < argc; ++a) {
     std::string arg = argv[a];
     auto val = [&](const char* k) -> const char* {
@@ -670,6 +925,10 @@ int main(int argc, char** argv) {
         continue;
       }
 #endif
+      if (std::string(v).compare(0, 5, "async") == 0) {
+        async_mode = v;
+        continue;
+      }
       if (std::string(v) != "all") {
         if (std::find(modes.begin(), modes.end(), v) == modes.end()) {
           usage();
@@ -725,6 +984,16 @@ int main(int argc, char** argv) {
     return 0;
   }
 #endif
+
+  if (!async_mode.empty()) {
+    std::cout << "dlmem_ep async: sockets=" << async::NUM_SOCKETS << " socket_size=" << async::SOCKET_SIZE
+              << " lanes=" << ep::NL << " warps=" << ep::NW << " workers=" << SIMX_NUM_WORKERS << std::endl;
+    if (run_async(async_mode, seeds, reqs, variants, csv) != 0) {
+      return 1;
+    }
+    std::cout << "PASSED" << std::endl;
+    return 0;
+  }
 
   std::cout << "dlmem_ep: sockets=" << ep::NUM_SOCKETS << " socket_size=" << ep::SOCKET_SIZE
             << " blocks=" << ep::NB << " lanes=" << ep::NL << " warps=" << ep::NW

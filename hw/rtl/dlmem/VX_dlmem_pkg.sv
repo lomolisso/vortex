@@ -57,6 +57,13 @@ package VX_dlmem_pkg;
     // tag carries the destination CTA slot, and nothing answers either kind.
     localparam [1:0] DLMEM_OP_DXA = 2'd3;
 `endif
+`ifdef VX_CFG_EXT_MBAR_ENABLE
+    // A translated st.async/red.async lane leaves for the egress with its
+    // mbarrier word address above the core field and the top address bit set;
+    // no real remote address reaches that bit.
+    localparam DLMEM_ASYNC_BIT    = LSU_ADDR_WIDTH - 1;
+    localparam DLMEM_ASYNC_MB_LSB = DLMEM_LMEM_AW + DLMEM_CORE_W;
+`endif
 
     // Request network packet; the fabric dst is the target core.
     typedef struct packed {
@@ -71,12 +78,17 @@ package VX_dlmem_pkg;
     `ifdef VX_CFG_EXT_ZACAS_ENABLE
         logic [`VX_CFG_XLEN-1:0]   amo_cmp;
     `endif
+    `ifdef VX_CFG_EXT_MBAR_ENABLE
+        // st.async/red.async: after the access, complete_tx(bytes) on this mbarrier word.
+        logic                      mbar_valid;
+        logic [DLMEM_LMEM_AW-1:0]  mbar_addr;
+    `endif
         logic [DLMEM_TAG_W-1:0]    tag;          // LD/AMO: source pending index; ST: source warp id
     } dlmem_req_pkt_t;
 
     // Response network packet; the fabric dst is the requesting core.
     typedef struct packed {
-        logic                      ack;          // 1: store committed, data unused; 0: LD/AMO data
+        logic                      ack;          // 1: store committed, data unused (with MBAR, bit 0 marks an async access); 0: LD/AMO data
         logic [DLMEM_TAG_W-1:0]    tag;
         logic [`VX_CFG_XLEN-1:0]   data;         // full bank word, as VX_local_mem returns it
     } dlmem_rsp_pkt_t;

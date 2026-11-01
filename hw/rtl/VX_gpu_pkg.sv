@@ -1042,7 +1042,13 @@ package VX_gpu_pkg;
     // Spends two of the struct's spare padding bits -- INST_ARGS_BITS is
     // unchanged (the PACKAGE_ASSERT below proves it).
     typedef struct packed {
+    `ifdef VX_CFG_EXT_MBAR_ENABLE
+        // st.async/red.async: a posted store (or add) to a cluster peer that
+        // completes on the mbarrier named by rs3 in the destination block.
+        logic                       is_async;
+    `else
         logic [(INST_ARGS_BITS-1-1-12-2-1-1-$bits(amo_op_e)-2-2)-1:0] __padding;
+    `endif
         logic [1:0]                 export_mask;
         logic                       amo_valid;
         logic                       amo_unsigned;
@@ -1534,6 +1540,11 @@ package VX_gpu_pkg;
         logic [`VX_CFG_NUM_LSU_LANES-1:0][LSU_ADDR_WIDTH-1:0]       addr;
         logic [`VX_CFG_NUM_LSU_LANES-1:0][MEM_ATTR_WIDTH-1:0]       attr;
         logic [`VX_CFG_NUM_LSU_LANES-1:0][(LSU_WORD_SIZE*8)-1:0]    data;
+    `ifdef VX_CFG_EXT_MBAR_ENABLE
+        // st.async/red.async: each lane's mbarrier word address (rs3), for the DLMEM translation.
+        logic                                                       is_async;
+        logic [`VX_CFG_NUM_LSU_LANES-1:0][LSU_ADDR_WIDTH-1:0]       mbar_addr;
+    `endif
         logic [LSU_CLIENT_TAG_WIDTH-1:0]                            tag;
     } lsu_req_data_t;
 

@@ -206,6 +206,9 @@ module VX_decode import
         // loads/stores/fences/packed-loads don't propagate 'x through
         op_args.lsu.amo_valid = 1'b0;
     `endif
+    `ifdef VX_CFG_EXT_MBAR_ENABLE
+        op_args.lsu.is_async = 1'b0;
+    `endif
     `ifdef VX_CFG_EXT_OM_ENABLE
         // Same reason: op_args defaults to 'x, and a stale export_mask makes
         // VX_gfx_uops expand an ORDINARY store into an aperture record --
@@ -418,7 +421,7 @@ module VX_decode import
                 end
             `ifdef VX_CFG_EXT_MBAR_ENABLE
                 // mbarrier ops: a .D AMO on a local-memory object, the op in funct3.
-                // funct7 1 is the relaxed arrive/arrive_tx; other funct7 and funct3 6 are reserved.
+                // funct7 1 is the relaxed arrive/arrive_tx; other funct7 are reserved.
                 if ((funct7 == 7'd0 && funct3 <= 3'd5) || (funct7 == 7'd1 && funct3 <= 3'd1)) begin
                     ex_type = EX_LSU;
                     op_type = INST_OP_BITS'({1'b0, LSU_FMT_D});
@@ -437,6 +440,25 @@ module VX_decode import
                     `USED_IREG (rd);
                     `USED_IREG (rs1);
                     `USED_IREG (rs2);
+                end
+                // st.async / red.async.add: R4, rs1 = window address, rs2 = data,
+                // rs3 = window mbarrier, funct2 = {add, 64-bit}; posted, no rd.
+                if (funct3 == 3'd6) begin
+                    ex_type = EX_LSU;
+                    op_type = INST_OP_BITS'({1'b1, (funct2[0] ? LSU_FMT_D : LSU_FMT_W)});
+                    op_args.lsu.is_store     = 1;
+                    op_args.lsu.is_float     = 0;
+                    op_args.lsu.pack         = 0;
+                    op_args.lsu.offset       = 0;
+                    op_args.lsu.amo_valid    = funct2[1];
+                    op_args.lsu.amo_op       = AMO_OP_ADD;
+                    op_args.lsu.amo_unsigned = 1'b0;
+                    op_args.lsu.amo_aq       = 1'b0;
+                    op_args.lsu.amo_rl       = 1'b0;
+                    op_args.lsu.is_async     = 1'b1;
+                    `USED_IREG (rs1);
+                    `USED_IREG (rs2);
+                    `USED_IREG (rs3);
                 end
             `endif
             end

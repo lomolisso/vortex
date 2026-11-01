@@ -24,7 +24,8 @@
 // compare_latency.py). Without --mode every mode runs, with seeds 1 and 2.
 //
 // Built with LRSC_ASSERT=1, a remote LR or SC must stop the simulation on the
-// egress assertion, as it would in the core.
+// egress assertion, as it would in the core. --mode=async[-random] runs the
+// st.async/red.async bench (dlmem_async_bench.h), --mode=rows* the DXA rows.
 
 #include "vl_simulator.h"
 #include "VVX_dlmem_ep_top.h"
@@ -37,6 +38,7 @@
 #define DLMEM_EP_ROWS
 #include "dlmem_rows_bench.h"
 #endif
+#include "dlmem_async_bench.h"
 
 #include <iostream>
 #include <type_traits>
@@ -351,12 +353,150 @@ int run_rows(const std::string& mode, const std::vector<uint32_t>& seeds, uint32
 }
 #endif
 
+// The same endpoints driven by the st.async/red.async bench: each core's
+// first LSU port carries translated async lanes; the row ports stay idle.
+class AsyncRtlDut final : public async::Dut {
+public:
+  AsyncRtlDut() {
+    auto* t = sim_.operator->();
+    t->reset = 1;
+    this->drive(async::In());
+    for (int i = 0; i < 8; ++i) {
+      tick_ = sim_.step(tick_, 2);
+    }
+    t->reset = 0;
+    t->eval();
+    async_bit_ = t->cfg_async_bit;
+    mb_lsb_ = t->cfg_async_mb_lsb;
+    amo_add_ = t->cfg_amo_add;
+    amo_ctx_ = t->cfg_amo_complete_tx;
+  }
+
+  uint32_t amo_add() const override {
+    return amo_add_;
+  }
+
+  uint32_t amo_complete_tx() const override {
+    return amo_ctx_;
+  }
+
+  void cycle(const async::In& in, async::Out& out) override {
+    auto* t = sim_.operator->();
+    this->drive(in);
+    t->eval();
+
+    for (uint32_t c = 0; c < NCC; ++c) {
+      uint32_t p = c * NB;
+      out.req_fire[c] = (in.req[c] != nullptr) && get_bits(t->lsu_req_ready, p, 1);
+      auto& q = out.lmem[c];
+      q.fire = get_bits(t->lmem_req_valid, c, 1) && in.lmem_ready[c];
+      q.rw = get_bits(t->lmem_req_rw, c, 1);
+      q.amo = get_bits(t->lmem_req_amo, c, 1);
+      q.uns = get_bits(t->lmem_req_amo_unsigned, c, 1);
+      q.amo_op = uint32_t(get_bits(t->lmem_req_amo_op, c * 4, 4));
+      q.byteen = uint8_t(get_bits(t->lmem_req_byteen, c * 8, 8));
+      q.waddr = uint32_t(get_bits(t->lmem_req_addr, c * 32, 32));
+      q.hart = uint32_t(get_bits(t->lmem_req_hart_id, c * 32, 32));
+      q.tag = uint32_t(get_bits(t->lmem_req_tag, c * 8, 8));
+      q.data = get_bits(t->lmem_req_data, c * 64, 64);
+      bool ej = get_bits(t->rsp_ej_fire, c, 1);
+      bool ack = get_bits(t->rsp_ej_ack, c, 1);
+      out.ack_ej[c] = ej && ack;
+      out.data_ej[c] = ej && !ack;
+      out.wt_ack[c] = get_bits(t->ack_valid, c, 1);
+    }
+
+    tick_ = sim_.step(tick_, 2);
+    t->eval();
+
+    for (uint32_t c = 0; c < NCC; ++c) {
+      out.eg_empty[c] = get_bits(t->egress_empty, c, 1);
+      out.in_empty[c] = get_bits(t->ingress_empty, c, 1);
+    }
+  }
+
+private:
+  void drive(const async::In& in) {
+    auto* t = sim_.operator->();
+    for (uint32_t p = 0; p < NP; ++p) {
+      uint32_t c = p / NB;
+      const async::Req* r = (p % NB == 0) ? in.req[c] : nullptr;
+      set_bits(t->lsu_req_valid, p, 1, r != nullptr);
+      set_bits(t->lsu_req_rw, p, 1, r != nullptr);
+      set_bits(t->lsu_req_mask, p * NL, NL, r ? r->mask : 0);
+      set_bits(t->lsu_req_tag, p * 8, 8, r ? r->wid : 0);
+      for (uint32_t l = 0; l < NL; ++l) {
+        uint32_t i = p * NL + l;
+        const async::Lane* lv = r ? r->lanes[l] : nullptr;
+        uint64_t addr = lv ? ((1ull << async_bit_) | (uint64_t(lv->mbar) << mb_lsb_)
+                              | (uint64_t(lv->dst) << async::LMEM_AW) | lv->waddr) : 0;
+        set_bits(t->lsu_req_addr, i * 64, 64, addr);
+        set_bits(t->lsu_req_data, i * 64, 64, lv ? lv->data : 0);
+        set_bits(t->lsu_req_byteen, i * 8, 8, lv ? lv->byteen : 0);
+        set_bits(t->lsu_req_amo, i, 1, lv && lv->red);
+        set_bits(t->lsu_req_amo_op, i * 4, 4, (lv && lv->red) ? amo_add_ : 0);
+        set_bits(t->lsu_req_amo_unsigned, i, 1, 0);
+        set_bits(t->lsu_req_amo_cmp, i * 64, 64, 0);
+        set_bits(t->lsu_req_hart_id, i * 32, 32, lv ? lv->hart : 0);
+      }
+      set_bits(t->lsu_rsp_ready, p, 1, 1);
+      set_bits(t->wt_inc_valid, p, 1, 0);
+    }
+    for (uint32_t c = 0; c < NCC; ++c) {
+      set_bits(t->lmem_req_ready, c, 1, in.lmem_ready[c]);
+      set_bits(t->lmem_rsp_valid, c, 1, in.lrsp_valid[c]);
+      set_bits(t->lmem_rsp_tag, c * 8, 8, in.lrsp_tag[c]);
+      set_bits(t->lmem_rsp_data, c * 64, 64, 0);
+    #ifdef DLMEM_EP_ROWS
+      set_bits(t->slot_valid, c * NW, NW, ~0ull);
+      set_bits(t->dma_ready, c, 1, 1);
+    #endif
+    }
+  #ifdef DLMEM_EP_ROWS
+    for (uint32_t s = 0; s < ep::NUM_SOCKETS; ++s) {
+      set_bits(t->row_valid, s, 1, 0);
+    }
+  #endif
+  }
+
+  vl_simulator<VVX_dlmem_ep_top> sim_;
+  uint64_t tick_ = 0;
+  uint32_t async_bit_ = 0;
+  uint32_t mb_lsb_ = 0;
+  uint32_t amo_add_ = 0;
+  uint32_t amo_ctx_ = 0;
+};
+
+int run_async(const std::string& mode, const std::vector<uint32_t>& seeds, uint32_t reqs, const std::string& csv) {
+  for (auto seed : (mode == "async") ? std::vector<uint32_t>{seeds.front()} : seeds) {
+    async::Options opts;
+    opts.mode = mode;
+    opts.seed = seed;
+    opts.reqs = reqs;
+    AsyncRtlDut dut;
+    async::Bench bench(dut, opts);
+    uint32_t failures = bench.run();
+    if (failures != 0) {
+      std::cout << "FAILED: mode " << mode << " seed " << seed << ": " << bench.first_failure()
+                << " [" << failures << " check(s)]" << std::endl;
+      return 1;
+    }
+    std::cout << "mode " << mode << " seed " << seed << ": cycles=" << bench.cycles() << " lanes=" << bench.lanes()
+              << " max_pending=" << bench.max_inflight() << std::endl;
+    if (mode == "async" && !csv.empty()) {
+      bench.write_csv(csv);
+      std::cout << "wrote " << csv << std::endl;
+    }
+  }
+  return 0;
+}
+
 void usage(const char* prog) {
   std::cerr << "usage: " << prog << " [--mode=random|hotspot|storeflood|loadflood|backpressure|lrsc|latency|all"
 #ifdef DLMEM_EP_ROWS
                "|rows|rows-random|rows-retired"
 #endif
-               "]\n"
+               "|async|async-random]\n"
                "       [--seed=N] [--reqs=N] [--csv=FILE] [--trace=FILE]" << std::endl;
 }
 
@@ -371,6 +511,7 @@ int main(int argc, char** argv) {
   std::string csv;
   std::string trace_path;
   std::string row_mode;
+  std::string async_mode;
   for (int i = 1; i < argc; ++i) {
     const char* a = argv[i];
     if (a[0] == '+') {
@@ -385,6 +526,10 @@ int main(int argc, char** argv) {
           continue;
         }
       #endif
+        if (m.compare(0, 5, "async") == 0) {
+          async_mode = m;
+          continue;
+        }
         if (std::find(modes.begin(), modes.end(), m) == modes.end()) {
           usage(argv[0]);
           return 2;
@@ -420,6 +565,16 @@ int main(int argc, char** argv) {
     return 0;
   }
 #endif
+
+  if (!async_mode.empty()) {
+    std::cout << "dlmem_ep async: sockets=" << async::NUM_SOCKETS << " socket_size=" << async::SOCKET_SIZE
+              << " lanes=" << NL << " warps=" << NW << std::endl;
+    if (run_async(async_mode, seeds, reqs, csv) != 0) {
+      return 1;
+    }
+    std::cout << "PASSED" << std::endl;
+    return 0;
+  }
 
   std::cout << "dlmem_ep: sockets=" << ep::NUM_SOCKETS << " socket_size=" << ep::SOCKET_SIZE
             << " blocks=" << NB << " lanes=" << NL << " warps=" << NW << " zacas=" << ep::ZACAS

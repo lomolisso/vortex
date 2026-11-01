@@ -450,6 +450,22 @@ define dlmem_ep_rows_case
 	python3 $(VORTEX_HOME)/hw/unittest/dlmem_ep/compare_latency.py \
 		dlmem_ep/rows_$(1).csv dlmem_ep/simx_rows_$(1).csv
 endef
+# st.async / red.async lanes (mbarriers): each core sends translated async
+# lanes into every core, its own included; each destination ingress performs
+# the store or add, then after its response a complete_tx of its bytes on the
+# lane's mbarrier, then acks; no ack reaches a store tracker. Random lanes
+# under local-memory stalls and response delays, then the fixed schedule, whose
+# CSV must match the SimX endpoints' run row for row.
+# $(1)=shape tag of the SimX test $(2)=that shape's CONFIGS $(3)=seed
+define dlmem_ep_async_case
+	$(MAKE) -C dlmem_ep clean
+	$(MAKE) -C dlmem_ep CONFIGS="$(DLMEM_EP_CFG) $(2)"
+	$(MAKE) -C dlmem_ep run CONFIGS="$(DLMEM_EP_CFG) $(2)" OPTS="--mode=async-random --seed=$(3)"
+	$(MAKE) -C dlmem_ep run CONFIGS="$(DLMEM_EP_CFG) $(2)" OPTS="--mode=async --csv=async_$(1).csv"
+	$(MAKE) -C $(DLMEM_EP_SIMX) run SHAPES=$(1) OPTS="--mode=async --csv=$(CURDIR)/dlmem_ep/simx_async_$(1).csv"
+	python3 $(VORTEX_HOME)/hw/unittest/dlmem_ep/compare_latency.py \
+		dlmem_ep/async_$(1).csv dlmem_ep/simx_async_$(1).csv
+endef
 run-dlmem-ep:
 ifeq ($(XLEN),64)
 	$(call dlmem_ep_case,s1214,-DVX_CFG_NUM_CORES=2 -DVX_CFG_SOCKET_SIZE=2 -DVX_CFG_NUM_LSU_LANES=4,1)
@@ -473,6 +489,11 @@ ifeq ($(XLEN),64)
 	$(call dlmem_ep_rows_case,s4214,-DVX_CFG_NUM_CORES=8 -DVX_CFG_SOCKET_SIZE=2 -DVX_CFG_NUM_LSU_LANES=4,14)
 	! dlmem_ep/dlmem_ep --mode=rows-retired > dlmem_ep/rows_retired.log 2>&1
 	grep -q "DXA write into a retired CTA slot" dlmem_ep/rows_retired.log
+	$(call dlmem_ep_async_case,s1214,-DVX_CFG_NUM_CORES=2 -DVX_CFG_SOCKET_SIZE=2 -DVX_CFG_NUM_LSU_LANES=4,21)
+	$(call dlmem_ep_async_case,s2114,-DVX_CFG_NUM_CORES=2 -DVX_CFG_SOCKET_SIZE=1 -DVX_CFG_NUM_LSU_LANES=4,22)
+	$(call dlmem_ep_async_case,s2224,-DVX_CFG_NUM_CORES=4 -DVX_CFG_SOCKET_SIZE=2 -DVX_CFG_ISSUE_WIDTH=2 \
+		-DVX_CFG_NUM_LSU_BLOCKS=2 -DVX_CFG_NUM_LSU_LANES=4,23)
+	$(call dlmem_ep_async_case,s4214,-DVX_CFG_NUM_CORES=8 -DVX_CFG_SOCKET_SIZE=2 -DVX_CFG_NUM_LSU_LANES=4,24)
 	$(MAKE) -C dlmem_ep clean
 endif
 

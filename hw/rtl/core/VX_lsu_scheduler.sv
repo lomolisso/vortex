@@ -87,6 +87,11 @@ module VX_lsu_scheduler import VX_gpu_pkg::*; #(
         assign client_if[i].rsp_valid = cli_rsp_valid[i];
         assign client_if[i].rsp_data  = cli_rsp_data[i];
         assign cli_rsp_ready[i] = client_if[i].rsp_ready;
+    `ifdef VX_CFG_EXT_MBAR_ENABLE
+        // Consumed by the DLMEM translation ahead of the scheduler.
+        `UNUSED_VAR (cli_req_data[i].is_async)
+        `UNUSED_VAR (cli_req_data[i].mbar_addr)
+    `endif
     end
 
     if (NUM_CLIENTS == 1) begin : g_no_arb

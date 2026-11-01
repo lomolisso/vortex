@@ -22,6 +22,11 @@
 // word goes straight to the local memory's DMA port, which commits it as it
 // accepts it, so the copy's completion, a complete_tx taken in a slot after
 // it, reaches its bank later; neither sends a response.
+// With MBAR, an st.async/red.async keeps its slot through two local-memory
+// requests on the same input: the access, then, once the access's response
+// has returned (after its bank commit), a complete_tx of its bytes on its
+// mbarrier, whose response is dropped. The ack follows the complete_tx's
+// acceptance and carries no data.
 module VX_dlmem_ingress import VX_gpu_pkg::*, VX_dlmem_pkg::*; #(
     parameter `STRING INSTANCE_ID = "",
     parameter NUM_SLOTS = DLMEM_INGRESS_SLOTS,
@@ -48,7 +53,12 @@ module VX_dlmem_ingress import VX_gpu_pkg::*, VX_dlmem_pkg::*; #(
     localparam RSP_DATAW  = DLMEM_CORE_W + DLMEM_RSP_DATAW;
 
     `STATIC_ASSERT (NUM_SLOTS >= 1, ("invalid parameter"))
+`ifdef VX_CFG_EXT_MBAR_ENABLE
+    // One more tag bit marks the complete_tx whose response is dropped.
+    `STATIC_ASSERT (SLOT_W + 1 <= LSU_TAG_WIDTH - UUID_WIDTH, ("dlmem ingress: local-memory tag too narrow"))
+`else
     `STATIC_ASSERT (SLOT_W <= LSU_TAG_WIDTH - UUID_WIDTH, ("dlmem ingress: local-memory tag too narrow"))
+`endif
 
     reg [NUM_SLOTS-1:0]                    busy_r;
     reg [NUM_SLOTS-1:0]                    done_r;
@@ -56,6 +66,12 @@ module VX_dlmem_ingress import VX_gpu_pkg::*, VX_dlmem_pkg::*; #(
     reg [NUM_SLOTS-1:0][DLMEM_CORE_W-1:0]  src_r;
     reg [NUM_SLOTS-1:0][DLMEM_TAG_W-1:0]   tag_r;
     reg [NUM_SLOTS-1:0][WORD_W-1:0]        data_r;
+`ifdef VX_CFG_EXT_MBAR_ENABLE
+    reg [NUM_SLOTS-1:0]                    async_r;
+    reg [NUM_SLOTS-1:0]                    cx_sent_r;
+    reg [NUM_SLOTS-1:0][DLMEM_LMEM_AW-1:0] mbar_addr_r;
+    reg [NUM_SLOTS-1:0][`CLOG2(LSU_WORD_SIZE+1)-1:0] bytes_r;
+`endif
 
     // Accept into the lowest free slot.
 
@@ -79,11 +95,12 @@ module VX_dlmem_ingress import VX_gpu_pkg::*, VX_dlmem_pkg::*; #(
     wire is_data  = is_row && ~req_pkt.amo_unsigned;
     wire is_compl = is_row && req_pkt.amo_unsigned;
 
-    wire lmem_req_valid = req_in_if.valid && ~is_data && free_valid;
+    wire cx_valid;
+    wire lmem_req_valid = req_in_if.valid && ~is_data && free_valid && ~cx_valid;
     wire lmem_req_ready;
     wire req_fire = lmem_req_valid && lmem_req_ready;
 
-    assign req_in_if.ready = is_data ? dma_out_if.req_ready : (free_valid && lmem_req_ready);
+    assign req_in_if.ready = is_data ? dma_out_if.req_ready : (free_valid && lmem_req_ready && ~cx_valid);
     `UNUSED_VAR (req_in_if.dst)
 
     // A data word is one bank's lane of a DMA beat.
@@ -113,6 +130,14 @@ module VX_dlmem_ingress import VX_gpu_pkg::*, VX_dlmem_pkg::*; #(
     assign dma_out_if.rsp_ready       = 1'b1;
     `UNUSED_VAR (dma_out_if.rsp_valid)
     `UNUSED_VAR (dma_out_if.rsp_data)
+`elsif VX_CFG_EXT_MBAR_ENABLE
+    wire cx_valid;
+    wire lmem_req_valid = req_in_if.valid && free_valid && ~cx_valid;
+    wire lmem_req_ready;
+    wire req_fire = lmem_req_valid && lmem_req_ready;
+
+    assign req_in_if.ready = free_valid && lmem_req_ready && ~cx_valid;
+    `UNUSED_VAR (req_in_if.dst)
 `else
     wire lmem_req_valid = req_in_if.valid && free_valid;
     wire lmem_req_ready;
@@ -143,6 +168,61 @@ module VX_dlmem_ingress import VX_gpu_pkg::*, VX_dlmem_pkg::*; #(
 
     wire [LSU_TAG_WIDTH-1:0] lmem_tag = {UUID_WIDTH'(0), (LSU_TAG_WIDTH-UUID_WIDTH)'(free_idx)};
 
+`ifdef VX_CFG_EXT_MBAR_ENABLE
+    // The oldest completed slot, if async, sends its complete_tx first; new
+    // requests wait, and the local memory never waits on the network.
+    wire [SLOT_W-1:0] head_slot;
+    wire              cpl_empty;
+    assign cx_valid = ~cpl_empty && async_r[head_slot] && ~cx_sent_r[head_slot];
+    wire cx_fire = cx_valid && lmem_req_ready;
+
+    // An atomic of hart 0.
+    localparam mem_bus_attr_t CX_ATTR = '{
+        is_addr_local: 1'b1,
+        amo: '{amo_valid: 1'b1, amo_op: AMO_OP_MBAR_COMPLETE_TX, default: '0},
+        default: '0
+    };
+    wire [LSU_TAG_WIDTH-1:0] cx_tag = {UUID_WIDTH'(0), (LSU_TAG_WIDTH-UUID_WIDTH)'({1'b1, head_slot})};
+
+    VX_elastic_buffer #(
+        .DATAW   (LMEM_DATAW),
+        .SIZE    (`TO_OUT_BUF_SIZE(OUT_BUF)),
+        .OUT_REG (`TO_OUT_BUF_REG(OUT_BUF))
+    ) lmem_req_buf (
+        .clk       (clk),
+        .reset     (reset),
+        .valid_in  (lmem_req_valid || cx_valid),
+        .ready_in  (lmem_req_ready),
+        .data_in   (cx_valid ? {
+            1'b0,
+            mbar_addr_r[head_slot],
+            WORD_W'(bytes_r[head_slot]),
+            {LSU_WORD_SIZE{1'b1}},
+            MEM_ATTR_WIDTH'(CX_ATTR),
+            cx_tag
+        } : {
+            (req_pkt.op == DLMEM_OP_ST),
+            req_pkt.addr,
+            req_pkt.data,
+            req_pkt.byteen,
+            MEM_ATTR_WIDTH'(lmem_attr),
+            lmem_tag
+        }),
+        .data_out  (lmem_bus_if.req_data),
+        .valid_out (lmem_bus_if.req_valid),
+        .ready_out (lmem_bus_if.req_ready)
+    );
+
+    // Local-memory responses complete their slot; they are never refused.
+    // A complete_tx's response completes nothing.
+
+    assign lmem_bus_if.rsp_ready = 1'b1;
+
+    wire [SLOT_W-1:0] rsp_slot = lmem_bus_if.rsp_data.tag.value[SLOT_W-1:0];
+    wire rsp_drop = lmem_bus_if.rsp_data.tag.value[SLOT_W];
+    wire lmem_rsp_fire = lmem_bus_if.rsp_valid && ~rsp_drop;
+    `UNUSED_VAR (lmem_bus_if.rsp_data.tag)
+`else
     VX_elastic_buffer #(
         .DATAW   (LMEM_DATAW),
         .SIZE    (`TO_OUT_BUF_SIZE(OUT_BUF)),
@@ -172,15 +252,26 @@ module VX_dlmem_ingress import VX_gpu_pkg::*, VX_dlmem_pkg::*; #(
     wire [SLOT_W-1:0] rsp_slot = lmem_bus_if.rsp_data.tag.value[SLOT_W-1:0];
     wire lmem_rsp_fire = lmem_bus_if.rsp_valid;
     `UNUSED_VAR (lmem_bus_if.rsp_data.tag)
+`endif
 
+`ifndef VX_CFG_EXT_MBAR_ENABLE
     wire [SLOT_W-1:0] head_slot;
     wire              cpl_empty, cpl_full;
+`else
+    wire              cpl_full;
+`endif
     wire              rsp_buf_ready;
 `ifdef DXA_MBAR_ENABLE
-    // A completion's slot frees in turn without a response.
+    // A completion's slot frees in turn without a response; an async slot's
+    // ack waits for its complete_tx.
     reg [NUM_SLOTS-1:0] posted_r;
-    wire              rsp_send = ~cpl_empty && ~posted_r[head_slot];
-    wire              rsp_fire = ~cpl_empty && (posted_r[head_slot] || rsp_buf_ready);
+    wire              cx_ok    = ~async_r[head_slot] || cx_sent_r[head_slot] || cx_fire;
+    wire              rsp_send = ~cpl_empty && ~posted_r[head_slot] && cx_ok;
+    wire              rsp_fire = ~cpl_empty && (posted_r[head_slot] || (rsp_buf_ready && cx_ok));
+`elsif VX_CFG_EXT_MBAR_ENABLE
+    wire              cx_ok    = ~async_r[head_slot] || cx_sent_r[head_slot] || cx_fire;
+    wire              rsp_send = ~cpl_empty && cx_ok;
+    wire              rsp_fire = rsp_send && rsp_buf_ready;
 `else
     wire              rsp_fire = ~cpl_empty && rsp_buf_ready;
 `endif
@@ -222,10 +313,24 @@ module VX_dlmem_ingress import VX_gpu_pkg::*, VX_dlmem_pkg::*; #(
             `ifdef DXA_MBAR_ENABLE
                 posted_r[s] <= is_compl;
             `endif
+            `ifdef VX_CFG_EXT_MBAR_ENABLE
+                async_r[s]     <= req_pkt.mbar_valid;
+                mbar_addr_r[s] <= req_pkt.mbar_addr;
+                bytes_r[s]     <= `CLOG2(LSU_WORD_SIZE+1)'($countones(req_pkt.byteen));
+                ack_r[s]       <= (req_pkt.op == DLMEM_OP_ST) || req_pkt.mbar_valid;
+            `else
                 ack_r[s] <= (req_pkt.op == DLMEM_OP_ST);
+            `endif
                 src_r[s] <= req_pkt.src;
                 tag_r[s] <= req_pkt.tag;
             end
+        `ifdef VX_CFG_EXT_MBAR_ENABLE
+            if (alloc_s) begin
+                cx_sent_r[s] <= 1'b0;
+            end else if (cx_fire && (head_slot == SLOT_W'(s))) begin
+                cx_sent_r[s] <= 1'b1;
+            end
+        `endif
             if (done_s) begin
                 data_r[s] <= lmem_bus_if.rsp_data.data;
             end
@@ -239,7 +344,11 @@ module VX_dlmem_ingress import VX_gpu_pkg::*, VX_dlmem_pkg::*; #(
         rsp_pkt      = '0;
         rsp_pkt.ack  = ack_r[head_slot];
         rsp_pkt.tag  = tag_r[head_slot];
+    `ifdef VX_CFG_EXT_MBAR_ENABLE
+        rsp_pkt.data = ack_r[head_slot] ? `VX_CFG_XLEN'(async_r[head_slot]) : data_r[head_slot];
+    `else
         rsp_pkt.data = data_r[head_slot];
+    `endif
     end
 
     VX_elastic_buffer #(
@@ -249,7 +358,7 @@ module VX_dlmem_ingress import VX_gpu_pkg::*, VX_dlmem_pkg::*; #(
     ) rsp_buf (
         .clk       (clk),
         .reset     (reset),
-    `ifdef DXA_MBAR_ENABLE
+    `ifdef VX_CFG_EXT_MBAR_ENABLE
         .valid_in  (rsp_send),
     `else
         .valid_in  (~cpl_empty),
@@ -269,6 +378,23 @@ module VX_dlmem_ingress import VX_gpu_pkg::*, VX_dlmem_pkg::*; #(
         ("%t: *** %s completion queue overflow", $time, INSTANCE_ID))
     `RUNTIME_ASSERT (~(rsp_fire && ~done_r[head_slot]),
         ("%t: *** %s response for an incomplete slot: slot=%0d", $time, INSTANCE_ID, head_slot))
+`ifdef VX_CFG_EXT_MBAR_ENABLE
+`ifdef DBG_TRACE_MEM
+    always @(posedge clk) begin
+        if (~reset && req_fire && req_pkt.mbar_valid) begin
+            `TRACE(2, ("%t: %s async-acc: src=%0d, addr=0x%0h, mbar=0x%0h, red=%0d, slot=%0d\n", $time, INSTANCE_ID,
+                req_pkt.src, req_pkt.addr, req_pkt.mbar_addr, (req_pkt.op == DLMEM_OP_AMO), free_idx))
+        end
+        if (~reset && cx_fire) begin
+            `TRACE(2, ("%t: %s async-cx: mbar=0x%0h, bytes=%0d, slot=%0d\n", $time, INSTANCE_ID,
+                mbar_addr_r[head_slot], bytes_r[head_slot], head_slot))
+        end
+        if (~reset && rsp_fire && async_r[head_slot]) begin
+            `TRACE(2, ("%t: %s async-ack: dst=%0d, slot=%0d\n", $time, INSTANCE_ID, src_r[head_slot], head_slot))
+        end
+    end
+`endif
+`endif
 `ifdef DXA_MBAR_ENABLE
     wire row_fire = req_in_if.valid && req_in_if.ready && is_row;
     wire [NW_WIDTH-1:0] row_slot = NW_WIDTH'(req_pkt.tag);

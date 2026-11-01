@@ -239,6 +239,10 @@ bool LsuUnit::is_try_wait(const instr_trace_t* trace) {
 	auto* type = std::get_if<AmoType>(&trace->op_type);
 	return type && *type == AmoType::MBAR_TRY_WAIT;
 }
+
+static bool is_async(const LsuType* type) {
+	return type && (*type == LsuType::ST_ASYNC || *type == LsuType::RED_ASYNC);
+}
 #else
 #line 184
 #endif
@@ -274,6 +278,15 @@ void LsuUnit::compute_addrs(uint32_t b, instr_trace_t* trace) {
 		auto lsu_args = std::get<IntrLsuArgs>(trace->instr_ptr->get_args());
 		data_bytes = 1u << (lsu_args.width & 0x3);
 		is_write   = (lsu_tag && *lsu_tag == LsuType::STORE);
+	#ifdef VX_CFG_EXT_MBAR_ENABLE
+		is_write   = is_write || is_async(lsu_tag);
+	#endif
+#if defined(VX_CFG_EXT_MBAR_ENABLE)
+#elif defined(VX_CFG_EXT_DLMEM_ENABLE)
+#line 214
+#else
+#line 208
+#endif
 		offset     = lsu_args.offset;
 		stride     = lsu_args.stride;
 		if (is_write && lsu_args.width > 3)
@@ -324,6 +337,18 @@ void LsuUnit::compute_addrs(uint32_t b, instr_trace_t* trace) {
 				// (LR encodes rs2 = x0, so the captured value is 0).
 				e.data = rs2_data[t].u64;
 			}
+	#ifdef VX_CFG_EXT_MBAR_ENABLE
+			// An async store or add carries its mbarrier (rs3) as the third operand.
+			if (is_async(lsu_tag)) {
+				e.amo_cmp = trace->src_data[2][t].u64;
+			}
+	#endif
+#if defined(VX_CFG_EXT_MBAR_ENABLE)
+#elif defined(VX_CFG_EXT_DLMEM_ENABLE)
+#line 264
+#else
+#line 258
+#endif
 			if (is_cas) {
 				e.amo_cmp = trace->src_data[2][t].u64;
 			}
@@ -676,7 +701,17 @@ void LsuUnit::process_request_step(uint32_t b) {
 #endif
 	const bool is_amo   = (amo_tag != nullptr);
 	const bool is_fence = (lsu_tag && *lsu_tag == LsuType::FENCE);
+#ifdef VX_CFG_EXT_MBAR_ENABLE
+	const bool is_write = (lsu_tag && *lsu_tag == LsuType::STORE) || is_async(lsu_tag);
+#else
 	const bool is_write = (lsu_tag && *lsu_tag == LsuType::STORE);
+#endif
+#if defined(VX_CFG_EXT_MBAR_ENABLE)
+#elif defined(VX_CFG_EXT_DLMEM_ENABLE)
+#line 607
+#else
+#line 601
+#endif
 
 	if (is_fence) {
 		this->issue_fence(b, trace);
@@ -761,6 +796,21 @@ void LsuUnit::process_request_step(uint32_t b) {
 			lsu_req.amo_rl = std::get<IntrAmoArgs>(trace->instr_ptr->get_args()).rl;
 #endif
 		}
+#ifdef VX_CFG_EXT_MBAR_ENABLE
+		// The add of a red.async returns nothing: it retires as a store does.
+		if (is_async(lsu_tag)) {
+			lsu_req.flags.async = 1;
+			if (*lsu_tag == LsuType::RED_ASYNC) {
+				lsu_req.op = MemOp::AMO_ADD;
+			}
+		}
+#endif
+#if defined(VX_CFG_EXT_MBAR_ENABLE)
+#elif defined(VX_CFG_EXT_DLMEM_ENABLE)
+#line 691
+#else
+#line 685
+#endif
 		uint32_t t0 = state.addr_list.size() - state.remain_addrs;
 		uint32_t beat_n = std::min<uint32_t>(VX_CFG_NUM_LSU_LANES, state.remain_addrs);
 		std::vector<mem_addr_size_t> lane_entries(VX_CFG_NUM_LSU_LANES);

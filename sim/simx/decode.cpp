@@ -308,6 +308,16 @@ static op_string_t op_string(const Instr &instr) {
 #ifdef VX_CFG_EXT_DLMEM_ENABLE
       case LsuType::CFENCE: return {"CFENCE", ""};
 #endif
+#ifdef VX_CFG_EXT_MBAR_ENABLE
+      case LsuType::ST_ASYNC:  return {(std::get<IntrLsuArgs>(instrArgs).width == 3) ? "ST.ASYNC.B64" : "ST.ASYNC.B32", ""};
+      case LsuType::RED_ASYNC: return {(std::get<IntrLsuArgs>(instrArgs).width == 3) ? "RED.ASYNC.ADD.U64" : "RED.ASYNC.ADD.U32", ""};
+#endif
+#if defined(VX_CFG_EXT_MBAR_ENABLE)
+#elif defined(VX_CFG_EXT_DLMEM_ENABLE)
+#line 308
+#else
+#line 310
+#endif
       default:
         std::abort();
       }
@@ -1166,6 +1176,17 @@ Instr::Ptr Decoder::decode(uint32_t code, uint64_t uuid) {
 #ifdef VX_CFG_EXT_DLMEM_ENABLE
   case Opcode::EXT3: {
   #ifdef VX_CFG_EXT_MBAR_ENABLE
+    // funct3 = 6 is R4-type: st.async (funct2 0, 1: b32, b64) and red.async.add
+    // (2, 3: u32, u64), rs1 the window address, rs2 the data, rs3 the mbarrier.
+    if (funct3 == 6) {
+      instr->set_fu_type(FUType::LSU);
+      instr->set_op_type((funct2 < 2) ? LsuType::ST_ASYNC : LsuType::RED_ASYNC);
+      instr->set_args(IntrLsuArgs{(funct2 & 1) ? 3u : 2u, 0, 0});
+      instr->set_src_reg(0, rs1, RegType::Integer);
+      instr->set_src_reg(1, rs2, RegType::Integer);
+      instr->set_src_reg(2, rs3, RegType::Integer);
+      break;
+    }
     // funct7 = 1 is the relaxed form of arrive and arrive_tx.
     if (funct7 > 1 || (funct7 == 1 && funct3 > 1))
       std::abort();

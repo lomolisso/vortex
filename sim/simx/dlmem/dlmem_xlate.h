@@ -71,6 +71,11 @@ private:
   using RowPtr = std::shared_ptr<const dlmem_ref::Row>;
 
   uint32_t translate(LsuReq& req, const dlmem_ref::Row& row);
+#ifdef VX_CFG_EXT_MBAR_ENABLE
+  void translate_async(LsuReq& req, uint32_t lane, const dlmem_ref::Xlate& x);
+#else
+#line 73
+#endif
   static uint32_t local_access_lanes(const LsuReq& req);
 
   dlmem_ref::Cfg cfg_;

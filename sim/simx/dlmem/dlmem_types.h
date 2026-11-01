@@ -71,6 +71,15 @@ struct DlmemReqPkt {
   // the destination slot.
   bool     dxa = false;
 #endif
+#ifdef VX_CFG_EXT_MBAR_ENABLE
+  // An st.async (op ST) or red.async (op AMO_ADD): once its access has
+  // committed, the ingress applies complete_tx of its bytes to the mbarrier at
+  // mbar_addr, a byte address in the target's local memory, and acks it.
+  bool     mbar_valid = false;
+  uint64_t mbar_addr = 0;
+#else
+#line 73
+#endif
 
   friend std::ostream& operator<<(std::ostream& os, const DlmemReqPkt& p) {
 #ifdef DXA_MBAR_ENABLE
@@ -81,6 +90,13 @@ struct DlmemReqPkt {
     os << "src=" << p.src << ", dst=" << p.dst << ", op=" << p.op
        << ", addr=0x" << std::hex << p.lmem_addr << std::dec
        << ", tag=" << p.tag << " (#" << p.uuid << ")";
+#ifdef VX_CFG_EXT_MBAR_ENABLE
+    if (p.mbar_valid) {
+      os << ", mbar=0x" << std::hex << p.mbar_addr << std::dec;
+    }
+#else
+#line 83
+#endif
     return os;
   }
 };
@@ -92,6 +108,11 @@ struct DlmemRspPkt {
   uint32_t tag = 0;
   std::shared_ptr<mem_block_t> data;   // the bank's response block for LD/AMO
   uint64_t uuid = 0;
+#ifdef VX_CFG_EXT_MBAR_ENABLE
+  bool     mbar = false;               // the ack of an st.async / red.async
+#else
+#line 94
+#endif
 
   friend std::ostream& operator<<(std::ostream& os, const DlmemRspPkt& p) {
     os << "dst=" << p.dst << ", " << (p.ack ? "ack" : "data")

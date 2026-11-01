@@ -36,7 +36,8 @@ cfg_of = $(CONFIGS) $(SHAPE_$(patsubst %_mt,%,$(1))) $(if $(filter %_mt,$(1)),-D
 all:
 	$(foreach b,$(BUILDS),$(MAKE) -C $(SIMX_DIR) DESTDIR=$(CURDIR)/simx_$(b) $(CURDIR)/simx_$(b)/dlmem_ep_test CONFIGS="$(call cfg_of,$(b))" &&) true
 
-# With the assert on, a remote LR/SC must abort, as it does in the core.
+# With the assert on, a remote LR/SC must abort, as it does in the core. Every
+# build also runs random st.async / red.async lanes (mbarriers are always on).
 LRSC_BUILD := simx_$(firstword $(SHAPES))
 
 # Without DXA in CONFIGS, run also adds a DXA build per ROWS_SHAPES for the
@@ -51,6 +52,7 @@ run:
 	$(foreach b,$(BUILDS),$(MAKE) -C $(SIMX_DIR) DESTDIR=$(CURDIR)/simx_$(b) test-dlmem-ep CONFIGS="$(call cfg_of,$(b))" DLMEM_EP_OPTS="$(OPTS)" &&) true
 	! $(CURDIR)/$(LRSC_BUILD)/dlmem_ep_test --mode=lrsc --lrsc-assert > $(LRSC_BUILD)/lrsc_assert.log 2>&1
 	grep -q "remote LR/SC is not supported" $(LRSC_BUILD)/lrsc_assert.log
+	$(foreach b,$(BUILDS),$(CURDIR)/simx_$(b)/dlmem_ep_test --mode=async-random &&) true
 ifneq ($(ROWS_RUN),)
 	$(foreach s,$(ROWS_RUN),$(MAKE) -C $(SIMX_DIR) DESTDIR=$(CURDIR)/simx_rows_$(s) test-dlmem-ep CONFIGS="$(call rows_cfg,$(s))" DLMEM_EP_OPTS="--mode=rows" && \
 		$(MAKE) -C $(SIMX_DIR) DESTDIR=$(CURDIR)/simx_rows_$(s) test-dlmem-ep CONFIGS="$(call rows_cfg,$(s))" DLMEM_EP_OPTS="--mode=rows-random" &&) true

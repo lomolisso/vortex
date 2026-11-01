@@ -165,6 +165,37 @@ static inline __attribute__((always_inline)) bool vx_mbar_try_wait_acquire_clust
   return true;
 }
 
+// st.async and red.async, like PTX st.async / red.async .shared::cluster
+// .mbarrier::complete_tx::bytes: `addr` and `mbar` are window addresses
+// (vx_cluster_map_shared_rank()) in one block of the caller's cluster, which
+// may be the caller's own. Once the store or the add has been performed in
+// that block, complete_tx(4 or 8 bytes) is applied to `mbar`, per lane. They
+// are asynchronous and weak: no fence, barrier or exit waits for them, and
+// the consumer learns of the data only through its mbarrier. The add returns
+// nothing.
+#define __VX_ASYNC_OP(f2, p, v, m)                                       \
+    __asm__ volatile (".insn r4 %0, 6, %1, x0, %2, %3, %4"               \
+                      :: "i"(RISCV_CUSTOM2), "i"(f2), "r"(p), "r"(v), "r"(m) \
+                      : "memory")
+
+static inline __attribute__((always_inline)) void vx_st_async_u32(void* addr, uint32_t v, uint64_t* mbar) {
+  __VX_ASYNC_OP(0, addr, (uint64_t)v, mbar);
+}
+
+static inline __attribute__((always_inline)) void vx_st_async_u64(void* addr, uint64_t v, uint64_t* mbar) {
+  __VX_ASYNC_OP(1, addr, v, mbar);
+}
+
+static inline __attribute__((always_inline)) void vx_red_async_add_u32(void* addr, uint32_t v, uint64_t* mbar) {
+  __VX_ASYNC_OP(2, addr, (uint64_t)v, mbar);
+}
+
+static inline __attribute__((always_inline)) void vx_red_async_add_u64(void* addr, uint64_t v, uint64_t* mbar) {
+  __VX_ASYNC_OP(3, addr, v, mbar);
+}
+
+#undef __VX_ASYNC_OP
+
 #ifdef __cplusplus
 }
 

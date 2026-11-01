@@ -128,8 +128,14 @@ module VX_dlmem_ep_top import VX_gpu_pkg::*, VX_dlmem_pkg::*; #(
     output wire [NCC-1:0][7:0]              dma_slot,
     output wire [NCC-1:0]                   dma_remote,
     output wire [NCC-1:0]                   dma_last,
-    input  wire [NCC-1:0]                   dma_ready,
-
+    input  wire [NCC-1:0]                   dma_ready
+`endif
+`ifdef VX_CFG_EXT_MBAR_ENABLE
+    ,
+    // The translated encoding of an st.async/red.async lane, and its atomics.
+    output wire [7:0]                       cfg_async_bit,
+    output wire [7:0]                       cfg_async_mb_lsb,
+    output wire [7:0]                       cfg_amo_add,
     output wire [31:0]                      cfg_amo_complete_tx
 `endif
 );
@@ -137,6 +143,12 @@ module VX_dlmem_ep_top import VX_gpu_pkg::*, VX_dlmem_pkg::*; #(
     `UNUSED_PARAM (NS)
     `UNUSED_PARAM (DMA_DW)
     `UNUSED_PARAM (DMA_BW)
+`endif
+`ifdef VX_CFG_EXT_MBAR_ENABLE
+    assign cfg_async_bit    = 8'(DLMEM_ASYNC_BIT);
+    assign cfg_async_mb_lsb = 8'(DLMEM_ASYNC_MB_LSB);
+    assign cfg_amo_add      = 8'(AMO_OP_ADD);
+    assign cfg_amo_complete_tx = 32'(AMO_OP_MBAR_COMPLETE_TX);
 `endif
     localparam TAGV_W = LSU_TAG_WIDTH - UUID_WIDTH;
     localparam CNT_W  = `CLOG2(NL + 1);
@@ -168,7 +180,6 @@ module VX_dlmem_ep_top import VX_gpu_pkg::*, VX_dlmem_pkg::*; #(
 
 `ifdef DXA_MBAR_ENABLE
     `STATIC_ASSERT (DXA_CTA_GEN_W <= 8 && NW_WIDTH <= 8, ("dlmem_ep_top: slot container too small"))
-    assign cfg_amo_complete_tx = 32'(AMO_OP_MBAR_COMPLETE_TX);
 
     wire [NS-1:0][DLMEM_REQ_DATAW-1:0] row_pkt_data;
     wire [NS-1:0][DLMEM_CORE_W-1:0]    row_pkt_dst;

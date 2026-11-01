@@ -12,6 +12,12 @@
 // limitations under the License.
 
 #include "dlmem_ingress.h"
+#ifdef VX_CFG_EXT_MBAR_ENABLE
+#include <cstring>
+#include "mem_block_pool.h"
+#else
+#line 14
+#endif
 
 using namespace vortex;
 
@@ -90,7 +96,7 @@ bool DlmemIngress::accept_dxa(const DlmemReqPkt& pkt) {
     DT(3, this->name() << " dxa data in: " << pkt);
     return true;
   }
-  if (LmemReqOut.full())
+  if (LmemReqOut.full() || this->cx_valid())
     return false;
   int32_t s = -1;
   for (uint32_t i = 0; i < slots_.size(); ++i) {
@@ -137,7 +143,13 @@ void DlmemIngress::on_tick() {
     }
   } else
 #endif
-
+#ifdef VX_CFG_EXT_MBAR_ENABLE
+  // The head completion's complete_tx takes the request buffer first.
+  if (this->cx_valid()) {
+    // a new request waits
+  } else
+#endif
+#line 141
   // Accept a request into the lowest free slot, its response space reserved.
   if (!NetReqIn.empty() && !LmemReqOut.full()) {
     int32_t s = -1;
@@ -163,6 +175,18 @@ void DlmemIngress::on_tick() {
       req.flags.local = 1;
       // The store's response is its bank-commit ack.
       req.flags.strsp = slot.ack;
+    #ifdef VX_CFG_EXT_MBAR_ENABLE
+      if (pkt.mbar_valid) {
+        slot.mbar      = true;
+        slot.mbar_addr = pkt.mbar_addr;
+        slot.bytes     = __builtin_popcountll(pkt.byteen);
+        // A red.async is acked as a store: it returns nothing.
+        slot.ack       = true;
+        req.flags.strsp = (pkt.op == MemOp::ST);
+      }
+    #else
+    #line 165
+    #endif
       LmemReqOut.send(req, 1);
       DT(4, this->name() << " accept slot" << s << ": " << pkt);
       NetReqIn.pop();
@@ -170,6 +194,22 @@ void DlmemIngress::on_tick() {
   }
 
   // Inject the oldest completion; its slot frees with the push.
+#ifdef VX_CFG_EXT_MBAR_ENABLE
+  // An async slot sends its complete_tx, then its ack, which may leave in
+  // the same cycle.
+  bool cx_ok = true;
+  if (this->cx_valid()) {
+    cx_ok = false;
+    if (!LmemReqOut.full()) {
+      const uint32_t s = done_.front();
+      auto req = this->complete_tx(s);
+      LmemReqOut.send(req, 1);
+      DT(4, this->name() << " complete_tx slot" << s << ": " << req);
+      slots_.at(s).cx_sent = true;
+      cx_ok = true;
+    }
+  }
+#endif
 #ifdef DXA_MBAR_ENABLE
   // A COMPL's complete_tx sends nothing: its slot frees in turn.
   if (!done_.empty() && slots_.at(done_.front()).posted) {
@@ -178,7 +218,12 @@ void DlmemIngress::on_tick() {
     done_.pop_front();
   } else
 #endif
+#ifdef VX_CFG_EXT_MBAR_ENABLE
+  if (cx_ok && !done_.empty() && !NetRspOut.full()) {
+#else
+#line 181
   if (!done_.empty() && !NetRspOut.full()) {
+#endif
     uint32_t s = done_.front();
     auto& slot = slots_.at(s);
     DlmemRspPkt rsp;
@@ -187,6 +232,11 @@ void DlmemIngress::on_tick() {
     rsp.tag  = slot.tag;
     rsp.data = slot.ack ? nullptr : slot.data;
     rsp.uuid = slot.uuid;
+  #ifdef VX_CFG_EXT_MBAR_ENABLE
+    rsp.mbar = slot.mbar;
+  #else
+  #line 189
+  #endif
     NetRspOut.send(rsp, 1);
     DT(4, this->name() << " inject slot" << s << ": " << rsp);
     slot = Slot();
@@ -197,6 +247,16 @@ void DlmemIngress::on_tick() {
   if (!LmemRspIn.empty()) {
     auto& rsp = LmemRspIn.peek();
     uint32_t s = uint32_t(rsp.tag);
+  #ifdef VX_CFG_EXT_MBAR_ENABLE
+    // An async access's complete_tx answers too, past the slot tags; it is dropped.
+    if (s >= slots_.size()) {
+      LmemRspIn.pop();
+      __assert(LmemRspIn.empty(), "ingress: two local-memory responses in one cycle");
+      return;
+    }
+  #else
+  #line 199
+  #endif
     __assert(s < slots_.size() && slots_[s].busy, "ingress: response for a free slot");
     slots_[s].data = rsp.data;
     done_.push_back(s);
@@ -214,3 +274,27 @@ void DlmemIngress::on_tick() {
     this->tick_sleep();
   }
 }
+
+#ifdef VX_CFG_EXT_MBAR_ENABLE
+// The completion FIFO's head is an async access whose complete_tx has not left.
+bool DlmemIngress::cx_valid() const {
+  if (done_.empty())
+    return false;
+  const auto& slot = slots_.at(done_.front());
+  return slot.mbar && !slot.cx_sent;
+}
+
+// Its response, tagged past the slots, is dropped.
+MemReq DlmemIngress::complete_tx(uint32_t s) const {
+  const auto& slot = slots_.at(s);
+  const uint32_t off = uint32_t(slot.mbar_addr & (VX_CFG_MEM_BLOCK_SIZE - 1));
+  auto blk = make_mem_block();
+  std::memset(blk->data(), 0, blk->size());
+  const uint64_t bytes = slot.bytes;
+  std::memcpy(blk->data() + off, &bytes, sizeof(bytes));
+  MemReq req(MemOp::MBAR_COMPLETE_TX, config_.lmem_base + slot.mbar_addr, blk, uint64_t(0xff) << off,
+             uint32_t(slots_.size() + s), 0, slot.uuid);
+  req.flags.local = 1;
+  return req;
+}
+#endif

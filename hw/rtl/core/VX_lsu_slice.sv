@@ -323,8 +323,14 @@ module VX_lsu_slice import VX_gpu_pkg::*; #(
 `ifdef VX_CFG_EXT_A_ENABLE
     // AMO MemReq.rw is unconditionally 0: a missing line under SC must
     // miss-and-return-failure, not write-and-succeed.
+`ifdef VX_CFG_EXT_MBAR_ENABLE
+    // A red.async is posted like a store; only its peer's ingress performs the add.
+    assign mem_req_rw = execute_if.data.op_args.lsu.is_store
+                     && (~execute_if.data.op_args.lsu.amo_valid || execute_if.data.op_args.lsu.is_async);
+`else
     assign mem_req_rw = execute_if.data.op_args.lsu.is_store
                      && ~execute_if.data.op_args.lsu.amo_valid;
+`endif
 `else
     assign mem_req_rw = execute_if.data.op_args.lsu.is_store;
 `endif
@@ -525,6 +531,12 @@ module VX_lsu_slice import VX_gpu_pkg::*; #(
     assign client_if.req_data.addr   = mem_req_addr;
     assign client_if.req_data.attr   = mem_req_attr;
     assign client_if.req_data.data   = mem_req_data;
+`ifdef VX_CFG_EXT_MBAR_ENABLE
+    assign client_if.req_data.is_async = execute_if.data.op_args.lsu.is_async;
+    for (genvar i = 0; i < NUM_LANES; ++i) begin : g_mbar_addr
+        assign client_if.req_data.mbar_addr[i] = execute_if.data.rs3_data[i][`VX_CFG_MEM_ADDR_WIDTH-1:REQ_ASHIFT];
+    end
+`endif
     assign client_if.req_data.tag    = mem_req_tag;
     assign mem_req_ready             = client_if.req_ready;
 

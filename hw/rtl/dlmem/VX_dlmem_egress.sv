@@ -168,7 +168,14 @@ module VX_dlmem_egress import VX_gpu_pkg::*, VX_dlmem_pkg::*; #(
     wire is_st   = in_rw[cur_blk];
     wire is_lr   = cur_amo && (cur_attr.amo.amo_op == AMO_OP_LR);
     wire is_sc   = cur_amo && (cur_attr.amo.amo_op == AMO_OP_SC);
+`ifdef VX_CFG_EXT_MBAR_ENABLE
+    // An async lane is posted on a store credit; a red.async is its peer's AMO.
+    wire cur_async = cur_addr[DLMEM_ASYNC_BIT];
+    wire [1:0] cur_op = is_st ? ((cur_async && cur_amo) ? DLMEM_OP_AMO : DLMEM_OP_ST)
+                              : ((cur_amo && ~is_lr) ? DLMEM_OP_AMO : DLMEM_OP_LD);
+`else
     wire [1:0] cur_op = is_st ? DLMEM_OP_ST : ((cur_amo && ~is_lr) ? DLMEM_OP_AMO : DLMEM_OP_LD);
+`endif
 
     wire [DLMEM_CORE_W-1:0] cur_dst = cur_addr[DLMEM_LMEM_AW +: DLMEM_CORE_W];
 
@@ -253,6 +260,10 @@ module VX_dlmem_egress import VX_gpu_pkg::*, VX_dlmem_pkg::*; #(
     `ifdef VX_CFG_EXT_ZACAS_ENABLE
         req_pkt.amo_cmp      = cur_attr.amo.amo_cmp;
     `endif
+    `ifdef VX_CFG_EXT_MBAR_ENABLE
+        req_pkt.mbar_valid   = cur_async;
+        req_pkt.mbar_addr    = cur_addr[DLMEM_ASYNC_MB_LSB +: DLMEM_LMEM_AW];
+    `endif
         req_pkt.tag          = is_st ? DLMEM_TAG_W'(cur_wid) : DLMEM_TAG_W'(free_idx);
     end
 
@@ -287,6 +298,10 @@ module VX_dlmem_egress import VX_gpu_pkg::*, VX_dlmem_pkg::*; #(
 
     wire rsp_ack  = rsp_in_if.valid && rsp_pkt.ack;
     wire rsp_fill = rsp_in_if.valid && ~rsp_pkt.ack;
+`ifdef VX_CFG_EXT_MBAR_ENABLE
+    // An async access's ack returns its credit only: the tracker never counted it.
+    wire rsp_ack_wt = rsp_ack && ~rsp_pkt.data[0];
+`endif
     wire [PEND_W-1:0] rsp_idx = rsp_pkt.tag[PEND_W-1:0];
 
     reg [PENDING_SIZE-1:0][NW_WIDTH-1:0] pend_wid_r;
@@ -303,7 +318,11 @@ module VX_dlmem_egress import VX_gpu_pkg::*, VX_dlmem_pkg::*; #(
             done_valid_r <= 1'b0;
         end else begin
             credits_r    <= credits_r - CRED_W'(st_fire) + CRED_W'(rsp_ack);
+        `ifdef VX_CFG_EXT_MBAR_ENABLE
+            ack_valid_r  <= rsp_ack_wt;
+        `else
             ack_valid_r  <= rsp_ack;
+        `endif
             done_valid_r <= rsp_fill || sc_fire;
         end
         ack_wid_r  <= rsp_pkt.tag[NW_WIDTH-1:0];
@@ -420,7 +439,14 @@ module VX_dlmem_egress import VX_gpu_pkg::*, VX_dlmem_pkg::*; #(
 
     // Protocol checks.
 
+`ifdef VX_CFG_EXT_MBAR_ENABLE
+    // An async lane's encoding has no window base; it may name its own core.
+    wire cur_in_window = cur_async || ((cur_addr >= WIN_BASE) && (cur_addr < WIN_END));
+    wire cur_to_self   = ~cur_async && (cur_dst == DLMEM_CORE_W'(MY_CORE));
+    wire cur_st_amo    = ~cur_async && is_st && cur_amo;
+`else
     wire cur_in_window = (cur_addr >= WIN_BASE) && (cur_addr < WIN_END);
+`endif
 
     `RUNTIME_ASSERT (~lock_r || in_valid[lock_blk_r],
         ("%t: *** %s locked LSU request withdrawn: block=%0d", $time, INSTANCE_ID, lock_blk_r))
@@ -428,10 +454,17 @@ module VX_dlmem_egress import VX_gpu_pkg::*, VX_dlmem_pkg::*; #(
         ("%t: *** %s LSU request without lanes: block=%0d", $time, INSTANCE_ID, arb_index))
     `RUNTIME_ASSERT (~(lane_fire && ~cur_in_window),
         ("%t: *** %s remote lane outside the DLMEM window: addr=0x%0h", $time, INSTANCE_ID, {cur_addr, DLMEM_WA'(0)}))
+`ifdef VX_CFG_EXT_MBAR_ENABLE
+    `RUNTIME_ASSERT (~(lane_fire && cur_to_self),
+        ("%t: *** %s remote lane addressed to its own core: addr=0x%0h", $time, INSTANCE_ID, {cur_addr, DLMEM_WA'(0)}))
+    `RUNTIME_ASSERT (~(cur_valid && cur_st_amo),
+        ("%t: *** %s remote lane is both a store and an AMO", $time, INSTANCE_ID))
+`else
     `RUNTIME_ASSERT (~(lane_fire && (cur_dst == DLMEM_CORE_W'(MY_CORE))),
         ("%t: *** %s remote lane addressed to its own core: addr=0x%0h", $time, INSTANCE_ID, {cur_addr, DLMEM_WA'(0)}))
     `RUNTIME_ASSERT (~(cur_valid && is_st && cur_amo),
         ("%t: *** %s remote lane is both a store and an AMO", $time, INSTANCE_ID))
+`endif
     `RUNTIME_ASSERT (~(LRSC_ASSERT != 0 && lane_fire && is_lr),
         ("%t: *** %s remote LR/SC is not supported: LR addr=0x%0h", $time, INSTANCE_ID, {cur_addr, DLMEM_WA'(0)}))
     `RUNTIME_ASSERT (~(LRSC_ASSERT != 0 && lane_fire && is_sc),
@@ -442,5 +475,19 @@ module VX_dlmem_egress import VX_gpu_pkg::*, VX_dlmem_pkg::*; #(
         ("%t: *** %s response for a free or filled pending entry: tag=%0d", $time, INSTANCE_ID, rsp_pkt.tag))
     `RUNTIME_ASSERT (~(rsp_in_if.valid && (rsp_in_if.dst != DLMEM_CORE_W'(MY_CORE))),
         ("%t: *** %s response for core %0d", $time, INSTANCE_ID, rsp_in_if.dst))
+
+`ifdef VX_CFG_EXT_MBAR_ENABLE
+`ifdef DBG_TRACE_MEM
+    always @(posedge clk) begin
+        if (~reset && pkt_fire && cur_async) begin
+            `TRACE(2, ("%t: %s async-send: dst=%0d, addr=0x%0h, mbar=0x%0h, red=%0d, wid=%0d\n", $time, INSTANCE_ID,
+                cur_dst, req_pkt.addr, req_pkt.mbar_addr, cur_amo, cur_wid))
+        end
+        if (~reset && rsp_ack && ~rsp_ack_wt) begin
+            `TRACE(2, ("%t: %s async-ack: wid=%0d\n", $time, INSTANCE_ID, rsp_pkt.tag))
+        end
+    end
+`endif
+`endif
 
 endmodule

@@ -507,6 +507,82 @@ tests:
     shape: {cores: 2, l2cache: true}
     args: "-m data -p -R -r 16 -e 16"
 
+  # --- st.async / red.async (dlmem_st_async) ---
+  # Each round every block arms one mbarrier per op it receives with
+  # arrive_tx of the incoming bytes before the cluster barrier; every thread
+  # then stores st.async.b32 and .b64 words into the next rank's block and adds
+  # red.async.add.u32 and .u64 into rank 0's counters, all with no fence, each
+  # op completing 4 or 8 bytes on the destination block's mbarrier. Every
+  # thread waits for its own block's phases and checks at once that each
+  # stored word holds the round's value and each counter the exact total; the
+  # host checks every block's whole local memory and each mbarrier word
+  # against mbar_ref. A warp's lanes write consecutive words in one instruction.
+  - id: dlmem_st_async
+    app: dlmem_st_async
+    drivers: [simx, rtlsim]
+    touches: &st_async_touches [tests/regression/dlmem_st_async, hw/rtl/dlmem, hw/rtl/core/VX_decode.sv,
+              hw/rtl/core/VX_lsu_slice.sv, hw/rtl/core/VX_lsu_unit.sv, hw/rtl/core/VX_mem_unit.sv,
+              hw/rtl/core/VX_lsu_scheduler.sv,
+              hw/rtl/core/VX_execute.sv, hw/rtl/core/VX_issue.sv, hw/rtl/core/VX_operands.sv,
+              hw/rtl/core/VX_core.sv, hw/rtl/VX_gpu_pkg.sv, hw/rtl/VX_define.vh, hw/rtl/interfaces,
+              hw/rtl/mem/VX_local_mem.sv, hw/rtl/mem/VX_lmem_switch.sv, hw/rtl/cache/VX_amo_alu.sv,
+              hw/rtl/cache/VX_amo_unit.sv, hw/rtl/VX_socket.sv, hw/rtl/VX_cluster.sv,
+              sim/simx/dlmem, sim/simx/decode.cpp, sim/simx/instr.h, sim/simx/operands,
+              sim/simx/lsu_unit, sim/simx/core, sim/simx/types.h, sim/simx/mem/local_mem,
+              sim/simx/amo, sim/simx/socket, sim/simx/cluster, sim/simx/mbar_waiters,
+              sw/kernel/include/vx_mbar.h, sw/kernel/include/vx_dlmem.h, sw/common/mbar_ref.h,
+              sw/common/dlmem_ref.h, VX_config.toml]
+    shape: {cores: 2, l2cache: true}
+    args: "-k 2 -n 2"
+  # Loopback: every block into itself through its own window address, and a
+  # DEFAULT cluster whose peer sits on the same core; both go out through the
+  # egress and back into the core's own ingress.
+  - id: dlmem_st_async-self
+    app: dlmem_st_async
+    drivers: [simx, rtlsim]
+    touches: *st_async_touches
+    shape: {cores: 2, l2cache: true}
+    args: "-m self -k 2 -n 2"
+  - id: dlmem_st_async-samecore
+    app: dlmem_st_async
+    drivers: [simx, rtlsim]
+    touches: *st_async_touches
+    shape: {cores: 2, l2cache: true}
+    args: "-p default -k 2 -n 2"
+  # Four cores in two sockets: the ring and the adds cross the cluster crossbar.
+  - id: dlmem_st_async-4c-s2
+    app: dlmem_st_async
+    drivers: [simx, rtlsim]
+    tier: nightly
+    configs+: "-DVX_CFG_SOCKET_SIZE=2 -DVX_CFG_MBAR_SUSPEND_CYCLES=4096"
+    touches: *st_async_touches
+    shape: {cores: 4, warps: 8, l2cache: true}
+    args: "-k 4 -n 4 -w 2 -r 4"
+  # 64 ops per round from each block, eight times the store credits.
+  - id: dlmem_st_async-4c-flood
+    app: dlmem_st_async
+    drivers: [simx, rtlsim]
+    tier: nightly
+    configs+: "-DVX_CFG_SOCKET_SIZE=2 -DVX_CFG_MBAR_SUSPEND_CYCLES=4096"
+    touches: *st_async_touches
+    shape: {cores: 4, warps: 8, l2cache: true}
+    args: "-k 4 -n 1 -w 8 -e 8 -o 5 -r 3"
+  # Parity at XLEN 64: one SPREAD cluster of four blocks on four single-core
+  # sockets, every op, two rounds (SimX -0.68%). With two cores per socket
+  # SimX measures -6.95%, and apps without async ops swing by the same ~6.5
+  # points: the known SimX-fast gap of SOCKET_SIZE 2. Every wait is one
+  # try_wait, which the last complete_tx wakes: the egress credits, the
+  # network, the ingress's store or add then complete_tx and the wake-up set
+  # the timing.
+  - id: parity-dlmem-st-async
+    check: model_parity
+    app: dlmem_st_async
+    xlen: [64]
+    configs+: "-DVX_CFG_MBAR_SUSPEND_CYCLES=4096"
+    touches: *st_async_touches
+    shape: {cores: 4, warps: 8, l2cache: true}
+    args: "-k 4 -n 1 -w 2 -e 2 -r 2"
+
   # --- DXA copies completing on an mbarrier ---
   # dxa_mbar: one block fills the core. Per round warp 0 arrives on the
   # mbarrier declaring the box bytes and issues a 1-D copy into local memory;
@@ -804,6 +880,81 @@ tests:
     configs+: "-DVX_CFG_EXT_DXA_ENABLE"
     touches: *dxa_mbar_touches
     env: {DRIVER: rtlsim, APP: dxa_mbar, ARGS: "-x mcast", EXPECT: "DXA multicast rank outside the cluster"}
+    run: *expect_fail_run
+
+  # st.async that must stop the simulation with the exact message, from rank
+  # 0 of a SPREAD cluster of two blocks: a local destination; an mbarrier in
+  # the issuer's block, or given as a local pointer; a destination outside
+  # the cluster; and one past the end of the peer's block.
+  - id: dlmem_st_async-x-local
+    via: script
+    driver: simx
+    configs+: "-DVX_CFG_NUM_CORES=2 -DVX_CFG_L2_ENABLE"
+    touches: *st_async_touches
+    env: {DRIVER: simx, APP: dlmem_st_async, ARGS: "-x local", EXPECT: "st.async needs a cluster window address"}
+    run: *expect_fail_run
+  - id: dlmem_st_async-x-local
+    via: script
+    driver: rtlsim
+    configs+: "-DVX_CFG_NUM_CORES=2 -DVX_CFG_L2_ENABLE"
+    touches: *st_async_touches
+    env: {DRIVER: rtlsim, APP: dlmem_st_async, ARGS: "-x local", EXPECT: "st.async needs a cluster window address"}
+    run: *expect_fail_run
+  - id: dlmem_st_async-x-mbar
+    via: script
+    driver: simx
+    configs+: "-DVX_CFG_NUM_CORES=2 -DVX_CFG_L2_ENABLE"
+    touches: *st_async_touches
+    env: {DRIVER: simx, APP: dlmem_st_async, ARGS: "-x mbar", EXPECT: "st.async mbarrier must be in the destination block"}
+    run: *expect_fail_run
+  - id: dlmem_st_async-x-mbar
+    via: script
+    driver: rtlsim
+    configs+: "-DVX_CFG_NUM_CORES=2 -DVX_CFG_L2_ENABLE"
+    touches: *st_async_touches
+    env: {DRIVER: rtlsim, APP: dlmem_st_async, ARGS: "-x mbar", EXPECT: "st.async mbarrier must be in the destination block"}
+    run: *expect_fail_run
+  - id: dlmem_st_async-x-mbarlocal
+    via: script
+    driver: simx
+    configs+: "-DVX_CFG_NUM_CORES=2 -DVX_CFG_L2_ENABLE"
+    touches: *st_async_touches
+    env: {DRIVER: simx, APP: dlmem_st_async, ARGS: "-x mbarlocal", EXPECT: "st.async mbarrier must be in the destination block"}
+    run: *expect_fail_run
+  - id: dlmem_st_async-x-mbarlocal
+    via: script
+    driver: rtlsim
+    configs+: "-DVX_CFG_NUM_CORES=2 -DVX_CFG_L2_ENABLE"
+    touches: *st_async_touches
+    env: {DRIVER: rtlsim, APP: dlmem_st_async, ARGS: "-x mbarlocal", EXPECT: "st.async mbarrier must be in the destination block"}
+    run: *expect_fail_run
+  - id: dlmem_st_async-x-rank
+    via: script
+    driver: simx
+    configs+: "-DVX_CFG_NUM_CORES=2 -DVX_CFG_L2_ENABLE"
+    touches: *st_async_touches
+    env: {DRIVER: simx, APP: dlmem_st_async, ARGS: "-x rank", EXPECT: "DLMEM access out of bounds"}
+    run: *expect_fail_run
+  - id: dlmem_st_async-x-rank
+    via: script
+    driver: rtlsim
+    configs+: "-DVX_CFG_NUM_CORES=2 -DVX_CFG_L2_ENABLE"
+    touches: *st_async_touches
+    env: {DRIVER: rtlsim, APP: dlmem_st_async, ARGS: "-x rank", EXPECT: "DLMEM access out of bounds"}
+    run: *expect_fail_run
+  - id: dlmem_st_async-x-off
+    via: script
+    driver: simx
+    configs+: "-DVX_CFG_NUM_CORES=2 -DVX_CFG_L2_ENABLE"
+    touches: *st_async_touches
+    env: {DRIVER: simx, APP: dlmem_st_async, ARGS: "-x off", EXPECT: "DLMEM access out of bounds"}
+    run: *expect_fail_run
+  - id: dlmem_st_async-x-off
+    via: script
+    driver: rtlsim
+    configs+: "-DVX_CFG_NUM_CORES=2 -DVX_CFG_L2_ENABLE"
+    touches: *st_async_touches
+    env: {DRIVER: rtlsim, APP: dlmem_st_async, ARGS: "-x off", EXPECT: "DLMEM access out of bounds"}
     run: *expect_fail_run
 
   # The knob without its prerequisites must stop the build, in SimX (the

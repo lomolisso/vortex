@@ -168,9 +168,19 @@ void DlmemEgress::issue() {
              "egress: remote lane outside the DLMEM window");
     dlmem_ref::decode_remote(cfg, a, &dst, &lb);
   }
+#ifdef VX_CFG_EXT_MBAR_ENABLE
+  // An async lane into a block of this core loops back through the network.
+  const bool is_async = req.flags.async;
+  __assert(dst < config_.ncc && (is_async || dst != config_.core_id), "egress: remote lane targets itself");
+  // A red.async returns nothing: it holds a store credit until its ack.
+  bool is_st = (req.op == MemOp::ST) || is_async;
+#else
+#line 171
   __assert(dst < config_.ncc && dst != config_.core_id, "egress: remote lane targets itself");
 
   bool is_st = (req.op == MemOp::ST);
+#endif
+#line 174
   bool is_lr = (req.op == MemOp::AMO_LR);
   bool is_sc = (req.op == MemOp::AMO_SC);
 
@@ -234,6 +244,15 @@ void DlmemEgress::issue() {
     pkt.hart_id = make_hart_id(req.cid, req.wid, req.tids.at(l));
     pkt.flags.amo_unsigned = req.flags.amo_unsigned;
     pkt.uuid = req.uuid;
+#ifdef VX_CFG_EXT_MBAR_ENABLE
+    if (is_async) {
+      pkt.amo_cmp    = 0;
+      pkt.mbar_valid = true;
+      pkt.mbar_addr  = req.amo_cmp.at(l);
+    }
+#else
+#line 236
+#endif
     if (is_st) {
       pkt.tag = req.wid;
       --credits_;
@@ -271,7 +290,15 @@ void DlmemEgress::sink() {
   if (rsp.ack) {
     __assert(credits_ < config_.store_credits, "egress: store credit overflow");
     ++credits_;
+  #ifdef VX_CFG_EXT_MBAR_ENABLE
+    // The tracker never counted an async access.
+    if (!rsp.mbar) {
+      AckOut.send(rsp.tag, 1);
+    }
+  #else
     AckOut.send(rsp.tag, 1);
+  #endif
+  #line 275
   } else {
     __assert(rsp.tag < entries_.size(), "egress: response tag out of range");
     auto& e = entries_.at(rsp.tag);
