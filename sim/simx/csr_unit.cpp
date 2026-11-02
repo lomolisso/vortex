@@ -123,6 +123,13 @@ Word CsrUnit::get_csr(uint32_t addr, uint32_t wid, uint32_t tid) {
   case VX_CSR_CTA_CLUSTER_SIZE: return warp.cta_csrs.cluster_size;
 #ifdef VX_CFG_EXT_DLMEM_ENABLE
   case VX_CSR_CTA_CLUSTER_RANK: return warp.cta_csrs.cluster_rank;
+  case VX_CSR_CTA_CLUSTER_DIM_X: return launch_.cluster_dim[0];
+  case VX_CSR_CTA_CLUSTER_DIM_Y: return launch_.cluster_dim[1];
+  case VX_CSR_CTA_CLUSTER_DIM_Z: return launch_.cluster_dim[2];
+  case VX_CSR_CTA_LMEM_SIZE:     return launch_.lmem_size;
+  case VX_CSR_CTA_CLUSTER_FLAGS: return launch_.cluster_flags;
+#else
+#line 126
 #endif
 
   CSR_READ_64(VX_CSR_MCYCLE, core_perf.cycles);
@@ -446,3 +453,17 @@ void CsrUnit::process(instr_trace_t* trace) {
   }
   DT(3, "csr-unit process: op=" << csr_type << ", " << *trace);
 }
+
+#ifdef VX_CFG_EXT_DLMEM_ENABLE
+void CsrUnit::dcr_write(uint32_t addr, uint32_t value) {
+  switch (addr) {
+  case VX_DCR_KMU_CLUSTER_DIM_X: launch_.cluster_dim[0] = value; break;
+  case VX_DCR_KMU_CLUSTER_DIM_Y: launch_.cluster_dim[1] = value; break;
+  case VX_DCR_KMU_CLUSTER_DIM_Z: launch_.cluster_dim[2] = value; break;
+  case VX_DCR_KMU_LMEM_SIZE:     launch_.lmem_size = value; break;
+  // policy bit 1: the launch named a cluster shape
+  case VX_DCR_KMU_CLUSTER_POLICY: launch_.cluster_flags = (value >> 1) & 1; break;
+  default: break;
+  }
+}
+#endif

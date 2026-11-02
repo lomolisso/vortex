@@ -1,13 +1,14 @@
 // cluster_sync: the hardware cluster barrier (cluster.sync(), and the split
 // barrier_arrive() / barrier_wait()) on a DLMEM device, RV64.
 //
-//   default  three launches in one process: DEFAULT (same-core) clusters of
+//   default  three launches in one process: single-core clusters of
 //            K = min(4, NUM_WARPS / 2) blocks of 2 warps, SPREAD with K = 1,
 //            and SPREAD of the device's largest K
 //   -k K     one launch in clusters of K x 1 x 1 instead
-//   -w W     warps per block (default 1)
+//   -w W     warps per block (default 1; 2 with -x exit or arrive-exit)
 //   -n G     clusters per launch; the grid is G * K blocks (default 6)
-//   -s / -d  SPREAD (default) / DEFAULT policy for the -k launch
+//   -s / -c / -d  SPREAD (default) / SINGLE_CORE / DEFAULT (the device's
+//            choice: SPREAD for K > 1 on DLMEM) policy for the -k launch
 //   -i P     barrier phases per block (default 4, 64 with -p)
 //   -l B     local-memory bytes per block (default 0)
 //   -m mode  sync (default), split, skew, mixed, exit or handoff
@@ -16,21 +17,34 @@
 //   -p       parity mode: no atomics and no rank-dependent work, so the
 //            instruction count does not depend on timing
 //   -v       print every cluster's placement (core:slot by rank)
-//   -x       pass a launch whose clusters cannot be co-resident to the
-//            runtime, which must refuse it with VX_ERR_INVALID_VALUE
+//   -x reject      pass a launch whose clusters cannot be co-resident to
+//                  the runtime, which must refuse it with VX_ERR_INVALID_VALUE
+//   -x exit        the last warp of every block exits without arriving; the
+//                  others sync (PTX: the barrier waits for non-exited threads)
+//   -x blockexit   the block of the last rank exits at once; the others sync
+//   -x arrive-exit the last warp of every block, and every warp of the last
+//                  rank's block, arrive once and exit without waiting
+//   -x partial     the upper half of every warp returns before the barrier
+//   -x divergent   the odd and even lanes of a warp arrive in the two branches
+//                  of an if/else; the simulator must stop the run, since a
+//                  warp counts once per phase
+//   -x k16         K = 16 (or -k): refused without VX_CLUSTER_FLAG_NON_PORTABLE,
+//                  then run with it
+//   The -x modes other than reject and k16 default to DEFAULT clusters of
+//   K = min(4, the largest cluster), and count arrivals per phase.
 //
 // With the A extension, every warp adds itself to its cluster's counter for
 // the phase before arriving and reads the counter back after the release; it
 // must hold every warp of the cluster. Every arrive must return the phase
 // token of its phase. The host checks the kernel's error counts, the counters,
-// that each block ran once, its rank, and that a DEFAULT cluster stays on one
-// core. In handoff mode (its own kernel, no counters) each warp passes a
+// that each block ran once, its rank, and that a single-core cluster stays on
+// one core. In handoff mode (its own kernel, no counters) each warp passes a
 // global word to the same warp of the next rank every phase through the split
 // barrier; under SPREAD the reader's L1 holds the line from two phases back,
 // so the default arrive and wait must make every read fresh, while -r is
-// expected to read stale data. A DEFAULT cluster must fit on one core at once (K * W warps and K
-// slots), or its barrier would deadlock: the app refuses such a launch unless
-// -x leaves the refusal to the runtime.
+// expected to read stale data. A single-core cluster must fit on one core at
+// once (K * W warps and K slots), or its barrier would deadlock: the app
+// refuses such a launch unless -x reject leaves the refusal to the runtime.
 
 #include <vortex2.h>
 #include <VX_types.h>
@@ -72,8 +86,11 @@ bool        relaxed     = false;
 bool        parity_mode = false;
 bool        verbose     = false;
 bool        expect_reject = false;
+uint32_t    req_x       = XMODE_NONE;
+bool        x_k16       = false;
 
 const char* const kModeNames[] = {"sync", "split", "skew", "mixed", "exit", "handoff"};
+const char* const kXModeNames[] = {"", "exit", "blockexit", "arrive-exit", "partial", "divergent"};
 
 struct Caps {
   uint64_t num_cores = 0, num_clusters = 0, num_warps = 0, num_threads = 0;
@@ -87,23 +104,28 @@ struct Launch {
   uint32_t k, g, w;
   vx_cluster_policy_e policy;
   const char* name;
+  uint32_t flags;
 };
 
 void usage() {
-  std::printf("Usage: [-k cluster size] [-w warps per block] [-n clusters] [-s: SPREAD | -d: DEFAULT]"
+  std::printf("Usage: [-k cluster size] [-w warps per block] [-n clusters]"
+              " [-s: SPREAD | -c: SINGLE_CORE | -d: DEFAULT]"
               " [-i phases] [-l local-memory bytes] [-m sync|split|skew|mixed|exit|handoff] [-r: relaxed]"
-              " [-p: parity] [-v: placement] [-x: expect the runtime to refuse] [-h]\n");
+              " [-p: parity] [-v: placement]"
+              " [-x reject|exit|blockexit|arrive-exit|partial|divergent|k16] [-h]\n");
 }
 
 void parse_args(int argc, char** argv) {
   int c;
   bool bad = false;
-  while ((c = getopt(argc, argv, "k:w:n:sdi:l:m:rpvxh")) != -1) {
+  bool w_given = false;
+  while ((c = getopt(argc, argv, "k:w:n:scdi:l:m:rpvx:h")) != -1) {
     switch (c) {
       case 'k': req_k       = (uint32_t)std::atoi(optarg); break;
-      case 'w': req_w       = (uint32_t)std::atoi(optarg); break;
+      case 'w': req_w       = (uint32_t)std::atoi(optarg); w_given = true; break;
       case 'n': req_g       = (uint32_t)std::atoi(optarg); break;
       case 's': req_policy  = VX_CLUSTER_POLICY_SPREAD;    break;
+      case 'c': req_policy  = VX_CLUSTER_POLICY_SINGLE_CORE; break;
       case 'd': req_policy  = VX_CLUSTER_POLICY_DEFAULT;   break;
       case 'i': req_p       = (uint32_t)std::atoi(optarg); bad |= (req_p == 0); break;
       case 'l': req_lmem    = (uint32_t)std::atoi(optarg); break;
@@ -119,16 +141,37 @@ void parse_args(int argc, char** argv) {
       case 'r': relaxed     = true;                        break;
       case 'p': parity_mode = true;                        break;
       case 'v': verbose     = true;                        break;
-      case 'x': expect_reject = true;                      break;
+      case 'x': {
+        bool known = false;
+        if (std::strcmp(optarg, "reject") == 0) {
+          expect_reject = known = true;
+        } else if (std::strcmp(optarg, "k16") == 0) {
+          x_k16 = known = true;
+        }
+        for (uint32_t m = 1; m < sizeof(kXModeNames) / sizeof(kXModeNames[0]); ++m) {
+          if (std::strcmp(optarg, kXModeNames[m]) == 0) {
+            req_x = m;
+            known = true;
+          }
+        }
+        bad |= !known;
+        break;
+      }
       case 'h': usage(); std::exit(0);
       default:  usage(); std::exit(-1);
     }
   }
+  if (!w_given && (req_x == XMODE_EXIT || req_x == XMODE_ARRIVE_EXIT))
+    req_w = 2;
+  bad |= req_x != XMODE_NONE && (parity_mode || relaxed || req_mode != MODE_SYNC);
+  bad |= (req_x == XMODE_EXIT || req_x == XMODE_ARRIVE_EXIT) && req_w < 2;
+  bad |= (req_x == XMODE_BLOCKEXIT || req_x == XMODE_ARRIVE_EXIT) && req_k == 1;
   // Rank-dependent work and the exit mode's lone arrivals would make the
   // instruction count depend on timing.
   bad |= parity_mode && req_mode != MODE_SYNC;
   bad |= relaxed && req_mode != MODE_SYNC && req_mode != MODE_HANDOFF;
   bad |= expect_reject && req_k == 0 && req_policy < 0;
+  bad |= x_k16 && (parity_mode || relaxed || req_mode != MODE_SYNC);
   if (bad || optind < argc || req_w == 0 || req_g == 0 || req_lmem % sizeof(uint32_t) != 0) {
     usage();
     std::exit(-1);
@@ -136,7 +179,19 @@ void parse_args(int argc, char** argv) {
 }
 
 const char* policy_name(uint32_t p) {
-  return (p == VX_CLUSTER_POLICY_SPREAD) ? "SPREAD" : (p == VX_CLUSTER_POLICY_DEFAULT) ? "DEFAULT" : "?";
+  return (p == VX_CLUSTER_POLICY_SPREAD) ? "SPREAD"
+       : (p == VX_CLUSTER_POLICY_DEFAULT) ? "DEFAULT"
+       : (p == VX_CLUSTER_POLICY_SINGLE_CORE) ? "SINGLE_CORE" : "?";
+}
+
+uint32_t nonportable(uint32_t k) {
+  return (k > VX_CLUSTER_MAX_PORTABLE) ? VX_CLUSTER_FLAG_NON_PORTABLE : 0;
+}
+
+// The runtime places a DEFAULT cluster of more than one block SPREAD on a DLMEM device.
+bool one_core(const Caps& caps, const Launch& L) {
+  return L.policy == VX_CLUSTER_POLICY_SINGLE_CORE
+      || (L.policy == VX_CLUSTER_POLICY_DEFAULT && (!caps.dlmem() || L.k == 1));
 }
 
 // Slots a block of the launch's local-memory size leaves on a core.
@@ -153,13 +208,15 @@ uint32_t usable_slots(const Caps& caps) {
 const char* not_coresident(const Caps& caps, const Launch& L) {
   if (L.w > caps.num_warps)
     return "a block is wider than a core";
-  if (L.policy == VX_CLUSTER_POLICY_DEFAULT) {
+  if (one_core(caps, L)) {
     if (L.k * L.w > caps.num_warps)
-      return "a DEFAULT cluster needs more warps than a core has";
+      return "a single-core cluster needs more warps than a core has";
     if (L.k > usable_slots(caps))
-      return "a DEFAULT cluster needs more slots than a core has";
+      return "a single-core cluster needs more slots than a core has";
   } else if (L.k > caps.max_cluster) {
     return "K is above VX_CAPS_DLMEM_MAX_CLUSTER";
+  } else if (L.k > VX_CLUSTER_MAX_PORTABLE && !(L.flags & VX_CLUSTER_FLAG_NON_PORTABLE)) {
+    return "K is above VX_CLUSTER_MAX_PORTABLE without VX_CLUSTER_FLAG_NON_PORTABLE";
   }
   return nullptr;
 }
@@ -214,8 +271,9 @@ int check(const Caps& caps, const Launch& L, const Job& j) {
       report(b, "cluster rank", rec[REC_RANK], b % k);
     if (rec[REC_SIZE] != k)
       report(b, "cluster size", rec[REC_SIZE], k);
-    if (rec[REC_PHASES] != j.phases)
-      report(b, "phases", rec[REC_PHASES], j.phases);
+    const bool left = (req_x == XMODE_BLOCKEXIT || req_x == XMODE_ARRIVE_EXIT) && b % k == k - 1;
+    if (rec[REC_PHASES] != (left ? 0 : j.phases))
+      report(b, "phases", rec[REC_PHASES], left ? 0 : j.phases);
     if (rec[REC_CORE] >= caps.num_cores)
       report(b, "core id", rec[REC_CORE], caps.num_cores - 1);
     for (uint32_t i = 0; i < w; ++i) {
@@ -235,10 +293,14 @@ int check(const Caps& caps, const Launch& L, const Job& j) {
   for (uint32_t g = 0; g < L.g && !j.counts.empty(); ++g) {
     for (uint32_t i = 0; i < j.phases; ++i) {
       const uint32_t got = j.counts[(size_t)g * j.phases + i];
-      if (got != k * w) {
+      const uint32_t want = (req_x == XMODE_EXIT)        ? k * (w - 1)
+                          : (req_x == XMODE_BLOCKEXIT)   ? (k - 1) * w
+                          : (req_x == XMODE_ARRIVE_EXIT) ? (i == 0 ? k * w : (k - 1) * (w - 1))
+                          : k * w;
+      if (got != want) {
         if (errors < 16)
           std::printf("*** %s: cluster %u phase %u: %u arrivals counted, expected %u\n",
-                      L.name, g, i, got, k * w);
+                      L.name, g, i, got, want);
         ++errors;
       }
     }
@@ -256,8 +318,8 @@ int check(const Caps& caps, const Launch& L, const Job& j) {
         report(b, "slot already held by a block of its cluster", rec[REC_CTA_ID], ~0u);
       if (rec[REC_CORE] / ncc != first[REC_CORE] / ncc)
         report(b, "hardware cluster", rec[REC_CORE] / ncc, first[REC_CORE] / ncc);
-      if (L.policy == VX_CLUSTER_POLICY_DEFAULT && rec[REC_CORE] != first[REC_CORE])
-        report(b, "core (DEFAULT keeps a cluster on one core)", rec[REC_CORE], first[REC_CORE]);
+      if (one_core(caps, L) && rec[REC_CORE] != first[REC_CORE])
+        report(b, "core (a single-core cluster stays on one core)", rec[REC_CORE], first[REC_CORE]);
     }
     if (verbose) {
       std::printf("%s: cluster %u:", L.name, g);
@@ -271,20 +333,26 @@ int check(const Caps& caps, const Launch& L, const Job& j) {
 
 // One launch end to end: the mismatches, or 1 when it could not run.
 int run_launch(vx_device_h dev, vx_queue_h q, vx_kernel_h kernel, vx_kernel_h handoff_kernel,
-               const Caps& caps, const Launch& L) {
+               vx_kernel_h x_kernel, const Caps& caps, const Launch& L, bool reject) {
   const bool counting = caps.atomics() && !parity_mode && req_mode != MODE_HANDOFF;
   Job j;
   j.num_blocks = L.g * L.k;
   j.phases = req_p ? req_p : (parity_mode ? 64 : 4);
-  std::printf("%s: %s, K=%u, %u clusters of %u-warp blocks, %u phases of %s%s%s, %u local-memory bytes\n",
-              L.name, policy_name(L.policy), L.k, L.g, L.w, j.phases, kModeNames[req_mode],
-              relaxed ? " (relaxed)" : "", counting ? " with arrival counters" : "", req_lmem);
+  std::printf("%s: %s, K=%u, %u clusters of %u-warp blocks, %u phases of %s%s%s%s, %u local-memory bytes%s\n",
+              L.name, policy_name(L.policy), L.k, L.g, L.w, j.phases,
+              req_x ? "x-" : "", req_x ? kXModeNames[req_x] : kModeNames[req_mode],
+              relaxed ? " (relaxed)" : "", counting ? " with arrival counters" : "", req_lmem,
+              (L.flags & VX_CLUSTER_FLAG_NON_PORTABLE) ? ", non-portable" : "");
+  if (req_x != XMODE_NONE && !counting) {
+    std::printf("*** %s: -x %s needs the A extension\n", L.name, kXModeNames[req_x]);
+    return 1;
+  }
   const char* why = not_coresident(caps, L);
-  if (expect_reject && !why) {
+  if (reject && !why) {
     std::printf("*** %s: -x needs a launch whose clusters cannot be co-resident\n", L.name);
     return 1;
   }
-  if (why && !expect_reject) {
+  if (why && !reject) {
     std::printf("*** %s: refused, its clusters cannot be co-resident: %s\n", L.name, why);
     return 1;
   }
@@ -299,6 +367,10 @@ int run_launch(vx_device_h dev, vx_queue_h q, vx_kernel_h kernel, vx_kernel_h ha
     j.counts.assign((size_t)L.g * j.phases, 0);
     upload(dev, q, j.counts, &j.count_buf, &j.arg.count_addr);
   }
+  if (req_x == XMODE_DIVERGENT) {
+    j.data.assign(L.g, 0);
+    upload(dev, q, j.data, &j.data_buf, &j.arg.data_addr);
+  }
   if (req_mode == MODE_HANDOFF) {
     // One cache line per block, so no two blocks share a line.
     const uint32_t line_words = VX_CFG_MEM_BLOCK_SIZE / sizeof(uint32_t);
@@ -312,10 +384,12 @@ int run_launch(vx_device_h dev, vx_queue_h q, vx_kernel_h kernel, vx_kernel_h ha
   j.arg.spin        = parity_mode ? kParityWork : kSpin;
   j.arg.num_threads = (uint32_t)caps.num_threads;
   j.arg.relaxed     = relaxed;
+  j.arg.xmode       = req_x;
 
   vx_launch_info_t li = {};
   li.struct_size    = sizeof(li);
-  li.kernel         = (req_mode == MODE_HANDOFF) ? handoff_kernel : kernel;
+  li.kernel         = (req_x != XMODE_NONE) ? x_kernel
+                    : (req_mode == MODE_HANDOFF) ? handoff_kernel : kernel;
   li.args_host      = &j.arg;
   li.args_size      = sizeof(j.arg);
   li.ndim           = 1;
@@ -330,10 +404,13 @@ int run_launch(vx_device_h dev, vx_queue_h q, vx_kernel_h kernel, vx_kernel_h ha
   li.cluster_dim[1] = 1;
   li.cluster_dim[2] = 1;
   li.cluster_policy = L.policy;
+  li.cluster_flags  = L.flags;
   vx_event_h launch_ev = nullptr;
   const vx_result_t r = vx_enqueue_launch(q, &li, 0, nullptr, &launch_ev);
-  if (expect_reject && r == VX_ERR_INVALID_VALUE) {
+  if (reject && r == VX_ERR_INVALID_VALUE) {
     std::printf("reject: %s: %s (expected VX_ERR_INVALID_VALUE)\n", L.name, vx_result_string(r));
+    // The queued uploads read j's host vectors when they run.
+    CHECK(vx_queue_finish(q, VX_TIMEOUT_INFINITE));
     if (j.data_buf)
       vx_buffer_release(j.data_buf);
     if (j.count_buf)
@@ -344,11 +421,12 @@ int run_launch(vx_device_h dev, vx_queue_h q, vx_kernel_h kernel, vx_kernel_h ha
   }
   if (r != VX_SUCCESS) {
     std::printf("*** %s: the launch returned %s%s\n", L.name, vx_result_string(r),
-                expect_reject ? ", expected VX_ERR_INVALID_VALUE" : "");
+                reject ? ", expected VX_ERR_INVALID_VALUE" : "");
+    CHECK(vx_queue_finish(q, VX_TIMEOUT_INFINITE));
     return 1;
   }
   // An accepted launch that cannot be co-resident deadlocks below.
-  if (expect_reject) {
+  if (reject) {
     std::printf("*** %s: the launch was accepted, expected VX_ERR_INVALID_VALUE (%s)\n",
                 L.name, why);
     std::fflush(stdout);
@@ -363,7 +441,7 @@ int run_launch(vx_device_h dev, vx_queue_h q, vx_kernel_h kernel, vx_kernel_h ha
   }
   vx_event_release(launch_ev);
 
-  const int errors = check(caps, L, j) + (expect_reject ? 1 : 0);
+  const int errors = check(caps, L, j) + (reject ? 1 : 0);
   if (req_mode == MODE_HANDOFF) {
     uint64_t stale = 0;
     for (uint32_t e : j.errs)
@@ -414,34 +492,46 @@ int main(int argc, char** argv) {
 
   vx_module_h mod = nullptr;
   CHECK(vx_module_load_file(dev, kernel_file, &mod));
-  vx_kernel_h kernel = nullptr, handoff_kernel = nullptr;
+  vx_kernel_h kernel = nullptr, handoff_kernel = nullptr, x_kernel = nullptr;
   CHECK(vx_module_get_kernel(mod, "sync_k", &kernel));
   CHECK(vx_module_get_kernel(mod, "handoff_k", &handoff_kernel));
+  CHECK(vx_module_get_kernel(mod, "xsync_k", &x_kernel));
 
-  std::vector<Launch> launches;
-  if (req_k != 0 || req_policy >= 0) {
+  // (launch, the runtime must refuse it)
+  std::vector<std::pair<Launch, bool>> launches;
+  if (x_k16) {
+    const auto policy = (vx_cluster_policy_e)((req_policy < 0) ? VX_CLUSTER_POLICY_DEFAULT : req_policy);
+    const uint32_t k = req_k ? req_k : 16;
+    launches.push_back({{k, req_g, req_w, policy, "portable", 0}, true});
+    launches.push_back({{k, req_g, req_w, policy, "non-portable", VX_CLUSTER_FLAG_NON_PORTABLE}, false});
+  } else if (req_x != XMODE_NONE) {
+    const auto policy = (vx_cluster_policy_e)((req_policy < 0) ? VX_CLUSTER_POLICY_DEFAULT : req_policy);
+    const uint32_t k = req_k ? req_k : std::min<uint32_t>(4, (uint32_t)caps.max_cluster);
+    launches.push_back({{k, req_g, req_w, policy, kXModeNames[req_x], nonportable(k)}, false});
+  } else if (req_k != 0 || req_policy >= 0) {
     const auto policy = (vx_cluster_policy_e)((req_policy < 0) ? VX_CLUSTER_POLICY_SPREAD : req_policy);
     uint32_t k = req_k;
     if (k == 0) {
-      k = (policy == VX_CLUSTER_POLICY_SPREAD)
+      k = (policy != VX_CLUSTER_POLICY_SINGLE_CORE)
         ? (uint32_t)caps.max_cluster
         : std::max<uint32_t>(1, std::min<uint32_t>(4, (uint32_t)caps.num_warps / req_w));
     }
-    launches.push_back({k, req_g, req_w, policy, "launch"});
+    launches.push_back({{k, req_g, req_w, policy, "launch", nonportable(k)}, expect_reject});
   } else {
     // A same-core cluster first, then K = 1 and the largest K, so the barrier
     // state is reset by the slot admissions of each new launch.
     const uint32_t w = std::min<uint32_t>(2, (uint32_t)caps.num_warps);
     const uint32_t k = std::max<uint32_t>(1, std::min<uint32_t>(4, (uint32_t)caps.num_warps / w));
-    launches.push_back({k, req_g, w, VX_CLUSTER_POLICY_DEFAULT, "default"});
-    launches.push_back({1, req_g, req_w, VX_CLUSTER_POLICY_SPREAD, "spread-1"});
-    launches.push_back({(uint32_t)caps.max_cluster, req_g, req_w, VX_CLUSTER_POLICY_SPREAD,
-                        "spread-max"});
+    launches.push_back({{k, req_g, w, VX_CLUSTER_POLICY_SINGLE_CORE, "single-core", 0}, false});
+    launches.push_back({{1, req_g, req_w, VX_CLUSTER_POLICY_SPREAD, "spread-1", 0}, false});
+    launches.push_back({{(uint32_t)caps.max_cluster, req_g, req_w, VX_CLUSTER_POLICY_SPREAD,
+                         "spread-max", nonportable((uint32_t)caps.max_cluster)}, false});
   }
   int errors = 0;
-  for (const Launch& L : launches)
-    errors += run_launch(dev, q, kernel, handoff_kernel, caps, L);
+  for (const auto& L : launches)
+    errors += run_launch(dev, q, kernel, handoff_kernel, x_kernel, caps, L.first, L.second);
 
+  vx_kernel_release(x_kernel);
   vx_kernel_release(handoff_kernel);
   vx_kernel_release(kernel);
   vx_module_release(mod);

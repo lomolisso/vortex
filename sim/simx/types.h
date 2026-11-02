@@ -2337,9 +2337,9 @@ struct GbarArrive {
   uint32_t core_id;
 #ifdef VX_CFG_EXT_DLMEM_ENABLE
   uint32_t kind = 0;     // GBAR_KIND_* of VX_gpu_pkg; 0 is a barrier arrival
-  uint32_t gang_id = 0;  // gang_id and epoch: valid only for a SPREAD gang of K > 1
-  uint32_t epoch = 0;
+  uint32_t gang_id = 0, epoch = 0;  // valid only for a SPREAD gang of K > 1
   uint32_t slot = 0;     // CTA_DONE: the freed CTA slot
+  bool     arrived = false;  // CTA_DONE: the block's arrival counts in its gang's open phase
 #endif
 };
 

@@ -119,7 +119,7 @@ static inline __attribute__((always_inline)) uint64_t vx_mbar_arrive_tx_relaxed(
 // PTX mbarrier.arrive.release.cluster: the warp's earlier global stores are
 // also visible to waiters on other cores once the phase completes.
 static inline __attribute__((always_inline)) uint64_t vx_mbar_arrive_release_cluster(uint64_t* p, uint32_t count) {
-  vx_fence();
+  vx_fence_cluster();
   return vx_mbar_arrive(p, count);
 }
 
@@ -161,7 +161,7 @@ static inline __attribute__((always_inline)) bool vx_mbar_try_wait_parity(uint64
 static inline __attribute__((always_inline)) bool vx_mbar_try_wait_acquire_cluster(uint64_t* p, uint64_t token) {
   if (!vx_mbar_try_wait(p, token))
     return false;
-  vx_fence();
+  vx_fence_cluster();
   return true;
 }
 

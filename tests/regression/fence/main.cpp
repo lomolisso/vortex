@@ -9,6 +9,14 @@
 //             cycles, so a timer starved by the fences fails the run instead
 //             of hanging it, and so does a done flag that a fence never makes
 //             visible.
+//   -x cluster: DLMEM. Clusters of -c blocks (default 2, DEFAULT policy, so
+//             on different cores) pass -n messages (default 16) in pairs
+//             through global memory with vx_fence_cluster(); the reader's L1
+//             holds the previous message, so a stale read fails the run. Then
+//             every block times a loop of vx_fence_cluster() and one of
+//             vx_fence(), each after a store, and the cycles are printed.
+//             -x cluster-parity passes no messages, so the instruction count
+//             does not depend on timing.
 
 #include <algorithm>
 #include <iostream>
@@ -34,6 +42,8 @@ const char* kernel_file = "kernel.vxbin";
 uint32_t count = 0;
 uint32_t mode = FENCE_MODE_VECADD;
 uint32_t budget = 20000;
+uint32_t cluster_k = 2;
+bool cluster_parity = false;
 
 vx_device_h device = nullptr;
 vx_buffer_h src0_buffer = nullptr;
@@ -48,19 +58,34 @@ kernel_arg_t kernel_arg = {};
 
 static void show_usage() {
    std::cout << "Vortex Test." << std::endl;
-   std::cout << "Usage: [-k: kernel] [-t vecadd|storm] [-n words (vecadd) or timed iterations (storm)]"
-             << " [-b storm fencer budget in cycles, default 20000] [-h: help]" << std::endl;
+   std::cout << "Usage: [-k: kernel] [-t vecadd|storm] [-n words (vecadd), timed iterations (storm) or messages (cluster)]"
+             << " [-b storm fencer budget in cycles, default 20000]"
+             << " [-x cluster|cluster-parity] [-c cluster size, default 2] [-h: help]" << std::endl;
 }
 
 static void parse_args(int argc, char **argv) {
   int c;
-  while ((c = getopt(argc, argv, "n:k:t:b:h")) != -1) {
+  while ((c = getopt(argc, argv, "n:k:t:b:x:c:h")) != -1) {
     switch (c) {
     case 'n':
       count = atoi(optarg);
       break;
     case 'k':
       kernel_file = optarg;
+      break;
+    case 'c':
+      cluster_k = atoi(optarg);
+      break;
+    case 'x':
+      mode = FENCE_MODE_CLUSTER;
+      if (strcmp(optarg, "cluster") == 0) {
+        cluster_parity = false;
+      } else if (strcmp(optarg, "cluster-parity") == 0) {
+        cluster_parity = true;
+      } else {
+        show_usage();
+        exit(-1);
+      }
       break;
     case 't':
       if (strcmp(optarg, "vecadd") == 0) {
@@ -346,6 +371,114 @@ static int run_storm(uint32_t num_cores, uint32_t num_warps, uint32_t num_thread
   return errors;
 }
 
+
+static int run_cluster(uint32_t num_threads) {
+  uint64_t isa_flags = 0, num_cores = 0, num_clusters = 0, max_cluster = 0;
+  RT_CHECK(vx_device_query(device, VX_CAPS_ISA_FLAGS, &isa_flags));
+  RT_CHECK(vx_device_query(device, VX_CAPS_NUM_CORES, &num_cores));
+  RT_CHECK(vx_device_query(device, VX_CAPS_NUM_CLUSTERS, &num_clusters));
+  RT_CHECK(vx_device_query(device, VX_CAPS_DLMEM_MAX_CLUSTER, &max_cluster));
+  const uint32_t ncc = (uint32_t)(num_cores / num_clusters);
+  if ((isa_flags & VX_ISA_EXT_DLMEM) == 0 || (isa_flags & VX_ISA_STD_A) == 0) {
+    std::cout << "Error: -x cluster needs DLMEM and the A extension" << std::endl;
+    return 1;
+  }
+  const uint32_t k = cluster_k;
+  if (k < 2 || k % 2 != 0 || k > max_cluster || k > ncc || num_threads > CLUSTER_LINE_WORDS) {
+    std::cout << "Error: -x cluster needs an even K of at least 2 within a hardware cluster of "
+              << ncc << " cores (largest cluster " << max_cluster << ")" << std::endl;
+    return 1;
+  }
+  const uint32_t rounds = cluster_parity ? 0 : (count ? count : 16);
+  const uint32_t fences = 32;
+  const uint32_t num_blocks = (uint32_t)num_cores / k * k;
+  std::cout << "cluster: " << num_blocks / k << " clusters of " << k << " one-warp blocks, " << rounds
+            << " messages per pair with vx_fence_cluster(), " << fences
+            << " timed fences of each kind" << std::endl;
+
+  cluster_arg_t arg = {};
+  arg.mode        = FENCE_MODE_CLUSTER;
+  arg.rounds      = rounds;
+  arg.fences      = fences;
+  arg.bound       = 1u << 20;
+  arg.num_threads = num_threads;
+  const uint64_t line_bytes = (uint64_t)num_blocks * CLUSTER_LINE_WORDS * sizeof(uint32_t);
+  std::vector<uint32_t> h_zero(num_blocks * CLUSTER_LINE_WORDS, 0);
+  std::vector<uint32_t> h_rec(num_blocks * CLUSTER_REC_WORDS, 0);
+  const uint64_t rec_size = h_rec.size() * sizeof(uint32_t);
+  RT_CHECK(vx_buffer_create(device, line_bytes, VX_MEM_READ_WRITE, &src0_buffer));
+  RT_CHECK(vx_buffer_address(src0_buffer, &arg.data_addr));
+  RT_CHECK(vx_buffer_create(device, line_bytes, VX_MEM_READ_WRITE, &src1_buffer));
+  RT_CHECK(vx_buffer_address(src1_buffer, &arg.flag_addr));
+  RT_CHECK(vx_buffer_create(device, line_bytes, VX_MEM_READ_WRITE, &dst_buffer));
+  RT_CHECK(vx_buffer_address(dst_buffer, &arg.scratch_addr));
+  RT_CHECK(vx_buffer_create(device, rec_size, VX_MEM_READ_WRITE, &rec_buffer));
+  RT_CHECK(vx_buffer_address(rec_buffer, &arg.rec_addr));
+  RT_CHECK(vx_enqueue_write(queue, src0_buffer, 0, h_zero.data(), line_bytes, 0, nullptr, nullptr));
+  RT_CHECK(vx_enqueue_write(queue, src1_buffer, 0, h_zero.data(), line_bytes, 0, nullptr, nullptr));
+  RT_CHECK(vx_enqueue_write(queue, rec_buffer, 0, h_rec.data(), rec_size, 0, nullptr, nullptr));
+
+  vx_launch_info_t li = {};
+  li.struct_size    = sizeof(li);
+  li.kernel         = kernel;
+  li.args_host      = &arg;
+  li.args_size      = sizeof(arg);
+  li.ndim           = 1;
+  li.grid_dim[0]    = num_blocks;
+  li.block_dim[0]   = num_threads;
+  li.cluster_dim[0] = k;
+  li.cluster_policy = VX_CLUSTER_POLICY_DEFAULT;
+  li.cluster_flags  = (k > VX_CLUSTER_MAX_PORTABLE) ? VX_CLUSTER_FLAG_NON_PORTABLE : 0;
+  vx_event_h launch_ev = nullptr, read_ev = nullptr;
+  RT_CHECK(vx_enqueue_launch(queue, &li, 0, nullptr, &launch_ev));
+  RT_CHECK(vx_enqueue_read(queue, h_rec.data(), rec_buffer, 0, rec_size, 1, &launch_ev, &read_ev));
+  RT_CHECK(vx_event_wait_value(read_ev, 1, VX_TIMEOUT_INFINITE));
+  vx_event_release(read_ev);
+  vx_event_release(launch_ev);
+
+  int errors = 0;
+  uint64_t stale = 0, cfence = 0, gfence = 0;
+  uint32_t cfence_max = 0, gfence_max = 0;
+  for (uint32_t b = 0; b < num_blocks; ++b) {
+    const uint32_t* r = &h_rec[b * CLUSTER_REC_WORDS];
+    if (r[CLUSTER_REC_DONE] != 1) {
+      std::cout << "error: block " << b << " did not finish" << std::endl;
+      ++errors;
+      continue;
+    }
+    if (r[CLUSTER_REC_RANK] != b % k) {
+      std::cout << "error: block " << b << " has rank " << r[CLUSTER_REC_RANK] << std::endl;
+      ++errors;
+    }
+    for (uint32_t o = b - b % k; o < b; ++o) {
+      if (h_rec[o * CLUSTER_REC_WORDS + CLUSTER_REC_CORE] == r[CLUSTER_REC_CORE]) {
+        std::cout << "error: blocks " << o << " and " << b << " of one cluster share core "
+                  << r[CLUSTER_REC_CORE] << ", so no message crosses an L1" << std::endl;
+        ++errors;
+      }
+    }
+    if (r[CLUSTER_REC_TIMEOUT] != 0) {
+      std::cout << "error: block " << b << " gave up on " << r[CLUSTER_REC_TIMEOUT] << " flags" << std::endl;
+      ++errors;
+    }
+    stale += r[CLUSTER_REC_STALE];
+    cfence += r[CLUSTER_REC_CFENCE];
+    gfence += r[CLUSTER_REC_GFENCE];
+    cfence_max = std::max(cfence_max, r[CLUSTER_REC_CFENCE]);
+    gfence_max = std::max(gfence_max, r[CLUSTER_REC_GFENCE]);
+  }
+  std::cout << "cluster: " << stale << " stale words of "
+            << (uint64_t)num_blocks * (rounds / 2) * num_threads << " read" << std::endl;
+  if (stale != 0) {
+    std::cout << "error: vx_fence_cluster() left a reader with stale data" << std::endl;
+    ++errors;
+  }
+  std::cout << "cluster: " << fences << " fences after a store, average/max cycles per block: "
+            << "vx_fence_cluster() " << cfence / num_blocks << "/" << cfence_max
+            << ", vx_fence() " << gfence / num_blocks << "/" << gfence_max << std::endl;
+  return errors;
+}
+
 int main(int argc, char *argv[]) {
   // parse command arguments
   parse_args(argc, argv);
@@ -369,8 +502,8 @@ int main(int argc, char *argv[]) {
   RT_CHECK(vx_module_load_file(device, kernel_file, &module_));
   RT_CHECK(vx_module_get_kernel(module_, "main", &kernel));
 
-  int errors = (mode == FENCE_MODE_STORM)
-             ? run_storm(num_cores, num_warps, num_threads)
+  int errors = (mode == FENCE_MODE_STORM)   ? run_storm(num_cores, num_warps, num_threads)
+             : (mode == FENCE_MODE_CLUSTER) ? run_cluster(num_threads)
              : run_vecadd(total_warps * num_threads);
 
   // cleanup

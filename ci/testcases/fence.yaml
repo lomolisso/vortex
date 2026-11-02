@@ -46,6 +46,40 @@ tests:
     shape: {clusters: 2, cores: 2, l2cache: true, l3cache: true}
     args: "-tstorm"
     tier: full
+  # Cluster-scope fence (DLMEM, XLEN 64): pairs of blocks of one cluster, on
+  # different cores, pass messages through global memory with
+  # vx_fence_cluster(); the reader's L1 holds the previous message, so a fence
+  # that leaves it fails the run. Every block then prints the cycles of a
+  # vx_fence_cluster() loop and of a vx_fence() loop.
+  - id: cluster-2x2-l3
+    app: fence
+    drivers: [simx, rtlsim]
+    xlen: [64]
+    configs+: "-DVX_CFG_EXT_DLMEM_ENABLE"
+    shape: {clusters: 2, cores: 2, l3cache: true}
+    args: "-x cluster"
+    touches: &fence_cluster_touches [hw/rtl/cache, hw/rtl/core/VX_lsu_slice.sv, hw/rtl/core/VX_decode.sv,
+              hw/rtl/core/VX_mem_unit.sv, hw/rtl/dlmem, hw/rtl/VX_gpu_pkg.sv, hw/rtl/Vortex.sv,
+              hw/rtl/VX_cluster.sv, hw/rtl/VX_socket.sv, sim/simx, sw/kernel/include/vx_intrinsics.h,
+              sw/kernel/include/vx_dlmem.h, sw/runtime/common/queue.cpp, tests/regression/fence]
+  - id: cluster-1x4-l2-l3
+    app: fence
+    drivers: [simx, rtlsim]
+    xlen: [64]
+    configs+: "-DVX_CFG_EXT_DLMEM_ENABLE"
+    shape: {cores: 4, l2cache: true, l3cache: true}
+    args: "-x cluster"
+    touches: *fence_cluster_touches
+  # SimX<->rtlsim parity of the two timed fence loops, without the messages
+  # (their polls depend on timing).
+  - id: parity-fence-cluster
+    check: model_parity
+    app: fence
+    xlen: [64]
+    configs+: "-DVX_CFG_EXT_DLMEM_ENABLE"
+    shape: {cores: 4, l2cache: true, l3cache: true}
+    args: "-x cluster-parity"
+    touches: *fence_cluster_touches
   # SimX<->rtlsim cycle parity on fences in a loop: amomax's seq_cst load
   # brackets every iteration with two fences, all harts contending.
   - id: parity-amomax

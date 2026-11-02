@@ -265,59 +265,32 @@ vx_result_t Queue::enqueue_copy(Buffer* dst, uint64_t do_, Buffer* src,
 
 namespace {
 
-// A struct that ends before cluster_policy means DEFAULT. Only a DLMEM device
-// has the policy register (*policy_dcr), and every launch writes it, since it
-// is sticky and SPREAD cannot be validated against pre-programmed geometry.
+// Resolves the launch's cluster policy into the value of the policy register
+// (*policy, VX_DCR_KMU_CLUSTER_POLICY) and checks the cluster can be placed.
+// Only a DLMEM device has the register (*policy_dcr), and every launch writes
+// it, since it is sticky and SPREAD cannot be validated against
+// pre-programmed geometry.
 vx_result_t launch_policy(Device* dev, const vx_launch_info_t* info,
                           uint32_t* policy, bool* policy_dcr) {
-    uint32_t p = VX_CLUSTER_POLICY_DEFAULT;
-    if (info->struct_size >= offsetof(vx_launch_info_t, cluster_policy)
-                           + sizeof(info->cluster_policy))
-        p = static_cast<uint32_t>(info->cluster_policy);
-    if (p > VX_CLUSTER_POLICY_SPREAD) return VX_ERR_INVALID_VALUE;
-
-    uint64_t isa = 0;
-    auto r = dev->query_caps(VX_CAPS_ISA_FLAGS, &isa);
+    ClusterInfo ci;
+    auto r = cluster_info(to_handle(dev), info, &ci);
     if (r != VX_SUCCESS) return r;
-    const bool dlmem = (isa & VX_ISA_EXT_DLMEM) != 0;
-    if (p == VX_CLUSTER_POLICY_SPREAD && !dlmem) return VX_ERR_NOT_SUPPORTED;
-    *policy = p;
-    *policy_dcr = dlmem;
-    if (!dlmem) return VX_SUCCESS;
+    *policy = (ci.spread ? kKmuPolicySpread : 0) | (ci.explicit_cluster ? kKmuPolicyExplicit : 0);
+    *policy_dcr = ci.dlmem;
+    if (!ci.dlmem) return VX_SUCCESS;
     if (info->ndim == 0)
-        return (p == VX_CLUSTER_POLICY_SPREAD) ? VX_ERR_INVALID_VALUE : VX_SUCCESS;
-
-    uint64_t k = 1, block_size = 1;
-    for (uint32_t i = 0; i < info->ndim; ++i) {
-        k *= std::max<uint32_t>(info->cluster_dim[i], 1);
-        block_size *= info->block_dim[i];
-    }
-    uint64_t nw = 0, max_cluster = 0, nt = 0, lmem_cap = 0, line = 0;
-    r = dev->query_caps(VX_CAPS_NUM_WARPS, &nw);
-    if (r == VX_SUCCESS) r = dev->query_caps(VX_CAPS_DLMEM_MAX_CLUSTER, &max_cluster);
-    if (r == VX_SUCCESS) r = dev->query_caps(VX_CAPS_NUM_THREADS, &nt);
-    if (r == VX_SUCCESS) r = dev->query_caps(VX_CAPS_LOCAL_MEM_SIZE, &lmem_cap);
-    if (r == VX_SUCCESS) r = dev->query_caps(VX_CAPS_CACHE_LINE_SIZE, &line);
-    if (r != VX_SUCCESS) return r;
-    // The KMU's rank counter holds the largest cluster of either policy.
-    if (k > std::max(nw, max_cluster)) return VX_ERR_INVALID_VALUE;
-
-    // DEFAULT puts every member on one core: unless all of them hold a slot and
-    // W warps at once, the first cluster barrier never completes.
-    const uint64_t warps  = std::max<uint64_t>((block_size + nt - 1) / nt, 1);
-    const uint64_t stride = (info->lmem_size + line - 1) / line * line;
-    const uint64_t slots  = (stride == 0) ? nw : std::min(nw, lmem_cap / stride);
-    if (p != VX_CLUSTER_POLICY_SPREAD)
-        return (k * warps > nw || k > slots) ? VX_ERR_INVALID_VALUE : VX_SUCCESS;
-    if (k > max_cluster) return VX_ERR_INVALID_VALUE;
-
-    // SPREAD needs each member's slot and W warps on a core of one hardware cluster.
-    uint64_t cores = 0, clusters = 0;
-    r = dev->query_caps(VX_CAPS_NUM_CORES, &cores);
-    if (r == VX_SUCCESS) r = dev->query_caps(VX_CAPS_NUM_CLUSTERS, &clusters);
-    if (r != VX_SUCCESS) return r;
-    const uint64_t ncc    = cores / clusters;
-    if (k > ncc * std::min(slots, nw / warps)) return VX_ERR_INVALID_VALUE;
+        return (ci.policy == VX_CLUSTER_POLICY_SPREAD) ? VX_ERR_INVALID_VALUE : VX_SUCCESS;
+    // The KMU's rank counter holds the largest cluster of either placement.
+    if (ci.k > std::max(ci.nw, ci.max_cluster)) return VX_ERR_INVALID_VALUE;
+    // Past the portable size a cluster needs the caller's opt-in, whatever its placement.
+    if (ci.k > VX_CLUSTER_MAX_PORTABLE && !(ci.flags & VX_CLUSTER_FLAG_NON_PORTABLE))
+        return VX_ERR_INVALID_VALUE;
+    // A single-core cluster's blocks must all hold a slot and W warps of their
+    // core at once, or its first cluster barrier never completes.
+    if (!ci.spread)
+        return (ci.k * ci.warps > ci.nw || ci.k > ci.slots) ? VX_ERR_INVALID_VALUE : VX_SUCCESS;
+    // A SPREAD cluster takes K cores of one hardware cluster with room for one block each.
+    if (ci.k > ci.max_cluster || ci.k > ci.ncc || ci.per_core == 0) return VX_ERR_INVALID_VALUE;
     return VX_SUCCESS;
 }
 

@@ -29,7 +29,11 @@
 // all of it at once with done events and global and local barriers. A warp may
 // leave a cluster barrier only once every warp of every block of its cluster has
 // arrived (and, for a gang, after the gang's release); both latency legs are
-// measured on an idle cluster.
+// measured on an idle cluster. Warps and whole blocks also exit, before, between
+// and right after arrivals: a block arrives once every live warp has, a cluster
+// once every live block has, and a gang's CTA_DONE carries whether the block's
+// arrival is still pending. --mode=twice arrives twice in one phase and must
+// stop the run with the barrier unit's assert.
 
 #include "vl_simulator.h"
 #include "VVX_bar_unit_top.h"
@@ -43,6 +47,8 @@
 #include <iostream>
 #include <map>
 #include <random>
+#include <set>
+#include <string>
 #include <type_traits>
 #include <vector>
 
@@ -369,6 +375,7 @@ private:
     sim_->rel_valid = 0;
     sim_->done_in_valid = 0;
     sim_->done_in_epoch = 0;
+    sim_->exit_valid = 0;
     for (uint32_t c = 0; c < NCC; ++c) {
       put(sim_->req_wid, c, NW_W, 0);
       put(sim_->req_id, c, NB_W, 0);
@@ -426,7 +433,7 @@ struct SlotInfo {
   uint32_t k       = 1;
 };
 
-enum COpT { C_SYNC, C_ARRIVE, C_WAIT, C_LBAR, C_GLOBAL, C_DELAY, C_ADMIT, C_HOLD_REL };
+enum COpT { C_SYNC, C_ARRIVE, C_WAIT, C_LBAR, C_GLOBAL, C_DELAY, C_ADMIT, C_HOLD_REL, C_EXIT };
 
 struct COp {
   COpT     t;
@@ -458,6 +465,12 @@ struct Cluster {
   std::map<uint32_t, std::vector<uint64_t>> unlocks;   // phase -> unlock cycles of its waiters
   uint32_t gang_arr   = 0;    // the gang's count of block arrivals, current phase
   uint32_t gang_phase = 0;
+  uint32_t glive      = 0;    // the gang's blocks not yet done, as the gang unit counts them
+  std::set<std::pair<uint32_t, uint32_t>> gset;   // (core, slot) arrived in the gang's open phase
+  uint32_t lblocks    = 0;    // a cluster inside one core: blocks still live
+  uint32_t blk        = 0;    // and blocks arrived in its open phase
+  uint32_t ph         = 0;    // its open phase
+  uint32_t exits      = 0;    // blocks gone
 };
 
 struct CScenario {
@@ -513,6 +526,8 @@ struct CStats {
   uint32_t rel_under_req = 0;  // a core took a release in a cycle it had a barrier request
   uint64_t rsp_stalls = 0;
   uint32_t collide_tries = 0;   // releases timed onto a global barrier's completion
+  uint32_t arrived_dones = 0;   // done events that carried an arrival
+  uint32_t stale_arrived = 0;   // of those, ones whose phase the gang had released already
   uint64_t a_min = ~0ull, a_max = 0;   // CBAR push -> gang event port
   uint64_t b_min = ~0ull, b_max = 0;   // release leaves the gang -> unlock
 };
@@ -540,7 +555,10 @@ public:
     struct Slot {
       int      cl = -1;
       uint32_t adm = 0;
-      uint32_t sarr = 0;       // arrivals of the block in its current phase
+      uint32_t live = 0;       // warps not exited
+      uint32_t amask = 0;      // warps arrived in the block's open phase
+      bool     pendb = false;  // the block arrived, its phase is open
+      bool     pend = false;   // the barrier unit's view: arrived, its release not taken
       uint32_t lbar = 0;       // local barrier arrivals
       std::map<uint32_t, uint64_t> lbar_done;   // instance -> request cycle of its last arrival
     };
@@ -549,12 +567,15 @@ public:
       COpT     t = C_SYNC;
       uint32_t wid = 0, slot = 0, size_m1 = 0, id = 0, token = 0;
       bool     cbar_push = false;
+      bool     exit = false;
       int      cl = -1;
       uint32_t round = 0;
     };
     struct Exp {
       uint32_t kind, slot, gang, epoch, size_m1;
       uint64_t push;
+      uint32_t arrived = 0;
+      int      cl = -1;      // a done event of a block whose warps all exited
     };
     struct Rel {
       uint32_t gang, epoch;
@@ -567,7 +588,8 @@ public:
     std::vector<std::vector<Slot>> slots(NCC, std::vector<Slot>(NW));
     std::vector<Req> pend(NCC);
     std::vector<std::deque<Exp>> expect(NCC);
-    std::vector<std::deque<uint32_t>> todo(NCC);
+    // done events: the code in bits 31..0; bit 32 marks a block that exited, its cluster in bits 63..40
+    std::vector<std::deque<uint64_t>> todo(NCC);
     std::vector<uint32_t> made(NCC, 0), done_seq(NCC, 0);
     std::deque<Rel> rels;
     std::vector<uint32_t> g_round(NCC, 0);
@@ -585,6 +607,10 @@ public:
     this->clear();
     tick_ = sim_.reset(tick_);
     st = CStats();
+    for (auto& x : sc.clusters) {
+      x.glive = x.K;
+      x.lblocks = x.K;
+    }
 
     // a gang id no cluster of the scenario uses, for releases that must match nothing
     uint32_t idle_gang = 0;
@@ -614,12 +640,65 @@ public:
       put(sim_->cbar_wr_epoch, c, 1, info.epoch);
       put(sim_->cbar_wr_base, c, NW_W, info.base);
       put(sim_->cbar_wr_k, c, 8, info.k);
+      put(sim_->cbar_wr_warps, c, 8, sc.clusters[cl].W);
       Slot& s = slots[c][slot];
       s.cl = cl;
       ++s.adm;
-      s.sarr = 0;
+      s.live = sc.clusters[cl].W;
+      s.amask = 0;
+      s.pendb = false;
+      s.pend = false;
       s.lbar = 0;
       s.lbar_done.clear();
+    };
+
+    // The bench's own count: a block arrives once every live warp has, a cluster
+    // inside one core completes once every live block has.
+    auto local_check = [&](int cl, uint64_t at) {
+      Cluster& x = sc.clusters[cl];
+      if (x.blk != 0 && x.blk == x.lblocks) {
+        x.last_req[x.ph++] = at;
+        x.blk = 0;
+        for (uint32_t c = 0; c < NCC; ++c) {
+          for (auto& sl : slots[c]) {
+            if (sl.cl == cl) {
+              sl.amask = 0;
+              sl.pendb = false;
+            }
+          }
+        }
+      }
+    };
+    // true when the block's arrival goes to the gang unit
+    auto block_check = [&](uint32_t c, uint32_t slot, uint64_t at) {
+      Slot& sl = slots[c][slot];
+      Cluster& x = sc.clusters[sl.cl];
+      if (sl.pendb || sl.live == 0 || uint32_t(__builtin_popcount(sl.amask)) != sl.live) {
+        return false;
+      }
+      sl.pendb = true;
+      if (x.gang) {
+        return true;
+      }
+      ++x.blk;
+      local_check(sl.cl, at);
+      return false;
+    };
+    // the gang unit: a phase completes once every block not done has arrived
+    auto gang_raise = [&](int cl) {
+      Cluster& x = sc.clusters[cl];
+      x.gang_arr = 0;
+      x.gset.clear();
+      uint32_t ph = x.gang_phase++;
+      x.last_req[ph] = st.cycles;
+      // releases that must match nothing go first, well ahead of the real one
+      uint64_t at = 0;
+      if (x.bogus) {
+        rels.push_back({x.gang_id, x.epoch ^ 1u, -1, 0, 0});
+        rels.push_back({idle_gang % GANGS, x.epoch, -1, 0, 0});
+        at = st.cycles + 24;
+      }
+      rels.push_back({x.gang_id, x.epoch, cl, ph, sc.collide ? NEVER : at});
     };
 
     while (true) {
@@ -724,6 +803,31 @@ public:
           Cluster& x = sc.clusters[s.cl];
           r.cl = s.cl;
           r.size_m1 = x.W - 1;
+          if (o.t == C_EXIT) {
+            r.exit = true;
+            s.amask &= ~(1u << w);
+            if (s.live == 0) {
+              fail("core %u warp %u exits from slot %u, which has no live warp", c, w, o.slot);
+              continue;
+            }
+            wp.wait = Wait();
+            if (--s.live == 0) {
+              ++x.exits;
+              if (x.gang) {
+                uint64_t code = o.slot | (uint64_t(x.gang_id) << NW_W) | (uint64_t(x.epoch & 1) << (NW_W + GANG_W));
+                todo[c].push_back(code | (1ull << 32) | (uint64_t(s.cl) << 40));
+              } else {
+                --x.lblocks;
+                if (s.pendb) {
+                  --x.blk;
+                }
+                local_check(s.cl, st.cycles + 1);
+              }
+            } else {
+              r.cbar_push = block_check(c, o.slot, st.cycles + 1);
+            }
+            continue;
+          }
           put(sim_->read_addr, c, BAR_ADDR_W, addr_of(o.slot, 0));
           if (o.t == C_LBAR) {
             uint32_t inst = s.lbar / x.W;
@@ -758,13 +862,9 @@ public:
           r.token = ph & 1;
           wp.last_cl = s.cl;
           wp.last_ph = ph;
-          if (++x.arr[ph] == x.K * x.W) {
-            x.last_req[ph] = st.cycles + 1;
-          }
-          if (++s.sarr == x.W) {
-            s.sarr = 0;
-            r.cbar_push = x.gang;
-          }
+          ++x.arr[ph];
+          s.amask |= 1u << w;
+          r.cbar_push = block_check(c, o.slot, st.cycles + 1);
           if (o.t == C_SYNC) {
             wp.wait = Wait();
             wp.wait.kind = 1;
@@ -779,7 +879,10 @@ public:
       for (uint32_t c = 0; c < NCC; ++c) {
         const Req& r = cur[c];
         bool cl = r.valid && (r.t == C_SYNC || r.t == C_ARRIVE || r.t == C_WAIT);
-        put(sim_->req_valid, c, 1, r.valid);
+        put(sim_->req_valid, c, 1, r.valid && !r.exit);
+        put(sim_->exit_valid, c, 1, r.valid && r.exit);
+        put(sim_->exit_wid, c, NW_W, r.wid);
+        put(sim_->exit_slot, c, NW_W, r.slot);
         put(sim_->req_wid, c, NW_W, r.wid);
         put(sim_->req_id, c, NB_W, r.id);
         put(sim_->req_is_global, c, 1, r.valid && r.t == C_GLOBAL);
@@ -789,7 +892,7 @@ public:
         put(sim_->req_phase, c, 1, r.valid && r.t == C_WAIT && r.token);
         put(sim_->req_size_m1, c, BAR_SIZE_W, r.size_m1);
         bool v = !todo[c].empty();
-        uint32_t code = v ? todo[c].front() : 0;
+        uint32_t code = v ? uint32_t(todo[c].front()) : 0;
         put(sim_->done_in_valid, c, 1, v);
         put(sim_->done_in_slot, c, NW_W, code & ((1u << NW_W) - 1));
         put(sim_->done_in_gang, c, GANG_W, (code >> NW_W) & ((1u << GANG_W) - 1));
@@ -856,10 +959,16 @@ public:
           }
         }
         if (ready) {
-          uint32_t code = todo[c].front();
+          uint64_t t = todo[c].front();
+          uint32_t code = uint32_t(t);
           todo[c].pop_front();
-          expect[c].push_back({KIND_DONE, code & ((1u << NW_W) - 1), (code >> NW_W) & ((1u << GANG_W) - 1),
-                               (code >> (NW_W + GANG_W)) & 1, 0, st.cycles});
+          Exp e{KIND_DONE, code & ((1u << NW_W) - 1), (code >> NW_W) & ((1u << GANG_W) - 1),
+                (code >> (NW_W + GANG_W)) & 1, 0, st.cycles};
+          // the barrier unit's view of the slot: arrived, its release not taken
+          const Slot& sl = slots[c][e.slot];
+          e.arrived = (sl.pend && sl.cl >= 0 && sc.clusters[sl.cl].gang) ? 1 : 0;
+          e.cl = ((t >> 32) & 1) ? int(t >> 40) : -1;
+          expect[c].push_back(e);
           progress = true;
         }
       }
@@ -875,13 +984,32 @@ public:
           expect[c].pop_front();
           bool same = (kind == e.kind) && (uint32_t(sim_->evt_slot) == e.slot) && (uint32_t(sim_->evt_gang) == e.gang)
                    && (uint32_t(sim_->evt_epoch) == e.epoch)
-                   && (kind != KIND_CBAR || uint32_t(sim_->evt_size_m1) == e.size_m1);
+                   && (kind != KIND_CBAR || uint32_t(sim_->evt_size_m1) == e.size_m1)
+                   && (kind != KIND_DONE || uint32_t(sim_->evt_arrived) == e.arrived);
           if (!same) {
             fail("core %u: event kind %u slot %u gang %u epoch %u size_m1 %u, expected kind %u slot %u gang %u epoch %u"
-                 " size_m1 %u", c, kind, uint32_t(sim_->evt_slot), uint32_t(sim_->evt_gang), uint32_t(sim_->evt_epoch),
-                 uint32_t(sim_->evt_size_m1), e.kind, e.slot, e.gang, e.epoch, e.size_m1);
+                 " size_m1 %u (arrived %u, expected %u)", c, kind, uint32_t(sim_->evt_slot), uint32_t(sim_->evt_gang),
+                 uint32_t(sim_->evt_epoch), uint32_t(sim_->evt_size_m1), e.kind, e.slot, e.gang, e.epoch, e.size_m1,
+                 uint32_t(sim_->evt_arrived), e.arrived);
           } else if (kind == KIND_DONE) {
             ++st.dones;
+            st.arrived_dones += e.arrived;
+            if (e.cl >= 0) {
+              // a gang's block ended: its arrival counts only while its phase is open
+              Cluster& x = sc.clusters[e.cl];
+              bool counted = e.arrived && x.gset.count({c, e.slot});
+              if (e.arrived && !counted) {
+                ++st.stale_arrived;
+              }
+              --x.glive;
+              if (counted) {
+                x.gset.erase({c, e.slot});
+                --x.gang_arr;
+              }
+              if (x.gang_arr != 0 && x.gang_arr == x.glive) {
+                gang_raise(e.cl);
+              }
+            }
           } else {
             ++st.cbars;
             uint64_t lat = st.cycles - e.push;
@@ -898,17 +1026,9 @@ public:
               fail("CBAR for gang %u epoch %u, which the bench never made", e.gang, e.epoch);
             } else {
               Cluster& x = sc.clusters[cl];
-              if (++x.gang_arr == x.K) {
-                x.gang_arr = 0;
-                uint32_t ph = x.gang_phase++;
-                // releases that must match nothing go first, well ahead of the real one
-                uint64_t at = 0;
-                if (x.bogus) {
-                  rels.push_back({x.gang_id, x.epoch ^ 1u, -1, 0, 0});
-                  rels.push_back({idle_gang % GANGS, x.epoch, -1, 0, 0});
-                  at = st.cycles + 24;
-                }
-                rels.push_back({x.gang_id, x.epoch, cl, ph, sc.collide ? NEVER : at});
+              x.gset.insert({c, e.slot});
+              if (++x.gang_arr == x.glive) {
+                gang_raise(cl);
               }
             }
           }
@@ -921,6 +1041,14 @@ public:
         if (r.cl >= 0) {
           sc.clusters[r.cl].rel_fire[r.ph] = st.cycles;
           ++st.releases;
+          for (uint32_t c = 0; c < NCC; ++c) {
+            for (auto& sl : slots[c]) {
+              if (sl.cl == r.cl) {
+                sl.amask = 0;
+                sl.pendb = false;
+              }
+            }
+          }
         }
         progress = true;
       }
@@ -986,6 +1114,23 @@ public:
         }
       }
 
+      // the barrier unit's pending flags, as the next cycle sees them
+      for (uint32_t c = 0; c < NCC; ++c) {
+        if (cur[c].valid && cur[c].cbar_push) {
+          slots[c][cur[c].slot].pend = true;
+        }
+        if (get(sim_->cbar_rsp_fire, c, 1)) {
+          uint32_t g = get(sim_->cbar_rsp_gang, c, GANG_W);
+          uint32_t ep = get(sim_->cbar_rsp_epoch, c, 1);
+          for (auto& sl : slots[c]) {
+            if (sl.pend && sl.cl >= 0 && sc.clusters[sl.cl].gang && sc.clusters[sl.cl].gang_id == g
+             && (sc.clusters[sl.cl].epoch & 1) == ep) {
+              sl.pend = false;
+            }
+          }
+        }
+      }
+
       tick_ = sim_.step(tick_, 2);
       ++st.cycles;
 
@@ -1041,6 +1186,7 @@ private:
     sim_->rel_valid = 0;
     sim_->done_in_valid = 0;
     sim_->done_in_epoch = 0;
+    sim_->exit_valid = 0;
     for (uint32_t c = 0; c < NCC; ++c) {
       put(sim_->req_wid, c, NW_W, 0);
       put(sim_->req_id, c, NB_W, 0);
@@ -1053,6 +1199,9 @@ private:
       put(sim_->cbar_wr_gang_id, c, GANG_W, 0);
       put(sim_->cbar_wr_base, c, NW_W, 0);
       put(sim_->cbar_wr_k, c, 8, 0);
+      put(sim_->cbar_wr_warps, c, 8, 0);
+      put(sim_->exit_wid, c, NW_W, 0);
+      put(sim_->exit_slot, c, NW_W, 0);
     }
     sim_->cbar_wr_gang = 0;
     sim_->cbar_wr_epoch = 0;
@@ -1381,19 +1530,265 @@ static bool c_mix(Sim& sim, uint64_t& tick, uint32_t seed) {
   return creport("cluster barriers with done events, global and local barriers", ok, st);
 }
 
+// The members of a cluster for the exit scenarios: one block per core at `slot`
+// (a gang), or, at one core, `k` blocks in consecutive slots (inside the core).
+static int exit_cluster(CScenario& sc, uint32_t slot, uint32_t W, uint32_t gang_id, uint32_t k,
+                        std::vector<std::pair<uint32_t, uint32_t>>& m) {
+  m.clear();
+  bool gang = (NCC > 1);
+  if (gang) {
+    for (uint32_t c = 0; c < NCC; ++c) {
+      m.push_back({c, slot});
+    }
+  } else {
+    for (uint32_t r = 0; r < k; ++r) {
+      m.push_back({0, slot + r});
+    }
+  }
+  return sc.add(gang, gang_id % GANGS, 1, W, m);
+}
+
+// Warps that exit: in every block one warp exits, before its first arrival or
+// after some phases; the others sync every phase and must all be released.
+static bool c_exit(Sim& sim, uint64_t& tick) {
+  uint32_t W = std::min<uint32_t>(3, NW - 1);
+  uint32_t k = (NCC > 1) ? NCC : std::max<uint32_t>(1, (NW - 1) / W);
+  if (W < 2) {
+    std::printf("warp exits: needs 3 warps, skipped\n");
+    return true;
+  }
+  CScenario sc;
+  std::vector<std::pair<uint32_t, uint32_t>> m;
+  uint32_t slot = (NCC > 1) ? 1 : 0;
+  exit_cluster(sc, slot, W, 1, k, m);
+  const uint32_t P = 4;
+  for (size_t i = 0; i < m.size(); ++i) {
+    uint32_t c = m[i].first;
+    for (uint32_t j = 0; j < W; ++j) {
+      uint32_t w = (NCC > 1) ? slot + j : uint32_t(i) * W + j;
+      auto& pg = sc.prog[c][w];
+      uint32_t last = (j + 1 == W) ? uint32_t(i % P) : P;   // the last warp syncs this many phases
+      for (uint32_t p = 0; p < last; ++p) {
+        pg.push_back(cop(C_DELAY, 0, 1 + (c * 5 + j * 3 + p * 7) % 11));
+        pg.push_back(cop(C_SYNC, m[i].second));
+      }
+      if (j + 1 == W) {
+        pg.push_back(cop(C_DELAY, 0, 1 + (c * 3 + 2 * i) % 9));
+        pg.push_back(cop(C_EXIT, m[i].second));
+      }
+    }
+  }
+  CBench b(sim, tick, 161);
+  CStats st;
+  bool ok = b.run(sc, st);
+  ok = ok && (st.unlocks == m.size() * ((W - 1) * P) + [&] {
+    uint32_t n = 0;
+    for (size_t i = 0; i < m.size(); ++i) {
+      n += uint32_t(i % P);
+    }
+    return n;
+  }()) && ((NCC == 1) || st.releases == P);
+  return creport("warp exits before and between phases", ok, st);
+}
+
+// Whole blocks that end: in a gang, a block's CTA_DONE completes the phase the
+// others wait in; inside a core, the base slot's live-block count drops.
+// Member 0 ends at once, member 1 after one phase, the rest sync every phase.
+static bool c_blockexit(Sim& sim, uint64_t& tick) {
+  uint32_t W = 2;
+  uint32_t k = (NCC > 1) ? NCC : std::min<uint32_t>(3, NW / W);
+  if (k < 2 || ((NCC > 1) ? (W + 1 > NW) : (W * k > NW))) {
+    std::printf("block exits: needs 4 warps, skipped\n");
+    return true;
+  }
+  CScenario sc;
+  std::vector<std::pair<uint32_t, uint32_t>> m;
+  uint32_t slot = (NCC > 1) ? 1 : 0;
+  if (NCC > 1 && slot + W > NW) {
+    slot = 0;
+  }
+  exit_cluster(sc, slot, W, 2, k, m);
+  const uint32_t P = 3;
+  for (size_t i = 0; i < m.size(); ++i) {
+    uint32_t c = m[i].first;
+    uint32_t phases = (i == 0) ? 0 : (i == 1) ? 1 : P;
+    for (uint32_t j = 0; j < W; ++j) {
+      uint32_t w = (NCC > 1) ? slot + j : uint32_t(i) * W + j;
+      auto& pg = sc.prog[c][w];
+      for (uint32_t p = 0; p < phases; ++p) {
+        pg.push_back(cop(C_DELAY, 0, 1 + (c * 7 + j * 5 + p * 3) % 13));
+        pg.push_back(cop(C_SYNC, m[i].second));
+      }
+      // member 1's exits come late, after the others arrived in phase 1
+      pg.push_back(cop(C_DELAY, 0, (i == 1) ? 60 + 4 * j : 2 + j));
+      if (i < 2) {
+        pg.push_back(cop(C_EXIT, m[i].second));
+      }
+    }
+  }
+  CBench b(sim, tick, 171);
+  CStats st;
+  bool ok = b.run(sc, st);
+  ok = ok && (st.unlocks == W * (1 + (k - 2) * P)) && ((NCC == 1) || (st.releases == ((k > 2) ? P : 1) && st.dones == 2));
+  return creport("whole blocks that end, one at once and one inside a phase", ok, st);
+}
+
+// Arrive, then exit: a warp's arrival leaves both counts when it exits. Cluster
+// A: member 0's warps arrive first and exit before the others arrive (its
+// arrival still counts at the gang unit when its done event comes). Cluster B:
+// member 0 arrives last, completing the phase, and exits at once, so its done
+// event may reach the gang unit after the phase was released. Inside one core,
+// one warp of member 0 arrives and exits.
+static bool c_arrive_exit(Sim& sim, uint64_t& tick) {
+  uint32_t W = 1;
+  uint32_t k = (NCC > 1) ? NCC : std::min<uint32_t>(3, NW - 1);
+  if (NW < 3 || k < 2) {
+    std::printf("arrive then exit: needs 3 warps, skipped\n");
+    return true;
+  }
+  CScenario sc;
+  const uint32_t P = 3;
+  for (uint32_t v = 0; v < ((NCC > 1) ? 2u : 1u); ++v) {
+    std::vector<std::pair<uint32_t, uint32_t>> m;
+    uint32_t slot = 1 + v;
+    if (NCC == 1) {
+      slot = 0;
+      W = 2;
+      k = std::min<uint32_t>(2, NW / 2);
+    }
+    exit_cluster(sc, slot, W, 3 + v, k, m);
+    for (size_t i = 0; i < m.size(); ++i) {
+      uint32_t c = m[i].first;
+      for (uint32_t j = 0; j < W; ++j) {
+        uint32_t w = (NCC > 1) ? slot + j : uint32_t(i) * W + j;
+        auto& pg = sc.prog[c][w];
+        if (i == 0 && (NCC > 1 || j == 0)) {
+          pg.push_back(cop(C_DELAY, 0, (v == 0) ? 1 : 80));
+          pg.push_back(cop(C_ARRIVE, m[i].second));
+          pg.push_back(cop(C_DELAY, 0, (v == 0) ? 3 : 0));
+          pg.push_back(cop(C_EXIT, m[i].second));
+          continue;
+        }
+        for (uint32_t p = 0; p < P; ++p) {
+          pg.push_back(cop(C_DELAY, 0, (v == 0 && p == 0) ? 40 + 2 * i : 1 + (c * 3 + p) % 5));
+          pg.push_back(cop(C_SYNC, m[i].second));
+        }
+      }
+    }
+  }
+  CBench b(sim, tick, 181);
+  CStats st;
+  bool ok = b.run(sc, st);
+  std::printf("arrive-exit: %u done events carried an arrival, %u of them after the gang had released its phase\n",
+              st.arrived_dones, st.stale_arrived);
+  if (ok && NCC > 1 && (st.arrived_dones == 0 || st.releases != 2 * P)) {
+    std::printf("FAIL arrive-exit: %u arrived done events, %u releases (want %u)\n", st.arrived_dones, st.releases,
+                2 * P);
+    ok = false;
+  }
+  return creport("arrive then exit", ok, st);
+}
+
+// Random programs with exits: every warp syncs or splits arrive and wait for a
+// random number of phases, then exits, some right after an arrival.
+static bool c_exit_mix(Sim& sim, uint64_t& tick, uint32_t seed) {
+  CScenario sc;
+  std::mt19937 rng(seed * 17 + 3);
+  const uint32_t P = 5;
+  uint32_t W = (NW >= 4) ? 2 : 1;
+  std::vector<std::vector<std::pair<uint32_t, uint32_t>>> mems;
+  uint32_t slot = 0;
+  for (uint32_t g = 0; slot + W <= NW && g < 3; ++g) {
+    std::vector<std::pair<uint32_t, uint32_t>> m;
+    if (NCC > 1) {
+      for (uint32_t c = 0; c < NCC; ++c) {
+        m.push_back({c, slot});
+      }
+      sc.add(true, (5 + g) % GANGS, g & 1, W, m);
+      mems.push_back(m);
+      slot += W;   // slot s holds warps s..s+W-1
+    } else {
+      uint32_t kk = std::min<uint32_t>(2, (NW - slot) / W);
+      if (kk == 0) {
+        break;
+      }
+      for (uint32_t r = 0; r < kk; ++r) {
+        m.push_back({0, slot + r});
+      }
+      sc.add(false, 0, 0, W, m);
+      mems.push_back(m);
+      slot += kk * W;
+    }
+  }
+  for (size_t g = 0; g < mems.size(); ++g) {
+    const auto& m = mems[g];
+    uint32_t wbase = m[0].second;
+    for (size_t i = 0; i < m.size(); ++i) {
+      for (uint32_t j = 0; j < W; ++j) {
+        uint32_t c = m[i].first;
+        uint32_t w = (NCC > 1) ? wbase + j : wbase + uint32_t(i) * W + j;
+        auto& pg = sc.prog[c][w];
+        uint32_t x = (rng() % 3 == 0) ? rng() % (P + 1) : P;
+        for (uint32_t p = 0; p < x; ++p) {
+          pg.push_back(cop(C_DELAY, 0, rng() % 9));
+          if (rng() % 2) {
+            pg.push_back(cop(C_SYNC, m[i].second));
+          } else {
+            pg.push_back(cop(C_ARRIVE, m[i].second));
+            pg.push_back(cop(C_DELAY, 0, rng() % 7));
+            pg.push_back(cop(C_WAIT, m[i].second));
+          }
+        }
+        if (x < P && rng() % 2) {
+          pg.push_back(cop(C_DELAY, 0, rng() % 9));
+          pg.push_back(cop(C_ARRIVE, m[i].second));
+        }
+        pg.push_back(cop(C_DELAY, 0, rng() % 5));
+        pg.push_back(cop(C_EXIT, m[i].second));
+      }
+    }
+  }
+  sc.random_pick = true;
+  sc.jitter = 4;
+  CBench b(sim, tick, seed + 5);
+  CStats st;
+  bool ok = b.run(sc, st);
+  std::printf("exit mix: %u done events carried an arrival, %u after their phase was released\n", st.arrived_dones,
+              st.stale_arrived);
+  return creport("random phases with warp and block exits", ok, st);
+}
+
+// A warp that arrives twice in one open phase (a divergent arrive without
+// .aligned) must stop the run with the barrier unit's assert.
+static void c_twice(Sim& sim, uint64_t& tick) {
+  CScenario sc;
+  uint32_t W = std::min<uint32_t>(2, NW);
+  sc.add(false, 0, 0, W, {{0, 0}});
+  sc.prog[0][0] = {cop(C_ARRIVE, 0), cop(C_DELAY, 0, 2), cop(C_ARRIVE, 0)};
+  if (W > 1) {
+    sc.prog[0][1] = {cop(C_DELAY, 0, 40), cop(C_SYNC, 0)};
+  }
+  CBench b(sim, tick, 191);
+  CStats st;
+  b.run(sc, st);
+}
+
 
 int main(int argc, char** argv) {
   Verilated::commandArgs(argc, argv);
 
   uint32_t seed = 1;
+  std::string mode = "all";
   for (int i = 1; i < argc; ++i) {
     if (argv[i][0] == '+') {
       continue;
     }
     if (std::strncmp(argv[i], "--seed=", 7) == 0) {
       seed = uint32_t(std::strtoul(argv[i] + 7, nullptr, 0));
+    } else if (std::strncmp(argv[i], "--mode=", 7) == 0) {
+      mode = argv[i] + 7;
     } else {
-      std::printf("usage: %s [--seed=N]\n", argv[0]);
+      std::printf("usage: %s [--seed=N] [--mode=all|twice]\n", argv[0]);
       return 2;
     }
   }
@@ -1402,6 +1797,11 @@ int main(int argc, char** argv) {
 
   Sim sim;
   uint64_t tick = 0;
+  if (mode == "twice") {
+    c_twice(sim, tick);
+    std::printf("FAIL twice: a warp arrived twice in one phase without an assert\n");
+    return 1;
+  }
   Bench bench(sim, tick, seed);
   bool ok = true;
 
@@ -1478,6 +1878,10 @@ int main(int argc, char** argv) {
     ok = c_collide(sim, tick) && ok;
   }
   ok = c_mix(sim, tick, seed) && ok;
+  ok = c_exit(sim, tick) && ok;
+  ok = c_blockexit(sim, tick) && ok;
+  ok = c_arrive_exit(sim, tick) && ok;
+  ok = c_exit_mix(sim, tick, seed) && ok;
 
   if (!ok) {
     std::cout << "FAILED!" << std::endl;

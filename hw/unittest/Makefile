@@ -300,12 +300,13 @@ endif
 # schedule, whose placement CSV must match the SimX model's run of the same
 # schedule row for row, commit cycles included (placement parity). The same
 # event port carries the gangs' cluster-barrier arrivals: directed release
-# scenarios, random phases against dlmem_ref, and the deterministic barrier
-# schedule's release table (cbar_*.csv); a gang that ends inside a barrier
-# phase must stop the last build with its assert. Then the barrier units' shared
+# scenarios, random phases against dlmem_ref, blocks that end inside a phase,
+# and the deterministic barrier schedules' release tables (cbar_*.csv, and
+# cbarx_*.csv with blocks that end early). Then the barrier units' shared
 # request queue: CTA_DONE events against global barrier rounds under response
 # stalls, cluster barriers (gangs, in-core clusters, split arrive/wait, stale
-# releases, all mixed) and both latencies, at 1 core, 2x2 and 4x2.
+# releases, warp and block exits, all mixed) and both latencies, at 1 core, 2x2,
+# 4x2 and 16x4; a warp that arrives twice in one phase must stop the run.
 # $(1)=NUM_CORES $(2)=SOCKET_SIZE $(3)=NUM_WARPS $(4)=DLMEM_MAX_CLUSTER
 # $(5)=LMEM_LOG_SIZE $(6)=CLUSTER_ID $(7)=seed $(8)=other CONFIGS
 CTA_GANG_SIMX := cta_gang/simx/cta_gang_test
@@ -315,13 +316,17 @@ define cta_gang_case
 		-DVX_CFG_SOCKET_SIZE=$(2) -DVX_CFG_NUM_WARPS=$(3) -DVX_CFG_DLMEM_MAX_CLUSTER=$(4) -DVX_CFG_LMEM_LOG_SIZE=$(5) $(8)"
 	$(MAKE) -C cta_gang run CLUSTER_ID=$(6) CONFIGS="-DVX_CFG_EXT_DLMEM_ENABLE -DVX_CFG_NUM_CORES=$(1) \
 		-DVX_CFG_SOCKET_SIZE=$(2) -DVX_CFG_NUM_WARPS=$(3) -DVX_CFG_DLMEM_MAX_CLUSTER=$(4) -DVX_CFG_LMEM_LOG_SIZE=$(5) $(8)" \
-		OPTS="--seed=$(7) --csv=placement_c$(1)s$(2)w$(3)m$(4)k$(6).csv --cbar-csv=cbar_c$(1)s$(2)w$(3)m$(4)k$(6).csv"
+		OPTS="--seed=$(7) --csv=placement_c$(1)s$(2)w$(3)m$(4)k$(6).csv --cbar-csv=cbar_c$(1)s$(2)w$(3)m$(4)k$(6).csv \
+		--cbarx-csv=cbarx_c$(1)s$(2)w$(3)m$(4)k$(6).csv"
 	$(CTA_GANG_SIMX) --shape=$(1),$(2),$(3),$(4),$(5) --csv=cta_gang/simx_placement_c$(1)s$(2)w$(3)m$(4)k$(6).csv \
-		--cbar-csv=cta_gang/simx_cbar_c$(1)s$(2)w$(3)m$(4)k$(6).csv
+		--cbar-csv=cta_gang/simx_cbar_c$(1)s$(2)w$(3)m$(4)k$(6).csv \
+		--cbarx-csv=cta_gang/simx_cbarx_c$(1)s$(2)w$(3)m$(4)k$(6).csv
 	python3 $(VORTEX_HOME)/hw/unittest/cta_gang/compare_placement.py \
 		cta_gang/placement_c$(1)s$(2)w$(3)m$(4)k$(6).csv cta_gang/simx_placement_c$(1)s$(2)w$(3)m$(4)k$(6).csv
 	python3 $(VORTEX_HOME)/hw/unittest/cta_gang/compare_cbar.py \
 		cta_gang/cbar_c$(1)s$(2)w$(3)m$(4)k$(6).csv cta_gang/simx_cbar_c$(1)s$(2)w$(3)m$(4)k$(6).csv
+	python3 $(VORTEX_HOME)/hw/unittest/cta_gang/compare_cbar.py \
+		cta_gang/cbarx_c$(1)s$(2)w$(3)m$(4)k$(6).csv cta_gang/simx_cbarx_c$(1)s$(2)w$(3)m$(4)k$(6).csv
 endef
 # $(1)=CONFIGS $(2)=seed
 define bar_unit_case
@@ -344,20 +349,23 @@ ifeq ($(XLEN),64)
 	$(call cta_gang_case,4,2,4,4,14,1,9,-DVX_CFG_NUM_CLUSTERS=2)
 	$(call cta_gang_case,6,2,4,3,14,0,10,)
 	$(call cta_gang_case,4,2,16,4,17,0,11,-DVX_CFG_NUM_THREADS=8)
-	! cta_gang/cta_gang --mode=midphase > cta_gang/midphase.log 2>&1
-	grep -q "gang ended inside a cluster barrier phase" cta_gang/midphase.log
+	$(call cta_gang_case,16,4,4,16,14,0,12,)
+	$(call cta_gang_case,16,4,8,16,18,0,13,)
 	$(call bar_unit_case,-DVX_CFG_NUM_CORES=1 -DVX_CFG_SOCKET_SIZE=1,1)
+	! bar_unit/bar_unit --mode=twice > bar_unit/twice.log 2>&1
+	grep -q "warp arrived twice at the cluster barrier in one phase" bar_unit/twice.log
 	$(call bar_unit_case,-DVX_CFG_NUM_CORES=4 -DVX_CFG_SOCKET_SIZE=2,2)
 	$(call bar_unit_case,-DVX_CFG_NUM_CORES=8 -DVX_CFG_SOCKET_SIZE=2 -DVX_CFG_NUM_WARPS=8,3)
+	$(call bar_unit_case,-DVX_CFG_NUM_CORES=16 -DVX_CFG_SOCKET_SIZE=4,4)
 	$(MAKE) -C cta_gang clean
 	$(MAKE) -C bar_unit clean
 endif
 
 # Aperture translation: one core's peer table and per-block stages, checked
 # against dlmem_ref::translate on the shared vectors, then on random traffic.
-# The shapes span every window size (LMEM_LOG 14..18), MAX_CLUSTER 1, 2, 3, 4
-# and 8, core fields wider than the rank field (NCC 6, 8 and 16 over MAX 3, 4
-# and 8), second-cluster core ids, 1 to 8 lanes, 1 and 2 blocks, and Zacas.
+# The shapes span every window size (LMEM_LOG 14..18), MAX_CLUSTER 1, 2, 3, 4,
+# 8 and 16, core fields wider than the rank field (NCC 6, 8 and 16 over MAX 3,
+# 4 and 8), second-cluster core ids, 1 to 8 lanes, 1 and 2 blocks, and Zacas.
 # NCC 6 has no vectors, so it runs random traffic only. The full runs also feed
 # a model of the LSU scheduler's queue, stressing back-pressure and handoffs,
 # and every run models the core's remote-access and local-access trackers, so
@@ -399,8 +407,13 @@ ifeq ($(XLEN),64)
 		-DVX_CFG_DLMEM_MAX_CLUSTER=4 -DVX_CFG_LMEM_LOG_SIZE=17 -DVX_CFG_ISSUE_WIDTH=2 \
 		-DVX_CFG_NUM_LSU_LANES=2,6,0,--seed=5)
 	$(call dlmem_xlate_case,-DVX_CFG_NUM_CLUSTERS=2 -DVX_CFG_NUM_CORES=16 -DVX_CFG_SOCKET_SIZE=4 \
-		-DVX_CFG_NUM_WARPS=16 -DVX_CFG_LMEM_LOG_SIZE=18 -DVX_CFG_EXT_A_ENABLE \
+		-DVX_CFG_NUM_WARPS=16 -DVX_CFG_DLMEM_MAX_CLUSTER=8 -DVX_CFG_LMEM_LOG_SIZE=18 -DVX_CFG_EXT_A_ENABLE \
 		-DVX_CFG_EXT_ZACAS_ENABLE,25,0,--seed=6)
+	$(call dlmem_xlate_case,-DVX_CFG_NUM_CORES=16 -DVX_CFG_SOCKET_SIZE=2 -DVX_CFG_NUM_WARPS=4 \
+		-DVX_CFG_DLMEM_MAX_CLUSTER=16 -DVX_CFG_LMEM_LOG_SIZE=14,13,0,--mode=random --seed=12)
+	$(call dlmem_xlate_case,-DVX_CFG_NUM_CLUSTERS=2 -DVX_CFG_NUM_CORES=16 -DVX_CFG_SOCKET_SIZE=4 \
+		-DVX_CFG_NUM_WARPS=16 -DVX_CFG_DLMEM_MAX_CLUSTER=16 -DVX_CFG_LMEM_LOG_SIZE=18 -DVX_CFG_EXT_A_ENABLE \
+		-DVX_CFG_EXT_ZACAS_ENABLE,25,0,--mode=random --seed=14)
 	$(call dlmem_xlate_case,-DVX_CFG_NUM_CLUSTERS=2 -DVX_CFG_NUM_CORES=6 -DVX_CFG_SOCKET_SIZE=2 \
 		-DVX_CFG_NUM_WARPS=4 -DVX_CFG_DLMEM_MAX_CLUSTER=3 -DVX_CFG_LMEM_LOG_SIZE=15 \
 		-DVX_CFG_NUM_LSU_LANES=1,10,0,--mode=random --seed=7)

@@ -419,6 +419,19 @@ module VX_decode import
                     rd_xregs[XREG_1] = 1'b1;
                 `endif
                 end
+                if (funct7 == 7'd2 && funct3 == 3'd7) begin
+                    // vx_fence_cluster: cluster scope runs at GPU strength, as on sm_90.
+                    ex_type = EX_LSU;
+                    op_type = INST_LSU_FENCE;
+                    op_args.lsu.is_store = 0;
+                    op_args.lsu.is_float = 0;
+                    op_args.lsu.pack     = 0;
+                    op_args.lsu.offset   = 0;
+                `ifdef TCU_META_ENABLE
+                    rd_xregs[XREG_0] = 1'b1;
+                    rd_xregs[XREG_1] = 1'b1;
+                `endif
+                end
             `ifdef DXA_MBAR_ENABLE
                 if (funct7 == 7'd1 && funct3 == 3'd7) begin
                     // vx_fence_proxy_async: the warp waits until the fence retires,

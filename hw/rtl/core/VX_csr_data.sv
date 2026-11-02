@@ -60,6 +60,13 @@ import VX_fpu_pkg::*;
     input wire [`VX_CFG_XLEN-1:0]       req_src,
     output wire [`VX_CFG_XLEN-1:0]      read_data,
 
+`ifdef VX_CFG_EXT_DLMEM_ENABLE
+    // the launch's cluster shape, requested local-memory size and explicit-cluster flag
+    input wire [2:0][CLUSTER_SIZE_W-1:0] launch_cluster_dim,
+    input wire [`VX_CFG_LMEM_LOG_SIZE:0] launch_lmem_size,
+    input wire                          launch_cluster_explicit,
+`endif
+
     // Host performance-counter reads
     input wire [7:0]                    dcr_mpm_class,
     input wire [`VX_CSR_ADDR_BITS-1:0]  dcr_addr,
@@ -166,6 +173,12 @@ import VX_fpu_pkg::*;
             `VX_CSR_CTA_ENTRY       : live_sel_w[LIVE_ENTRY] = 1;
         `ifdef VX_CFG_EXT_DLMEM_ENABLE
             `VX_CSR_CTA_CLUSTER_RANK: live_sel_w[LIVE_CLUSTER_RANK] = 1;
+            // written by the host while the device is idle, so stable within a launch
+            `VX_CSR_CTA_CLUSTER_DIM_X: stable_w = `VX_CFG_XLEN'(launch_cluster_dim[0]);
+            `VX_CSR_CTA_CLUSTER_DIM_Y: stable_w = `VX_CFG_XLEN'(launch_cluster_dim[1]);
+            `VX_CSR_CTA_CLUSTER_DIM_Z: stable_w = `VX_CFG_XLEN'(launch_cluster_dim[2]);
+            `VX_CSR_CTA_LMEM_SIZE    : stable_w = `VX_CFG_XLEN'(launch_lmem_size);
+            `VX_CSR_CTA_CLUSTER_FLAGS: stable_w = `VX_CFG_XLEN'(launch_cluster_explicit);
         `endif
 
             `VX_CSR_WARP_ID    : stable_w = `VX_CFG_XLEN'(req_wid);

@@ -40,7 +40,10 @@ struct CbarSlot {
   uint32_t epoch   = 0;
   uint32_t base    = 0;      // otherwise the cluster's first slot on this core
   uint32_t k       = 1;      // and its block count
+  uint32_t warps   = 0;      // the block's warps: its live count at admission
 };
+#else
+#line 44
 #endif
 
 // Owns per-warp barrier state; resumes waiting warps via the parent Scheduler;
@@ -66,13 +69,13 @@ public:
 #line 58
 #endif
 #ifdef VX_CFG_EXT_DLMEM_ENABLE
-  // Sends a SPREAD block's done event to the cluster's gang unit, through the
-  // same request queue the global barrier arrivals use.
+  // Sends a SPREAD block's done event to its gang unit, through the gbar request queue.
   void send_cta_done(const CtaDone& done);
   // The gang unit released a cluster barrier phase.
   void cluster_release(uint32_t gang_id, uint32_t epoch);
   // A block was admitted into the slot: its cluster-barrier state restarts.
   void slot_admit(uint32_t slot, const CbarSlot& info);
+  void warp_exit(uint32_t wid, uint32_t slot);  // it stops counting at the cluster barrier
 #endif
 
 protected:
@@ -92,20 +95,25 @@ private:
 #ifdef VX_CFG_EXT_DLMEM_ENABLE
   // Books a request queue departure; returns its cycle.
   uint64_t gbar_book(uint64_t now);
-  void cbar_send(const CbarSlot& info);
+  void cbar_send(uint32_t slot);
 
   uint32_t cluster_phase(uint32_t bar_id) const;
   void cluster_arrive(uint32_t bar_id, uint32_t count, uint32_t wid, bool is_sync_bar);
   bool cluster_wait(uint32_t bar_id, uint32_t phase, uint32_t wid);
-  void cluster_complete(uint32_t first, uint32_t count);
+  void cluster_complete(uint32_t base);
+  void slot_release(uint32_t slot);
+  void block_arrive(uint32_t slot);
 
   // Per-slot cluster-barrier state, apart from the barrier store: the slot's
   // __syncthreads barrier stays usable between a cluster arrive and its wait.
   std::vector<CbarSlot> cinfo_;
-  std::vector<uint32_t> ccount_;   // warps of the block arrived
+  std::vector<uint32_t> clive_;    // warps of the block not exited
+  std::vector<WarpMask> carr_;     // warps of the block arrived in the open phase
+  std::vector<uint32_t> ccount_;   // and their count, until the block arrives
   std::vector<uint32_t> cblk_;     // blocks arrived, at a same-core cluster's base slot
+  std::vector<uint32_t> cbl_live_; // blocks not exited, at a same-core cluster's base slot
   std::vector<WarpMask> cwait_;    // suspended warps
-  std::vector<bool>     cpend_;    // arrived, waiting for the gang unit's release
+  std::vector<bool>     cpend_;    // the block arrived; its phase is still open
   std::vector<uint32_t> cphase_;
 
   // A done event enters the RTL queue only cycles after the warp exit, and a
@@ -116,10 +124,16 @@ private:
     uint32_t slot;
     uint32_t gang_id;
     uint32_t epoch;
+    bool     sampled;
+    bool     arrived;   // the block's arrival counts in its gang's open phase
   };
   std::deque<PendingDone> done_q_;
 
   void book_dones(uint64_t now);
+#elif defined(VX_CFG_EXT_DXA_ENABLE)
+#line 121
+#else
+#line 114
 #endif
 
   Core*       core_;

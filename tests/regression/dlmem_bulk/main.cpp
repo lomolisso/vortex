@@ -18,9 +18,9 @@
 //   -f        race: vx_fence_proxy_async() between the stores and the copy
 //   -F        the other modes: leave out the vx_fence_proxy_async() that
 //             orders the source's fill before the cluster barrier
-//   -p spread|default
+//   -p spread|single-core
 //             the cluster policy: SPREAD (default) puts the ranks on
-//             different cores; DEFAULT keeps the cluster on one core, so
+//             different cores; single-core keeps the cluster on one core, so
 //             every window destination is another slot of the issuer's core
 //   -k K      blocks per cluster (default 2)
 //   -n G      clusters (default 2)
@@ -34,7 +34,7 @@
 //   -g H      race: rank 0 of each cluster is a hog that copies H bytes of its
 //             unchanged source every round once the other ranks are ready, and
 //             only then lets them store theirs, one word per thread of warp 0
-//             (-s 4 x threads), so that, in a DEFAULT cluster with two engine
+//             (-s 4 x threads), so that, in a single-core cluster with two engine
 //             workers, their stores wait behind its copy at the banks
 //   -b D      the mbarrier sits D doublewords into the block, 0-6 (default 0),
 //             so in local-memory bank D modulo the banks
@@ -58,7 +58,7 @@
 // The host checks every block's whole local memory byte for byte: each
 // source range, each destination range against its sender's source, every
 // other byte its canary; and the final mbarrier word against mbar_ref. SPREAD
-// runs must have a copy cross cores, DEFAULT runs must keep every copy on one
+// runs must have a copy cross cores, single-core runs must keep every copy on one
 // core.
 //
 // A device without the extensions, or that the clusters do not fit, prints
@@ -120,7 +120,7 @@ bool     verbose = false;
 bool     requested = false;
 
 void usage() {
-  std::printf("Usage: [-m ring|many|self|race] [-f] [-F] [-p spread|default] [-k K] [-n clusters] [-w warps]"
+  std::printf("Usage: [-m ring|many|self|race] [-f] [-F] [-p spread|single-core] [-k K] [-n clusters] [-w warps]"
               " [-c copies] [-s bytes] [-o src align] [-O dst align] [-r rounds] [-g hog bytes] [-b mbar doubleword] [-S]"
               " [-x size|align|dalign|src|rank|mbar|box|retired] [-v] [-h]\n");
 }
@@ -154,7 +154,7 @@ void parse_args(int argc, char** argv) {
       case 'f': race_fence = true; break;
       case 'F': no_fence = true; break;
       case 'p': {
-        const char* const kPolicies[] = {"spread", "default"};
+        const char* const kPolicies[] = {"spread", "single-core"};
         spread = parse_name(optarg, kPolicies, 0, 2) == 0;
         break;
       }
@@ -292,13 +292,13 @@ int main(int argc, char** argv) {
   } else if (race) {
     std::printf("dlmem_bulk: race, %s, %s, %u clusters of %u blocks of %u warps x %u threads, %u cores of %u warps,"
                 " %u rounds of %u bytes%s, hog of %u bytes, mbarrier at byte %u, %u bytes of local memory"
-                " per block\n", race_fence ? "fenced" : "unfenced", spread ? "SPREAD" : "DEFAULT", req_g, k, req_w, nt,
+                " per block\n", race_fence ? "fenced" : "unfenced", spread ? "SPREAD" : "SINGLE_CORE", req_g, k, req_w, nt,
                 (uint32_t)caps.num_cores, (uint32_t)caps.num_warps, rounds, size, soft ? " (reference path)" : "",
                 hog, arg.lm_mbar, arg.lmem_bytes);
   } else {
     std::printf("dlmem_bulk: %s, %s, %u clusters of %u blocks of %u warps x %u threads, %u cores of %u warps,"
                 " %u copies per block (%s, %lu bytes per cluster%s), alignment bases %u/%u, %s, mbarrier at byte %u,"
-                " %u bytes of local memory per block\n", kModeNames[mode], spread ? "SPREAD" : "DEFAULT", req_g, k,
+                " %u bytes of local memory per block\n", kModeNames[mode], spread ? "SPREAD" : "SINGLE_CORE", req_g, k,
                 req_w, nt, (uint32_t)caps.num_cores, (uint32_t)caps.num_warps, copies, size ? "fixed size" : "size mix",
                 (unsigned long)total, soft ? ", reference path" : "", salign, dalign,
                 no_fence ? "no proxy fence" : "proxy fence", arg.lm_mbar, arg.lmem_bytes);
@@ -318,7 +318,7 @@ int main(int argc, char** argv) {
   if (!fits) {
     std::printf("%s: %s clusters of %u blocks of %u warps and %u bytes do not fit %u cores of %u warps x %u"
                 " threads and %u bytes (largest cluster %u)\n", requested ? "Error" : "SKIPPED",
-                spread ? "SPREAD" : "DEFAULT", k, req_w, arg.lmem_bytes, (uint32_t)caps.num_cores,
+                spread ? "SPREAD" : "SINGLE_CORE", k, req_w, arg.lmem_bytes, (uint32_t)caps.num_cores,
                 (uint32_t)caps.num_warps, nt, (uint32_t)caps.lmem_size, (uint32_t)caps.max_cluster);
     vx_queue_release(q);
     vx_device_release(dev);
@@ -367,7 +367,8 @@ int main(int argc, char** argv) {
   li.cluster_dim[0] = k;
   li.cluster_dim[1] = 1;
   li.cluster_dim[2] = 1;
-  li.cluster_policy = spread ? VX_CLUSTER_POLICY_SPREAD : VX_CLUSTER_POLICY_DEFAULT;
+  li.cluster_policy = spread ? VX_CLUSTER_POLICY_SPREAD : VX_CLUSTER_POLICY_SINGLE_CORE;
+  li.cluster_flags = (k > VX_CLUSTER_MAX_PORTABLE) ? VX_CLUSTER_FLAG_NON_PORTABLE : 0;
 
   vx_event_h launch_ev = nullptr;
   CHECK(vx_enqueue_launch(q, &li, 0, nullptr, &launch_ev));
@@ -540,7 +541,7 @@ int main(int argc, char** argv) {
       ++errors;
     }
     if ((mode == MODE_RING || mode == MODE_MANY) && !spread && cross != 0) {
-      std::printf("*** a DEFAULT launch put a cluster on several cores\n");
+      std::printf("*** a SINGLE_CORE launch put a cluster on several cores\n");
       ++errors;
     }
   }

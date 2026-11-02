@@ -87,6 +87,8 @@ CtaGang::CtaGang(const SimContext& ctx, const char* name, const dlmem_ref::Cfg& 
 {
   dlmem_ref::reset(cfg_, mirror_);
   dlmem_ref::reset(cfg_, gids_);
+  gph_.assign(cfg_.num_gangs, false);
+  sph_.assign(cfg_.ncc, std::vector<bool>(cfg_.nw, false));
 }
 
 void CtaGang::on_reset() {
@@ -104,6 +106,8 @@ void CtaGang::on_reset() {
   failed_    = false;
   dirty_     = false;
   evt_q_.clear();
+  gph_.assign(cfg_.num_gangs, false);
+  sph_.assign(cfg_.ncc, std::vector<bool>(cfg_.nw, false));
   out_.reset();
 }
 
@@ -145,19 +149,59 @@ void CtaGang::apply_done(const GangEvent& d) {
   check(policy_ == KMU_POLICY_SPREAD, "cta_gang: done event outside a SPREAD launch");
   check(d.core < cfg_.ncc && blocks_ != 0, "cta_gang: done event for no placed block");
   DT(2, this->name() << " cta-done: core_id=" << d.core << ", slot=" << d.slot
-        << ", gang=" << d.gang_id << ", epoch=" << d.epoch);
+        << ", gang=" << d.gang_id << ", epoch=" << d.epoch << ", arrived=" << d.arrived);
   dlmem_ref::release(mirror_, d.core, d.slot, w_);
   --blocks_;
-  if (k_ > 1) {
-    dlmem_ref::done(gids_, d.gang_id, d.epoch);
+}
+
+// A block that ends leaves the gang's live members, and the open phase's
+// arrivals if it arrived in it; it can complete that phase, whose release
+// then leaves next cycle as an arrival's does. The live count drops with the
+// mirror, before the cycle's placement; the phase is a register.
+void CtaGang::done_phase(const GangEvent& d, bool before) {
+  if (k_ <= 1)
+    return;
+  auto& g = gids_;
+  uint32_t id = d.gang_id;
+  if (before) {
+    check(id < g.live.size() && g.live[id], "done: gang id not live");
+    check(g.epoch[id] == d.epoch, "done: stale epoch");
+    check(g.cnt[id] > 0, "done: too many done events");
+    done_cnt_ = g.cnt[id];
+    if (--g.cnt[id] == 0) {
+      g.live[id] = false;
+    }
+    return;
+  }
+  bool arr = d.arrived && (sph_.at(d.core).at(d.slot) == gph_.at(id));
+  check(!arr || g.arrived[id] != 0, "done: the block's arrival is not held by its gang");
+  uint32_t left = g.arrived[id] - (arr ? 1 : 0);
+  if (left != 0 && left == done_cnt_ - 1) {
+    g.arrived[id]  = 0;
+    g.rel_pend[id] = true;
+    gph_[id] = !gph_[id];
+  } else {
+    g.arrived[id] = left;
   }
 }
 
 void CtaGang::apply_cbar(const GangEvent& a) {
   check(policy_ == KMU_POLICY_SPREAD && k_ > 1, "cta_gang: cluster-barrier arrival outside a SPREAD gang");
   check(a.count == k_, "cta_gang: cluster-barrier arrival with a block count other than the gang's");
-  DT(2, this->name() << " cbar-arrive: core_id=" << a.core << ", gang=" << a.gang_id << ", epoch=" << a.epoch);
-  dlmem_ref::cbar_arrive(gids_, a.gang_id, a.epoch, k_);
+  DT(2, this->name() << " cbar-arrive: core_id=" << a.core << ", slot=" << a.slot << ", gang=" << a.gang_id << ", epoch=" << a.epoch);
+  auto& g = gids_;
+  uint32_t id = a.gang_id;
+  check(id < g.live.size() && g.live[id], "cbar_arrive: gang id not live");
+  check(g.epoch[id] == a.epoch, "cbar_arrive: stale epoch");
+  check(!g.rel_pend[id], "cbar_arrive: arrival before the previous release left");
+  check(g.arrived[id] < g.cnt[id], "cbar_arrive: too many arrivals");
+  sph_.at(a.core).at(a.slot) = gph_.at(id);
+  // the phase completes when every live member arrived
+  if (++g.arrived[id] == g.cnt[id]) {
+    g.arrived[id]  = 0;
+    g.rel_pend[id] = true;
+    gph_[id] = !gph_[id];
+  }
 }
 
 void CtaGang::forward_legacy() {
@@ -270,6 +314,7 @@ void CtaGang::on_tick() {
   // a cluster-barrier arrival frees nothing, so it cannot wake a failed placement
   if (has_evt && evt.kind == GangEvent::CTA_DONE) {
     this->apply_done(evt);
+    this->done_phase(evt, true);
     dirty_ = true;
   }
 
@@ -327,6 +372,9 @@ void CtaGang::on_tick() {
   }
   if (has_evt && evt.kind == GangEvent::CBAR) {
     this->apply_cbar(evt);
+  }
+  if (has_evt && evt.kind == GangEvent::CTA_DONE) {
+    this->done_phase(evt, false);
   }
 
   bool rel_pend = std::find(gids_.rel_pend.begin(), gids_.rel_pend.end(), true) != gids_.rel_pend.end();

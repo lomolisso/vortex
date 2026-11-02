@@ -35,13 +35,18 @@ struct GangEvent {
   uint32_t gang_id;
   uint32_t epoch;
   uint32_t count;     // CBAR: the gang's block count
+#ifdef VX_CFG_EXT_DLMEM_ENABLE
+  bool     arrived = false;  // CTA_DONE: the block's arrival counts in the open phase
+#else
+#line 37
+#endif
 };
 
 // Gang unit of one hardware cluster (VX_cta_gang): it sits between the
 // cluster's launch lane and its cores.
 //
 // A DEFAULT launch passes through; the cluster's fan-out picks its core. A SPREAD
-// message's K blocks are placed all or nothing, spread first, on an exact
+// message's K blocks are placed all or nothing, one per core, on an exact
 // mirror of every core's free CTA slots and used warps, one greedy step per
 // cycle, and then leave as K pinned beats, one per cycle. A slot returns to
 // the mirror only when its block's CTA_DONE event arrives, so the slot a beat
@@ -121,6 +126,19 @@ private:
   bool       direct_;             // no fan-out: the output skid is the core's
 
   uint64_t rel_delay_;
+#ifdef VX_CFG_EXT_DLMEM_ENABLE
+
+  void done_phase(const GangEvent& d, bool before);
+  uint32_t done_cnt_ = 0;          // the live count a done event found
+
+  // Each gang's phase parity, flipped by its releases, and the parity of each
+  // block's last arrival: a block that ends after arriving still counts only
+  // while that phase is open.
+  std::vector<bool> gph_;
+  std::vector<std::vector<bool>> sph_;
+#else
+#line 123
+#endif
 
   friend class SimObject<CtaGang>;
 };

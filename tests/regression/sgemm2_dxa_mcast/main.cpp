@@ -219,10 +219,10 @@ int main(int argc, char* argv[]) {
     // B-tile that one CTA fetches.
     li.cluster_dim[0] = mc_group_size;
     li.cluster_dim[1] = 1;
-    if (spread_k) {
+    li.cluster_policy = spread_k ? VX_CLUSTER_POLICY_SPREAD : VX_CLUSTER_POLICY_SINGLE_CORE;
+    li.cluster_flags = (mc_group_size > VX_CLUSTER_MAX_PORTABLE) ? VX_CLUSTER_FLAG_NON_PORTABLE : 0;
+    if (spread_k)
       li.cluster_dim[2] = 1;
-      li.cluster_policy = VX_CLUSTER_POLICY_SPREAD;
-    }
     RT_CHECK(vx_enqueue_launch(queue, &li, 0, nullptr, &launch_ev));
   }
 

@@ -42,6 +42,11 @@ module VX_bar_unit_top import VX_gpu_pkg::*; (
     input  wire [DLMEM_NCC-1:0]                     cbar_wr_epoch,
     input  wire [DLMEM_NCC-1:0][NW_WIDTH-1:0]       cbar_wr_base,
     input  wire [DLMEM_NCC-1:0][7:0]                cbar_wr_k,
+    input  wire [DLMEM_NCC-1:0][7:0]                cbar_wr_warps,
+
+    input  wire [DLMEM_NCC-1:0]                     exit_valid,
+    input  wire [DLMEM_NCC-1:0][NW_WIDTH-1:0]       exit_wid,
+    input  wire [DLMEM_NCC-1:0][NW_WIDTH-1:0]       exit_slot,
 
     input  wire [DLMEM_NCC-1:0][`VX_CFG_NUM_WARPS-1:0] active_warps,
     output wire [DLMEM_NCC-1:0]                     unlock_valid,
@@ -60,6 +65,7 @@ module VX_bar_unit_top import VX_gpu_pkg::*; (
     output wire [GANG_ID_W-1:0]                     evt_gang,
     output wire                                     evt_epoch,
     output wire [NC_WIDTH-1:0]                      evt_size_m1,
+    output wire                                     evt_arrived,
 
     input  wire                                     rel_valid,
     input  wire [GANG_ID_W-1:0]                     rel_gang,
@@ -70,7 +76,9 @@ module VX_bar_unit_top import VX_gpu_pkg::*; (
     output wire [DLMEM_NCC-1:0]                     gbar_rsp_stall,
     // a core takes a cluster-barrier release this cycle, or holds one back
     output wire [DLMEM_NCC-1:0]                     cbar_rsp_fire,
-    output wire [DLMEM_NCC-1:0]                     cbar_rsp_stall
+    output wire [DLMEM_NCC-1:0]                     cbar_rsp_stall,
+    output wire [DLMEM_NCC-1:0][GANG_ID_W-1:0]      cbar_rsp_gang,
+    output wire [DLMEM_NCC-1:0]                     cbar_rsp_epoch
 );
     localparam SS = `VX_CFG_SOCKET_SIZE;
 
@@ -98,6 +106,7 @@ module VX_bar_unit_top import VX_gpu_pkg::*; (
             assign done_in.slot    = done_in_slot[C];
             assign done_in.gang_id = done_in_gang[C];
             assign done_in.epoch   = done_in_epoch[C];
+            assign done_in.arrived = 1'b0;
 
             cbar_slot_t cbar_info;
             localparam CK_W = $bits(cbar_info.k);
@@ -122,6 +131,10 @@ module VX_bar_unit_top import VX_gpu_pkg::*; (
                 .cbar_wr_valid  (cbar_wr_valid[C]),
                 .cbar_wr_slot   (cbar_wr_slot[C]),
                 .cbar_wr_info   (cbar_info),
+                .cbar_wr_warps  ((NW_WIDTH+1)'(cbar_wr_warps[C])),
+                .warp_exit_valid(exit_valid[C]),
+                .warp_exit_wid  (exit_wid[C]),
+                .warp_exit_slot (exit_slot[C]),
                 .gbar_bus_if    (per_core_gbar_bus_if[i]),
                 .cta_done_valid (done_in_valid[C]),
                 .cta_done_data  (done_in),
@@ -136,6 +149,8 @@ module VX_bar_unit_top import VX_gpu_pkg::*; (
                                     && per_core_gbar_bus_if[i].rsp_data.kind;
             assign cbar_rsp_stall[C] = per_core_gbar_bus_if[i].rsp_valid && ~per_core_gbar_bus_if[i].rsp_ready
                                     && per_core_gbar_bus_if[i].rsp_data.kind;
+            assign cbar_rsp_gang[C]  = per_core_gbar_bus_if[i].rsp_data.gang_id;
+            assign cbar_rsp_epoch[C] = per_core_gbar_bus_if[i].rsp_data.epoch;
         end
 
         VX_gbar_arb #(
@@ -183,5 +198,6 @@ module VX_bar_unit_top import VX_gpu_pkg::*; (
     assign evt_slot  = evt_data.slot;
     assign evt_gang  = evt_data.gang_id;
     assign evt_epoch = evt_data.epoch;
+    assign evt_arrived = evt_data.arrived;
 
 endmodule

@@ -8,7 +8,7 @@
 // block's whole local memory is checked byte for byte: every receiver holds
 // the copies in its tile slots, every other byte (and every byte of a
 // non-receiver) its canary.
-//   -m MASK   legacy barrier multicast with any mask: a DEFAULT cluster of
+//   -m MASK   legacy barrier multicast with any mask: a single-core cluster of
 //             -s blocks (default: the warps of a core), rank 0 issues, and
 //             bit j selects the block in the issuer's slot + j
 //   -M MASK   cluster multicast on mbarriers: bit r selects cluster rank r,
@@ -22,7 +22,7 @@
 //   -n C      copies the issuer multicasts, each into the next tile slot (default 1)
 //   -b E      bytes per element: 1, 2, 4 or 8 (default 4)
 //   -i R      -M: the issuing rank (default 0)
-//   -p spread|default
+//   -p spread|single-core
 //             -M: the cluster policy (default spread)
 //   -H        -M: issue through vortex::dxa_multicast_cluster_Nd
 //   -x neg    a run that must stop the simulator, in a SPREAD cluster of two
@@ -91,7 +91,7 @@ static void show_usage() {
   std::cout << "Usage: [-k kernel] [-r src_rows] [-c src_cols] "
                "[-R tile_rows] [-C tile_cols] [-h]\n"
                "       -m MASK | -M MASK | -x rank|spread|box|retired, with [-s K] [-g clusters] [-w warps]"
-               " [-d rank] [-n copies] [-b elem bytes] [-i issuer] [-p spread|default] [-H] [-v]\n";
+               " [-d rank] [-n copies] [-b elem bytes] [-i issuer] [-p spread|single-core] [-H] [-v]\n";
 }
 
 static uint32_t parse_num(const char* s) {
@@ -124,7 +124,7 @@ static void parse_args(int argc, char** argv) {
       case 'b': mc_elem   = parse_num(optarg); break;
       case 'i': mc_issuer = parse_num(optarg); break;
       case 'p':
-        if (!strcmp(optarg, "spread") || !strcmp(optarg, "default")) {
+        if (!strcmp(optarg, "spread") || !strcmp(optarg, "single-core")) {
           mc_spread = !strcmp(optarg, "spread");
           break;
         }
@@ -262,6 +262,8 @@ int main(int argc, char* argv[]) {
     // walking the barrier-id space past its bounds.
     li.cluster_dim[0] = num_recv;
     li.cluster_dim[1] = 1;
+    li.cluster_policy = VX_CLUSTER_POLICY_SINGLE_CORE;
+    li.cluster_flags = (num_recv > VX_CLUSTER_MAX_PORTABLE) ? VX_CLUSTER_FLAG_NON_PORTABLE : 0;
     RT_CHECK(vx_enqueue_launch(queue, &li, 0, nullptr, &launch_ev));
   }
 
@@ -450,7 +452,7 @@ static int run_checked() {
     std::printf("dxa_copy_mcast: %s multicast, mask %#x, %s, %u clusters of %u blocks of %u warps x %u threads,"
                 " issuer rank %u%s, %u cores of %u warps, %u copies of a rank-%u box of %u bytes (%u-byte"
                 " elements), %u bytes of local memory per block\n", legacy ? "legacy" : "cluster", mc_mask,
-                spread ? "SPREAD" : "DEFAULT", mc_g, k, mc_w, nt, legacy ? 0 : mc_issuer,
+                spread ? "SPREAD" : "SINGLE_CORE", mc_g, k, mc_w, nt, legacy ? 0 : mc_issuer,
                 mc_helper ? " (helper)" : "", (uint32_t)num_cores, (uint32_t)num_warps, mc_copies, mc_ndim,
                 arg.box, elem, arg.lmem_bytes);
   }
@@ -464,7 +466,7 @@ static int run_checked() {
                            : (k * mc_w <= num_warps && k * footprint(arg.lmem_bytes) <= lmem_size);
   if (!fits) {
     std::printf("Error: %s clusters of %u blocks of %u warps and %u bytes do not fit %u cores of %u warps and"
-                " %u bytes (largest cluster %u)\nFAILED!\n", spread ? "SPREAD" : "DEFAULT", k, mc_w,
+                " %u bytes (largest cluster %u)\nFAILED!\n", spread ? "SPREAD" : "SINGLE_CORE", k, mc_w,
                 arg.lmem_bytes, (uint32_t)num_cores, (uint32_t)num_warps, (uint32_t)lmem_size,
                 (uint32_t)max_cluster);
     return 1;
@@ -516,7 +518,8 @@ static int run_checked() {
   li.cluster_dim[0] = k;
   li.cluster_dim[1] = 1;
   li.cluster_dim[2] = 1;
-  li.cluster_policy = spread ? VX_CLUSTER_POLICY_SPREAD : VX_CLUSTER_POLICY_DEFAULT;
+  li.cluster_policy = spread ? VX_CLUSTER_POLICY_SPREAD : VX_CLUSTER_POLICY_SINGLE_CORE;
+  li.cluster_flags = (k > VX_CLUSTER_MAX_PORTABLE) ? VX_CLUSTER_FLAG_NON_PORTABLE : 0;
 
   vx_event_h launch_ev = nullptr;
   CHECK(vx_enqueue_launch(q, &li, 0, nullptr, &launch_ev));
@@ -654,7 +657,7 @@ static int run_checked() {
       ++errors;
     }
     if (!spread && cross != 0) {
-      std::printf("*** a DEFAULT launch put a cluster on several cores\n");
+      std::printf("*** a SINGLE_CORE launch put a cluster on several cores\n");
       ++errors;
     }
   }

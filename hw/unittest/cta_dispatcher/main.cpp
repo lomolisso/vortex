@@ -510,6 +510,18 @@ private:
 #if VX_CFG_EXT_DLMEM_ENABLED
   // Peer-row writes, CTA_DONE events and the CTA_DONE back-pressure.
   bool check_dlmem(const std::vector<Cta>& ctas, int presented, bool accept) {
+    // only the warps the dispatcher launched retire from a CTA slot
+    if (bool(sim_->warp_done_cta) != (sim_->warp_done && !spawned_exit_)) {
+      std::printf("FAIL: warp %u exits (%s), the dispatcher %s it\n", (uint32_t)sim_->warp_done_wid,
+                  spawned_exit_ ? "spawned" : "dispatched", sim_->warp_done_cta ? "retires" : "ignores");
+      return false;
+    }
+    // a retiring warp's slot, as the barrier unit reads it
+    if (sim_->warp_done && done_slot_ >= 0 && sim_->warp_done_slot != uint32_t(done_slot_)) {
+      std::printf("FAIL: warp %u retires from slot %u, the dispatcher names slot %u\n", (uint32_t)sim_->warp_done_wid,
+                  uint32_t(done_slot_), (uint32_t)sim_->warp_done_slot);
+      return false;
+    }
     // a peer row for every admitted block, one cycle after it was taken
     bool want_wr = (prev_accept_ >= 0);
     if (bool(sim_->peer_wr_valid) != want_wr) {
@@ -545,17 +557,19 @@ private:
       uint32_t k = c.pinned ? std::min(c.k, MAXC) : std::min(c.k, usable_slots(stride_of(c.lmem_size)));
       bool gang = c.pinned && k > 1;
       uint32_t base = c.pinned ? slot : model_.window();
+      uint32_t warps = (c.block_size + NUM_THREADS - 1) / NUM_THREADS;
       bool ok = (sim_->cbar_wr_slot == slot) && (bool(sim_->cbar_wr_gang) == gang) && (sim_->cbar_wr_k == k)
-             && (sim_->cbar_wr_base == base);
+             && (sim_->cbar_wr_base == base) && (sim_->cbar_wr_warps == warps);
       if (c.pinned) {
         ok = ok && (sim_->cbar_wr_gang_id == c.gang) && (sim_->cbar_wr_epoch == c.epoch);
       }
       if (!ok) {
         std::printf("FAIL: launch %u CTA %u (%s, K=%u): cluster-barrier record slot %u gang %d id %u epoch %u base %u"
-                    " k %u, want slot %u gang %d id %u epoch %u base %u k %u\n", c.launch + 1, c.block_idx,
+                    " k %u warps %u, want slot %u gang %d id %u epoch %u base %u k %u warps %u\n", c.launch + 1, c.block_idx,
                     c.pinned ? "pinned" : "legacy", c.k, (uint32_t)sim_->cbar_wr_slot, int(sim_->cbar_wr_gang),
                     (uint32_t)sim_->cbar_wr_gang_id, (uint32_t)sim_->cbar_wr_epoch, (uint32_t)sim_->cbar_wr_base,
-                    (uint32_t)sim_->cbar_wr_k, slot, int(gang), c.gang, c.epoch, base, k);
+                    (uint32_t)sim_->cbar_wr_k, (uint32_t)sim_->cbar_wr_warps, slot, int(gang), c.gang, c.epoch, base, k,
+                    warps);
         return false;
       }
       ++cbar_records;
@@ -678,6 +692,9 @@ private:
       active_ &= ~(1u << w);
       sim_->warp_done     = 1;
       sim_->warp_done_wid = w;
+#if VX_CFG_EXT_DLMEM_ENABLED
+      done_slot_ = (warp_cta_[w] >= 0) ? slot_of_[warp_cta_[w]] : -1;
+#endif
       // The CTA's last warp: a pinned block now owes its done event. A legacy
       // block's slot frees in the dispatcher two cycles later, so the bench's
       // gang reuses it only after that.
@@ -690,6 +707,20 @@ private:
         }
       }
     }
+#if VX_CFG_EXT_DLMEM_ENABLED
+    // Now and then an idle warp exits as a vx_wspawn warp would: no slot counts it.
+    spawned_exit_ = false;
+    for (uint32_t i = 0; i < NUM_WARPS && !sim_->warp_done && (cycle_ % 7) == 3; ++i) {
+      uint32_t w = (uint32_t(cycle_) + i) % NUM_WARPS;
+      // a warp the dispatcher is launching now is not idle
+      if (!((active_ >> w) & 1) && !(sim_->cta_fire && sim_->cta_wid == w)) {
+        sim_->warp_done     = 1;
+        sim_->warp_done_wid = w;
+        done_slot_    = -1;
+        spawned_exit_ = true;
+      }
+    }
+#endif
     sim_->active_warps = active_;
   }
 
@@ -711,6 +742,8 @@ private:
   std::vector<int> warp_cta_;           // wid -> CTA
   std::vector<uint32_t> left_;          // warps still running, per CTA
   std::vector<int> slot_of_;            // CTA -> slot
+  int      done_slot_ = -1;             // the slot of the warp retiring this cycle
+  bool     spawned_exit_ = false;       // the exiting warp is not the dispatcher's
   std::vector<bool> pinned_;            // CTA -> pinned
   std::map<uint32_t, int> taken_;       // slot -> resident CTA (a pinned one until its done event leaves)
   std::map<uint32_t, int> pending_;     // slot -> finished pinned CTA owing its event

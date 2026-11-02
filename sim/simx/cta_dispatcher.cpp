@@ -321,6 +321,7 @@ void CtaDispatcher::admit(uint64_t now) {
     cbar_wr_info_.epoch   = cta_.epoch;
     cbar_wr_info_.base    = base;
     cbar_wr_info_.k       = cta_.row.k;
+    cbar_wr_info_.warps   = cta_size_;
   } else {
     if (cta_.is_first_of_cluster) {
       legacy_base_ = base;
@@ -329,12 +330,14 @@ void CtaDispatcher::admit(uint64_t now) {
     uint32_t K = cta_.cluster_dim[0] * cta_.cluster_dim[1] * cta_.cluster_dim[2];
     K = std::min((K == 0) ? 1u : K, max_slots);
     peer_row_[base] = dlmem_ref::legacy_row(my_core_, legacy_base_, K, VX_CFG_DLMEM_MAX_CLUSTER);
-    cbar_wr_info_.base = legacy_base_;
-    cbar_wr_info_.k    = K;
+    cbar_wr_info_.base  = legacy_base_;
+    cbar_wr_info_.k     = K;
+    cbar_wr_info_.warps = cta_size_;
   }
   // The RTL registers the row write one cycle after admission.
   PeerWrOut.send({base, peer_row_[base], stride}, 1);
 #else
+#line 310
   tail_slot_ = (base + 1) % max_slots;
 #endif
 #ifdef DXA_MBAR_ENABLE

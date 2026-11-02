@@ -563,6 +563,13 @@ VX_CSR_CTA_LMEM_ADDR  = 0xCDF
 
 VX_CSR_CTA_CLUSTER_SIZE = 0xCE0
 VX_CSR_CTA_CLUSTER_RANK = 0xCE4  # block rank in its thread-block cluster
+# DLMEM only: the launch's cluster shape, requested local-memory size, and
+# flags (bit 0: the launch named a cluster shape, PTX %is_explicit_cluster).
+VX_CSR_CTA_CLUSTER_DIM_X = 0xCE5
+VX_CSR_CTA_CLUSTER_DIM_Y = 0xCE6
+VX_CSR_CTA_CLUSTER_DIM_Z = 0xCE7
+VX_CSR_CTA_LMEM_SIZE     = 0xCE8
+VX_CSR_CTA_CLUSTER_FLAGS = 0xCE9
 
 VX_CSR_CTA_ENTRY = 0xCE1  # kernel entry PC, supplied per-CTA by the KMU
 

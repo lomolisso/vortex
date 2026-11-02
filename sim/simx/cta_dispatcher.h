@@ -98,7 +98,15 @@ public:
 
   // The cluster-barrier record of the block admitted by the last step(), once.
   bool take_cbar_wr(uint32_t* slot, CbarSlot* info);
+
+  // The warp's CTA slot, or NUM_WARPS when the warp is not a dispatched CTA's.
+  uint32_t warp_slot(uint32_t wid) const { return wid_to_slot_.at(wid); }
 #else
+#ifdef DXA_MBAR_ENABLE
+#line 99
+#else
+#line 94
+#endif
   void warp_done(uint32_t wid);
 #endif
 

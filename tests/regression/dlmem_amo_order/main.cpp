@@ -278,6 +278,7 @@ int main(int argc, char** argv) {
   li.cluster_dim[1] = 1;
   li.cluster_dim[2] = 1;
   li.cluster_policy = VX_CLUSTER_POLICY_SPREAD;
+  li.cluster_flags = (K > VX_CLUSTER_MAX_PORTABLE) ? VX_CLUSTER_FLAG_NON_PORTABLE : 0;
 
   vx_event_h launch_ev = nullptr, read_ev = nullptr;
   CHECK(vx_enqueue_launch(q, &li, 0, nullptr, &launch_ev));

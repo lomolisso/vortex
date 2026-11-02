@@ -835,6 +835,32 @@ private:
 };
 
 // ============================================================================
+// Thread-block clusters (queue.cpp, runtime_helpers.cpp).
+// ============================================================================
+
+// VX_DCR_KMU_CLUSTER_POLICY bits.
+constexpr uint32_t kKmuPolicySpread   = 1u << 0;
+constexpr uint32_t kKmuPolicyExplicit = 1u << 1;  // the launch named a cluster shape
+
+// A launch's cluster against the device it runs on.
+struct ClusterInfo {
+    uint32_t policy;            // vx_cluster_policy_e, DEFAULT for a struct without it
+    uint32_t flags;             // VX_CLUSTER_FLAG_*, 0 for a struct without them
+    bool     dlmem;
+    bool     spread;            // placed SPREAD; otherwise every block of a cluster on one core
+    bool     explicit_cluster;  // a cluster_dim of the launch is not 0
+    uint64_t k;                 // blocks per cluster
+    uint64_t warps;             // warps per block
+    uint64_t slots;             // blocks of the launch's local-memory size a core holds
+    uint64_t per_core;          // blocks of the launch an idle core holds
+    uint64_t cores, ncc, num_clusters, nw, nt, max_cluster, lmem_cap;
+};
+
+// VX_ERR_INVALID_VALUE for an unknown policy or flag, VX_ERR_NOT_SUPPORTED
+// for SPREAD on a device without DLMEM.
+vx_result_t cluster_info(vx_device_h dev, const vx_launch_info_t* info, ClusterInfo* out);
+
+// ============================================================================
 // Handle conversion helpers.
 // ============================================================================
 

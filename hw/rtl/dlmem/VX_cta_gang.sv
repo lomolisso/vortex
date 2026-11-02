@@ -18,17 +18,20 @@
 //
 // A DEFAULT beat passes through unchanged. A SPREAD message (one thread-block
 // cluster of K blocks) is placed all or nothing on an exact mirror of every
-// core's free CTA slots and reserved warps: one greedy step per cycle, spread
-// first from a round-robin start core (sw/common/dlmem_ref.h place()). The K
+// core's free CTA slots and reserved warps: one greedy step per cycle, each
+// member on its own core, from a round-robin start core (sw/common/dlmem_ref.h
+// place()); a gang that finds fewer than K capable cores waits. The K
 // beats then leave as pinned messages, each routed by `dest` to its core with
 // its forced slot and the gang's peer row. A slot returns to the mirror only
 // when its block's CTA_DONE event arrives, so a forced slot is always free when
 // its beat reaches the core.
 //
 // The same event port carries the gangs' cluster-barrier arrivals, one per
-// block and phase. The K-th arrival raises the gang's release, which leaves
-// lowest gang id first; the id stays taken until it has left, so a release
-// never reaches a later gang that reuses the id.
+// block and phase. A phase completes once every block still live has arrived:
+// by the last arrival, or by the CTA_DONE of the last block missing. That
+// raises the gang's release, which leaves lowest gang id first; the id stays
+// taken until it has left, so a release never reaches a later gang that reuses
+// the id.
 //
 // Timing: a head beat visible in cycle t is placed in cycles t+1..t+K; beat e
 // is taken at the earliest in cycle t+K+1+e and leaves one cycle later.
@@ -97,6 +100,11 @@ module VX_cta_gang import VX_gpu_pkg::*; #(
     reg [NG-1:0][DLMEM_K_W-1:0] arr_r;
     reg [NG-1:0]                relp_r;
     reg [NG-1:0]                rel_ep_r;
+    // a phase parity per gang, flipped by each release, and the parity each
+    // block's last arrival counted in: a block that ends after its arrival
+    // still counts only if its phase has not been released
+    reg [NG-1:0]                gph_r;
+    reg [NCC-1:0][NW-1:0]       sph_r;
 
     // per-launch latches: a launch's done events use its policy, K and W
     reg [7:0]                   ctx_r;
@@ -179,11 +187,18 @@ module VX_cta_gang import VX_gpu_pkg::*; #(
         end
     end
 
-    // A phase's K-th arrival raises the gang's release; the release port
-    // sends the lowest pending one.
+    // A phase's arrival from its last live block raises the gang's release;
+    // the release port sends the lowest pending one.
     wire [GANG_ID_W-1:0]  cbar_id   = evt_data.gang_id;
     wire [DLMEM_K_W-1:0]  cbar_next = arr_r[cbar_id] + DLMEM_K_W'(1);
-    wire                  cbar_last = (32'(cbar_next) == 32'(k_r));
+    wire                  cbar_last = (cbar_next == cnt_r[cbar_id]);
+
+    // a block that ends lowers the live count, and its arrival if it still counts
+    wire                  done_arr  = done_gang && done_data.arrived
+                                   && (sph_r[done_data.core][done_data.slot] == gph_r[cbar_id]);
+    wire [DLMEM_K_W-1:0]  done_left = arr_r[cbar_id] - DLMEM_K_W'(done_arr);
+    wire                  done_last = done_gang && (done_left != '0)
+                                   && (done_left == (cnt_r[cbar_id] - DLMEM_K_W'(1)));
 
     logic [GANG_ID_W-1:0] rel_id;
     always @(*) begin
@@ -219,11 +234,9 @@ module VX_cta_gang import VX_gpu_pkg::*; #(
         assign capable[c] = (|(sfree_r[c] & umask_r))
                          && ((USED_W+1)'(sused_r[c]) + (USED_W+1)'(w_r) <= (USED_W+1)'(NW));
     end
-    wire           any_capable = (|capable);
-    wire [NCC-1:0] cand_new    = capable & ~visited_r;
-    // every capable core already holds a member: start a new round
-    wire           new_round   = ~(|cand_new);
-    wire [NCC-1:0] cand        = new_round ? capable : cand_new;
+    // a core already holding a member is not a candidate
+    wire [NCC-1:0] cand        = capable & ~visited_r;
+    wire           any_capable = (|cand);
 
     // the first candidate at or after the start core, cyclically
     logic [CORE_W-1:0] sel_core;
@@ -357,6 +370,8 @@ module VX_cta_gang import VX_gpu_pkg::*; #(
             arr_r       <= '0;
             relp_r      <= '0;
             rel_ep_r    <= '0;
+            gph_r       <= '0;
+            sph_r       <= '0;
         end else begin
             free_r  <= free_n;
             used_r  <= used_n;
@@ -368,13 +383,23 @@ module VX_cta_gang import VX_gpu_pkg::*; #(
                 relp_r[rel_id] <= 1'b0;
             end
             if (cbar_valid) begin
+                sph_r[evt_data.core][evt_data.slot] <= gph_r[cbar_id];
                 if (cbar_last) begin
                     arr_r[cbar_id]    <= '0;
                     relp_r[cbar_id]   <= 1'b1;
                     rel_ep_r[cbar_id] <= evt_data.epoch;
+                    gph_r[cbar_id]    <= ~gph_r[cbar_id];
                 end else begin
                     arr_r[cbar_id] <= cbar_next;
                 end
+            end
+            if (done_last) begin
+                arr_r[cbar_id]    <= '0;
+                relp_r[cbar_id]   <= 1'b1;
+                rel_ep_r[cbar_id] <= evt_data.epoch;
+                gph_r[cbar_id]    <= ~gph_r[cbar_id];
+            end else if (done_arr) begin
+                arr_r[cbar_id] <= done_left;
             end
 
             case (state)
@@ -412,7 +437,7 @@ module VX_cta_gang import VX_gpu_pkg::*; #(
                     members_r[step_r] <= '{core: sel_core, slot: sel_slot};
                     sfree_r[sel_core][sel_slot] <= 1'b0;
                     sused_r[sel_core] <= sused_r[sel_core] + w_r;
-                    visited_r <= (new_round ? '0 : visited_r) | (NCC'(1) << sel_core);
+                    visited_r <= visited_r | (NCC'(1) << sel_core);
                     amask_r   <= amask_n;
                     aused_r   <= aused_n;
                     if (is_last) begin
@@ -474,12 +499,12 @@ module VX_cta_gang import VX_gpu_pkg::*; #(
                                     && (cnt_r[done_data.gang_id] != 0)),
         ("%t: %s: CTA_DONE for gang %0d epoch %0d, which is not live", $time, INSTANCE_ID,
          done_data.gang_id, done_data.epoch))
-    `RUNTIME_ASSERT (~done_gang || (cnt_r[done_data.gang_id] != DLMEM_K_W'(1)) || (arr_r[done_data.gang_id] == '0),
-        ("%t: %s: gang ended inside a cluster barrier phase: gang %0d epoch %0d, %0d of %0d blocks arrived", $time,
-         INSTANCE_ID, done_data.gang_id, done_data.epoch, arr_r[done_data.gang_id], k_r))
+    `RUNTIME_ASSERT (~done_arr || (arr_r[done_data.gang_id] != '0),
+        ("%t: %s: CTA_DONE of gang %0d epoch %0d counts an arrival the gang does not hold", $time, INSTANCE_ID,
+         done_data.gang_id, done_data.epoch))
     `RUNTIME_ASSERT (~cbar_valid || ((policy_r == KMU_POLICY_SPREAD) && (k_r > CLUSTER_SIZE_W'(1))
                                      && (32'(cbar_id) < NG) && live_r[cbar_id] && (epoch_r[cbar_id] == evt_data.epoch)
-                                     && ~relp_r[cbar_id] && (32'(arr_r[cbar_id]) < 32'(k_r))
+                                     && ~relp_r[cbar_id] && (arr_r[cbar_id] < cnt_r[cbar_id])
                                      && ((32'(evt_size_m1) + 1) == 32'(k_r))),
         ("%t: %s: cluster-barrier arrival for gang %0d epoch %0d (size %0d) that is not live, not waiting for it, or of another size",
          $time, INSTANCE_ID, cbar_id, evt_data.epoch, 32'(evt_size_m1) + 1))

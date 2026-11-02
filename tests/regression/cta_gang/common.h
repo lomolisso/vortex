@@ -12,6 +12,7 @@ typedef struct {
   uint32_t lmem_bytes;
   uint32_t bound;        // rendezvous polls before giving up
   uint32_t work;         // ALU iterations every thread runs first
+  uint32_t tail_work;    // ALU iterations the last rank runs before it exits
 } gang_arg_t;
 
 #define REC_BLOCK    0  // blockIdx.x

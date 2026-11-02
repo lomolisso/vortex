@@ -159,9 +159,13 @@ typedef enum {
     VX_QUEUE_PRIORITY_HIGH   = 2
 } vx_queue_priority_e;
 
+// DEFAULT is the device's own placement, as on the H100: on a VX_ISA_EXT_DLMEM
+// device a cluster of more than one block is placed SPREAD; otherwise, and for
+// K = 1, every block of a cluster shares one core.
 typedef enum {
-    VX_CLUSTER_POLICY_DEFAULT = 0,   // a cluster's blocks share one core
-    VX_CLUSTER_POLICY_SPREAD  = 1    // blocks spread over one hardware cluster's cores (VX_ISA_EXT_DLMEM)
+    VX_CLUSTER_POLICY_DEFAULT     = 0,
+    VX_CLUSTER_POLICY_SPREAD      = 1,  // blocks spread over one hardware cluster's cores (VX_ISA_EXT_DLMEM)
+    VX_CLUSTER_POLICY_SINGLE_CORE = 2   // a cluster's blocks share one core, on every device
 } vx_cluster_policy_e;
 
 // ============================================================================
@@ -169,6 +173,13 @@ typedef enum {
 // ============================================================================
 
 #define VX_QUEUE_PROFILING_ENABLE  (1u << 0)
+
+// vx_launch_info_t.cluster_flags: a cluster of more than VX_CLUSTER_MAX_PORTABLE
+// blocks needs VX_CLUSTER_FLAG_NON_PORTABLE, like CUDA's
+// cudaFuncAttributeNonPortableClusterSizeAllowed; VX_CAPS_DLMEM_MAX_CLUSTER
+// bounds it either way.
+#define VX_CLUSTER_FLAG_NON_PORTABLE (1u << 0)
+#define VX_CLUSTER_MAX_PORTABLE      8
 
 // Timeout sentinel — wait forever.
 #define VX_TIMEOUT_INFINITE        ((uint64_t)-1)
@@ -210,6 +221,9 @@ typedef struct {
     // Moves cluster_policy past the version-1 struct's tail padding, so its size tells the versions apart.
     uint32_t     reserved0;
     vx_cluster_policy_e cluster_policy;
+    // Moves cluster_flags past the version-2 struct's tail padding, as reserved0 does.
+    uint32_t     reserved1;
+    uint32_t     cluster_flags;   // VX_CLUSTER_FLAG_*
 } vx_launch_info_t;
 
 // 3D-strided DMA descriptor for the rect enqueue ops. Mirrors OpenCL 1.2's
@@ -278,6 +292,19 @@ vx_result_t vx_device_max_occupancy_grid (vx_device_h dev, uint32_t ndim,
                                           const uint32_t* global_dim,
                                           uint32_t* grid_out,
                                           uint32_t* block_out);
+
+// Cluster occupancy of `info` (its block, local-memory size, cluster shape,
+// policy and flags), like cudaOccupancyMaxActiveClusters and
+// cudaOccupancyMaxPotentialClusterSize, on an idle device:
+// - max_active_clusters: how many of its clusters can be resident at once, 0
+//   if one never fits;
+// - max_potential_cluster_size: the largest cluster size that fits, at most
+//   VX_CLUSTER_MAX_PORTABLE unless the flags allow more; its cluster shape is
+//   ignored.
+vx_result_t vx_occupancy_max_active_clusters      (vx_device_h dev, const vx_launch_info_t* info,
+                                                   uint32_t* out);
+vx_result_t vx_occupancy_max_potential_cluster_size(vx_device_h dev, const vx_launch_info_t* info,
+                                                   uint32_t* out);
 
 // ============================================================================
 // Buffer

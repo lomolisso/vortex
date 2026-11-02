@@ -101,6 +101,9 @@ module VX_cta_dispatch_top import VX_gpu_pkg::*;
     output wire                         cbar_wr_epoch,
     output wire [NW_WIDTH-1:0]          cbar_wr_base,
     output wire [7:0]                   cbar_wr_k,
+    output wire [NW_WIDTH:0]            cbar_wr_warps,
+    output wire                         warp_done_cta,
+    output wire [NW_WIDTH-1:0]          warp_done_slot,
 
     output wire                         busy_out,
 `endif
@@ -208,6 +211,8 @@ module VX_cta_dispatch_top import VX_gpu_pkg::*;
     assign cta_done_slot  = cta_done_data.slot;
     assign cta_done_gang  = cta_done_data.gang_id;
     assign cta_done_epoch = cta_done_data.epoch;
+    // the barrier unit fills the arrived bit
+    `UNUSED_VAR (cta_done_data.arrived)
     assign peer_wr_row    = peer_wr_row_s;
 
     cbar_slot_t cbar_wr_info;
@@ -253,6 +258,9 @@ module VX_cta_dispatch_top import VX_gpu_pkg::*;
         .cbar_wr_valid  (cbar_wr_valid),
         .cbar_wr_slot   (cbar_wr_slot),
         .cbar_wr_info   (cbar_wr_info),
+        .cbar_wr_warps  (cbar_wr_warps),
+        .warp_done_cta  (warp_done_cta),
+        .warp_done_slot (warp_done_slot),
     `endif
         .busy          (busy)
     );

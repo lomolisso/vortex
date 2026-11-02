@@ -355,9 +355,9 @@ bool Scheduler::setTmask(uint32_t wid, const ThreadMask& tmask) {
     }
 #endif
 #ifdef VX_CFG_EXT_DLMEM_ENABLE
-    if (auto done = cta_dispatcher_->warp_done(wid)) {
+    barrier_unit_->warp_exit(wid, cta_dispatcher_->warp_slot(wid));
+    if (auto done = cta_dispatcher_->warp_done(wid))
       barrier_unit_->send_cta_done(*done);
-    }
 #else
     cta_dispatcher_->warp_done(wid);
 #endif

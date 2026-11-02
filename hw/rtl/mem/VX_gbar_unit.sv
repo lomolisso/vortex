@@ -126,6 +126,8 @@ module VX_gbar_unit import VX_gpu_pkg::*; #(
         evt_data_r.slot    <= gbar_bus_if.req_data.slot;
         evt_data_r.gang_id <= gbar_bus_if.req_data.gang_id;
         evt_data_r.epoch   <= gbar_bus_if.req_data.epoch;
+        // a CTA_DONE carries its arrived bit in size_m1
+        evt_data_r.arrived <= gbar_bus_if.req_data.size_m1[0];
         evt_size_m1_r      <= gbar_bus_if.req_data.size_m1;
     end
 

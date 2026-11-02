@@ -105,8 +105,8 @@ inline void reset(const Cfg& cfg, Mirror& m) {
   m.rr = 0;
 }
 
-// All-or-nothing, spread first: a round gives each member a distinct core, and a new
-// round starts only once every capable core holds one. On failure m is unchanged.
+// All-or-nothing, one member per core, as on the H100: a gang that finds fewer
+// than K capable cores waits rather than doubling up. On failure m is unchanged.
 inline bool place(const Cfg& cfg, Mirror& m, uint32_t K, uint32_t W, uint32_t U, std::vector<Peer>& out) {
   check(K >= 1, "place: empty gang");
   Mirror s = m;
@@ -115,26 +115,17 @@ inline bool place(const Cfg& cfg, Mirror& m, uint32_t K, uint32_t W, uint32_t U,
   uint64_t umask = low_mask(U);
   out.clear();
   for (uint32_t r = 0; r < K; ++r) {
-    std::vector<bool> capable(cfg.ncc, false);
-    bool any_capable = false;
-    for (uint32_t c = 0; c < cfg.ncc; ++c) {
-      check(s.used[c] <= cfg.nw, "place: core over-reserved");
-      capable[c] = ((s.free[c] & umask) != 0) && (cfg.nw - s.used[c] >= W);
-      any_capable = any_capable || capable[c];
-    }
-    if (!any_capable) {
-      out.clear();
-      return false;
-    }
     std::vector<bool> cand(cfg.ncc, false);
     bool any_cand = false;
     for (uint32_t c = 0; c < cfg.ncc; ++c) {
-      cand[c] = capable[c] && !visited[c];
+      check(s.used[c] <= cfg.nw, "place: core over-reserved");
+      const bool capable = ((s.free[c] & umask) != 0) && (cfg.nw - s.used[c] >= W);
+      cand[c] = capable && !visited[c];
       any_cand = any_cand || cand[c];
     }
     if (!any_cand) {
-      visited.assign(cfg.ncc, false);
-      cand = capable;
+      out.clear();
+      return false;
     }
     uint32_t c = 0;
     for (uint32_t i = 0; i < cfg.ncc; ++i) {

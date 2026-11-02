@@ -35,11 +35,16 @@ BarrierUnit::BarrierUnit(const SimContext& ctx, const char* name, Core* core, Sc
 {
 #ifdef VX_CFG_EXT_DLMEM_ENABLE
   cinfo_.resize(VX_CFG_NUM_WARPS);
+  clive_.resize(VX_CFG_NUM_WARPS);
+  carr_.resize(VX_CFG_NUM_WARPS);
   ccount_.resize(VX_CFG_NUM_WARPS);
   cblk_.resize(VX_CFG_NUM_WARPS);
+  cbl_live_.resize(VX_CFG_NUM_WARPS);
   cwait_.resize(VX_CFG_NUM_WARPS);
   cpend_.resize(VX_CFG_NUM_WARPS);
   cphase_.resize(VX_CFG_NUM_WARPS);
+#else
+#line 43
 #endif
 #ifdef VX_CFG_EXT_DXA_ENABLE
   TxbarIn.bind(this, &BarrierUnit::on_txbar);
@@ -91,7 +96,7 @@ void BarrierUnit::send_cta_done(const CtaDone& done) {
   if (!done_q_.empty()) {
     push = std::max(push, done_q_.back().push + 1);
   }
-  done_q_.push_back({push, done.slot, done.gang_id, done.epoch});
+  done_q_.push_back({push, done.slot, done.gang_id, done.epoch, false, false});
   this->tick_wake();
 }
 
@@ -100,6 +105,7 @@ void BarrierUnit::send_cta_done(const CtaDone& done) {
 void BarrierUnit::book_dones(uint64_t now) {
   while (!done_q_.empty() && done_q_.front().push < now) {
     const auto& d = done_q_.front();
+    assert(d.sampled);
     uint64_t due = std::max(d.push + 1, gbar_send_next_);
     assert(due >= now);
     gbar_send_next_ = due + 1;
@@ -108,13 +114,22 @@ void BarrierUnit::book_dones(uint64_t now) {
     msg.gang_id = d.gang_id;
     msg.epoch   = d.epoch;
     msg.slot    = d.slot;
+    msg.arrived = d.arrived;
     core_->gbar_arrive_out.send(msg, (due - now) + CTA_DONE_LINK_DELAY);
     done_q_.pop_front();
   }
 }
 
 void BarrierUnit::on_tick() {
-  this->book_dones(SimPlatform::instance().cycles());
+  uint64_t now = SimPlatform::instance().cycles();
+  // The event takes its slot's arrival as the queue's write sees it.
+  for (auto& d : done_q_) {
+    if (!d.sampled && d.push <= now) {
+      d.sampled = true;
+      d.arrived = cpend_.at(d.slot) && cinfo_[d.slot].gang;
+    }
+  }
+  this->book_dones(now);
   if (done_q_.empty()) {
     this->tick_sleep();
   }
@@ -122,20 +137,25 @@ void BarrierUnit::on_tick() {
 
 // A completed block of a SPREAD gang queues like a barrier arrival; past the
 // queue it takes the done events' path, so both reach the gang unit in queue order.
-void BarrierUnit::cbar_send(const CbarSlot& info) {
+void BarrierUnit::cbar_send(uint32_t slot) {
+  const auto& info = cinfo_[slot];
   uint64_t now = SimPlatform::instance().cycles();
   uint64_t due = this->gbar_book(now);
   GbarArrive msg{0, info.k, core_->id()};
   msg.kind    = GBAR_KIND_CBAR;
   msg.gang_id = info.gang_id;
   msg.epoch   = info.epoch;
+  msg.slot    = slot;
   core_->gbar_arrive_out.send(msg, (due - now) + CTA_DONE_LINK_DELAY);
 }
 
 void BarrierUnit::slot_admit(uint32_t slot, const CbarSlot& info) {
   cinfo_.at(slot) = info;
+  clive_[slot]  = info.warps;
+  carr_[slot].reset();
   ccount_[slot] = 0;
   cblk_[slot]   = 0;
+  cbl_live_[slot] = info.k;
   cwait_[slot].reset();
   cpend_[slot]  = false;
   cphase_[slot] = 0;
@@ -155,35 +175,70 @@ uint32_t BarrierUnit::cluster_phase(uint32_t bar_id) const {
 }
 
 void BarrierUnit::cluster_arrive(uint32_t bar_id, uint32_t count, uint32_t wid, bool is_sync_bar) {
+  // A block arrives when every warp of it that has not exited has arrived;
+  // the software count is not used.
+  __unused(count);
   uint32_t slot = cbar_slot(bar_id);
-  DP(4, "*** Cluster barrier arrive: core #" << core_->id() << ", warp #" << wid << ", slot #" << slot << ", phase=" << cphase_[slot] << ", count=" << ccount_[slot]);
-  if (cpend_[slot]) {
-    std::cout << "Error: cluster barrier arrival before its phase completed: core=" << core_->id() << " wid=" << wid << " slot=" << slot << std::endl;
-    std::abort();
-  }
-  if (count == 0) {
-    std::cout << "Error: cluster barrier arrive count=0: core=" << core_->id() << " wid=" << wid << " slot=" << slot << std::endl;
+  DP(4, "*** Cluster barrier arrive: core #" << core_->id() << ", warp #" << wid << ", slot #" << slot << ", phase=" << cphase_[slot] << ", count=" << ccount_[slot] << ", live=" << clive_[slot]);
+  if (carr_[slot].test(wid)) {
+    std::cout << "Error: warp arrived twice at the cluster barrier in one phase (a divergent arrive needs .aligned): core=" << core_->id() << " wid=" << wid << " slot=" << slot << std::endl;
     std::abort();
   }
   if (is_sync_bar) {
     cwait_[slot].set(wid);
   }
-  if (ccount_[slot] + 1 != count) {
-    ++ccount_[slot];
-    return;
+  carr_[slot].set(wid);
+  if (++ccount_[slot] == clive_[slot]) {
+    this->block_arrive(slot);
   }
+}
+
+void BarrierUnit::block_arrive(uint32_t slot) {
   ccount_[slot] = 0;
+  cpend_[slot]  = true;
   const auto& info = cinfo_[slot];
   if (info.gang) {
-    cpend_[slot] = true;
-    this->cbar_send(info);
+    this->cbar_send(slot);
     return;
   }
   // same-core cluster or a cluster of one: completes at its base slot
   uint32_t b = info.base;
-  if (++cblk_.at(b) == cinfo_[b].k) {
-    cblk_[b] = 0;
-    this->cluster_complete(b, cinfo_[b].k);
+  if (++cblk_.at(b) == cbl_live_.at(b)) {
+    this->cluster_complete(b);
+  }
+}
+
+void BarrierUnit::warp_exit(uint32_t wid, uint32_t slot) {
+  if (slot >= VX_CFG_NUM_WARPS)
+    return;
+  assert(clive_[slot] != 0);
+  --clive_[slot];
+  // an arrived warp leaves the arrival count too, unless its block already arrived
+  if (carr_[slot].test(wid)) {
+    carr_[slot].reset(wid);
+    if (!cpend_[slot]) {
+      --ccount_[slot];
+    }
+  }
+  if (clive_[slot] != 0) {
+    if (!cpend_[slot] && ccount_[slot] != 0 && ccount_[slot] == clive_[slot]) {
+      this->block_arrive(slot);
+    }
+    return;
+  }
+  // The block is gone. A gang hears it from the block's done event; a
+  // same-core cluster stops waiting for it at its base slot.
+  const auto& info = cinfo_[slot];
+  if (info.gang)
+    return;
+  uint32_t b = info.base;
+  assert(cbl_live_.at(b) != 0);
+  --cbl_live_[b];
+  if (cpend_[slot]) {
+    --cblk_[b];
+  }
+  if (cblk_[b] != 0 && cblk_[b] == cbl_live_[b]) {
+    this->cluster_complete(b);
   }
 }
 
@@ -197,18 +252,27 @@ bool BarrierUnit::cluster_wait(uint32_t bar_id, uint32_t phase, uint32_t wid) {
   return wait;
 }
 
-void BarrierUnit::cluster_complete(uint32_t first, uint32_t count) {
-  for (uint32_t s = first; s < first + count; ++s) {
-    for (uint32_t i = 0; i < VX_CFG_NUM_WARPS; ++i) {
-      if (cwait_.at(s).test(i)) {
-        DP(3, "*** Resume core #" << core_->id() << ", warp #" << i << " at cluster barrier of slot #" << s);
-        scheduler_->resume(i);
-      }
+// Releases the arrived blocks of the same-core cluster based at slot b.
+void BarrierUnit::cluster_complete(uint32_t b) {
+  cblk_.at(b) = 0;
+  for (uint32_t s = 0; s < VX_CFG_NUM_WARPS; ++s) {
+    if (cpend_[s] && !cinfo_[s].gang && cinfo_[s].base == b) {
+      this->slot_release(s);
     }
-    cwait_[s].reset();
-    cpend_[s] = false;
-    cphase_[s] ^= 1u;
   }
+}
+
+void BarrierUnit::slot_release(uint32_t s) {
+  for (uint32_t i = 0; i < VX_CFG_NUM_WARPS; ++i) {
+    if (cwait_.at(s).test(i)) {
+      DP(3, "*** Resume core #" << core_->id() << ", warp #" << i << " at cluster barrier of slot #" << s);
+      scheduler_->resume(i);
+    }
+  }
+  cwait_[s].reset();
+  carr_[s].reset();
+  cpend_[s] = false;
+  cphase_[s] ^= 1u;
 }
 
 // No pending slot matches a release whose block exited after arriving, or
@@ -217,10 +281,14 @@ void BarrierUnit::cluster_release(uint32_t gang_id, uint32_t epoch) {
   for (uint32_t s = 0; s < VX_CFG_NUM_WARPS; ++s) {
     const auto& info = cinfo_[s];
     if (cpend_[s] && info.gang && info.gang_id == gang_id && info.epoch == epoch) {
-      this->cluster_complete(s, 1);
+      this->slot_release(s);
     }
   }
 }
+#elif defined(VX_CFG_EXT_DXA_ENABLE)
+#line 222
+#else
+#line 214
 #endif
 
 void BarrierUnit::on_reset() {

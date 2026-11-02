@@ -43,6 +43,13 @@ __kernel void gang_k(gang_arg_t* __UNIFORM__ arg) {
       polls = 0;
   }
 
+  // Keeps the last rank's slot, so the other ranks' cores free up first.
+  if (get_cluster_rank() + 1 == get_cluster_size()) {
+    for (uint32_t i = 0; i < arg->tail_work; ++i) {
+      asm volatile ("addi %0, %0, 1" : "+r"(x));
+    }
+  }
+
   rec[REC_BLOCK]   = b;
   rec[REC_CORE]    = vx_core_id();
   rec[REC_CTA_ID]  = get_local_group_id();

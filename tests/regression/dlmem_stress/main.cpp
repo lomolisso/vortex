@@ -27,7 +27,7 @@
 //            local memory through the window, completing on an mbarrier
 //            there, in the first phase and after each cluster.sync() phase
 //            end; the receiver waits for it and checks it before its phase end
-//   -c       control run: DEFAULT (same-core) clusters through the same
+//   -c       control run: single-core clusters (VX_CLUSTER_POLICY_SINGLE_CORE) through the same
 //            window, so nothing crosses the network
 //   -v       print every cluster's placement (core:slot by rank)
 //
@@ -176,7 +176,7 @@ int run_launch(vx_device_h dev, vx_queue_h q, vx_kernel_h kernel, const Caps& ca
   const uint32_t threads = num_blocks * nt;
   const uint32_t dw = dump_words(L.k, nt);
   std::printf("dlmem_stress: %s K=%u, %u clusters, %u warps and %u bytes of local memory per"
-              " block, %u phases of %u steps, seed %#x%s\n", control ? "DEFAULT" : "SPREAD", L.k,
+              " block, %u phases of %u steps, seed %#x%s\n", control ? "SINGLE_CORE" : "SPREAD", L.k,
               L.g, L.w, L.lmem, req_phases, req_steps, seed,
               ((dxa_flags() & FLAG_RDXA) ? ", DXA copies, also into the next rank" : use_dxa ? ", DXA copies" : ""));
 
@@ -248,7 +248,8 @@ int run_launch(vx_device_h dev, vx_queue_h q, vx_kernel_h kernel, const Caps& ca
   li.cluster_dim[0] = L.k;
   li.cluster_dim[1] = 1;
   li.cluster_dim[2] = 1;
-  li.cluster_policy = control ? VX_CLUSTER_POLICY_DEFAULT : VX_CLUSTER_POLICY_SPREAD;
+  li.cluster_policy = control ? VX_CLUSTER_POLICY_SINGLE_CORE : VX_CLUSTER_POLICY_SPREAD;
+  li.cluster_flags = (L.k > VX_CLUSTER_MAX_PORTABLE) ? VX_CLUSTER_FLAG_NON_PORTABLE : 0;
 
   vx_event_h launch_ev = nullptr, read_ev = nullptr;
   CHECK(vx_enqueue_launch(q, &li, 0, nullptr, &launch_ev));

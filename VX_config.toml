@@ -314,8 +314,9 @@ VX_CFG_DXA_MAX_INFLIGHT = 8
 
 [dlmem]
 # Largest thread-block cluster a distributed launch may place across the
-# cores of one hardware cluster (CUDA's portable limit is 8).
-VX_CFG_DLMEM_MAX_CLUSTER = "expr: min(8, $VX_CFG_NUM_CORES)"
+# cores of one hardware cluster. As on the H100, the runtime accepts more than
+# 8 blocks (CUDA's portable limit) only with VX_CLUSTER_FLAG_NON_PORTABLE.
+VX_CFG_DLMEM_MAX_CLUSTER = "expr: min(16, $VX_CFG_NUM_CORES)"
 # Remote stores a core may have unacknowledged; bounds the per-warp store counters.
 VX_CFG_DLMEM_STORE_CREDITS = 8
 # Remote loads and AMOs a core may have outstanding; sizes the egress response table.

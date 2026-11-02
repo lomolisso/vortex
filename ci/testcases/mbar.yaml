@@ -548,7 +548,7 @@ tests:
     drivers: [simx, rtlsim]
     touches: *st_async_touches
     shape: {cores: 2, l2cache: true}
-    args: "-p default -k 2 -n 2"
+    args: "-p single-core -k 2 -n 2"
   # Four cores in two sockets: the ring and the adds cross the cluster crossbar.
   - id: dlmem_st_async-4c-s2
     app: dlmem_st_async

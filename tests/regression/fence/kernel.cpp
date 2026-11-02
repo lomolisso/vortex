@@ -136,9 +136,77 @@ static void storm(kernel_arg_t* arg) {
 	}
 }
 
+#if VX_CFG_EXT_DLMEM_ENABLED
+#include <vx_dlmem.h>
+
+// The blocks of a cluster pair up (rank r with r ^ 1) and pass messages
+// through global memory in turns: the writer stores a line, fences and raises
+// its flag; the reader polls the flag with an atomic, fences and reads the
+// line. The reader's L1 holds the line from the round before (and from a
+// first read), so only a fence that drops it returns the new words.
+static void cluster_mp(cluster_arg_t* arg) {
+	const uint32_t lane  = threadIdx.x % arg->num_threads;
+	const uint32_t b     = blockIdx.x;
+	const uint32_t rank  = vx_cluster_block_rank();
+	const uint32_t peer  = b - rank + (rank ^ 1);
+	auto data    = (volatile uint32_t*)arg->data_addr;
+	auto flags   = (volatile uint32_t*)arg->flag_addr;
+	auto scratch = (volatile uint32_t*)arg->scratch_addr;
+	auto rec     = (volatile uint32_t*)arg->rec_addr + b * CLUSTER_REC_WORDS;
+	volatile uint32_t* mine  = data + b * CLUSTER_LINE_WORDS;
+	volatile uint32_t* yours = data + peer * CLUSTER_LINE_WORDS;
+
+	(void)yours[lane];
+	uint32_t stale = 0, timeouts = 0;
+	for (uint32_t i = 0; i < arg->rounds; ++i) {
+		if ((i & 1) == (rank & 1)) {
+			mine[lane] = cluster_tag(i, b, lane);
+			vx_fence_cluster();
+			if (lane == 0)
+				flags[b * CLUSTER_LINE_WORDS] = i + 1;
+		} else {
+			uint32_t polls = 0;
+			while (amo_read(&flags[peer * CLUSTER_LINE_WORDS]) < i + 1 && polls < arg->bound)
+				++polls;
+			timeouts += (polls == arg->bound);
+			vx_fence_cluster();
+			stale += (yours[lane] != cluster_tag(i, peer, lane));
+		}
+	}
+
+	volatile uint32_t* line = scratch + b * CLUSTER_LINE_WORDS;
+	const uint32_t t0 = cycles();
+	for (uint32_t n = 0; n < arg->fences; ++n) {
+		line[lane] = n;
+		vx_fence_cluster();
+	}
+	const uint32_t t1 = cycles();
+	for (uint32_t n = 0; n < arg->fences; ++n) {
+		line[lane] = n;
+		vx_fence();
+	}
+	const uint32_t t2 = cycles();
+
+	if (stale != 0)
+		amo_add(&rec[CLUSTER_REC_STALE], stale);
+	if (lane == 0) {
+		rec[CLUSTER_REC_CORE]    = vx_core_id();
+		rec[CLUSTER_REC_RANK]    = rank;
+		rec[CLUSTER_REC_TIMEOUT] = timeouts;
+		rec[CLUSTER_REC_CFENCE]  = t1 - t0;
+		rec[CLUSTER_REC_GFENCE]  = t2 - t1;
+		rec[CLUSTER_REC_DONE]    = 1;
+	}
+}
+#endif
+
 __kernel void kernel_main(kernel_arg_t* __UNIFORM__ arg) {
 	if (arg->mode == FENCE_MODE_STORM) {
 		storm(arg);
+#if VX_CFG_EXT_DLMEM_ENABLED
+	} else if (arg->mode == FENCE_MODE_CLUSTER) {
+		cluster_mp((cluster_arg_t*)arg);
+#endif
 	} else {
 		vecadd(arg);
 	}

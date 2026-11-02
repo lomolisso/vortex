@@ -110,6 +110,12 @@ module VX_csr_unit import VX_gpu_pkg::*; #(
         .req_src        (csr_req_src),
         .read_data      (csr_scalar_data),
 
+    `ifdef VX_CFG_EXT_DLMEM_ENABLE
+        .launch_cluster_dim      (dcr_csr_if.cluster_dim),
+        .launch_lmem_size        (dcr_csr_if.lmem_size),
+        .launch_cluster_explicit (dcr_csr_if.cluster_explicit),
+    `endif
+
         .dcr_mpm_class  (dcr_csr_if.mpm_class),
         .dcr_addr       (dcr_csr_if.addr),
         .dcr_data       (dcr_read_data)

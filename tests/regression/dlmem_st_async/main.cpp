@@ -7,9 +7,9 @@
 //   -m ring   stores: block r into rank (r + 1) % K; adds: every rank into
 //             rank 0's counters, rank 0 into its own (default)
 //   -m self   every block into itself, through its own window address
-//   -p spread|default
+//   -p spread|single-core
 //             the cluster policy: SPREAD (default) puts the ranks on
-//             different cores; DEFAULT keeps the cluster on one core
+//             different cores; single-core keeps the cluster on one core
 //   -k K      blocks per cluster (default 2)
 //   -n G      clusters (default 2)
 //   -w W      warps per block (default 2)
@@ -31,7 +31,7 @@
 // exact total so far. The host then checks every block's whole local memory
 // byte for byte (the last round's words, the counters, canaries everywhere
 // else) and each mbarrier word against mbar_ref. SPREAD runs must have ops
-// cross cores, DEFAULT runs must keep them on one core.
+// cross cores, single-core runs must keep them on one core.
 //
 // A device the clusters do not fit prints SKIPPED when the run was launched
 // without options, and fails when any option asked for a run.
@@ -82,7 +82,7 @@ bool     verbose = false;
 bool     requested = false;
 
 void usage() {
-  std::printf("Usage: [-m ring|self] [-p spread|default] [-k K] [-n clusters] [-w warps] [-e ops per thread]"
+  std::printf("Usage: [-m ring|self] [-p spread|single-core] [-k K] [-n clusters] [-w warps] [-e ops per thread]"
               " [-r rounds] [-o op mask] [-x local|mbar|mbarlocal|rank|off] [-v] [-h]\n");
 }
 
@@ -113,7 +113,7 @@ void parse_args(int argc, char** argv) {
     switch (c) {
       case 'm': mode = parse_name(optarg, kModeNames, 0, NUM_MODES); break;
       case 'p': {
-        const char* const kPolicies[] = {"spread", "default"};
+        const char* const kPolicies[] = {"spread", "single-core"};
         spread = parse_name(optarg, kPolicies, 0, 2) == 0;
         break;
       }
@@ -207,7 +207,7 @@ int main(int argc, char** argv) {
                 kNegNames[neg], (uint32_t)num_cores, (uint32_t)num_warps, nt);
   } else {
     std::printf("dlmem_st_async: %s, %s, %u clusters of %u blocks of %u warps x %u threads, %u cores of %u warps,"
-                " %u rounds of %u ops per thread of", kModeNames[mode], spread ? "SPREAD" : "DEFAULT", req_g, k,
+                " %u rounds of %u ops per thread of", kModeNames[mode], spread ? "SPREAD" : "SINGLE_CORE", req_g, k,
                 req_w, nt, (uint32_t)num_cores, (uint32_t)num_warps, rounds, elems);
     for (uint32_t o = 0; o < NUM_OPS; ++o) {
       if (ops & (1u << o))
@@ -225,7 +225,7 @@ int main(int argc, char** argv) {
                            : (k * req_w <= num_warps && k * footprint(arg.lmem_bytes) <= lmem_size);
   if (!fits) {
     std::printf("%s: %s clusters of %u blocks of %u warps and %u bytes do not fit %u cores of %u warps and"
-                " %u bytes (largest cluster %u)\n", requested ? "Error" : "SKIPPED", spread ? "SPREAD" : "DEFAULT",
+                " %u bytes (largest cluster %u)\n", requested ? "Error" : "SKIPPED", spread ? "SPREAD" : "SINGLE_CORE",
                 k, req_w, arg.lmem_bytes, (uint32_t)num_cores, (uint32_t)num_warps, (uint32_t)lmem_size,
                 (uint32_t)max_cluster);
     vx_queue_release(q);
@@ -275,7 +275,8 @@ int main(int argc, char** argv) {
   li.cluster_dim[0] = k;
   li.cluster_dim[1] = 1;
   li.cluster_dim[2] = 1;
-  li.cluster_policy = spread ? VX_CLUSTER_POLICY_SPREAD : VX_CLUSTER_POLICY_DEFAULT;
+  li.cluster_policy = spread ? VX_CLUSTER_POLICY_SPREAD : VX_CLUSTER_POLICY_SINGLE_CORE;
+  li.cluster_flags = (k > VX_CLUSTER_MAX_PORTABLE) ? VX_CLUSTER_FLAG_NON_PORTABLE : 0;
 
   vx_event_h launch_ev = nullptr;
   CHECK(vx_enqueue_launch(q, &li, 0, nullptr, &launch_ev));
@@ -420,7 +421,7 @@ int main(int argc, char** argv) {
       ++errors;
     }
     if (!spread && cross != 0) {
-      std::printf("*** a DEFAULT launch put a cluster on several cores\n");
+      std::printf("*** a SINGLE_CORE launch put a cluster on several cores\n");
       ++errors;
     }
   }

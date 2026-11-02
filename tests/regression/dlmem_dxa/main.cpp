@@ -10,9 +10,9 @@
 //             itself
 //   -m self   control: every block copies into its own local memory through
 //             local pointers (the single-block path)
-//   -p spread|default
+//   -p spread|single-core
 //             the cluster policy: SPREAD (default) puts the ranks on
-//             different cores; DEFAULT keeps the cluster on one core, so
+//             different cores; single-core keeps the cluster on one core, so
 //             every window destination is another slot of the issuer's core
 //   -k K      blocks per cluster (default 2)
 //   -n G      clusters (default 2)
@@ -34,7 +34,7 @@
 // checks every block's whole local memory byte for byte: each tile slot
 // holds its sender's source tile, every other byte its canary; and the final
 // mbarrier word against mbar_ref. SPREAD runs must have a copy cross cores,
-// DEFAULT runs must keep every copy on one core.
+// single-core runs must keep every copy on one core.
 //
 // A device the clusters do not fit prints SKIPPED when the run was launched
 // without options, and fails when any option asked for a run.
@@ -92,7 +92,7 @@ bool     verbose = false;
 bool     requested = false;
 
 void usage() {
-  std::printf("Usage: [-m ring|many|self] [-p spread|default] [-k K] [-n clusters] [-w warps] [-d rank]"
+  std::printf("Usage: [-m ring|many|self] [-p spread|single-core] [-k K] [-n clusters] [-w warps] [-d rank]"
               " [-c copies] [-b elem bytes] [-x rank|mbar|legacy|mcast|retired|box] [-v] [-h]\n");
 }
 
@@ -123,7 +123,7 @@ void parse_args(int argc, char** argv) {
     switch (c) {
       case 'm': mode = parse_name(optarg, kModeNames, 0, NUM_MODES); break;
       case 'p': {
-        const char* const kPolicies[] = {"spread", "default"};
+        const char* const kPolicies[] = {"spread", "single-core"};
         spread = parse_name(optarg, kPolicies, 0, 2) == 0;
         break;
       }
@@ -275,7 +275,7 @@ int main(int argc, char** argv) {
   } else {
     std::printf("dlmem_dxa: %s, %s, %u clusters of %u blocks of %u warps x %u threads, %u cores of %u warps,"
                 " %u copies per block of a rank-%u box of %u bytes (%u-byte elements), %u bytes of local memory"
-                " per block\n", kModeNames[mode], spread ? "SPREAD" : "DEFAULT", req_g, k, req_w, nt,
+                " per block\n", kModeNames[mode], spread ? "SPREAD" : "SINGLE_CORE", req_g, k, req_w, nt,
                 (uint32_t)caps.num_cores, (uint32_t)caps.num_warps, copies, ndim, arg.box, elem, arg.lmem_bytes);
   }
   const uint64_t need = VX_ISA_EXT_DLMEM | VX_ISA_STD_A | VX_ISA_EXT_DXA;
@@ -288,7 +288,7 @@ int main(int argc, char** argv) {
                            : (k * req_w <= caps.num_warps && k * footprint(arg.lmem_bytes) <= caps.lmem_size);
   if (!fits) {
     std::printf("%s: %s clusters of %u blocks of %u warps and %u bytes do not fit %u cores of %u warps and"
-                " %u bytes (largest cluster %u)\n", requested ? "Error" : "SKIPPED", spread ? "SPREAD" : "DEFAULT",
+                " %u bytes (largest cluster %u)\n", requested ? "Error" : "SKIPPED", spread ? "SPREAD" : "SINGLE_CORE",
                 k, req_w, arg.lmem_bytes, (uint32_t)caps.num_cores, (uint32_t)caps.num_warps,
                 (uint32_t)caps.lmem_size, (uint32_t)caps.max_cluster);
     vx_queue_release(q);
@@ -354,7 +354,8 @@ int main(int argc, char** argv) {
   li.cluster_dim[0] = k;
   li.cluster_dim[1] = 1;
   li.cluster_dim[2] = 1;
-  li.cluster_policy = spread ? VX_CLUSTER_POLICY_SPREAD : VX_CLUSTER_POLICY_DEFAULT;
+  li.cluster_policy = spread ? VX_CLUSTER_POLICY_SPREAD : VX_CLUSTER_POLICY_SINGLE_CORE;
+  li.cluster_flags = (k > VX_CLUSTER_MAX_PORTABLE) ? VX_CLUSTER_FLAG_NON_PORTABLE : 0;
 
   vx_event_h launch_ev = nullptr;
   CHECK(vx_enqueue_launch(q, &li, 0, nullptr, &launch_ev));
@@ -472,7 +473,7 @@ int main(int argc, char** argv) {
       ++errors;
     }
     if (mode != MODE_SELF && !spread && cross != 0) {
-      std::printf("*** a DEFAULT launch put a cluster on several cores\n");
+      std::printf("*** a SINGLE_CORE launch put a cluster on several cores\n");
       ++errors;
     }
   }

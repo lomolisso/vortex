@@ -17,7 +17,7 @@
 //   -r R     producer/consumer rounds (default 8)
 //   -p       parity mode: one launch of fixed window-store loops into the next
 //            rank (K = 2, or -k), no spin and no data-dependent trip count
-//   -c       control run: DEFAULT (same-core) clusters through the same
+//   -c       control run: single-core clusters (VX_CLUSTER_POLICY_SINGLE_CORE) through the same
 //            window, so nothing crosses the network
 //   -v       print every cluster's placement (core:slot by rank)
 //
@@ -169,7 +169,7 @@ int run_launch(vx_device_h dev, vx_queue_h q, vx_module_h mod, const Caps& caps,
   r.nt = block_threads(caps, L);
   const uint32_t n = L.lmem / sizeof(uint32_t);
   std::printf("dlmem_store: %s, %s K=%u, %u clusters, %u warps and %u bytes of local memory"
-              " per block, seed %#x\n", kname, control ? "DEFAULT" : "SPREAD", L.k, L.g, L.w,
+              " per block, seed %#x\n", kname, control ? "SINGLE_CORE" : "SPREAD", L.k, L.g, L.w,
               L.lmem, seed);
 
   vx_kernel_h kernel = nullptr;
@@ -221,7 +221,8 @@ int run_launch(vx_device_h dev, vx_queue_h q, vx_module_h mod, const Caps& caps,
   li.cluster_dim[0] = L.k;
   li.cluster_dim[1] = 1;
   li.cluster_dim[2] = 1;
-  li.cluster_policy = control ? VX_CLUSTER_POLICY_DEFAULT : VX_CLUSTER_POLICY_SPREAD;
+  li.cluster_policy = control ? VX_CLUSTER_POLICY_SINGLE_CORE : VX_CLUSTER_POLICY_SPREAD;
+  li.cluster_flags = (L.k > VX_CLUSTER_MAX_PORTABLE) ? VX_CLUSTER_FLAG_NON_PORTABLE : 0;
 
   vx_event_h launch_ev = nullptr, read_ev = nullptr;
   CHECK(vx_enqueue_launch(q, &li, 0, nullptr, &launch_ev));

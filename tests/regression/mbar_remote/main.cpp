@@ -17,7 +17,7 @@
 //   -m tx      remote complete_tx, expect_tx and arrive_tx: every thread
 //              completes bytes on every peer's object, the expecting arrives
 //              come late, so tx goes negative in between
-//   -m self    -m all in DEFAULT clusters: every peer is on the caller's core
+//   -m self    -m all in single-core clusters: every peer is on the caller's core
 //   -k K       blocks per cluster (default 2)
 //   -n G       clusters (default 2)
 //   -w W       warps per block (default 2)
@@ -265,6 +265,7 @@ bool launch(vx_device_h dev, vx_queue_h q, vx_module_h mod, const char* kname, c
   li.cluster_dim[1] = 1;
   li.cluster_dim[2] = 1;
   li.cluster_policy = run.policy;
+  li.cluster_flags = (run.k > VX_CLUSTER_MAX_PORTABLE) ? VX_CLUSTER_FLAG_NON_PORTABLE : 0;
   if (li.lmem_size > caps.lmem_size) {
     std::printf("*** %u bytes of local memory per block, the core has %lu\n", li.lmem_size,
                 (unsigned long)caps.lmem_size);
@@ -449,7 +450,7 @@ int main(int argc, char** argv) {
   std::printf("mbar_remote: %s%s%s%s%s, %u cores of %u warps x %u threads, %u clusters of %u blocks of %u warps,"
               " %u phases, delay %u\n",
               neg_wait ? "-x wait" : kModeNames[mode], relaxed ? " (relaxed)" : "", unfenced ? " (unfenced)" : "",
-              parity ? " (parity)" : "", self ? " DEFAULT" : " SPREAD", (uint32_t)caps.num_cores,
+              parity ? " (parity)" : "", self ? " SINGLE_CORE" : " SPREAD", (uint32_t)caps.num_cores,
               (uint32_t)caps.num_warps, (uint32_t)caps.num_threads, req_g, k, req_w, rounds, delay);
   if (!(caps.isa & VX_ISA_EXT_DLMEM) || !(caps.isa & VX_ISA_STD_A)) {
     std::printf("Error: the device needs DLMEM and the A extension\nFAILED!\n");
@@ -457,7 +458,7 @@ int main(int argc, char** argv) {
   }
   if (self ? k * req_w > caps.num_warps : (k > caps.max_cluster || caps.num_cores < 2 || req_w > caps.num_warps)) {
     std::printf("%s: %s clusters of %u blocks of %u warps do not fit %u cores of %u warps (largest cluster %u)\n",
-                requested ? "Error" : "SKIPPED", self ? "DEFAULT" : "SPREAD", k, req_w, (uint32_t)caps.num_cores,
+                requested ? "Error" : "SKIPPED", self ? "SINGLE_CORE" : "SPREAD", k, req_w, (uint32_t)caps.num_cores,
                 (uint32_t)caps.num_warps, (uint32_t)caps.max_cluster);
     vx_queue_release(q);
     vx_device_release(dev);
@@ -485,7 +486,7 @@ int main(int argc, char** argv) {
   run.g = neg_wait ? 1 : req_g;
   run.w = req_w;
   run.nt = (uint32_t)caps.num_threads;
-  run.policy = self ? VX_CLUSTER_POLICY_DEFAULT : VX_CLUSTER_POLICY_SPREAD;
+  run.policy = self ? VX_CLUSTER_POLICY_SINGLE_CORE : VX_CLUSTER_POLICY_SPREAD;
   const uint32_t R = rounds;
 
   int errors = 0;

@@ -188,6 +188,8 @@ int main(int argc, char* argv[]) {
         // to land on the same core so the DXA multicast in the kernel
         // can deliver scale[cluster_id] to all of them in one shot.
         li.cluster_dim[0] = K;
+        li.cluster_policy = VX_CLUSTER_POLICY_SINGLE_CORE;
+        li.cluster_flags = (K > VX_CLUSTER_MAX_PORTABLE) ? VX_CLUSTER_FLAG_NON_PORTABLE : 0;
         RT_CHECK(vx_enqueue_launch(queue, &li, 0, nullptr, &launch_ev));
     }
 

@@ -373,6 +373,16 @@ inline void vx_fence() {
     __asm__ volatile ("fence iorw, iorw" ::: "memory");
 }
 
+// PTX fence.sc.cluster / fence.acq_rel.cluster. Cluster scope runs at GPU
+// strength, as on sm_90, where .cluster lowers to the same code as .gpu.
+inline void vx_fence_cluster() {
+#if VX_CFG_EXT_DLMEM_ENABLED
+    __asm__ volatile (".insn r %0, 7, 2, x0, x0, x0" :: "i"(RISCV_CUSTOM2) : "memory");
+#else
+    vx_fence();
+#endif
+}
+
 
 //
 // cooperative threads extensions

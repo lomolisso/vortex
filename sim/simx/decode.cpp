@@ -1209,6 +1209,13 @@ Instr::Ptr Decoder::decode(uint32_t code, uint64_t uuid) {
   } break;
 #ifdef VX_CFG_EXT_DLMEM_ENABLE
   case Opcode::EXT3: {
+    // funct7 = 2, funct3 = 7 is the cluster-scope fence, a FENCE as on sm_90.
+    if (funct7 == 2 && funct3 == 7) {
+      instr->set_fu_type(FUType::LSU);
+      instr->set_op_type(LsuType::FENCE);
+      instr->set_args(IntrLsuArgs{0, 0, 0});
+      break;
+    }
   #ifdef VX_CFG_EXT_MBAR_ENABLE
     // funct3 = 6 is R4-type: st.async (funct2 0, 1: b32, b64) and red.async.add
     // (2, 3: u32, u64), rs1 the window address, rs2 the data, rs3 the mbarrier.
@@ -1274,7 +1281,9 @@ Instr::Ptr Decoder::decode(uint32_t code, uint64_t uuid) {
   #endif
   } break;
 #endif
-#if defined(DXA_MBAR_ENABLE)
+#if defined(DXA_MBAR_ENABLE) && !defined(VX_CFG_EXT_DLMEM_ENABLE)
+#line 1230
+#elif defined(DXA_MBAR_ENABLE)
 #elif defined(VX_CFG_EXT_MBAR_ENABLE)
 #line 1225
 #elif defined(VX_CFG_EXT_DLMEM_ENABLE)

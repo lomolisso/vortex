@@ -26,6 +26,8 @@ defaults:
             sim/simx/core, sim/simx/dlmem, sim/simx/socket, sim/simx/mem/local_mem,
             sw/kernel/include/vx_dlmem.h, sw/kernel/include/vx_spawn2.h,
             sw/runtime/common/caps.h, sw/runtime/common/queue.cpp,
+            sw/runtime/common/runtime_helpers.cpp, sw/runtime/common/vortex2_internal.h,
+            sw/runtime/include/vortex2.h, sw/kernel/include/vx_intrinsics.h,
             sw/runtime/common/legacy_runtime.cpp, tests/regression/cluster_rank,
             tests/regression/cta_gang, tests/regression/cluster_sync,
             tests/regression/dlmem_local, tests/regression/dlmem_store,
@@ -69,6 +71,22 @@ tests:
     drivers: [rtlsim]
     configs+: "-DVX_CFG_LMEM_LOG_SIZE=17"
     args: "-m -l 131072"
+  # Every PTX cluster identity register (%cluster_ctaid, %cluster_nctaid,
+  # %clusterid, %nclusterid, %is_explicit_cluster, the shared-memory sizes) and
+  # address op (cvta, mapa, getctarank, isspacep, cluster_group queries)
+  # against a host model, with no cluster shape and with 1-D, 2-D and 3-D
+  # clusters. The DXA build rounds a block's slot to a 128-byte row.
+  - id: cluster_rank-ids
+    app: cluster_rank
+    drivers: [simx, rtlsim]
+    shape: {cores: 4, l2cache: true}
+    args: "-x ids"
+  - id: cluster_rank-ids-dxa
+    app: cluster_rank
+    drivers: [simx]
+    configs+: "-DVX_CFG_EXT_DXA_ENABLE -DVX_CFG_LMEM_NUM_BANKS=16"
+    shape: {cores: 4, l2cache: true}
+    args: "-x ids"
 
   # SimX<->rtlsim parity at XLEN 64, which the entry's own xlen opts into. The
   # rank launches alone are all dispatch, so -l adds a fill of each core's whole
@@ -79,15 +97,23 @@ tests:
     app: cluster_rank
     xlen: [64]
     args: "-m -l 16384"
+  - id: parity-cluster-rank-ids
+    check: model_parity
+    app: cluster_rank
+    xlen: [64]
+    shape: {cores: 4, l2cache: true}
+    args: "-x ids"
 
-  # Distributed launch (VX_CLUSTER_POLICY_SPREAD): each cluster's blocks are
-  # placed all at once on the cores of one hardware cluster, spread first. The
-  # app checks every block ran once, ranks follow the walk, a cluster stays in
-  # one hardware cluster, and the first cluster of each launch, placed on an
-  # idle machine, puts rank r on core r. The A extension adds an atomic
-  # rendezvous per cluster that only completes if its blocks are co-resident;
-  # it needs one shared last-level cache, hence the L2 or L3 on these shapes.
-  # One core: SPREAD of the largest K (1 here), SPREAD K=1, then DEFAULT
+  # Distributed launch (VX_CLUSTER_POLICY_SPREAD, and DEFAULT for K > 1): each
+  # cluster's blocks are placed all at once, one per core of one hardware
+  # cluster; as on the H100, a cluster that finds fewer than K cores with room
+  # waits instead of putting two blocks on one core. The app checks every block
+  # ran once, ranks follow the walk, a cluster stays in one hardware cluster
+  # on distinct cores, and the first cluster of each launch, placed on an idle
+  # machine, puts rank r on core r. The A extension adds an atomic rendezvous
+  # per cluster that only completes if its blocks are co-resident; it needs one
+  # shared last-level cache, hence the L2 or L3 on these shapes.
+  # One core: SPREAD of the largest K (1 here), SPREAD K=1, then single-core
   # clusters of 2, in one process, so each launch restarts the placement.
   - id: cta_gang-1c
     app: cta_gang
@@ -149,10 +175,12 @@ tests:
     configs+: "-DVX_CFG_EXT_A_ENABLE"
     shape: {cores: 4, l2cache: true}
     args: "-k 4 -l 16384"
-  # The runtime refuses SPREAD past VX_CAPS_DLMEM_MAX_CLUSTER, a cluster past
-  # what the rank counter holds, policy 2 and a struct_size below version 1, on
-  # both the single-launch and the batch path; it runs a version-1-sized
-  # descriptor as DEFAULT, and a SPREAD batch launch spreads.
+  # The runtime refuses SPREAD and DEFAULT past VX_CAPS_DLMEM_MAX_CLUSTER, a
+  # single-core cluster past what the rank counter or one core holds, policy 3,
+  # an unknown cluster flag and a struct_size below version 1, on both the
+  # single-launch and the batch path; it runs a version-1-sized descriptor as
+  # DEFAULT, ignores the tail of a version-2-sized one, and a SPREAD batch
+  # launch spreads.
   - id: cta_gang-reject
     app: cta_gang
     drivers: [simx]
@@ -165,12 +193,58 @@ tests:
     configs: ""
     shape: {cores: 2}
     args: "-r"
+  # Sixteen-warp cores: SINGLE_CORE past 8 blocks needs VX_CLUSTER_FLAG_NON_PORTABLE too.
+  - id: cta_gang-reject-w16
+    app: cta_gang
+    drivers: [simx]
+    shape: {cores: 2, warps: 16}
+    args: "-r"
+  # DEFAULT is the device's placement, as on the H100: K > 1 lands SPREAD (one
+  # block per core) on a DLMEM device, by single launch, batch and a version-1
+  # descriptor; K = 1 runs as usual. Without DLMEM a DEFAULT cluster shares a core.
+  - id: cta_gang-x-default-spread
+    app: cta_gang
+    drivers: [simx, rtlsim]
+    configs+: "-DVX_CFG_EXT_A_ENABLE"
+    shape: {cores: 4, l2cache: true}
+    args: "-x default-spread"
+  - id: cta_gang-x-default-spread-nodlmem
+    app: cta_gang
+    drivers: [simx]
+    configs: "-DVX_CFG_EXT_A_ENABLE"
+    shape: {cores: 2, l2cache: true}
+    args: "-x default-spread"
+  # VX_CLUSTER_POLICY_SINGLE_CORE keeps a cluster on one core, also a cluster of
+  # 3 that no 2-core hardware cluster can spread and DEFAULT must refuse.
+  - id: cta_gang-x-single-core
+    app: cta_gang
+    drivers: [simx, rtlsim]
+    configs+: "-DVX_CFG_EXT_A_ENABLE"
+    shape: {cores: 2, l2cache: true}
+    args: "-x single-core"
+  # Clusters of 4 on 4 cores whose last rank outlives the others: once cores
+  # 0-2 drain, a cluster finds 3 capable cores and must wait for core 3, since
+  # a cluster waits for free cores and never shares one.
+  - id: cta_gang-x-nowrap
+    app: cta_gang
+    drivers: [simx, rtlsim]
+    configs+: "-DVX_CFG_EXT_A_ENABLE"
+    shape: {cores: 4, l2cache: true}
+    args: "-x nowrap"
+  # Clusters of 16, past the portable size, with VX_CLUSTER_FLAG_NON_PORTABLE.
+  - id: cta_gang-16c
+    app: cta_gang
+    drivers: [simx]
+    configs+: "-DVX_CFG_EXT_A_ENABLE"
+    shape: {cores: 16, l2cache: true}
+    args: "-k 16 -n 4"
 
   # SimX<->rtlsim parity of the gang unit's placement and done-event timing, at
   # XLEN 64. Fixed ALU work and no rendezvous keep the instruction count exact.
   # Most of the ~4.6% cycle gap is not the gang: on this shape the RTL's socket
   # 1 finishes each wave's record stores ~500 cycles after socket 0 (SimX has no
-  # such skew; DEFAULT already shows 4.2%), so later gangs share cores in rtlsim.
+  # such skew; single-core clusters already show 4.2%), so later gangs are
+  # placed on other cores in rtlsim.
   # The done events reach the gang in the same order, one per cycle, in both.
   - id: parity-cta-gang
     check: model_parity
@@ -180,12 +254,28 @@ tests:
     shape: {cores: 4}
     args: "-p -k 4 -n 16"
 
+  # Programs whose extra warps start with vx_wspawn and exit on their own, on a
+  # DLMEM device, where every warp exit also reaches the cluster barrier.
+  - id: wspawn-arith
+    app: arith
+    drivers: [simx, rtlsim]
+    args: "-n64"
+  - id: wspawn-vecadd_v1
+    app: vecadd_v1
+    drivers: [simx, rtlsim]
+    shape: {cores: 2}
+    args: "-n64"
+  - id: wspawn-sgemm_v1
+    app: sgemm_v1
+    drivers: [simx, rtlsim]
+    args: "-n16"
+
   # --- cluster barrier ---
   # cluster.sync() and the split barrier_arrive()/barrier_wait(). Each phase,
   # every warp adds itself to an atomic counter of its cluster before arriving
   # and must read the whole cluster back after the release; the arrive tokens
   # must follow the phase. A late rank per phase makes an early release show.
-  # One core: same-core clusters of 4 two-warp blocks, then SPREAD K=1 and the
+  # One core: single-core clusters of 4 two-warp blocks, then SPREAD K=1 and the
   # largest K, in one process, so each launch's slot admissions reset the
   # barrier state.
   - id: cluster_sync-1c
@@ -238,7 +328,7 @@ tests:
     drivers: [simx, rtlsim]
     configs+: "-DVX_CFG_EXT_A_ENABLE"
     shape: {cores: 2, warps: 8, l2cache: true}
-    args: "-d -k 4 -w 2 -m mixed"
+    args: "-c -k 4 -w 2 -m mixed"
   # Split-barrier handoff of global data across cores (handoff_k): each phase
   # every warp stores a word, arrives and waits, then loads the word of the
   # same warp of the next rank, on another core under SPREAD, whose line its
@@ -296,7 +386,77 @@ tests:
     app: cluster_sync
     drivers: [simx, rtlsim]
     shape: {cores: 1}
-    args: "-d -k 4 -w 2 -x"
+    args: "-c -k 4 -w 2 -x reject"
+
+  # PTX barrier.cluster waits for the non-exited threads of the cluster: a warp
+  # (-x exit) or a whole block (-x blockexit) that exits without arriving stops
+  # counting, and its exit can complete the phase; a warp or block that arrives
+  # and exits without waiting (-x arrive-exit) counts in that phase only.
+  # Lanes of a warp that return early (-x partial) leave the warp counting
+  # once. Every phase checks the arrival counters. DEFAULT clusters spread
+  # over the cores; -c keeps them on one core.
+  - id: cluster_sync-x-exit
+    app: cluster_sync
+    drivers: [simx, rtlsim]
+    configs+: "-DVX_CFG_EXT_A_ENABLE"
+    shape: {cores: 4, warps: 8, l2cache: true}
+    args: "-x exit -k 4 -w 2 -n 4"
+  - id: cluster_sync-x-exit-1c
+    app: cluster_sync
+    drivers: [simx, rtlsim]
+    configs+: "-DVX_CFG_EXT_A_ENABLE"
+    shape: {warps: 8}
+    args: "-x exit -c -k 2 -w 2 -n 4"
+  - id: cluster_sync-x-blockexit
+    app: cluster_sync
+    drivers: [simx, rtlsim]
+    configs+: "-DVX_CFG_EXT_A_ENABLE"
+    shape: {cores: 4, warps: 8, l2cache: true}
+    args: "-x blockexit -k 4 -w 2 -n 4"
+  - id: cluster_sync-x-blockexit-1c
+    app: cluster_sync
+    drivers: [simx, rtlsim]
+    configs+: "-DVX_CFG_EXT_A_ENABLE"
+    shape: {warps: 8}
+    args: "-x blockexit -c -k 4 -w 2 -n 2"
+  - id: cluster_sync-x-arrive-exit
+    app: cluster_sync
+    drivers: [simx, rtlsim]
+    configs+: "-DVX_CFG_EXT_A_ENABLE"
+    shape: {cores: 4, warps: 8, l2cache: true}
+    args: "-x arrive-exit -k 4 -w 2 -n 4"
+  - id: cluster_sync-x-arrive-exit-1c
+    app: cluster_sync
+    drivers: [simx, rtlsim]
+    configs+: "-DVX_CFG_EXT_A_ENABLE"
+    shape: {warps: 8}
+    args: "-x arrive-exit -c -k 2 -w 2 -n 2"
+  - id: cluster_sync-x-arrive-exit-2cl
+    app: cluster_sync
+    drivers: [simx, rtlsim]
+    configs+: "-DVX_CFG_EXT_A_ENABLE"
+    shape: {clusters: 2, cores: 2, warps: 8, l3cache: true}
+    args: "-x arrive-exit -k 2 -w 2 -n 4"
+  - id: cluster_sync-x-partial
+    app: cluster_sync
+    drivers: [simx, rtlsim]
+    configs+: "-DVX_CFG_EXT_A_ENABLE"
+    shape: {cores: 4, l2cache: true}
+    args: "-x partial -k 4 -w 2 -n 4"
+  - id: cluster_sync-x-partial-1c
+    app: cluster_sync
+    drivers: [simx, rtlsim]
+    configs+: "-DVX_CFG_EXT_A_ENABLE"
+    shape: {warps: 8}
+    args: "-x partial -c -k 2 -w 2 -n 2"
+  # Clusters of 16 on 16 cores: refused without VX_CLUSTER_FLAG_NON_PORTABLE,
+  # then run with it.
+  - id: cluster_sync-k16
+    app: cluster_sync
+    drivers: [simx, rtlsim]
+    configs+: "-DVX_CFG_EXT_A_ENABLE"
+    shape: {cores: 16, l2cache: true}
+    args: "-x k16 -n 2"
 
   # SimX<->rtlsim parity of the cluster barrier at XLEN 64: 64 phases with fixed
   # work and no atomics. Sixteen one-warp blocks fill the four cores at once, so
@@ -317,7 +477,15 @@ tests:
     check: model_parity
     app: cluster_sync
     xlen: [64]
-    args: "-p -d -k 4 -w 1"
+    args: "-p -c -k 4 -w 1"
+  # A warp per block exits before the barrier, so the exits complete phases.
+  - id: parity-cluster-sync-exit
+    check: model_parity
+    app: cluster_sync
+    xlen: [64]
+    configs+: "-DVX_CFG_EXT_A_ENABLE"
+    shape: {cores: 4, warps: 8, l2cache: true}
+    args: "-x exit -k 4 -w 2 -n 2"
 
   # --- aperture translation ---
   # A block reaches the local memory of every block of its cluster through the
@@ -480,6 +648,21 @@ tests:
     configs+: "-DVX_CFG_NUM_CORES=4"
     env: {DRIVER: rtlsim, APP: dlmem_local, ARGS: "-x oob", EXPECT: "DLMEM access out of bounds"}
     run: *expect_fail_run
+  # Without independent thread scheduling a warp is one arrival per phase: its
+  # odd and even lanes arriving in the two branches of an if/else (allowed by
+  # PTX without .aligned) must stop the simulator, not count twice.
+  - id: cluster_sync-x-divergent
+    via: script
+    driver: simx
+    configs+: "-DVX_CFG_EXT_A_ENABLE -DVX_CFG_NUM_CORES=4 -DVX_CFG_L2_ENABLE"
+    env: {DRIVER: simx, APP: cluster_sync, ARGS: "-x divergent -k 2 -w 1 -n 2", EXPECT: "warp arrived twice at the cluster barrier"}
+    run: *expect_fail_run
+  - id: cluster_sync-x-divergent
+    via: script
+    driver: rtlsim
+    configs+: "-DVX_CFG_EXT_A_ENABLE -DVX_CFG_NUM_CORES=4 -DVX_CFG_L2_ENABLE"
+    env: {DRIVER: rtlsim, APP: cluster_sync, ARGS: "-x divergent -k 2 -w 1 -n 2", EXPECT: "warp arrived twice at the cluster barrier"}
+    run: *expect_fail_run
 
   # SimX<->rtlsim parity of the translation stage at XLEN 64: fixed loops of
   # window loads, stores and atomics, at one core on each block's own slice,
@@ -564,6 +747,12 @@ tests:
     configs+: "-DVX_CFG_DLMEM_STORE_CREDITS=1 -DVX_CFG_DLMEM_PENDING_SIZE=1"
     shape: {cores: 2, l2cache: true}
     args: "-k 2 -l 64 -l 1024 -n 3"
+  # A cluster of 16 across 16 cores, with VX_CLUSTER_FLAG_NON_PORTABLE.
+  - id: dlmem_store-16c
+    app: dlmem_store
+    drivers: [simx, rtlsim]
+    shape: {cores: 16, l2cache: true}
+    args: "-k 16 -l 1024 -n 1"
   # Seeded random window loads, stores (1-8 bytes) and atomics on cells each
   # thread owns, spread over every slice, checked against the thread's own model,
   # plus adds into shared counters; each phase ends with cluster.sync(), the
@@ -666,7 +855,7 @@ tests:
     configs+: "-DVX_CFG_EXT_A_ENABLE -DVX_CFG_EXT_MBAR_ENABLE -DVX_CFG_EXT_DXA_ENABLE"
     touches: *dlmem_dxa_touches
     shape: {cores: 2, l2cache: true}
-    args: "-p default -k 2 -n 2"
+    args: "-p single-core -k 2 -n 2"
   # Many to one: every rank issues three copies back to back into rank 0
   # (rank 0 into itself through its own window address), whose one phase
   # expects all twelve.
@@ -941,7 +1130,7 @@ tests:
     configs+: "-DVX_CFG_EXT_A_ENABLE -DVX_CFG_EXT_MBAR_ENABLE -DVX_CFG_EXT_DXA_ENABLE"
     touches: *dlmem_bulk_touches
     shape: {cores: 2, l2cache: true}
-    args: "-p default -k 2 -n 2"
+    args: "-p single-core -k 2 -n 2"
   # Many to one: every rank issues two copies back to back into rank 0 (rank 0
   # into itself through its own window address), whose one phase expects all
   # eight, from four engines across both sockets.
@@ -1004,7 +1193,7 @@ tests:
     configs+: "-DVX_CFG_EXT_A_ENABLE -DVX_CFG_EXT_MBAR_ENABLE -DVX_CFG_EXT_DXA_ENABLE"
     touches: *dlmem_bulk_touches
     shape: {cores: 2, l2cache: true}
-    args: "-p default -k 2 -n 2 -c 4 -b 1"
+    args: "-p single-core -k 2 -n 2 -c 4 -b 1"
   # Two engine workers per socket: both blocks of a DEFAULT cluster copy at
   # once, and their reads and beats share the engine's local-memory port one
   # a cycle, in round-robin order.
@@ -1014,7 +1203,7 @@ tests:
     configs+: "-DVX_CFG_EXT_A_ENABLE -DVX_CFG_EXT_MBAR_ENABLE -DVX_CFG_EXT_DXA_ENABLE -DVX_CFG_NUM_DXA_CORES=2"
     touches: *dlmem_bulk_touches
     shape: {cores: 2, l2cache: true}
-    args: "-p default -k 2 -n 2 -c 2 -s 256"
+    args: "-p single-core -k 2 -n 2 -c 2 -s 256"
   # The proxy fence: per round warp 0 stores the round's words into its source,
   # calls vx_fence_proxy_async() and copies the source into its own local
   # memory at once, while three other warps load and store their own words
@@ -1261,7 +1450,7 @@ tests:
     configs+: "-DVX_CFG_EXT_A_ENABLE -DVX_CFG_EXT_MBAR_ENABLE -DVX_CFG_EXT_DXA_ENABLE"
     touches: *dxa_mcast_touches
     shape: {cores: 4, l2cache: true}
-    args: "-M 0xD -s 4 -p default -d 2"
+    args: "-M 0xD -s 4 -p single-core -d 2"
   # Legacy barrier multicast with a sparse mask: bit j selects the slot
   # issuer + j, for the data as for the barrier, in a DEFAULT cluster of four
   # single-warp blocks on one core; non-receivers stay untouched. The dense
@@ -1298,7 +1487,7 @@ tests:
     configs+: "-DVX_CFG_EXT_A_ENABLE -DVX_CFG_EXT_MBAR_ENABLE -DVX_CFG_EXT_DXA_ENABLE"
     touches: *dxa_mcast_touches
     shape: {cores: 2, threads: 16, l2cache: true}
-    args: "-M 0x3 -s 2 -p default -d 2"
+    args: "-M 0x3 -s 2 -p single-core -d 2"
   - id: dxa_copy_mcast-legacy-t16
     app: dxa_copy_mcast
     drivers: [simx, rtlsim]

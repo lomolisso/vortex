@@ -166,3 +166,99 @@ __kernel void handoff_k(sync_arg_t* __UNIFORM__ arg) {
   rec[REC_PHASES] = phases;
   rec[REC_RUNS]   = 1;
 }
+
+// Arrivals the cluster's counter for phase i must hold once the phase completes.
+static inline uint32_t xexpect(uint32_t xmode, uint32_t k, uint32_t warps, uint32_t i) {
+  switch (xmode) {
+  case XMODE_EXIT:        return k * (warps - 1);
+  case XMODE_BLOCKEXIT:   return (k - 1) * warps;
+  case XMODE_ARRIVE_EXIT: return (i == 0) ? k * warps : (k - 1) * (warps - 1);
+  default:                return k * warps;
+  }
+}
+
+__attribute__((noinline)) static uint32_t arrive_even(uint32_t spin) {
+  work(spin);
+  return vx_cluster_arrive();
+}
+
+__attribute__((noinline)) static uint32_t arrive_odd(uint32_t spin) {
+  work(2 * spin + 1);
+  return vx_cluster_arrive_relaxed();
+}
+
+// The leavers spin first, so the others arrive before them and only the
+// leavers' exits can complete the phase.
+__kernel void xsync_k(sync_arg_t* __UNIFORM__ arg) {
+  const uint32_t k      = arg->k;
+  const uint32_t phases = arg->phases;
+  const uint32_t xmode  = arg->xmode;
+  const uint32_t spin   = arg->spin;
+  const uint32_t b      = blockIdx.x;
+  const uint32_t warp   = get_sub_group_id();
+  const uint32_t warps  = get_num_sub_groups();
+  const uint32_t lane   = threadIdx.x % arg->num_threads;
+  const bool lead = (lane == 0);
+  auto cluster = vortex::this_cluster();
+  const uint32_t rank = cluster.block_rank();
+  const bool last_warp = (warp + 1 == warps);
+  const bool last_rank = (rank + 1 == k);
+  auto count = reinterpret_cast<uint32_t*>(arg->count_addr) + (b / k) * phases;
+  auto rec = reinterpret_cast<uint32_t*>(arg->rec_addr) + b * REC_WORDS;
+
+  if (threadIdx.x == 0) {
+    rec[REC_BLOCK]  = b;
+    rec[REC_CORE]   = vx_core_id();
+    rec[REC_CTA_ID] = get_local_group_id();
+    rec[REC_RANK]   = rank;
+    rec[REC_SIZE]   = cluster.num_blocks();
+    rec[REC_PHASES] = 0;
+    __atomic_fetch_add(&rec[REC_RUNS], 1u, __ATOMIC_SEQ_CST);
+  }
+
+  if (xmode == XMODE_DIVERGENT) {
+    // The other ranks arrive only after rank 0's second arrival, so that one
+    // lands while phase 0 is still open.
+    auto flag = reinterpret_cast<uint32_t*>(arg->data_addr) + b / k;
+    if (rank != 0) {
+      uint32_t polls = 0;
+      while (__atomic_fetch_or(flag, 0u, __ATOMIC_SEQ_CST) == 0 && ++polls < (1u << 20)) {}
+    }
+    const uint32_t token = (lane & 1) ? arrive_odd(spin) : arrive_even(spin);
+    if (rank == 0 && lane == 0)
+      __atomic_fetch_or(flag, 1u, __ATOMIC_SEQ_CST);
+    cluster.barrier_wait(token);
+    if (threadIdx.x == 0)
+      rec[REC_PHASES] = 1;
+    return;
+  }
+
+  if ((xmode == XMODE_EXIT && last_warp) || (xmode == XMODE_BLOCKEXIT && last_rank)) {
+    work(4 * spin);
+    return;
+  }
+  if (xmode == XMODE_ARRIVE_EXIT && (last_warp || last_rank)) {
+    if (lead)
+      __atomic_fetch_add(&count[0], 1u, __ATOMIC_SEQ_CST);
+    cluster.barrier_arrive();
+    work(4 * spin);
+    return;
+  }
+  if (xmode == XMODE_PARTIAL && lane >= arg->num_threads / 2)
+    return;
+
+  uint32_t errors = 0;
+  for (uint32_t i = 0; i < phases; ++i) {
+    const uint32_t expect = xexpect(xmode, k, warps, i);
+    work(rank == i % k ? 2 * spin : spin);
+    if (lead && __atomic_fetch_add(&count[i], 1u, __ATOMIC_SEQ_CST) >= expect)
+      ++errors;
+    cluster.sync();
+    if (lead && __atomic_fetch_or(&count[i], 0u, __ATOMIC_SEQ_CST) != expect)
+      ++errors;
+  }
+  if (lead && errors != 0)
+    reinterpret_cast<uint32_t*>(arg->err_addr)[b * warps + warp] = errors;
+  if (threadIdx.x == 0)
+    rec[REC_PHASES] = phases;
+}

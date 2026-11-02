@@ -403,10 +403,17 @@ bool ProcessorImpl::cycle() {
 }
 
 int ProcessorImpl::dcr_write(uint32_t addr, uint32_t value) {
-  // KMU DCRs route to the KMU and are not broadcast to cores.
+  // KMU DCRs route to the KMU; a DLMEM core also keeps a copy for its CSRs.
   bool is_kmu_dcr = (addr >= VX_DCR_KMU_STATE_BEGIN && addr < VX_DCR_KMU_STATE_END);
   if (is_kmu_dcr) {
     kmu_->dcr_write(addr, value);
+#ifdef VX_CFG_EXT_DLMEM_ENABLE
+    for (auto& cluster : clusters_) {
+      cluster->dcr_write(addr, value);
+    }
+#else
+#line 409
+#endif
     return 0;
   }
 #ifdef VX_CFG_VM_ENABLE

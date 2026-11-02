@@ -750,6 +750,7 @@ package VX_gpu_pkg;
         logic [NW_WIDTH-1:0]     slot;
         logic [GANG_ID_W-1:0]    gang_id;
         logic                    epoch;
+        logic                    arrived;  // the block's arrival is counted in its gang's open barrier phase
     } dlmem_cta_done_t;
 
     // A CTA slot's cluster-barrier record, written at admission.

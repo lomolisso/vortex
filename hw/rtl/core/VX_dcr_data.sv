@@ -119,6 +119,36 @@ module VX_dcr_data import VX_gpu_pkg::*; #(
     assign dcr_bus_if.rsp_valid = rsp_valid_r;
     assign dcr_bus_if.rsp_data  = rsp_data_r;
 
+`ifdef VX_CFG_EXT_DLMEM_ENABLE
+    // The KMU's launch DCRs, kept here as the KMU keeps them, for the cluster identity CSRs.
+    reg [2:0][CLUSTER_SIZE_W-1:0] cluster_dim_r;
+    reg [`VX_CFG_LMEM_LOG_SIZE:0] lmem_size_r;
+    reg                           cluster_explicit_r;
+
+    wire dcr_write = dcr_bus_if.req_valid && dcr_bus_if.req_data.rw;
+
+    always @(posedge clk) begin
+        if (reset) begin
+            cluster_dim_r      <= {3{CLUSTER_SIZE_W'(1)}};
+            lmem_size_r        <= '0;
+            cluster_explicit_r <= 1'b0;
+        end else if (dcr_write) begin
+            case (dcr_bus_if.req_data.addr)
+            `VX_DCR_KMU_CLUSTER_DIM_X:  cluster_dim_r[0]   <= dcr_bus_if.req_data.data[CLUSTER_SIZE_W-1:0];
+            `VX_DCR_KMU_CLUSTER_DIM_Y:  cluster_dim_r[1]   <= dcr_bus_if.req_data.data[CLUSTER_SIZE_W-1:0];
+            `VX_DCR_KMU_CLUSTER_DIM_Z:  cluster_dim_r[2]   <= dcr_bus_if.req_data.data[CLUSTER_SIZE_W-1:0];
+            `VX_DCR_KMU_LMEM_SIZE:      lmem_size_r        <= dcr_bus_if.req_data.data[`VX_CFG_LMEM_LOG_SIZE:0];
+            `VX_DCR_KMU_CLUSTER_POLICY: cluster_explicit_r <= dcr_bus_if.req_data.data[1];
+            default:;
+            endcase
+        end
+    end
+
+    assign dcr_csr_if.cluster_dim      = cluster_dim_r;
+    assign dcr_csr_if.lmem_size        = lmem_size_r;
+    assign dcr_csr_if.cluster_explicit = cluster_explicit_r;
+`endif
+
 `ifdef DBG_TRACE_PIPELINE
     always @(posedge clk) begin
         if (dcr_bus_if.req_valid && dcr_bus_if.req_data.rw) begin

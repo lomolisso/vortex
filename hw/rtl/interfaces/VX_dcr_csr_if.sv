@@ -20,11 +20,22 @@ interface VX_dcr_csr_if import VX_gpu_pkg::*; ();
     wire [7:0]                      mpm_class;
     wire [VX_DCR_DATA_WIDTH-1:0]    value;
     wire                            ready;
+`ifdef VX_CFG_EXT_DLMEM_ENABLE
+    // the core's copy of the launch DCRs behind the cluster identity CSRs
+    wire [2:0][CLUSTER_SIZE_W-1:0]  cluster_dim;
+    wire [`VX_CFG_LMEM_LOG_SIZE:0]  lmem_size;
+    wire                            cluster_explicit;
+`endif
 
     modport master (
         output valid,
         output addr,
         output mpm_class,
+    `ifdef VX_CFG_EXT_DLMEM_ENABLE
+        output cluster_dim,
+        output lmem_size,
+        output cluster_explicit,
+    `endif
         input  value,
         input  ready
     );
@@ -33,6 +44,11 @@ interface VX_dcr_csr_if import VX_gpu_pkg::*; ();
         input  valid,
         input  addr,
         input  mpm_class,
+    `ifdef VX_CFG_EXT_DLMEM_ENABLE
+        input  cluster_dim,
+        input  lmem_size,
+        input  cluster_explicit,
+    `endif
         output value,
         output ready
     );

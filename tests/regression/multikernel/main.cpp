@@ -88,6 +88,8 @@ int check_cluster_ranks(vx_queue_h q, vx_kernel_h kernel, vx_buffer_h buf,
   li.grid_dim[0]    = num_ctas;
   li.block_dim[0]   = block;
   li.cluster_dim[0] = k;
+  li.cluster_policy = VX_CLUSTER_POLICY_SINGLE_CORE;
+  li.cluster_flags = (k > VX_CLUSTER_MAX_PORTABLE) ? VX_CLUSTER_FLAG_NON_PORTABLE : 0;
 
   vx_event_h launch_ev = nullptr, read_ev = nullptr;
   CHECK(vx_enqueue_launch(q, &li, 0, nullptr, &launch_ev));

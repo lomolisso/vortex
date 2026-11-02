@@ -39,6 +39,12 @@ public:
   void set_csr(uint32_t addr, Word value, uint32_t wid, uint32_t tid);
   uint32_t get_fpu_rm(uint32_t funct3, uint32_t wid, uint32_t tid);
   void update_fcrs(uint32_t fflags, uint32_t wid, uint32_t tid);
+#ifdef VX_CFG_EXT_DLMEM_ENABLE
+  // The core's copy of the launch DCRs behind the cluster identity CSRs.
+  void dcr_write(uint32_t addr, uint32_t value);
+#else
+#line 41
+#endif
 
 private:
   Core* core_;
@@ -46,6 +52,15 @@ private:
   // Readback mirror of the kernel-visible SATP CSR. Not a translation source:
   // the MMUs take their root from the device DCR (see Cluster::set_mmu_satp).
   uint64_t satp_ = 0;
+#endif
+#ifdef VX_CFG_EXT_DLMEM_ENABLE
+  struct {
+    uint32_t cluster_dim[3] = {1, 1, 1};
+    uint32_t lmem_size      = 0;
+    uint32_t cluster_flags  = 0;
+  } launch_;
+#else
+#line 49
 #endif
 };
 

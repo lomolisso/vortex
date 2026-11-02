@@ -9,16 +9,26 @@
 //   -m       also map an object into every rank and check each address
 //            against DLMEM_BASE + rank * local-memory size + offset
 //   -l B     also fill and check a B-byte local-memory slice per CTA
+//   -x ids   instead, every cluster identity register (%cluster_ctaid,
+//            %cluster_nctaid, %clusterid, %nclusterid, %is_explicit_cluster,
+//            the shared-memory sizes) and address op (cvta, mapa, getctarank,
+//            isspacep) against a host model, over launches with no cluster
+//            shape and with 1-D, 2-D and 3-D clusters (DEFAULT policy), and a
+//            2-D single-core one
 //
-// A default launch the device cannot hold prints SKIPPED; a requested one fails.
+// The rank launches keep each cluster on one core (VX_CLUSTER_POLICY_SINGLE_CORE),
+// whose slot window they check. A default launch the device cannot hold prints
+// SKIPPED; a requested one fails.
 
 #include <vortex2.h>
 #include <VX_types.h>
 #include "common.h"
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <unistd.h>
 #include <vector>
 
@@ -40,6 +50,11 @@ const char* kernel_file = "kernel.vxbin";
 uint32_t    req_k       = 0;
 bool        map_mode    = false;
 uint32_t    lmem_bytes  = 0;
+bool        ids_mode    = false;
+
+// The -x ids launches' local memory: not a whole memory block, so the rounded
+// %total_smem_size differs from %dynamic_smem_size.
+constexpr uint32_t kIdsLmemBytes = 200;
 
 struct Caps {
   uint64_t num_cores = 0, num_warps = 0, num_threads = 0;
@@ -55,13 +70,15 @@ struct Shape {
 
 void usage() {
   std::printf("Usage: [-k cluster size] [-m: check the rank address map]"
-              " [-l local-memory bytes per CTA] [-h]\n");
+              " [-l local-memory bytes per CTA] [-x ids] [-h]\n");
 }
 
 void parse_args(int argc, char** argv) {
   int c;
-  while ((c = getopt(argc, argv, "k:ml:h")) != -1) {
+  bool bad = false;
+  while ((c = getopt(argc, argv, "k:ml:x:h")) != -1) {
     switch (c) {
+      case 'x': ids_mode   = (std::strcmp(optarg, "ids") == 0); bad |= !ids_mode; break;
       case 'k': req_k      = (uint32_t)std::atoi(optarg); break;
       case 'm': map_mode   = true;                        break;
       case 'l': lmem_bytes = (uint32_t)std::atoi(optarg); break;
@@ -69,7 +86,7 @@ void parse_args(int argc, char** argv) {
       default:  usage(); std::exit(-1);
     }
   }
-  if (optind < argc) {
+  if (bad || optind < argc) {
     usage();
     std::exit(-1);
   }
@@ -122,6 +139,8 @@ int run_rank(vx_device_h dev, vx_queue_h q, vx_kernel_h kernel,
   li.args_size    = sizeof(arg);
   li.ndim         = s.ndim;
   li.lmem_size    = kRankLmemBytes;
+  li.cluster_policy = VX_CLUSTER_POLICY_SINGLE_CORE;
+  li.cluster_flags  = (k > VX_CLUSTER_MAX_PORTABLE) ? VX_CLUSTER_FLAG_NON_PORTABLE : 0;
   li.block_dim[0] = (uint32_t)caps.num_threads;
   li.block_dim[1] = 1;
   li.block_dim[2] = 1;
@@ -274,6 +293,139 @@ int run_lmem(vx_device_h dev, vx_queue_h q, vx_kernel_h kernel, const Caps& caps
   return errors;
 }
 
+
+struct IdsShape {
+  const char* name;
+  uint32_t ndim;
+  uint32_t cluster[3];   // as passed: 0 = no shape on that axis
+  uint32_t grid[3];
+  vx_cluster_policy_e policy;
+};
+
+// The slot the dispatcher gives a block: the request rounded up to a memory
+// block, or to a local-memory row in a DXA build.
+uint32_t slot_bytes(uint32_t bytes) {
+  uint32_t align = VX_CFG_MEM_BLOCK_SIZE;
+#if VX_CFG_EXT_DXA_ENABLED
+  align = std::max<uint32_t>(align, VX_CFG_LMEM_NUM_BANKS * (VX_CFG_XLEN / 8));
+#endif
+  return (bytes + align - 1) / align * align;
+}
+
+// ids_k over one launch: the mismatches against the host model.
+int run_ids(vx_device_h dev, vx_queue_h q, vx_kernel_h kernel, const Caps& caps,
+            const IdsShape& s) {
+  uint32_t dim[3] = {1, 1, 1};
+  bool expl = false;
+  for (uint32_t d = 0; d < s.ndim; ++d) {
+    expl |= (s.cluster[d] != 0);
+    dim[d] = s.cluster[d] ? s.cluster[d] : 1;
+  }
+  uint32_t grid[3] = {1, 1, 1};
+  for (uint32_t d = 0; d < s.ndim; ++d)
+    grid[d] = s.grid[d];
+  const uint32_t k = dim[0] * dim[1] * dim[2];
+  const uint32_t nb = grid[0] * grid[1] * grid[2];
+  const uint32_t nt = (uint32_t)caps.num_threads;
+  std::printf("cluster_rank: ids %s, %s, cluster %ux%ux%u%s, grid %ux%ux%u\n", s.name,
+              s.policy == VX_CLUSTER_POLICY_SINGLE_CORE ? "SINGLE_CORE" : "DEFAULT",
+              dim[0], dim[1], dim[2], expl ? "" : " (none named)", grid[0], grid[1], grid[2]);
+
+  const uint64_t rec_bytes = (uint64_t)nb * IDS_WORDS * sizeof(uint32_t);
+  vx_buffer_h rec_buf = nullptr;
+  CHECK(vx_buffer_create(dev, rec_bytes, VX_MEM_READ_WRITE, &rec_buf));
+  std::vector<uint32_t> recs((size_t)nb * IDS_WORDS, 0xffffffffu);
+  CHECK(vx_enqueue_write(q, rec_buf, 0, recs.data(), rec_bytes, 0, nullptr, nullptr));
+  ids_arg_t arg = {};
+  CHECK(vx_buffer_address(rec_buf, &arg.rec_addr));
+
+  vx_launch_info_t li = {};
+  li.struct_size    = sizeof(li);
+  li.kernel         = kernel;
+  li.args_host      = &arg;
+  li.args_size      = sizeof(arg);
+  li.ndim           = s.ndim;
+  li.lmem_size      = kIdsLmemBytes;
+  li.cluster_policy = s.policy;
+  li.cluster_flags  = (k > VX_CLUSTER_MAX_PORTABLE) ? VX_CLUSTER_FLAG_NON_PORTABLE : 0;
+  li.block_dim[0]   = nt;
+  li.block_dim[1]   = 1;
+  li.block_dim[2]   = 1;
+  for (uint32_t d = 0; d < 3; ++d) {
+    li.grid_dim[d]    = grid[d];
+    li.cluster_dim[d] = s.cluster[d];
+  }
+  vx_event_h launch_ev = nullptr, rec_ev = nullptr;
+  CHECK(vx_enqueue_launch(q, &li, 0, nullptr, &launch_ev));
+  CHECK(vx_enqueue_read(q, recs.data(), rec_buf, 0, rec_bytes, 1, &launch_ev, &rec_ev));
+  CHECK(vx_event_wait_value(rec_ev, 1, VX_TIMEOUT_INFINITE));
+  vx_event_release(rec_ev);
+  vx_event_release(launch_ev);
+
+  int errors = 0;
+  const uint32_t log = VX_CFG_LMEM_LOG_SIZE;
+  for (uint32_t z = 0; z < grid[2]; ++z) {
+    for (uint32_t y = 0; y < grid[1]; ++y) {
+      for (uint32_t x = 0; x < grid[0]; ++x) {
+        const uint32_t b = x + grid[0] * (y + grid[1] * z);
+        const uint32_t* rec = &recs[(size_t)b * IDS_WORDS];
+        const uint32_t bid[3] = {x, y, z};
+        const uint32_t rank = (x % dim[0]) + dim[0] * ((y % dim[1]) + dim[1] * (z % dim[2]));
+        const uint32_t next = (rank + 1) % k;
+        // the next rank's block: same cluster, ctaid of rank `next`
+        const uint32_t nc[3] = {next % dim[0], (next / dim[0]) % dim[1], next / (dim[0] * dim[1])};
+        const uint32_t nx = x - x % dim[0] + nc[0], ny = y - y % dim[1] + nc[1],
+                       nz = z - z % dim[2] + nc[2];
+        const uint32_t nblock = nx + grid[0] * (ny + grid[1] * nz);
+        auto expect = [&](const char* what, uint32_t idx, uint32_t v) {
+          if (rec[idx] != v) {
+            if (errors < 24)
+              std::printf("*** ids %s block (%u,%u,%u): %s = %#x, expected %#x\n", s.name, x, y, z,
+                          what, rec[idx], v);
+            ++errors;
+          }
+        };
+        if (rec[IDS_BLOCK] != x || rec[IDS_BLOCK + 1] != y || rec[IDS_BLOCK + 2] != z) {
+          expect("blockIdx.x (never ran?)", IDS_BLOCK, x);
+          continue;
+        }
+        static const char* const ax[3] = {"x", "y", "z"};
+        char name[48];
+        for (uint32_t d = 0; d < 3; ++d) {
+          std::snprintf(name, sizeof(name), "%%cluster_ctaid.%s", ax[d]);
+          expect(name, IDS_CTAID + d, bid[d] % dim[d]);
+          std::snprintf(name, sizeof(name), "%%cluster_nctaid.%s", ax[d]);
+          expect(name, IDS_NCTAID + d, dim[d]);
+          std::snprintf(name, sizeof(name), "%%clusterid.%s", ax[d]);
+          expect(name, IDS_CLUSTERID + d, bid[d] / dim[d]);
+          std::snprintf(name, sizeof(name), "%%nclusterid.%s", ax[d]);
+          expect(name, IDS_NCLUSTERID + d, grid[d] / dim[d]);
+        }
+        expect("%is_explicit_cluster", IDS_EXPLICIT, expl ? 1 : 0);
+        expect("%dynamic_smem_size", IDS_DYN_SMEM, kIdsLmemBytes);
+        expect("%total_smem_size", IDS_TOTAL_SMEM, slot_bytes(kIdsLmemBytes));
+        expect("%aggr_smem_size", IDS_AGGR_SMEM, slot_bytes(kIdsLmemBytes));
+        expect("%reserved_smem_offset", IDS_RESERVED, 0);
+        expect("%cluster_ctarank", IDS_RANK, rank);
+        // Window offsets are relative to the block's own local memory.
+        expect("cvta.shared::cluster", IDS_CVTA, (rank << log) | IDS_OBJ_OFFSET);
+        expect("getctarank(own object)", IDS_RANK_LOCAL, rank);
+        expect("getctarank(next rank's window pointer)", IDS_RANK_WINDOW, next);
+        expect("getctarank.u32(mapa.u32)", IDS_RANK_U32, next);
+        expect("mapa.u32 into the next rank", IDS_MAPA, (next << log) | IDS_OBJ_OFFSET);
+        expect("the next rank's object through cvta(mapa.u32)", IDS_PEER_VALUE, (uint32_t)ids_tag(nblock));
+        expect("cluster_group::num_threads()", IDS_CG_THREADS, k * nt);
+        expect("cluster_group::thread_rank() of thread 0", IDS_CG_TRANK, rank * nt);
+        expect("cluster_group::dim_threads().x", IDS_CG_DIMTX, nt * dim[0]);
+        expect("cluster_group::query_shared_rank(window)", IDS_CG_QRANK, next);
+        expect("flags (isspacep, cvta, mapa, cluster_group dims, timer)", IDS_FLAGS, IDS_F_ALL);
+      }
+    }
+  }
+
+  CHECK(vx_buffer_release(rec_buf));
+  return errors;
+}
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -306,13 +458,35 @@ int main(int argc, char** argv) {
 
   vx_module_h mod = nullptr;
   CHECK(vx_module_load_file(dev, kernel_file, &mod));
-  vx_kernel_h rank_kernel = nullptr, lmem_kernel = nullptr;
+  vx_kernel_h rank_kernel = nullptr, lmem_kernel = nullptr, ids_kernel = nullptr;
   CHECK(vx_module_get_kernel(mod, "rank_k", &rank_kernel));
   CHECK(vx_module_get_kernel(mod, "lmem_k", &lmem_kernel));
+  CHECK(vx_module_get_kernel(mod, "ids_k", &ids_kernel));
 
   const uint32_t nc = (uint32_t)caps.num_cores;
   std::vector<Shape> shapes;
-  if (req_k != 0) {
+  if (ids_mode) {
+    const auto D = VX_CLUSTER_POLICY_DEFAULT;
+    const uint32_t m = (uint32_t)caps.max_cluster;
+    const uint32_t k1 = std::min<uint32_t>(4, m);
+    const uint32_t c2 = (m >= 4) ? 2 : 1;
+    std::vector<IdsShape> ids = {
+      {"none", 2, {0, 0, 0}, {4, 3, 1}, D},
+      {"1d", 1, {k1, 0, 0}, {3 * k1, 1, 1}, D},
+      {"2d", 2, {c2, 2, 0}, {2 * c2, 6, 1}, D},
+      {"3d", 3, {c2, 1, 2}, {2 * c2, 3, 4}, D},
+      {"3d-partial", 3, {0, 2, 1}, {3, 4, 2}, D},
+    };
+    if (caps.num_warps >= 2)
+      ids.push_back({"2d-single-core", 2, {1, 2, 0}, {3, 4, 1}, VX_CLUSTER_POLICY_SINGLE_CORE});
+    if (m < 2) {
+      std::printf("*** -x ids needs a device whose largest cluster is at least 2\n");
+      ++errors;
+    } else {
+      for (const IdsShape& sh : ids)
+        errors += run_ids(dev, q, ids_kernel, caps, sh);
+    }
+  } else if (req_k != 0) {
     shapes.push_back({2, {req_k, 1, 1}, {2 * req_k, nc + 1, 1}, true});
   } else {
     // Different CTA counts per launch, each several rounds of the machine.
@@ -326,11 +500,12 @@ int main(int argc, char** argv) {
     if (e > 0 || (e < 0 && s.requested))
       errors += (e > 0) ? e : 1;
   }
-  if (lmem_bytes != 0) {
+  if (lmem_bytes != 0 && !ids_mode) {
     const int e = run_lmem(dev, q, lmem_kernel, caps);
     errors += (e < 0) ? 1 : e;
   }
 
+  vx_kernel_release(ids_kernel);
   vx_kernel_release(lmem_kernel);
   vx_kernel_release(rank_kernel);
   vx_module_release(mod);

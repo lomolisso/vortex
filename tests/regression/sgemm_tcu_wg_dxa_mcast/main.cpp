@@ -478,6 +478,8 @@ int main(int argc, char *argv[]) {
     // B-fetch leader (rank 0) from followers, preventing duplicate multicast fires.
     li.cluster_dim[0] = 1;
     li.cluster_dim[1] = mc_group_size;
+    li.cluster_policy = VX_CLUSTER_POLICY_SINGLE_CORE;
+    li.cluster_flags = (mc_group_size > VX_CLUSTER_MAX_PORTABLE) ? VX_CLUSTER_FLAG_NON_PORTABLE : 0;
     RT_CHECK(vx_enqueue_launch(queue, &li, 0, nullptr, &launch_ev));
   }
 

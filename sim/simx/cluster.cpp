@@ -420,14 +420,14 @@ public:
 #ifdef VX_CFG_EXT_DLMEM_ENABLE
   // CTA_DONE and CBAR share one gang-unit queue, which keeps each core's order.
   void gang_event(const GbarArrive& msg) {
-    uint32_t cores_per_cluster = sockets_.size() * cores_per_socket_;
     GangEvent evt;
     evt.kind    = (msg.kind == GBAR_KIND_CBAR) ? GangEvent::CBAR : GangEvent::CTA_DONE;
-    evt.core    = msg.core_id % cores_per_cluster;
+    evt.core    = msg.core_id % (sockets_.size() * cores_per_socket_);
     evt.slot    = msg.slot;
     evt.gang_id = msg.gang_id;
     evt.epoch   = msg.epoch;
     evt.count   = msg.count;
+    evt.arrived = msg.arrived;
     cta_gang_->cta_event(evt);
   }
 

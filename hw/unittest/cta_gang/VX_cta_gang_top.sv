@@ -58,6 +58,8 @@ module VX_cta_gang_top import VX_gpu_pkg::*; #(
     input  wire [NW_WIDTH-1:0]              evt_slot,
     input  wire [GANG_ID_W-1:0]             evt_gang_id,
     input  wire                             evt_epoch,
+    // CTA_DONE: the block's arrival is still pending at its core
+    input  wire                             evt_arrived,
     input  wire [NC_WIDTH-1:0]              evt_size_m1,
 
     output wire                             rel_valid,
@@ -129,6 +131,7 @@ module VX_cta_gang_top import VX_gpu_pkg::*; #(
     assign evt_data.slot    = evt_slot;
     assign evt_data.gang_id = evt_gang_id;
     assign evt_data.epoch   = evt_epoch;
+    assign evt_data.arrived = evt_arrived;
 
     VX_cta_gang #(
         .INSTANCE_ID ("cta_gang"),

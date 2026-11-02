@@ -1,13 +1,13 @@
 // dlmem_local: the distributed local memory window between the blocks of a
-// cluster, on a DLMEM device (RV64): same-core peers (DEFAULT clusters) and,
+// cluster, on a DLMEM device (RV64): same-core peers (SINGLE_CORE clusters) and,
 // with -s and K > 1, peers on other cores (SPREAD clusters).
 //
 //   default  three launches in one process: SPREAD K = 1 with 1 KB of local
-//            memory per block, DEFAULT K = min(2, MAX) with 64 B and DEFAULT
+//            memory per block, SINGLE_CORE K = min(2, MAX) with 64 B and SINGLE_CORE
 //            K = MAX with SRAM / K, where MAX is VX_CAPS_DLMEM_MAX_CLUSTER
 //   -k K     clusters of K x 1 x 1 instead (K <= MAX: the window names ranks
 //            up to MAX only), with 64 B, 1 KB and SRAM / K per block
-//   -s / -d  SPREAD / DEFAULT (the default) policy for the -k launch
+//   -s / -d  SPREAD / SINGLE_CORE (the default) policy for the -k launch
 //   -n G     clusters per launch (default: one round of the machine, plus one)
 //   -w W     warps per block (default 1)
 //   -l B     local-memory bytes per block, a multiple of 64; repeat for a sweep
@@ -31,7 +31,7 @@
 //            2-block cluster (needs MAX >= 3)
 //   -v       print every cluster's placement (core:slot by rank)
 //
-// Until the hardware cluster barrier is used (-c), a DEFAULT cluster syncs on a
+// Until the hardware cluster barrier is used (-c), a SINGLE_CORE cluster syncs on a
 // local barrier of its base slot: its blocks sit in consecutive slots of one core.
 // A SPREAD cluster of more than one block always uses the cluster barrier.
 // A default launch the device cannot hold prints SKIPPED; a requested one fails.
@@ -107,7 +107,7 @@ void parse_args(int argc, char** argv) {
     switch (c) {
       case 'k': req_k      = (uint32_t)std::atoi(optarg); break;
       case 's': req_policy = VX_CLUSTER_POLICY_SPREAD;    break;
-      case 'd': req_policy = VX_CLUSTER_POLICY_DEFAULT;   break;
+      case 'd': req_policy = VX_CLUSTER_POLICY_SINGLE_CORE;   break;
       case 'n': req_g      = (uint32_t)std::atoi(optarg); break;
       case 'w': req_w      = (uint32_t)std::atoi(optarg); break;
       case 'l': req_lmem.push_back((uint32_t)std::atoi(optarg)); break;
@@ -136,7 +136,7 @@ void parse_args(int argc, char** argv) {
 }
 
 const char* policy_name(uint32_t p) {
-  return (p == VX_CLUSTER_POLICY_SPREAD) ? "SPREAD" : "DEFAULT";
+  return (p == VX_CLUSTER_POLICY_SPREAD) ? "SPREAD" : "SINGLE_CORE";
 }
 
 uint64_t footprint(uint32_t lmem) {
@@ -179,7 +179,7 @@ std::string infeasible(const Caps& caps, const Launch& L) {
     return "";
   }
   // A same-core cluster syncs on one core, so all its blocks must fit there.
-  if (L.policy == VX_CLUSTER_POLICY_DEFAULT && slots_per_core(caps, L) < L.k) {
+  if (L.policy == VX_CLUSTER_POLICY_SINGLE_CORE && slots_per_core(caps, L) < L.k) {
     std::snprintf(buf, sizeof(buf), "a core holds %u such blocks, the cluster needs %u",
                   slots_per_core(caps, L), L.k);
     return buf;
@@ -273,6 +273,7 @@ int run_launch(vx_device_h dev, vx_queue_h q, vx_module_h mod, const Caps& caps,
   li.cluster_dim[1] = 1;
   li.cluster_dim[2] = 1;
   li.cluster_policy = (vx_cluster_policy_e)L.policy;
+  li.cluster_flags  = (L.k > VX_CLUSTER_MAX_PORTABLE) ? VX_CLUSTER_FLAG_NON_PORTABLE : 0;
 
   vx_event_h launch_ev = nullptr, read_ev = nullptr;
   CHECK(vx_enqueue_launch(q, &li, 0, nullptr, &launch_ev));
@@ -311,9 +312,9 @@ int run_launch(vx_device_h dev, vx_queue_h q, vx_module_h mod, const Caps& caps,
     if (rec[REC_SIZE] != L.k)
       report(b, "vx_cluster_num_blocks()", rec[REC_SIZE], L.k);
     const uint32_t* first = rec_of(b - b % L.k);
-    if (L.policy == VX_CLUSTER_POLICY_DEFAULT && first[REC_RAN] == 1) {
+    if (L.policy == VX_CLUSTER_POLICY_SINGLE_CORE && first[REC_RAN] == 1) {
       if (rec[REC_CORE] != first[REC_CORE])
-        report(b, "core (a DEFAULT cluster shares one)", rec[REC_CORE], first[REC_CORE]);
+        report(b, "core (a SINGLE_CORE cluster shares one)", rec[REC_CORE], first[REC_CORE]);
       if (rec[REC_SLOT] != first[REC_SLOT] + b % L.k)
         report(b, "slot (base + rank)", rec[REC_SLOT], first[REC_SLOT] + b % L.k);
     }
@@ -438,7 +439,7 @@ int main(int argc, char** argv) {
   vx_module_h mod = nullptr;
   CHECK(vx_module_load_file(dev, kernel_file, &mod));
 
-  const uint32_t D = VX_CLUSTER_POLICY_DEFAULT, S = VX_CLUSTER_POLICY_SPREAD;
+  const uint32_t D = VX_CLUSTER_POLICY_SINGLE_CORE, S = VX_CLUSTER_POLICY_SPREAD;
   const uint32_t max_k = (uint32_t)caps.max_cluster;
   std::vector<Launch> launches;
   auto lmems = [&](uint32_t dflt) {

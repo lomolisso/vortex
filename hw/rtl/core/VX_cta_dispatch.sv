@@ -68,6 +68,10 @@ module VX_cta_dispatch import VX_gpu_pkg::*; #(
     output wire                     cbar_wr_valid,
     output wire [NW_WIDTH-1:0]      cbar_wr_slot,
     output cbar_slot_t              cbar_wr_info,
+    output wire [NW_WIDTH:0]        cbar_wr_warps,
+    // warp_done names a warp this unit launched, and warp_done_slot its CTA slot
+    output wire                     warp_done_cta,
+    output wire [NW_WIDTH-1:0]      warp_done_slot,
 `endif
 
 `ifdef DXA_MBAR_ENABLE
@@ -517,7 +521,11 @@ module VX_cta_dispatch import VX_gpu_pkg::*; #(
 
             // ---- Register retirement signals (1-stage pipeline aligned with
             //      rem_warps_ram OUT_REG=1 latency) ---------------------------
+        `ifdef VX_CFG_EXT_DLMEM_ENABLE
+            warp_done_r     <= warp_done_cta;
+        `else
             warp_done_r     <= warp_done;
+        `endif
             warp_done_r_dly <= warp_done_r;
             if (warp_done) done_slot_r <= done_slot;
             done_slot_r_dly <= done_slot_r;
@@ -705,6 +713,8 @@ module VX_cta_dispatch import VX_gpu_pkg::*; #(
     assign cta_done_data.slot    = done_pend_slot;
     assign cta_done_data.gang_id = gang_r[done_pend_slot];
     assign cta_done_data.epoch   = gepoch_r[done_pend_slot];
+    // the barrier unit knows whether the block's arrival is pending
+    assign cta_done_data.arrived = 1'b0;
 
     wire cta_done_fire = cta_done_valid && cta_done_ready;
 
@@ -794,6 +804,7 @@ module VX_cta_dispatch import VX_gpu_pkg::*; #(
     reg                 cbar_wr_valid_r;
     reg [CS_BITS-1:0]   cbar_wr_slot_r;
     cbar_slot_t         cbar_wr_info_r;
+    reg [NW_WIDTH:0]    cbar_wr_warps_r;
 
     always @(posedge clk) begin
         if (reset) begin
@@ -802,14 +813,36 @@ module VX_cta_dispatch import VX_gpu_pkg::*; #(
             cbar_wr_valid_r <= admit_fire;
         end
         if (admit_fire) begin
-            cbar_wr_slot_r <= base_slot;
-            cbar_wr_info_r <= cbar_info;
+            cbar_wr_slot_r  <= base_slot;
+            cbar_wr_info_r  <= cbar_info;
+            cbar_wr_warps_r <= kmu_num_warps;
         end
     end
 
     assign cbar_wr_valid = cbar_wr_valid_r;
     assign cbar_wr_slot  = cbar_wr_slot_r;
     assign cbar_wr_info  = cbar_wr_info_r;
+    assign cbar_wr_warps = cbar_wr_warps_r;
+    assign warp_done_slot = done_slot;
+
+    // A warp vx_wspawn started holds no CTA slot: its exit reaches no slot's counts.
+    // The bit follows the launch itself: the last warp's cycle can pick a wid it never fires.
+    reg [`VX_CFG_NUM_WARPS-1:0] warp_cta_r;
+
+    always @(posedge clk) begin
+        if (reset) begin
+            warp_cta_r <= '0;
+        end else begin
+            if (warp_done) begin
+                warp_cta_r[warp_done_wid] <= 1'b0;
+            end
+            if (warp_fire_r) begin
+                warp_cta_r[warp_id_r] <= 1'b1;
+            end
+        end
+    end
+
+    assign warp_done_cta = warp_done && warp_cta_r[warp_done_wid];
 
     `RUNTIME_ASSERT (~(admit_fire && is_pinned) || (32'(kmu_req.args.compute.dlmem.row.k) < (1 << CK_W)),
         ("%t: %s cluster of %0d blocks does not fit the slot record's count", $time, INSTANCE_ID,
@@ -1084,7 +1117,11 @@ module VX_cta_dispatch import VX_gpu_pkg::*; #(
             warp_done_wid_r     <= '0;
             warp_done_wid_r_dly <= '0;
         end else begin
+        `ifdef VX_CFG_EXT_DLMEM_ENABLE
+            if (warp_done_cta) warp_done_wid_r <= warp_done_wid;
+        `else
             if (warp_done) warp_done_wid_r <= warp_done_wid;
+        `endif
             warp_done_wid_r_dly <= warp_done_wid_r;
         end
     end

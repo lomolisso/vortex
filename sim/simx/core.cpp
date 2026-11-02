@@ -1441,6 +1441,15 @@ bool Core::setTmask(uint32_t wid, const ThreadMask& tmask) {
 }
 
 int Core::dcr_write(uint32_t addr, uint32_t value) {
+#ifdef VX_CFG_EXT_DLMEM_ENABLE
+  // The KMU's launch DCRs also reach every core, for its identity CSRs.
+  impl_->csr_unit().dcr_write(addr, value);
+  return 0;
+#elif defined(VX_CFG_EXT_DXA_ENABLE)
+#line 1363
+#else
+#line 1355
+#endif
   __unused(addr);
   __unused(value);
   // KMU DCRs are handled at ProcessorImpl level and never reach here.

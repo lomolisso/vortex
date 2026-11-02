@@ -117,6 +117,9 @@ module VX_scheduler import VX_gpu_pkg::*; #(
     wire                cbar_wr_valid;
     wire [NW_WIDTH-1:0] cbar_wr_slot;
     cbar_slot_t         cbar_wr_info;
+    wire [NW_WIDTH:0]   cbar_wr_warps;
+    wire                cta_warp_exit;
+    wire [NW_WIDTH-1:0] cta_warp_done_slot;
 `endif
 
     VX_cta_dispatch #(
@@ -154,6 +157,9 @@ module VX_scheduler import VX_gpu_pkg::*; #(
         .cbar_wr_valid  (cbar_wr_valid),
         .cbar_wr_slot   (cbar_wr_slot),
         .cbar_wr_info   (cbar_wr_info),
+        .cbar_wr_warps  (cbar_wr_warps),
+        .warp_done_cta  (cta_warp_exit),
+        .warp_done_slot (cta_warp_done_slot),
     `endif
     `ifdef DXA_MBAR_ENABLE
         .slot_valid     (cta_slot_valid),
@@ -504,6 +510,10 @@ module VX_scheduler import VX_gpu_pkg::*; #(
         .cbar_wr_valid  (cbar_wr_valid),
         .cbar_wr_slot   (cbar_wr_slot),
         .cbar_wr_info   (cbar_wr_info),
+        .cbar_wr_warps  (cbar_wr_warps),
+        .warp_exit_valid(cta_warp_exit),
+        .warp_exit_wid  (warp_ctl_if.wid),
+        .warp_exit_slot (cta_warp_done_slot),
         .cta_done_valid (cta_done_valid),
         .cta_done_data  (cta_done_data),
         .cta_done_ready (cta_done_ready),

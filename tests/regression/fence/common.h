@@ -3,8 +3,40 @@
 
 #include <stdint.h>
 
-#define FENCE_MODE_VECADD 0
-#define FENCE_MODE_STORM  1
+#define FENCE_MODE_VECADD  0
+#define FENCE_MODE_STORM   1
+#define FENCE_MODE_CLUSTER 2
+
+
+// One 256-byte line per block, wider than any cache line.
+#define CLUSTER_LINE_WORDS 64
+
+// Per-block record of the cluster mode, written by lane 0.
+#define CLUSTER_REC_CORE     0  // vx_core_id()
+#define CLUSTER_REC_RANK     1  // rank in the cluster
+#define CLUSTER_REC_STALE    2  // stale words read, summed over the warp
+#define CLUSTER_REC_TIMEOUT  3  // rounds whose flag never came
+#define CLUSTER_REC_CFENCE   4  // cycles of the vx_fence_cluster() loop
+#define CLUSTER_REC_GFENCE   5  // cycles of the vx_fence() loop
+#define CLUSTER_REC_DONE     6  // 1 once the block finished
+#define CLUSTER_REC_WORDS    8
+
+static inline uint32_t cluster_tag(uint32_t round, uint32_t block, uint32_t lane) {
+  return ((round + 1) << 16) ^ (block << 8) ^ lane;
+}
+
+// The cluster mode's argument; mode sits where kernel_arg_t has it.
+typedef struct {
+  uint32_t mode;
+  uint32_t rounds;        // messages each block of a pair sends
+  uint32_t fences;        // iterations of each timed fence loop
+  uint32_t bound;         // polls of a flag before giving up
+  uint32_t num_threads;
+  uint64_t data_addr;     // one line per block
+  uint64_t flag_addr;     // one line per block
+  uint64_t scratch_addr;  // one line per block, stored to before every timed fence
+  uint64_t rec_addr;      // CLUSTER_REC_WORDS per block
+} cluster_arg_t;
 
 // Storm control block: one word per 256-byte line, wider than any cache line,
 // so no two control words share a line at any level.
