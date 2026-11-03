@@ -29,6 +29,24 @@ tests:
     app: amo
     drivers: [simx, rtlsim]
     configs+: "-DVX_CFG_EXT_ZACAS_ENABLE"
+  # Compare-and-swap whose comparand is not zero, hit and miss, per hart:
+  # amocas.w, and amocas.d at RV64, on global and on local memory. The
+  # cas_ladder races compare against 0 only, which a comparand dropped on the
+  # way to the cache or the bank passes. Their own kernel (kernel_cas.vxbin).
+  - id: cas-global
+    app: amo
+    drivers: [simx, rtlsim]
+    configs+: "-DVX_CFG_EXT_ZACAS_ENABLE"
+    args: "-t cas-global"
+    touches: [hw/rtl/cache, hw/rtl/mem, hw/rtl/core/VX_lsu_slice.sv, hw/rtl/VX_gpu_pkg.sv,
+              sim/simx/amo, sim/simx/mem, tests/regression/amo]
+  - id: cas-local
+    app: amo
+    drivers: [simx, rtlsim]
+    configs+: "-DVX_CFG_EXT_ZACAS_ENABLE"
+    args: "-t cas-local"
+    touches: [hw/rtl/mem, hw/rtl/core/VX_lsu_slice.sv, hw/rtl/VX_gpu_pkg.sv,
+              sim/simx/amo, sim/simx/mem, tests/regression/amo]
   # Fewer LSU lanes than threads, so a warp's request is split into packets and
   # threads a lane-width apart ride the same LSU lane. Each must still hold its
   # own LR/SC reservation.

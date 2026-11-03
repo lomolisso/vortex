@@ -32,6 +32,12 @@ VX_CFG_EXT_A_ENABLE = false
 # an atomic, it does not replace the set. Off by default because it widens the
 # memory request with a comparand operand.
 VX_CFG_EXT_ZACAS_ENABLE = false
+# PTX atomics beyond RISC-V A (RV64 only): float add and packed min/max, inc/dec,
+# executed where the H100 has a single instruction. Requires A and Zacas
+# (the forms the H100 runs as CAS loops are CAS loops in the kernel headers).
+VX_CFG_EXT_FPAMO_ENABLE = false
+# Extra cycles a float atomic holds its execution site beyond an integer atomic.
+VX_CFG_FPAMO_LATENCY = 3
 
 VX_CFG_EXT_ZICOND_ENABLE = true
 VX_CFG_EXT_TCU_ENABLE = false

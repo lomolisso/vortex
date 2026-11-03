@@ -39,6 +39,9 @@
 // The including file provides the VX_CFG_* configuration first.
 #include <VX_types.h>
 #include "mbar_ref.h"
+#ifdef VX_CFG_EXT_FPAMO_ENABLE
+#include "amo_ref.h"
+#endif
 
 namespace ep {
 
@@ -92,6 +95,13 @@ enum : uint8_t {
 inline bool is_mbar_op(uint8_t op) {
   return op >= OP_MBAR_ARRIVE && op <= OP_MBAR_COMPLETE_TX;
 }
+
+#ifdef VX_CFG_EXT_FPAMO_ENABLE
+// The PTX atomics' 5-bit codes (amo_ref), which the packets must carry intact.
+inline bool is_ptx_op(uint8_t op) {
+  return op >= vortex::amo_ref::OP_INC && op <= vortex::amo_ref::OP_FMAX2_BF;
+}
+#endif
 
 enum Kind : uint8_t { K_LD, K_ST, K_AMO, K_LR, K_SC };
 
@@ -405,6 +415,15 @@ private:
   uint8_t rand_amo() {
     static const uint8_t ops[] = {OP_ADD, OP_SWAP, OP_XOR, OP_OR, OP_AND, OP_MIN, OP_MAX, OP_MBAR_ARRIVE,
                                   OP_MBAR_ARRIVE_TX, OP_MBAR_EXPECT_TX, OP_MBAR_COMPLETE_TX, OP_CAS};
+#ifdef VX_CFG_EXT_FPAMO_ENABLE
+    // FPAMO builds have Zacas; one op in two is a PTX atomic.
+    namespace ar = vortex::amo_ref;
+    static const uint8_t ptx_ops[] = {ar::OP_INC, ar::OP_DEC, ar::OP_FADD, ar::OP_FADD2, ar::OP_FADD2_BF,
+                                      ar::OP_FMIN2, ar::OP_FMAX2, ar::OP_FMIN2_BF, ar::OP_FMAX2_BF};
+    if (chance(50)) {
+      return ptx_ops[rnd(sizeof(ptx_ops))];
+    }
+#endif
     return ops[rnd(ZACAS ? 12 : 11)];
   }
 
@@ -430,6 +449,11 @@ private:
     if (mbar) {
       sz = 3;  // an mbarrier is a whole doubleword
     }
+#ifdef VX_CFG_EXT_FPAMO_ENABLE
+    if (kind == K_AMO && is_ptx_op(amo_op)) {
+      sz = (vortex::amo_ref::legal(amo_op, 3) && chance(50)) ? 3 : 2;
+    }
+#endif
     for (uint32_t l = 0; l < NL; ++l) {
       if (!(mask >> l & 1)) {
         continue;
@@ -628,6 +652,19 @@ private:
     case OP_MBAR_EXPECT_TX:
     case OP_MBAR_COMPLETE_TX:
       return vortex::mbar_ref::apply(op, old, rhs).new_word;
+#ifdef VX_CFG_EXT_FPAMO_ENABLE
+    // the local-memory bank follows the loop site: f32 subnormals kept, f64 NaN quieted
+    case vortex::amo_ref::OP_INC:
+    case vortex::amo_ref::OP_DEC:
+    case vortex::amo_ref::OP_FADD:
+    case vortex::amo_ref::OP_FADD2:
+    case vortex::amo_ref::OP_FADD2_BF:
+    case vortex::amo_ref::OP_FMIN2:
+    case vortex::amo_ref::OP_FMAX2:
+    case vortex::amo_ref::OP_FMIN2_BF:
+    case vortex::amo_ref::OP_FMAX2_BF:
+      return vortex::amo_ref::apply(op, (bits == 64) ? vortex::amo_ref::W_D : vortex::amo_ref::W_W, old, rhs, vortex::amo_ref::SITE_LOOP);
+#endif
     default:      return old;
     }
   }

@@ -138,24 +138,20 @@ void LocalMemSwitch::on_tick() {
         }
 #endif
         auto type = get_addr_type(in_req.addrs.at(i));
-        // An AMO whose address is Shared is executed by the LMEM bank here.
-        // The RTL has no such path -- VX_lmem_switch strips the AMO bits and
-        // asserts -- so the two models diverge on this op until the hardware
-        // path lands, and a Shared AMO cannot be run on FPGA.
+        // Both legs carry the comparand: the local-memory banks and the LLC
+        // each execute compare-and-swap.
         if (type == AddrType::Shared) {
           out_lmem_req.mask.set(i);
-          out_lmem_req.addrs.at(i)  = in_req.addrs.at(i);
-          out_lmem_req.data.at(i)   = in_req.data.at(i);
-          out_lmem_req.byteen.at(i) = in_req.byteen.at(i);
-#ifdef VX_CFG_EXT_DLMEM_ENABLE
-          // A window CAS to a same-core peer executes in this core's local memory.
+          out_lmem_req.addrs.at(i)   = in_req.addrs.at(i);
+          out_lmem_req.data.at(i)    = in_req.data.at(i);
+          out_lmem_req.byteen.at(i)  = in_req.byteen.at(i);
           out_lmem_req.amo_cmp.at(i) = in_req.amo_cmp.at(i);
-#endif
         } else {
           out_dc_req.mask.set(i);
-          out_dc_req.addrs.at(i)  = in_req.addrs.at(i);
-          out_dc_req.data.at(i)   = in_req.data.at(i);
-          out_dc_req.byteen.at(i) = in_req.byteen.at(i);
+          out_dc_req.addrs.at(i)   = in_req.addrs.at(i);
+          out_dc_req.data.at(i)    = in_req.data.at(i);
+          out_dc_req.byteen.at(i)  = in_req.byteen.at(i);
+          out_dc_req.amo_cmp.at(i) = in_req.amo_cmp.at(i);
         }
       }
     }

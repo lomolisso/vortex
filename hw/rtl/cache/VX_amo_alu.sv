@@ -89,6 +89,11 @@ module VX_amo_alu import VX_gpu_pkg::*; #(
                                                   : ((a_s < b_s) ? a_s : b_s);
             AMO_OP_MAX:   arith_res = is_unsigned ? ((a_u > b_u) ? a_u : b_u)
                                                   : ((a_s > b_s) ? a_s : b_s);
+        `ifdef VX_CFG_EXT_FPAMO_ENABLE
+            // PTX inc/dec: u32 counters that wrap at the operand bound.
+            AMO_OP_INC:   arith_res = (a_u >= b_u) ? '0 : (a_u + ARW'(1));
+            AMO_OP_DEC:   arith_res = ((a_u == '0) || (a_u > b_u)) ? b_u : (a_u - ARW'(1));
+        `endif
             default:      arith_res = a_u;
         endcase
         if (arith_w) arith_res = {{(ARW-32){1'b0}}, arith_res[31:0]};
@@ -130,7 +135,11 @@ module VX_amo_alu import VX_gpu_pkg::*; #(
         // widths, so an erroneous op still leaves a defined word.
         localparam signed [22:0] TX_MAX = 23'sd1048575;
 
+    `ifdef VX_CFG_EXT_FPAMO_ENABLE
+        wire        is_mbar = (op >= AMO_OP_MBAR_ARRIVE) && (op <= AMO_OP_MBAR_TRY_WAIT);
+    `else
         wire        is_mbar = (op >= AMO_OP_MBAR_ARRIVE);
+    `endif
         wire        is_wait = (op == AMO_OP_MBAR_TEST_WAIT) || (op == AMO_OP_MBAR_TRY_WAIT);
         wire [19:0] pend    = old_word[19:0];
         wire [19:0] expd    = old_word[39:20];

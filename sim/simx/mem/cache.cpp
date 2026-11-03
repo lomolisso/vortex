@@ -730,6 +730,20 @@ public:
   uint64_t admitted() const {
     return adm_seq_ctr_;
   }
+#ifdef VX_CFG_EXT_FPAMO_ENABLE
+
+  // Float atomics this bank has admitted from cache input `input`.
+  uint64_t fp_admitted(uint32_t input) const {
+    return fp_admitted_.at(input);
+  }
+
+  // Whether a committing atomic holds core admission.
+  bool amo_holding() const {
+    return amo_hold_ != 0;
+  }
+#else
+#line 732
+#endif
 
 protected:
   void on_reset() {
@@ -767,6 +781,12 @@ protected:
     fd_mreq_ = 0;
     mreq_sent_ = 0;
     amo_hold_ = 0;
+#ifdef VX_CFG_EXT_FPAMO_ENABLE
+    std::fill(fp_admitted_.begin(), fp_admitted_.end(), 0);
+    fp_replay_hold_ = 0;
+#else
+#line 769
+#endif
 #if VX_CFG_EXT_A_ENABLED
     amo_unit_.reset();
     for (auto &e : amo_passthru_) {
@@ -817,6 +837,13 @@ protected:
     if (amo_hold_ != 0) {
       --amo_hold_;
     }
+#ifdef VX_CFG_EXT_FPAMO_ENABLE
+    if (fp_replay_hold_ != 0) {
+      --fp_replay_hold_;
+    }
+#else
+#line 819
+#endif
 
     // calculate memory latency
     perf_stats_.mem_latency += pending_fill_reqs_;
@@ -853,6 +880,15 @@ private:
     // 1) replay: one chain entry leaves per tick — when the fill-forward
     // drain completed the head this tick, this slot goes to new core
     // requests instead
+#ifdef VX_CFG_EXT_FPAMO_ENABLE
+    // A replay behind a replayed float atomic waits while that atomic holds
+    // the compute stage, and the stalled pipe takes nothing else meanwhile.
+    if (fp_replay_hold_ != 0 && mshr_.has_ready_reqs() && !fwd_consumed) {
+      return;
+    }
+#else
+#line 855
+#endif
     if (mshr_.has_ready_reqs() && !fwd_consumed) {
       bank_req_t bank_req;
       mshr_.dequeue(&bank_req);
@@ -860,7 +896,19 @@ private:
       // a storing atomic that replays after its fill commits like a hit
       if (config_.is_llc && memop_is_amo(bank_req.op) && bank_req.op != MemOp::AMO_LR) {
         amo_hold_ = config_.latency + 3;
+#ifdef VX_CFG_EXT_FPAMO_ENABLE
+        // a float atomic computes and commits after the float unit's stages
+        if (memop_is_fp_amo(bank_req.op)) {
+          amo_hold_ += VX_CFG_FPAMO_LATENCY;
+          fp_replay_hold_ = VX_CFG_FPAMO_LATENCY + 1;
+        }
+#else
+#line 862
+#endif
       }
+#endif
+#ifndef VX_CFG_EXT_FPAMO_ENABLE
+#line 864
 #endif
       pipe_req_->push(bank_req);
       DT(3, this->name() << " replay-deq: " << bank_req);
@@ -1041,6 +1089,11 @@ private:
               ++perf_stats_.reads;
               ++perf_stats_.read_misses;
             }
+#ifdef VX_CFG_EXT_FPAMO_ENABLE
+            this->fp_admit(core_req);
+#else
+#line 1043
+#endif
             this->core_req_in.pop();
             return;
           }
@@ -1087,10 +1140,25 @@ private:
       // the result's write into the data array.
       if (is_amo && config_.is_llc && core_req.op != MemOp::AMO_LR && this->sectorResident(core_req.addr)) {
         amo_hold_ = config_.latency + 3;
+#ifdef VX_CFG_EXT_FPAMO_ENABLE
+        if (memop_is_fp_amo(core_req.op)) {
+          amo_hold_ += VX_CFG_FPAMO_LATENCY;
+        }
+#else
+#line 1089
+#endif
       }
+#endif
+#ifndef VX_CFG_EXT_FPAMO_ENABLE
+#line 1091
 #endif
       if (core_req.is_write()) ++perf_stats_.writes;
       else                ++perf_stats_.reads;
+#ifdef VX_CFG_EXT_FPAMO_ENABLE
+      this->fp_admit(core_req);
+#else
+#line 1093
+#endif
       this->core_req_in.pop();
       return;
     }
@@ -1265,8 +1333,15 @@ private:
     if (hit_sec.data) {
       old_word = amo_load_word(hit_sec.data->data(), byte_off, width);
     }
+#ifdef VX_CFG_EXT_FPAMO_ENABLE
+    auto rmw = amo_compute_ptx(op, width, old_word, rhs, unsigned_minmax,
+                               bank_req.amo_cmp, amo_ref::SITE_LLC);
+#else
+#line 1268
     auto rmw = amo_unit_.compute(op, width, old_word, rhs, unsigned_minmax,
                                  bank_req.amo_cmp);
+#line 1269
+#endif
 
     // Build response payload: a fresh block with the relevant word at byte_off.
     // For LR/AMO* the word carries old_word (LSU sext at width gives rd).
@@ -1321,6 +1396,9 @@ private:
     this->commitWriterErase(bank_req.adm_seq);
     return true;
   }
+#endif
+#ifndef VX_CFG_EXT_FPAMO_ENABLE
+#line 1324
 #endif
 
   // Pipeline tail: process the head of pipe_req_ — at most one bank_req_t per tick.
@@ -2091,6 +2169,22 @@ private:
   uint64_t   mreq_sent_;  // memory requests sent so far
 
   uint32_t   amo_hold_;   // cycles core admission stays held by a committing atomic
+#ifdef VX_CFG_EXT_FPAMO_ENABLE
+  // Float atomics admitted per cache input, and the cycles the replay port
+  // stays held behind a replayed float atomic.
+  std::vector<uint64_t> fp_admitted_ = std::vector<uint64_t>(config_.num_inputs, 0);
+  uint32_t fp_replay_hold_ = 0;
+
+  // Counts an admitted float atomic against the cache input it came from (the
+  // bank crossbar puts the input in the tag's low bits).
+  void fp_admit(const MemReq& core_req) {
+    if (config_.is_llc && memop_is_fp_amo(core_req.op)) {
+      ++fp_admitted_.at(core_req.tag & ((1ull << params_.log2_num_inputs) - 1));
+    }
+  }
+#else
+#line 2093
+#endif
 
 #if VX_CFG_EXT_A_ENABLED
   AmoUnit  amo_unit_;
@@ -2202,6 +2296,12 @@ public:
       grace_.at(i)      = false;
       fwd_cnt_.at(i)    = 0;
     }
+#ifdef VX_CFG_EXT_FPAMO_ENABLE
+    std::fill(fp_sent_.begin(), fp_sent_.end(), 0);
+    std::fill(fp_waited_.begin(), fp_waited_.end(), false);
+#else
+#line 2204
+#endif
   }
 
   void tick() {
@@ -2251,6 +2351,15 @@ public:
           core_req_in.pop();
         }
       } else if (admit_.at(req_id)) {
+#ifdef VX_CFG_EXT_FPAMO_ENABLE
+        if (this->fp_input_held(req_id)) {
+          continue;
+        }
+        const bool fp_amo = config_.is_llc && memop_is_fp_amo(core_req.op);
+        const uint32_t fp_bank = params_.addr_bank_id(core_req.addr);
+#else
+#line 2253
+#endif
       #ifdef VX_CFG_EXT_DLMEM_ENABLE
         // A CTA fence ends here: it goes on as a plain read of its line.
         if (config_.fence_cta && core_req.flags.fence_cta) {
@@ -2269,6 +2378,14 @@ public:
           core_req_in.pop();
           fired_.at(req_id) = true;
           ++fwd_cnt_.at(req_id);
+#ifdef VX_CFG_EXT_FPAMO_ENABLE
+          if (fp_amo) {
+            ++fp_sent_.at(req_id);
+            fp_bank_.at(req_id) = fp_bank;
+          }
+#else
+#line 2271
+#endif
         }
       }
     }
@@ -2302,6 +2419,29 @@ public:
   }
 
 private:
+#ifdef VX_CFG_EXT_FPAMO_ENABLE
+
+  // An input whose float atomic has waited at a bank held by a committing
+  // atomic sends nothing more until that bank takes it: the hardware's input
+  // hands a request on only when its bank accepts it, so younger requests
+  // queue behind the atomic.
+  bool fp_input_held(uint32_t input) {
+    uint64_t admitted = 0;
+    for (const auto &bank : banks_) {
+      admitted += bank->fp_admitted(input);
+    }
+    if (admitted == fp_sent_.at(input)) {
+      fp_waited_.at(input) = false;
+      return false;
+    }
+    if (banks_.at(fp_bank_.at(input))->amo_holding()) {
+      fp_waited_.at(input) = true;
+    }
+    return fp_waited_.at(input);
+  }
+#else
+#line 2304
+#endif
 
   // Fence admission in front of the banks, the counterpart of the hardware's
   // cache_init, whose states it follows. Above the shared level a fence at
@@ -2557,6 +2697,13 @@ private:
   std::vector<uint64_t> fwd_cnt_;   // per input: requests sent to the banks
   std::vector<uint64_t> drain_fwd_; // per input: requests sent before the drain
   std::vector<uint64_t> drain_adm_; // per bank: admissions the drain waits on
+#ifdef VX_CFG_EXT_FPAMO_ENABLE
+  std::vector<uint64_t> fp_sent_ = std::vector<uint64_t>(config_.num_inputs, 0); // per input: float atomics sent
+  std::vector<uint32_t> fp_bank_ = std::vector<uint32_t>(config_.num_inputs, 0); // per input: bank of the last one
+  std::vector<bool>     fp_waited_ = std::vector<bool>(config_.num_inputs, false); // per input: it waited on a hold
+#else
+#line 2559
+#endif
 };
 
 ///////////////////////////////////////////////////////////////////////////////

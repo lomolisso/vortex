@@ -53,6 +53,30 @@
 #define SIMX_MT 0
 #endif
 #include "constants.h"
+#ifdef VX_CFG_EXT_FPAMO_ENABLE
+// PTX atomics beyond RISC-V A (name, MemOp value), in amo_ref op order from
+// AMO_INC. Their enumerators, names and tests expand at the end of lines that
+// exist without the knob, so knob-off line numbers (assert's __LINE__) are kept
+// in every configuration.
+#define VX_FPAMO_OPS(X) \
+  X(INC, 19) X(DEC, 20) X(FADD, 21) X(FADD_BF, 22) X(FADD2, 23) X(FADD2_BF, 24) \
+  X(FMIN2, 25) X(FMAX2, 26) X(FMIN2_BF, 27) X(FMAX2_BF, 28)
+#define VX_FPAMO_ONLY(...) __VA_ARGS__
+#define VX_FPAMO_MEMOP(n, v)        AMO_##n = v,
+#define VX_FPAMO_MEMOP_NAME(n, v)   case MemOp::AMO_##n: os << "AMO_" #n; break;
+#define VX_FPAMO_AMOTYPE(n, v)      , AMO##n
+#define VX_FPAMO_AMOTYPE_NAME(n, v) case AmoType::AMO##n: os << "AMO" #n; break;
+#define VX_FPAMO_AMO_TO_MEMOP(n, v) case AmoType::AMO##n: return MemOp::AMO_##n;
+// The PTX atomics are read-modify-write atomics outside the AMO_LR..AMO_CAS
+// range; the float ones hold their execution site VX_CFG_FPAMO_LATENCY cycles longer.
+#define VX_FPAMO_MEMOP_TESTS \
+  inline bool memop_is_ptx_amo(MemOp op) { return op >= MemOp::AMO_INC && op <= MemOp::AMO_FMAX2_BF; } \
+  inline bool memop_is_fp_amo(MemOp op) { return op >= MemOp::AMO_FADD && op <= MemOp::AMO_FMAX2_BF; }
+#else
+#define VX_FPAMO_OPS(X)
+#define VX_FPAMO_ONLY(...)
+#line 55
+#endif
 #if defined(VX_CFG_EXT_DXA_ENABLE) && defined(VX_CFG_EXT_MBAR_ENABLE)
 #include <dlmem_ref.h>
 #else
@@ -462,7 +486,7 @@ enum class MemOp : uint8_t {
   // Compare-and-swap. Kept last so the range checks below stay contiguous;
   // it is the only atomic that reads a third operand (the comparand, which
   // the instruction takes from rd).
-  AMO_CAS   = 12,
+  AMO_CAS   = 12, VX_FPAMO_OPS(VX_FPAMO_MEMOP)
 #ifdef VX_CFG_EXT_MBAR_ENABLE
   MBAR_ARRIVE      = 13,
   MBAR_ARRIVE_TX   = 14,
@@ -473,12 +497,12 @@ enum class MemOp : uint8_t {
 #else
 #line 424
 #endif
-};
+}; VX_FPAMO_ONLY(VX_FPAMO_MEMOP_TESTS)
 
-inline bool memop_is_atomic(MemOp op) {
+inline bool memop_is_atomic(MemOp op) { VX_FPAMO_ONLY(if (memop_is_ptx_amo(op)) return true;)
   return op >= MemOp::AMO_LR && op <= MemOp::AMO_CAS;
 }
-inline bool memop_is_amo_rmw(MemOp op) {
+inline bool memop_is_amo_rmw(MemOp op) { VX_FPAMO_ONLY(if (memop_is_ptx_amo(op)) return true;)
   return op >= MemOp::AMO_SWAP && op <= MemOp::AMO_CAS;
 }
 inline bool memop_is_write(MemOp op) {
@@ -575,7 +599,7 @@ inline std::ostream &operator<<(std::ostream &os, const MemOp& op) {
   case MemOp::AMO_XOR:   os << "AMO_XOR"; break;
   case MemOp::AMO_MIN:   os << "AMO_MIN"; break;
   case MemOp::AMO_MAX:   os << "AMO_MAX"; break;
-  case MemOp::AMO_CAS:   os << "AMO_CAS"; break;
+  case MemOp::AMO_CAS:   os << "AMO_CAS"; break; VX_FPAMO_OPS(VX_FPAMO_MEMOP_NAME)
 #ifdef VX_CFG_EXT_MBAR_ENABLE
   case MemOp::MBAR_ARRIVE:      os << "MBAR_ARRIVE"; break;
   case MemOp::MBAR_ARRIVE_TX:   os << "MBAR_ARRIVE_TX"; break;
@@ -603,7 +627,7 @@ enum class AmoType {
   AMOMAX,
   AMOMINU,
   AMOMAXU,
-  AMOCAS
+  AMOCAS VX_FPAMO_OPS(VX_FPAMO_AMOTYPE)
 #ifdef VX_CFG_EXT_MBAR_ENABLE
   , MBAR_ARRIVE, MBAR_ARRIVE_TX, MBAR_EXPECT_TX, MBAR_COMPLETE_TX, MBAR_TEST_WAIT, MBAR_TRY_WAIT
 #else
@@ -629,7 +653,7 @@ inline std::ostream &operator<<(std::ostream &os, const AmoType& type) {
   case AmoType::AMOMIN:  os << "AMOMIN"; break;
   case AmoType::AMOMAX:  os << "AMOMAX"; break;
   case AmoType::AMOMINU: os << "AMOMINU"; break;
-  case AmoType::AMOMAXU: os << "AMOMAXU"; break;
+  case AmoType::AMOMAXU: os << "AMOMAXU"; break; VX_FPAMO_OPS(VX_FPAMO_AMOTYPE_NAME)
 #ifdef VX_CFG_EXT_MBAR_ENABLE
   case AmoType::MBAR_ARRIVE:      os << "MBAR_ARRIVE"; break;
   case AmoType::MBAR_ARRIVE_TX:   os << "MBAR_ARRIVE_TX"; break;
@@ -1377,7 +1401,7 @@ inline MemOp amo_to_memop(AmoType t) {
   case AmoType::AMOMINU: return MemOp::AMO_MIN;
   case AmoType::AMOMAX:
   case AmoType::AMOMAXU: return MemOp::AMO_MAX;
-  case AmoType::AMOCAS:  return MemOp::AMO_CAS;
+  case AmoType::AMOCAS:  return MemOp::AMO_CAS; VX_FPAMO_OPS(VX_FPAMO_AMO_TO_MEMOP)
 #ifdef VX_CFG_EXT_MBAR_ENABLE
   case AmoType::MBAR_ARRIVE:      return MemOp::MBAR_ARRIVE;
   case AmoType::MBAR_ARRIVE_TX:   return MemOp::MBAR_ARRIVE_TX;

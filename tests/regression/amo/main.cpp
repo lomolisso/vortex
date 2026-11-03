@@ -27,7 +27,7 @@ kernel_arg_t kernel_arg = {};
 
 static void show_usage() {
   std::cout << "Vortex AMO regression test." << std::endl;
-  std::cout << "Usage: [-t<name>: select test [-x<name>: exclude]] "
+  std::cout << "Usage: [-t<name>: select test (opt-in: cas-global, cas-local) [-x<name>: exclude]] "
             << "[-s<id>: start id] [-e<id>: end id] [-k<kernel>] "
             << "[-n<iters>: per-hart iters] [-c: continue on error] [-h]"
             << std::endl;
@@ -66,6 +66,17 @@ void cleanup() {
 int main(int argc, char *argv[]) {
   parse_args(argc, argv);
   if (iters == 0) iters = 1;
+
+  // The opt-in cases live in kernel_cas.vxbin and run without the others.
+  const bool cas_opt_in = selected.count("cas-global") || selected.count("cas-local");
+  if (cas_opt_in) {
+    if (selected.size() != selected.count("cas-global") + selected.count("cas-local")) {
+      std::cout << "Error: cas-global and cas-local run apart from the other tests" << std::endl;
+      return -1;
+    }
+    if (!std::strcmp(kernel_file, "kernel.vxbin"))
+      kernel_file = "kernel_cas.vxbin";
+  }
 
   std::cout << "iters per hart: " << iters << std::endl;
   std::cout << "kernel: " << kernel_file << std::endl;
@@ -111,6 +122,14 @@ int main(int argc, char *argv[]) {
 
   testSuite = new TestSuite(device);
   if (testid_e == 0) testid_e = (int)testSuite->size() - 1;
+#if VX_CFG_EXT_ZACAS_ENABLED
+  if (std::strcmp(testSuite->get_test(CASG_TEST_GLOBAL)->name(), "cas-global")
+   || std::strcmp(testSuite->get_test(CASG_TEST_LOCAL)->name(), "cas-local")) {
+    std::cout << "Error: kernel_cas.vxbin's test ids moved" << std::endl;
+    cleanup();
+    return -1;
+  }
+#endif
   kernel_arg.peer_core = testSuite->peer_core();
   kernel_arg.peer_warp = testSuite->peer_warp();
 
@@ -124,6 +143,7 @@ int main(int argc, char *argv[]) {
 
     if (!selected.empty() && selected.count(name) == 0) continue;
     if (!excluded.empty() && excluded.count(name) != 0) continue;
+    if (test->opt_in() && selected.count(name) == 0) continue;
 
     if (auto reason = test->skip_reason()) {
       std::cout << "Test" << t << "-" << name << " SKIPPED (" << reason << ")" << std::endl;

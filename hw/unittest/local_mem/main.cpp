@@ -24,7 +24,10 @@
 // after a try_wait is taken that reads the phase not complete, a flip {row}
 // two cycles after a writing op is taken that completes it, nothing for any
 // other op; in op order per bank. --neg=<underflow|txrange|align> issues one
-// erroneous op, and the bank's assert must abort the run.
+// erroneous op, and the bank's assert must abort the run. Float-atomic builds
+// run inc/dec against amo_ref with their timing; --neg=fpsite issues a float
+// atomic, which only the last-level cache executes, and the bank's site assert
+// must abort the run.
 
 #include "vl_simulator.h"
 #include "VVX_local_mem_top.h"
@@ -50,6 +53,10 @@
 #ifdef VX_CFG_EXT_MBAR_ENABLE
 #include "mbar_ref.h"
 namespace mbar = vortex::mbar_ref;
+#endif
+#ifdef VX_CFG_EXT_FPAMO_ENABLE
+#include "amo_ref.h"
+namespace amo_ref = vortex::amo_ref;
 #endif
 
 constexpr uint32_t XLEN       = VX_CFG_XLEN;
@@ -80,7 +87,8 @@ constexpr bool     CAS_EN     = VX_CFG_EXT_ZACAS_ENABLED;
 // Must match the VX_local_mem_top localparams.
 constexpr uint32_t TAG_BITS     = 16;
 constexpr uint32_t DMA_TAG_BITS = 8;
-constexpr uint32_t AMO_OP_BITS  = 4;
+// amo_op_e: 4 bits, 5 with the float atomics (VX_local_mem_top takes it from the package).
+constexpr uint32_t AMO_OP_BITS  = (VX_CFG_EXT_FPAMO_ENABLED != 0) ? 5 : 4;
 constexpr uint32_t HART_BITS    = 16;
 
 constexpr uint64_t WORD_MASK = (XLEN == 64) ? ~0ull : 0xffffffffull;
@@ -88,6 +96,11 @@ constexpr uint64_t MASK32    = 0xffffffffull;
 constexpr uint32_t FULL_BE   = (1u << WORD_SIZE) - 1;
 
 static_assert((NUM_BANKS & (NUM_BANKS - 1)) == 0, "NUM_BANKS must be a power of two");
+static_assert(sizeof(std::declval<VVX_local_mem_top&>().mem_req_amo_op)
+                == ((NUM_REQS * AMO_OP_BITS <= 8) ? 1 : (NUM_REQS * AMO_OP_BITS <= 16) ? 2
+                  : (NUM_REQS * AMO_OP_BITS <= 32) ? 4 : (NUM_REQS * AMO_OP_BITS <= 64) ? 8
+                  : ((NUM_REQS * AMO_OP_BITS + 31) / 32) * 4),
+              "mem_req_amo_op width differs from the testbench's amo_op width");
 
 static bool acks_stores(uint32_t lane) {
   return static_cast<int>(lane) == ACK_LANE;
@@ -116,7 +129,9 @@ enum AmoOp : uint8_t {
   AMO_LR = 0, AMO_SC = 1, AMO_ADD = 2, AMO_SWAP = 3, AMO_XOR = 4,
   AMO_OR = 5, AMO_AND = 6, AMO_MIN = 7, AMO_MAX = 8, AMO_CAS = 9,
   AMO_MBAR_ARRIVE = 10, AMO_MBAR_ARRIVE_TX = 11, AMO_MBAR_EXPECT_TX = 12,
-  AMO_MBAR_COMPLETE_TX = 13, AMO_MBAR_TEST_WAIT = 14, AMO_MBAR_TRY_WAIT = 15
+  AMO_MBAR_COMPLETE_TX = 13, AMO_MBAR_TEST_WAIT = 14, AMO_MBAR_TRY_WAIT = 15,
+  AMO_INC = 16, AMO_DEC = 17, AMO_FADD = 18, AMO_FADD2 = 20, AMO_FADD2_BF = 21,
+  AMO_FMIN2 = 22, AMO_FMAX2 = 23, AMO_FMIN2_BF = 24, AMO_FMAX2_BF = 25
 };
 
 static const char* amo_name(uint8_t op, bool uns) {
@@ -137,6 +152,15 @@ static const char* amo_name(uint8_t op, bool uns) {
   case AMO_MBAR_COMPLETE_TX: return "MBAR_COMPLETE_TX";
   case AMO_MBAR_TEST_WAIT:   return "MBAR_TEST_WAIT";
   case AMO_MBAR_TRY_WAIT:    return "MBAR_TRY_WAIT";
+  case AMO_INC:      return "AMOINC";
+  case AMO_DEC:      return "AMODEC";
+  case AMO_FADD:     return "AMOFADD";
+  case AMO_FADD2:    return "AMOFADD2";
+  case AMO_FADD2_BF: return "AMOFADD2.BF";
+  case AMO_FMIN2:    return "AMOFMIN2";
+  case AMO_FMAX2:    return "AMOFMAX2";
+  case AMO_FMIN2_BF: return "AMOFMIN2.BF";
+  case AMO_FMAX2_BF: return "AMOFMAX2.BF";
   default:       return "AMO?";
   }
 }
@@ -289,6 +313,13 @@ static uint64_t amo_new_word(const LsuReq& r, uint64_t old) {
   bool lt_u = a < b;
   bool lt = r.uns ? lt_u : lt_s;
   uint64_t res = a;
+#ifdef VX_CFG_EXT_FPAMO_ENABLE
+  // inc/dec, the only ops past OP_BASE a bank runs; their result is the same at every site.
+  if (r.op >= amo_ref::OP_BASE) {
+    res = amo_ref::apply(r.op, is_w ? amo_ref::W_W : amo_ref::W_D, a, b, amo_ref::SITE_LOOP);
+    return merge(old, res << sh, r.byteen);
+  }
+#endif
   switch (r.op) {
   case AMO_LR:   res = a; break;
   case AMO_SC:   res = b; break;
@@ -631,6 +662,23 @@ public:
   int run() {
     std::printf("local_mem: XLEN=%u lanes=%u banks=%u rows=%u size=%u amo=%d zacas=%d mbar=%d seed=%u\n",
                 XLEN, NUM_REQS, NUM_BANKS, NUM_ROWS, LMEM_SIZE, AMO_EN, CAS_EN, MBAR_EN, opts_.seed);
+  #ifdef VX_CFG_EXT_FPAMO_ENABLE
+    if (opts_.neg == "fpsite") {
+      // A float atomic at a bank must stop the run.
+      LsuReq r;
+      r.amo = true;
+      r.op = AMO_FADD;
+      r.byteen = lane_byteen(W_LO);
+      r.addr = word_addr(5 % NUM_ROWS, NUM_BANKS - 1);
+      r.data = 0x3f800000u;
+      std::printf("neg fpsite: issuing %s\n", amo_name(r.op, false));
+      std::fflush(stdout);
+      this->lsu_access(0, r);
+      this->idle(8);
+      std::printf("FAILED: neg fpsite did not abort\n");
+      return 1;
+    }
+  #endif
     if (!opts_.neg.empty()) {
     #ifdef VX_CFG_EXT_MBAR_ENABLE
       return this->mbar_negative(opts_.neg);
@@ -653,6 +701,9 @@ public:
     if (AMO_EN) {
       this->directed();
       this->lrsc_window();
+    #ifdef VX_CFG_EXT_FPAMO_ENABLE
+      this->fpamo();
+    #endif
     #ifdef VX_CFG_EXT_MBAR_ENABLE
       this->mbar_directed();
       this->mbar_events();
@@ -3010,6 +3061,81 @@ private:
     }
     return d;
   }
+
+#ifdef VX_CFG_EXT_FPAMO_ENABLE
+  // inc/dec at each lane position of every bank from every input, against
+  // amo_ref: the returned old value, the stored word and, in DLMEM builds, the
+  // commit report. Then the bank occupancy: a load behind an inc in the same
+  // bank answers as early as behind an add.
+  void fpamo() {
+    const uint32_t before = failures_;
+    std::vector<uint32_t> lanes = {0};
+    if (NUM_LSU_REQS > 1) {
+      lanes.push_back(NUM_LSU_REQS - 1);
+    }
+    if (ACK_LANE >= 0) {
+      lanes.push_back(static_cast<uint32_t>(ACK_LANE));
+    }
+    uint32_t n = 0;
+    for (uint8_t op : {AMO_INC, AMO_DEC}) {
+      for (uint32_t lane : lanes) {
+        for (uint32_t bank = 0; bank < NUM_BANKS; ++bank) {
+          for (int width : {W_LO, W_HI}) {
+            uint32_t row = this->rand_below(NUM_ROWS);
+            uint64_t& g = this->gold(row, bank);
+            for (uint32_t k = 0; k < 4; ++k) {
+              LsuReq a;
+              a.amo = true;
+              a.op = op;
+              a.byteen = lane_byteen(width);
+              a.addr = word_addr(row, bank);
+              a.wid = static_cast<int>(this->rand_below(NUM_WARPS));
+              uint64_t v = this->rand_below(6);
+              v |= v << 32;
+              a.data = lane_position(width, (width == W_HI) ? (v << 32) : v);
+              const std::string what = strf("%s lane %u bank %u %s", amo_name(op, false), lane, bank,
+                                            width_name(width));
+              auto ret = this->expect_report(what, lane, a);
+              this->check_ret("fpamo " + what, ret, g);
+              g = amo_new_word(a, g);
+              ++n;
+            }
+            LsuReq ld;
+            ld.byteen = FULL_BE;
+            ld.addr = word_addr(row, bank);
+            this->check_ret(strf("fpamo read-back %s bank %u", amo_name(op, false), bank),
+                            this->expect_report("read-back", 0, ld), g);
+          }
+        }
+      }
+    }
+    // Bank occupancy behind an atomic, against an add.
+    auto occupancy = [&](uint8_t op) {
+      uint32_t row = this->rand_below(NUM_ROWS);
+      LsuReq a;
+      a.amo = true;
+      a.op = op;
+      a.byteen = lane_byteen(W_LO);
+      a.addr = word_addr(row, 0);
+      a.data = 1;
+      LsuReq ld;
+      ld.byteen = FULL_BE;
+      ld.addr = word_addr(this->rand_below(NUM_ROWS), 0);
+      uint32_t ld_lane = (NUM_LSU_REQS > 1) ? 1 : 0;
+      ScnRun sr = this->run_issues({this->lsu_issue(0, 0, a), this->lsu_issue(1, ld_lane, ld)}, true, 12);
+      uint64_t& g = this->gold(row, 0);
+      g = amo_new_word(a, g);
+      return sr.ok ? (sr.rsp[1] - sr.acc[0]) : -1;
+    };
+    const int t_add = occupancy(AMO_ADD);
+    const int t_inc = occupancy(AMO_INC);
+    std::printf("fpamo: atomic then load in its bank: %d cycles (add), %d (inc)", t_add, t_inc);
+    if (t_inc != t_add) {
+      this->fail(strf("FAIL fpamo occupancy: inc held the bank %d cycles, add %d", t_inc, t_add));
+    }
+    std::printf("\nfpamo: %u atomics: %s\n", n, (failures_ == before) ? "ok" : "FAILED");
+  }
+#endif
 
   void directed() {
     std::array<std::array<Cell, NUM_K>, NUM_SCN> cells{};

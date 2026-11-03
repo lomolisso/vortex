@@ -45,6 +45,9 @@
 
 namespace {
 
+// amo_op_e: 4 bits, 5 with the float atomics (VX_dlmem_ep_top takes it from the package).
+constexpr uint32_t AMO_OP_BITS = (VX_CFG_EXT_FPAMO_ENABLED != 0) ? 5 : 4;
+
 template <typename T>
 void set_bits(T& sig, uint32_t lsb, uint32_t width, uint64_t value) {
   if constexpr (std::is_integral_v<T>) {
@@ -132,7 +135,7 @@ public:
       q.local = get_bits(t->lmem_req_local, c, 1);
       q.amo = get_bits(t->lmem_req_amo, c, 1);
       q.uns = get_bits(t->lmem_req_amo_unsigned, c, 1);
-      q.amo_op = uint8_t(get_bits(t->lmem_req_amo_op, c * 4, 4));
+      q.amo_op = uint8_t(get_bits(t->lmem_req_amo_op, c * AMO_OP_BITS, AMO_OP_BITS));
       q.byteen = uint8_t(get_bits(t->lmem_req_byteen, c * 8, 8));
       q.waddr = uint32_t(get_bits(t->lmem_req_addr, c * 32, 32));
       q.hart = uint32_t(get_bits(t->lmem_req_hart_id, c * 32, 32));
@@ -195,7 +198,7 @@ private:
         set_bits(t->lsu_req_data, i * 64, 64, lv ? lv->data : 0);
         set_bits(t->lsu_req_byteen, i * 8, 8, lv ? lv->byteen : 0);
         set_bits(t->lsu_req_amo, i, 1, lv && lv->amo);
-        set_bits(t->lsu_req_amo_op, i * 4, 4, lv ? lv->amo_op : 0);
+        set_bits(t->lsu_req_amo_op, i * AMO_OP_BITS, AMO_OP_BITS, lv ? lv->amo_op : 0);
         set_bits(t->lsu_req_amo_unsigned, i, 1, lv && lv->uns);
         set_bits(t->lsu_req_amo_cmp, i * 64, 64, lv ? lv->cmp : 0);
         set_bits(t->lsu_req_hart_id, i * 32, 32, lv ? lv->hart : 0);
@@ -276,7 +279,7 @@ public:
       q.rw = get_bits(t->lmem_req_rw, c, 1);
       q.amo = get_bits(t->lmem_req_amo, c, 1);
       q.uns = get_bits(t->lmem_req_amo_unsigned, c, 1);
-      q.amo_op = uint32_t(get_bits(t->lmem_req_amo_op, c * 4, 4));
+      q.amo_op = uint32_t(get_bits(t->lmem_req_amo_op, c * AMO_OP_BITS, AMO_OP_BITS));
       q.byteen = uint8_t(get_bits(t->lmem_req_byteen, c * 8, 8));
       q.waddr = uint32_t(get_bits(t->lmem_req_addr, c * 32, 32));
       q.hart = uint32_t(get_bits(t->lmem_req_hart_id, c * 32, 32));
@@ -393,7 +396,7 @@ public:
       q.rw = get_bits(t->lmem_req_rw, c, 1);
       q.amo = get_bits(t->lmem_req_amo, c, 1);
       q.uns = get_bits(t->lmem_req_amo_unsigned, c, 1);
-      q.amo_op = uint32_t(get_bits(t->lmem_req_amo_op, c * 4, 4));
+      q.amo_op = uint32_t(get_bits(t->lmem_req_amo_op, c * AMO_OP_BITS, AMO_OP_BITS));
       q.byteen = uint8_t(get_bits(t->lmem_req_byteen, c * 8, 8));
       q.waddr = uint32_t(get_bits(t->lmem_req_addr, c * 32, 32));
       q.hart = uint32_t(get_bits(t->lmem_req_hart_id, c * 32, 32));
@@ -434,7 +437,7 @@ private:
         set_bits(t->lsu_req_data, i * 64, 64, lv ? lv->data : 0);
         set_bits(t->lsu_req_byteen, i * 8, 8, lv ? lv->byteen : 0);
         set_bits(t->lsu_req_amo, i, 1, lv && lv->red);
-        set_bits(t->lsu_req_amo_op, i * 4, 4, (lv && lv->red) ? amo_add_ : 0);
+        set_bits(t->lsu_req_amo_op, i * AMO_OP_BITS, AMO_OP_BITS, (lv && lv->red) ? amo_add_ : 0);
         set_bits(t->lsu_req_amo_unsigned, i, 1, 0);
         set_bits(t->lsu_req_amo_cmp, i * 64, 64, 0);
         set_bits(t->lsu_req_hart_id, i * 32, 32, lv ? lv->hart : 0);

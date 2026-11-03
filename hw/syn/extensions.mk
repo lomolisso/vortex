@@ -61,6 +61,14 @@ ifneq (,$(filter -DVX_CFG_EXT_TCU_ENABLE -DVX_CFG_EXT_TCU_ENABLE=1 -DVX_CFG_EXT_
 	endif
 endif
 
+# Add the float atomic unit's HardFloat sources (once: a BHF TCU adds them too)
+ifneq (,$(filter -DVX_CFG_EXT_FPAMO_ENABLE -DVX_CFG_EXT_FPAMO_ENABLE=1 -DVX_CFG_EXT_FPAMO_ENABLED=1, $(XCONFIGS)))
+	ifeq (,$(filter -I$(THIRD_PARTY_DIR)/hardfloat/source, $(RTL_INCLUDE)))
+		RTL_INCLUDE += -J$(THIRD_PARTY_DIR)/hardfloat/source/RISCV
+		RTL_INCLUDE += -I$(THIRD_PARTY_DIR)/hardfloat/source
+	endif
+endif
+
 # Add DXA extension sources
 ifneq (,$(filter -DVX_CFG_EXT_DXA_ENABLE -DVX_CFG_EXT_DXA_ENABLE=1 -DVX_CFG_EXT_DXA_ENABLED=1, $(XCONFIGS)))
 	RTL_PKGS += $(RTL_DIR)/dxa/VX_dxa_pkg.sv

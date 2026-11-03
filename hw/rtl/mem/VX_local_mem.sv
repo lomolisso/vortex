@@ -536,6 +536,13 @@ module VX_local_mem import VX_gpu_pkg::*; #(
             assign amo_wb_store = amo_wb_valid_r && ~amo_wb_is_lr_r && ~amo_wb_sc_fail_r;
         `endif
             assign amo_busy = amo_rd_valid_r || amo_wb_valid_r;
+        `ifdef VX_CFG_EXT_FPAMO_ENABLE
+            // Float atomics execute only in the last-level cache; on local memory
+            // the kernel headers run them as compare-and-swap loops.
+            `RUNTIME_ASSERT(~(amo_wb_valid_r && amo_op_is_fp(amo_op_e'(amo_wb_op_r))),
+                ("%t: *** %s bank%0d: atomic not supported at this site: op=%0d byteen=0x%h row=0x%0h",
+                    $time, INSTANCE_ID, i, amo_wb_op_r, amo_wb_byteen_r, amo_wb_addr_r))
+        `endif
 
             always @(posedge clk) begin
                 if (reset) begin
@@ -663,6 +670,15 @@ module VX_local_mem import VX_gpu_pkg::*; #(
             if (WORD_WIDTH < 64) begin : g_amo_hi_unused
                 `UNUSED_VAR (amo_new_word[63:WORD_WIDTH])
             end
+        `ifdef VX_CFG_EXT_FPAMO_ENABLE
+            // A float or inc/dec atomic is a naturally aligned word or doubleword.
+            wire wb_is_fpamo = (amo_op_e'(amo_wb_op_r) >= AMO_OP_INC);
+            wire wb_be_ok = (amo_wb_byteen_r == WORD_SIZE'(8'h0f)) || (amo_wb_byteen_r == WORD_SIZE'(8'hf0))
+                         || (amo_wb_byteen_r == WORD_SIZE'(8'hff));
+            `RUNTIME_ASSERT(~(amo_wb_valid_r && wb_is_fpamo && ~wb_be_ok),
+                ("%t: *** %s bank%0d: atomic is not naturally aligned: row=0x%0h byteen=0x%h op=%0d",
+                    $time, INSTANCE_ID, i, amo_wb_addr_r, amo_wb_byteen_r, amo_wb_op_r))
+        `endif
         `ifdef VX_CFG_EXT_MBAR_ENABLE
             // One atomic owns the bank from its read to its write-back, so its
             // insert (read stage) and a flip (write-back stage) never meet.
@@ -675,7 +691,12 @@ module VX_local_mem import VX_gpu_pkg::*; #(
             assign mbar_evt_row[i]   = amo_wb_addr_r;
             `RUNTIME_ASSERT(~(evt_insert && evt_flip),
                 ("%t: *** %s bank%0d: two mbarrier waiter events in one cycle", $time, INSTANCE_ID, i))
+        `ifdef VX_CFG_EXT_FPAMO_ENABLE
+            wire wb_is_mbar = (amo_op_e'(amo_wb_op_r) >= AMO_OP_MBAR_ARRIVE)
+                           && (amo_op_e'(amo_wb_op_r) <= AMO_OP_MBAR_TRY_WAIT);
+        `else
             wire wb_is_mbar = (amo_op_e'(amo_wb_op_r) >= AMO_OP_MBAR_ARRIVE);
+        `endif
             `RUNTIME_ASSERT(~(amo_wb_valid_r && wb_is_mbar && ~(&amo_wb_byteen_r)),
                 ("%t: *** %s bank%0d: mbarrier op is not a naturally aligned doubleword: row=0x%0h byteen=0x%h",
                     $time, INSTANCE_ID, i, amo_wb_addr_r, amo_wb_byteen_r))

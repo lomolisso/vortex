@@ -34,6 +34,10 @@
 #include "vl_simulator.h"
 #include "VVX_cache_top.h"
 #include "VX_config.h"
+#ifdef VX_CFG_EXT_FPAMO_ENABLE
+#include "amo_ref.h"
+namespace amo_ref = vortex::amo_ref;
+#endif
 
 #include <algorithm>
 #include <array>
@@ -164,7 +168,9 @@ constexpr uint32_t NUM_HARTS    = (HART_ID_BITS >= 4) ? 16 : (1u << HART_ID_BITS
 constexpr uint32_t ATTR_FLUSH     = 0;
 constexpr uint32_t ATTR_AMO_VALID = 4;
 constexpr uint32_t ATTR_AMO_OP    = ATTR_AMO_VALID + 1;
-constexpr uint32_t ATTR_AMO_UNS   = ATTR_AMO_OP + 4;
+// amo_op_e: 4 bits, 5 with the float atomics (VX_gpu_pkg.sv); the attr width check below holds it.
+constexpr uint32_t AMO_OP_BITS    = (VX_CFG_EXT_FPAMO_ENABLED != 0) ? 5 : 4;
+constexpr uint32_t ATTR_AMO_UNS   = ATTR_AMO_OP + AMO_OP_BITS;
 constexpr uint32_t ATTR_AMO_CMP   = ATTR_AMO_UNS + 1;
 constexpr uint32_t ATTR_HART      = ATTR_AMO_CMP + (CAS_EN ? XLEN : 0);
 constexpr uint32_t ATTR_FENCE     = ATTR_HART + HART_ID_BITS;
@@ -207,6 +213,10 @@ static_assert(sizeof(std::declval<VVX_cache_top&>().mem_req_valid) == MEM_PORTS,
 enum AmoOp : uint8_t {
   AMO_LR = 0, AMO_SC = 1, AMO_ADD = 2, AMO_SWAP = 3, AMO_XOR = 4,
   AMO_OR = 5, AMO_AND = 6, AMO_MIN = 7, AMO_MAX = 8, AMO_CAS = 9
+#ifdef VX_CFG_EXT_FPAMO_ENABLE
+  , AMO_INC = 16, AMO_DEC, AMO_FADD, AMO_FADD_BF, AMO_FADD2, AMO_FADD2_BF,
+  AMO_FMIN2, AMO_FMAX2, AMO_FMIN2_BF, AMO_FMAX2_BF
+#endif
 };
 
 struct AmoKind {
@@ -233,6 +243,18 @@ static const char* amo_name(uint8_t op, bool uns) {
   case AMO_MIN:  return uns ? "AMOMINU" : "AMOMIN";
   case AMO_MAX:  return uns ? "AMOMAXU" : "AMOMAX";
   case AMO_CAS:  return "AMOCAS";
+#ifdef VX_CFG_EXT_FPAMO_ENABLE
+  case AMO_INC:      return "AMOINC";
+  case AMO_DEC:      return "AMODEC";
+  case AMO_FADD:     return "AMOFADD";
+  case AMO_FADD_BF:  return "AMOFADD.BF";
+  case AMO_FADD2:    return "AMOFADD2";
+  case AMO_FADD2_BF: return "AMOFADD2.BF";
+  case AMO_FMIN2:    return "AMOFMIN2";
+  case AMO_FMAX2:    return "AMOFMAX2";
+  case AMO_FMIN2_BF: return "AMOFMIN2.BF";
+  case AMO_FMAX2_BF: return "AMOFMAX2.BF";
+#endif
   default:       return "AMO?";
   }
 }
@@ -349,6 +371,14 @@ static std::pair<uint32_t, uint32_t> amo_lane(uint64_t byteen) {
 // RVA/Zacas read-modify-write on a size-byte operand; *wrote says whether the
 // result is a store for reservation purposes (a failed compare is not).
 static uint64_t amo_compute(uint8_t op, bool uns, uint32_t size, uint64_t a, uint64_t b, uint64_t c, bool* wrote) {
+#ifdef VX_CFG_EXT_FPAMO_ENABLE
+  // The last-level cache's rules: f32 flushed, f64 NaN unchanged (H100 global memory).
+  uint32_t width = (size == 8) ? amo_ref::W_D : amo_ref::W_W;
+  if (op >= amo_ref::OP_BASE) {
+    *wrote = true;
+    return amo_ref::apply(op, width, a, b, amo_ref::SITE_LLC);
+  }
+#endif
   uint64_t mask = (size == 8) ? ~0ull : 0xffffffffull;
   a &= mask;
   b &= mask;
@@ -540,7 +570,7 @@ public:
       uint64_t attr = 0;
       attr |= static_cast<uint64_t>(r.flush) << ATTR_FLUSH;
       attr |= static_cast<uint64_t>(r.amo) << ATTR_AMO_VALID;
-      attr |= static_cast<uint64_t>(r.op & 0xf) << ATTR_AMO_OP;
+      attr |= static_cast<uint64_t>(r.op & ((1u << AMO_OP_BITS) - 1)) << ATTR_AMO_OP;
       attr |= static_cast<uint64_t>(r.uns) << ATTR_AMO_UNS;
       t->core_req_valid[i] = slot[i].has_value();
       t->core_req_rw[i] = r.rw;
@@ -733,7 +763,7 @@ struct Options {
   bool     no_assert     = false;
   uint32_t stress_fence  = 0;     // stress: % of issues that are fences
   uint64_t watch         = ~0ull; // word whose traffic is traced
-  std::string tests      = "race,chain,chainbp,wbqburst,bypass,chainload,settle,fence,fencecta,fstorm,stress";
+  std::string tests      = "race,chain,chainbp,wbqburst,bypass,chainload,settle,fence,fencecta,fstorm,fpamo,stress";
 };
 
 struct Hang {};
@@ -799,6 +829,9 @@ public:
       }
       if (this->selected("fstorm")) {
         this->fence_storms();
+      }
+      if (AMO_EN && this->selected("fpamo")) {
+        this->fpamo_round();
       }
       for (uint32_t s = 0; this->selected("stress") && s < opts_.stress_seeds; ++s) {
         this->stress(opts_.seed * 7919u + s);
@@ -2325,6 +2358,13 @@ private:
       r.data = this->rand_word();
       r.label = strf("stress store 0x%" PRIx64, w);
       this->present(port, r);
+#ifdef VX_CFG_EXT_FPAMO_ENABLE
+    } else if (roll < 88 && rand_below(3) == 0) {
+      const FpForm& f = this->rand_fp_form();
+      uint64_t a = w + this->aligned_offset(f.size);
+      this->present(port, this->make_amo(f.op, false, a, f.size, this->fp_operand(f), 0, rand_below(NUM_HARTS),
+                                         "stress"));
+#endif
     } else if (roll < 88) {
       AmoKind k = STORE_AMOS[rand_below(NUM_STORE_AMOS)];
       uint32_t size = this->amo_size(rand_below(2));
@@ -2352,6 +2392,141 @@ private:
     }
     return true;
   }
+
+#ifdef VX_CFG_EXT_FPAMO_ENABLE
+  // The atomics beyond RISC-V A, at the access size each is issued with.
+  struct FpForm {
+    uint8_t  op;
+    uint32_t size;
+    bool     fp;
+  };
+
+  static const std::vector<FpForm>& fp_forms() {
+    static const std::vector<FpForm> all = {
+      {AMO_INC, 4, false}, {AMO_DEC, 4, false}, {AMO_FADD, 4, true}, {AMO_FADD, 8, true},
+      {AMO_FADD2, 4, true}, {AMO_FADD2, 8, true}, {AMO_FADD2_BF, 4, true},
+      {AMO_FMIN2, 4, true}, {AMO_FMAX2, 4, true}, {AMO_FMIN2_BF, 4, true}, {AMO_FMAX2_BF, 4, true}};
+    static const std::vector<FpForm> narrow = [] {
+      std::vector<FpForm> v;
+      for (auto& f : all) {
+        if (f.size <= MAX_AMO_SIZE && (!f.fp || WORD_SIZE >= 8)) {
+          v.push_back(f);
+        }
+      }
+      return v;
+    }();
+    return narrow;
+  }
+
+  const FpForm& rand_fp_form() {
+    const auto& v = fp_forms();
+    return v[rand_below(static_cast<uint32_t>(v.size()))];
+  }
+
+  // Random bits, small counters for inc/dec, or a per-element special value.
+  uint64_t fp_operand(const FpForm& f) {
+    static const uint16_t s16[] = {0x0000, 0x8000, 0x0001, 0x03ff, 0x0400, 0x3c00, 0xbc00, 0x7bff, 0x7c00, 0xfc00,
+                                   0x7e00, 0x7f80, 0xff80, 0x0080, 0x007f, 0x3f80};
+    static const uint32_t s32[] = {0x00000000u, 0x80000000u, 0x00000001u, 0x807fffffu, 0x00800000u, 0x3f800000u,
+                                   0xbf800000u, 0x7f7fffffu, 0x7f800000u, 0xff800000u, 0x7fc00000u, 0x33800000u};
+    if (f.op == AMO_INC || f.op == AMO_DEC) {
+      return rand_below(8);
+    }
+    uint64_t v = rng_();
+    if (rand_below(3) == 0) {
+      uint32_t elem = (f.op == AMO_FADD) ? f.size : ((f.op == AMO_FADD2 && f.size == 8) ? 4 : 2);
+      v = 0;
+      for (uint32_t o = 0; o < f.size; o += elem) {
+        uint64_t e = (elem == 2) ? s16[rand_below(16)] : (elem == 4) ? s32[rand_below(12)] : (static_cast<uint64_t>(s32[rand_below(12)]) << 32);
+        v |= e << (o * 8);
+      }
+    }
+    return v & ((f.size == 8) ? ~0ull : ((1ull << (f.size * 8)) - 1));
+  }
+
+  // Cycles from the acceptance of `first` (port 0) to the response of
+  // `second` (port 1), presented right after it, both on a resident line.
+  uint64_t timed_pair(const Req& first, const Req& second) {
+    this->drain();
+    this->present(0, first);
+    this->wait_accept(0);
+    uint64_t start = dut_.cycle();
+    uint32_t tag = this->present(1 % NUM_REQS, second);
+    this->wait_response(1 % NUM_REQS, tag);
+    uint64_t t = dut_.cycle() - start;
+    this->drain();
+    return t;
+  }
+
+  // Every form at every aligned offset of a word against amo_ref (the last
+  // level's site rules), back-to-back bursts of them on one word from every
+  // port, and the timing: a float atomic holds the bank exactly
+  // VX_CFG_FPAMO_LATENCY cycles longer than an integer one, and inc/dec as
+  // long as one.
+  void fpamo_round() {
+    uint32_t f0 = failures_;
+    uint64_t base = 0x00500000ull;
+    uint32_t n = 0;
+    const auto& forms = fp_forms();
+    for (uint32_t fi = 0; fi < forms.size(); ++fi) {
+      const FpForm& f = forms[fi];
+      for (uint32_t off = 0; off < WORD_SIZE; off += f.size) {
+        uint64_t a = base + fi * LINE_SIZE + off;
+        for (uint32_t k = 0; k < 6; ++k) {
+          this->blocking(k % NUM_REQS, this->make_amo(f.op, false, a, f.size, this->fp_operand(f), 0,
+                                                      k % NUM_HARTS, "fpamo"));
+          ++n;
+        }
+      }
+    }
+    // Bursts: one word, every port presenting without waiting.
+    for (uint32_t b = 0; b < 32; ++b) {
+      uint64_t w = base + 0x10000 + (b % 4) * WORD_SIZE;
+      for (uint32_t k = 0; k < 2 * NUM_REQS; ++k) {
+        const FpForm& f = this->rand_fp_form();
+        uint64_t a = w + this->aligned_offset(f.size);
+        this->present(k % NUM_REQS, this->make_amo(f.op, false, a, f.size, this->fp_operand(f), rng_(),
+                                                   k % NUM_HARTS, "fpamo burst"));
+        ++n;
+      }
+    }
+    this->drain();
+    for (uint32_t b = 0; b < 4; ++b) {
+      uint64_t w = base + 0x10000 + b * WORD_SIZE;
+      this->evict_and_reread(w, 0, Role::None, "fpamo reread");
+    }
+    // Timing on a resident line: atomic then a load of another word, and
+    // atomic then an atomic on the same word.
+    uint64_t ta = base + 0x20000;
+    this->blocking(0, this->make_load(ta, "fpamo timing warm"));
+    auto amo = [&](uint8_t op, uint32_t size, uint64_t a) {
+      return this->make_amo(op, false, a, size, (op == AMO_ADD || op == AMO_INC) ? 1 : 0x3f800000u, 0, 0,
+                            "fpamo timing");
+    };
+    const uint64_t LAT = VX_CFG_FPAMO_LATENCY;
+    uint64_t t_int_ld = this->timed_pair(amo(AMO_ADD, 4, ta), this->make_load(ta + WORD_SIZE, "fpamo timing load"));
+    uint64_t t_int_aa = this->timed_pair(amo(AMO_ADD, 4, ta), amo(AMO_ADD, 4, ta));
+    uint64_t t_inc_ld = this->timed_pair(amo(AMO_INC, 4, ta), this->make_load(ta + WORD_SIZE, "fpamo timing load"));
+    uint64_t t_fp_ld  = this->timed_pair(amo(AMO_FADD, 4, ta), this->make_load(ta + WORD_SIZE, "fpamo timing load"));
+    uint64_t t_fp_aa  = this->timed_pair(amo(AMO_FADD, 4, ta), amo(AMO_FADD, 4, ta));
+    std::printf("fpamo timing: atomic->load %" PRIu64 " (int) %" PRIu64 " (inc) %" PRIu64 " (float); "
+                "atomic->atomic %" PRIu64 " (int) %" PRIu64 " (float); latency %" PRIu64 "\n",
+                t_int_ld, t_inc_ld, t_fp_ld, t_int_aa, t_fp_aa, LAT);
+    if (t_inc_ld != t_int_ld) {
+      this->fail(strf("FAIL fpamo timing: inc then load took %" PRIu64 " cycles, an integer atomic %" PRIu64,
+                      t_inc_ld, t_int_ld));
+    }
+    if (WORD_SIZE >= 8 && (t_fp_ld != t_int_ld + LAT || t_fp_aa != t_int_aa + LAT)) {
+      this->fail(strf("FAIL fpamo timing: a float atomic must hold %" PRIu64 " cycles longer: load %" PRIu64
+                      " vs %" PRIu64 ", atomic %" PRIu64 " vs %" PRIu64, LAT, t_fp_ld, t_int_ld, t_fp_aa, t_int_aa));
+    }
+    std::printf("fpamo: %u atomics, %s\n", n, (failures_ == f0) ? "ok" : "FAILED");
+  }
+#else
+  void fpamo_round() {
+    std::printf("fpamo: float atomics disabled; skipped\n");
+  }
+#endif
 
   void stress(uint32_t seed) {
     rng_.seed(seed);

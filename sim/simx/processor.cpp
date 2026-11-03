@@ -176,6 +176,14 @@ ProcessorImpl::ProcessorImpl()
   static_assert(VX_CFG_MBAR_SUSPEND_CYCLES < (VX_DBG_STALL_TIMEOUT) / 4,
                 "VX_CFG_MBAR_SUSPEND_CYCLES must stay well below the scheduler stall timeout");
 #endif
+#ifdef VX_CFG_EXT_FPAMO_ENABLE
+  static_assert(VX_CFG_XLEN == 64, "FPAMO requires XLEN 64");
+  static_assert(VX_CFG_EXT_A_ENABLED, "FPAMO requires the A extension");
+  // the forms the H100 runs as CAS loops are 32-bit CAS loops in the kernel headers
+  static_assert(VX_CFG_EXT_ZACAS_ENABLED, "FPAMO requires Zacas");
+#else
+#line 178
+#endif
 
   // connect L3 core interfaces
   for (uint32_t i = 0; i < VX_CFG_NUM_CLUSTERS; ++i) {

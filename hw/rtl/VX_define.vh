@@ -118,6 +118,19 @@
     `endif
 `endif
 
+// Float and inc/dec atomics; the header's CAS loops need Zacas.
+`ifdef VX_CFG_EXT_FPAMO_ENABLE
+    `ifndef VX_CFG_XLEN_64
+        `error "FPAMO requires XLEN 64"
+    `endif
+    `ifndef VX_CFG_EXT_A_ENABLE
+        `error "FPAMO requires the A extension"
+    `endif
+    `ifndef VX_CFG_EXT_ZACAS_ENABLE
+        `error "FPAMO requires Zacas"
+    `endif
+`endif
+
 // Convenience flag: the TCU metadata SRAM is present when any metadata-consuming
 // mode (MX or sparse) is enabled. Internal derived macro — not a VX_CFG_* knob.
 `ifdef VX_CFG_TCU_MX_ENABLE

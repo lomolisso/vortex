@@ -42,6 +42,10 @@ module VX_cache_amo import VX_gpu_pkg::*; #(
     parameter MSHR_ADDR_WIDTH = 1,
     parameter WORDS_PER_LINE  = 1,
     parameter WORDS_PER_SECTOR = WORDS_PER_LINE, // words per fill/eviction sector (= WORDS_PER_LINE when 1 sector/line)
+`ifdef VX_CFG_EXT_FPAMO_ENABLE
+    // Float atomics at the commit site, each computing VX_CFG_FPAMO_LATENCY cycles longer
+    parameter FP_ENABLE       = FPAMO_LLC_FLOAT,
+`endif
     parameter PIPE_EX         = 0             // deferred-commit depth: _st1 ports lag the S0 lookup by PIPE_EX+1 cycles (0 = classic 2-stage)
 ) (
     input  wire                          clk,
@@ -578,12 +582,57 @@ module VX_cache_amo import VX_gpu_pkg::*; #(
         );
         `UNUSED_VAR (ret_word_unused)
 
+    `ifdef VX_CFG_EXT_FPAMO_ENABLE
+        // A float op stays in the compute stage FPL cycles longer while the
+        // float unit works on the held operands; commit_busy and chain_stall
+        // cover the whole stay.
+        localparam FPL   = `VX_CFG_FPAMO_LATENCY;
+        localparam FPL_W = `CLOG2(FPL + 1);
+        localparam FP_EN = (FP_ENABLE != 0) && (LANE_SIZE == 8);
+        reg [FPL_W-1:0] cmp_wait;
+        wire st1_is_fp = FP_EN && amo_op_is_fp(amo_st1.amo_op);
+        wire cmp_is_fp = FP_EN && amo_op_is_fp(cmp_op);
+        wire [63:0] cmp_new_word;
+        if (FP_EN) begin : g_fpu
+            wire [63:0] fp_new_word;
+            VX_amo_fpu #(
+                .LATENCY  (FPL)
+            ) amo_fpu (
+                .clk      (clk),
+                .reset    (reset),
+                .op       (cmp_op),
+                .width    (cmp_width),
+                .old_word (cmp_old),
+                .rhs      (cmp_rhs),
+                .new_word (fp_new_word)
+            );
+            assign cmp_new_word = cmp_is_fp ? fp_new_word : new_word;
+        end else begin : g_no_fpu
+            assign cmp_new_word = new_word;
+        end
+        `RUNTIME_ASSERT (~(amo_st1.amo_valid && valid_st1 && is_creq_st1 && ~FP_EN && amo_op_is_fp(amo_st1.amo_op)),
+            ("%t: atomic not supported at this site: op=%0d width=%0d addr=0x%0h", $time, amo_st1.amo_op, width_st1, addr_st1))
+        // A float or inc/dec atomic is a naturally aligned word or doubleword of its lane.
+        wire st1_is_fpamo = (amo_st1.amo_op >= AMO_OP_INC);
+        wire st1_be_ok = (lane_byteen_st1 == LANE_SIZE'(8'h0f)) || (lane_byteen_st1 == LANE_SIZE'(8'hf0))
+                      || (lane_byteen_st1 == LANE_SIZE'(8'hff));
+        `RUNTIME_ASSERT (~(amo_st1.amo_valid && valid_st1 && is_creq_st1 && st1_is_fpamo && ~st1_be_ok),
+            ("%t: atomic is not naturally aligned (addr=0x%0h byteen=0x%h)", $time, addr_st1, lane_byteen_st1))
+
+        // place the computed value at its byte offset within the lane
+        wire [LANE_WIDTH-1:0] wb_data_w = LANE_WIDTH'(cmp_new_word) << cmp_bit_off;
+
+        // Compute finished this cycle (result ready to enqueue): the compute
+        // stage is occupied, done waiting, and not being reloaded by a fresh latch.
+        assign wb_push = cmp_valid && (cmp_wait == '0) && ~(do_store_st1 && ~pipe_stall);
+    `else
         // place the computed value at its byte offset within the lane
         wire [LANE_WIDTH-1:0] wb_data_w = LANE_WIDTH'(new_word) << cmp_bit_off;
 
         // Compute finished this cycle (result ready to enqueue): the compute
         // stage is occupied and not being reloaded by a fresh latch.
         assign wb_push = cmp_valid && ~(do_store_st1 && ~pipe_stall);
+    `endif
         // A same-WORD result coalesces into that word's existing entry, byte-
         // merging its bytes (see the enqueue) so repeated or adjacent sub-word
         // AMOs to one word collapse to a single writeback. Different words of the
@@ -628,6 +677,9 @@ module VX_cache_amo import VX_gpu_pkg::*; #(
         always @(posedge clk) begin
             if (reset) begin
                 cmp_valid   <= 1'b0;
+            `ifdef VX_CFG_EXT_FPAMO_ENABLE
+                cmp_wait    <= '0;
+            `endif
                 wbq_count   <= '0;
                 wb_settle   <= '0;
             end else begin
@@ -662,6 +714,11 @@ module VX_cache_amo import VX_gpu_pkg::*; #(
                     cmp_tag      <= tag_st1;
                     cmp_idx      <= req_idx_st1;
                     cmp_attr     <= attr_st1;
+                `ifdef VX_CFG_EXT_FPAMO_ENABLE
+                    cmp_wait     <= st1_is_fp ? FPL_W'(FPL) : '0;
+                end else if (cmp_valid && (cmp_wait != '0)) begin
+                    cmp_wait  <= cmp_wait - FPL_W'(1);
+                `endif
                 end else if (cmp_valid) begin
                     cmp_valid <= 1'b0;
                 end

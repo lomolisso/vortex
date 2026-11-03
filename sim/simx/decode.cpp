@@ -31,6 +31,11 @@
 #include "tensor_cfg.h"
 #include "tcu_unit.h"
 #endif
+#ifdef VX_CFG_EXT_FPAMO_ENABLE
+#include "amo_ref.h"
+#else
+#line 33
+#endif
 
 using namespace vortex;
 
@@ -329,6 +334,29 @@ static op_string_t op_string(const Instr &instr) {
     },
     [&](AmoType amo_type)-> op_string_t {
       auto amoArgs = std::get<IntrAmoArgs>(instrArgs);
+#ifdef VX_CFG_EXT_FPAMO_ENABLE
+      {
+        const bool d = (amoArgs.width == 3);
+        switch (amo_type) {
+        case AmoType::AMOINC:      return {"AMOINC.W", ""};
+        case AmoType::AMODEC:      return {"AMODEC.W", ""};
+        case AmoType::AMOFADD:     return {d ? "AMOFADD.D" : "AMOFADD.W", ""};
+        case AmoType::AMOFADD2:    return {d ? "AMOFADD2.D" : "AMOFADD2.W", ""};
+        case AmoType::AMOFADD2_BF: return {"AMOFADD2.BF.W", ""};
+        case AmoType::AMOFMIN2:    return {"AMOFMIN2.W", ""};
+        case AmoType::AMOFMAX2:    return {"AMOFMAX2.W", ""};
+        case AmoType::AMOFMIN2_BF: return {"AMOFMIN2.BF.W", ""};
+        case AmoType::AMOFMAX2_BF: return {"AMOFMAX2.BF.W", ""};
+        default: break;
+        }
+      }
+#elif defined(DXA_MBAR_ENABLE)
+#line 327
+#elif defined(VX_CFG_EXT_MBAR_ENABLE)
+#line 324
+#else
+#line 316
+#endif
       switch (amoArgs.width) {
       case 2: {
         switch (amo_type) {
@@ -1281,9 +1309,37 @@ Instr::Ptr Decoder::decode(uint32_t code, uint64_t uuid) {
   #endif
   } break;
 #endif
+#ifdef VX_CFG_EXT_FPAMO_ENABLE
+  case Opcode::EXT4: {
+    // PTX atomics, R-type laid out like RISC-V A: funct5 = amo_ref code - OP_BASE,
+    // funct3 = width. No 16-bit form exists in hardware.
+    static const AmoType ptx_types[] = {
+      AmoType::AMOINC, AmoType::AMODEC, AmoType::AMOFADD, AmoType::AMOFADD_BF,
+      AmoType::AMOFADD2, AmoType::AMOFADD2_BF, AmoType::AMOFMIN2, AmoType::AMOFMAX2,
+      AmoType::AMOFMIN2_BF, AmoType::AMOFMAX2_BF
+    };
+    if (funct3 == amo_ref::W_H || !amo_ref::legal(amo_ref::OP_BASE + funct5, funct3)) {
+      std::abort();
+    }
+    uint32_t aq = (code >> shift_aq) & mask_aq;
+    uint32_t rl = (code >> shift_rl) & mask_rl;
+    instr->set_fu_type(FUType::LSU);
+    instr->set_op_type(ptx_types[funct5]);
+    instr->set_args(IntrAmoArgs{funct3, aq, rl});
+  #ifdef VX_CFG_EXT_DLMEM_ENABLE
+    instr->set_wstall(aq != 0);
+  #endif
+    instr->set_dest_reg(rd, RegType::Integer);
+    instr->set_src_reg(0, rs1, RegType::Integer);
+    instr->set_src_reg(1, rs2, RegType::Integer);
+  } break;
+#endif
 #if defined(DXA_MBAR_ENABLE) && !defined(VX_CFG_EXT_DLMEM_ENABLE)
 #line 1230
 #elif defined(DXA_MBAR_ENABLE)
+#ifndef VX_CFG_EXT_FPAMO_ENABLE
+#line 1286
+#endif
 #elif defined(VX_CFG_EXT_MBAR_ENABLE)
 #line 1225
 #elif defined(VX_CFG_EXT_DLMEM_ENABLE)

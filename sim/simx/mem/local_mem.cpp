@@ -180,6 +180,16 @@ public:
 			return;
 		constexpr uint32_t LOG_THREADS = log2ceil(VX_CFG_NUM_THREADS);
 		constexpr uint32_t WID_MASK = (1u << log2ceil(VX_CFG_NUM_WARPS)) - 1;
+#ifdef VX_CFG_EXT_FPAMO_ENABLE
+#elif defined(DXA_MBAR_ENABLE)
+#line 176
+#elif defined(VX_CFG_EXT_MBAR_ENABLE)
+#line 164
+#elif defined(VX_CFG_EXT_DXA_ENABLE)
+#line 157
+#else
+#line 152
+#endif
 		uint64_t due = SimPlatform::instance().cycles() + delay;
 		__assert(due > commit_due_.at(bank), simobject_->name() << "-bank" << bank
 		         << ": two commit pulses in one cycle");
@@ -618,9 +628,36 @@ public:
 				const uint64_t old_word = amo_load_word(obuf, 0, width);
 				const uint64_t rhs = bank_req.data
 					? amo_load_word(bank_req.data->data(), byte_off, width) : 0;
+#ifdef VX_CFG_EXT_FPAMO_ENABLE
+				if (memop_is_fp_amo(op)) {
+					fpamo_site_abort(simobject_->name() + "-bank" + std::to_string(i), op, width, bank_req.addr);
+				}
+				auto rmw = amo_compute_ptx(op, width, old_word, rhs,
+				                           bank_req.flags.amo_unsigned,
+				                           bank_req.amo_cmp, amo_ref::SITE_LOOP);
+#else
+#if defined(DXA_MBAR_ENABLE)
+#line 614
+#elif defined(VX_CFG_EXT_MBAR_ENABLE)
+#line 274
+#elif defined(VX_CFG_EXT_DXA_ENABLE)
+#line 354
+#else
+#line 234
+#endif
 				auto rmw = amo_compute(op, width, old_word, rhs,
 				                       bank_req.flags.amo_unsigned,
 				                       bank_req.amo_cmp);
+#if defined(DXA_MBAR_ENABLE)
+#line 616
+#elif defined(VX_CFG_EXT_MBAR_ENABLE)
+#line 276
+#elif defined(VX_CFG_EXT_DXA_ENABLE)
+#line 356
+#else
+#line 236
+#endif
+#endif
 #ifdef VX_CFG_EXT_MBAR_ENABLE
 				if (is_mbar) {
 					const uint32_t err = mbar_ref::apply(mbar_op_code(op), old_word, rhs).err;
@@ -676,8 +713,28 @@ public:
 #endif
 				xbar_req_out.pop();
 				amo_busy_[i] = AMO_BANK_STALL_CYCLES;   // capture, then write back
+#ifdef VX_CFG_EXT_FPAMO_ENABLE
+#elif defined(DXA_MBAR_ENABLE)
+#line 674
+#elif defined(VX_CFG_EXT_MBAR_ENABLE)
+#line 334
+#else
+#line 285
+#endif
 				continue;
 			}
+#endif
+#ifdef VX_CFG_EXT_FPAMO_ENABLE
+#elif defined(DXA_MBAR_ENABLE)
+#line 673
+#elif defined(VX_CFG_EXT_MBAR_ENABLE)
+#line 333
+#elif VX_CFG_EXT_A_ENABLED
+#line 284
+#elif defined(VX_CFG_EXT_DXA_ENABLE)
+#line 415
+#else
+#line 295
 #endif
 
 			// Apply byte-enabled writes from TLM payload to local RAM.

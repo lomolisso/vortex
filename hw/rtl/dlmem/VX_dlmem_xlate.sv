@@ -238,9 +238,17 @@ module VX_dlmem_xlate import VX_gpu_pkg::*, VX_dlmem_pkg::*; #(
         assign attr_out[i] = attr;
         assign lane_lacc[i] = attr.is_lacc;
     `ifdef VX_CFG_EXT_MBAR_ENABLE
+    `ifdef VX_CFG_EXT_FPAMO_ENABLE
+        wire is_mbar = attr.amo.amo_valid && (attr.amo.amo_op >= AMO_OP_MBAR_ARRIVE)
+                    && (attr.amo.amo_op <= AMO_OP_MBAR_TRY_WAIT);
+        assign lane_mbar_global[i] = act && is_mbar && ~attr.is_addr_local && ~rem;
+        assign lane_mbar_rwait[i]  = act && attr.amo.amo_valid && (attr.amo.amo_op >= AMO_OP_MBAR_TEST_WAIT)
+                                  && (attr.amo.amo_op <= AMO_OP_MBAR_TRY_WAIT) && rem;
+    `else
         wire is_mbar = attr.amo.amo_valid && (attr.amo.amo_op >= AMO_OP_MBAR_ARRIVE);
         assign lane_mbar_global[i] = act && is_mbar && ~attr.is_addr_local && ~rem;
         assign lane_mbar_rwait[i]  = act && attr.amo.amo_valid && (attr.amo.amo_op >= AMO_OP_MBAR_TEST_WAIT) && rem;
+    `endif
     `endif
 
         assign out_remote[i] = rem;

@@ -98,6 +98,26 @@ tests:
     run: "make -C hw/unittest run-dxa-bulk"
     touches: [hw/rtl/dxa, hw/rtl/VX_gpu_pkg.sv, hw/rtl/VX_define.vh, hw/rtl/dlmem/VX_dlmem_pkg.sv,
               hw/unittest/dxa_core, hw/unittest/Makefile, hw/unittest/common.mk]
+  # Float and inc/dec atomics (RV64 only): the float unit against amo_ref at
+  # three latencies, the last-level cache bank and the local-memory banks with
+  # the new ops (a float op at a bank aborts at the site assert), the DLMEM
+  # endpoints and translation with the 5-bit op, then core and memory-unit lint.
+  - id: hw-fpamo
+    via: script
+    xlen: [64]
+    run: "make -C hw/unittest run-fpamo"
+    touches: [hw/rtl/cache, hw/rtl/mem, hw/rtl/dlmem, hw/rtl/core/VX_decode.sv,
+              hw/rtl/VX_gpu_pkg.sv, hw/rtl/VX_define.vh, hw/syn/hardfloat.mk,
+              third_party/hardfloat, sw/common/amo_ref.h, hw/unittest/amo_fpu,
+              hw/unittest/cache, hw/unittest/local_mem, hw/unittest/dlmem_ep,
+              hw/unittest/dlmem_xlate, hw/unittest/Makefile, hw/unittest/common.mk,
+              tests/unittest/dlmem_ep]
+  # The FPAMO golden model: hand vectors, then every row of the H100
+  # measurements in tests/unittest/amo_ref/h100_atomics.csv.gz.
+  - id: sw-amo-ref
+    via: script
+    run: "make -C tests/unittest/amo_ref run"
+    touches: [sw/common/amo_ref.h, tests/unittest/amo_ref, tests/regression/atomic_fp/probe_csv.h]
   # The SimX twin of the line reader at 4, 8 and 16 banks.
   - id: sw-dxa-bulk
     via: script

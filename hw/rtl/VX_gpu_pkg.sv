@@ -196,6 +196,47 @@ package VX_gpu_pkg;
     // parameter (not ifdef) on the cache hierarchy. When EXT_A_ENABLE is
     // undefined, the struct bits are still allocated in the attr field but
     // the cache's AMO logic is generated away by AMO_ENABLE=0.
+`ifdef VX_CFG_EXT_FPAMO_ENABLE
+    typedef enum logic [4:0] {
+        AMO_OP_LR    = 5'h00,
+        AMO_OP_SC    = 5'h01,
+        AMO_OP_ADD   = 5'h02,
+        AMO_OP_SWAP  = 5'h03,
+        AMO_OP_XOR   = 5'h04,
+        AMO_OP_OR    = 5'h05,
+        AMO_OP_AND   = 5'h06,
+        AMO_OP_MIN   = 5'h07,
+        AMO_OP_MAX   = 5'h08,
+        AMO_OP_CAS   = 5'h09
+    `ifdef VX_CFG_EXT_MBAR_ENABLE
+      , AMO_OP_MBAR_ARRIVE      = 5'h0A
+      , AMO_OP_MBAR_ARRIVE_TX   = 5'h0B
+      , AMO_OP_MBAR_EXPECT_TX   = 5'h0C
+      , AMO_OP_MBAR_COMPLETE_TX = 5'h0D
+      , AMO_OP_MBAR_TEST_WAIT   = 5'h0E
+      , AMO_OP_MBAR_TRY_WAIT    = 5'h0F
+    `endif
+        // PTX atomics beyond RISC-V A (custom-3 funct5 = code - 16).
+      , AMO_OP_INC      = 5'h10
+      , AMO_OP_DEC      = 5'h11
+      , AMO_OP_FADD     = 5'h12
+        // 5'h13 is reserved (a bf16 scalar add runs as a CAS loop).
+      , AMO_OP_FADD2    = 5'h14
+      , AMO_OP_FADD2_BF = 5'h15
+      , AMO_OP_FMIN2    = 5'h16
+      , AMO_OP_FMAX2    = 5'h17
+      , AMO_OP_FMIN2_BF = 5'h18
+      , AMO_OP_FMAX2_BF = 5'h19
+    } amo_op_e;
+
+    // Ops the float unit executes; the integer ALU runs the rest.
+    function automatic logic amo_op_is_fp(input amo_op_e op);
+        return (op >= AMO_OP_FADD) && (op <= AMO_OP_FMAX2_BF);
+    endfunction
+
+    // Only the last-level cache runs the float atomics; INC/DEC run at every site.
+    localparam FPAMO_LLC_FLOAT = 1;
+`else
     typedef enum logic [3:0] {
         AMO_OP_LR    = 4'h0,
         AMO_OP_SC    = 4'h1,
@@ -218,6 +259,7 @@ package VX_gpu_pkg;
       , AMO_OP_MBAR_TRY_WAIT    = 4'hF
     `endif
     } amo_op_e;
+`endif
 
     // Slim AMO sideband. width derives from byteen popcount at the cache
     // bank; rhs is read from the request's data field. Includes scalar
@@ -1002,10 +1044,19 @@ package VX_gpu_pkg;
     //////////////////////// instruction arguments ////////////////////////////
 
     // tcu_args_t at 27 bits = 1+1+1+2+5+5+4+4+4. Sparse variants are distinct opcodes.
+`ifdef VX_CFG_EXT_FPAMO_ENABLE
+    // One more bit for the 5-bit amo_op of lsu_args_t.
+    localparam INST_ARGS_BITS = 3 + ALU_TYPE_BITS + 20 + 3;
+`else
     localparam INST_ARGS_BITS = 3 + ALU_TYPE_BITS + 20 + 2;
+`endif
 
     typedef struct packed {
+    `ifdef VX_CFG_EXT_FPAMO_ENABLE
+        logic [2:0] __padding;
+    `else
         logic [1:0] __padding;
+    `endif
         logic use_PC;
         logic use_imm;
         logic is_w;
@@ -1016,7 +1067,11 @@ package VX_gpu_pkg;
 
     // Branch instructions (JAL/JALR/B/SYS) execute on the ALU pipeline.
     typedef struct packed {
+    `ifdef VX_CFG_EXT_FPAMO_ENABLE
+        logic [2:0] __padding;
+    `else
         logic [1:0] __padding;
+    `endif
         logic use_PC;
         logic use_imm;
         logic is_rvc;
@@ -1101,6 +1156,9 @@ package VX_gpu_pkg;
 
 `ifdef VX_CFG_EXT_TCU_ENABLE
     typedef struct packed {
+    `ifdef VX_CFG_EXT_FPAMO_ENABLE
+        logic __padding;
+    `endif
         logic is_last_uop;    // WGMMA: set on last sub-uop of an expansion
         logic is_first_uop;   // WGMMA: set on first sub-uop of an expansion
         logic a_from_smem;    // 0=register, 1=shared memory (B is always smem)

@@ -128,6 +128,13 @@ ifneq (,$(filter -DVX_CFG_EXT_RTU_ENABLE, $(XCONFIGS)))
 	RTL_INCLUDE += -I$(RTL_DIR)/rtu
 endif
 
+# Float atomics: the HardFloat sources of the atomic float unit.
+include $(VORTEX_HOME)/hw/syn/hardfloat.mk
+ifneq (,$(FPAMO_ENABLED))
+	RTL_PRE_SRCS := $(filter-out $(HARDFLOAT_SRCS),$(RTL_PRE_SRCS)) $(HARDFLOAT_SRCS)
+	RTL_INCLUDE += $(HARDFLOAT_INCLUDE)
+endif
+
 RTL_PKGS += $(RTL_DIR)/VX_trace_pkg.sv
 
 SRCS = $(SW_COMMON_DIR)/util.cpp $(SIM_COMMON_DIR)/mem.cpp $(SW_COMMON_DIR)/softfloat_ext.cpp $(SW_COMMON_DIR)/rvfloats.cpp $(SIM_COMMON_DIR)/dram_sim.cpp $(SIM_COMMON_DIR)/elf_loader.cpp $(SIM_COMMON_DIR)/host_monitor.cpp $(SIM_COMMON_DIR)/cout_drainer.cpp

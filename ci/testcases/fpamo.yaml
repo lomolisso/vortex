@@ -1,0 +1,240 @@
+# PTX atomics beyond RISC-V A (VX_CFG_EXT_FPAMO_ENABLE, RV64 with A and
+# Zacas): float add and packed 16-bit min/max at the last-level cache, inc/dec
+# at the cache and the local-memory banks, and the kernel header's
+# compare-and-swap loops where nvcc emits them, float adds on local memory
+# among them (sw/kernel/include/vx_atomic.h).
+# atomic_fp checks every result bit for bit against sw/common/amo_ref.h, and
+# the edge runs also against H100 measurements (tests/unittest/amo_ref/
+# h100_atomics.csv.gz).
+category: fpamo
+defaults:
+  xlen: [64]
+  configs: "-DVX_CFG_EXT_A_ENABLE -DVX_CFG_EXT_ZACAS_ENABLE -DVX_CFG_EXT_FPAMO_ENABLE"
+  tier: smoke
+  touches: [sw/common/amo_ref.h, sw/kernel/include/vx_atomic.h, tests/regression/atomic_fp,
+            tests/unittest/amo_ref/h100_atomics.csv.gz,
+            hw/rtl/cache/VX_amo_alu.sv, hw/rtl/cache/VX_amo_fpu.sv, hw/rtl/cache/VX_amo_fpu_rec.sv,
+            hw/rtl/cache/VX_amo_unit.sv, hw/rtl/cache/VX_cache_amo.sv, hw/rtl/cache,
+            hw/rtl/mem/VX_local_mem.sv, hw/rtl/mem/VX_lmem_switch.sv, hw/rtl/core/VX_decode.sv,
+            hw/rtl/core/VX_lsu_slice.sv, hw/rtl/core/VX_lsu_unit.sv, hw/rtl/core/VX_mem_unit.sv,
+            hw/rtl/VX_gpu_pkg.sv, hw/rtl/VX_define.vh, hw/rtl/dlmem, hw/syn/hardfloat.mk,
+            hw/syn/extensions.mk, third_party/hardfloat, sim/rtlsim/Makefile, sim/xrtsim/Makefile,
+            sim/simx/amo, sim/simx/mem, sim/simx/decode.cpp, sim/simx/types.h,
+            sim/simx/processor.cpp, sim/simx/lsu_unit, sim/simx/dlmem, VX_config.toml]
+tests:
+  # Edge-case operand pairs: every FPAMO instruction the memory runs (and its
+  # red form), and every vx_atomic.h form both as the memory's own variant and
+  # as the generic one, on a 16-byte slot with guard bytes; slot and returned
+  # value against amo_ref. Global: the cache's instructions, f32 flushed.
+  - id: edge-global
+    app: atomic_fp
+    drivers: [simx, rtlsim]
+    args: "-s global -x edge"
+  # Local memory: inc/dec in the bank, every float add as the shared CAS loop.
+  - id: edge-local
+    app: atomic_fp
+    drivers: [simx, rtlsim]
+    args: "-s local -x edge"
+  # A peer block's local memory through the DLMEM window, clusters of 2 and 4.
+  - id: edge-remote
+    app: atomic_fp
+    drivers: [simx]
+    configs+: "-DVX_CFG_EXT_DLMEM_ENABLE"
+    shape: {cores: 2, l2cache: true}
+    args: "-s remote -x edge -k 2"
+  # The same on rtlsim with one form of each kind: the full set is 2.6M cycles.
+  - id: edge-remote-subset
+    app: atomic_fp
+    drivers: [simx, rtlsim]
+    configs+: "-DVX_CFG_EXT_DLMEM_ENABLE"
+    shape: {cores: 2, l2cache: true}
+    args: "-s remote -x edge -k 2 -o inc.u32,dec.u32,add.f32,add.f16x2,add.bf16,cas.b16"
+  - id: edge-remote-k4
+    app: atomic_fp
+    drivers: [simx, rtlsim]
+    tier: full
+    configs+: "-DVX_CFG_EXT_DLMEM_ENABLE"
+    shape: {cores: 4, l2cache: true}
+    args: "-s remote -x edge -k 4 -o add.f32"
+  - id: edge-remote-k16
+    app: atomic_fp
+    drivers: [simx]
+    tier: nightly
+    configs+: "-DVX_CFG_EXT_DLMEM_ENABLE"
+    shape: {cores: 16, l2cache: true}
+    args: "-s remote -x edge -k 16 -o inc.u32"
+
+  # Integer-valued adds from every thread into 16 bins: exact sums.
+  - id: hist-global-f32
+    app: atomic_fp
+    drivers: [simx, rtlsim]
+    args: "-s global -x hist -o add.f32 -k 2"
+  - id: hist-global-f16x2
+    app: atomic_fp
+    drivers: [simx, rtlsim]
+    args: "-s global -x hist -o add.f16x2"
+  - id: hist-global-v2f32
+    app: atomic_fp
+    drivers: [simx, rtlsim]
+    args: "-s global -x hist -o add.v2.f32 -r"
+  - id: hist-global-f64-generic
+    app: atomic_fp
+    drivers: [simx, rtlsim]
+    args: "-s global -x hist -o add.f64 -g"
+  - id: hist-local-f32
+    app: atomic_fp
+    drivers: [simx, rtlsim]
+    args: "-s local -x hist -o add.f32"
+  - id: hist-local-inc
+    app: atomic_fp
+    drivers: [simx, rtlsim]
+    args: "-s local -x hist -o inc.u32"
+  - id: hist-remote-f32
+    app: atomic_fp
+    drivers: [simx, rtlsim]
+    configs+: "-DVX_CFG_EXT_DLMEM_ENABLE"
+    shape: {cores: 4, l2cache: true}
+    args: "-s remote -x hist -o add.f32 -k 4"
+
+  # Every thread on one word; prints the cycles.
+  - id: contend-global
+    app: atomic_fp
+    drivers: [simx, rtlsim]
+    args: "-s global -x contend -o add.f32"
+  - id: contend-local
+    app: atomic_fp
+    drivers: [simx, rtlsim]
+    args: "-s local -x contend -o inc.u32"
+  - id: contend-local-loop
+    app: atomic_fp
+    drivers: [simx, rtlsim]
+    args: "-s local -x contend -o add.f32"
+  - id: contend-remote
+    app: atomic_fp
+    drivers: [simx, rtlsim]
+    configs+: "-DVX_CFG_EXT_DLMEM_ENABLE"
+    shape: {cores: 2, l2cache: true}
+    args: "-s remote -x contend -o inc.u32 -k 2"
+
+  # red.shared::cluster.add.f32 of every rank's vector into every peer, as the
+  # atomic_all_push collective.
+  - id: allpush
+    app: atomic_fp
+    drivers: [simx, rtlsim]
+    configs+: "-DVX_CFG_EXT_DLMEM_ENABLE"
+    shape: {cores: 4, l2cache: true}
+    args: "-s remote -x allpush -k 4 -m 64"
+  - id: allpush-k16
+    app: atomic_fp
+    drivers: [simx]
+    tier: nightly
+    configs+: "-DVX_CFG_EXT_DLMEM_ENABLE"
+    shape: {cores: 16, l2cache: true}
+    args: "-s remote -x allpush -k 16 -m 64"
+
+  # The global 16-bit add loop (ClusterFusion's atomicAdd(__half*)): threads of
+  # two blocks race on the halves of two words.
+  - id: f16loop
+    app: atomic_fp
+    drivers: [simx, rtlsim]
+    args: "-s global -x f16loop -o add.f16 -k 2"
+  - id: f16loop-bf16
+    app: atomic_fp
+    drivers: [simx, rtlsim]
+    args: "-s global -x f16loop -o add.bf16 -k 2"
+  - id: f16loop-local
+    app: atomic_fp
+    drivers: [simx, rtlsim]
+    args: "-s local -x f16loop -o add.f16"
+
+  # The AFU shell and host stack around the same RTL.
+  - id: edge-global-xrt
+    app: atomic_fp
+    drivers: [xrt]
+    args: "-s global -x edge -o add.f32"
+
+  # SimX<->rtlsim parity: hardware atomics only (a CAS loop's retries follow
+  # the timing, so its instruction count would not match), no spin.
+  - id: parity-contend-global
+    check: model_parity
+    app: atomic_fp
+    xlen: [64]
+    args: "-s global -x contend -o add.f32"
+  # One warp of 8 threads: each lane's float atomic holds the bank, and the
+  # loop's next load waits behind the last lanes; then 8 warps on one word.
+  - id: parity-contend-global-1w8t
+    check: model_parity
+    app: atomic_fp
+    xlen: [64]
+    shape: {warps: 1, threads: 8}
+    args: "-s global -x contend -o add.f32"
+  - id: parity-contend-global-8w8t
+    check: model_parity
+    app: atomic_fp
+    xlen: [64]
+    shape: {warps: 8, threads: 8}
+    args: "-s global -x contend -o add.f32"
+  - id: parity-hist-global
+    check: model_parity
+    app: atomic_fp
+    xlen: [64]
+    args: "-s global -x hist -o add.f32"
+  - id: parity-contend-local
+    check: model_parity
+    app: atomic_fp
+    xlen: [64]
+    args: "-s local -x contend -o inc.u32"
+  - id: parity-contend-remote
+    check: model_parity
+    app: atomic_fp
+    xlen: [64]
+    configs+: "-DVX_CFG_EXT_DLMEM_ENABLE"
+    shape: {cores: 2, l2cache: true}
+    args: "-s remote -x contend -o inc.u32 -k 2"
+
+  # Illegal knob combinations stop the build in SimX (the processor object)
+  # and in the RTL (a Verilator lint of the processor), each with the exact
+  # message. Tagged simx for cell placement.
+  - id: reject-rv32
+    via: script
+    driver: simx
+    xlen: [32]
+    env: {EXPECT: "FPAMO requires XLEN 64"}
+    run: &fpamo_reject |
+      set -u
+      read -r vh vl xl <<< "$(printf 'include config.mk\nall:\n\t@echo $(VORTEX_HOME) $(VERILATOR_PATH) $(XLEN)\n' | make -s -f -)"
+      tmp=$(mktemp -d)
+      make -C sim/simx DESTDIR="$tmp" "$tmp/obj/processor.o" > "$tmp/simx.log" 2>&1; simx_rc=$?
+      r=$vh/hw/rtl
+      "$vl/bin/verilator" --lint-only -Wno-lint -Wno-style -Wno-REDEFMACRO \
+        -DVX_CFG_XLEN="$xl" -DVX_CFG_XLEN_"$xl" -DSIMULATION ${CONFIGS:-} \
+        -Isw -Ihw -I"$r" -I"$r/libs" -I"$r/interfaces" -I"$r/core" -I"$r/mem" \
+        -I"$r/vm" -I"$r/cache" -I"$r/fpu" -I"$r/dlmem" \
+        "$r/VX_gpu_pkg.sv" "$r/fpu/VX_fpu_pkg.sv" "$r/dlmem/VX_dlmem_pkg.sv" \
+        "$r/VX_trace_pkg.sv" "$r/Vortex.sv" \
+        --top-module Vortex > "$tmp/rtl.log" 2>&1; rtl_rc=$?
+      fail=0
+      for side in simx rtl; do
+        rc=simx_rc; [ $side = rtl ] && rc=rtl_rc
+        if [ "${!rc}" -eq 0 ]; then
+          echo "FAIL: the $side build accepted CONFIGS=${CONFIGS:-}"; fail=1
+        elif ! grep -qF "$EXPECT" "$tmp/$side.log"; then
+          echo "FAIL: the $side build failed without '$EXPECT':"; tail -n 20 "$tmp/$side.log"; fail=1
+        else
+          echo "OK: the $side build rejects it: $(grep -F -m1 "$EXPECT" "$tmp/$side.log")"
+        fi
+      done
+      rm -rf "$tmp"
+      exit $fail
+  - id: reject-no-a
+    via: script
+    driver: simx
+    configs: "-DVX_CFG_EXT_FPAMO_ENABLE"
+    env: {EXPECT: "FPAMO requires the A extension"}
+    run: *fpamo_reject
+  - id: reject-no-zacas
+    via: script
+    driver: simx
+    configs: "-DVX_CFG_EXT_A_ENABLE -DVX_CFG_EXT_FPAMO_ENABLE"
+    env: {EXPECT: "FPAMO requires Zacas"}
+    run: *fpamo_reject

@@ -35,7 +35,7 @@ module VX_local_mem_top import VX_gpu_pkg::*; #(
     // Lane widths main.cpp packs the vector ports at (uuid is tied to zero)
     localparam TAG_VALUE_WIDTH  = 16,
     localparam DMA_TAG_VALUE_WIDTH = 8,
-    localparam AMO_OP_WIDTH     = 4,
+    localparam AMO_OP_WIDTH     = $bits(amo_op_e),
     localparam HART_IN_WIDTH    = 16,
 
     parameter TAG_WIDTH         = TAG_VALUE_WIDTH + UUID_WIDTH,
@@ -104,8 +104,6 @@ module VX_local_mem_top import VX_gpu_pkg::*; #(
     output wire [DMA_TAG_VALUE_WIDTH-1:0]      dma_rsp_tag,
     input  wire                                dma_rsp_ready
 );
-    `STATIC_ASSERT ($bits(amo_op_e) == AMO_OP_WIDTH,
-        ("local_mem_top: amo_op_e is %0d bits, the testbench packs %0d", $bits(amo_op_e), AMO_OP_WIDTH))
     `STATIC_ASSERT (TAG_WIDTH == TAG_VALUE_WIDTH + UUID_WIDTH,
         ("local_mem_top: TAG_WIDTH must be TAG_VALUE_WIDTH + UUID_WIDTH"))
     `STATIC_ASSERT (DMA_TAG_WIDTH == DMA_TAG_VALUE_WIDTH + UUID_WIDTH,

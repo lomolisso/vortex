@@ -69,6 +69,9 @@ public:
   // Why the device's geometry cannot run this case, or nullptr to run it.
   virtual const char* skip_reason() const { return nullptr; }
 
+  // Runs only when selected by name with -t.
+  virtual bool opt_in() const { return false; }
+
 protected:
   TestSuite* suite_;
   const char* const name_;
@@ -706,6 +709,55 @@ public:
   }
 };
 
+#if VX_CFG_EXT_ZACAS_ENABLED
+// 22) cas-global: per hart, amocas.w (and amocas.d at RV64) on its own line
+//   with a non-zero comparand, equal to memory (hit: the swap lands) and not
+//   (miss: memory unchanged); both return the old value. 23) cas-local: the
+//   same on a local-memory copy of the line.
+class Test_CAS_GLOBAL : public ITestCase {
+public:
+  Test_CAS_GLOBAL(TestSuite* s, const char* name) : ITestCase(s, name) {}
+  bool opt_in() const override { return true; }
+  void setup(uint32_t n, uint32_t* shared, uint32_t* per_hart) override {
+    for (uint32_t h = 0; h < n; ++h) {
+      uint32_t* line = shared + h * CASG_LINE_WORDS;
+      per_hart[h] = 0;
+      line[CASG_W_HIT]  = CASG_W_SEED(h);
+      line[CASG_W_MISS] = CASG_W_SEED(h);
+      put_d(line + CASG_D_HIT,  CASG_D_SEED(h));
+      put_d(line + CASG_D_MISS, CASG_D_SEED(h));
+    }
+  }
+  int verify(uint32_t n, uint32_t, const uint32_t* shared, const uint32_t*) override {
+    int errors = 0;
+    auto check = [&](uint32_t h, const char* what, uint64_t got, uint64_t want) {
+      if (got == want) return;
+      if (errors < 8)
+        std::cout << "  hart " << h << " " << what << ": 0x" << std::hex << got
+                  << ", expected 0x" << want << std::dec << std::endl;
+      ++errors;
+    };
+    for (uint32_t h = 0; h < n; ++h) {
+      const uint32_t* line = shared + h * CASG_LINE_WORDS;
+      check(h, "amocas.w hit memory",   line[CASG_W_HIT],      CASG_W_NEW(h));
+      check(h, "amocas.w hit old",      line[CASG_W_HIT_RET],  CASG_W_SEED(h));
+      check(h, "amocas.w miss memory",  line[CASG_W_MISS],     CASG_W_SEED(h));
+      check(h, "amocas.w miss old",     line[CASG_W_MISS_RET], CASG_W_SEED(h));
+#if VX_CFG_XLEN == 64
+      check(h, "amocas.d hit memory",   get_d(line + CASG_D_HIT),      CASG_D_NEW(h));
+      check(h, "amocas.d hit old",      get_d(line + CASG_D_HIT_RET),  CASG_D_SEED(h));
+      check(h, "amocas.d miss memory",  get_d(line + CASG_D_MISS),     CASG_D_SEED(h));
+      check(h, "amocas.d miss old",     get_d(line + CASG_D_MISS_RET), CASG_D_SEED(h));
+#endif
+    }
+    return errors;
+  }
+private:
+  static void put_d(uint32_t* p, uint64_t v) { p[0] = (uint32_t)v; p[1] = (uint32_t)(v >> 32); }
+  static uint64_t get_d(const uint32_t* p) { return ((uint64_t)p[1] << 32) | p[0]; }
+};
+#endif
+
 inline TestSuite::TestSuite(vx_device_h device) : device_(device) {
   uint64_t num_clusters, num_cores, num_warps, num_threads;
   RT_CHECK(vx_device_query(device, VX_CAPS_ISA_FLAGS, &isa_flags_));
@@ -756,6 +808,10 @@ inline TestSuite::TestSuite(vx_device_h device) : device_(device) {
   add_test(new Test_LRSC_PEER(this));
   add_test(new Test_AMO_MIXED_LMEM(this, (uint32_t)num_threads));
   add_test(new Test_LD_MIXED_LMEM(this, (uint32_t)num_threads));
+#if VX_CFG_EXT_ZACAS_ENABLED
+  add_test(new Test_CAS_GLOBAL(this, "cas-global"));
+  add_test(new Test_CAS_GLOBAL(this, "cas-local"));
+#endif
 }
 
 inline TestSuite::~TestSuite() {

@@ -136,6 +136,13 @@ ifneq (,$(filter -DVX_CFG_EXT_RTU_ENABLE, $(XCONFIGS)))
 	RTL_INCLUDE += -I$(RTL_DIR)/rtu
 endif
 
+# Float atomics: the HardFloat sources of the atomic float unit.
+include $(VORTEX_HOME)/hw/syn/hardfloat.mk
+ifneq (,$(FPAMO_ENABLED))
+	RTL_PRE_SRCS += $(HARDFLOAT_SRCS)
+	RTL_INCLUDE += $(HARDFLOAT_INCLUDE)
+endif
+
 RTL_PKGS += $(RTL_DIR)/VX_trace_pkg.sv
 
 # Command Processor: declare the package only. Interfaces live in
@@ -160,6 +167,9 @@ VL_FLAGS += -DVX_CFG_XLEN=$(XLEN) -DVX_CFG_XLEN_$(XLEN)
 VL_FLAGS += $(CONFIGS) $(filter -DVX_CFG_TCU_TYPE_% -DVX_CFG_FPU_TYPE_%,$(XCONFIGS))
 VL_FLAGS += $(RTL_INCLUDE)
 VL_FLAGS += $(RTL_PKGS)
+ifneq (,$(RTL_PRE_SRCS))
+VL_FLAGS += $(RTL_PRE_SRCS)
+endif
 
 # Extract RTL directories from include directories
 RTL_DIRS := $(patsubst -I%,%,$(filter -I%,$(RTL_INCLUDE)))

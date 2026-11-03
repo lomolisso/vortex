@@ -32,7 +32,8 @@ module VX_dlmem_ep_top import VX_gpu_pkg::*, VX_dlmem_pkg::*; #(
     localparam XW  = `VX_CFG_XLEN,
     localparam NS  = NUM_SOCKETS,
     localparam DMA_DW = LMEM_DMA_DATA_SIZE * 8,
-    localparam DMA_BW = LMEM_DMA_DATA_SIZE
+    localparam DMA_BW = LMEM_DMA_DATA_SIZE,
+    localparam AOW = $bits(amo_op_e)
 ) (
     input wire clk,
     input wire reset,
@@ -45,7 +46,7 @@ module VX_dlmem_ep_top import VX_gpu_pkg::*, VX_dlmem_pkg::*; #(
     input  wire [NP-1:0][NL-1:0][XW-1:0]    lsu_req_data,
     input  wire [NP-1:0][NL-1:0][WS-1:0]    lsu_req_byteen,
     input  wire [NP-1:0][NL-1:0]            lsu_req_amo,
-    input  wire [NP-1:0][NL-1:0][3:0]       lsu_req_amo_op,
+    input  wire [NP-1:0][NL-1:0][AOW-1:0]   lsu_req_amo_op,
     input  wire [NP-1:0][NL-1:0]            lsu_req_amo_unsigned,
     input  wire [NP-1:0][NL-1:0][XW-1:0]    lsu_req_amo_cmp,
     input  wire [NP-1:0][NL-1:0][31:0]      lsu_req_hart_id,
@@ -67,7 +68,7 @@ module VX_dlmem_ep_top import VX_gpu_pkg::*, VX_dlmem_pkg::*; #(
     output wire [NCC-1:0][WS-1:0]           lmem_req_byteen,
     output wire [NCC-1:0]                   lmem_req_local,
     output wire [NCC-1:0]                   lmem_req_amo,
-    output wire [NCC-1:0][3:0]              lmem_req_amo_op,
+    output wire [NCC-1:0][AOW-1:0]          lmem_req_amo_op,
     output wire [NCC-1:0]                   lmem_req_amo_unsigned,
     output wire [NCC-1:0][XW-1:0]           lmem_req_amo_cmp,
     output wire [NCC-1:0][31:0]             lmem_req_hart_id,
@@ -159,7 +160,6 @@ module VX_dlmem_ep_top import VX_gpu_pkg::*, VX_dlmem_pkg::*; #(
     `STATIC_ASSERT (TAGV_W <= 8, ("dlmem_ep_top: tag container too small"))
     `STATIC_ASSERT (NW_WIDTH <= 8 && CNT_W <= 8, ("dlmem_ep_top: wid/count container too small"))
     `STATIC_ASSERT (DLMEM_LMEM_AW <= 32, ("dlmem_ep_top: local address container too small"))
-    `STATIC_ASSERT ($bits(amo_op_e) == 4, ("dlmem_ep_top: amo_op_e width changed"))
     `STATIC_ASSERT (DLMEM_CORE_W <= 8, ("dlmem_ep_top: dst container too small"))
 
     // Request network

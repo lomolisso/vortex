@@ -72,6 +72,11 @@ MemOp to_memop(uint8_t kind, uint8_t amo_op) {
   case ep::OP_MBAR_COMPLETE_TX: return MemOp::MBAR_COMPLETE_TX;
   default: break;
   }
+#ifdef VX_CFG_EXT_FPAMO_ENABLE
+  if (ep::is_ptx_op(amo_op)) {
+    return MemOp(uint32_t(MemOp::AMO_INC) + (amo_op - vortex::amo_ref::OP_BASE));
+  }
+#endif
   std::abort();
 }
 
@@ -91,7 +96,11 @@ uint8_t to_amo_op(MemOp op) {
   case MemOp::MBAR_ARRIVE_TX:   return ep::OP_MBAR_ARRIVE_TX;
   case MemOp::MBAR_EXPECT_TX:   return ep::OP_MBAR_EXPECT_TX;
   case MemOp::MBAR_COMPLETE_TX: return ep::OP_MBAR_COMPLETE_TX;
+#ifdef VX_CFG_EXT_FPAMO_ENABLE
+  default:              return memop_is_ptx_amo(op) ? uint8_t(vortex::amo_ref::OP_BASE + (uint32_t(op) - uint32_t(MemOp::AMO_INC))) : 0;
+#else
   default:              return 0;
+#endif
   }
 }
 

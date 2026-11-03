@@ -183,6 +183,20 @@ module VX_decode import
     end
 `endif
 
+`ifdef VX_CFG_EXT_FPAMO_ENABLE
+    // custom-3 atomics: funct5 = op code - 16, funct3 = width (2 = W, 3 = D).
+    reg fpamo_legal;
+    always @(*) begin
+        case (funct5)
+            5'd0, 5'd1:                fpamo_legal = (funct3 == 3'd2);                     // INC, DEC
+            5'd2, 5'd4:                fpamo_legal = (funct3 == 3'd2) || (funct3 == 3'd3); // FADD, FADD2
+            5'd5, 5'd6, 5'd7, 5'd8, 5'd9: fpamo_legal = (funct3 == 3'd2);                  // FADD2_BF, FMIN2/FMAX2(_BF)
+            default:                   fpamo_legal = 1'b0;
+        endcase
+    end
+    wire [4:0] fpamo_code = 5'd16 + funct5;
+`endif
+
 `ifdef VX_CFG_EXT_C_ENABLE
     wire decode_is_rvc = fetch_if.data.is_rvc;
 `else
@@ -456,7 +470,11 @@ module VX_decode import
                     op_args.lsu.pack     = 0;
                     op_args.lsu.offset   = 0;
                     op_args.lsu.amo_valid    = 1'b1;
+                `ifdef VX_CFG_EXT_FPAMO_ENABLE
+                    op_args.lsu.amo_op       = amo_op_e'(5'(AMO_OP_MBAR_ARRIVE) + 5'(funct3));
+                `else
                     op_args.lsu.amo_op       = amo_op_e'(4'(AMO_OP_MBAR_ARRIVE) + 4'(funct3));
+                `endif
                     op_args.lsu.amo_unsigned = 1'b0;
                     op_args.lsu.amo_aq       = 1'b0;
                     // An arrive releases the warp's earlier local-memory accesses; a relaxed one orders nothing.
@@ -487,6 +505,30 @@ module VX_decode import
                     `USED_IREG (rs3);
                 end
             `endif
+            end
+        `endif
+        `ifdef VX_CFG_EXT_FPAMO_ENABLE
+            INST_EXT4: begin
+                if (fpamo_legal) begin
+                    // Laid out like an A AMO: rs1 = address, rs2 = operand, rd = old value.
+                    ex_type = EX_LSU;
+                    op_type = INST_OP_BITS'({1'b0, funct3}); // load-style width
+                    op_args.lsu.is_store     = 0;
+                    op_args.lsu.is_float     = 0;
+                    op_args.lsu.pack         = 0;
+                    op_args.lsu.offset       = 0;
+                    op_args.lsu.amo_valid    = 1'b1;
+                    op_args.lsu.amo_op       = amo_op_e'(fpamo_code);
+                    op_args.lsu.amo_unsigned = 1'b0;
+                    op_args.lsu.amo_aq       = instr[26];
+                    op_args.lsu.amo_rl       = instr[25];
+                `ifdef VX_CFG_EXT_DLMEM_ENABLE
+                    is_wstall = instr[26];
+                `endif
+                    `USED_IREG (rd);
+                    `USED_IREG (rs1);
+                    `USED_IREG (rs2);
+                end
             end
         `endif
             INST_SYS : begin

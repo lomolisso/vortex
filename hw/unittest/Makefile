@@ -580,6 +580,56 @@ ifeq ($(XLEN),64)
 	$(call cache_case,-DVX_CFG_EXT_DLMEM_ENABLE,$(CACHE_CTA) WRITEBACK=1,$(CACHE_FENCE))
 endif
 
+# Float atomics (RV64 only): the float unit against amo_ref at the configured
+# latency, then at 1 and 5 to cover its stage split; the last-level cache bank
+# (f32 FTZ) with float and inc/dec atomics in the directed rounds, the bursts and
+# the randomized traffic, also two-ported with response stalls and with a
+# deferred data stage; the local memory with inc/dec, and a float atomic sent
+# to it aborting the run at the site assert; the endpoints carrying the 5-bit
+# op (random traffic and the latency CSV against the SimX endpoints' s2214f
+# shape); the translation's mbarrier checks with the wider op; and the core and
+# the memory unit linted with them.
+FPAMO_CFG := -DVX_CFG_EXT_A_ENABLE -DVX_CFG_EXT_ZACAS_ENABLE -DVX_CFG_EXT_FPAMO_ENABLE
+CACHE_FPAMO := --tests=fpamo,stress --seed=5
+define amo_fpu_case
+	$(MAKE) -C amo_fpu clean
+	$(MAKE) -C amo_fpu CONFIGS="$(1)"
+	$(MAKE) -C amo_fpu run CONFIGS="$(1)" OPTS="$(2)"
+endef
+run-amo-fpu:
+ifeq ($(XLEN),64)
+	$(call amo_fpu_case,,--seed=1)
+	$(call amo_fpu_case,-DVX_CFG_FPAMO_LATENCY=1,--seed=2 --rounds=50000)
+	$(call amo_fpu_case,-DVX_CFG_FPAMO_LATENCY=5,--seed=3 --rounds=50000)
+	$(MAKE) -C amo_fpu clean
+else
+	@echo "run-amo-fpu: float atomics are RV64 only; nothing to run at XLEN $(XLEN)"
+endif
+run-fpamo: run-amo-fpu
+ifeq ($(XLEN),64)
+	$(call cache_case,$(FPAMO_CFG),,$(CACHE_FPAMO))
+	$(call cache_case,$(FPAMO_CFG),NUM_REQS=2 NUM_BANKS=2,$(CACHE_STALL))
+	$(call cache_case,$(FPAMO_CFG),NUM_BANKS=2 LATENCY=3)
+	$(call lmem_case,$(FPAMO_CFG))
+	! local_mem/local_mem --neg=fpsite > local_mem/neg_fpsite.log 2>&1
+	grep -q "atomic not supported at this site" local_mem/neg_fpsite.log
+	$(call lmem_case,$(DLMEM_LMEM) $(FPAMO_CFG))
+	$(call lmem_case,$(MBAR_LMEM) $(FPAMO_CFG))
+	$(MAKE) -C local_mem clean
+	$(call dlmem_ep_case,s2214f,-DVX_CFG_NUM_CORES=4 -DVX_CFG_SOCKET_SIZE=2 -DVX_CFG_NUM_LSU_LANES=4 \
+		-DVX_CFG_EXT_ZACAS_ENABLE -DVX_CFG_EXT_FPAMO_ENABLE,8)
+	$(MAKE) -C dlmem_ep clean
+	$(call dlmem_xlate_case,-DVX_CFG_NUM_CORES=2 -DVX_CFG_SOCKET_SIZE=1 -DVX_CFG_NUM_WARPS=4 \
+		-DVX_CFG_LMEM_LOG_SIZE=14 $(FPAMO_CFG) -DVX_CFG_EXT_MBAR_ENABLE,1,0,--seed=9,--mode=mbar)
+	$(MAKE) -C dlmem_xlate clean
+	$(MAKE) -C core lint CONFIGS="$(FPAMO_CFG)"
+	$(MAKE) -C core lint CONFIGS="$(FPAMO_CFG) -DVX_CFG_EXT_DLMEM_ENABLE -DVX_CFG_EXT_MBAR_ENABLE"
+	$(MAKE) -C mem_unit lint CONFIGS="$(DLMEM_LMEM) $(FPAMO_CFG)"
+	$(MAKE) -C mem_unit lint CONFIGS="$(MBAR_LMEM) $(FPAMO_CFG)"
+else
+	@echo "run-fpamo: float atomics are RV64 only; nothing to run at XLEN $(XLEN)"
+endif
+
 # TCU FEDP datapath — executed per format so a tcu/tfr change is gated by CI.
 # Each format must enable its own RTL datapath (FP16-only is the default). Covers
 # the native TFR and the DPI reference. Float formats compare against the windowed

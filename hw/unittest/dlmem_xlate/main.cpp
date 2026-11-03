@@ -439,7 +439,7 @@ private:
   void mark_mbar(Request& q, uint32_t op) {
     for (auto& at : q.attr) {
       set_bits(at, kAttrAmoValid, 1, 1);
-      set_bits(at, kAttrAmoOp, 4, op);
+      set_bits(at, kAttrAmoOp, kAmoOpBits, op);
     }
   }
 
@@ -449,7 +449,8 @@ private:
   Bits rand_attr() {
     Bits at = this->rand_bits(attr_w_);
   #ifdef VX_CFG_EXT_MBAR_ENABLE
-    if (get_bits(at, kAttrAmoOp, 4) >= kMbarArrive) {
+    const uint64_t op = get_bits(at, kAttrAmoOp, kAmoOpBits);
+    if (op >= kMbarArrive && op <= kMbarTryWait) {
       set_bits(at, kAttrAmoOp + 3, 1, 0);
     }
   #endif
@@ -1890,7 +1891,7 @@ private:
         lane0_ = true;
         this->offer_all({q}, 4);
         lane0_ = false;
-        uint32_t got_op = uint32_t(get_bits(last_attr0_, kAttrAmoOp, 4));
+        uint32_t got_op = uint32_t(get_bits(last_attr0_, kAttrAmoOp, kAmoOpBits));
         if (n_out_ != outs0 + 1 || this->busy() || n_wt_reads_ - rd0 != nl_ || n_lacc_lanes_ != lanes0
          || !last_remote0_ || !get_bits(last_attr0_, attr_remote_pos_, 1)
          || !get_bits(last_attr0_, kAttrAmoValid, 1) || got_op != op || last_addr0_ != want0) {
@@ -1950,6 +1951,9 @@ private:
   static constexpr uint32_t kMbarArrive   = 10;  // amo_op_e AMO_OP_MBAR_ARRIVE
   static constexpr uint32_t kMbarExpectTx = 12;
   static constexpr uint32_t kMbarTestWait = 14;
+  static constexpr uint32_t kMbarTryWait  = 15;
+  // amo_op_e is 5 bits with the float atomics (VX_gpu_pkg.sv).
+  static constexpr uint32_t kAmoOpBits    = (VX_CFG_EXT_FPAMO_ENABLED != 0) ? 5 : 4;
 
   Options opts_;
   std::mt19937_64 rng_;

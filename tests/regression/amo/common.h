@@ -96,6 +96,25 @@ constexpr uint32_t lrsc_bank_stations(uint32_t entries) {
 #define LRSC_PEER_B_SC_VALUE    0x7e0000b1u
 #define LRSC_PEER_B_SWAP_VALUE  0x7e0000b2u
 
+// cas-global: one 64-byte line of the shared buffer per hart. Word and
+// doubleword compare-and-swap with a non-zero comparand, once equal to the
+// memory (hit) and once not (miss); the returned old values land in the line.
+#define CASG_W_HIT       0
+#define CASG_W_MISS      1
+#define CASG_W_HIT_RET   2
+#define CASG_W_MISS_RET  3
+#define CASG_D_HIT       4   // words 4-5
+#define CASG_D_MISS      6
+#define CASG_D_HIT_RET   8
+#define CASG_D_MISS_RET  10
+#define CASG_LINE_WORDS  16
+#define CASG_TEST_GLOBAL 22  // test ids (with Zacas) in kernel_cas.vxbin
+#define CASG_TEST_LOCAL  23
+#define CASG_W_SEED(h)   (0x5a000001u + ((uint32_t)(h) << 4))
+#define CASG_W_NEW(h)    (0xc3000000u | (uint32_t)(h))
+#define CASG_D_SEED(h)   (0x1234567800000001ull + ((uint64_t)(h) << 4))
+#define CASG_D_NEW(h)    (0x8765432100000000ull | (uint64_t)(h))
+
 // Args shared between host (main.cpp) and the GPU kernel (kernel.cpp).
 // Layout matches dogfood's, with `iters` added for the contention loops.
 typedef struct {

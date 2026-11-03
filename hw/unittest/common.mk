@@ -1,5 +1,14 @@
 DESTDIR ?= .
 
+# Float atomics: the float unit's HardFloat sources, and softfloat for amo_ref.h.
+include $(VORTEX_HOME)/hw/syn/hardfloat.mk
+ifneq (,$(FPAMO_ENABLED))
+RTL_INCLUDE += $(HARDFLOAT_INCLUDE)
+VL_FLAGS += $(HARDFLOAT_SRCS)
+CXXFLAGS += -I$(SW_COMMON_DIR) -I$(THIRD_PARTY_DIR)/softfloat/source/include
+LDFLAGS += $(THIRD_PARTY_DIR)/softfloat/build/Linux-x86_64-GCC/softfloat.a
+endif
+
 CONFIGS +=
 PARAMS +=
 

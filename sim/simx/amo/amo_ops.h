@@ -119,3 +119,39 @@ inline uint64_t amo_byteen(uint32_t byte_off, uint8_t width) {
 }
 
 } // namespace vortex
+#ifdef VX_CFG_EXT_FPAMO_ENABLE
+#include <iostream>
+#include <string>
+#include "amo_ref.h"
+
+namespace vortex {
+
+// The amo_ref code of a PTX atomic MemOp.
+inline uint32_t ptx_amo_code(MemOp op) {
+  return amo_ref::OP_BASE + (uint32_t(op) - uint32_t(MemOp::AMO_INC));
+}
+
+// An atomic that has no row at its site: the LLC runs every PTX atomic decode
+// accepts, a local-memory bank only inc/dec (the kernel headers run float
+// atomics on local memory as CAS loops).
+[[noreturn]] inline void fpamo_site_abort(const std::string& site, MemOp op, uint32_t width, uint64_t addr) {
+  std::cerr << site << ": atomic not supported at this site: op=" << op << " width=" << width
+            << " addr=0x" << std::hex << addr << std::dec << std::endl;
+  std::abort();
+}
+
+// amo_compute with the PTX atomics through amo_ref, under the site's f32 flush
+// and f64 NaN rule (the LLC's, or the bank's, which are the loops').
+inline AmoComputeResult amo_compute_ptx(MemOp op, uint8_t width,
+                                        uint64_t old_word, uint64_t rhs,
+                                        bool unsigned_minmax, uint64_t cmp,
+                                        amo_ref::Site site) {
+  if (memop_is_ptx_amo(op)) {
+    const uint64_t m = amo_ref::width_mask(width);
+    return {amo_ref::apply(ptx_amo_code(op), width, old_word, rhs, site), old_word & m};
+  }
+  return amo_compute(op, width, old_word, rhs, unsigned_minmax, cmp);
+}
+
+} // namespace vortex
+#endif
