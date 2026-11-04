@@ -304,6 +304,12 @@ void DlmemXlate::translate_async(LsuReq& req, uint32_t lane,
     std::abort();
   }
   const uint64_t peer_base = x.lmem_byte - (addr & dlmem_ref::low_mask(cfg_.lmem_log));
+  // As in PTX, a lane into the issuing CTA's own block is an error; another
+  // CTA on this core, in another slot, is a legal destination.
+  if (x.kind == dlmem_ref::LOCAL && peer_base / stride_ == req.cta_id) {
+    report("st.async destination must be another block of the cluster", addr);
+    std::abort();
+  }
   req.addrs.at(lane)   = dlmem_ref::remote_addr(cfg_, x.core, x.lmem_byte);
   req.amo_cmp.at(lane) = (peer_base + moff) & ~uint64_t(LSU_WORD_SIZE - 1);
   req.dlmem_remote.set(lane);

@@ -167,34 +167,173 @@ static inline __attribute__((always_inline)) bool vx_mbar_try_wait_acquire_clust
 
 // st.async and red.async, like PTX st.async / red.async .shared::cluster
 // .mbarrier::complete_tx::bytes: `addr` and `mbar` are window addresses
-// (vx_cluster_map_shared_rank()) in one block of the caller's cluster, which
-// may be the caller's own. Once the store or the add has been performed in
-// that block, complete_tx(4 or 8 bytes) is applied to `mbar`, per lane. They
-// are asynchronous and weak: no fence, barrier or exit waits for them, and
-// the consumer learns of the data only through its mbarrier. The add returns
-// nothing.
-#define __VX_ASYNC_OP(f2, p, v, m)                                       \
-    __asm__ volatile (".insn r4 %0, 6, %1, x0, %2, %3, %4"               \
-                      :: "i"(RISCV_CUSTOM2), "i"(f2), "r"(p), "r"(v), "r"(m) \
+// (vx_cluster_map_shared_rank()) in one block of the caller's cluster other
+// than the caller's own, which stops the simulation, as it is undefined in
+// PTX; a block on the same core is fine. Once the store or the reduction has
+// been performed in that block, complete_tx of its bytes is applied to
+// `mbar`, per lane. They are asynchronous and weak: no fence, barrier or exit
+// waits for them, and the consumer learns of the data only through its
+// mbarrier. The reductions return nothing. Vector elements go in PTX order:
+// x at the lowest address.
+//
+// custom-2 R-type: funct3 is the width (2 = 4 bytes, 3 = 8, 4 = 16), funct7
+// the op << 2, rd the mbarrier, read as a source.
+#define __VX_ASYNC(f3, f5, addr, data, mbar)                             \
+    __asm__ volatile (".insn r %0, %1, %2, %3, %4, %5"                   \
+                      :: "i"(RISCV_CUSTOM2), "i"(f3), "i"((f5) << 2),    \
+                         "r"(mbar), "r"(addr), "r"(data)                 \
                       : "memory")
 
+// The 16-byte form takes its data from an even/odd register pair, the low
+// half (x, y) in the even one.
+#define __VX_ASYNC_Q(f5, addr, lo, hi, mbar) do {                        \
+    register uint64_t __vx_lo __asm__("a4") = (lo);                      \
+    register uint64_t __vx_hi __asm__("a5") = (hi);                      \
+    __asm__ volatile (".insn r %0, 4, %1, %2, %3, %4"                    \
+                      :: "i"(RISCV_CUSTOM2), "i"((f5) << 2), "r"(mbar),  \
+                         "r"(addr), "r"(__vx_lo), "r"(__vx_hi)           \
+                      : "memory");                                       \
+  } while (0)
+
+static inline __attribute__((always_inline)) uint32_t __vx_f32_bits(float v) {
+  union { float f; uint32_t u; } c;
+  c.f = v;
+  return c.u;
+}
+
+static inline __attribute__((always_inline)) uint64_t __vx_f64_bits(double v) {
+  union { double f; uint64_t u; } c;
+  c.f = v;
+  return c.u;
+}
+
+static inline __attribute__((always_inline)) uint64_t __vx_pack32(uint32_t lo, uint32_t hi) {
+  return ((uint64_t)hi << 32) | lo;
+}
+
 static inline __attribute__((always_inline)) void vx_st_async_u32(void* addr, uint32_t v, uint64_t* mbar) {
-  __VX_ASYNC_OP(0, addr, (uint64_t)v, mbar);
+  __VX_ASYNC(2, 1, addr, (uint64_t)v, mbar);
+}
+
+static inline __attribute__((always_inline)) void vx_st_async_s32(void* addr, int32_t v, uint64_t* mbar) {
+  __VX_ASYNC(2, 1, addr, (uint64_t)(int64_t)v, mbar);
+}
+
+static inline __attribute__((always_inline)) void vx_st_async_f32(void* addr, float v, uint64_t* mbar) {
+  __VX_ASYNC(2, 1, addr, (uint64_t)__vx_f32_bits(v), mbar);
 }
 
 static inline __attribute__((always_inline)) void vx_st_async_u64(void* addr, uint64_t v, uint64_t* mbar) {
-  __VX_ASYNC_OP(1, addr, v, mbar);
+  __VX_ASYNC(3, 1, addr, v, mbar);
+}
+
+static inline __attribute__((always_inline)) void vx_st_async_s64(void* addr, int64_t v, uint64_t* mbar) {
+  __VX_ASYNC(3, 1, addr, (uint64_t)v, mbar);
+}
+
+static inline __attribute__((always_inline)) void vx_st_async_f64(void* addr, double v, uint64_t* mbar) {
+  __VX_ASYNC(3, 1, addr, __vx_f64_bits(v), mbar);
+}
+
+// .v2.b32: `addr` 8-byte aligned, 8 bytes completed.
+static inline __attribute__((always_inline)) void vx_st_async_v2_u32(void* addr, uint32_t x, uint32_t y, uint64_t* mbar) {
+  __VX_ASYNC(3, 1, addr, __vx_pack32(x, y), mbar);
+}
+
+static inline __attribute__((always_inline)) void vx_st_async_v2_s32(void* addr, int32_t x, int32_t y, uint64_t* mbar) {
+  vx_st_async_v2_u32(addr, (uint32_t)x, (uint32_t)y, mbar);
+}
+
+static inline __attribute__((always_inline)) void vx_st_async_v2_f32(void* addr, float x, float y, uint64_t* mbar) {
+  vx_st_async_v2_u32(addr, __vx_f32_bits(x), __vx_f32_bits(y), mbar);
+}
+
+// .v4.b32 and .v2.b64: `addr` 16-byte aligned, 16 bytes completed, as two
+// 8-byte halves.
+static inline __attribute__((always_inline)) void vx_st_async_v4_u32(void* addr, uint32_t x, uint32_t y, uint32_t z,
+                                                                     uint32_t w, uint64_t* mbar) {
+  __VX_ASYNC_Q(1, addr, __vx_pack32(x, y), __vx_pack32(z, w), mbar);
+}
+
+static inline __attribute__((always_inline)) void vx_st_async_v4_s32(void* addr, int32_t x, int32_t y, int32_t z,
+                                                                     int32_t w, uint64_t* mbar) {
+  vx_st_async_v4_u32(addr, (uint32_t)x, (uint32_t)y, (uint32_t)z, (uint32_t)w, mbar);
+}
+
+static inline __attribute__((always_inline)) void vx_st_async_v4_f32(void* addr, float x, float y, float z, float w,
+                                                                     uint64_t* mbar) {
+  vx_st_async_v4_u32(addr, __vx_f32_bits(x), __vx_f32_bits(y), __vx_f32_bits(z), __vx_f32_bits(w), mbar);
+}
+
+static inline __attribute__((always_inline)) void vx_st_async_v2_u64(void* addr, uint64_t x, uint64_t y, uint64_t* mbar) {
+  __VX_ASYNC_Q(1, addr, x, y, mbar);
+}
+
+static inline __attribute__((always_inline)) void vx_st_async_v2_s64(void* addr, int64_t x, int64_t y, uint64_t* mbar) {
+  vx_st_async_v2_u64(addr, (uint64_t)x, (uint64_t)y, mbar);
+}
+
+static inline __attribute__((always_inline)) void vx_st_async_v2_f64(void* addr, double x, double y, uint64_t* mbar) {
+  vx_st_async_v2_u64(addr, __vx_f64_bits(x), __vx_f64_bits(y), mbar);
 }
 
 static inline __attribute__((always_inline)) void vx_red_async_add_u32(void* addr, uint32_t v, uint64_t* mbar) {
-  __VX_ASYNC_OP(2, addr, (uint64_t)v, mbar);
+  __VX_ASYNC(2, 2, addr, (uint64_t)v, mbar);
+}
+
+static inline __attribute__((always_inline)) void vx_red_async_add_s32(void* addr, int32_t v, uint64_t* mbar) {
+  __VX_ASYNC(2, 2, addr, (uint64_t)(int64_t)v, mbar);
 }
 
 static inline __attribute__((always_inline)) void vx_red_async_add_u64(void* addr, uint64_t v, uint64_t* mbar) {
-  __VX_ASYNC_OP(3, addr, v, mbar);
+  __VX_ASYNC(3, 2, addr, v, mbar);
 }
 
-#undef __VX_ASYNC_OP
+static inline __attribute__((always_inline)) void vx_red_async_add_s64(void* addr, int64_t v, uint64_t* mbar) {
+  __VX_ASYNC(3, 2, addr, (uint64_t)v, mbar);
+}
+
+static inline __attribute__((always_inline)) void vx_red_async_min_s32(void* addr, int32_t v, uint64_t* mbar) {
+  __VX_ASYNC(2, 3, addr, (uint64_t)(int64_t)v, mbar);
+}
+
+static inline __attribute__((always_inline)) void vx_red_async_max_s32(void* addr, int32_t v, uint64_t* mbar) {
+  __VX_ASYNC(2, 4, addr, (uint64_t)(int64_t)v, mbar);
+}
+
+static inline __attribute__((always_inline)) void vx_red_async_min_u32(void* addr, uint32_t v, uint64_t* mbar) {
+  __VX_ASYNC(2, 5, addr, (uint64_t)v, mbar);
+}
+
+static inline __attribute__((always_inline)) void vx_red_async_max_u32(void* addr, uint32_t v, uint64_t* mbar) {
+  __VX_ASYNC(2, 6, addr, (uint64_t)v, mbar);
+}
+
+static inline __attribute__((always_inline)) void vx_red_async_and_b32(void* addr, uint32_t v, uint64_t* mbar) {
+  __VX_ASYNC(2, 7, addr, (uint64_t)v, mbar);
+}
+
+static inline __attribute__((always_inline)) void vx_red_async_or_b32(void* addr, uint32_t v, uint64_t* mbar) {
+  __VX_ASYNC(2, 8, addr, (uint64_t)v, mbar);
+}
+
+static inline __attribute__((always_inline)) void vx_red_async_xor_b32(void* addr, uint32_t v, uint64_t* mbar) {
+  __VX_ASYNC(2, 9, addr, (uint64_t)v, mbar);
+}
+
+#if VX_CFG_EXT_FPAMO_ENABLED
+// PTX inc/dec: old >= v ? 0 : old + 1, and (old == 0 || old > v) ? v : old - 1.
+static inline __attribute__((always_inline)) void vx_red_async_inc_u32(void* addr, uint32_t v, uint64_t* mbar) {
+  __VX_ASYNC(2, 10, addr, (uint64_t)v, mbar);
+}
+
+static inline __attribute__((always_inline)) void vx_red_async_dec_u32(void* addr, uint32_t v, uint64_t* mbar) {
+  __VX_ASYNC(2, 11, addr, (uint64_t)v, mbar);
+}
+#endif
+
+#undef __VX_ASYNC_Q
+#undef __VX_ASYNC
 
 #ifdef __cplusplus
 }

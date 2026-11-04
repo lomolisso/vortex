@@ -19,6 +19,8 @@
 // barrier and the arrive of an arrive/wait barrier.
 // The CFENCE uop reads no register and writes none; with TCU metadata it waits
 // for the metadata scoreboard bits, so earlier TCU_LD loads are ordered too.
+// The same pair splits a 16-byte st.async into its two 8-byte halves, low then
+// high, each completing its own 8 bytes on the mbarrier.
 
 module VX_uop_release import VX_gpu_pkg::*; (
     input  ibuffer_t ibuf_in,
@@ -37,7 +39,15 @@ module VX_uop_release import VX_gpu_pkg::*; (
                && (ibuf_in.op_type == INST_OP_BITS'(INST_SFU_BAR))
                && (ibuf_in.op_args.wctl.is_sync_bar || ibuf_in.op_args.wctl.is_bar_arrive);
 
+`ifdef VX_CFG_EXT_MBAR_ENABLE
+    // A plain store with the reserved funct3=4 also decodes to op_type 4'b1100.
+    wire is_sq = (ibuf_in.ex_type == EX_LSU)
+              && ibuf_in.op_args.lsu.is_async
+              && (ibuf_in.op_type == INST_OP_BITS'(INST_LSU_SQ));
+    assign is_release = is_rl_amo || is_bar || is_sq;
+`else
     assign is_release = is_rl_amo || is_bar;
+`endif
 
     ibuffer_t cfence;
     always_comb begin
@@ -57,13 +67,33 @@ module VX_uop_release import VX_gpu_pkg::*; (
         cfence.rd       = '0;
         cfence.bytesel  = BYTESEL_DEFAULT;
     end
+`ifndef VX_CFG_EXT_MBAR_ENABLE
     assign ibuf_cfence = cfence;
+`endif
 
     ibuffer_t op;
     always_comb begin
         op = ibuf_in;
         op.uuid = get_uop_uuid(ibuf_in.uuid, UOP_CTR_W'(1));
     end
+
+`ifdef VX_CFG_EXT_MBAR_ENABLE
+    // The high half's data is the odd register of the pair; x0 stands for a zero pair.
+    ibuffer_t sq_lo, sq_hi;
+    always_comb begin
+        sq_lo = ibuf_in;
+        sq_lo.uuid    = get_uop_uuid(ibuf_in.uuid, UOP_CTR_W'(0));
+        sq_lo.op_type = INST_OP_BITS'(INST_LSU_SD);
+        sq_hi = ibuf_in;
+        sq_hi.uuid    = get_uop_uuid(ibuf_in.uuid, UOP_CTR_W'(1));
+        sq_hi.op_type = INST_OP_BITS'(INST_LSU_SD);
+        sq_hi.op_args.lsu.offset = 12'd8;
+        sq_hi.rs2     = ibuf_in.rs2 | NUM_REGS_BITS'(ibuf_in.rs2 != '0);
+    end
+    assign ibuf_cfence = is_sq ? sq_lo : cfence;
+    assign ibuf_op     = is_sq ? sq_hi : op;
+`else
     assign ibuf_op = op;
+`endif
 
 endmodule

@@ -314,12 +314,20 @@ static op_string_t op_string(const Instr &instr) {
       case LsuType::CFENCE: return {"CFENCE", ""};
 #endif
 #ifdef VX_CFG_EXT_MBAR_ENABLE
-      case LsuType::ST_ASYNC:  return {(std::get<IntrLsuArgs>(instrArgs).width == 3) ? "ST.ASYNC.B64" : "ST.ASYNC.B32", ""};
-      case LsuType::RED_ASYNC: return {(std::get<IntrLsuArgs>(instrArgs).width == 3) ? "RED.ASYNC.ADD.U64" : "RED.ASYNC.ADD.U32", ""};
+      case LsuType::ST_ASYNC: {
+        static const char* const st_names[] = {"ST.ASYNC.W", "ST.ASYNC.D", "ST.ASYNC.Q"};
+        auto a = std::get<IntrLsuArgs>(instrArgs);
+        return {st_names[a.width - 2], a.offset ? to_hex_str(a.offset) : ""};
+      }
+      case LsuType::RED_ASYNC: {
+        static const char* const red_names[] = {"ADD", "MIN", "MAX", "MINU", "MAXU", "AND", "OR", "XOR", "INC", "DEC"};
+        auto a = std::get<IntrLsuArgs>(instrArgs);
+        return {std::string("RED.ASYNC.") + red_names[a.red_op - 2] + ((a.width == 3) ? ".D" : ".W"), ""};
+      }
 #ifdef VX_CFG_EXT_DXA_ENABLE
       case LsuType::PFENCE: return {"FENCE.PROXY.ASYNC", ""};
 #else
-#line 313
+#line 321
 #endif
 #endif
 #if defined(VX_CFG_EXT_MBAR_ENABLE)
@@ -351,9 +359,9 @@ static op_string_t op_string(const Instr &instr) {
         }
       }
 #elif defined(DXA_MBAR_ENABLE)
-#line 327
+#line 363
 #elif defined(VX_CFG_EXT_MBAR_ENABLE)
-#line 324
+#line 355
 #else
 #line 316
 #endif
@@ -460,7 +468,7 @@ static op_string_t op_string(const Instr &instr) {
 #endif
 #if defined(DXA_MBAR_ENABLE)
 #elif defined(VX_CFG_EXT_MBAR_ENABLE)
-#line 419
+#line 450
 #else
 #line 411
 #endif
@@ -994,7 +1002,7 @@ Instr::Ptr Decoder::decode(uint32_t code, uint64_t uuid) {
 #endif
 #if defined(DXA_MBAR_ENABLE)
 #elif defined(VX_CFG_EXT_MBAR_ENABLE)
-#line 936
+#line 967
 #elif defined(VX_CFG_EXT_DLMEM_ENABLE)
 #line 928
 #else
@@ -1245,15 +1253,36 @@ Instr::Ptr Decoder::decode(uint32_t code, uint64_t uuid) {
       break;
     }
   #ifdef VX_CFG_EXT_MBAR_ENABLE
-    // funct3 = 6 is R4-type: st.async (funct2 0, 1: b32, b64) and red.async.add
-    // (2, 3: u32, u64), rs1 the window address, rs2 the data, rs3 the mbarrier.
-    if (funct3 == 6) {
+    // funct7 >= 4 is st.async / red.async, R-type: funct3 the width (2 W, 3 D,
+    // 4 Q), funct5 the op, rs1 the window address, rs2 the data and rd the
+    // mbarrier, which is read and never written. Q stores {x[rs2|1], x[rs2]}.
+    if (funct7 >= 4) {
+      const bool w = (funct3 == 2), d = (funct3 == 3), q = (funct3 == 4);
+      bool legal = (funct7 & 3) == 0;
+      switch (funct5) {
+      case 1: legal &= w || d || q; break;
+      case 2: legal &= w || d; break;
+      case 3: case 4: case 5: case 6: case 7: case 8: case 9: legal &= w; break;
+    #ifdef VX_CFG_EXT_FPAMO_ENABLE
+      case 10: case 11: legal &= w; break;
+    #endif
+      default: legal = false; break;
+      }
+      const char* msg = !legal ? "invalid st.async/red.async encoding"
+                      : (q && (rs2 & 1)) ? "st.async 16-byte data needs an even register pair" : nullptr;
+      if (msg) {
+        std::cerr << SimPlatform::instance().cycles() << ": " << this->name() << " " << msg
+                  << ": code=0x" << std::hex << code << std::dec << " (#" << uuid << ")" << std::endl;
+        std::abort();
+      }
       instr->set_fu_type(FUType::LSU);
-      instr->set_op_type((funct2 < 2) ? LsuType::ST_ASYNC : LsuType::RED_ASYNC);
-      instr->set_args(IntrLsuArgs{(funct2 & 1) ? 3u : 2u, 0, 0});
+      instr->set_op_type((funct5 == 1) ? LsuType::ST_ASYNC : LsuType::RED_ASYNC);
+      IntrLsuArgs args{funct3, 0, 0};
+      args.red_op = funct5;
+      instr->set_args(args);
       instr->set_src_reg(0, rs1, RegType::Integer);
       instr->set_src_reg(1, rs2, RegType::Integer);
-      instr->set_src_reg(2, rs3, RegType::Integer);
+      instr->set_src_reg(2, rd, RegType::Integer);
       break;
     }
   #ifdef VX_CFG_EXT_DXA_ENABLE
@@ -1267,7 +1296,7 @@ Instr::Ptr Decoder::decode(uint32_t code, uint64_t uuid) {
       break;
     }
   #else
-  #line 1189
+  #line 1248
   #endif
     // funct7 = 1 is the relaxed form of arrive and arrive_tx.
     if (funct7 > 1 || (funct7 == 1 && funct3 > 1))
@@ -1309,6 +1338,12 @@ Instr::Ptr Decoder::decode(uint32_t code, uint64_t uuid) {
   #endif
   } break;
 #endif
+#if defined(VX_CFG_EXT_MBAR_ENABLE)
+#elif defined(VX_CFG_EXT_DLMEM_ENABLE)
+#line 1198
+#else
+#line 1219
+#endif
 #ifdef VX_CFG_EXT_FPAMO_ENABLE
   case Opcode::EXT4: {
     // PTX atomics, R-type laid out like RISC-V A: funct5 = amo_ref code - OP_BASE,
@@ -1336,12 +1371,7 @@ Instr::Ptr Decoder::decode(uint32_t code, uint64_t uuid) {
 #endif
 #if defined(DXA_MBAR_ENABLE) && !defined(VX_CFG_EXT_DLMEM_ENABLE)
 #line 1230
-#elif defined(DXA_MBAR_ENABLE)
-#ifndef VX_CFG_EXT_FPAMO_ENABLE
-#line 1286
-#endif
 #elif defined(VX_CFG_EXT_MBAR_ENABLE)
-#line 1225
 #elif defined(VX_CFG_EXT_DLMEM_ENABLE)
 #line 1198
 #else

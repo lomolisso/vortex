@@ -41,6 +41,49 @@ package VX_trace_pkg;
         endcase
     endtask
 
+`ifdef VX_CFG_EXT_MBAR_ENABLE
+    task trace_async_op(input int level,
+                        input [INST_OP_BITS-1:0] op_type,
+                        input op_args_t op_args
+    );
+        if (op_args.lsu.amo_valid) begin
+            case (op_args.lsu.amo_op)
+                AMO_OP_ADD: `TRACE(level, ("RED.ASYNC.ADD"))
+                AMO_OP_MIN: begin
+                    if (op_args.lsu.amo_unsigned) begin
+                        `TRACE(level, ("RED.ASYNC.MINU"))
+                    end else begin
+                        `TRACE(level, ("RED.ASYNC.MIN"))
+                    end
+                end
+                AMO_OP_MAX: begin
+                    if (op_args.lsu.amo_unsigned) begin
+                        `TRACE(level, ("RED.ASYNC.MAXU"))
+                    end else begin
+                        `TRACE(level, ("RED.ASYNC.MAX"))
+                    end
+                end
+                AMO_OP_AND: `TRACE(level, ("RED.ASYNC.AND"))
+                AMO_OP_OR:  `TRACE(level, ("RED.ASYNC.OR"))
+                AMO_OP_XOR: `TRACE(level, ("RED.ASYNC.XOR"))
+            `ifdef VX_CFG_EXT_FPAMO_ENABLE
+                AMO_OP_INC: `TRACE(level, ("RED.ASYNC.INC"))
+                AMO_OP_DEC: `TRACE(level, ("RED.ASYNC.DEC"))
+            `endif
+                default:    `TRACE(level, ("RED.ASYNC.?"))
+            endcase
+        end else begin
+            `TRACE(level, ("ST.ASYNC"))
+        end
+        case (INST_LSU_BITS'(op_type))
+            INST_LSU_SW: `TRACE(level, (".W"))
+            INST_LSU_SD: `TRACE(level, (".D"))
+            INST_LSU_SQ: `TRACE(level, (".Q"))
+            default:     `TRACE(level, (".?"))
+        endcase
+    endtask
+`endif
+
     task trace_ex_op(input int level,
                      input [EX_BITS-1:0] ex_type,
                      input [INST_OP_BITS-1:0] op_type,
@@ -171,6 +214,11 @@ package VX_trace_pkg;
             endcase
         end
         EX_LSU: begin
+        `ifdef VX_CFG_EXT_MBAR_ENABLE
+            if (op_args.lsu.is_async) begin
+                trace_async_op(level, op_type, op_args);
+            end else
+        `endif
             if (op_args.lsu.pack != 0) begin
                 case (op_args.lsu.pack)
                     2'd1: begin

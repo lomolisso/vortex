@@ -197,6 +197,44 @@ module VX_decode import
     wire [4:0] fpamo_code = 5'd16 + funct5;
 `endif
 
+`ifdef VX_CFG_EXT_MBAR_ENABLE
+    // st.async / red.async: custom-2 with funct7 >= 4; funct5 = op, funct3 = width
+    // (2 = W, 3 = D, 4 = Q), funct2 = 0. A store has funct5 1; the rest are reductions.
+    wire     is_async_enc = (funct7 >= 7'd4);
+    reg      async_legal;
+    reg      async_red;
+    amo_op_e async_amo_op;
+    reg      async_unsigned;
+    always @(*) begin
+        async_legal    = (funct3 == 3'd2);
+        async_red      = 1'b1;
+        async_amo_op   = AMO_OP_ADD;
+        async_unsigned = 1'b0;
+        case (funct5)
+            5'd1: begin
+                async_legal = (funct3 >= 3'd2) && (funct3 <= 3'd4);
+                async_red   = 1'b0;
+            end
+            5'd2: async_legal = (funct3 == 3'd2) || (funct3 == 3'd3);
+            5'd3: async_amo_op = AMO_OP_MIN;
+            5'd4: async_amo_op = AMO_OP_MAX;
+            5'd5: begin async_amo_op = AMO_OP_MIN; async_unsigned = 1'b1; end
+            5'd6: begin async_amo_op = AMO_OP_MAX; async_unsigned = 1'b1; end
+            5'd7: async_amo_op = AMO_OP_AND;
+            5'd8: async_amo_op = AMO_OP_OR;
+            5'd9: async_amo_op = AMO_OP_XOR;
+        `ifdef VX_CFG_EXT_FPAMO_ENABLE
+            5'd10: async_amo_op = AMO_OP_INC;
+            5'd11: async_amo_op = AMO_OP_DEC;
+        `endif
+            default: async_legal = 1'b0;
+        endcase
+        if (funct2 != 2'b00) begin
+            async_legal = 1'b0;
+        end
+    end
+`endif
+
 `ifdef VX_CFG_EXT_C_ENABLE
     wire decode_is_rvc = fetch_if.data.is_rvc;
 `else
@@ -485,24 +523,26 @@ module VX_decode import
                     `USED_IREG (rs1);
                     `USED_IREG (rs2);
                 end
-                // st.async / red.async.add: R4, rs1 = window address, rs2 = data,
-                // rs3 = window mbarrier, funct2 = {add, 64-bit}; posted, no rd.
-                if (funct3 == 3'd6) begin
+                // st.async / red.async: rs1 = window address, rs2 = data, rd = window
+                // mbarrier; posted, so rd is only read, through the third operand slot.
+                if (is_async_enc && async_legal) begin
                     ex_type = EX_LSU;
-                    op_type = INST_OP_BITS'({1'b1, (funct2[0] ? LSU_FMT_D : LSU_FMT_W)});
+                    op_type = (funct3 == 3'd4) ? INST_OP_BITS'(INST_LSU_SQ)
+                                               : INST_OP_BITS'({1'b1, funct3});
                     op_args.lsu.is_store     = 1;
                     op_args.lsu.is_float     = 0;
                     op_args.lsu.pack         = 0;
                     op_args.lsu.offset       = 0;
-                    op_args.lsu.amo_valid    = funct2[1];
-                    op_args.lsu.amo_op       = AMO_OP_ADD;
-                    op_args.lsu.amo_unsigned = 1'b0;
+                    op_args.lsu.amo_valid    = async_red;
+                    op_args.lsu.amo_op       = async_amo_op;
+                    op_args.lsu.amo_unsigned = async_unsigned;
                     op_args.lsu.amo_aq       = 1'b0;
                     op_args.lsu.amo_rl       = 1'b0;
                     op_args.lsu.is_async     = 1'b1;
                     `USED_IREG (rs1);
                     `USED_IREG (rs2);
-                    `USED_IREG (rs3);
+                    reg_ids[RV_RS3]  = make_reg_num(REG_TYPE_I, RV_REGS_BITS'(rd));
+                    use_regs[RV_RS3] = 1'b1;
                 end
             `endif
             end
@@ -1063,6 +1103,17 @@ module VX_decode import
     ///////////////////////////////////////////////////////////////////////////
 
     wire fetch_fire = fetch_if.valid && fetch_if.ready;
+
+`ifdef VX_CFG_EXT_MBAR_ENABLE
+    // The core has no illegal-instruction trap: an undecoded encoding would issue with 'x fields.
+    wire async_fire = fetch_fire && (opcode == INST_EXT3) && is_async_enc;
+    `RUNTIME_ASSERT (~(async_fire && ~async_legal),
+        ("%t: %s invalid st.async/red.async encoding: wid=%0d PC=0x%0h instr=0x%h (#%0d)",
+            $time, INSTANCE_ID, fetch_if.data.wid, to_fullPC(fetch_if.data.PC), instr, fetch_if.data.uuid))
+    `RUNTIME_ASSERT (~(async_fire && async_legal && (funct3 == 3'd4) && rs2[0]),
+        ("%t: %s st.async 16-byte data needs an even register pair: wid=%0d PC=0x%0h rs2=x%0d (#%0d)",
+            $time, INSTANCE_ID, fetch_if.data.wid, to_fullPC(fetch_if.data.PC), rs2, fetch_if.data.uuid))
+`endif
 
     // Register decode_sched_if to break the long combinational path.
     reg                  decode_sched_valid_r;

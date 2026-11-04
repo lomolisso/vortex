@@ -690,8 +690,9 @@ public:
     SimPlatform::instance().finalize();
   }
 
-  uint32_t amo_add() const override {
-    return ep::OP_ADD;
+  // The local-memory op code the bench sees (to_amo_op()) of a red.async op.
+  uint32_t amo_code(uint8_t op) const override {
+    return to_amo_op(red_memop(op));
   }
 
   uint32_t amo_complete_tx() const override {
@@ -763,10 +764,30 @@ public:
   }
 
 private:
+  // The LSU request op of a red.async op (funct5).
+  static MemOp red_memop(uint8_t op) {
+    switch (op) {
+    case async::F5_ADD:   return MemOp::AMO_ADD;
+    case async::F5_MIN_S:
+    case async::F5_MIN_U: return MemOp::AMO_MIN;
+    case async::F5_MAX_S:
+    case async::F5_MAX_U: return MemOp::AMO_MAX;
+    case async::F5_AND:   return MemOp::AMO_AND;
+    case async::F5_OR:    return MemOp::AMO_OR;
+    case async::F5_XOR:   return MemOp::AMO_XOR;
+#ifdef VX_CFG_EXT_FPAMO_ENABLE
+    case async::F5_INC:   return MemOp::AMO_INC;
+    case async::F5_DEC:   return MemOp::AMO_DEC;
+#endif
+    default:              std::abort();
+    }
+  }
+
   LsuReq make_req(uint32_t c, const async::Req& v) {
     LsuReq r(ep::NL);
     const async::Lane* first = v.lanes.at(__builtin_ctz(v.mask));
-    r.op = first->red ? MemOp::AMO_ADD : MemOp::ST;
+    r.op = first->red ? red_memop(first->op) : MemOp::ST;
+    r.flags.amo_unsigned = first->uns;
     r.flags.async = 1;
     for (uint32_t l = 0; l < ep::NL; ++l) {
       const async::Lane* lv = v.lanes[l];

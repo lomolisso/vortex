@@ -15,12 +15,13 @@
 // st.async / red.async bench of the DLMEM endpoints: async lanes offered at
 // each core's first LSU port, every one through the network, its own core's
 // included, and checked where the destination's ingress performs them. Each
-// request, like an instruction, is all stores or all adds. It has no
+// request, like an instruction, has one op. It has no
 // simulator dependency, so the RTL testbench and the SimX test run the same
 // schedule and write the same latency rows.
 //
 // Checks, per lane: the destination's local-memory port takes the access (a
-// store, or an add for red.async) once, then, in a later cycle than the
+// store, or for red.async the lane's atomic op and signedness) once, then, in
+// a later cycle than the
 // access's response, one complete_tx of the lane's bytes on its mbarrier word
 // (hart 0, all byte lanes); its source then ejects one ack from the response
 // network. No ack reaches the store tracker, every lane's credit returns, and
@@ -75,13 +76,31 @@ constexpr uint32_t log2_up(uint32_t n) {
 constexpr uint32_t NW_BITS = log2_up(NW);
 constexpr uint32_t NT_BITS = log2_up(VX_CFG_NUM_THREADS);
 
+// The st.async/red.async op field (funct5 of the instruction).
+enum : uint8_t {
+  F5_ST = 1, F5_ADD = 2, F5_MIN_S = 3, F5_MAX_S = 4, F5_MIN_U = 5, F5_MAX_U = 6,
+  F5_AND = 7, F5_OR = 8, F5_XOR = 9, F5_INC = 10, F5_DEC = 11
+};
+
+// The reductions a build has; only add has a 64-bit form.
+inline std::vector<uint8_t> red_ops() {
+  std::vector<uint8_t> v = {F5_ADD, F5_MIN_S, F5_MAX_S, F5_MIN_U, F5_MAX_U, F5_AND, F5_OR, F5_XOR};
+#if VX_CFG_EXT_FPAMO_ENABLED
+  v.push_back(F5_INC);
+  v.push_back(F5_DEC);
+#endif
+  return v;
+}
+
 struct Lane {
   uint32_t src = 0;
   uint32_t req = 0;       // the request it belongs to
   uint32_t lane = 0;      // its LSU lane
   uint32_t seq = 0;       // per source, in issue order
   uint32_t dst = 0;
-  bool     red = false;   // red.async.add, else st.async
+  uint8_t  op = F5_ST;    // funct5
+  bool     red = false;   // red.async, else st.async
+  bool     uns = false;   // the unsigned min/max
   bool     wide = false;  // .b64/.u64, else .b32/.u32
   uint32_t waddr = 0;     // destination word
   uint32_t mbar = 0;      // destination mbarrier word
@@ -139,8 +158,9 @@ class Dut {
 public:
   virtual ~Dut() = default;
   virtual void cycle(const In& in, Out& out) = 0;
-  // The local memory's atomic op codes of an add and of an mbarrier complete_tx.
-  virtual uint32_t amo_add() const = 0;
+  // The local memory's atomic op code of a red.async op (funct5) and of an
+  // mbarrier complete_tx.
+  virtual uint32_t amo_code(uint8_t op) const = 0;
   virtual uint32_t amo_complete_tx() const = 0;
 };
 
@@ -252,9 +272,9 @@ private:
     return below(100) < pct;
   }
 
-  // A request from core s of warp wid: its lanes' (dst, word, mbarrier, kind).
+  // A request from core s of warp wid: its lanes' (dst, word, mbarrier, op, wide).
   void add_req(uint32_t s, uint32_t wid, uint64_t release,
-               const std::vector<std::tuple<uint32_t, uint32_t, uint32_t, bool, bool>>& lanes) {
+               const std::vector<std::tuple<uint32_t, uint32_t, uint32_t, uint8_t, bool>>& lanes) {
     reqs_.emplace_back();
     Req& r = reqs_.back();
     r.src = s;
@@ -263,7 +283,9 @@ private:
     for (uint32_t l = 0; l < lanes.size() && l < NL; ++l) {
       lanes_.emplace_back();
       Lane& x = lanes_.back();
-      std::tie(x.dst, x.waddr, x.mbar, x.red, x.wide) = lanes[l];
+      std::tie(x.dst, x.waddr, x.mbar, x.op, x.wide) = lanes[l];
+      x.red = (x.op != F5_ST);
+      x.uns = (x.op == F5_MIN_U || x.op == F5_MAX_U);
       x.src = s;
       x.req = uint32_t(reqs_.size() - 1);
       x.lane = l;
@@ -285,12 +307,16 @@ private:
     const std::string& m = opts_.mode;
     if (m == "async") {
       // Phase A: one lane at a time, every source into every core, its own
-      // included, both kinds and widths, far enough apart that none meet.
+      // included, both kinds and widths, the 32-bit reductions taking every
+      // op in turn, far enough apart that none meet.
+      const std::vector<uint8_t> rops = red_ops();
       uint64_t t = 8;
-      uint32_t k = 0;
+      uint32_t k = 0, nr = 0;
       for (uint32_t s = 0; s < NCC; ++s) {
         for (uint32_t d = 0; d < NCC; ++d, ++k) {
-          add_req(s, k % NW, t, {{d, 16 * k, 1000 + 2 * k, (k & 1) != 0, (k & 2) != 0}});
+          bool wide = (k & 2) != 0;
+          uint8_t op = !(k & 1) ? uint8_t(F5_ST) : wide ? uint8_t(F5_ADD) : rops[nr++ % rops.size()];
+          add_req(s, k % NW, t, {{d, 16 * k, 1000 + 2 * k, op, wide}});
           t += 40;
         }
       }
@@ -301,23 +327,25 @@ private:
       for (uint32_t s = 0; s < NCC; ++s) {
         for (uint32_t i = 0; i < 2; ++i) {
           bool red = ((s & 1) != 0) != (i != 0);
-          std::vector<std::tuple<uint32_t, uint32_t, uint32_t, bool, bool>> v;
+          std::vector<std::tuple<uint32_t, uint32_t, uint32_t, uint8_t, bool>> v;
           for (uint32_t l = 0; l < NL; ++l) {
             uint32_t d = (l & 1) ? (NCC - 1) : 0;
-            v.push_back({d, 512 + 16 * s + l, 2000 + s, red, (l & 2) != 0});
+            v.push_back({d, 512 + 16 * s + l, 2000 + s, red ? F5_ADD : F5_ST, (l & 2) != 0});
           }
           add_req(s, (s + i) % NW, t, v);
         }
       }
     } else if (m == "async-random") {
+      const std::vector<uint8_t> rops = red_ops();
       uint32_t n = opts_.reqs ? opts_.reqs : 150;
       for (uint32_t i = 0; i < n; ++i) {
         uint32_t s = below(NCC);
         uint32_t lanes = 1 + below(NL);
-        bool red = chance(40);
-        std::vector<std::tuple<uint32_t, uint32_t, uint32_t, bool, bool>> v;
+        uint8_t op = chance(40) ? rops[below(uint32_t(rops.size()))] : uint8_t(F5_ST);
+        bool can_wide = (op == F5_ST || op == F5_ADD);
+        std::vector<std::tuple<uint32_t, uint32_t, uint32_t, uint8_t, bool>> v;
         for (uint32_t l = 0; l < lanes; ++l) {
-          v.push_back({below(NCC), below(1u << LMEM_AW), below(1u << LMEM_AW), red, chance(50)});
+          v.push_back({below(NCC), below(1u << LMEM_AW), below(1u << LMEM_AW), op, can_wide && chance(50)});
         }
         add_req(s, below(NW), 8 + below(4 * n), v);
       }
@@ -456,10 +484,12 @@ private:
       fail(strf("core %u: local-memory access at word 0x%x is no issued lane's", c, q.waddr));
       return;
     }
-    bool ok = hit->red ? (!q.rw && q.amo && q.amo_op == dut_.amo_add() && !q.uns) : (q.rw && !q.amo);
+    bool ok = hit->red ? (!q.rw && q.amo && q.amo_op == dut_.amo_code(hit->op) && q.uns == hit->uns)
+                       : (q.rw && !q.amo);
     if (!ok || q.hart != hit->hart) {
-      fail(strf("core %u: access at word 0x%x: rw %d amo %d op %u uns %d hart 0x%x, expected %s of hart 0x%x", c,
-                q.waddr, q.rw, q.amo, q.amo_op, q.uns, q.hart, hit->red ? "an add" : "a store", hit->hart));
+      fail(strf("core %u: access at word 0x%x: rw %d amo %d op %u uns %d hart 0x%x, expected %s (op %u uns %d) of"
+                " hart 0x%x", c, q.waddr, q.rw, q.amo, q.amo_op, q.uns, q.hart, hit->red ? "a reduction" : "a store",
+                hit->red ? dut_.amo_code(hit->op) : 0u, hit->uns, hit->hart));
     }
     hit->acc = cycle_;
     pending_[c].push_back(hit);

@@ -560,6 +560,10 @@ package VX_gpu_pkg;
     // Proxy fence: held like a DLMEM fence, then answered by the translation stage; it reaches no cache.
     localparam INST_LSU_PFENCE = 4'b1101;
 `endif
+`ifdef VX_CFG_EXT_MBAR_ENABLE
+    // 16-byte st.async: split by the uop sequencer into two 8-byte halves, so it never reaches the LSU.
+    localparam INST_LSU_SQ =     4'b1100;
+`endif
     localparam INST_LSU_BITS =   4;
 
     localparam INST_FENCE_BITS = 1;

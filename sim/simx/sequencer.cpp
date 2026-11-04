@@ -77,6 +77,58 @@ instr_trace_t* Sequencer::make_cfence(instr_trace_t* trace) {
   return uop;
 }
 #endif
+#ifdef VX_CFG_EXT_MBAR_ENABLE
+bool Sequencer::is_async_q(const instr_trace_t* trace) {
+  auto type = std::get_if<LsuType>(&trace->op_type);
+  return type && *type == LsuType::ST_ASYNC
+      && std::get<IntrLsuArgs>(trace->instr_ptr->get_args()).width == 4;
+}
+
+// The low half is a new trace, an 8-byte st.async of x[rs2] at offset 0. The
+// instruction's own trace becomes the high half: x[rs2|1] at offset 8.
+instr_trace_t* Sequencer::split_q(instr_trace_t* trace) {
+  uint64_t uuid = trace->uuid;
+  // The low half gets uop index 0 in bits [31:24], as the RTL get_uop_uuid; the high
+  // half keeps the instruction's uuid, where the RTL writes uop index 1.
+  uint64_t uop_uuid = uuid & ~uint64_t(0xff000000);
+  auto& q = *trace->instr_ptr;
+  auto instr = std::allocate_shared<Instr>(instr_pool_, uop_uuid, FUType::LSU);
+  instr->set_parent_uuid(uuid);
+  instr->set_op_type(LsuType::ST_ASYNC);
+  IntrLsuArgs args = std::get<IntrLsuArgs>(q.get_args());
+  args.width  = 3;
+  args.offset = 0;
+  instr->set_args(args);
+  for (uint32_t i = 0; i < NUM_SRC_REGS; ++i) {
+    auto r = q.get_src_reg(i);
+    instr->set_src_reg(i, r.idx, r.type);
+  }
+  auto uop = core_->trace_pool().allocate(1);
+  new (uop) instr_trace_t(uop_uuid);
+  uop->cid       = trace->cid;
+  uop->wid       = trace->wid;
+  uop->cta_id    = trace->cta_id;
+  uop->PC        = trace->PC;
+  uop->code      = trace->code;
+  uop->tmask     = trace->tmask;
+  uop->instr_ptr = instr;
+  uop->fu_type   = FUType::LSU;
+  uop->op_type   = LsuType::ST_ASYNC;
+  uop->src_regs  = trace->src_regs;
+
+  args.offset = 8;
+  q.set_args(args);
+  auto rs2 = q.get_src_reg(1);
+  if (rs2.idx != 0) {
+    rs2.idx |= 1;
+    q.set_src_reg(1, rs2.idx, rs2.type);
+    trace->src_regs[1] = rs2;
+  }
+  return uop;
+}
+#else
+#line 79
+#endif
 
 instr_trace_t* Sequencer::get(instr_trace_t* trace) {
   // Idempotent: return cached micro-op if available
@@ -95,6 +147,21 @@ instr_trace_t* Sequencer::get(instr_trace_t* trace) {
     state_.current_uop = trace;
     return trace;
   }
+#endif
+#ifdef VX_CFG_EXT_MBAR_ENABLE
+  // Like the release pair, the low half issues in the cycle the instruction
+  // would have, and the high half follows.
+  if (state_.qpair == QPair::None && is_async_q(trace)) {
+    state_.qpair = QPair::Low;
+    state_.current_uop = this->split_q(trace);
+    return state_.current_uop;
+  }
+  if (state_.qpair == QPair::High) {
+    state_.current_uop = trace;
+    return trace;
+  }
+#else
+#line 98
 #endif
 
   // Activate sequencing for macro-op instructions
@@ -198,6 +265,18 @@ bool Sequencer::advance() {
     state_.release = Release::None;
     return true;
   }
+#endif
+#ifdef VX_CFG_EXT_MBAR_ENABLE
+  if (state_.qpair == QPair::Low) {
+    state_.qpair = QPair::High;
+    return false;
+  }
+  if (state_.qpair == QPair::High) {
+    state_.qpair = QPair::None;
+    return true;
+  }
+#else
+#line 201
 #endif
   if (state_.active) {
     ++state_.uop_index;

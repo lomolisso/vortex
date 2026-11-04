@@ -40,6 +40,8 @@
 #endif
 #include "dlmem_async_bench.h"
 
+#include <array>
+#include <cstdlib>
 #include <iostream>
 #include <type_traits>
 
@@ -371,12 +373,29 @@ public:
     t->eval();
     async_bit_ = t->cfg_async_bit;
     mb_lsb_ = t->cfg_async_mb_lsb;
-    amo_add_ = t->cfg_amo_add;
     amo_ctx_ = t->cfg_amo_complete_tx;
+    amo_.fill(AMO_NONE);
+    amo_[async::F5_ADD]   = t->cfg_amo_add;
+    amo_[async::F5_MIN_S] = t->cfg_amo_min;
+    amo_[async::F5_MAX_S] = t->cfg_amo_max;
+    amo_[async::F5_MIN_U] = t->cfg_amo_min;
+    amo_[async::F5_MAX_U] = t->cfg_amo_max;
+    amo_[async::F5_AND]   = t->cfg_amo_and;
+    amo_[async::F5_OR]    = t->cfg_amo_or;
+    amo_[async::F5_XOR]   = t->cfg_amo_xor;
+  #if VX_CFG_EXT_FPAMO_ENABLED
+    amo_[async::F5_INC]   = t->cfg_amo_inc;
+    amo_[async::F5_DEC]   = t->cfg_amo_dec;
+  #endif
   }
 
-  uint32_t amo_add() const override {
-    return amo_add_;
+  // amo_op_e (VX_gpu_pkg.sv) of each red.async op, as the top exports it.
+  uint32_t amo_code(uint8_t op) const override {
+    if (op >= amo_.size() || amo_[op] == AMO_NONE) {
+      std::cerr << "red.async op " << uint32_t(op) << " has no atomic op in this build" << std::endl;
+      std::abort();
+    }
+    return amo_[op];
   }
 
   uint32_t amo_complete_tx() const override {
@@ -437,8 +456,8 @@ private:
         set_bits(t->lsu_req_data, i * 64, 64, lv ? lv->data : 0);
         set_bits(t->lsu_req_byteen, i * 8, 8, lv ? lv->byteen : 0);
         set_bits(t->lsu_req_amo, i, 1, lv && lv->red);
-        set_bits(t->lsu_req_amo_op, i * AMO_OP_BITS, AMO_OP_BITS, (lv && lv->red) ? amo_add_ : 0);
-        set_bits(t->lsu_req_amo_unsigned, i, 1, 0);
+        set_bits(t->lsu_req_amo_op, i * AMO_OP_BITS, AMO_OP_BITS, (lv && lv->red) ? amo_code(lv->op) : 0);
+        set_bits(t->lsu_req_amo_unsigned, i, 1, lv && lv->uns);
         set_bits(t->lsu_req_amo_cmp, i * 64, 64, 0);
         set_bits(t->lsu_req_hart_id, i * 32, 32, lv ? lv->hart : 0);
       }
@@ -466,8 +485,9 @@ private:
   uint64_t tick_ = 0;
   uint32_t async_bit_ = 0;
   uint32_t mb_lsb_ = 0;
-  uint32_t amo_add_ = 0;
   uint32_t amo_ctx_ = 0;
+  static constexpr uint32_t AMO_NONE = ~0u;
+  std::array<uint32_t, 16> amo_;
 };
 
 int run_async(const std::string& mode, const std::vector<uint32_t>& seeds, uint32_t reqs, const std::string& csv) {

@@ -1,37 +1,46 @@
-// dlmem_st_async: st.async and red.async into the local memory of a block of
-// the thread-block cluster, through the DLMEM window, each completing its 4
-// or 8 bytes on an mbarrier in the destination block, on a DLMEM device with
-// the A extension and mbarriers (RV64). Like PTX st.async / red.async
-// .shared::cluster .mbarrier::complete_tx::bytes.
+// dlmem_st_async: st.async and red.async into the local memory of another
+// block of the thread-block cluster, through the DLMEM window, each
+// completing its bytes on an mbarrier in the destination block, on a DLMEM
+// device with the A extension and mbarriers (RV64). Like PTX st.async /
+// red.async .shared::cluster .mbarrier::complete_tx::bytes.
 //
-//   -m ring   stores: block r into rank (r + 1) % K; adds: every rank into
-//             rank 0's counters, rank 0 into its own (default)
-//   -m self   every block into itself, through its own window address
+// Stores go from block r into rank (r + 1) % K; reductions from rank 0 into
+// rank 1's counters and from every other rank into rank 0's. No op targets
+// its own block, which is an error.
+//
 //   -p spread|single-core
 //             the cluster policy: SPREAD (default) puts the ranks on
 //             different cores; single-core keeps the cluster on one core
-//   -k K      blocks per cluster (default 2)
+//   -k K      blocks per cluster, 2 to 8 (default 2)
 //   -n G      clusters (default 2)
 //   -w W      warps per block (default 2)
 //   -e N      ops per thread, op and round (default 2)
 //   -r R      rounds (default 2)
-//   -o MASK   the ops: bit 0 st.async.b32, 1 st.async.b64, 2 red.async.add.u32,
-//             3 red.async.add.u64 (default 15)
+//   -o MASK   the ops (default 0xf): bit 0 st.async.b32, 1 st.async.b64,
+//             2 red.async.add.u32, 3 red.async.add.u64, 4 st.async.v2.b32,
+//             5 st.async.v4.b32, 6 st.async.v2.b64, 7 red.async.add.s32,
+//             8 min.s32, 9 max.s32, 10 min.u32, 11 max.u32, 12 and.b32,
+//             13 or.b32, 14 xor.b32, 15 inc.u32, 16 dec.u32 (15 and 16 need
+//             a device built with VX_CFG_EXT_FPAMO_ENABLE)
 //   -x neg    a run that must stop the simulator, from rank 0 of a SPREAD
 //             cluster of 2: local (the destination is a local pointer), mbar
 //             (the mbarrier is in the issuer's block), mbarlocal (the
 //             mbarrier is a local pointer), rank (the destination lies outside
-//             the cluster), off (the destination lies past the peer's block)
+//             the cluster), off (the destination lies past the peer's block),
+//             self (the destination is the issuer's own block), align16 (a
+//             16-byte store 8 bytes past a 16-byte boundary), oddpair (a
+//             16-byte store whose data register is odd)
 //   -v        print every cluster's placement
 //
 // Each round, every receiving block arms its mbarriers with arrive_tx of the
 // bytes coming in before the cluster barrier; the senders issue with no fence;
 // every thread waits for its own block's phases and checks at once that every
-// stored word holds the round's value (no stale data) and every counter the
-// exact total so far. The host then checks every block's whole local memory
-// byte for byte (the last round's words, the counters, canaries everywhere
-// else) and each mbarrier word against mbar_ref. SPREAD runs must have ops
-// cross cores, single-core runs must keep them on one core.
+// stored word holds the round's value (no stale data) and thread 0 that every
+// counter holds the exact result so far. The host then checks every block's
+// whole local memory byte for byte (the last round's elements, the counters
+// and their other halves, canaries everywhere else) and each mbarrier word
+// against mbar_ref, a 16-byte store completing as two 8-byte halves. SPREAD
+// runs must have ops cross cores, single-core runs must keep them on one core.
 //
 // A device the clusters do not fit prints SKIPPED when the run was launched
 // without options, and fails when any option asked for a run.
@@ -62,14 +71,16 @@ namespace mr = vortex::mbar_ref;
     }                                                                 \
   } while (0)
 
-const char* const kModeNames[] = {"ring", "self"};
-const char* const kNegNames[]  = {"", "local", "mbar", "mbarlocal", "rank", "off"};
-const char* const kOpNames[]   = {"st.async.b32", "st.async.b64", "red.async.add.u32", "red.async.add.u64"};
+const char* const kNegNames[] = {"", "local", "mbar", "mbarlocal", "rank", "off", "self", "align16", "oddpair"};
+const char* const kOpNames[]  = {"st.async.b32", "st.async.b64", "red.async.add.u32", "red.async.add.u64",
+                                 "st.async.v2.b32", "st.async.v4.b32", "st.async.v2.b64", "red.async.add.s32",
+                                 "red.async.min.s32", "red.async.max.s32", "red.async.min.u32",
+                                 "red.async.max.u32", "red.async.and.b32", "red.async.or.b32",
+                                 "red.async.xor.b32", "red.async.inc.u32", "red.async.dec.u32"};
 
 constexpr uint32_t kLinger = 20000;
 
 const char* kernel_file = "kernel.vxbin";
-uint32_t mode    = MODE_RING;
 uint32_t neg     = NEG_NONE;
 uint32_t req_k   = 2;
 uint32_t req_g   = 2;
@@ -82,8 +93,8 @@ bool     verbose = false;
 bool     requested = false;
 
 void usage() {
-  std::printf("Usage: [-m ring|self] [-p spread|single-core] [-k K] [-n clusters] [-w warps] [-e ops per thread]"
-              " [-r rounds] [-o op mask] [-x local|mbar|mbarlocal|rank|off] [-v] [-h]\n");
+  std::printf("Usage: [-p spread|single-core] [-k K] [-n clusters] [-w warps] [-e ops per thread]"
+              " [-r rounds] [-o op mask] [-x local|mbar|mbarlocal|rank|off|self|align16|oddpair] [-v] [-h]\n");
 }
 
 uint32_t parse_count(const char* s) {
@@ -109,9 +120,8 @@ uint32_t parse_name(const char* s, const char* const* names, uint32_t first, uin
 void parse_args(int argc, char** argv) {
   requested = (argc > 1);
   int c;
-  while ((c = getopt(argc, argv, "m:p:k:n:w:e:r:o:x:vh")) != -1) {
+  while ((c = getopt(argc, argv, "p:k:n:w:e:r:o:x:vh")) != -1) {
     switch (c) {
-      case 'm': mode = parse_name(optarg, kModeNames, 0, NUM_MODES); break;
       case 'p': {
         const char* const kPolicies[] = {"spread", "single-core"};
         spread = parse_name(optarg, kPolicies, 0, 2) == 0;
@@ -129,8 +139,8 @@ void parse_args(int argc, char** argv) {
       default:  usage(); std::exit(-1);
     }
   }
-  if (optind < argc || req_k < 1 || req_k > 8 || req_g == 0 || req_w == 0 || elems == 0 || elems > 64
-      || rounds == 0 || rounds > 64 || ops == 0 || ops > 0xF) {
+  if (optind < argc || req_k < 2 || req_k > 8 || req_g == 0 || req_w == 0 || elems == 0 || elems > 64
+      || rounds == 0 || rounds > 64 || ops == 0 || ops > OPS_ALL) {
     usage();
     std::exit(-1);
   }
@@ -184,7 +194,7 @@ int main(int argc, char** argv) {
   CHECK(vx_device_query(dev, VX_CAPS_ISA_FLAGS,         &isa));
 
   if (neg) {
-    mode = MODE_RING; spread = true; req_k = 2; req_g = 1; req_w = 1; elems = 1; rounds = 1; ops = 1;
+    spread = true; req_k = 2; req_g = 1; req_w = 1; elems = 1; rounds = 1; ops = 1;
   }
   const uint32_t k = req_k, nt = (uint32_t)num_threads, threads = req_w * nt;
   if (threads * elems > 1024 * 64 || threads > 1024) {
@@ -193,27 +203,33 @@ int main(int argc, char** argv) {
   }
 
   sa_arg_t arg = {};
-  arg.mode       = mode;
   arg.neg        = neg;
   arg.k          = k;
   arg.ops        = ops;
   arg.rounds     = rounds;
   arg.elems      = elems;
-  arg.lmem_bytes = lm_bytes(threads, elems);
+  arg.lmem_bytes = lm_layout(threads, elems, ops, arg.mbar, arg.area, &arg.data_off);
   arg.linger     = kLinger;
 
   if (neg) {
     std::printf("dlmem_st_async: negative run '%s', SPREAD cluster of 2 blocks, %u cores of %u warps x %u threads\n",
                 kNegNames[neg], (uint32_t)num_cores, (uint32_t)num_warps, nt);
   } else {
-    std::printf("dlmem_st_async: %s, %s, %u clusters of %u blocks of %u warps x %u threads, %u cores of %u warps,"
-                " %u rounds of %u ops per thread of", kModeNames[mode], spread ? "SPREAD" : "SINGLE_CORE", req_g, k,
+    std::printf("dlmem_st_async: %s, %u clusters of %u blocks of %u warps x %u threads, %u cores of %u warps,"
+                " %u rounds of %u ops per thread of", spread ? "SPREAD" : "SINGLE_CORE", req_g, k,
                 req_w, nt, (uint32_t)num_cores, (uint32_t)num_warps, rounds, elems);
     for (uint32_t o = 0; o < NUM_OPS; ++o) {
       if (ops & (1u << o))
         std::printf(" %s", kOpNames[o]);
     }
     std::printf(", %u bytes of local memory per block\n", arg.lmem_bytes);
+  }
+  if ((ops & OPS_FPAMO) && !VX_CFG_EXT_FPAMO_ENABLED) {
+    std::printf("Error: red.async.inc/dec (-o bits 15 and 16) need a device built with VX_CFG_EXT_FPAMO_ENABLE\n"
+                "FAILED!\n");
+    vx_queue_release(q);
+    vx_device_release(dev);
+    return 1;
   }
   const uint64_t need = VX_ISA_EXT_DLMEM | VX_ISA_STD_A;
   if ((isa & need) != need) {
@@ -254,6 +270,34 @@ int main(int argc, char** argv) {
   vx_buffer_h rec_buf  = upload(dev, q, recs, &arg.rec_addr, VX_MEM_READ_WRITE);
   vx_buffer_h err_buf  = upload(dev, q, errs, &arg.err_addr, VX_MEM_READ_WRITE);
   vx_buffer_h dump_buf = upload(dev, q, dump, &arg.dump_addr, VX_MEM_READ_WRITE);
+  // Each block's counters after every round, folded in any order: every
+  // reduction here is order-independent.
+  std::vector<uint64_t> wantv((size_t)blocks * rounds * NUM_OPS, 0);
+  for (uint32_t b = 0; b < blocks && !neg; ++b) {
+    const uint32_t r = b % k, base = b - r;
+    uint32_t c32[NUM_OPS];
+    for (uint32_t o = 0; o < NUM_OPS; ++o)
+      c32[o] = red_init(o);
+    uint64_t c64 = 0;
+    for (uint32_t p = 0; p < rounds; ++p) {
+      for (uint32_t s = 0; s < k; ++s) {
+        if (red_dst(s) != r)
+          continue;
+        for (uint32_t t = 0; t < threads; ++t) {
+          for (uint32_t i = 0; i < elems; ++i) {
+            for (uint32_t o = 0; o < NUM_OPS; ++o) {
+              if (op_is_red(o) && o != OP_RED64)
+                c32[o] = red_fold(o, c32[o], red_value(o, p, base + s, t, i));
+            }
+            c64 += red64_value(p, base + s, t, i);
+          }
+        }
+      }
+      for (uint32_t o = 0; o < NUM_OPS; ++o)
+        wantv[((size_t)b * rounds + p) * NUM_OPS + o] = (o == OP_RED64) ? c64 : c32[o];
+    }
+  }
+  vx_buffer_h want_buf = upload(dev, q, wantv, &arg.want_addr, VX_MEM_READ);
 
   vx_module_h mod = nullptr;
   vx_kernel_h kernel = nullptr;
@@ -333,62 +377,53 @@ int main(int argc, char** argv) {
     if (stale)
       std::printf("*** %u stored words did not hold the round's value right after the wait\n", stale);
     if (bad_red)
-      std::printf("*** %u counters did not hold the round's total right after the wait\n", bad_red);
+      std::printf("*** %u counters did not hold the round's result right after the wait\n", bad_red);
     errors += (gave_up != 0) + (stale != 0) + (bad_red != 0) + (unfinished != 0);
 
     // The expected image of every block.
-    const uint32_t st64_off = lm_st64(threads, elems);
     uint32_t cross = 0, same = 0, bad_bytes = 0, bad_blocks = 0;
     for (uint32_t b = 0; b < blocks; ++b) {
       const uint32_t r = b % k, base = b - r;
       std::vector<uint8_t> want(arg.lmem_bytes, 0);
-      for (uint32_t w = LM_CANARY; w < arg.lmem_bytes / 4; ++w)
+      for (uint32_t w = arg.data_off / 4; w < arg.lmem_bytes / 4; ++w)
         put<uint32_t>(want, w * 4, canary_word(b, w));
-      const uint32_t src = base + (mode == MODE_RING ? (r + k - 1) % k : r);
+      const uint32_t src = base + st_src(r, k);
       const uint32_t p = rounds - 1;
-      for (uint32_t t = 0; t < threads; ++t) {
-        for (uint32_t i = 0; i < elems; ++i) {
-          const uint32_t w = i * threads + t;
-          if (ops & (1u << OP_ST32))
-            put<uint32_t>(want, LM_ST32 + w * 4, st32_value(p, src, t, i));
-          if (ops & (1u << OP_ST64))
-            put<uint64_t>(want, st64_off + w * 8, st64_value(p, src, t, i));
-        }
-      }
-      uint32_t c32 = 0;
-      uint64_t c64 = 0;
-      for (uint32_t s = 0; s < k; ++s) {
-        if (red_dst(mode, s) != r)
-          continue;
-        for (uint32_t pp = 0; pp < rounds; ++pp) {
-          for (uint32_t t = 0; t < threads; ++t) {
-            for (uint32_t i = 0; i < elems; ++i) {
-              if (ops & (1u << OP_RED32))
-                c32 += red32_value(pp, base + s, t, i);
-              if (ops & (1u << OP_RED64))
-                c64 += red64_value(pp, base + s, t, i);
-            }
+      for (uint32_t m = ops & OPS_ST; m; m &= m - 1) {
+        const uint32_t o = __builtin_ctz(m);
+        for (uint32_t t = 0; t < threads; ++t) {
+          for (uint32_t i = 0; i < elems; ++i) {
+            const uint32_t e = arg.area[o] + (i * threads + t) * op_bytes(o);
+            for (uint32_t j = 0; j < op_bytes(o) / 4; ++j)
+              put<uint32_t>(want, e + 4 * j, st_word(o, p, src, t, i, j));
           }
         }
       }
-      put<uint64_t>(want, LM_CTR32, c32);
-      put<uint64_t>(want, LM_CTR64, c64);
-      const uint32_t in[NUM_OPS] = {threads * elems, threads * elems,
-                                    red_senders(mode, r, k) * threads * elems,
-                                    red_senders(mode, r, k) * threads * elems};
-      for (uint32_t o = 0; o < NUM_OPS; ++o) {
+      for (uint32_t m = ops & OPS_RED; m; m &= m - 1) {
+        const uint32_t o = __builtin_ctz(m);
+        put<uint64_t>(want, arg.area[o] & ~7u, ctr_word_init(b, o, arg.area[o]));
+        const uint64_t c = wantv[((size_t)b * rounds + p) * NUM_OPS + o];
+        if (o == OP_RED64)
+          put<uint64_t>(want, arg.area[o], c);
+        else
+          put<uint32_t>(want, arg.area[o], (uint32_t)c);
+      }
+      for (uint32_t m = ops; m; m &= m - 1) {
+        const uint32_t o = __builtin_ctz(m);
+        const uint32_t in = (op_is_red(o) ? red_senders(r, k) : 1) * threads * elems;
         uint64_t w = mr::init(1);
-        if ((ops & (1u << o)) && in[o]) {
+        if (in) {
+          const uint32_t halves = op_bytes(o) / op_cx_bytes(o);
           for (uint32_t pp = 0; pp < rounds; ++pp) {
-            w = mr::apply(mr::OP_ARRIVE_TX, w, in[o] * op_bytes(o)).new_word;
-            for (uint32_t j = 0; j < in[o]; ++j)
-              w = mr::apply(mr::OP_COMPLETE_TX, w, op_bytes(o)).new_word;
+            w = mr::apply(mr::OP_ARRIVE_TX, w, in * op_bytes(o)).new_word;
+            for (uint32_t j = 0; j < in * halves; ++j)
+              w = mr::apply(mr::OP_COMPLETE_TX, w, op_cx_bytes(o)).new_word;
           }
         }
-        put<uint64_t>(want, LM_MBAR + o * 8, w);
+        put<uint64_t>(want, arg.mbar[o], w);
       }
 
-      const uint32_t q_st = base + st_dst(mode, r, k);
+      const uint32_t q_st = base + st_dst(r, k);
       if (rec(b)[REC_CORE] == rec(q_st)[REC_CORE])
         ++same;
       else
@@ -400,10 +435,18 @@ int main(int argc, char** argv) {
         if (got[i] == want[i])
           continue;
         if (bad++ < 4 && bad_blocks < 4) {
-          const char* where = i < LM_CTR32 ? "mbarrier" : i < LM_CTR64 ? "counter32"
-                              : i < LM_CTR64 + 8 ? "counter64" : i < LM_ST32 ? "gap"
-                              : i < st64_off ? "st32 area" : i < st64_off + threads * elems * 8 ? "st64 area"
-                              : "tail";
+          char where[48];
+          std::snprintf(where, sizeof(where), "canary");
+          for (uint32_t o = 0; o < NUM_OPS; ++o) {
+            if (!((ops >> o) & 1u))
+              continue;
+            const uint32_t lo = op_is_red(o) ? (arg.area[o] & ~7u) : arg.area[o];
+            const uint32_t sz = op_is_red(o) ? 8 : threads * elems * op_bytes(o);
+            if (i >= arg.mbar[o] && i < arg.mbar[o] + 8)
+              std::snprintf(where, sizeof(where), "mbarrier of %s", kOpNames[o]);
+            else if (i >= lo && i < lo + sz)
+              std::snprintf(where, sizeof(where), op_is_red(o) ? "counter word of %s" : "%s area", kOpNames[o]);
+          }
           std::printf("*** block %u (rank %u, core %u) byte %u (%s): %#04x, expected %#04x\n", b, r,
                       rec(b)[REC_CORE], i, where, got[i], want[i]);
         }
@@ -416,7 +459,7 @@ int main(int argc, char** argv) {
     std::printf("dlmem_st_async: %u blocks store across cores, %u on their own core; %u wrong bytes in %u blocks\n",
                 cross, same, bad_bytes, bad_blocks);
     errors += (bad_bytes != 0);
-    if (mode == MODE_RING && spread && cross == 0) {
+    if (spread && cross == 0) {
       std::printf("*** no op crossed cores in a SPREAD launch\n");
       ++errors;
     }
@@ -426,6 +469,7 @@ int main(int argc, char** argv) {
     }
   }
 
+  vx_buffer_release(want_buf);
   vx_buffer_release(dump_buf);
   vx_buffer_release(err_buf);
   vx_buffer_release(rec_buf);

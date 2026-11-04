@@ -258,6 +258,23 @@ bool LsuUnit::is_try_wait(const instr_trace_t* trace) {
 static bool is_async(const LsuType* type) {
 	return type && (*type == LsuType::ST_ASYNC || *type == LsuType::RED_ASYNC);
 }
+
+// A red.async's funct5 names the bank atomic it performs.
+static MemOp red_async_op(uint32_t red_op) {
+	switch (red_op) {
+	case 2: return MemOp::AMO_ADD;
+	case 3: case 5: return MemOp::AMO_MIN;
+	case 4: case 6: return MemOp::AMO_MAX;
+	case 7: return MemOp::AMO_AND;
+	case 8: return MemOp::AMO_OR;
+	case 9: return MemOp::AMO_XOR;
+#ifdef VX_CFG_EXT_FPAMO_ENABLE
+	case 10: return MemOp::AMO_INC;
+	case 11: return MemOp::AMO_DEC;
+#endif
+	default: std::abort();
+	}
+}
 #ifdef VX_CFG_EXT_DXA_ENABLE
 
 // The translation answers a proxy fence's token itself; no cache drained, so
@@ -378,9 +395,17 @@ void LsuUnit::compute_addrs(uint32_t b, instr_trace_t* trace) {
 				e.data = rs2_data[t].u64;
 			}
 	#ifdef VX_CFG_EXT_MBAR_ENABLE
-			// An async store or add carries its mbarrier (rs3) as the third operand.
+			// An async store or reduction carries its mbarrier (rd) as the third operand.
 			if (is_async(lsu_tag)) {
 				e.amo_cmp = trace->src_data[2][t].u64;
+				// The high half of a 16-byte st.async sits 8 bytes past the base.
+				if (offset == 8 && (e.addr & 15) != 8) {
+					std::cerr << SimPlatform::instance().cycles() << ": " << this->name()
+					          << " st.async 16-byte form needs a 16-byte aligned address: wid=" << trace->wid
+					          << " lane=" << t << " addr=0x" << std::hex << (e.addr - 8) << std::dec
+					          << " (#" << trace->uuid << ")" << std::endl;
+					std::abort();
+				}
 			}
 	#endif
 #if defined(VX_CFG_EXT_MBAR_ENABLE)
@@ -876,11 +901,13 @@ void LsuUnit::process_request_step(uint32_t b) {
 #endif
 		}
 #ifdef VX_CFG_EXT_MBAR_ENABLE
-		// The add of a red.async returns nothing: it retires as a store does.
+		// A red.async returns nothing: it retires as a store does.
 		if (is_async(lsu_tag)) {
 			lsu_req.flags.async = 1;
 			if (*lsu_tag == LsuType::RED_ASYNC) {
-				lsu_req.op = MemOp::AMO_ADD;
+				const uint32_t red_op = std::get<IntrLsuArgs>(trace->instr_ptr->get_args()).red_op;
+				lsu_req.op = red_async_op(red_op);
+				lsu_req.flags.amo_unsigned = (red_op == 5 || red_op == 6);
 			}
 		}
 #endif

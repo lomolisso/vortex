@@ -60,6 +60,12 @@ public:
   // A release (.rl AMO or SC, BAR, mbarrier arrive) issues as [CFENCE, op].
   static bool is_release(const instr_trace_t* trace);
 #endif
+#ifdef VX_CFG_EXT_MBAR_ENABLE
+  // A 16-byte st.async issues as two 8-byte ones: [low half, high half].
+  static bool is_async_q(const instr_trace_t* trace);
+#else
+#line 62
+#endif
 
 protected:
   void on_reset();
@@ -73,6 +79,13 @@ private:
   // The release expander: the CFENCE, then the instruction itself.
   enum class Release { None, Fence, Op };
 #endif
+#ifdef VX_CFG_EXT_MBAR_ENABLE
+  // The 16-byte st.async expander: the new low-half trace, then the
+  // instruction's own trace rewritten as the high half.
+  enum class QPair { None, Low, High };
+#else
+#line 75
+#endif
 
   struct State {
     bool     active;
@@ -83,6 +96,11 @@ private:
     uint64_t setup_cycle;
 #ifdef VX_CFG_EXT_DLMEM_ENABLE
     Release  release = Release::None;
+#endif
+#ifdef VX_CFG_EXT_MBAR_ENABLE
+    QPair    qpair = QPair::None;
+#else
+#line 86
 #endif
 
     State() : active(false), uop_index(0), uop_count(0), current_uop(nullptr), setup_cycle(~uint64_t(0)) {}
@@ -97,6 +115,11 @@ private:
 #ifdef VX_CFG_EXT_DLMEM_ENABLE
       release = Release::None;
 #endif
+#ifdef VX_CFG_EXT_MBAR_ENABLE
+      qpair = QPair::None;
+#else
+#line 99
+#endif
     }
   };
 
@@ -105,6 +128,11 @@ private:
 #ifdef VX_CFG_EXT_DLMEM_ENABLE
   PoolAllocator<Instr, 64>& instr_pool_;
   instr_trace_t* make_cfence(instr_trace_t* trace);
+#endif
+#ifdef VX_CFG_EXT_MBAR_ENABLE
+  instr_trace_t* split_q(instr_trace_t* trace);
+#else
+#line 108
 #endif
   LsuUopGen lsu_uop_gen_;
 #ifdef VX_CFG_EXT_TCU_ENABLE

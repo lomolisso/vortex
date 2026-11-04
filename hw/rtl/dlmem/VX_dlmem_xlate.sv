@@ -142,7 +142,7 @@ module VX_dlmem_xlate import VX_gpu_pkg::*, VX_dlmem_pkg::*; #(
 `ifdef VX_CFG_EXT_MBAR_ENABLE
     wire [NUM_LANES-1:0]                     lane_mbar_global, lane_mbar_rwait;
     // st.async/red.async lanes: every one leaves through the egress, its own core's included.
-    wire [NUM_LANES-1:0]                     lane_async, async_nowin, async_mbad;
+    wire [NUM_LANES-1:0]                     lane_async, async_nowin, async_mbad, async_self;
     `STATIC_ASSERT (DLMEM_ASYNC_MB_LSB + LMEM_AW <= DLMEM_ASYNC_BIT, ("no room for the async lane encoding"))
     `STATIC_ASSERT (DLMEM_ASYNC_BIT > WIN_LSB, ("the async flag overlaps the DLMEM window"))
 `endif
@@ -204,6 +204,8 @@ module VX_dlmem_xlate import VX_gpu_pkg::*, VX_dlmem_pkg::*; #(
         assign lane_async[i]  = async_act && rem;
         assign async_nowin[i] = async_act && ~win;
         assign async_mbad[i]  = mbad;
+        // The issuing block itself: its own core and its own slot. A same-core peer has another slot.
+        assign async_self[i]  = async_act && win && ~oob && ~mbad && is_self && (peer.slot == my_slot);
     `else
         assign addr_out[i] = win ? (rem ? rem_addr : loc_addr) : a;
     `endif
@@ -396,6 +398,9 @@ module VX_dlmem_xlate import VX_gpu_pkg::*, VX_dlmem_pkg::*; #(
     `RUNTIME_ASSERT (~(out_fire && (| async_mbad)),
         ("%t: %s st.async mbarrier must be in the destination block: wid=%0d lanes=0x%0h (#%0d)",
             $time, INSTANCE_ID, hdr_r.wid, async_mbad, hdr_r.uuid))
+    `RUNTIME_ASSERT (~(out_fire && (| async_self)),
+        ("%t: %s st.async destination must be another block of the cluster: wid=%0d lanes=0x%0h (#%0d)",
+            $time, INSTANCE_ID, hdr_r.wid, async_self, hdr_r.uuid))
 `endif
 
 endmodule

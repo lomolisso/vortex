@@ -380,6 +380,20 @@ module VX_lsu_slice import VX_gpu_pkg::*; #(
                 $time, execute_if.data.header.wid, to_fullPC(execute_if.data.header.PC), full_addr[i], inst_lsu_wsize(execute_if.data.op_type), execute_if.data.header.uuid))
     end
 
+`ifdef VX_CFG_EXT_MBAR_ENABLE
+    // A 16-byte st.async reaches the slice as two 8-byte halves; only the high one has offset 8.
+    wire execute_fire = execute_if.valid && execute_if.ready;
+    wire req_sq_hi    = execute_if.data.op_args.lsu.is_async && (execute_if.data.op_args.lsu.offset == 12'd8);
+    for (genvar i = 0; i < NUM_LANES; ++i) begin : g_sq_align
+        `RUNTIME_ASSERT(~(execute_fire && req_sq_hi && execute_if.data.header.tmask[i] && (full_addr[i][3:0] != 4'd8)),
+            ("%t: st.async 16-byte form needs a 16-byte aligned address: wid=%0d, PC=0x%0h, addr=0x%0h (#%0d)",
+                $time, execute_if.data.header.wid, to_fullPC(execute_if.data.header.PC), full_addr[i] - 8, execute_if.data.header.uuid))
+    end
+    `RUNTIME_ASSERT(~(execute_if.valid && execute_if.data.op_args.lsu.is_async && (execute_if.data.op_type == INST_LSU_SQ)),
+        ("%t: unsplit 16-byte st.async reached the LSU: wid=%0d, PC=0x%0h (#%0d)",
+            $time, execute_if.data.header.wid, to_fullPC(execute_if.data.header.PC), execute_if.data.header.uuid))
+`endif
+
     // store data formatting
     for (genvar i = 0; i < NUM_LANES; ++i) begin : g_mem_req_data
         always @(*) begin

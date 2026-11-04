@@ -137,6 +137,15 @@ module VX_dlmem_ep_top import VX_gpu_pkg::*, VX_dlmem_pkg::*; #(
     output wire [7:0]                       cfg_async_bit,
     output wire [7:0]                       cfg_async_mb_lsb,
     output wire [7:0]                       cfg_amo_add,
+    output wire [7:0]                       cfg_amo_xor,
+    output wire [7:0]                       cfg_amo_or,
+    output wire [7:0]                       cfg_amo_and,
+    output wire [7:0]                       cfg_amo_min,
+    output wire [7:0]                       cfg_amo_max,
+`ifdef VX_CFG_EXT_FPAMO_ENABLE
+    output wire [7:0]                       cfg_amo_inc,
+    output wire [7:0]                       cfg_amo_dec,
+`endif
     output wire [31:0]                      cfg_amo_complete_tx
 `endif
 );
@@ -149,6 +158,15 @@ module VX_dlmem_ep_top import VX_gpu_pkg::*, VX_dlmem_pkg::*; #(
     assign cfg_async_bit    = 8'(DLMEM_ASYNC_BIT);
     assign cfg_async_mb_lsb = 8'(DLMEM_ASYNC_MB_LSB);
     assign cfg_amo_add      = 8'(AMO_OP_ADD);
+    assign cfg_amo_xor      = 8'(AMO_OP_XOR);
+    assign cfg_amo_or       = 8'(AMO_OP_OR);
+    assign cfg_amo_and      = 8'(AMO_OP_AND);
+    assign cfg_amo_min      = 8'(AMO_OP_MIN);
+    assign cfg_amo_max      = 8'(AMO_OP_MAX);
+`ifdef VX_CFG_EXT_FPAMO_ENABLE
+    assign cfg_amo_inc      = 8'(AMO_OP_INC);
+    assign cfg_amo_dec      = 8'(AMO_OP_DEC);
+`endif
     assign cfg_amo_complete_tx = 32'(AMO_OP_MBAR_COMPLETE_TX);
 `endif
     localparam TAGV_W = LSU_TAG_WIDTH - UUID_WIDTH;

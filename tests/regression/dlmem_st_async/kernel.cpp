@@ -47,111 +47,174 @@ INL uint32_t wait_phase(uint64_t* mbar, uint32_t ph, uint32_t& tries) {
   }
 }
 
+template <uint32_t V> struct op_c { static constexpr uint32_t value = V; };
+
+// Calls f(op_c<o>()) for every op o in the uniform mask `ops`, so each op's
+// code is specialized at compile time; D5's ops (bits 0-3) are tested first
+// and the others behind one test.
+template <typename F>
+INL void for_ops(uint32_t ops, F&& f) {
+  if (ops & (1u << 0)) f(op_c<0>());
+  if (ops & (1u << 1)) f(op_c<1>());
+  if (ops & (1u << 2)) f(op_c<2>());
+  if (ops & (1u << 3)) f(op_c<3>());
+  if (ops & ~0xFu) {
+    if (ops & (1u << 4))  f(op_c<4>());
+    if (ops & (1u << 5))  f(op_c<5>());
+    if (ops & (1u << 6))  f(op_c<6>());
+    if (ops & (1u << 7))  f(op_c<7>());
+    if (ops & (1u << 8))  f(op_c<8>());
+    if (ops & (1u << 9))  f(op_c<9>());
+    if (ops & (1u << 10)) f(op_c<10>());
+    if (ops & (1u << 11)) f(op_c<11>());
+    if (ops & (1u << 12)) f(op_c<12>());
+    if (ops & (1u << 13)) f(op_c<13>());
+    if (ops & (1u << 14)) f(op_c<14>());
+    if (ops & (1u << 15)) f(op_c<15>());
+    if (ops & (1u << 16)) f(op_c<16>());
+  }
+}
+
+// Op o of sender block b's thread t, element i of round p, into `dst` (the
+// element's or the counter's window address).
+INL void issue(uint32_t o, uint8_t* dst, uint64_t* pmbar, uint32_t p, uint32_t b, uint32_t t, uint32_t i) {
+  switch (o) {
+  case OP_ST32:
+    vx_st_async_u32(dst, st_word(o, p, b, t, i, 0), pmbar);
+    break;
+  case OP_ST64:
+    vx_st_async_u64(dst, ((uint64_t)st_word(o, p, b, t, i, 1) << 32) | st_word(o, p, b, t, i, 0), pmbar);
+    break;
+  case OP_RED64:
+    vx_red_async_add_u64(dst, red64_value(p, b, t, i), pmbar);
+    break;
+  case OP_V2B32:
+    vx_st_async_v2_u32(dst, st_word(o, p, b, t, i, 0), st_word(o, p, b, t, i, 1), pmbar);
+    break;
+  case OP_V4B32:
+    vx_st_async_v4_u32(dst, st_word(o, p, b, t, i, 0), st_word(o, p, b, t, i, 1), st_word(o, p, b, t, i, 2),
+                       st_word(o, p, b, t, i, 3), pmbar);
+    break;
+  case OP_V2B64:
+    vx_st_async_v2_u64(dst, ((uint64_t)st_word(o, p, b, t, i, 1) << 32) | st_word(o, p, b, t, i, 0),
+                       ((uint64_t)st_word(o, p, b, t, i, 3) << 32) | st_word(o, p, b, t, i, 2), pmbar);
+    break;
+  default: {
+    const uint32_t v = red_value(o, p, b, t, i);
+    switch (o) {
+    case OP_RED32:  vx_red_async_add_u32(dst, v, pmbar); break;
+    case OP_ADDS32: vx_red_async_add_s32(dst, (int32_t)v, pmbar); break;
+    case OP_MINS32: vx_red_async_min_s32(dst, (int32_t)v, pmbar); break;
+    case OP_MAXS32: vx_red_async_max_s32(dst, (int32_t)v, pmbar); break;
+    case OP_MINU32: vx_red_async_min_u32(dst, v, pmbar); break;
+    case OP_MAXU32: vx_red_async_max_u32(dst, v, pmbar); break;
+    case OP_AND:    vx_red_async_and_b32(dst, v, pmbar); break;
+    case OP_OR:     vx_red_async_or_b32(dst, v, pmbar); break;
+    case OP_XOR:    vx_red_async_xor_b32(dst, v, pmbar); break;
+#if VX_CFG_EXT_FPAMO_ENABLED
+    case OP_INC:    vx_red_async_inc_u32(dst, v, pmbar); break;
+    case OP_DEC:    vx_red_async_dec_u32(dst, v, pmbar); break;
+#endif
+    default: break;
+    }
+  } break;
+  }
+}
+
 } // namespace
 
 // Each round, every block arms one mbarrier per op it receives with
 // arrive_tx of the bytes coming in, and the cluster barrier publishes that.
 // Then every thread issues its st.async (red.async) ops into the destination
-// block, each completing 4 or 8 bytes on that block's mbarrier, with no fence;
-// every thread waits for its own block's phases and checks right away that
-// each stored word holds the round's value and each counter the total so far.
-// At the end every block dumps its whole local memory for the host.
+// block, each completing its bytes on that block's mbarrier (a 16-byte store
+// as two 8-byte halves), with no fence; every thread waits for its own
+// block's phases and checks right away that each stored word holds the
+// round's value, and thread 0 that each counter holds the result the host
+// computed for the round. At the end every block dumps its whole local
+// memory for the host.
 __kernel void st_k(sa_arg_t* __UNIFORM__ arg) {
   const uint32_t tid  = threadIdx.x;
   const uint32_t T    = blockDim.x;
   const uint32_t b    = blockIdx.x;
   const uint32_t k    = arg->k;
   const uint32_t n    = arg->elems;
-  const uint32_t mode = arg->mode;
+  const uint32_t ops  = arg->ops;
   const vortex::cluster_group cl = vortex::this_cluster();
   const uint32_t r    = cl.block_rank();
   const uint32_t base = b - r;
   auto lm   = reinterpret_cast<uint8_t*>(__local_mem());
   auto lw   = reinterpret_cast<volatile uint32_t*>(lm);
-  auto mbar = reinterpret_cast<uint64_t*>(lm + LM_MBAR);
-  auto st32 = reinterpret_cast<volatile uint32_t*>(lm + LM_ST32);
-  auto st64 = reinterpret_cast<volatile uint64_t*>(lm + lm_st64(T, n));
-  auto ctr32 = reinterpret_cast<volatile uint32_t*>(lm + LM_CTR32);
-  auto ctr64 = reinterpret_cast<volatile uint64_t*>(lm + LM_CTR64);
   const uint32_t words = arg->lmem_bytes / 4;
 
   if (tid == 0)
     record(arg, b, r);
-  for (uint32_t w = LM_CANARY + tid; w < words; w += T)
+  for (uint32_t w = arg->data_off / 4 + tid; w < words; w += T)
     lw[w] = canary_word(b, w);
   if (tid == 0) {
-    *reinterpret_cast<volatile uint64_t*>(lm + LM_CTR32) = 0;
-    *ctr64 = 0;
-    for (uint32_t o = 0; o < NUM_OPS; ++o)
-      vx_mbar_init(mbar + o, 1);
+    for_ops(ops, [&](auto oc) {
+      constexpr uint32_t o = decltype(oc)::value;
+      vx_mbar_init(reinterpret_cast<uint64_t*>(lm + arg->mbar[o]), 1);
+      if (op_is_red(o))
+        *reinterpret_cast<volatile uint64_t*>(lm + (arg->area[o] & ~7u)) = ctr_word_init(b, o, arg->area[o]);
+    });
   }
 
-  // Ops per thread that land in this block, by op: stores from one sender,
-  // adds from red_senders() of them.
+  // Ops per thread that land in this block, by kind: stores from one
+  // sender, reductions from red_senders() of them.
   const uint32_t st_in  = n * T;
-  const uint32_t red_in = red_senders(mode, r, k) * n * T;
-  const uint32_t q_st   = st_dst(mode, r, k);
-  const uint32_t q_red  = red_dst(mode, r);
-  const uint32_t src    = base + (mode == MODE_RING ? (r + k - 1) % k : r);
-  auto peer_lm  = cl.map_shared_rank(lm, q_st);
-  auto peer_red = cl.map_shared_rank(lm, q_red);
-  auto peer_mbar = reinterpret_cast<uint64_t*>(peer_lm + LM_MBAR);
-  auto red_mbar  = reinterpret_cast<uint64_t*>(peer_red + LM_MBAR);
+  const uint32_t red_in = red_senders(r, k) * n * T;
+  const uint32_t src    = base + st_src(r, k);
+  auto peer_st  = cl.map_shared_rank(lm, st_dst(r, k));
+  auto peer_red = cl.map_shared_rank(lm, red_dst(r));
+  auto want = reinterpret_cast<const uint64_t*>(arg->want_addr) + (uint64_t)b * arg->rounds * NUM_OPS;
 
   uint32_t gave_up = 0, stale = 0, bad_red = 0, tries = 0;
-  uint32_t want32 = 0;
-  uint64_t want64 = 0;
   for (uint32_t p = 0; p < arg->rounds; ++p) {
     if (tid == 0) {
-      for (uint32_t o = 0; o < NUM_OPS; ++o) {
-        const uint32_t in = (o == OP_ST32 || o == OP_ST64) ? st_in : red_in;
-        if (((arg->ops >> o) & 1u) && in)
-          vx_mbar_arrive_tx(mbar + o, in * op_bytes(o));
-      }
+      for_ops(ops, [&](auto oc) {
+        constexpr uint32_t o = decltype(oc)::value;
+        const uint32_t in = op_is_red(o) ? red_in : st_in;
+        if (in)
+          vx_mbar_arrive_tx(reinterpret_cast<uint64_t*>(lm + arg->mbar[o]), in * op_bytes(o));
+      });
     }
     cl.sync();
 
     for (uint32_t i = 0; i < n; ++i) {
-      const uint32_t w = i * T + tid;
-      if (arg->ops & (1u << OP_ST32))
-        vx_st_async_u32(peer_lm + LM_ST32 + w * 4, st32_value(p, b, tid, i), peer_mbar + OP_ST32);
-      if (arg->ops & (1u << OP_ST64))
-        vx_st_async_u64(peer_lm + lm_st64(T, n) + w * 8, st64_value(p, b, tid, i), peer_mbar + OP_ST64);
-      if (arg->ops & (1u << OP_RED32))
-        vx_red_async_add_u32(peer_red + LM_CTR32, red32_value(p, b, tid, i), red_mbar + OP_RED32);
-      if (arg->ops & (1u << OP_RED64))
-        vx_red_async_add_u64(peer_red + LM_CTR64, red64_value(p, b, tid, i), red_mbar + OP_RED64);
+      for_ops(ops, [&](auto oc) {
+        constexpr uint32_t o = decltype(oc)::value;
+        if (op_is_red(o))
+          issue(o, peer_red + arg->area[o], reinterpret_cast<uint64_t*>(peer_red + arg->mbar[o]), p, b, tid, i);
+        else
+          issue(o, peer_st + arg->area[o] + (i * T + tid) * op_bytes(o),
+                reinterpret_cast<uint64_t*>(peer_st + arg->mbar[o]), p, b, tid, i);
+      });
     }
 
-    for (uint32_t o = 0; o < NUM_OPS; ++o) {
-      const uint32_t in = (o == OP_ST32 || o == OP_ST64) ? st_in : red_in;
-      if (((arg->ops >> o) & 1u) && in)
-        gave_up += wait_phase(mbar + o, p, tries);
-    }
+    for_ops(ops, [&](auto oc) {
+      constexpr uint32_t o = decltype(oc)::value;
+      if (op_is_red(o) ? red_in : st_in)
+        gave_up += wait_phase(reinterpret_cast<uint64_t*>(lm + arg->mbar[o]), p, tries);
+    });
 
-    for (uint32_t i = 0; i < n; ++i) {
-      const uint32_t w = i * T + tid;
-      if ((arg->ops & (1u << OP_ST32)) && st32[w] != st32_value(p, src, tid, i))
-        ++stale;
-      if ((arg->ops & (1u << OP_ST64)) && st64[w] != st64_value(p, src, tid, i))
-        ++stale;
-    }
-    // Thread 0 adds up every sender's contributions of the round.
-    if (tid == 0 && red_in) {
-      for (uint32_t s = 0; s < k; ++s) {
-        if (red_dst(mode, s) != r)
-          continue;
-        for (uint32_t t = 0; t < T; ++t) {
-          for (uint32_t i = 0; i < n; ++i) {
-            want32 += red32_value(p, base + s, t, i);
-            want64 += red64_value(p, base + s, t, i);
-          }
+    for_ops(ops & OPS_ST, [&](auto oc) {
+      constexpr uint32_t o = decltype(oc)::value;
+      for (uint32_t i = 0; i < n; ++i) {
+        auto e = reinterpret_cast<volatile uint32_t*>(lm + arg->area[o] + (i * T + tid) * op_bytes(o));
+        for (uint32_t j = 0; j < op_bytes(o) / 4; ++j) {
+          if (e[j] != st_word(o, p, src, tid, i, j))
+            ++stale;
         }
       }
-      if ((arg->ops & (1u << OP_RED32)) && *ctr32 != want32)
-        ++bad_red;
-      if ((arg->ops & (1u << OP_RED64)) && *ctr64 != want64)
-        ++bad_red;
+    });
+    if (tid == 0 && red_in) {
+      for_ops(ops & OPS_RED, [&](auto oc) {
+        constexpr uint32_t o = decltype(oc)::value;
+        const uint64_t got = (o == OP_RED64) ? *reinterpret_cast<volatile uint64_t*>(lm + arg->area[o])
+                                             : lw[arg->area[o] / 4];
+        if (got != want[p * NUM_OPS + o])
+          ++bad_red;
+      });
     }
   }
 
@@ -175,7 +238,8 @@ __kernel void neg_k(sa_arg_t* __UNIFORM__ arg) {
   const vortex::cluster_group cl = vortex::this_cluster();
   const uint32_t r = cl.block_rank();
   auto lm   = reinterpret_cast<uint8_t*>(__local_mem());
-  auto mbar = reinterpret_cast<uint64_t*>(lm + LM_MBAR);
+  auto mbar = reinterpret_cast<uint64_t*>(lm + arg->mbar[0]);
+  const uint32_t dst = arg->area[0];
 
   if (tid == 0) {
     record(arg, blockIdx.x, r);
@@ -184,27 +248,41 @@ __kernel void neg_k(sa_arg_t* __UNIFORM__ arg) {
   cl.sync();
   if (r == 0 && tid == 0) {
     auto peer      = cl.map_shared_rank(lm, 1);
-    auto peer_mbar = reinterpret_cast<uint64_t*>(peer + LM_MBAR);
+    auto peer_mbar = reinterpret_cast<uint64_t*>(peer + arg->mbar[0]);
     switch (arg->neg) {
     case NEG_LOCAL:
-      vx_st_async_u32(lm + LM_ST32, 1, peer_mbar);
+      vx_st_async_u32(lm + dst, 1, peer_mbar);
       break;
     case NEG_MBAR:
-      vx_st_async_u32(peer + LM_ST32, 1, cl.map_shared_rank(mbar, 0));
+      vx_st_async_u32(peer + dst, 1, cl.map_shared_rank(mbar, 0));
       break;
     case NEG_MBARLOCAL:
-      vx_st_async_u32(peer + LM_ST32, 1, mbar);
+      vx_st_async_u32(peer + dst, 1, mbar);
       break;
     case NEG_RANK: {
       auto bad = reinterpret_cast<uint8_t*>((uintptr_t)VX_MEM_DLMEM_BASE_ADDR + arg->neg_win);
-      vx_st_async_u32(bad + LM_ST32, 1, reinterpret_cast<uint64_t*>(bad + LM_MBAR));
+      vx_st_async_u32(bad + dst, 1, reinterpret_cast<uint64_t*>(bad + arg->mbar[0]));
       break;
     }
     case NEG_OFF:
       vx_st_async_u32(peer + arg->neg_win, 1, peer_mbar);
       break;
+    case NEG_SELF:
+      vx_st_async_u32(cl.map_shared_rank(lm, 0) + dst, 1, cl.map_shared_rank(mbar, 0));
+      break;
+    case NEG_ALIGN16:
+      vx_st_async_v4_u32(peer + dst + 8, 1, 2, 3, 4, peer_mbar);
+      break;
+    case NEG_ODDPAIR: {
+      // The 16-byte form with its data in a5, the odd register of a pair.
+      register uint64_t odd __asm__("a5") = 1;
+      __asm__ volatile (".insn r %0, 4, %1, %2, %3, %4"
+                        :: "i"(RISCV_CUSTOM2), "i"(1 << 2), "r"(peer_mbar), "r"(peer + dst), "r"(odd)
+                        : "memory");
+      break;
+    }
     default:
-      vx_st_async_u32(peer + LM_ST32, 1, peer_mbar);
+      vx_st_async_u32(peer + dst, 1, peer_mbar);
       break;
     }
   }

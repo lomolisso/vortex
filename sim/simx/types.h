@@ -410,8 +410,8 @@ enum class LsuType {
 #ifdef VX_CFG_EXT_DLMEM_ENABLE
   , CFENCE  // conditional CTA fence: the first uop of a release
 #ifdef VX_CFG_EXT_MBAR_ENABLE
-  // st.async / red.async.add: a store or add into a cluster block that
-  // completes on that block's mbarrier, which is the instruction's rs3.
+  // st.async / red.async: a store or reduction into a cluster block that
+  // completes on that block's mbarrier, which the instruction names in rd.
   , ST_ASYNC
   , RED_ASYNC
 #ifdef VX_CFG_EXT_DXA_ENABLE
@@ -433,6 +433,13 @@ struct IntrLsuArgs {
   uint32_t width : 3;
   uint32_t stride : 4;  // per-uop multiplier: 0 = regular LD/ST; 0..N-1 = packLD uop_idx
   int32_t  offset;      // immediate addr offset (signed); 0 for packLD uops
+#ifdef VX_CFG_EXT_MBAR_ENABLE
+  uint32_t red_op = 0;  // red.async: the op's funct5; a default keeps {w, s, off} initialisers complete
+#elif defined(VX_CFG_EXT_DLMEM_ENABLE)
+#line 389
+#else
+#line 386
+#endif
 };
 
 inline std::ostream &operator<<(std::ostream &os, const LsuType& type) {
