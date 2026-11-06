@@ -52,6 +52,10 @@ module VX_dxa_smem_wr import VX_gpu_pkg::*, VX_dxa_pkg::*; #(
     input  wire dxa_compl_t            active_compl,
     // Each socket core's slot stride, a launch constant.
     input  wire [`VX_CFG_SOCKET_SIZE-1:0][`VX_CFG_LMEM_LOG_SIZE:0] slot_stride,
+    // The row-major walk's constants (stable during the transfer).
+    input  wire dxa_tma_wr_t           tma,
+    // The generator ended a prefetch after tokens it dropped.
+    input  wire                        pf_end,
 `endif
 
     // Direct drain channel (from gmem_req).
@@ -135,6 +139,24 @@ module VX_dxa_smem_wr import VX_gpu_pkg::*, VX_dxa_pkg::*; #(
     reg [3:0]                 lg_ratio_q, lg_tcN_q, lg_nsteps_q, lg_bkK_q;
     reg [DXA_SMEM_ADDR_W-1:0] smem_base_q;
     reg [DXA_SMEM_ADDR_W-1:0] per_lane_stride_q;
+`ifdef DXA_MBAR_ENABLE
+    // Gather (a dim-0 element stride): each line's elements are read every
+    // es0 x elem_bytes and written one per beat, like the K-major scatter.
+    // Swizzle: each 16-byte chunk at block-relative offset r moves to
+    // r ^ (((r >> 7) & M) << 4). Prefetch: lines are dropped as they arrive.
+    wire tma_gather = tma.en && (tma.es0 != 4'd1);
+    reg                       gather_q, pf_q;
+    reg [1:0]                 swz_q;
+    reg [SMEM_ADDR_WIDTH-1:0] swz_base_w_q;
+    reg [6:0]                 rd_step_q;
+    always @(posedge clk) begin
+        gather_q     <= tma_gather;
+        pf_q         <= tma.prefetch;
+        swz_q        <= tma.swizzle;
+        swz_base_w_q <= SMEM_ADDR_WIDTH'(tma.blk_base >> SMEM_OFF_W);
+        rd_step_q    <= 7'(tma.es0) << ((elem_bytes == 4'd8) ? 3 : (elem_bytes == 4'd4) ? 2 : (elem_bytes == 4'd2) ? 1 : 0);
+    end
+`endif
     always @(posedge clk) begin
         dest_mode_q       <= dest_mode;
         dest_kmajor_q     <= dest_kmajor;
@@ -145,6 +167,12 @@ module VX_dxa_smem_wr import VX_gpu_pkg::*, VX_dxa_pkg::*; #(
         lg_bkK_q          <= lg_bkK;
         smem_base_q       <= smem_base;
         per_lane_stride_q <= DXA_SMEM_ADDR_W'(per_lane_stride_bytes);
+    `ifdef DXA_MBAR_ENABLE
+        // A gathered row is written contiguously.
+        if (tma_gather) begin
+            per_lane_stride_q <= DXA_SMEM_ADDR_W'(elem_bytes);
+        end
+    `endif
     end
 
     // ════════════════════════════════════════════════════════════════════
@@ -152,7 +180,11 @@ module VX_dxa_smem_wr import VX_gpu_pkg::*, VX_dxa_pkg::*; #(
     // (permuted dest). Both drain 1 element/beat (vs row-major streaming).
     // ════════════════════════════════════════════════════════════════════
     wire dest_tiled = (dest_mode_q == DXA_DEST_FLAT) || (dest_mode_q == DXA_DEST_BLOCKMAJOR);
+`ifdef DXA_MBAR_ENABLE
+    wire scatter    = dest_kmajor_q || dest_tiled || gather_q;
+`else
     wire scatter    = dest_kmajor_q || dest_tiled;
+`endif
     // esize = log2(elem_bytes), for the tiled destination formula.
     wire [3:0] esize = (elem_bytes_q == 4'd8) ? 4'd3
                      : (elem_bytes_q == 4'd4) ? 4'd2
@@ -194,8 +226,18 @@ module VX_dxa_smem_wr import VX_gpu_pkg::*, VX_dxa_pkg::*; #(
     // Cfill replication (for OOB CLs)
     // ════════════════════════════════════════════════════════════════════
     wire [GMEM_DATAW-1:0] cfill_replicated;
+`ifdef DXA_MBAR_ENABLE
+    // CFILL byte (a & 3) lands at LMEM byte a, whatever the token's line offset.
+    wire [1:0]  fill_rot  = 2'(sw_smem_byte_addr) - 2'(sw_byte_offset);
+    wire [63:0] cfill_2x  = {cfill, cfill};
+    wire [31:0] cfill_rot = cfill_2x[{1'b0, fill_rot, 3'b000} +: 32];
+`endif
     for (genvar i = 0; i < CL_SIZE / 4; ++i) begin : g_cfill
+    `ifdef DXA_MBAR_ENABLE
+        assign cfill_replicated[i*32 +: 32] = cfill_rot;
+    `else
         assign cfill_replicated[i*32 +: 32] = cfill;
+    `endif
     end
 
     // ════════════════════════════════════════════════════════════════════
@@ -220,6 +262,9 @@ module VX_dxa_smem_wr import VX_gpu_pkg::*, VX_dxa_pkg::*; #(
     // fb-load. Width FILL_CAP (CL + one SMEM word of in-word-offset headroom).
     reg [FILL_CAP*8-1:0]      pend_data_r;
     reg [COARSE_W-1:0]        pend_coarse_r;
+`ifdef DXA_MBAR_ENABLE
+    reg                       pend_gth_r, defer_gth_r, fb_gth_r;  // a gathered (read, not filled) line
+`endif
 
     // ════════════════════════════════════════════════════════════════════
     // Deferred-last slot — holds the CL marked `last` while other CLs
@@ -349,6 +394,13 @@ module VX_dxa_smem_wr import VX_gpu_pkg::*, VX_dxa_pkg::*; #(
     // sw_ready conditions:
     //   - If sw is the last-to-defer: defer is empty → accept.
     //   - Else: pend can capture → accept.
+`ifdef DXA_MBAR_ENABLE
+    assign sw_ready = pf_q || (sw_is_last_defer ? can_defer : can_capture_pend);
+
+    wire sw_accept     = sw_valid && sw_ready;
+    wire sw_defer_path = sw_accept && sw_is_last_defer && ~pf_q;
+    wire sw_pend_path  = sw_accept && ~sw_is_last_defer && ~pf_q;
+`else
     assign sw_ready = sw_is_last_defer ? can_defer : can_capture_pend;
 
     wire sw_accept     = sw_valid && sw_ready;
@@ -357,6 +409,7 @@ module VX_dxa_smem_wr import VX_gpu_pkg::*, VX_dxa_pkg::*; #(
     // so the fb-load source is always a register; only the shallow coarse shift is
     // on the load path. The extra cycle is at fill-empty boundaries only.
     wire sw_pend_path  = sw_accept && ~sw_is_last_defer;
+`endif
 
     // Deferred-CL promotion to fb: fires when fb is emptying and we are
     // about to be down to 1 outstanding (= just the deferred).
@@ -493,7 +546,11 @@ module VX_dxa_smem_wr import VX_gpu_pkg::*, VX_dxa_pkg::*; #(
                     // Read pointer advances; fb_data_r is NOT shifted. K-major
                     // strides the dest uniformly; tiled advances it by the
                     // in-block/wrap constant selected by the registered flag.
+                `ifdef DXA_MBAR_ENABLE
+                    km_rd_off_r    <= km_rd_off_r + CL_OFF_BITS'(fb_gth_r ? rd_step_q : 7'(elem_bytes_q));
+                `else
                     km_rd_off_r    <= km_rd_off_r + CL_OFF_BITS'(elem_bytes_q);
+                `endif
                     fb_level_r     <= fb_level_r - drain_q_bytes;
                     fb_byte_addr_r <= fb_byte_addr_r
                         + (dest_tiled ? (fb_n_wrap_r ? tiled_wrap_q : tiled_step_q)
@@ -525,6 +582,9 @@ module VX_dxa_smem_wr import VX_gpu_pkg::*, VX_dxa_pkg::*; #(
                 fb_tag_r         <= fb_load_tag;
                 fb_last_r        <= fb_load_last;
                 fb_active_r      <= 1'b1;
+            `ifdef DXA_MBAR_ENABLE
+                fb_gth_r         <= use_pend_for_fb ? pend_gth_r : defer_gth_r;
+            `endif
             end else if (drain_emptying_now) begin
                 fb_data_r   <= '0;
                 fb_level_r  <= '0;
@@ -567,6 +627,9 @@ module VX_dxa_smem_wr import VX_gpu_pkg::*, VX_dxa_pkg::*; #(
                 pend_calc_r           <= dest_tiled;
                 pend_addr_rdy_r       <= ~dest_tiled;
                 pend_valid_r          <= 1'b1;
+            `ifdef DXA_MBAR_ENABLE
+                pend_gth_r            <= gather_q && ~sw_oob;
+            `endif
             end else if (use_pend_for_fb) begin
                 pend_valid_r <= 1'b0;
             end
@@ -584,6 +647,9 @@ module VX_dxa_smem_wr import VX_gpu_pkg::*, VX_dxa_pkg::*; #(
                 defer_calc_r           <= dest_tiled;
                 defer_addr_rdy_r       <= ~dest_tiled;
                 defer_valid_r          <= 1'b1;
+            `ifdef DXA_MBAR_ENABLE
+                defer_gth_r            <= gather_q && ~sw_oob;
+            `endif
             end else if (use_defer_for_fb) begin
                 defer_valid_r <= 1'b0;
             end
@@ -595,8 +661,25 @@ module VX_dxa_smem_wr import VX_gpu_pkg::*, VX_dxa_pkg::*; #(
     // ════════════════════════════════════════════════════════════════════
     wire drain_complete = drain_fire && drain_will_empty;
 
+`ifdef DXA_MBAR_ENABLE
+    // A prefetch is done when its last line is taken and no other is left.
+    reg pf_last_seen_r;
+    always @(posedge clk) begin
+        if (reset || transfer_start) begin
+            pf_last_seen_r <= 1'b0;
+        end else if (pf_q && ((sw_accept && sw_last) || pf_end)) begin
+            pf_last_seen_r <= 1'b1;
+        end
+    end
+    wire pf_seen = sw_last || pf_last_seen_r || pf_end;
+    wire pf_done = pf_q && ((sw_accept && (sw_outstanding == SEQ_W'(1)) && pf_seen)
+                         || (pf_end && (sw_outstanding == SEQ_W'(0))));
+    assign release_en  = pf_q ? sw_accept : drain_complete;
+    assign release_tag = pf_q ? sw_tag : fb_tag_r;
+`else
     assign release_en  = drain_complete;
     assign release_tag = fb_tag_r;
+`endif
 
     // ════════════════════════════════════════════════════════════════════
     // SMEM write output (with optional multicast replay)
@@ -744,7 +827,33 @@ module VX_dxa_smem_wr import VX_gpu_pkg::*, VX_dxa_pkg::*; #(
     // fb_word_addr_r in row-major (streamed). Replay adds the serviced
     // receiver's offset.
     wire [SMEM_ADDR_WIDTH-1:0] base_word_addr = scatter ? km_word_addr : fb_word_addr_r;
+`ifdef DXA_MBAR_ENABLE
+    // Swizzle on the block-relative word: the XOR's bits above the word
+    // move the word, those inside it swap its 16-byte chunks. The replay
+    // adds the receivers' offsets after.
+    localparam SWZ_TOP    = (SMEM_OFF_W < 7) ? SMEM_OFF_W : 7;
+    localparam SWZ_STAGES = (SWZ_TOP > 4) ? (SWZ_TOP - 4) : 0;
+    wire [SMEM_ADDR_WIDTH-1:0] swz_rel = base_word_addr - swz_base_w_q;
+    wire [SMEM_ADDR_WIDTH+SMEM_OFF_W-1:0] swz_rel_b = {swz_rel, SMEM_OFF_W'(0)};
+    wire [2:0] swz_m  = (swz_q == 2'd1) ? 3'b001 : (swz_q == 2'd2) ? 3'b011 : (swz_q == 2'd3) ? 3'b111 : 3'b000;
+    wire [2:0] swz_xv = 3'(swz_rel_b >> 7) & swz_m;
+    wire [6:0] swz_x  = {swz_xv, 4'b0000};
+    wire [SMEM_ADDR_WIDTH-1:0] swz_word = swz_base_w_q + (swz_rel ^ SMEM_ADDR_WIDTH'(swz_x >> SMEM_OFF_W));
+    wire [SWZ_STAGES:0][SMEM_DATAW-1:0]     swz_d;
+    wire [SWZ_STAGES:0][SMEM_WORD_SIZE-1:0] swz_e;
+    assign swz_d[0] = fb_word_data;
+    assign swz_e[0] = fb_word_byteen;
+    for (genvar t = 0; t < SWZ_STAGES; ++t) begin : g_swz
+        for (genvar i = 0; i < SMEM_WORD_SIZE; ++i) begin : g_bytes
+            localparam J = i ^ (1 << (4 + t));
+            assign swz_d[t+1][i*8 +: 8] = swz_x[4 + t] ? swz_d[t][J*8 +: 8] : swz_d[t][i*8 +: 8];
+            assign swz_e[t+1][i]        = swz_x[4 + t] ? swz_e[t][J] : swz_e[t][i];
+        end
+    end
+    wire [SMEM_ADDR_WIDTH-1:0] replay_addr  = swz_word + beat_offset_r;
+`else
     wire [SMEM_ADDR_WIDTH-1:0] replay_addr  = base_word_addr + beat_offset_r;
+`endif
     // Only the low SMEM_ADDR_WIDTH+SMEM_OFF_W bits of the stride are used.
     `UNUSED_VAR (tbl_stride)
     // per_lane_stride_bytes is LMEM-bounded; only the low DXA_SMEM_ADDR_W bits feed fb_byte_addr_r.
@@ -754,7 +863,11 @@ module VX_dxa_smem_wr import VX_gpu_pkg::*, VX_dxa_pkg::*; #(
     end
 
     assign smem_wr_valid   = mc_write_valid;
+`ifdef DXA_MBAR_ENABLE
+    assign smem_wr_addr    = is_multicast ? replay_addr : swz_word;
+`else
     assign smem_wr_addr    = is_multicast ? replay_addr : base_word_addr;
+`endif
     assign smem_req_fire   = mc_write_fire;
 
     wire is_last_drain = fb_last_r && drain_will_empty;
@@ -778,8 +891,13 @@ module VX_dxa_smem_wr import VX_gpu_pkg::*, VX_dxa_pkg::*; #(
     assign smem_bus_if.req_valid       = smem_wr_valid;
     assign smem_bus_if.req_data.rw     = 1'b1;
     assign smem_bus_if.req_data.addr   = smem_wr_addr;
+`ifdef DXA_MBAR_ENABLE
+    assign smem_bus_if.req_data.data   = swz_d[SWZ_STAGES];
+    assign smem_bus_if.req_data.byteen = swz_e[SWZ_STAGES];
+`else
     assign smem_bus_if.req_data.data   = fb_word_data;
     assign smem_bus_if.req_data.byteen = fb_word_byteen;
+`endif
 `ifdef DXA_MBAR_ENABLE
     // A cluster multicast's receivers each take their last beat with their
     // own block, mbarrier and route; any other mbarrier transfer has one.
@@ -818,7 +936,11 @@ module VX_dxa_smem_wr import VX_gpu_pkg::*, VX_dxa_pkg::*; #(
     end
 
     assign wr_done_count = wr_count_r;
+`ifdef DXA_MBAR_ENABLE
+    assign transfer_done = transfer_active && (pf_q ? pf_done : (smem_req_fire && smem_wr_last_pkt));
+`else
     assign transfer_done = transfer_active && smem_req_fire && smem_wr_last_pkt;
+`endif
 
 `ifdef PERF_ENABLE
     reg [31:0] wrp_total_lmem_writes_r;
@@ -842,7 +964,11 @@ module VX_dxa_smem_wr import VX_gpu_pkg::*, VX_dxa_pkg::*; #(
             end
             if (smem_req_fire) begin
                 $write("DXA_PIPE,%0d,SMEM_WR,addr=0x%0h,byteen=0x%0h,last=%0d\n",
+                `ifdef DXA_MBAR_ENABLE
+                    $time, smem_wr_addr, swz_e[SWZ_STAGES], smem_wr_last_pkt);
+                `else
                     $time, smem_wr_addr, fb_word_byteen, smem_wr_last_pkt);
+                `endif
             end
         `ifdef DXA_MBAR_ENABLE
             if (smem_req_fire && mc_cluster) begin

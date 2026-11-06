@@ -66,6 +66,10 @@ module VX_dxa_addr_gen import VX_gpu_pkg::*, VX_dxa_pkg::*; #(
     output wire [15:0]                 out_k_row,    // dim1 index (K-row) of this CL
     output wire [15:0]                 out_n_base,   // N index of this CL's element 0
     output wire [DXA_SMEM_ADDR_W-1:0]  out_smem_base // tile SMEM byte base (for tiled dest)
+`ifdef DXA_MBAR_ENABLE
+    // A prefetch walk ended after tokens it dropped (a pulse).
+  , output wire                        out_pf_end
+`endif
 );
     localparam VLEN_W      = CL_OFF_BITS + 1;
 
@@ -85,7 +89,11 @@ module VX_dxa_addr_gen import VX_gpu_pkg::*, VX_dxa_pkg::*; #(
     // Outer-dim odometer.
     reg [DXA_MAX_OUTER_DIMS-1:0][31:0] dim_count_r;   // Current index per dim
     reg [DXA_MAX_OUTER_DIMS-1:0][31:0] dim_last_r;    // Last index per dim (tile-1)
+`ifdef DXA_MBAR_ENABLE
+    reg [DXA_MAX_OUTER_DIMS-1:0][`VX_CFG_MEM_ADDR_WIDTH-1:0] delta_r;  // Wrap delta per dim, signed
+`else
     reg [DXA_MAX_OUTER_DIMS-1:0][31:0] delta_r;       // Wrap delta per dim
+`endif
     reg [DXA_MAX_OUTER_DIMS-1:0][31:0] oob_limit_r;   // OOB limit per dim
 
     // SMEM byte address tracking.
@@ -130,7 +138,87 @@ module VX_dxa_addr_gen import VX_gpu_pkg::*, VX_dxa_pkg::*; #(
     assign out_n_base     = n_base_r;
     assign out_smem_base  = tiled_base_r;
 
+`ifdef DXA_MBAR_ENABLE
+    // ════════════════════════════════════════════════════════════════════
+    // Row-major box walk (PTX tile and im2col modes). A row (one outer
+    // index, an im2col pixel) is up to three segments: the dim-0 elements
+    // before lo0 and from hi0 on are filled (LEAD, TRAIL), the rest read
+    // (IB), or filled too when an outer coordinate is out of bounds. LEAD and
+    // TRAIL split into tokens at line boundaries of their LMEM address, IB at
+    // those of its global address; with a dim-0 element stride an IB token is
+    // one line's elements, gathered by smem_wr.
+    // setup_params stay stable until transfer_done, after the last token.
+    // ════════════════════════════════════════════════════════════════════
+    localparam SEG_LEAD = 2'd0, SEG_IB = 2'd1, SEG_TRAIL = 2'd2;
+    localparam ND = DXA_MAX_OUTER_DIMS;
+    dxa_tma_params_t tp;
+    assign tp = setup_params.tma;
+
+    reg                    tma_r;
+    reg [1:0]              seg_r;
+    reg                    row_oob_r;
+    reg [CL_OFF_BITS-1:0]  first_off_r;
+    reg [ND-1:0][DXA_X_W-1:0] xcnt_r;   // outer coordinates of the row
+    reg [ND-1:0][`VX_CFG_MEM_ADDR_WIDTH-1:0] acmp_r;  // im2col address components, from the first pixel's
+    reg                    pf_end_r;
+    reg [10:0]             pix_r;
+    reg [`VX_CFG_MEM_ADDR_WIDTH-1:0] gth_addr_r;   // next gathered element
+    reg [DXA_N0_W-1:0]     gth_rem_r;
+
+    wire [1:0]  esz      = start_km_esize;
+    wire [31:0] lead_b   = 32'(tp.lo0) << esz;
+    wire [DXA_N0_W-1:0] ib_e = tp.hi0 - tp.lo0;
+    wire [31:0] ib_b     = 32'(ib_e) << esz;
+    wire [31:0] trail_b  = 32'(tp.n0 - tp.hi0) << esz;
+    wire        gather   = tma_r && (tp.es0 != 4'd1);
+
+    // A prefetch reads only: it walks no LEAD or TRAIL, and skips an
+    // out-of-bounds row in one cycle; a box with no in-bounds dim-0 element ends at start.
+    wire pf_walk  = tp.prefetch;
+    wire pf_skip  = active_r && tma_r && pf_walk && row_oob_r;
+    wire pf_empty = tp.en && pf_walk && (ib_e == 0);
+    wire lead_on  = ~pf_walk && (lead_b != 0);
+    wire trail_on = ~pf_walk && (trail_b != 0);
+
+    wire [1:0] row_seg0 = lead_on ? SEG_LEAD : ((ib_e != 0) ? SEG_IB : SEG_TRAIL);
+
+    // The segment after seg_r in its row.
+    wire [1:0] seg_next = (seg_r == SEG_LEAD && ib_e != 0) ? SEG_IB : SEG_TRAIL;
+    wire seg_has_next = ~pf_skip && (((seg_r == SEG_LEAD) && ((ib_e != 0) || trail_on))
+                                  || ((seg_r == SEG_IB) && trail_on));
+
+    // Gathered IB token: the line's elements from the next one, every es0.
+    localparam CNT_W = CL_OFF_BITS + 1;
+    function automatic [CNT_W+3:0] small_divmod(input [CNT_W-1:0] n, input [3:0] d);
+        logic [4:0] rem;
+        logic [CNT_W-1:0] q;
+        rem = '0;
+        q   = '0;
+        for (int i = CNT_W-1; i >= 0; --i) begin
+            rem = {rem[3:0], n[i]};
+            if (rem >= 5'(d)) begin
+                rem  = rem - 5'(d);
+                q[i] = 1'b1;
+            end
+        end
+        small_divmod = {q, rem[3:0]};
+    endfunction
+    wire [CNT_W-1:0] g_ph    = CNT_W'(gth_addr_r[CL_OFF_BITS-1:0] >> esz);
+    wire [CNT_W-1:0] g_avail = CNT_W'(GMEM_LINE_SIZE >> esz) - g_ph;
+    wire [CNT_W+3:0] g_qr    = small_divmod(g_avail - CNT_W'(1), tp.es0);
+    wire [CNT_W-1:0] g_cnt_line = g_qr[CNT_W+3:4] + CNT_W'(1);
+    wire [3:0]       g_res   = tp.es0 - 4'd1 - g_qr[3:0];
+    wire             g_last  = (gth_rem_r <= DXA_N0_W'(g_cnt_line));
+    wire [CNT_W-1:0] g_cnt   = g_last ? CNT_W'(gth_rem_r) : g_cnt_line;
+    wire [`VX_CFG_MEM_ADDR_WIDTH-1:0] g_next =
+        {gth_addr_r[`VX_CFG_MEM_ADDR_WIDTH-1:CL_OFF_BITS] + 1'b1, CL_OFF_BITS'(0)}
+      + (`VX_CFG_MEM_ADDR_WIDTH'(g_res) << esz);
+    wire g_tok = gather && (seg_r == SEG_IB);
+
+    wire [CL_OFF_BITS-1:0] first_off = tma_r ? first_off_r : gmem_cursor_r[CL_OFF_BITS-1:0];
+`else
     wire [CL_OFF_BITS-1:0] first_off = gmem_cursor_r[CL_OFF_BITS-1:0];
+`endif
 
     // ---- Narrow token: byte_offset + valid_length ----
     // is_last_line is a decremented trip-count reaching 1 — a register-fed
@@ -161,6 +249,20 @@ module VX_dxa_addr_gen import VX_gpu_pkg::*, VX_dxa_pkg::*; #(
     wire is_last_outer = dim0_last && dim1_last && dim2_last && dim3_last;
 
     // ---- Output ----
+`ifdef DXA_MBAR_ENABLE
+    wire tok_seg_last = pf_skip || (g_tok ? g_last : is_last_line);
+    wire is_last_row  = tp.im2col ? (pix_r == (tp.ppc - 11'd1)) : is_last_outer;
+    wire [VLEN_W-1:0] tok_len = g_tok ? VLEN_W'(g_cnt << esz) : cur_valid_length;
+    assign out_valid          = active_r && ~pf_skip;
+    assign out_pf_end         = pf_end_r;
+    assign out_cl_addr        = g_tok ? gth_addr_r[`VX_CFG_MEM_ADDR_WIDTH-1:CL_OFF_BITS] : cl_addr_r;
+    assign out_smem_byte_addr = smem_byte_addr_r;
+    assign out_byte_offset    = g_tok ? gth_addr_r[CL_OFF_BITS-1:0] : cur_byte_offset;
+    assign out_valid_length   = tok_len;
+    assign out_oob            = tma_r ? ((seg_r != SEG_IB) || row_oob_r) : is_oob;
+    assign out_last           = tma_r ? (tok_seg_last && ~seg_has_next && is_last_row)
+                                      : (is_last_line && is_last_outer);
+`else
     assign out_valid          = active_r;
     assign out_cl_addr        = cl_addr_r;
     assign out_smem_byte_addr = smem_byte_addr_r;
@@ -168,6 +270,7 @@ module VX_dxa_addr_gen import VX_gpu_pkg::*, VX_dxa_pkg::*; #(
     assign out_valid_length   = cur_valid_length;
     assign out_oob            = is_oob;
     assign out_last           = is_last_line && is_last_outer;
+`endif
 
     // ---- Advance logic ----
     wire advance = out_valid && out_ready;
@@ -179,11 +282,19 @@ module VX_dxa_addr_gen import VX_gpu_pkg::*, VX_dxa_pkg::*; #(
     wire dim2_steps = ~dim2_last;
     // dim3 must step otherwise (we already checked is_last_outer).
 
+`ifdef DXA_MBAR_ENABLE
+    wire [`VX_CFG_MEM_ADDR_WIDTH-1:0] step_delta =
+        dim0_steps ? delta_r[0] :
+        dim1_steps ? delta_r[1] :
+        dim2_steps ? delta_r[2] :
+                     delta_r[3];
+`else
     wire [`VX_CFG_MEM_ADDR_WIDTH-1:0] step_delta =
         dim0_steps ? `VX_CFG_MEM_ADDR_WIDTH'(delta_r[0]) :
         dim1_steps ? `VX_CFG_MEM_ADDR_WIDTH'(delta_r[1]) :
         dim2_steps ? `VX_CFG_MEM_ADDR_WIDTH'(delta_r[2]) :
                      `VX_CFG_MEM_ADDR_WIDTH'(delta_r[3]);
+`endif
 
     // K-major SMEM step = (elements in this CL) * per_lane_stride/esize.
     //   Interior CL: valid_length == LINE, so step == tile1 << log2(LINE) — a
@@ -212,6 +323,62 @@ module VX_dxa_addr_gen import VX_gpu_pkg::*, VX_dxa_pkg::*; #(
     function automatic logic [VLEN_W-1:0] calc_last_vend(input logic [CL_OFF_BITS-1:0] off);
         calc_last_vend = (off == '0) ? VLEN_W'(GMEM_LINE_SIZE) : {1'b0, off};
     endfunction
+
+`ifdef DXA_MBAR_ENABLE
+    // ---- Row wrap: the next row's outer coordinates and cursor ----
+    // Tile: the odometer's dims wrap at their last index, back to the first
+    // coordinate. im2col: a pixel coordinate past xhi wraps to xlo; a carry
+    // out of the spatial dims steps the batch (whose xhi never wraps).
+    wire [ND-1:0] dim_wrap_t = {dim3_last, dim2_last, dim1_last, dim0_last};
+    wire [ND-1:0] dim_wrap;
+    wire [ND:0]   dim_carry;
+    wire [ND-1:0][DXA_X_W-1:0] x_next;
+    wire [ND-1:0][`VX_CFG_MEM_ADDR_WIDTH-1:0] a_next;
+    assign dim_carry[0] = 1'b1;
+    for (genvar d = 0; d < ND; ++d) begin : g_odo
+        wire [DXA_X_W-1:0] x_step = xcnt_r[d] + DXA_X_W'(tp.es[d]);
+        assign dim_wrap[d] = tp.im2col ? ($signed(x_step) > $signed(tp.xhi[d])) : dim_wrap_t[d];
+        assign dim_carry[d+1] = dim_carry[d] && dim_wrap[d];
+        assign x_next[d] = ~dim_carry[d] ? xcnt_r[d]
+                         : (dim_wrap[d] ? (tp.im2col ? tp.xlo[d] : tp.xinit[d]) : x_step);
+        assign a_next[d] = ~dim_carry[d] ? acmp_r[d]
+                         : (dim_wrap[d] ? tp.alo[d] : (acmp_r[d] + delta_r[d]));
+    end
+    `UNUSED_VAR (dim_carry[ND])
+    function automatic logic oob_of(input logic [ND-1:0][DXA_X_W-1:0] x, input logic [ND-1:0][31:0] sz);
+        oob_of = 1'b0;
+        for (int d = 0; d < ND; ++d) begin
+            if (x[d][DXA_X_W-1] || (x[d][DXA_X_W-2:0] >= (DXA_X_W-1)'(sz[d]))) oob_of = 1'b1;
+        end
+    endfunction
+    wire oob_next = oob_of(x_next, tp.size);
+    wire [`VX_CFG_MEM_ADDR_WIDTH-1:0] i2c_cursor = setup_params.initial_gmem_base
+        + a_next[0] + a_next[1] + a_next[2] + a_next[3];
+
+    // ---- Segment entry: at start, at a segment switch, at a row wrap ----
+    wire start_oob = oob_of(tp.xinit, tp.size);
+    wire wrap_now  = tok_seg_last && ~seg_has_next;
+    wire [`VX_CFG_MEM_ADDR_WIDTH-1:0] row_cursor = tp.im2col ? i2c_cursor : next_cursor;
+    wire [DXA_SMEM_ADDR_W-1:0] smem_after = smem_byte_addr_r + DXA_SMEM_ADDR_W'(tok_len);
+    wire [1:0] ent_seg = (start || wrap_now) ? row_seg0 : seg_next;
+    wire [CL_OFF_BITS-1:0] ent_smem = start ? setup_params.initial_smem_base[CL_OFF_BITS-1:0]
+                                            : smem_after[CL_OFF_BITS-1:0];
+    wire [`VX_CFG_MEM_ADDR_WIDTH-1:0] ent_cursor = start ? setup_params.initial_gmem_base
+                                                 : (wrap_now ? row_cursor : gmem_cursor_r);
+    wire [CL_OFF_BITS-1:0] ent_off = (ent_seg == SEG_IB) ? ent_cursor[CL_OFF_BITS-1:0] : ent_smem;
+    always @(posedge clk) begin
+        if (reset) begin
+            pf_end_r <= 1'b0;
+        end else begin
+            pf_end_r <= start ? pf_empty : (pf_skip && wrap_now && is_last_row);
+        end
+    end
+    // The writer's constants.
+    `UNUSED_VAR (tp.swizzle)
+    `UNUSED_VAR (tp.blk_base)
+    wire [31:0] ent_len = (ent_seg == SEG_LEAD) ? lead_b : ((ent_seg == SEG_IB) ? ib_b : trail_b);
+    wire [31:0] ent_span = 32'(ent_off) + ent_len;
+`endif
 
     always @(posedge clk) begin
         if (reset) begin
@@ -242,6 +409,11 @@ module VX_dxa_addr_gen import VX_gpu_pkg::*, VX_dxa_pkg::*; #(
             for (int d = 0; d < DXA_MAX_OUTER_DIMS; d++) begin
                 dim_count_r[d] <= '0;
             end
+        `ifdef DXA_MBAR_ENABLE
+            tma_r            <= 1'b0;
+            seg_r            <= SEG_IB;
+            row_oob_r        <= 1'b0;
+        `endif
         end else if (start) begin
             active_r         <= 1'b1;
             gmem_cursor_r    <= setup_params.initial_gmem_base;
@@ -272,7 +444,75 @@ module VX_dxa_addr_gen import VX_gpu_pkg::*, VX_dxa_pkg::*; #(
                 delta_r[d]     <= setup_params.delta[d];
                 oob_limit_r[d] <= setup_params.oob_limit[d];
             end
+        `ifdef DXA_MBAR_ENABLE
+            tma_r    <= tp.en;
+            if (pf_empty) begin
+                active_r <= 1'b0;
+            end
+            if (tp.en) begin
+                seg_r        <= ent_seg;
+                row_oob_r    <= start_oob;
+                first_off_r  <= ent_off;
+                lines_left_r <= calc_num_lines(ent_span);
+                last_vend_r  <= calc_last_vend(ent_span[CL_OFF_BITS-1:0]);
+                gth_addr_r   <= ent_cursor;
+                gth_rem_r    <= ib_e;
+                xcnt_r       <= tp.xinit;
+                acmp_r       <= '0;
+                pix_r        <= '0;
+            end
+        `endif
+`ifdef DXA_MBAR_ENABLE
+        end else if (advance || pf_skip) begin
+          if (tma_r) begin
+            smem_byte_addr_r <= smem_after;
+            if (wrap_now && is_last_row) begin
+                active_r <= 1'b0;
+            end else if (tok_seg_last) begin
+                // Next segment of the row, or the next row's first.
+                seg_r        <= ent_seg;
+                first_off_r  <= ent_off;
+                cl_addr_r    <= ent_cursor[`VX_CFG_MEM_ADDR_WIDTH-1:CL_OFF_BITS];
+                lines_left_r <= calc_num_lines(ent_span);
+                is_first_r   <= 1'b1;
+                last_vend_r  <= calc_last_vend(ent_span[CL_OFF_BITS-1:0]);
+                gth_addr_r   <= ent_cursor;
+                gth_rem_r    <= ib_e;
+                if (wrap_now) begin
+                    row_oob_r     <= oob_next;
+                    gmem_cursor_r <= row_cursor;
+                    xcnt_r        <= x_next;
+                    acmp_r        <= a_next;
+                    pix_r         <= pix_r + 11'd1;
+                    if (dim0_steps) begin
+                        dim_count_r[0] <= dim_count_r[0] + 1;
+                    end else begin
+                        dim_count_r[0] <= '0;
+                        if (dim1_steps) begin
+                            dim_count_r[1] <= dim_count_r[1] + 1;
+                        end else begin
+                            dim_count_r[1] <= '0;
+                            if (dim2_steps) begin
+                                dim_count_r[2] <= dim_count_r[2] + 1;
+                            end else begin
+                                dim_count_r[2] <= '0;
+                                dim_count_r[3] <= dim_count_r[3] + 1;
+                            end
+                        end
+                    end
+                end
+            end else if (g_tok) begin
+                gth_addr_r <= g_next;
+                gth_rem_r  <= gth_rem_r - DXA_N0_W'(g_cnt_line);
+            end else begin
+                cl_addr_r    <= cl_addr_r + 1;
+                lines_left_r <= lines_left_r - 1;
+                is_first_r   <= 1'b0;
+            end
+          end else begin
+`else
         end else if (advance) begin
+`endif
             // SMEM byte address advance:
             //   Row-major: linear += valid_length.
             //   K-major:   per-CL += km_step (scatter each element to its column
@@ -331,6 +571,9 @@ module VX_dxa_addr_gen import VX_gpu_pkg::*, VX_dxa_pkg::*; #(
                 // Tiled scatter: advance N by the elements drained from this CL.
                 n_base_r     <= n_base_r + 16'(cur_valid_length >> km_esize_r);
             end
+        `ifdef DXA_MBAR_ENABLE
+          end
+        `endif
         end
     end
 
@@ -341,7 +584,11 @@ module VX_dxa_addr_gen import VX_gpu_pkg::*, VX_dxa_pkg::*; #(
     always @(posedge clk) begin
         if (~reset && advance) begin
             $write("DXA_PIPE,%0d,AG_OUT,addr=0x%0h,off=%0d,len=%0d,oob=%0d,last=%0d,dim={%0d,%0d,%0d,%0d},left=%0d,smem=0x%0h\n",
+            `ifdef DXA_MBAR_ENABLE
+                $time, out_cl_addr, out_byte_offset, out_valid_length, out_oob, out_last,
+            `else
                 $time, cl_addr_r, cur_byte_offset, cur_valid_length, is_oob, out_last,
+            `endif
                 dim_count_r[0], dim_count_r[1], dim_count_r[2], dim_count_r[3],
                 lines_left_r, smem_byte_addr_r);
         end

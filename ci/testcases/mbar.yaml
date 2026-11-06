@@ -43,7 +43,7 @@ defaults:
             hw/rtl/tcu, sim/simx/tcu, sw/kernel/include/vx_tensor.h,
             tests/regression/sgemm_tcu_wg_mbar, tests/regression/sgemm_tcu_mx_mbar,
             sim/simx/mbar_waiters, sim/simx/Makefile, tests/regression/mbar_wait,
-            tests/regression/mbar_remote]
+            tests/regression/mbar_remote, sw/common/dxa_ref.h, sw/common/dxa_meta.h]
 tests:
   # One block of 4 warps x 4 threads. basic: every thread arrives with 1 and
   # waits on its token for 32 phases; the stores before each arrive must be
@@ -660,7 +660,8 @@ tests:
               sw/common/mbar_ref.h, sw/kernel/include/vx_dxa.h, sw/kernel/include/vx_mbar.h,
               tests/regression/dxa_mbar, tests/regression/dxa_copy,
               tests/regression/dxa_kmajor_check, VX_config.toml, hw/rtl/core/VX_cpa_unit.sv,
-              sim/simx/cpa_unit]
+              sim/simx/cpa_unit, sw/common/dxa_ref.h, sw/common/dxa_meta.h,
+              hw/rtl/core/VX_decode.sv, sim/simx/decode.cpp]
     args: "-r 8"
   - id: dxa_mbar-legacy
     app: dxa_mbar
@@ -1405,4 +1406,282 @@ tests:
     driver: rtlsim
     touches: *e4_touches
     env: {DRIVER: rtlsim, APP: cp_async, ARGS: "-x encoding", EXPECT: "invalid cp.async encoding"}
+    run: *expect_fail_run
+
+  # --- PTX tensor loads (dxa_load, funct3 = 2) ---
+  # cp.async.bulk.tensor.{1..5}d.shared::cluster.global.{tile,im2col}
+  # .mbarrier::complete_tx::bytes and the tensor prefetch. Every block fills its
+  # local memory with canaries and arms its mbarrier with the bytes it will
+  # receive; warp 0 issues the loads; the host checks every byte of every
+  # block against sw/common/dxa_ref.h (box, per-element fill, swizzle, im2col
+  # walk, canaries) and the final mbarrier word against mbar_ref. Runs that do
+  # not fit one local memory or 16 descriptors use several launches.
+  # 2D boxes that run past size0 (and size1): only the elements inside the
+  # tensor are read, the rest is zero-filled.
+  - id: dxa_load-edge
+    app: dxa_load
+    drivers: [simx, rtlsim]
+    configs+: "-DVX_CFG_EXT_DXA_ENABLE"
+    touches: &dxa_load_touches [hw/rtl/dxa, sim/simx/dxa, hw/rtl/core/VX_mem_unit.sv,
+              hw/rtl/mem/VX_local_mem.sv, hw/rtl/core/VX_cta_dispatch.sv, hw/rtl/core/VX_core.sv,
+              hw/rtl/core/VX_execute.sv, hw/rtl/core/VX_sfu_unit.sv, hw/rtl/core/VX_wctl_unit.sv,
+              hw/rtl/core/VX_bar_unit.sv, hw/rtl/VX_socket.sv, hw/rtl/VX_gpu_pkg.sv,
+              hw/rtl/VX_define.vh, hw/rtl/cache/VX_amo_alu.sv, hw/rtl/cache/VX_amo_unit.sv,
+              hw/rtl/dlmem, hw/rtl/mem/VX_lmem_switch.sv, hw/rtl/VX_kmu.sv,
+              hw/rtl/VX_cluster.sv, hw/rtl/interfaces, sim/simx/mem/local_mem,
+              sim/simx/core, sim/simx/socket, sim/simx/cta_dispatcher, sim/simx/types.h,
+              sim/simx/mbar_waiters, sim/simx/amo, sim/simx/scheduler, sim/simx/barrier_unit,
+              sim/simx/sfu_unit, sim/simx/Makefile, sim/simx/dlmem, sim/simx/kmu,
+              sim/simx/cluster, hw/rtl/core/VX_scheduler.sv,
+              sw/common/mbar_ref.h, sw/common/dlmem_ref.h, sw/kernel/include/vx_dxa.h,
+              sw/kernel/include/vx_mbar.h, sw/kernel/include/vx_dlmem.h,
+              sw/kernel/include/vx_barrier.h,
+              tests/regression/dxa_mbar, tests/regression/dxa_copy,
+              tests/regression/dxa_kmajor_check, VX_config.toml, hw/rtl/core/VX_cpa_unit.sv,
+              sim/simx/cpa_unit, tests/regression/dxa_load, sw/common/dxa_ref.h,
+              sw/common/dxa_meta.h, sw/runtime/include/dxa.h, hw/rtl/core/VX_decode.sv,
+              sim/simx/decode.cpp]
+    args: "-m edge"
+  # Signed coordinates, boxes starting at -1 (and further) in dims 0 and 1.
+  - id: dxa_load-halo
+    app: dxa_load
+    drivers: [simx, rtlsim]
+    configs+: "-DVX_CFG_EXT_DXA_ENABLE"
+    touches: *dxa_load_touches
+    args: "-m halo"
+  # 5D boxes larger than the tensor, filled on both sides of every dim.
+  - id: dxa_load-oob5
+    app: dxa_load
+    drivers: [simx, rtlsim]
+    configs+: "-DVX_CFG_EXT_DXA_ENABLE"
+    touches: *dxa_load_touches
+    args: "-m oob5"
+  # OOB-NaN fill: f16 0x7FFF, f32 and f64 0x7FFFFFFF per 32-bit word.
+  - id: dxa_load-nan
+    app: dxa_load
+    drivers: [simx, rtlsim]
+    configs+: "-DVX_CFG_EXT_DXA_ENABLE"
+    touches: *dxa_load_touches
+    args: "-m nan"
+  # Element strides 1-8 in dims 1-4 of a 5D box, with fill.
+  - id: dxa_load-es
+    app: dxa_load
+    drivers: [simx, rtlsim]
+    configs+: "-DVX_CFG_EXT_DXA_ENABLE"
+    touches: *dxa_load_touches
+    args: "-m es"
+  - id: dxa_load-swz32
+    app: dxa_load
+    drivers: [simx, rtlsim]
+    configs+: "-DVX_CFG_EXT_DXA_ENABLE"
+    touches: *dxa_load_touches
+    args: "-m swz -s 32"
+  - id: dxa_load-swz64
+    app: dxa_load
+    drivers: [simx, rtlsim]
+    configs+: "-DVX_CFG_EXT_DXA_ENABLE"
+    touches: *dxa_load_touches
+    args: "-m swz -s 64"
+  - id: dxa_load-swz128
+    app: dxa_load
+    drivers: [simx, rtlsim]
+    configs+: "-DVX_CFG_EXT_DXA_ENABLE"
+    touches: *dxa_load_touches
+    args: "-m swz -s 128"
+  # Interleave: 16B with dim-0 element strides 1, 2 and 4; 32B with 32B swizzle.
+  - id: dxa_load-il16
+    app: dxa_load
+    drivers: [simx, rtlsim]
+    configs+: "-DVX_CFG_EXT_DXA_ENABLE"
+    touches: *dxa_load_touches
+    args: "-m il16"
+  - id: dxa_load-il32
+    app: dxa_load
+    drivers: [simx, rtlsim]
+    configs+: "-DVX_CFG_EXT_DXA_ENABLE"
+    touches: *dxa_load_touches
+    args: "-m il32"
+  # im2col at ranks 3-5: corners, offsets, traversal strides, channel and image
+  # fill, 64B swizzle (i2c4); and the three PTX §5.5.4 examples.
+  - id: dxa_load-i2c3
+    app: dxa_load
+    drivers: [simx, rtlsim]
+    configs+: "-DVX_CFG_EXT_DXA_ENABLE"
+    touches: *dxa_load_touches
+    args: "-m i2c3"
+  - id: dxa_load-i2c4
+    app: dxa_load
+    drivers: [simx, rtlsim]
+    configs+: "-DVX_CFG_EXT_DXA_ENABLE"
+    touches: *dxa_load_touches
+    args: "-m i2c4"
+  - id: dxa_load-i2c5
+    app: dxa_load
+    drivers: [simx, rtlsim]
+    configs+: "-DVX_CFG_EXT_DXA_ENABLE"
+    touches: *dxa_load_touches
+    args: "-m i2c5"
+  - id: dxa_load-i2c-ptx
+    app: dxa_load
+    drivers: [simx, rtlsim]
+    configs+: "-DVX_CFG_EXT_DXA_ENABLE"
+    touches: *dxa_load_touches
+    args: "-m i2c-ptx"
+  # Tensor prefetch (tile, im2col) then the same loads: the data is identical
+  # and the prefetch writes nothing.
+  - id: dxa_load-pf
+    app: dxa_load
+    drivers: [simx, rtlsim]
+    configs+: "-DVX_CFG_EXT_DXA_ENABLE"
+    touches: *dxa_load_touches
+    args: "-m pf"
+  # 16 banks: 128-byte local-memory words, so one swizzle row is one word.
+  - id: dxa_load-b16
+    app: dxa_load
+    drivers: [simx, rtlsim]
+    configs+: "-DVX_CFG_EXT_DXA_ENABLE -DVX_CFG_LMEM_NUM_BANKS=16"
+    touches: *dxa_load_touches
+    args: "-m swz -s 128"
+  # A SPREAD cluster of 2 on 2 cores: a multicast with 128B swizzle into both
+  # ranks and one without the issuer; a window destination with a raw window
+  # mbarrier on the peer (both directions, one swizzled); each block into
+  # itself through its own window address.
+  - id: dxa_load-mc
+    app: dxa_load
+    drivers: [simx, rtlsim]
+    configs+: "-DVX_CFG_EXT_DXA_ENABLE"
+    touches: *dxa_load_touches
+    shape: {cores: 2, l2cache: true}
+    args: "-m mc"
+  - id: dxa_load-win
+    app: dxa_load
+    drivers: [simx, rtlsim]
+    configs+: "-DVX_CFG_EXT_DXA_ENABLE"
+    touches: *dxa_load_touches
+    shape: {cores: 2, l2cache: true}
+    args: "-m win"
+  - id: dxa_load-selfwin
+    app: dxa_load
+    drivers: [simx, rtlsim]
+    configs+: "-DVX_CFG_EXT_DXA_ENABLE"
+    touches: *dxa_load_touches
+    shape: {cores: 2, l2cache: true}
+    args: "-m selfwin"
+  # Parity at XLEN 64, in the perf mode (the loads repeated 8 times, no
+  # canaries, no dump): a 2D box with 128B swizzle and fill on both dims, 4D
+  # im2col, 5D boxes out of bounds on both sides of every dim (whole rows
+  # filled), and a dim-0 gather with 32B interleave; every wait is one
+  # try_wait (4096-cycle limit).
+  - id: parity-dxa-load-swz
+    check: model_parity
+    app: dxa_load
+    xlen: [64]
+    configs+: "-DVX_CFG_EXT_DXA_ENABLE -DVX_CFG_MBAR_SUSPEND_CYCLES=4096"
+    touches: *dxa_load_touches
+    args: "-m swz-oob -p"
+  - id: parity-dxa-load-i2c
+    check: model_parity
+    app: dxa_load
+    xlen: [64]
+    configs+: "-DVX_CFG_EXT_DXA_ENABLE -DVX_CFG_MBAR_SUSPEND_CYCLES=4096"
+    touches: *dxa_load_touches
+    args: "-m i2c4 -p"
+  - id: parity-dxa-load-oob
+    check: model_parity
+    app: dxa_load
+    xlen: [64]
+    configs+: "-DVX_CFG_EXT_DXA_ENABLE -DVX_CFG_MBAR_SUSPEND_CYCLES=4096"
+    touches: *dxa_load_touches
+    args: "-m oob5 -p"
+  - id: parity-dxa-load-gather
+    check: model_parity
+    app: dxa_load
+    xlen: [64]
+    configs+: "-DVX_CFG_EXT_DXA_ENABLE -DVX_CFG_MBAR_SUSPEND_CYCLES=4096"
+    touches: *dxa_load_touches
+    args: "-m il32 -p"
+  # Tensor loads that must stop the simulation with the exact message.
+  - id: dxa_load-x-mbar-align
+    via: script
+    driver: simx
+    configs+: "-DVX_CFG_EXT_DXA_ENABLE"
+    touches: *dxa_load_touches
+    env: {DRIVER: simx, APP: dxa_load, ARGS: "-x mbar-align", EXPECT: "DXA mbarrier must be 8-byte aligned"}
+    run: *expect_fail_run
+  - id: dxa_load-x-mbar-align
+    via: script
+    driver: rtlsim
+    configs+: "-DVX_CFG_EXT_DXA_ENABLE"
+    touches: *dxa_load_touches
+    env: {DRIVER: rtlsim, APP: dxa_load, ARGS: "-x mbar-align", EXPECT: "DXA mbarrier must be 8-byte aligned"}
+    run: *expect_fail_run
+  - id: dxa_load-x-swz-align
+    via: script
+    driver: simx
+    configs+: "-DVX_CFG_EXT_DXA_ENABLE"
+    touches: *dxa_load_touches
+    env: {DRIVER: simx, APP: dxa_load, ARGS: "-x swz-align", EXPECT: "DXA swizzle needs a 128-byte aligned destination"}
+    run: *expect_fail_run
+  - id: dxa_load-x-swz-align
+    via: script
+    driver: rtlsim
+    configs+: "-DVX_CFG_EXT_DXA_ENABLE"
+    touches: *dxa_load_touches
+    env: {DRIVER: rtlsim, APP: dxa_load, ARGS: "-x swz-align", EXPECT: "DXA swizzle needs a 128-byte aligned destination"}
+    run: *expect_fail_run
+  - id: dxa_load-x-swz-span
+    via: script
+    driver: simx
+    configs+: "-DVX_CFG_EXT_DXA_ENABLE"
+    touches: *dxa_load_touches
+    env: {DRIVER: simx, APP: dxa_load, ARGS: "-x swz-span", EXPECT: "DXA swizzle span smaller than the inner box"}
+    run: *expect_fail_run
+  - id: dxa_load-x-swz-span
+    via: script
+    driver: rtlsim
+    configs+: "-DVX_CFG_EXT_DXA_ENABLE"
+    touches: *dxa_load_touches
+    env: {DRIVER: rtlsim, APP: dxa_load, ARGS: "-x swz-span", EXPECT: "DXA swizzle span smaller than the inner box"}
+    run: *expect_fail_run
+  - id: dxa_load-x-es0
+    via: script
+    driver: simx
+    configs+: "-DVX_CFG_EXT_DXA_ENABLE"
+    touches: *dxa_load_touches
+    env: {DRIVER: simx, APP: dxa_load, ARGS: "-x es0", EXPECT: "DXA element stride on dimension 0 needs interleave"}
+    run: *expect_fail_run
+  - id: dxa_load-x-es0
+    via: script
+    driver: rtlsim
+    configs+: "-DVX_CFG_EXT_DXA_ENABLE"
+    touches: *dxa_load_touches
+    env: {DRIVER: rtlsim, APP: dxa_load, ARGS: "-x es0", EXPECT: "DXA element stride on dimension 0 needs interleave"}
+    run: *expect_fail_run
+  - id: dxa_load-x-il32
+    via: script
+    driver: simx
+    configs+: "-DVX_CFG_EXT_DXA_ENABLE"
+    touches: *dxa_load_touches
+    env: {DRIVER: simx, APP: dxa_load, ARGS: "-x il32", EXPECT: "DXA 32B interleave needs 32B swizzle"}
+    run: *expect_fail_run
+  - id: dxa_load-x-il32
+    via: script
+    driver: rtlsim
+    configs+: "-DVX_CFG_EXT_DXA_ENABLE"
+    touches: *dxa_load_touches
+    env: {DRIVER: rtlsim, APP: dxa_load, ARGS: "-x il32", EXPECT: "DXA 32B interleave needs 32B swizzle"}
+    run: *expect_fail_run
+  - id: dxa_load-x-layout
+    via: script
+    driver: simx
+    configs+: "-DVX_CFG_EXT_DXA_ENABLE"
+    touches: *dxa_load_touches
+    env: {DRIVER: simx, APP: dxa_load, ARGS: "-x layout", EXPECT: "DXA swizzle and element strides need the row-major layout"}
+    run: *expect_fail_run
+  - id: dxa_load-x-layout
+    via: script
+    driver: rtlsim
+    configs+: "-DVX_CFG_EXT_DXA_ENABLE"
+    touches: *dxa_load_touches
+    env: {DRIVER: rtlsim, APP: dxa_load, ARGS: "-x layout", EXPECT: "DXA swizzle and element strides need the row-major layout"}
     run: *expect_fail_run

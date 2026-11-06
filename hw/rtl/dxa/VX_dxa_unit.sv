@@ -126,15 +126,31 @@ module VX_dxa_unit import VX_gpu_pkg::*, VX_dxa_pkg::*; #(
 `endif
 `ifdef DXA_MBAR_ENABLE
     // A bulk copy names no descriptor and no box: an mbarrier-mode meta of
-    // descriptor 0, zero coordinates and no multicast.
-    wire is_bulk = execute_if.data.op_args.dxa.bulk;
-    assign dxa_req_data_in.meta      = is_bulk ? 32'hC0000000 : lane1_rs1[31:0];
-    assign dxa_req_data_in.coords[0] = is_bulk ? 32'd0 : lane2_rs1[31:0];
-    assign dxa_req_data_in.coords[1] = is_bulk ? 32'd0 : lane3_rs1[31:0];
-    assign dxa_req_data_in.coords[2] = is_bulk ? 32'd0 : lane0_rs2[31:0];
-    assign dxa_req_data_in.coords[3] = is_bulk ? 32'd0 : lane1_rs2[31:0];
-    assign dxa_req_data_in.coords[4] = is_bulk ? 32'd0 : lane2_rs2[31:0];
-    assign dxa_req_data_in.cta_mask  = is_bulk ? '0 : lane3_rs2[`VX_CFG_NUM_WARPS-1:0];
+    // descriptor 0, zero coordinates and no multicast. A tensor load
+    // (funct3 2) packs two coordinates per lane and its descriptor slot and
+    // prefetch flag in lane 0 rs2[36:32]; its multicast mask is lane 1 rs2.
+    wire is_bulk  = execute_if.data.op_args.dxa.bulk;
+    wire is_tload = execute_if.data.op_args.dxa.tload;
+    wire is_bload = execute_if.data.op_args.dxa.bload;
+    wire is_bpf   = execute_if.data.op_args.dxa.bprefetch;
+    wire is_lin   = is_bulk || is_bload || is_bpf;
+    wire is_raw   = is_bulk || is_tload || is_bload;
+    wire is_pf    = (is_tload && lane0_rs2[36]) || is_bpf;
+    wire [31:0] tl_meta = {2'b11, 26'd0, lane0_rs2[35:32]};
+    assign dxa_req_data_in.meta      = is_tload ? tl_meta : (is_lin ? 32'hC0000000 : lane1_rs1[31:0]);
+    assign dxa_req_data_in.coords[0] = is_lin ? 32'd0 : lane2_rs1[31:0];
+    assign dxa_req_data_in.coords[1] = is_lin ? 32'd0 : (is_tload ? lane2_rs1[63:32] : lane3_rs1[31:0]);
+    assign dxa_req_data_in.coords[2] = is_lin ? 32'd0 : (is_tload ? lane3_rs1[31:0] : lane0_rs2[31:0]);
+    assign dxa_req_data_in.coords[3] = is_lin ? 32'd0 : (is_tload ? lane3_rs1[63:32] : lane1_rs2[31:0]);
+    assign dxa_req_data_in.coords[4] = is_lin ? 32'd0 : (is_tload ? lane0_rs2[31:0] : lane2_rs2[31:0]);
+    assign dxa_req_data_in.cta_mask  = (is_lin || is_tload) ? '0 : lane3_rs2[`VX_CFG_NUM_WARPS-1:0];
+    assign dxa_req_data_in.tload     = is_tload;
+    assign dxa_req_data_in.bload     = is_bload;
+    assign dxa_req_data_in.prefetch  = is_pf;
+    assign dxa_req_data_in.offs[0]   = is_tload ? lane1_rs2[31:16] : 16'd0;
+    assign dxa_req_data_in.offs[1]   = is_tload ? lane1_rs2[47:32] : 16'd0;
+    assign dxa_req_data_in.offs[2]   = is_tload ? lane1_rs2[63:48] : 16'd0;
+    assign dxa_req_data_in.gsrc      = (is_bload || is_bpf) ? lane2_rs1[`VX_CFG_MEM_ADDR_WIDTH-1:0] : '0;
 `else
     assign dxa_req_data_in.meta      = lane1_rs1[31:0];
     assign dxa_req_data_in.coords[0] = lane2_rs1[31:0];
@@ -167,7 +183,8 @@ module VX_dxa_unit import VX_gpu_pkg::*, VX_dxa_pkg::*; #(
         assign dst_rank = '0;
     end
     wire [LMEM_LOG-1:0] dst_off = lane0_rs1[LMEM_LOG-1:0];
-    wire dst_win = ((lane0_rs1 >> WIN_LSB) == (DLMEM_BASE_B >> WIN_LSB));
+    // A prefetch has no destination.
+    wire dst_win = ~is_pf && ((lane0_rs1 >> WIN_LSB) == (DLMEM_BASE_B >> WIN_LSB));
 
     wire mbar_mode = lane1_rs1[30];
     wire mbar_win  = mbar_mode && lane1_rs1[29];
@@ -184,32 +201,6 @@ module VX_dxa_unit import VX_gpu_pkg::*, VX_dxa_pkg::*; #(
     wire [LMEM_LOG-1:0] mbar_base = peer_slot_base[mbar_peer.slot];
     `UNUSED_VAR (mbar_base[2:0])
 
-    // A multicast in mbarrier mode names cluster ranks: every masked rank gets
-    // the data and its mbarrier at the issuer's own block-relative offsets.
-    wire mc_mode    = ~is_bulk && mbar_mode && (lane3_rs2[31:0] != '0);
-    wire mc_cluster = mc_mode && ~dst_win && ~mbar_win;
-    wire [LMEM_LOG-1:0] own_base = peer_slot_base[issue_slot];
-    wire [LMEM_LOG-1:0] mc_off   = lmem_rel_byte_addr[LMEM_LOG-1:0] - own_base;
-    wire [DXA_MBAR_OFF_W-1:0] mc_mbar_rel = mbar_off_w - own_base[LMEM_LOG-1:3];
-    wire [LMEM_LOG:0] mc_room = ({1'b0, mc_off} < peer_stride) ? (peer_stride - (LMEM_LOG+1)'(mc_off)) : '0;
-
-    dxa_mc_peer_t [DLMEM_MAX_CLUSTER-1:0] mc_peers;
-    wire [DLMEM_MAX_CLUSTER-1:0] row_other;
-    for (genvar r = 0; r < DLMEM_MAX_CLUSTER; ++r) begin : g_mc_peers
-        assign mc_peers[r].remote = (peer_row.peers[r].core != DLMEM_CORE_W'(MY_CORE));
-        assign mc_peers[r].core   = peer_row.peers[r].core;
-        assign mc_peers[r].slot   = peer_row.peers[r].slot;
-        assign mc_peers[r].gen    = cta_slot_gen[peer_row.peers[r].slot];
-        assign row_other[r] = (32'(r) < 32'(peer_row.k)) && mc_peers[r].remote;
-    end
-
-    assign dxa_req_data_in.smem_addr = mc_cluster ? mc_off
-                                     : (dst_win ? (dst_base + dst_off) : lmem_rel_byte_addr[DXA_SMEM_ADDR_W-1:0]);
-    assign dxa_req_data_in.slot      = dst_slot;
-    assign dxa_req_data_in.gen       = cta_slot_gen[dst_slot];
-    assign dxa_req_data_in.remote    = dst_remote;
-    assign dxa_req_data_in.dst_core  = dst_peer.core;
-    assign dxa_req_data_in.dst_slot  = dst_peer.slot;
     // A bulk copy's lane 1 is a raw mbarrier pointer, decoded like lane 0:
     // a window rank of the issuer's cluster, or a local address.
     localparam [`VX_CFG_XLEN-1:0] LMEM_BASE_B = `VX_CFG_XLEN'(`VX_MEM_LMEM_BASE_ADDR);
@@ -230,17 +221,55 @@ module VX_dxa_unit import VX_gpu_pkg::*, VX_dxa_pkg::*; #(
     wire [LMEM_LOG-1:0] bk_mb_lmem = bk_mb_win ? (bk_mb_base + bk_mb_off) : bk_mb_rel[LMEM_LOG-1:0];
     `UNUSED_VAR (bk_mb_lmem[2:0])
 
-    assign dxa_req_data_in.mbar_off  = is_bulk ? bk_mb_lmem[LMEM_LOG-1:3]
-                                     : mc_cluster ? mc_mbar_rel
+    // A multicast in mbarrier mode names cluster ranks: every masked rank gets
+    // the data and its mbarrier at the issuer's own block-relative offsets.
+    // The raw forms (funct3 1..3) decode their mbarrier pointer as above.
+    wire [31:0] mc_mask_w = (is_tload || is_bload) ? 32'(lane1_rs2[15:0]) : lane3_rs2[31:0];
+    wire mbar_mode_e = is_raw || mbar_mode;
+    wire mbar_win_e  = is_raw ? bk_mb_win : mbar_win;
+    wire mc_mode    = ~is_bulk && ~is_pf && mbar_mode_e && (mc_mask_w != '0);
+    wire mc_cluster = mc_mode && ~dst_win && ~mbar_win_e;
+    wire [LMEM_LOG-1:0] own_base = peer_slot_base[issue_slot];
+    wire [LMEM_LOG-1:0] mc_off   = lmem_rel_byte_addr[LMEM_LOG-1:0] - own_base;
+    wire [DXA_MBAR_OFF_W-1:0] mc_mbar_rel = (is_raw ? bk_mb_lmem[LMEM_LOG-1:3] : mbar_off_w) - own_base[LMEM_LOG-1:3];
+    wire [LMEM_LOG:0] mc_room = ({1'b0, mc_off} < peer_stride) ? (peer_stride - (LMEM_LOG+1)'(mc_off)) : '0;
+    // A local destination's bytes up to the end of the issuer's block.
+    wire [`VX_CFG_XLEN-1:0] own_off = lmem_rel_byte_addr - `VX_CFG_XLEN'(own_base);
+    wire [LMEM_LOG:0] own_room = (own_off < `VX_CFG_XLEN'(peer_stride)) ? (peer_stride - (LMEM_LOG+1)'(own_off)) : '0;
+
+    dxa_mc_peer_t [DLMEM_MAX_CLUSTER-1:0] mc_peers;
+    wire [DLMEM_MAX_CLUSTER-1:0] row_other;
+    for (genvar r = 0; r < DLMEM_MAX_CLUSTER; ++r) begin : g_mc_peers
+        assign mc_peers[r].remote = (peer_row.peers[r].core != DLMEM_CORE_W'(MY_CORE));
+        assign mc_peers[r].core   = peer_row.peers[r].core;
+        assign mc_peers[r].slot   = peer_row.peers[r].slot;
+        assign mc_peers[r].gen    = cta_slot_gen[peer_row.peers[r].slot];
+        assign row_other[r] = (32'(r) < 32'(peer_row.k)) && mc_peers[r].remote;
+    end
+
+    assign dxa_req_data_in.smem_addr = mc_cluster ? mc_off
+                                     : (dst_win ? (dst_base + dst_off) : lmem_rel_byte_addr[DXA_SMEM_ADDR_W-1:0]);
+    assign dxa_req_data_in.blk_base  = mc_cluster ? '0 : (dst_win ? dst_base : own_base);
+    assign dxa_req_data_in.slot      = dst_slot;
+    assign dxa_req_data_in.gen       = cta_slot_gen[dst_slot];
+    assign dxa_req_data_in.remote    = dst_remote;
+    assign dxa_req_data_in.dst_core  = dst_peer.core;
+    assign dxa_req_data_in.dst_slot  = dst_peer.slot;
+    assign dxa_req_data_in.mbar_off  = mc_cluster ? mc_mbar_rel
+                                     : is_raw ? bk_mb_lmem[LMEM_LOG-1:3]
                                      : (mbar_win ? (mbar_base[LMEM_LOG-1:3] + mbar_off_w) : mbar_off_w);
     assign dxa_req_data_in.win       = dst_win;
-    assign dxa_req_data_in.win_room  = mc_cluster ? mc_room : (peer_stride - (LMEM_LOG+1)'(dst_off));
+    assign dxa_req_data_in.win_room  = mc_cluster ? mc_room
+                                     : (dst_win ? (peer_stride - (LMEM_LOG+1)'(dst_off)) : own_room);
     assign dxa_req_data_in.mc_cluster = mc_cluster;
-    assign dxa_req_data_in.mc_mask   = lane3_rs2[DLMEM_MAX_CLUSTER-1:0];
+    assign dxa_req_data_in.mc_mask   = mc_mask_w[DLMEM_MAX_CLUSTER-1:0];
     assign dxa_req_data_in.mc_peers  = mc_peers;
     assign dxa_req_data_in.bulk      = is_bulk;
     assign dxa_req_data_in.src_addr  = bk_src_rel[LMEM_LOG-1:0];
-    assign dxa_req_data_in.size      = bk_size[LMEM_LOG:0];
+    // A bulk prefetch is a hint: it reads at most the local memory's size.
+    wire [31:0] bpf_size = bk_size[31:0];
+    wire bpf_clamp = (bpf_size > 32'(1 << LMEM_LOG));
+    assign dxa_req_data_in.size      = (is_bpf && bpf_clamp) ? (LMEM_LOG+1)'(1 << LMEM_LOG) : bk_size[LMEM_LOG:0];
 
     // Issue-time checks, simulation only.
     wire dst_oob  = dst_win && ((32'(dst_rank) >= 32'(peer_row.k)) || ({1'b0, dst_off} >= peer_stride));
@@ -266,6 +295,12 @@ module VX_dxa_unit import VX_gpu_pkg::*, VX_dxa_pkg::*; #(
     wire bk_mbar    = (~bk_mb_win && ~bk_mb_in) || (dst_blk_core != bk_mb_core) || (dst_slot != bk_mb_slot);
     wire bk_box     = (bk_dst_off >= `VX_CFG_XLEN'(peer_stride))
                    || (bk_size > (`VX_CFG_XLEN'(peer_stride) - bk_dst_off));
+    // A global source (bload, bulk prefetch) has the same 16-byte rules.
+    wire gb_align   = (is_bpf ? (bpf_size == '0) : (bk_size == '0)) || (bk_size[3:0] != '0) || (lane2_rs1[3:0] != '0)
+                   || (is_bload && (bk_dst_off[3:0] != '0));
+    // An LMEM-to-LMEM copy by a local pointer or by its own rank names the issuer's block.
+    wire bk_self    = ~dst_win || ((dst_peer.core == DLMEM_CORE_W'(MY_CORE)) && (dst_peer.slot == issue_slot));
+    wire mb_misalign = (lane1_rs1[2:0] != '0);
 `endif
     // smem_addr (LMEM byte width) and meta/coords (32-bit ABI) take low bits;
     // high bits unused when XLEN exceeds the field width
@@ -288,9 +323,11 @@ module VX_dxa_unit import VX_gpu_pkg::*, VX_dxa_pkg::*; #(
 
 `ifdef DXA_MBAR_ENABLE
     wire bulk_fire  = fire && is_send && is_bulk;
-    wire issue_fire = fire && is_send && ~is_bulk;
+    wire issue_fire = fire && is_send && ~is_raw && ~is_bpf;
+    wire ld_fire    = fire && is_send && (is_tload || is_bload) && ~is_pf;
+    wire bpf_fire   = fire && is_send && is_bpf;
     wire is_mcast   = ($countones(dxa_req_data_in.cta_mask) > 1);
-    wire mc_rank_oob = ((lane3_rs2[31:0] >> peer_row.k) != '0);
+    wire mc_rank_oob = ((mc_mask_w >> peer_row.k) != '0);
     wire mc_mbar_oob = ({1'b0, mc_mbar_rel, 3'b0} >= (LMEM_LOG+1)'(peer_stride));
     `RUNTIME_ASSERT(~(issue_fire && mc_mode && (dst_win || mbar_win)),
         ("%t: *** %s DXA multicast needs a local address: wid=%0d smem=0x%0h meta=0x%0h cta_mask=0x%0h",
@@ -313,19 +350,50 @@ module VX_dxa_unit import VX_gpu_pkg::*, VX_dxa_pkg::*; #(
     `RUNTIME_ASSERT(~(issue_fire && dst_win && ~mbar_mode),
         ("%t: *** %s DXA cluster destination needs an mbarrier: wid=%0d smem=0x%0h meta=0x%0h",
          $time, INSTANCE_ID, execute_if.data.header.wid, lane0_rs1, lane1_rs1))
-    `RUNTIME_ASSERT(~(bulk_fire && bk_align),
+    `RUNTIME_ASSERT(~((bulk_fire || ld_fire) && mb_misalign),
+        ("%t: *** %s DXA mbarrier must be 8-byte aligned: wid=%0d mbar=0x%0h",
+         $time, INSTANCE_ID, execute_if.data.header.wid, lane1_rs1))
+    wire bk_ok0 = bulk_fire && ~mb_misalign;
+    `RUNTIME_ASSERT(~(bk_ok0 && bk_align),
         ("%t: *** %s DXA bulk copy needs 16-byte size and alignment: wid=%0d dst=0x%0h src=0x%0h size=%0d",
          $time, INSTANCE_ID, execute_if.data.header.wid, lane0_rs1, lane2_rs1, lane3_rs1))
-    `RUNTIME_ASSERT(~(bulk_fire && ~bk_align && bk_src_out),
+    `RUNTIME_ASSERT(~(bk_ok0 && ~bk_align && bk_src_out),
         ("%t: *** %s DXA bulk copy source outside the block: wid=%0d src=0x%0h size=%0d stride=0x%0h",
          $time, INSTANCE_ID, execute_if.data.header.wid, lane2_rs1, lane3_rs1, peer_stride))
-    `RUNTIME_ASSERT(~(bulk_fire && ~bk_align && ~bk_src_out && bk_rank),
+    `RUNTIME_ASSERT(~(bk_ok0 && ~bk_align && ~bk_src_out && bk_rank),
         ("%t: *** %s DXA destination rank outside the cluster: wid=%0d dst=0x%0h mbar=0x%0h k=%0d stride=0x%0h",
          $time, INSTANCE_ID, execute_if.data.header.wid, lane0_rs1, lane1_rs1, peer_row.k, peer_stride))
-    `RUNTIME_ASSERT(~(bulk_fire && ~bk_align && ~bk_src_out && ~bk_rank && bk_mbar),
+    `RUNTIME_ASSERT(~(bk_ok0 && ~bk_align && ~bk_src_out && ~bk_rank && bk_self),
+        ("%t: *** %s DXA bulk copy into the issuing block: wid=%0d dst=0x%0h",
+         $time, INSTANCE_ID, execute_if.data.header.wid, lane0_rs1))
+    `RUNTIME_ASSERT(~(bk_ok0 && ~bk_align && ~bk_src_out && ~bk_rank && ~bk_self && bk_mbar),
         ("%t: *** %s DXA mbarrier must be in the destination block: wid=%0d dst=0x%0h mbar=0x%0h",
          $time, INSTANCE_ID, execute_if.data.header.wid, lane0_rs1, lane1_rs1))
-    `RUNTIME_ASSERT(~(bulk_fire && ~bk_align && ~bk_src_out && ~bk_rank && ~bk_mbar && bk_box),
+    `RUNTIME_ASSERT(~(bk_ok0 && ~bk_align && ~bk_src_out && ~bk_rank && ~bk_self && ~bk_mbar && bk_box),
+        ("%t: *** %s DXA box exceeds the destination block: wid=%0d dst=0x%0h size=%0d stride=0x%0h",
+         $time, INSTANCE_ID, execute_if.data.header.wid, lane0_rs1, lane3_rs1, peer_stride))
+    // Tensor loads and global-to-LMEM copies, with raw pointers.
+    wire ld_ok0 = ld_fire && ~mb_misalign && ~(is_bload && gb_align);
+    `RUNTIME_ASSERT(~((ld_fire && ~mb_misalign && is_bload && gb_align) || (bpf_fire && gb_align)),
+        ("%t: *** %s DXA bulk copy needs 16-byte size and alignment: wid=%0d dst=0x%0h src=0x%0h size=%0d",
+         $time, INSTANCE_ID, execute_if.data.header.wid, lane0_rs1, lane2_rs1, lane3_rs1))
+    `RUNTIME_ASSERT(~(ld_ok0 && mc_mode && (dst_win || bk_mb_win)),
+        ("%t: *** %s DXA multicast needs a local address: wid=%0d dst=0x%0h mbar=0x%0h cta_mask=0x%0h",
+         $time, INSTANCE_ID, execute_if.data.header.wid, lane0_rs1, lane1_rs1, mc_mask_w))
+    `RUNTIME_ASSERT(~(ld_ok0 && mc_mode && mc_rank_oob),
+        ("%t: *** %s DXA multicast rank outside the cluster: wid=%0d cta_mask=0x%0h k=%0d",
+         $time, INSTANCE_ID, execute_if.data.header.wid, mc_mask_w, peer_row.k))
+    `RUNTIME_ASSERT(~(ld_ok0 && mc_cluster && mc_mbar_oob),
+        ("%t: *** %s mbarrier offset outside the block: wid=%0d mbar=0x%0h stride=0x%0h",
+         $time, INSTANCE_ID, execute_if.data.header.wid, lane1_rs1, peer_stride))
+    `RUNTIME_ASSERT(~(ld_ok0 && ~mc_mode && bk_rank),
+        ("%t: *** %s DXA destination rank outside the cluster: wid=%0d dst=0x%0h mbar=0x%0h k=%0d stride=0x%0h",
+         $time, INSTANCE_ID, execute_if.data.header.wid, lane0_rs1, lane1_rs1, peer_row.k, peer_stride))
+    `RUNTIME_ASSERT(~(ld_ok0 && ~mc_mode && ~bk_rank && bk_mbar),
+        ("%t: *** %s DXA mbarrier must be in the destination block: wid=%0d dst=0x%0h mbar=0x%0h",
+         $time, INSTANCE_ID, execute_if.data.header.wid, lane0_rs1, lane1_rs1))
+    `RUNTIME_ASSERT(~(ld_ok0 && is_bload && ~(mc_mode && (dst_win || bk_mb_win || mc_rank_oob || mc_mbar_oob))
+                      && ~(~mc_mode && (bk_rank || bk_mbar)) && bk_box),
         ("%t: *** %s DXA box exceeds the destination block: wid=%0d dst=0x%0h size=%0d stride=0x%0h",
          $time, INSTANCE_ID, execute_if.data.header.wid, lane0_rs1, lane3_rs1, peer_stride))
 `endif

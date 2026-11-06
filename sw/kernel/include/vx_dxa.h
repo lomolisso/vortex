@@ -284,6 +284,274 @@ inline void vx_dxa_bulk_copy(void* dst, const void* src, uint32_t size, uint64_t
 inline void vx_fence_proxy_async(void) {
   __asm__ volatile (".insn r %0, 7, 1, x0, x0, x0" :: "i"(RISCV_CUSTOM2) : "memory");
 }
+
+// PTX tensor loads, cp.async.bulk.tensor.{1..5}d.shared::cluster.global
+// .{tile,im2col}.mbarrier::complete_tx::bytes: `dst` and `mbar` are each a
+// local pointer into the issuer's own block or a window address
+// (vx_cluster_map_shared_rank) of one block of its cluster, decoded by the
+// hardware, and `mbar` (8-byte aligned) must be in the block of `dst`. The
+// descriptor slot selects tile or im2col mode; coordinates are signed and a box
+// element outside the tensor is filled (zero or OOB-NaN). The engine applies
+// complete_tx(box bytes) to `mbar` once the box has landed. The _multicast
+// forms land in every block of the cluster whose rank is set in `cta_mask`, at
+// the block-relative offsets of the issuer's local `dst` and `mbar`. The _hint
+// forms take the .L2::cache_hint operand and drop it.
+// funct3 = 2: rs1 = wgather(dst, mbar, {c1, c0}, {c3, c2}),
+//             rs2 = wgather({ctl, c4}, {o3, o2, o1, cta_mask}, 0, 0), ctl = slot | prefetch << 4.
+
+#define VX_DXA_CTL_PREFETCH (1u << 4)
+
+inline size_t __vx_dxa_pair(int32_t lo, int32_t hi) {
+  return ((size_t)(uint32_t)hi << 32) | (size_t)(uint32_t)lo;
+}
+
+inline void __vx_dxa_tload(uint32_t ctl, void* dst, uint64_t* mbar,
+                           int32_t c0, int32_t c1, int32_t c2, int32_t c3, int32_t c4,
+                           uint32_t o1, uint32_t o2, uint32_t o3, uint32_t cta_mask) {
+  const size_t a0 = vx_wgather((size_t)(uintptr_t)dst,
+                               (size_t)(uintptr_t)mbar,
+                               __vx_dxa_pair(c0, c1),
+                               __vx_dxa_pair(c2, c3));
+  const size_t a1 = vx_wgather(((size_t)ctl << 32) | (size_t)(uint32_t)c4,
+                               ((size_t)(o3 & 0xFFFFu) << 48) | ((size_t)(o2 & 0xFFFFu) << 32)
+                                 | ((size_t)(o1 & 0xFFFFu) << 16) | (size_t)(cta_mask & 0xFFFFu),
+                               (size_t)0,
+                               (size_t)0);
+  __asm__ volatile (
+      ".insn r %0, 2, %1, x0, %2, %3\n\t"
+      :
+      : "i"(VX_DXA_EXT_OPCODE), "i"(VX_DXA_FUNCT7), "r"(a0), "r"(a1)
+      : "memory");
+}
+
+inline void vx_dxa_load_1d(uint32_t slot, void* dst, uint64_t* mbar, int32_t c0) {
+  __vx_dxa_tload(slot, dst, mbar, c0, 0, 0, 0, 0, 0, 0, 0, 0);
+}
+inline void vx_dxa_load_2d(uint32_t slot, void* dst, uint64_t* mbar, int32_t c0, int32_t c1) {
+  __vx_dxa_tload(slot, dst, mbar, c0, c1, 0, 0, 0, 0, 0, 0, 0);
+}
+inline void vx_dxa_load_3d(uint32_t slot, void* dst, uint64_t* mbar, int32_t c0, int32_t c1, int32_t c2) {
+  __vx_dxa_tload(slot, dst, mbar, c0, c1, c2, 0, 0, 0, 0, 0, 0);
+}
+inline void vx_dxa_load_4d(uint32_t slot, void* dst, uint64_t* mbar, int32_t c0, int32_t c1, int32_t c2,
+                           int32_t c3) {
+  __vx_dxa_tload(slot, dst, mbar, c0, c1, c2, c3, 0, 0, 0, 0, 0);
+}
+inline void vx_dxa_load_5d(uint32_t slot, void* dst, uint64_t* mbar, int32_t c0, int32_t c1, int32_t c2,
+                           int32_t c3, int32_t c4) {
+  __vx_dxa_tload(slot, dst, mbar, c0, c1, c2, c3, c4, 0, 0, 0, 0);
+}
+
+inline void vx_dxa_load_1d_multicast(uint32_t slot, void* dst, uint64_t* mbar, int32_t c0,
+                                     uint16_t cta_mask) {
+  __vx_dxa_tload(slot, dst, mbar, c0, 0, 0, 0, 0, 0, 0, 0, cta_mask);
+}
+inline void vx_dxa_load_2d_multicast(uint32_t slot, void* dst, uint64_t* mbar, int32_t c0, int32_t c1,
+                                     uint16_t cta_mask) {
+  __vx_dxa_tload(slot, dst, mbar, c0, c1, 0, 0, 0, 0, 0, 0, cta_mask);
+}
+inline void vx_dxa_load_3d_multicast(uint32_t slot, void* dst, uint64_t* mbar, int32_t c0, int32_t c1,
+                                     int32_t c2, uint16_t cta_mask) {
+  __vx_dxa_tload(slot, dst, mbar, c0, c1, c2, 0, 0, 0, 0, 0, cta_mask);
+}
+inline void vx_dxa_load_4d_multicast(uint32_t slot, void* dst, uint64_t* mbar, int32_t c0, int32_t c1,
+                                     int32_t c2, int32_t c3, uint16_t cta_mask) {
+  __vx_dxa_tload(slot, dst, mbar, c0, c1, c2, c3, 0, 0, 0, 0, cta_mask);
+}
+inline void vx_dxa_load_5d_multicast(uint32_t slot, void* dst, uint64_t* mbar, int32_t c0, int32_t c1,
+                                     int32_t c2, int32_t c3, int32_t c4, uint16_t cta_mask) {
+  __vx_dxa_tload(slot, dst, mbar, c0, c1, c2, c3, c4, 0, 0, 0, cta_mask);
+}
+
+// im2col: c0 = first channel, c1..c(R-2) = the filter base (w, h, d), c(R-1) = n;
+// o1..o3 = the im2col offsets for W, H, D.
+inline void vx_dxa_load_im2col_3d(uint32_t slot, void* dst, uint64_t* mbar, int32_t c0, int32_t c1,
+                                  int32_t c2, uint16_t o1) {
+  __vx_dxa_tload(slot, dst, mbar, c0, c1, c2, 0, 0, o1, 0, 0, 0);
+}
+inline void vx_dxa_load_im2col_4d(uint32_t slot, void* dst, uint64_t* mbar, int32_t c0, int32_t c1,
+                                  int32_t c2, int32_t c3, uint16_t o1, uint16_t o2) {
+  __vx_dxa_tload(slot, dst, mbar, c0, c1, c2, c3, 0, o1, o2, 0, 0);
+}
+inline void vx_dxa_load_im2col_5d(uint32_t slot, void* dst, uint64_t* mbar, int32_t c0, int32_t c1,
+                                  int32_t c2, int32_t c3, int32_t c4, uint16_t o1, uint16_t o2, uint16_t o3) {
+  __vx_dxa_tload(slot, dst, mbar, c0, c1, c2, c3, c4, o1, o2, o3, 0);
+}
+inline void vx_dxa_load_im2col_3d_multicast(uint32_t slot, void* dst, uint64_t* mbar, int32_t c0,
+                                            int32_t c1, int32_t c2, uint16_t o1, uint16_t cta_mask) {
+  __vx_dxa_tload(slot, dst, mbar, c0, c1, c2, 0, 0, o1, 0, 0, cta_mask);
+}
+inline void vx_dxa_load_im2col_4d_multicast(uint32_t slot, void* dst, uint64_t* mbar, int32_t c0,
+                                            int32_t c1, int32_t c2, int32_t c3, uint16_t o1, uint16_t o2,
+                                            uint16_t cta_mask) {
+  __vx_dxa_tload(slot, dst, mbar, c0, c1, c2, c3, 0, o1, o2, 0, cta_mask);
+}
+inline void vx_dxa_load_im2col_5d_multicast(uint32_t slot, void* dst, uint64_t* mbar, int32_t c0,
+                                            int32_t c1, int32_t c2, int32_t c3, int32_t c4, uint16_t o1,
+                                            uint16_t o2, uint16_t o3, uint16_t cta_mask) {
+  __vx_dxa_tload(slot, dst, mbar, c0, c1, c2, c3, c4, o1, o2, o3, cta_mask);
+}
+
+inline void vx_dxa_load_1d_hint(uint32_t slot, void* dst, uint64_t* mbar, int32_t c0, uint64_t l2_hint) {
+  (void)l2_hint;
+  vx_dxa_load_1d(slot, dst, mbar, c0);
+}
+inline void vx_dxa_load_2d_hint(uint32_t slot, void* dst, uint64_t* mbar, int32_t c0, int32_t c1,
+                                uint64_t l2_hint) {
+  (void)l2_hint;
+  vx_dxa_load_2d(slot, dst, mbar, c0, c1);
+}
+inline void vx_dxa_load_3d_hint(uint32_t slot, void* dst, uint64_t* mbar, int32_t c0, int32_t c1,
+                                int32_t c2, uint64_t l2_hint) {
+  (void)l2_hint;
+  vx_dxa_load_3d(slot, dst, mbar, c0, c1, c2);
+}
+inline void vx_dxa_load_4d_hint(uint32_t slot, void* dst, uint64_t* mbar, int32_t c0, int32_t c1,
+                                int32_t c2, int32_t c3, uint64_t l2_hint) {
+  (void)l2_hint;
+  vx_dxa_load_4d(slot, dst, mbar, c0, c1, c2, c3);
+}
+inline void vx_dxa_load_5d_hint(uint32_t slot, void* dst, uint64_t* mbar, int32_t c0, int32_t c1,
+                                int32_t c2, int32_t c3, int32_t c4, uint64_t l2_hint) {
+  (void)l2_hint;
+  vx_dxa_load_5d(slot, dst, mbar, c0, c1, c2, c3, c4);
+}
+inline void vx_dxa_load_1d_multicast_hint(uint32_t slot, void* dst, uint64_t* mbar, int32_t c0,
+                                          uint16_t cta_mask, uint64_t l2_hint) {
+  (void)l2_hint;
+  vx_dxa_load_1d_multicast(slot, dst, mbar, c0, cta_mask);
+}
+inline void vx_dxa_load_2d_multicast_hint(uint32_t slot, void* dst, uint64_t* mbar, int32_t c0, int32_t c1,
+                                          uint16_t cta_mask, uint64_t l2_hint) {
+  (void)l2_hint;
+  vx_dxa_load_2d_multicast(slot, dst, mbar, c0, c1, cta_mask);
+}
+inline void vx_dxa_load_3d_multicast_hint(uint32_t slot, void* dst, uint64_t* mbar, int32_t c0, int32_t c1,
+                                          int32_t c2, uint16_t cta_mask, uint64_t l2_hint) {
+  (void)l2_hint;
+  vx_dxa_load_3d_multicast(slot, dst, mbar, c0, c1, c2, cta_mask);
+}
+inline void vx_dxa_load_4d_multicast_hint(uint32_t slot, void* dst, uint64_t* mbar, int32_t c0, int32_t c1,
+                                          int32_t c2, int32_t c3, uint16_t cta_mask, uint64_t l2_hint) {
+  (void)l2_hint;
+  vx_dxa_load_4d_multicast(slot, dst, mbar, c0, c1, c2, c3, cta_mask);
+}
+inline void vx_dxa_load_5d_multicast_hint(uint32_t slot, void* dst, uint64_t* mbar, int32_t c0, int32_t c1,
+                                          int32_t c2, int32_t c3, int32_t c4, uint16_t cta_mask,
+                                          uint64_t l2_hint) {
+  (void)l2_hint;
+  vx_dxa_load_5d_multicast(slot, dst, mbar, c0, c1, c2, c3, c4, cta_mask);
+}
+inline void vx_dxa_load_im2col_3d_hint(uint32_t slot, void* dst, uint64_t* mbar, int32_t c0, int32_t c1,
+                                       int32_t c2, uint16_t o1, uint64_t l2_hint) {
+  (void)l2_hint;
+  vx_dxa_load_im2col_3d(slot, dst, mbar, c0, c1, c2, o1);
+}
+inline void vx_dxa_load_im2col_4d_hint(uint32_t slot, void* dst, uint64_t* mbar, int32_t c0, int32_t c1,
+                                       int32_t c2, int32_t c3, uint16_t o1, uint16_t o2, uint64_t l2_hint) {
+  (void)l2_hint;
+  vx_dxa_load_im2col_4d(slot, dst, mbar, c0, c1, c2, c3, o1, o2);
+}
+inline void vx_dxa_load_im2col_5d_hint(uint32_t slot, void* dst, uint64_t* mbar, int32_t c0, int32_t c1,
+                                       int32_t c2, int32_t c3, int32_t c4, uint16_t o1, uint16_t o2,
+                                       uint16_t o3, uint64_t l2_hint) {
+  (void)l2_hint;
+  vx_dxa_load_im2col_5d(slot, dst, mbar, c0, c1, c2, c3, c4, o1, o2, o3);
+}
+inline void vx_dxa_load_im2col_3d_multicast_hint(uint32_t slot, void* dst, uint64_t* mbar, int32_t c0,
+                                                 int32_t c1, int32_t c2, uint16_t o1, uint16_t cta_mask,
+                                                 uint64_t l2_hint) {
+  (void)l2_hint;
+  vx_dxa_load_im2col_3d_multicast(slot, dst, mbar, c0, c1, c2, o1, cta_mask);
+}
+inline void vx_dxa_load_im2col_4d_multicast_hint(uint32_t slot, void* dst, uint64_t* mbar, int32_t c0,
+                                                 int32_t c1, int32_t c2, int32_t c3, uint16_t o1, uint16_t o2,
+                                                 uint16_t cta_mask, uint64_t l2_hint) {
+  (void)l2_hint;
+  vx_dxa_load_im2col_4d_multicast(slot, dst, mbar, c0, c1, c2, c3, o1, o2, cta_mask);
+}
+inline void vx_dxa_load_im2col_5d_multicast_hint(uint32_t slot, void* dst, uint64_t* mbar, int32_t c0,
+                                                 int32_t c1, int32_t c2, int32_t c3, int32_t c4, uint16_t o1,
+                                                 uint16_t o2, uint16_t o3, uint16_t cta_mask,
+                                                 uint64_t l2_hint) {
+  (void)l2_hint;
+  vx_dxa_load_im2col_5d_multicast(slot, dst, mbar, c0, c1, c2, c3, c4, o1, o2, o3, cta_mask);
+}
+
+// cp.async.bulk.prefetch.tensor.{1..5}d.L2.global.{tile,im2col}: the engine
+// reads the box's in-bounds lines into the L2. No local-memory write, no
+// mbarrier, and the warp does not wait.
+inline void vx_dxa_prefetch_1d(uint32_t slot, int32_t c0) {
+  __vx_dxa_tload(slot | VX_DXA_CTL_PREFETCH, 0, 0, c0, 0, 0, 0, 0, 0, 0, 0, 0);
+}
+inline void vx_dxa_prefetch_2d(uint32_t slot, int32_t c0, int32_t c1) {
+  __vx_dxa_tload(slot | VX_DXA_CTL_PREFETCH, 0, 0, c0, c1, 0, 0, 0, 0, 0, 0, 0);
+}
+inline void vx_dxa_prefetch_3d(uint32_t slot, int32_t c0, int32_t c1, int32_t c2) {
+  __vx_dxa_tload(slot | VX_DXA_CTL_PREFETCH, 0, 0, c0, c1, c2, 0, 0, 0, 0, 0, 0);
+}
+inline void vx_dxa_prefetch_4d(uint32_t slot, int32_t c0, int32_t c1, int32_t c2, int32_t c3) {
+  __vx_dxa_tload(slot | VX_DXA_CTL_PREFETCH, 0, 0, c0, c1, c2, c3, 0, 0, 0, 0, 0);
+}
+inline void vx_dxa_prefetch_5d(uint32_t slot, int32_t c0, int32_t c1, int32_t c2, int32_t c3, int32_t c4) {
+  __vx_dxa_tload(slot | VX_DXA_CTL_PREFETCH, 0, 0, c0, c1, c2, c3, c4, 0, 0, 0, 0);
+}
+inline void vx_dxa_prefetch_im2col_3d(uint32_t slot, int32_t c0, int32_t c1, int32_t c2, uint16_t o1) {
+  __vx_dxa_tload(slot | VX_DXA_CTL_PREFETCH, 0, 0, c0, c1, c2, 0, 0, o1, 0, 0, 0);
+}
+inline void vx_dxa_prefetch_im2col_4d(uint32_t slot, int32_t c0, int32_t c1, int32_t c2, int32_t c3,
+                                      uint16_t o1, uint16_t o2) {
+  __vx_dxa_tload(slot | VX_DXA_CTL_PREFETCH, 0, 0, c0, c1, c2, c3, 0, o1, o2, 0, 0);
+}
+inline void vx_dxa_prefetch_im2col_5d(uint32_t slot, int32_t c0, int32_t c1, int32_t c2, int32_t c3,
+                                      int32_t c4, uint16_t o1, uint16_t o2, uint16_t o3) {
+  __vx_dxa_tload(slot | VX_DXA_CTL_PREFETCH, 0, 0, c0, c1, c2, c3, c4, o1, o2, o3, 0);
+}
+
+// cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes: the
+// engine copies `size` bytes from global memory at `gsrc` (a physical
+// address, VX_MEM_PHYS) to `dst`, then applies complete_tx(size) to `mbar`.
+// `dst` and `mbar` follow the tensor-load rules; `size` is a nonzero multiple
+// of 16 and `gsrc` and `dst` are 16-byte aligned.
+// funct3 = 3: rs1 = wgather(dst, mbar, gsrc, size), rs2 = x0 or wgather(0, cta_mask, 0, 0).
+inline void vx_dxa_bulk_load(void* dst, const void* gsrc, uint32_t size, uint64_t* mbar) {
+  const size_t a0 = vx_wgather((size_t)(uintptr_t)dst,
+                               (size_t)(uintptr_t)mbar,
+                               (size_t)(uintptr_t)gsrc,
+                               (size_t)size);
+  __asm__ volatile (
+      ".insn r %0, 3, %1, x0, %2, x0\n\t"
+      :
+      : "i"(VX_DXA_EXT_OPCODE), "i"(VX_DXA_FUNCT7), "r"(a0)
+      : "memory");
+}
+
+// .multicast::cluster: lands in every rank set in `cta_mask` at the
+// block-relative offsets of the issuer's local `dst` and `mbar`.
+inline void vx_dxa_bulk_load_multicast(void* dst, const void* gsrc, uint32_t size, uint64_t* mbar,
+                                       uint16_t cta_mask) {
+  const size_t a0 = vx_wgather((size_t)(uintptr_t)dst,
+                               (size_t)(uintptr_t)mbar,
+                               (size_t)(uintptr_t)gsrc,
+                               (size_t)size);
+  const size_t a1 = vx_wgather((size_t)0, (size_t)cta_mask, (size_t)0, (size_t)0);
+  __asm__ volatile (
+      ".insn r %0, 3, %1, x0, %2, %3\n\t"
+      :
+      : "i"(VX_DXA_EXT_OPCODE), "i"(VX_DXA_FUNCT7), "r"(a0), "r"(a1)
+      : "memory");
+}
+
+// cp.async.bulk.prefetch.L2.global: reads [gsrc, gsrc + size) into the L2.
+// funct3 = 4: rs1 = wgather(0, 0, gsrc, size), rs2 = x0.
+inline void vx_dxa_prefetch_l2(const void* gsrc, uint32_t size) {
+  const size_t a0 = vx_wgather((size_t)0, (size_t)0, (size_t)(uintptr_t)gsrc, (size_t)size);
+  __asm__ volatile (
+      ".insn r %0, 4, %1, x0, %2, x0\n\t"
+      :
+      : "i"(VX_DXA_EXT_OPCODE), "i"(VX_DXA_FUNCT7), "r"(a0)
+      : "memory");
+}
 #endif // VX_CFG_EXT_MBAR_ENABLE
 
 // Multicast DXA issues read GMEM once and replay SMEM writes to multiple

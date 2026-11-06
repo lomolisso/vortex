@@ -101,6 +101,12 @@ module VX_dxa_desc_table import VX_gpu_pkg::*, VX_dxa_pkg::*; (
     assign read_desc.stride3 = entry_rdata[`VX_DCR_DXA_DESC_STRIDE3_OFF*32 +: 32];
     assign read_desc.smem_stride = entry_rdata[`VX_DCR_DXA_DESC_SMEM_STRIDE_OFF*32 +: 32];
     assign read_desc.estride2    = entry_rdata[`VX_DCR_DXA_DESC_ESTRIDE2_OFF*32 +: 32];
+`ifdef DXA_MBAR_ENABLE
+    assign read_desc.estride0    = entry_rdata[`VX_DCR_DXA_DESC_ESTRIDE0_OFF*32 +: 32];
+    assign read_desc.estride1    = entry_rdata[`VX_DCR_DXA_DESC_ESTRIDE1_OFF*32 +: 32];
+    assign read_desc.estride3    = entry_rdata[`VX_DCR_DXA_DESC_ESTRIDE3_OFF*32 +: 32];
+    assign read_desc.estride4    = entry_rdata[`VX_DCR_DXA_DESC_ESTRIDE4_OFF*32 +: 32];
+`endif
 
     assign dcr_bus_if.rsp_valid = '0;
     assign dcr_bus_if.rsp_data  = '0;

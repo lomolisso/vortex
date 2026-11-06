@@ -1,17 +1,18 @@
 // dlmem_bulk: DXA bulk copies from a block's own local memory into the local
-// memory of a block of its thread-block cluster, the issuer's own included,
-// completing on an mbarrier in the destination block, on a DLMEM device with
+// memory of another block of its thread-block cluster (a copy into the
+// issuer's own block is an error, as in PTX), completing on an mbarrier in the destination block, on a DLMEM device with
 // the A extension, mbarriers and the DXA (RV64). Like CUDA's
 // cp.async.bulk.shared::cluster.shared::cta.mbarrier::complete_tx::bytes, with
 // fence.proxy.async ordering the source's stores before the copy.
 //
 //   -m ring   block r copies into rank (r + 1) % K through the window (default)
 //   -m many   every rank copies into rank 0, back to back, each into its own
-//             slots; rank 0's own copies use the window address of itself
+//             slots, and rank 0 into rank 1
 //   -m self   every block copies into its own local memory through local
-//             pointers
+//             pointers, which must stop the simulator (strict PTX: the
+//             destination is another block); -x self is the catalog form
 //   -m race   rounds in which warp 0 stores the round's words into its source
-//             and copies it into its own local memory at once, while the other
+//             and copies it into the next rank's local memory at once, while the other
 //             warps load and store their own words on every bank. Without -f
 //             the run only reports the bytes that hold the previous round's
 //             value (stale); with -f a stale byte is an error
@@ -31,11 +32,23 @@
 //   -o A      source misalignment base, in 16-byte units, 0-3 (default 1)
 //   -O A      destination misalignment base, in 16-byte units, 0-3 (default 0)
 //   -r R      race rounds (default 8)
-//   -g H      race: rank 0 of each cluster is a hog that copies H bytes of its
-//             unchanged source every round once the other ranks are ready, and
+//   -H H      race: rank 0 of each cluster is a hog that copies H bytes of its
+//             unchanged source into rank 1 every round once the other ranks are ready, and
 //             only then lets them store theirs, one word per thread of warp 0
 //             (-s 4 x threads), so that, in a single-core cluster with two engine
 //             workers, their stores wait behind its copy at the banks
+//   -g cta|win|mc|pf
+//             copies from global memory (cp.async.bulk.shared::cluster.global):
+//             cta, every block into its own local memory through local
+//             pointers; win, rank r into rank (r + 1) % K through the window;
+//             mc, rank 0 multicasts each copy into the ranks of -M; pf, cta
+//             with every source prefetched into the L2 first
+//             (cp.async.bulk.prefetch.L2). -s 0 is a mix of 16, 4096, 720 and
+//             48 bytes; -o offsets the sources, -O the destinations
+//   -M mask   -g mc: the ctaMask (default 0x3)
+//   -P        -g pf: first two prefetches of the source buffer larger than a
+//             local memory (twice it, and it + 16 bytes); a prefetch is a hint
+//             and the engine reads at most a local memory's worth of each
 //   -b D      the mbarrier sits D doublewords into the block, 0-6 (default 0),
 //             so in local-memory bank D modulo the banks
 //   -S        the reference path: the issuing warp copies with its own loads
@@ -47,7 +60,9 @@
 //             (the destination and its mbarrier lie outside the cluster), mbar
 //             (the mbarrier is in the issuer's block, not the destination's),
 //             box (a copy running past the destination block), retired (the
-//             destination block has exited when the copy reaches it)
+//             destination block has exited when the copy reaches it), self (a
+//             copy into the issuer's own block), mbar-align (an mbarrier 4
+//             bytes off its doubleword)
 //   -v        print every cluster's placement
 //
 // Copy i of rank r reads 16 * ((i + r + A) % 4) bytes into its source slot
@@ -76,6 +91,7 @@
 #include <cstdlib>
 #include <algorithm>
 #include <cstring>
+#include <string>
 #include <unistd.h>
 #include <vector>
 
@@ -93,7 +109,9 @@ namespace mr = vortex::mbar_ref;
   } while (0)
 
 const char* const kModeNames[] = {"ring", "many", "self", "race"};
-const char* const kNegNames[]  = {"", "size", "align", "dalign", "src", "rank", "mbar", "box", "retired"};
+const char* const kNegNames[]  = {"", "size", "align", "dalign", "src", "rank", "mbar", "box", "retired", "self",
+                                  "mbar-align"};
+const char* const kGNames[]    = {"", "cta", "win", "mc", "pf"};
 
 constexpr uint32_t kLinger   = 20000;
 constexpr uint32_t kRaceSize = 256;
@@ -112,6 +130,9 @@ uint32_t dalign  = 0;
 uint32_t rounds  = 8;
 uint32_t mbar_dw = 0;
 uint32_t hog     = 0;
+uint32_t gkind   = GK_NONE;
+uint32_t gmask   = 0x3;
+bool     pf_big  = false;
 bool     race_fence = false;
 bool     no_fence   = false;
 bool     soft       = false;
@@ -121,8 +142,8 @@ bool     requested = false;
 
 void usage() {
   std::printf("Usage: [-m ring|many|self|race] [-f] [-F] [-p spread|single-core] [-k K] [-n clusters] [-w warps]"
-              " [-c copies] [-s bytes] [-o src align] [-O dst align] [-r rounds] [-g hog bytes] [-b mbar doubleword] [-S]"
-              " [-x size|align|dalign|src|rank|mbar|box|retired] [-v] [-h]\n");
+              " [-c copies] [-s bytes] [-o src align] [-O dst align] [-r rounds] [-H hog bytes] [-g cta|win|mc|pf] [-M mask] [-P]"
+              " [-b mbar doubleword] [-S] [-x size|align|dalign|src|rank|mbar|box|retired|self|mbar-align] [-v] [-h]\n");
 }
 
 uint32_t parse_count(const char* s) {
@@ -148,7 +169,7 @@ uint32_t parse_name(const char* s, const char* const* names, uint32_t first, uin
 void parse_args(int argc, char** argv) {
   requested = (argc > 1);
   int c;
-  while ((c = getopt(argc, argv, "m:fFp:k:n:w:c:s:o:O:r:g:b:Sx:vh")) != -1) {
+  while ((c = getopt(argc, argv, "m:fFp:k:n:w:c:s:o:O:r:H:g:M:Pb:Sx:vh")) != -1) {
     switch (c) {
       case 'm': mode = parse_name(optarg, kModeNames, 0, NUM_MODES); break;
       case 'f': race_fence = true; break;
@@ -167,7 +188,10 @@ void parse_args(int argc, char** argv) {
       case 'O': dalign = parse_count(optarg); break;
       case 'r': rounds = parse_count(optarg); break;
       case 'b': mbar_dw = parse_count(optarg); break;
-      case 'g': hog    = parse_count(optarg); break;
+      case 'H': hog    = parse_count(optarg); break;
+      case 'g': gkind  = parse_name(optarg, kGNames, 1, NUM_GKINDS); break;
+      case 'M': gmask  = (uint32_t)std::strtoul(optarg, nullptr, 0); break;
+      case 'P': pf_big = true; break;
       case 'S': soft   = true; break;
       case 'x': neg    = parse_name(optarg, kNegNames, 1, NUM_NEGS); break;
       case 'v': verbose = true; break;
@@ -175,12 +199,15 @@ void parse_args(int argc, char** argv) {
       default:  usage(); std::exit(-1);
     }
   }
-  const bool local = (mode == MODE_SELF || mode == MODE_RACE);
+  const bool local = (mode == MODE_SELF || gkind == GK_CTA || gkind == GK_PF);
   if (optind < argc || req_k < 1 || req_k > MAX_CLUSTER || req_g == 0 || req_w == 0 || copies == 0
       || copies > MAX_COPIES || size % 16 != 0 || salign > 3 || dalign > 3 || rounds == 0
       || rounds > MAX_ROUNDS || mbar_dw > MAX_MBAR_DW || (!local && req_k < 2) || (race_fence && mode != MODE_RACE)
       || (no_fence && mode == MODE_RACE) || (soft && neg)
-      || (hog && (mode != MODE_RACE || hog % 16 != 0 || req_k < 2 || soft))) {
+      || (hog && (mode != MODE_RACE || hog % 16 != 0 || req_k < 2 || soft))
+      || (pf_big && gkind != GK_PF)
+      || (gkind && (mode != MODE_RING || soft || neg || (gkind == GK_WIN && req_k < 2) || gmask == 0
+                    || gmask >= (1u << req_k)))) {
     usage();
     std::exit(-1);
   }
@@ -278,15 +305,33 @@ int main(int argc, char** argv) {
   arg.linger       = kLinger;
   arg.lm_mbar      = 8 * mbar_dw;
   arg.hog          = race ? hog : 0;
+  arg.gkind        = gkind;
+  arg.mask         = gkind == GK_MC ? gmask : 0;
+  if (pf_big) {
+    arg.pf_big[0] = (uint32_t)(2 * caps.lmem_size);
+    arg.pf_big[1] = (uint32_t)(caps.lmem_size + 16);
+  }
   const uint32_t ham_words = race ? threads - nt : 0;
-  arg.lmem_bytes   = round_up(lm_ham(&arg) + ham_words * 4, 256);
+  arg.lmem_bytes   = gkind ? round_up(g_end(&arg), 256) : round_up(lm_ham(&arg) + ham_words * 4, 256);
   arg.neg_off      = arg.lmem_bytes - 32;
+  if (gkind)
+    arg.pitch = 0;
 
   uint64_t total = 0;
   for (uint32_t r = 0; r < k; ++r)
     for (uint32_t i = 0; i < copies; ++i)
       total += copy_size(&arg, r, i);
-  if (neg) {
+  if (gkind) {
+    uint64_t per = 0;
+    for (uint32_t i = 0; i < copies; ++i)
+      per += g_size(&arg, i);
+    std::printf("dlmem_bulk: global %s%s, %s, %u clusters of %u blocks of %u warps x %u threads, %u cores of %u"
+                " warps, %u copies per block (%s, %lu bytes), alignment bases %u/%u, mbarrier at byte %u, %u bytes"
+                " of local memory per block\n", kGNames[gkind], gkind == GK_MC ? (" mask " + std::to_string(gmask)).c_str()
+                : "", spread ? "SPREAD" : "SINGLE_CORE", req_g, k, req_w, nt, (uint32_t)caps.num_cores,
+                (uint32_t)caps.num_warps, copies, size ? "fixed size" : "size mix", (unsigned long)per, salign, dalign,
+                arg.lm_mbar, arg.lmem_bytes);
+  } else if (neg) {
     std::printf("dlmem_bulk: negative run '%s', SPREAD cluster of 2 blocks, %u cores of %u warps x %u threads\n",
                 kNegNames[neg], (uint32_t)caps.num_cores, (uint32_t)caps.num_warps, nt);
   } else if (race) {
@@ -346,11 +391,20 @@ int main(int argc, char** argv) {
   vx_buffer_h dump_buf = upload(dev, q, dump, &arg.dump_addr, VX_MEM_READ_WRITE);
   std::vector<uint32_t> sync(2 * req_g, 0);
   vx_buffer_h sync_buf = upload(dev, q, sync, &arg.sync_addr, VX_MEM_READ_WRITE);
+  std::vector<uint8_t> gsrc;
+  vx_buffer_h gsrc_buf = nullptr;
+  if (gkind) {
+    gsrc.resize(std::max<size_t>((size_t)blocks * copies * g_pitch(&arg), arg.pf_big[0]) + 64);
+    for (size_t o = 0; o < gsrc.size(); ++o)
+      gsrc[o] = g_byte(o);
+    gsrc_buf = upload(dev, q, gsrc, &arg.gsrc_addr, VX_MEM_READ);
+  }
 
   vx_module_h mod = nullptr;
   vx_kernel_h kernel = nullptr;
   CHECK(vx_module_load_file(dev, kernel_file, &mod));
-  CHECK(vx_module_get_kernel(mod, neg ? "neg_k" : "copy_k", &kernel));
+  const char* entry = neg ? "neg_k" : gkind ? "gload_k" : race ? "race_k" : mode == MODE_MANY ? "many_k" : "copy_k";
+  CHECK(vx_module_get_kernel(mod, entry, &kernel));
   vx_launch_info_t li = {};
   li.struct_size    = sizeof(li);
   li.kernel         = kernel;
@@ -434,10 +488,37 @@ int main(int argc, char** argv) {
         want[b][o] = canary_byte(b, o);
     }
     uint32_t cross = 0, same = 0, stale = 0;
-    if (race) {
+    if (gkind) {
       for (uint32_t b = 0; b < blocks; ++b) {
-        const uint32_t r = b % k, so = src_off(&arg, r, 0);
-        const uint8_t* got = reinterpret_cast<const uint8_t*>(dump.data()) + (size_t)b * L;
+        if (g_incoming(&arg, b % k))
+          mbar_want[b] = mr::apply(mr::OP_ARRIVE_TX, mbar_want[b], g_incoming(&arg, b % k)).new_word;
+      }
+      for (uint32_t b = 0; b < blocks; ++b) {
+        const uint32_t r = b % k, base = b - r;
+        uint32_t rx = 1u << g_dst_rank(&arg, r);
+        if (gkind == GK_MC)
+          rx = r == 0 ? gmask : 0;
+        for (uint32_t qr = 0; qr < k; ++qr) {
+          if (!((rx >> qr) & 1u))
+            continue;
+          const uint32_t dst = base + qr;
+          if (rec(b)[REC_CORE] == rec(dst)[REC_CORE])
+            ++same;
+          else
+            ++cross;
+          for (uint32_t i = 0; i < copies; ++i) {
+            const uint32_t d = g_dst_off(&arg, r, i), n = g_size(&arg, i);
+            const uint64_t so = g_src_off(&arg, b, i);
+            for (uint32_t x = 0; x < n; ++x)
+              want[dst][d + x] = gsrc[so + x];
+            mbar_want[dst] = mr::apply(mr::OP_COMPLETE_TX, mbar_want[dst], n).new_word;
+          }
+        }
+      }
+    } else if (race) {
+      for (uint32_t b = 0; b < blocks; ++b) {
+        const uint32_t r = b % k, so = src_off(&arg, r, 0), qb = b - r + strict_dst(mode, r, k);
+        const uint8_t* got = reinterpret_cast<const uint8_t*>(dump.data()) + (size_t)qb * L;
         const uint32_t one = 1;
         std::memcpy(&want[b][lm_flag(&arg)], &one, sizeof(one));
         for (uint32_t h = 0; h < ham_words; ++h) {
@@ -448,10 +529,10 @@ int main(int argc, char** argv) {
           // Every round copies the same canaries into slot 0.
           const uint32_t d = dst_off(&arg, r, 0);
           for (uint32_t x = 0; x < hog; ++x)
-            want[b][d + x] = canary_byte(b, so + x);
+            want[qb][d + x] = canary_byte(b, so + x);
           for (uint32_t j = 0; j < rounds; ++j) {
-            mbar_want[b] = mr::apply(mr::OP_ARRIVE_TX, mbar_want[b], hog).new_word;
-            mbar_want[b] = mr::apply(mr::OP_COMPLETE_TX, mbar_want[b], hog).new_word;
+            mbar_want[qb] = mr::apply(mr::OP_ARRIVE_TX, mbar_want[qb], hog).new_word;
+            mbar_want[qb] = mr::apply(mr::OP_COMPLETE_TX, mbar_want[qb], hog).new_word;
           }
           continue;
         }
@@ -462,21 +543,21 @@ int main(int argc, char** argv) {
           for (uint32_t x = 0; x < size; ++x) {
             const uint8_t now = race_byte(b, j, so + x);
             const uint8_t old = j ? race_byte(b, j - 1, so + x) : canary_byte(b, so + x);
-            want[b][d + x] = now;
+            want[qb][d + x] = now;
             if (got[d + x] != now && got[d + x] == old) {
               ++stale;
               if (!race_fence)
-                want[b][d + x] = old;
+                want[qb][d + x] = old;
             }
           }
-          mbar_want[b] = mr::apply(mr::OP_ARRIVE_TX, mbar_want[b], size).new_word;
-          mbar_want[b] = mr::apply(mr::OP_COMPLETE_TX, mbar_want[b], size).new_word;
+          mbar_want[qb] = mr::apply(mr::OP_ARRIVE_TX, mbar_want[qb], size).new_word;
+          mbar_want[qb] = mr::apply(mr::OP_COMPLETE_TX, mbar_want[qb], size).new_word;
         }
       }
     } else {
       for (uint32_t b = 0; b < blocks; ++b) {
         const uint32_t r = b % k;
-        mbar_want[b] = mr::apply(mr::OP_ARRIVE_TX, mbar_want[b], incoming(&arg, r)).new_word;
+        mbar_want[b] = mr::apply(mr::OP_ARRIVE_TX, mbar_want[b], strict_incoming(&arg, r)).new_word;
         for (uint32_t i = 0; i < copies; ++i) {
           const uint32_t so = src_off(&arg, r, i), n = copy_size(&arg, r, i);
           for (uint32_t x = 0; x < n; ++x)
@@ -484,7 +565,7 @@ int main(int argc, char** argv) {
         }
       }
       for (uint32_t b = 0; b < blocks; ++b) {
-        const uint32_t r = b % k, dst = b - r + dst_rank(mode, r, k);
+        const uint32_t r = b % k, dst = b - r + strict_dst(mode, r, k);
         if (rec(b)[REC_CORE] == rec(dst)[REC_CORE])
           ++same;
         else
@@ -513,12 +594,13 @@ int main(int argc, char** argv) {
         if (o / 8 == arg.lm_mbar / 8 || got[o] == want[b][o])
           continue;
         if (bad++ < 4 && bad_blocks < 4) {
-          const uint32_t ld = lm_dst(&arg), lh = lm_ham(&arg);
+          const uint32_t ld = gkind ? LM_SRC : lm_dst(&arg), lh = gkind ? g_end(&arg) : lm_ham(&arg);
           const char* where = o < LM_SRC ? "header" : o < ld ? "source slots" : o < lh ? "destination slots"
                             : "hammer words";
           const uint32_t base = o < LM_SRC ? 0 : o < ld ? LM_SRC : o < lh ? ld : lh;
           std::printf("*** block %u (rank %u, core %u) byte %u (%s, slot %u, offset %u): %#04x, expected %#04x\n",
-                      b, b % k, rec(b)[REC_CORE], o, where, (o - base) / arg.pitch, (o - base) % arg.pitch,
+                      b, b % k, rec(b)[REC_CORE], o, where, arg.pitch ? (o - base) / arg.pitch : 0,
+                      arg.pitch ? (o - base) % arg.pitch : o - base,
                       got[o], want[b][o]);
         }
       }
@@ -535,17 +617,23 @@ int main(int argc, char** argv) {
       std::printf("dlmem_bulk: %u copies across cores, %u on the issuer's core; %u wrong bytes in %u blocks\n",
                   cross * copies, same * copies, bad_bytes, bad_blocks);
     }
+    if (gkind == GK_WIN && spread && cross == 0) {
+      std::printf("*** no global copy crossed cores in a SPREAD launch\n");
+      ++errors;
+    }
     errors += (bad_bytes != 0);
-    if ((mode == MODE_RING || mode == MODE_MANY) && spread && cross == 0) {
+    if ((mode == MODE_RING || mode == MODE_MANY) && !gkind && spread && cross == 0) {
       std::printf("*** no copy crossed cores in a SPREAD launch\n");
       ++errors;
     }
-    if ((mode == MODE_RING || mode == MODE_MANY) && !spread && cross != 0) {
+    if ((mode == MODE_RING || mode == MODE_MANY) && !gkind && !spread && cross != 0) {
       std::printf("*** a SINGLE_CORE launch put a cluster on several cores\n");
       ++errors;
     }
   }
 
+  if (gsrc_buf)
+    vx_buffer_release(gsrc_buf);
   vx_buffer_release(sync_buf);
   vx_buffer_release(dump_buf);
   vx_buffer_release(err_buf);

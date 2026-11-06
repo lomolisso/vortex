@@ -67,6 +67,15 @@ struct DxaReq {
   uint64_t src_addr;
   uint32_t size;
   uint64_t sent;          // the cycle it left the unit
+  // The PTX forms: a tensor load (funct3 = 2) or a global bulk load
+  // (funct3 = 3), either of which may be a prefetch (no local-memory write,
+  // no completion; funct3 = 4 is the bulk one). coords are signed.
+  bool     tload;
+  bool     bload;
+  bool     prefetch;
+  uint32_t offs[3];       // the im2col offsets along W, H, D
+  uint64_t gsrc;          // a bulk load's global source, and size its bytes
+  uint64_t blk_off;       // smem_addr's offset in its block, the swizzle's base
 #else
 #line 43
 #endif
@@ -101,6 +110,8 @@ private:
   void translate(const instr_trace_t* trace, uint32_t meta, uint32_t cta_mask, DxaReq& req) const;
   void cluster_receivers(const instr_trace_t* trace, uint32_t meta, uint32_t cta_mask, DxaReq& req) const;
   void translate_bulk(const instr_trace_t* trace, DxaReq& req) const;
+  bool issue_ptx(instr_trace_t* trace);
+  void decode_ptx(const instr_trace_t* trace, DxaType type, DxaReq& req) const;
 
   [[noreturn]] void issue_abort(const instr_trace_t* trace, const char* msg) const;
 

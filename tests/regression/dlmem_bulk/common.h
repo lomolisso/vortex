@@ -4,9 +4,9 @@
 #include <stdint.h>
 
 #define MODE_RING   0   // rank r copies into rank (r + 1) % K
-#define MODE_MANY   1   // every rank copies into rank 0, back to back
-#define MODE_SELF   2   // every rank copies into its own local memory through local pointers
-#define MODE_RACE   3   // rounds of plain stores to the source, then a local copy of it
+#define MODE_MANY   1   // ranks 1.. copy into rank 0, back to back, and rank 0 into rank 1
+#define MODE_SELF   2   // every rank copies into its own local memory: must stop the simulator (strict PTX)
+#define MODE_RACE   3   // rounds of plain stores to the source, then a copy of it into the next rank
 #define NUM_MODES   4
 
 #define NEG_NONE    0
@@ -18,7 +18,17 @@
 #define NEG_MBAR    6   // the mbarrier is in another block than the destination
 #define NEG_BOX     7   // the copy starts inside the destination block and runs past its end
 #define NEG_RETIRED 8   // the destination block exits before the copy reaches it
-#define NUM_NEGS    9
+#define NEG_SELF    9   // a copy into the issuer's own block through local pointers
+#define NEG_MALIGN  10  // an mbarrier 4 bytes off its doubleword
+#define NUM_NEGS    11
+
+// -g: copies from global memory (cp.async.bulk.shared::cluster.global)
+#define GK_NONE     0
+#define GK_CTA      1   // every block loads into its own local memory through local pointers
+#define GK_WIN      2   // rank r loads into rank (r + 1) % K through the window
+#define GK_MC       3   // rank 0 multicasts every copy into the ranks of the mask
+#define GK_PF       4   // GK_CTA, each copy's source prefetched into the L2 first
+#define NUM_GKINDS  5
 
 #define MAX_CLUSTER 8
 #define MAX_COPIES  8
@@ -48,6 +58,10 @@ typedef struct {
   uint32_t neg_off;      // -x src, -x box: a block offset 32 bytes before its end
   uint32_t lm_mbar;      // the mbarrier's byte offset in the block, a doubleword of the header
   uint32_t hog;          // race: rank 0 copies this many bytes per round instead of racing; 0: none
+  uint64_t gsrc_addr;    // -g: the global source buffer
+  uint32_t gkind;
+  uint32_t mask;         // -g mc: the ctaMask
+  uint32_t pf_big[2];    // -g pf -P: bulk prefetches of the source buffer larger than a local memory
 } bulk_arg_t;
 
 // Byte offsets in the block's local memory: the header (the mbarrier, at
@@ -130,6 +144,18 @@ static inline uint32_t dst_rank(uint32_t mode, uint32_t r, uint32_t k) {
   return mode == MODE_RING ? (r + 1) % k : mode == MODE_MANY ? 0 : r;
 }
 
+// The destination rank of rank r's copies as the kernels issue them: never r
+// itself (a copy into the issuer's own block is an error), except in -m self.
+// copy_k keeps dst_rank for ring and self, so their code is unchanged.
+static inline uint32_t strict_dst(uint32_t mode, uint32_t r, uint32_t k) {
+  return (mode == MODE_RING || mode == MODE_RACE) ? (r + 1) % k : mode == MODE_MANY ? (r == 0 ? 1 : 0) : r;
+}
+
+// Race: the bytes rank q receives per round, from rank q - 1.
+static inline uint32_t race_in(const bulk_arg_t* a, uint32_t q) {
+  return is_hog(a, (q + a->k - 1) % a->k) ? a->hog : a->size;
+}
+
 static inline uint32_t num_src_slots(const bulk_arg_t* a) {
   return a->mode == MODE_RACE ? 1 : a->copies;
 }
@@ -174,6 +200,74 @@ static inline uint32_t incoming(const bulk_arg_t* a, uint32_t q) {
       n += copy_size(a, s, i);
   }
   return n;
+}
+
+// Bytes that land in rank q under strict_dst.
+static inline uint32_t strict_incoming(const bulk_arg_t* a, uint32_t q) {
+  uint32_t n = 0;
+  for (uint32_t s = 0; s < a->k; ++s) {
+    if (strict_dst(a->mode, s, a->k) != q)
+      continue;
+    for (uint32_t i = 0; i < a->copies; ++i)
+      n += copy_size(a, s, i);
+  }
+  return n;
+}
+
+// -g: copy i is the same size on every rank; the global mix spans 16 B to 4 KB.
+static inline uint32_t g_size(const bulk_arg_t* a, uint32_t i) {
+  return a->size ? a->size : (i % 4 == 0 ? 16 : i % 4 == 1 ? 4096 : i % 4 == 2 ? 720 : 48);
+}
+
+#define G_MIX_MAX 4096
+
+// Bytes between destination slots: each copy sits 0-48 bytes into its slot
+// and at least 64 canary bytes follow it.
+static inline uint32_t g_slot(const bulk_arg_t* a, uint32_t i) {
+  return (g_size(a, i) + 48 + 64 + 63) / 64 * 64;
+}
+
+// Destination of copy i of sender rank r, the same in every receiver.
+static inline uint32_t g_dst_off(const bulk_arg_t* a, uint32_t r, uint32_t i) {
+  uint32_t o = LM_SRC;
+  for (uint32_t j = 0; j < i; ++j)
+    o += g_slot(a, j);
+  return o + 16 * ((3 * i + r + a->dalign) % 4);
+}
+
+static inline uint32_t g_end(const bulk_arg_t* a) {
+  return g_dst_off(a, 0, a->copies);
+}
+
+// Bytes between the sources of block b's copies in the global buffer.
+static inline uint32_t g_pitch(const bulk_arg_t* a) {
+  uint32_t m = 0;
+  for (uint32_t i = 0; i < a->copies; ++i)
+    m = g_size(a, i) > m ? g_size(a, i) : m;
+  return (m + 48 + 63) / 64 * 64;
+}
+
+static inline uint64_t g_src_off(const bulk_arg_t* a, uint32_t b, uint32_t i) {
+  return (uint64_t)(b * a->copies + i) * g_pitch(a) + 16 * ((i + b + a->salign) % 4);
+}
+
+// Byte o of the global source buffer.
+static inline uint8_t g_byte(uint64_t o) {
+  return word_byte(mix32(0x6B0000u, (uint32_t)(o / 4)), (uint32_t)o);
+}
+
+static inline uint32_t g_dst_rank(const bulk_arg_t* a, uint32_t r) {
+  return a->gkind == GK_WIN ? (r + 1) % a->k : r;
+}
+
+// Bytes that land in rank q.
+static inline uint32_t g_incoming(const bulk_arg_t* a, uint32_t q) {
+  uint32_t per = 0;
+  for (uint32_t i = 0; i < a->copies; ++i)
+    per += g_size(a, i);
+  if (a->gkind == GK_MC)
+    return ((a->mask >> q) & 1u) ? per : 0;
+  return per;
 }
 
 #endif

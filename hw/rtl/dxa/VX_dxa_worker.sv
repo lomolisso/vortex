@@ -91,6 +91,15 @@ module VX_dxa_worker import VX_gpu_pkg::*, VX_dxa_pkg::*; #(
     wire [15:0]                 ag_k_row;
     wire [15:0]                 ag_n_base;
     wire [DXA_SMEM_ADDR_W-1:0]  ag_smem_base;
+`ifdef DXA_MBAR_ENABLE
+    wire                        ag_pf_end;
+    dxa_tma_wr_t                ag_tma_wr;
+    assign ag_tma_wr.en       = setup_params.tma.en;
+    assign ag_tma_wr.prefetch = setup_params.tma.prefetch;
+    assign ag_tma_wr.es0      = setup_params.tma.es0;
+    assign ag_tma_wr.swizzle  = setup_params.tma.swizzle;
+    assign ag_tma_wr.blk_base = setup_params.tma.blk_base;
+`endif
 
     // gmem_req → smem_wr (direct-drain channel).
     wire                        sw_valid;
@@ -205,6 +214,9 @@ module VX_dxa_worker import VX_gpu_pkg::*, VX_dxa_pkg::*; #(
         .out_k_row            (ag_k_row),
         .out_n_base           (ag_n_base),
         .out_smem_base        (ag_smem_base)
+    `ifdef DXA_MBAR_ENABLE
+      , .out_pf_end           (ag_pf_end)
+    `endif
     );
 
     // ════════════════════════════════════════════════════════════════════
@@ -297,6 +309,8 @@ module VX_dxa_worker import VX_gpu_pkg::*, VX_dxa_pkg::*; #(
     `ifdef DXA_MBAR_ENABLE
         .active_compl          (active_compl),
         .slot_stride           (slot_stride),
+        .tma                   (ag_tma_wr),
+        .pf_end                (ag_pf_end),
     `endif
         .sw_valid              (sw_valid),
         .sw_ready              (sw_ready),

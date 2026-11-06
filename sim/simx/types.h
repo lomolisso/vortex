@@ -784,6 +784,9 @@ enum class DxaType {
   ISSUE
 #ifdef VX_CFG_EXT_MBAR_ENABLE
   , BULK  // cp.async.bulk from the block's local memory into a cluster block
+  , TLOAD      // the PTX tensor load or tensor prefetch
+  , BLOAD      // cp.async.bulk from global memory into a cluster block
+  , BPREFETCH  // cp.async.bulk.prefetch.L2.global
 #else
 #line 637
 #endif
@@ -796,6 +799,9 @@ inline std::ostream &operator<<(std::ostream &os, const DxaType& type) {
   case DxaType::ISSUE: os << "DXA.ISSUE"; break;
 #ifdef VX_CFG_EXT_MBAR_ENABLE
   case DxaType::BULK:  os << "DXA.BULK"; break;
+  case DxaType::TLOAD: os << "DXA.TLOAD"; break;
+  case DxaType::BLOAD: os << "DXA.BLOAD"; break;
+  case DxaType::BPREFETCH: os << "DXA.BPREFETCH"; break;
 #else
 #line 644
 #endif

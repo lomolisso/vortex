@@ -21,6 +21,9 @@
 #ifdef DXA_MBAR_ENABLE
 #include <iostream>
 #include <string>
+#include "dxa_ref.h"
+#else
+#line 24
 #endif
 #include "core.h"
 #include "socket.h"
@@ -90,6 +93,11 @@ public:
     uint8_t  dest_layout;      // DestLayout (Flat/BlockMajor use tiled_dest_elem)
     uint32_t tile_k_row;       // tiled scatter: K-row (dim1 index) for this span
     uint32_t tile_n_base;      // tiled scatter: N (dim0) index where the span starts
+#ifdef DXA_MBAR_ENABLE
+    uint32_t src_step;         // a gather transfer's line bytes between elements (one a beat), else 0
+#else
+#line 92
+#endif
   };
 
   // ── Inflight slot for a GMEM read ──────────────────────────────────
@@ -173,6 +181,15 @@ public:
     // The cycle's start, as smem_wr's registers hold it.
     bool                    st_fb = false, st_pend = false, st_defer = false;
     uint32_t                st_outstanding = 0;
+    // The PTX traversal (swizzle, element strides, im2col, a global bulk
+    // load): a token per line piece, drained one local-memory word a beat.
+    bool                    ptx = false;
+    bool                    prefetch = false;    // reads only
+    uint32_t                swz_mask = 0;        // the swizzle's M, 0 for none
+    uint64_t                blk_base = 0;        // the destination block's base, the swizzle's origin
+    uint64_t                first_line = 0;      // the first cycle its address generator emits a line
+    uint64_t                tok_start  = 0;      // the cycle smem_wr's current line began to drain
+    dxa_ref::Desc           ref;                 // the descriptor, decoded by the golden model
 #else
 #line 137
 #endif
@@ -463,6 +480,11 @@ private:
     }
 
 #ifdef DXA_MBAR_ENABLE
+    w.ptx        = false;
+    w.prefetch   = false;
+    w.swz_mask   = 0;
+    w.first_line = 0;
+    w.tok_start  = 0;
     this->load_receivers(w, req);
     if (req.bulk) {
       this->start_bulk(w);
@@ -488,22 +510,54 @@ private:
 
     w.desc = descriptors_.at(req.desc_slot);
     w.smem_stride = w.desc.smem_stride;
+#ifdef DXA_MBAR_ENABLE
+    if (req.bload) {
+      if (!req.prefetch && req.size > req.win_room) {
+        this->dxa_abort(w, "DXA box exceeds the destination block: " + std::to_string(req.size)
+                        + " bytes, room " + std::to_string(req.win_room));
+      }
+      w.desc = this->bulk_desc(req);
+      w.smem_stride = 0;
+    }
+    this->setup_ptx(w);
+    if (req.prefetch) {
+      this->enumerate_ptx(w);
+      if (w.work_list.empty()) {
+        finish_worker(w);
+        return;
+      }
+      w.work_list.back().last = true;
+      w.state = WState::RUNNING;
+      perf_stats_.gmem_reads += std::count_if(w.work_list.begin(), w.work_list.end(),
+                                              [](const LineWork& lw) { return !lw.oob; });
+      return;
+    }
+#else
+#line 389
+#endif
 
 #ifdef DXA_MBAR_ENABLE
     if (req.mode) {
       w.tx_bytes = this->box_bytes(w);
-      if (req.win && w.tx_bytes > req.win_room) {
-        this->dxa_abort(w, "DXA box exceeds the destination block: " + std::to_string(w.tx_bytes)
+    }
+    if (!req.bload) {
+      const uint64_t extent = this->box_extent(w);
+      if (extent > req.win_room) {
+        this->dxa_abort(w, "DXA box exceeds the destination block: " + std::to_string(extent)
                         + " bytes, room " + std::to_string(req.win_room));
       }
     }
 #endif
 
-    enumerate_work_list(w);
 #ifdef DXA_MBAR_ENABLE
+    this->enumerate_ptx(w);
     if (req.mode && w.work_list.empty()) {
       this->dxa_abort(w, "invalid DXA rank: no work for the box");
     }
+#else
+#line 401
+    enumerate_work_list(w);
+#line 406
 #endif
     if (w.work_list.empty()) {
       // No work — same edge case as above.
@@ -517,7 +571,15 @@ private:
     w.work_list.back().last = true;
 
     w.state = WState::RUNNING;
+#ifdef DXA_MBAR_ENABLE
+    // Fill tokens read nothing.
+    perf_stats_.gmem_reads += std::count_if(w.work_list.begin(), w.work_list.end(),
+                                            [](const LineWork& lw) { return !lw.oob; });
+#else
+#line 419
     perf_stats_.gmem_reads += w.work_list.size();
+#line 419
+#endif
 
     DT(3, simobject_->name() << "[" << w.worker_id << "] start: core="
        << req.core->id() << ", wid=" << req.wid
@@ -677,6 +739,14 @@ private:
     if (w.req.bulk) {
       return;
     }
+    if (w.first_line != 0 && SimPlatform::instance().cycles() < w.first_line) {
+      return;
+    }
+    // A prefetch's out-of-bounds row: a generator cycle, no token.
+    if (w.prefetch && w.ag_idx < w.work_list.size() && w.work_list[w.ag_idx].oob) {
+      ++w.ag_idx;
+      return;
+    }
 #else
 #line 574
 #endif
@@ -740,6 +810,14 @@ private:
 
   // ── smem_wr: drain ready slots, build LMEM MemReqs ───────────────────
   void tick_worker_smem_wr(Worker& w) {
+#ifdef DXA_MBAR_ENABLE
+    if (w.prefetch) {
+      this->drain_prefetch(w);
+      return;
+    }
+#else
+#line 634
+#endif
     if (w.issued_order.empty()) {
       // Nothing in flight — if all addr_gen done, transfer is finished.
       if (w.ag_idx == w.work_list.size()) finish_worker(w);
@@ -795,6 +873,13 @@ private:
     // independently, so gate the beat on the whole group being ready instead of
     // stranding the half already sent.
 #ifdef DXA_MBAR_ENABLE
+    // smem_wr captures a line into its skid register a cycle before the fill
+    // buffer takes it, so a line's first beat comes at least two cycles after
+    // the previous line's.
+    const bool tok_first = (w.km_elem_idx == 0 && w.km_byte_off == 0 && w.mc_cta_idx == 0);
+    const bool tok_gap   = (w.req.tload || w.req.bload) && tok_first;
+    if (tok_gap && cycle_ < w.tok_start + 2)
+      return;
     if (lmem_arb_) {
       if (lmem_taken_)
         return;
@@ -802,7 +887,9 @@ private:
     }
     if (to_stream ? stream_.full() : !this->core_inputs_ready(socket_local_cid))
       return;
-    if (w.req.cluster) {
+    if (tok_gap)
+      w.tok_start = cycle_;
+    if (w.req.cluster || w.ptx) {
       this->emit_cluster_beat(w, socket_local_cid, to_stream);
       return;
     }
@@ -950,8 +1037,16 @@ private:
                       s.rsp_data->data() + lw.cl_byte_offset + ee * wlen,
                       wlen);
         } else {
+#ifdef DXA_MBAR_ENABLE
+          // The fill's byte at local-memory offset a is byte a & 3 of the pattern.
+          for (uint32_t b = 0; b < wlen; ++b)
+            (*blk)[doff + b] = uint8_t((pat >> (((doff + b) & 3) * 8)) & 0xff);
+#else
+#line 792
           for (uint32_t b = 0; b < wlen; ++b)
             (*blk)[doff + b] = uint8_t((pat >> ((b & 3) * 8)) & 0xff);
+#line 793
+#endif
         }
       }
       req.byteen = byteen;
@@ -1203,27 +1298,42 @@ private:
     const uint32_t t_tcN     = tiled ? desc_geo_tcn(w.desc) : 1u;
     const uint32_t t_bkK     = tiled ? desc_geo_bkk(w.desc) : 1u;
     const uint32_t t_nsteps  = tiled ? std::max<uint32_t>(1u, uint32_t(w.desc.tile_sizes[0]) / t_tcN) : 1u;
-    auto dest_byte_of = [&](uint32_t idx) -> uint64_t {
+    // The element's dense destination, before the swizzle and the receiver's
+    // offset. A swizzle moves 16-byte chunks inside a word of at most 128
+    // bytes, so a beat's dense word is one destination word.
+    auto dense_of = [&](uint32_t idx) -> uint64_t {
       if (tiled) {
         uint32_t de = tiled_dest_elem(DestLayout(lw.dest_layout), lw.tile_k_row,
                                       lw.tile_n_base + idx, t_ratio, t_tcN, t_nsteps, t_bkK);
-        return w.req.smem_addr + uint64_t(de) * t_eb + rcv.off;
+        return w.req.smem_addr + uint64_t(de) * t_eb;
       }
-      return lw.smem_word_addr + lw.smem_byte_offset + uint64_t(idx) * lw.km_lane_stride + rcv.off;
+      return lw.smem_word_addr + lw.smem_byte_offset + uint64_t(idx) * lw.km_lane_stride;
     };
+    const bool     swz      = (w.swz_mask != 0);
+    const uint64_t row_mask = swz ? ~uint64_t(kSwzWord - 1) : kRowMask;
+    const uint32_t src_step = lw.src_step ? lw.src_step : wlen;
 
     uint32_t e = w.km_elem_idx;
     uint32_t b = w.km_byte_off;
-    const uint64_t row = (dest_byte_of(e) + b) & kRowMask;
+    const uint32_t e_first = e;
+    const uint64_t row = (dense_of(e) + b + rcv.off) & row_mask;
     std::array<MemReq, DxaCore::LMEM_PORTS_PER_CORE> beat;
     std::array<uint32_t, DxaCore::LMEM_PORTS_PER_CORE> beat_port;
     uint32_t n = 0;
     while (e < num_elems) {
-      const uint64_t dest = dest_byte_of(e) + b;
-      if ((dest & kRowMask) != row)
+      // A gather transfer writes one element a beat.
+      if (lw.src_step != 0 && b == 0 && e != e_first)
         break;
+      const uint64_t dense = dense_of(e) + b;
+      if (((dense + rcv.off) & row_mask) != row)
+        break;
+      const uint64_t dest  = this->swizzle(w, dense) + rcv.off;
       const uint64_t dword = dest & ~uint64_t(kLmemWordSize - 1);
-      if (n == 0 || beat.at(n - 1).addr != dword) {
+      uint32_t slot_k = 0;
+      while (slot_k < n && beat.at(slot_k).addr != dword) {
+        ++slot_k;
+      }
+      if (slot_k == n) {
         if (n == DxaCore::LMEM_PORTS_PER_CORE)
           break;
         MemReq req;
@@ -1241,15 +1351,18 @@ private:
                            ? uint32_t((dword / kLmemWordSize) & (DxaCore::LMEM_PORTS_PER_CORE - 1)) : 0u);
         ++n;
       }
-      auto& req = beat.at(n - 1);
-      const uint64_t lim = std::min((dest & kRowMask) + DxaCore::LMEM_ROW_SIZE, dword + kLmemWordSize);
+      auto& req = beat.at(slot_k);
+      // Without a swizzle the run ends at the word or the block; with one, at
+      // the 16-byte chunk.
+      const uint64_t lim = swz ? ((dense | 15u) + 1 - dense + dest)
+                               : std::min((dest & kRowMask) + DxaCore::LMEM_ROW_SIZE, dword + kLmemWordSize);
       const uint32_t len = uint32_t(std::min<uint64_t>(wlen - b, lim - dest));
       const uint32_t doff = uint32_t(dest - dword);
       for (uint32_t k = 0; k < len; ++k) {
         req.byteen |= uint64_t(1) << (doff + k);
         (*req.data)[doff + k] = s.rsp_data
-            ? (*s.rsp_data)[lw.cl_byte_offset + e * wlen + b + k]
-            : uint8_t((lw.cfill >> (((b + k) & 3) * 8)) & 0xff);
+            ? (*s.rsp_data)[lw.cl_byte_offset + e * src_step + b + k]
+            : uint8_t((lw.cfill >> (((doff + k) & 3) * 8)) & 0xff);
       }
       b += len;
       if (b == wlen) {
@@ -1390,8 +1503,12 @@ private:
       this->dxa_abort(w, "invalid DXA rank: " + std::to_string(rank));
     }
     uint64_t bytes = desc_elem_bytes(meta);
-    for (uint32_t d = 0; d < rank; ++d) {
-      bytes *= w.desc.tile_sizes[d];
+    if (w.ref.im2col) {
+      bytes *= uint64_t(w.ref.channels) * w.ref.pixels;
+    } else {
+      for (uint32_t d = 0; d < rank; ++d) {
+        bytes *= dxa_ref::n_elems(w.ref, d);
+      }
     }
     if (bytes == 0) {
       this->dxa_abort(w, "invalid DXA rank: empty box");
@@ -1400,6 +1517,338 @@ private:
       this->dxa_abort(w, "DXA box exceeds local memory: " + std::to_string(bytes) + " bytes");
     }
     return uint32_t(bytes);
+  }
+
+  // ── The PTX traversal ───────────────────────────────────────────────
+  static constexpr uint32_t kSwzWord = std::min<uint32_t>(DxaCore::LMEM_ROW_SIZE, 128u);
+
+  // The descriptor's words, as the golden model decodes them.
+  static dxa_ref::Desc ref_desc(const Descriptor& d) {
+    uint32_t wd[dxa_ref::DESC_WORDS] = {};
+    wd[VX_DCR_DXA_DESC_BASE_LO_OFF]    = uint32_t(d.base_addr);
+    wd[VX_DCR_DXA_DESC_BASE_HI_OFF]    = uint32_t(d.base_addr >> 32);
+    wd[VX_DCR_DXA_DESC_SIZE0_OFF]      = d.sizes[0];
+    wd[VX_DCR_DXA_DESC_SIZE1_OFF]      = d.sizes[1];
+    wd[VX_DCR_DXA_DESC_SIZE2_OFF]      = d.sizes[2];
+    wd[VX_DCR_DXA_DESC_SIZE3_OFF]      = d.sizes[3];
+    wd[VX_DCR_DXA_DESC_SIZE4_OFF]      = d.sizes[4];
+    wd[VX_DCR_DXA_DESC_STRIDE0_OFF]    = d.strides[0];
+    wd[VX_DCR_DXA_DESC_STRIDE1_OFF]    = d.strides[1];
+    wd[VX_DCR_DXA_DESC_STRIDE2_OFF]    = d.strides[2];
+    wd[VX_DCR_DXA_DESC_STRIDE3_OFF]    = d.strides[3];
+    wd[VX_DCR_DXA_DESC_META_OFF]       = d.meta;
+    wd[VX_DCR_DXA_DESC_ESTRIDE0_OFF]   = d.element_strides[0];
+    wd[VX_DCR_DXA_DESC_ESTRIDE1_OFF]   = d.element_strides[1];
+    wd[VX_DCR_DXA_DESC_ESTRIDE2_OFF]   = d.element_strides[2];
+    wd[VX_DCR_DXA_DESC_ESTRIDE3_OFF]   = d.element_strides[3];
+    wd[VX_DCR_DXA_DESC_ESTRIDE4_OFF]   = d.element_strides[4];
+    wd[VX_DCR_DXA_DESC_TILESIZE01_OFF] = uint32_t(d.tile_sizes[0]) | (uint32_t(d.tile_sizes[1]) << 16);
+    wd[VX_DCR_DXA_DESC_TILESIZE23_OFF] = uint32_t(d.tile_sizes[2]) | (uint32_t(d.tile_sizes[3]) << 16);
+    wd[VX_DCR_DXA_DESC_TILESIZE4_OFF]  = d.tile_sizes[4];
+    wd[VX_DCR_DXA_DESC_CFILL_OFF]      = d.cfill;
+    return dxa_ref::decode(wd);
+  }
+
+  // The bytes from the destination to the end of what the box writes, the
+  // swizzle's moves included.
+  uint64_t box_extent(const Worker& w) const {
+    const auto& d = w.ref;
+    uint64_t dense = d.elem;
+    if (d.im2col) {
+      dense *= uint64_t(d.channels) * d.pixels;
+    } else {
+      for (uint32_t i = 0; i < d.rank && i < dxa_ref::MAX_RANK; ++i) {
+        dense *= dxa_ref::n_elems(d, i);
+      }
+    }
+    if (d.swizzle == dxa_ref::SWZ_NONE || dense == 0)
+      return dense;
+    const uint32_t rel = uint32_t(w.req.blk_off);
+    uint32_t lo = 0, hi = 0;
+    dxa_ref::footprint(w.ref, rel, &lo, &hi);
+    return hi - rel;
+  }
+
+  // The swizzle of a destination byte, on its block-relative offset.
+  uint64_t swizzle(const Worker& w, uint64_t a) const {
+    if (w.swz_mask == 0)
+      return a;
+    return w.blk_base + dxa_ref::swizzle(uint32_t(a - w.blk_base), w.ref.swizzle);
+  }
+
+  // The synthetic descriptor of a global bulk load: rank 1, 8-byte elements,
+  // the range as its tile. A prefetch is a hint and reads at most a local
+  // memory's worth of it, so its tile always fits.
+  static Descriptor bulk_desc(const DxaReq& req) {
+    const uint64_t bytes = req.prefetch
+        ? std::min<uint64_t>(req.size, uint64_t(1) << VX_CFG_LMEM_LOG_SIZE) : req.size;
+    Descriptor d;
+    d.base_addr = req.gsrc;
+    d.meta = (1u << DXA_DESC_META_DIM_LSB) | (3u << DXA_DESC_META_ELEMSZ_LSB);
+    d.sizes[0] = uint32_t(bytes / 8);
+    d.tile_sizes[0] = uint16_t(bytes / 8);
+    d.element_strides[0] = 1;
+    return d;
+  }
+
+  // VX_dxa_setup's latency for the PTX forms, from the request leaving the
+  // unit to the first line: 2 cycles of descriptor fetch, the rank's setup
+  // (4 up to rank 2, then 2 a rank), 2 of promotion, 1 to the first line.
+  static uint64_t ptx_first_line(uint32_t rank) {
+    const uint32_t setup = (rank <= 2) ? 4u : 2u * rank;
+    return 2 + setup + 2 + 1;
+  }
+
+  // The descriptor's checks and the transfer's traversal state.
+  void setup_ptx(Worker& w) {
+    const DxaReq& req = w.req;
+    w.ref = ref_desc(w.desc);
+    const auto& d = w.ref;
+    if (const char* msg = dxa_ref::check_tensor(d, uint32_t(req.blk_off), req.prefetch)) {
+      this->dxa_abort(w, msg);
+    }
+    w.ptx      = (d.swizzle != dxa_ref::SWZ_NONE) || (dxa_ref::es(d, 0) > 1) || d.im2col || req.bload;
+    w.prefetch = req.prefetch;
+    w.swz_mask = dxa_ref::swizzle_mask(d.swizzle);
+    w.blk_base = req.smem_addr - req.blk_off;
+    if (req.tload || req.bload) {
+      w.first_line = req.sent + ptx_first_line(std::max(d.rank, 1u));
+    }
+    // A barrier multicast replays into consecutive slots of this core.
+    if (w.ptx && !req.cluster && w.is_multicast) {
+      for (uint32_t i = 0; i < w.rcvs.size(); ++i) {
+        w.rcvs.at(i).off     = uint64_t(w.cta_indices.at(i)) * w.smem_stride;
+        w.rcvs.at(i).bar_idx = w.cta_indices.at(i);
+      }
+    }
+  }
+
+  // The tokens of a tensor copy in an mbarrier build: signed coordinates,
+  // traversal strides, the bounds of every element, im2col; a prefetch keeps
+  // only its in-bounds lines. An in-bounds box at the default fields gets
+  // exactly enumerate_work_list's tokens.
+  void enumerate_ptx(Worker& w) {
+    const auto& desc = w.desc;
+    const uint32_t rank = desc_rank(desc.meta);
+    const uint32_t elem = desc_elem_bytes(desc.meta);
+    const bool   im2col = w.ref.im2col;
+    DestLayout layout   = desc_layout(desc.meta);
+    bool dest_kmajor    = (layout == DestLayout::KMajor);
+    bool dest_tiled     = desc_dest_tiled(desc.meta);
+    if ((dest_kmajor || dest_tiled) && rank > 2) {
+      dest_kmajor = false;
+      dest_tiled  = false;
+      layout      = DestLayout::RowMajor;
+    }
+    const bool scatter = dest_kmajor || dest_tiled;
+
+    std::array<uint32_t, 5> n  = {1, 1, 1, 1, 1};
+    std::array<uint32_t, 5> es = {1, 1, 1, 1, 1};
+    for (uint32_t d = 0; d < rank; ++d) {
+      const uint32_t tile = std::max<uint32_t>(1u, desc.tile_sizes[d]);
+      es[d] = dxa_ref::es(w.ref, d);
+      n[d]  = (tile + es[d] - 1) / es[d];
+    }
+    if (im2col) {
+      n[0]  = std::max<uint32_t>(1u, w.ref.channels);
+      es[0] = 1;
+    }
+    const uint32_t n0   = n[0];
+    const uint32_t es0  = es[0];
+    const int64_t  c0   = int32_t(w.req.coords[0]);
+    const int64_t  size0 = desc.sizes[0];
+    const uint32_t per_lane_stride_bytes = n[1] * elem;
+    const uint32_t geo_ratio  = dest_tiled ? std::max<uint32_t>(1u, 4u / elem) : 1u;
+    const uint32_t geo_tcN    = dest_tiled ? desc_geo_tcn(desc) : 1u;
+    const uint32_t geo_bkK    = dest_tiled ? desc_geo_bkk(desc) : 1u;
+    const uint32_t geo_nsteps = dest_tiled ? std::max<uint32_t>(1u, n0 / geo_tcN) : 1u;
+    const uint32_t cfill = desc.cfill;
+    uint64_t global_prev_cl = ~uint64_t(0);
+
+    // K-major, Flat and BlockMajor are Vortex layouts with the walk of the
+    // tensor issue: no dim-0 bound, unsigned outer coordinates.
+    const bool old_walk = (desc_layout(desc.meta) != DestLayout::RowMajor);
+    // Every row has the same dim-0 segments: [0, lo0) and [hi0, n0) are
+    // filled, [lo0, hi0) is read unless the row itself is out of bounds.
+    uint32_t lo0 = 0, hi0 = n0;
+    if (!old_walk) {
+      if (c0 < 0) {
+        lo0 = uint32_t(std::min<int64_t>(n0, (es0 - 1 - c0) / es0));
+      }
+      const int64_t room = size0 - c0;
+      hi0 = (room <= 0) ? lo0 : uint32_t(std::max<int64_t>(lo0, std::min<int64_t>(n0, (room + es0 - 1) / es0)));
+    }
+    const bool gather = (es0 > 1);
+
+    // A row's tokens, as VX_dxa_addr_gen walks it. The filled segments split
+    // at lines of their local-memory address; the read one at lines of its
+    // global address, which an out-of-bounds row still has, though it reads
+    // nothing. A gather token holds one line's elements, and every token of
+    // a gather transfer drains one element a beat.
+    // A prefetch reads only the in-bounds part of in-bounds rows; each
+    // out-of-bounds row, or the whole box with no in-bounds dim-0 element,
+    // still takes one generator cycle (an entry with no read).
+    auto skip_entry = [&]() {
+      LineWork lw{};
+      lw.oob = true;
+      w.work_list.push_back(lw);
+    };
+    const bool pf_empty = w.prefetch && (lo0 == hi0);
+    auto emit_row = [&](int64_t gbase, bool row_in, uint64_t row_smem_base, uint32_t k_row) {
+      if (w.prefetch && (pf_empty || !row_in)) {
+        if (!pf_empty)
+          skip_entry();
+        return;
+      }
+      const uint32_t seg_lo[3] = {0, lo0, hi0};
+      const uint32_t seg_hi[3] = {lo0, hi0, n0};
+      for (uint32_t sg = 0; sg < 3; ++sg) {
+        const bool ib   = (sg == 1);
+        const bool fill = !ib || !row_in;
+        if (fill && w.prefetch)
+          continue;
+        const uint32_t seg_end = seg_hi[sg];
+        for (uint32_t e0 = seg_lo[sg]; e0 < seg_end; ) {
+          const uint64_t gaddr_e = uint64_t(gbase + int64_t(e0) * es0 * elem);
+          uint64_t saddr_e;
+          if (dest_tiled) {
+            uint32_t de = tiled_dest_elem(layout, k_row, e0, geo_ratio, geo_tcN, geo_nsteps, geo_bkK);
+            saddr_e = w.req.smem_addr + uint64_t(de) * elem;
+          } else if (dest_kmajor) {
+            saddr_e = row_smem_base + uint64_t(e0) * uint64_t(per_lane_stride_bytes);
+          } else {
+            saddr_e = row_smem_base + uint64_t(e0) * elem;
+          }
+          const uint64_t cl_addr = gaddr_e & kGmemLineMask;
+          const uint64_t sword   = saddr_e & ~uint64_t(kLmemWordSize - 1);
+          const uint32_t cl_off  = uint32_t(gaddr_e - cl_addr);
+          const uint32_t s_off   = uint32_t(saddr_e - sword);
+          const uint32_t cl_room = kGmemLineSize - cl_off;
+          const uint32_t sw_room = kLmemWordSize - s_off;
+          const uint32_t seg_room = (seg_end - e0) * elem;
+          LineWork lw{};
+          uint32_t num_elems;
+          if (!ib) {
+            const uint32_t ln_room = kGmemLineSize - uint32_t(saddr_e & (kGmemLineSize - 1));
+            uint32_t fspan = std::min({sw_room, ln_room, seg_room});
+            fspan -= fspan % elem;
+            if (fspan == 0)
+              break;
+            num_elems = fspan / elem;
+            lw.valid_length   = gather ? elem : fspan;
+            lw.km_num_elems   = gather ? num_elems : 1;
+            lw.km_lane_stride = gather ? elem : 0;
+            lw.src_step       = gather ? elem : 0;
+          } else if (gather) {
+            if (cl_room < elem)
+              break;
+            num_elems = std::min(seg_end - e0, (cl_room - elem) / (es0 * elem) + 1);
+            lw.valid_length   = elem;
+            lw.km_num_elems   = num_elems;
+            lw.km_lane_stride = elem;
+            lw.src_step       = fill ? elem : es0 * elem;
+          } else {
+            uint32_t gspan = scatter ? std::min({cl_room, seg_room, uint32_t(VX_CFG_MEM_BLOCK_SIZE)})
+                           : w.ptx   ? std::min(cl_room, seg_room)
+                                     : std::min({cl_room, sw_room, seg_room, uint32_t(VX_CFG_MEM_BLOCK_SIZE)});
+            gspan -= gspan % elem;
+            if (gspan == 0)
+              break;
+            num_elems = gspan / elem;
+            lw.valid_length   = scatter ? elem : gspan;
+            lw.km_num_elems   = scatter ? num_elems : 1;
+            lw.km_lane_stride = dest_kmajor ? per_lane_stride_bytes : 0;
+          }
+          lw.gmem_cl_addr     = cl_addr;
+          lw.smem_word_addr   = sword;
+          lw.cl_byte_offset   = cl_off;
+          lw.smem_byte_offset = s_off;
+          lw.cfill            = cfill;
+          lw.oob              = fill;
+          lw.last             = false;
+          lw.dest_layout      = uint8_t(layout);
+          lw.tile_k_row       = k_row;
+          lw.tile_n_base      = e0;
+          if (!fill && cl_addr == global_prev_cl) {
+            ++perf_stats_.gmem_dedup;
+          } else if (!fill) {
+            global_prev_cl = cl_addr;
+          }
+          w.work_list.push_back(lw);
+          e0 += num_elems;
+        }
+      }
+    };
+
+    if (pf_empty) {
+      skip_entry();
+      return;
+    }
+    if (im2col) {
+      this->enumerate_im2col(w, emit_row);
+      return;
+    }
+    uint32_t total_rows = 1;
+    for (uint32_t d = 1; d < rank; ++d) total_rows *= n[d];
+    for (uint32_t row = 0; row < total_rows; ++row) {
+      uint32_t outer[4] = {};
+      uint32_t rem = row;
+      bool row_in = true;
+      int64_t gbase = int64_t(desc.base_addr) + c0 * elem;
+      for (uint32_t d = 1; d < rank; ++d) {
+        outer[d - 1] = rem % n[d];
+        rem /= n[d];
+        const int64_t x = int64_t(int32_t(w.req.coords[d])) + int64_t(outer[d - 1]) * es[d];
+        row_in = row_in && (old_walk ? (uint64_t(w.req.coords[d]) + outer[d - 1] < desc.sizes[d])
+                                     : (x >= 0 && x < int64_t(desc.sizes[d])));
+        gbase += x * int64_t(desc.strides[d - 1]);
+      }
+      const uint64_t row_smem_base = dest_kmajor
+          ? (w.req.smem_addr + uint64_t(outer[0]) * elem)
+          : (w.req.smem_addr + uint64_t(row * n0) * elem);
+      emit_row(gbase, row_in, row_smem_base, outer[0]);
+    }
+  }
+
+  // The im2col walk (dxa_ref::im2col_pixels): pixel k's channels are a row.
+  template <typename EmitRow>
+  void enumerate_im2col(Worker& w, EmitRow& emit_row) {
+    const auto& d = w.ref;
+    dxa_ref::Req q;
+    for (uint32_t i = 0; i < dxa_ref::MAX_RANK; ++i) {
+      q.coord[i] = int32_t(w.req.coords[i]);
+    }
+    for (uint32_t i = 0; i < 3; ++i) {
+      q.offs[i] = w.req.offs[i];
+    }
+    const uint64_t row_bytes = uint64_t(std::max<uint32_t>(1u, d.channels)) * d.elem;
+    dxa_ref::im2col_pixels(d, q, [&](uint32_t k, const int64_t* x, bool pix_in) {
+      int64_t gbase = int64_t(d.base) + x[0] * int64_t(d.elem);
+      for (uint32_t i = 1; i < d.rank; ++i) {
+        gbase += x[i] * int64_t(d.stride[i - 1]);
+      }
+      emit_row(gbase, pix_in, w.req.smem_addr + uint64_t(k) * row_bytes, 0u);
+    });
+  }
+
+  // A prefetch's smem_wr: one arrived token a cycle leaves without a write,
+  // the last one after the others.
+  void drain_prefetch(Worker& w) {
+    if (w.issued_order.empty()) {
+      if (w.ag_idx == w.work_list.size())
+        finish_worker(w);
+      return;
+    }
+    for (auto it = w.issued_order.begin(); it != w.issued_order.end(); ++it) {
+      auto& sl = w.inflight.at(*it);
+      if (sl.rsp_arrived && (!sl.work.last || w.issued_order.size() == 1)) {
+        sl.allocated   = false;
+        sl.rsp_arrived = false;
+        sl.rsp_data.reset();
+        w.issued_order.erase(it);
+        return;
+      }
+    }
   }
 
   // A bulk copy: the lines covering [src_addr, src_addr + size) of the

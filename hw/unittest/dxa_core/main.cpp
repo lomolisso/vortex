@@ -20,18 +20,32 @@
 // responses come back in order after a random delay under random request
 // back-pressure, and must write exactly the destination bytes, complete with
 // one last beat carrying the mbarrier, the byte count and the slot, and never
-// refuse a read response.
+// refuse a read response. Then tensor loads (PTX tile and im2col modes),
+// global-to-local bulk copies and prefetches, against out-of-order global
+// responses under back-pressure: every local-memory byte must match the
+// reference box walk (signed coordinates, fill on both sides of every
+// dimension, element strides, every swizzle, interleave, im2col, a cluster
+// multicast), each transfer's completion beat must be its last write and carry
+// its byte count, every in-bounds line must be read once per row token, and a
+// prefetch must read its lines and write nothing.
 
 #include <iostream>
 #include <cassert>
 #include <cstdlib>
 #include <cstdio>
+#include <cstring>
 #include <deque>
 #include <map>
 #include <vector>
 #include <type_traits>
+#include <functional>
+#include <string>
 #include <VX_config.h>
 #include <VX_types.h>
+#if defined(VX_CFG_EXT_MBAR_ENABLE)
+#include <dxa_ref.h>
+namespace dxa_ref = vortex::dxa_ref;
+#endif
 #include "VVX_dxa_core_top.h"
 #include "verilated.h"
 #ifdef VCD_OUTPUT
@@ -554,6 +568,708 @@ static bool run_bulk_all() {
     return ok;
 }
 
+// ---- Tensor loads, global bulk copies and prefetches ----------------------
+
+#ifdef NDEBUG
+static constexpr int UUID_W = 1;
+#else
+static constexpr int UUID_W = 44;
+#endif
+static constexpr int NC_W     = up1(clog2(VX_CFG_NUM_CORES));
+static constexpr int MADDR_W  = VX_CFG_MEM_ADDR_WIDTH;
+// The tensor-load fields sit above the bulk-copy ones: core_id, uuid, then blk_base up.
+static constexpr int R_CORE   = R_WID + NW_W + UUID_W;
+static constexpr int R_BLK    = R_CORE + NC_W;
+static constexpr int R_GSRC   = R_BLK + LMEM_LOG;
+static constexpr int R_OFFS   = R_GSRC + MADDR_W;
+static constexpr int R_PF     = R_OFFS + 48;
+static constexpr int R_BLOAD  = R_PF + 1;
+static constexpr int R_TLOAD  = R_BLOAD + 1;
+static constexpr int R_END    = R_TLOAD + 1;
+static constexpr int CL       = VX_CFG_L1_LINE_SIZE;
+
+template <typename T>
+static int port_width(int width) {
+    int w = int(sizeof(T)) * 8;
+    return width < w ? width : w;
+}
+template <typename T>
+static uint64_t port_bits(const T& v, int lsb, int width) {
+    uint64_t r = 0;
+    width = port_width<T>(width);
+    for (int i = 0; i < width; ++i)
+        r |= uint64_t(port_bit(v, lsb + i)) << i;
+    return r;
+}
+template <typename T>
+static void port_set(T& v, int lsb, int width, uint64_t value) {
+    width = port_width<T>(width);
+    if constexpr (std::is_integral<T>::value) {
+        for (int i = 0; i < width; ++i) {
+            T bit = T(1) << (lsb + i);
+            v = ((value >> i) & 1) ? (v | bit) : (v & ~bit);
+        }
+    } else {
+        set_bits(v, lsb, width, value);
+    }
+}
+
+static void dcr_write(uint32_t addr, uint32_t data) {
+    dut->dcr_req_valid = 1;
+    dut->dcr_req_rw    = 1;
+    dut->dcr_req_addr  = addr;
+    dut->dcr_req_data  = data;
+    clock_cycle();
+    dut->dcr_req_valid = 0;
+    dut->dcr_req_rw    = 0;
+}
+
+// Every address bit changes the byte, so a wrong high address bit shows.
+static uint8_t gmem_byte(uint64_t a) {
+    return uint8_t((a * 131u) ^ (a >> 8) * 7u ^ (a >> 16) * 13u ^ (a >> 24) * 29u ^ (a >> 32) * 37u
+                   ^ (a >> 40) * 41u ^ 0x3cu);
+}
+
+// A transfer, as the request and descriptor the engine receives.
+struct Xfer {
+    std::string name;
+    // descriptor
+    uint32_t rank = 1, esz = 2, swz = 0, il = 0, im2col = 0;
+    uint64_t base = 0;
+    uint32_t size[5] = {1, 1, 1, 1, 1};
+    uint32_t stride[4] = {0, 0, 0, 0};    // bytes, dims 1..4
+    uint32_t es[5] = {1, 1, 1, 1, 1};
+    uint32_t tile[5] = {1, 1, 1, 1, 1};
+    uint32_t cpp = 0, ppc = 0;            // im2col
+    int32_t  lower[3] = {0, 0, 0}, upper[3] = {0, 0, 0};
+    uint32_t cfill = 0;
+    // request
+    int32_t  c[5] = {0, 0, 0, 0, 0};
+    uint32_t offs[3] = {0, 0, 0};
+    uint32_t smem = 0, blk_base = 0, mbar = 0, slot = 1, gen = 3;
+    bool     prefetch = false;
+    bool     bload = false;               // a global bulk copy (base, bytes)
+    uint32_t bytes = 0;
+    uint32_t mc_mask = 0;                 // a cluster multicast to local slots 0..MAXC-1
+    uint32_t room = 0;                    // bytes from smem to its block's end (0: to the memory's end)
+};
+
+static dxa_ref::Desc ref_desc(const Xfer& x) {
+    dxa_ref::Desc d;
+    d.base = x.base; d.rank = x.rank; d.elem = 1u << x.esz; d.layout = 0;
+    d.swizzle = x.swz; d.interleave = x.il; d.im2col = x.im2col != 0;
+    for (int i = 0; i < 5; ++i) {
+        d.size[i] = x.size[i]; d.estride[i] = x.es[i]; d.tile[i] = x.tile[i];
+    }
+    for (int i = 0; i < 4; ++i)
+        d.stride[i] = x.stride[i];
+    d.channels = x.cpp; d.pixels = x.ppc;
+    for (int i = 0; i < 3; ++i) {
+        d.lower[i] = x.lower[i]; d.upper[i] = x.upper[i];
+    }
+    d.cfill = x.cfill;
+    return d;
+}
+
+// The golden box walk (dxa_ref.h): f(dense offset, in bounds, global address)
+// per element in destination order; returns the tx bytes. A bulk copy is one
+// row of doublewords.
+static uint32_t walk(const Xfer& x, const std::function<void(uint32_t, bool, uint64_t)>& f) {
+    uint32_t e = 1u << x.esz;
+    if (x.bload || x.bytes) {
+        for (uint32_t i = 0; i < x.bytes / e; ++i)
+            f(i * e, true, x.base + uint64_t(i) * e);
+        return x.bytes;
+    }
+    auto d = ref_desc(x);
+    dxa_ref::Req q;
+    for (int i = 0; i < 5; ++i)
+        q.coord[i] = x.c[i];
+    for (int i = 0; i < 3; ++i)
+        q.offs[i] = x.offs[i];
+    dxa_ref::for_each_element(d, q, f);
+    return dxa_ref::tx_bytes(d);
+}
+
+static uint32_t box_n(const Xfer& x, int d) { return dxa_ref::n_elems(ref_desc(x), uint32_t(d)); }
+
+// The engine's line reads: one per in-bounds row segment's line (a gathered
+// segment reads each line holding one of its elements).
+static uint64_t expect_reads(const Xfer& x) {
+    uint64_t reads = 0;
+    int64_t row_first = -1, row_last = -1;
+    uint32_t e = 1u << x.esz, cnt = 0, per_row = x.bytes ? x.bytes / e : (x.im2col ? x.cpp : box_n(x, 0));
+    // In-bounds elements of a row are one contiguous run (dim-0 split).
+    walk(x, [&](uint32_t, bool in, uint64_t a) {
+        if (in) {
+            if (row_first < 0)
+                row_first = int64_t(a);
+            row_last = int64_t(a);
+        }
+        if (++cnt == per_row) {
+            if (row_first >= 0)
+                reads += uint64_t(row_last / CL - row_first / CL + 1);
+            row_first = row_last = -1;
+            cnt = 0;
+        }
+    });
+    return reads;
+}
+
+static void program_desc(uint32_t slot, const Xfer& x) {
+    uint32_t d = VX_DCR_DXA_DESC_BASE + slot * VX_DCR_DXA_DESC_STRIDE;
+    uint32_t meta = x.rank | (x.esz << 3) | (x.swz << 7) | (x.il << 9) | (x.im2col << 13);
+    dcr_write(d + VX_DCR_DXA_DESC_BASE_LO_OFF, uint32_t(x.base));
+    dcr_write(d + VX_DCR_DXA_DESC_BASE_HI_OFF, uint32_t(x.base >> 32));
+    for (int i = 0; i < 5; ++i)
+        dcr_write(d + VX_DCR_DXA_DESC_SIZE0_OFF + i, x.size[i]);
+    for (int i = 0; i < 4; ++i)
+        dcr_write(d + VX_DCR_DXA_DESC_STRIDE0_OFF + i, x.stride[i]);
+    dcr_write(d + VX_DCR_DXA_DESC_META_OFF, meta);
+    for (int i = 0; i < 5; ++i)
+        dcr_write(d + VX_DCR_DXA_DESC_ESTRIDE0_OFF + i, x.es[i]);
+    uint32_t t23;
+    if (x.im2col) {
+        dcr_write(d + VX_DCR_DXA_DESC_TILESIZE01_OFF, (x.ppc << 16) | x.cpp);
+        auto f = [](int32_t v, int w) { return uint32_t(v) & ((1u << w) - 1); };
+        if (x.rank == 3)
+            t23 = f(x.lower[0], 16) | (f(x.upper[0], 16) << 16);
+        else if (x.rank == 4)
+            t23 = f(x.lower[0], 8) | (f(x.lower[1], 8) << 8) | (f(x.upper[0], 8) << 16) | (f(x.upper[1], 8) << 24);
+        else
+            t23 = f(x.lower[0], 5) | (f(x.lower[1], 5) << 5) | (f(x.lower[2], 5) << 10)
+                | (f(x.upper[0], 5) << 15) | (f(x.upper[1], 5) << 20) | (f(x.upper[2], 5) << 25);
+    } else {
+        dcr_write(d + VX_DCR_DXA_DESC_TILESIZE01_OFF, (x.tile[1] << 16) | x.tile[0]);
+        t23 = (x.tile[3] << 16) | x.tile[2];
+    }
+    dcr_write(d + VX_DCR_DXA_DESC_TILESIZE23_OFF, t23);
+    dcr_write(d + VX_DCR_DXA_DESC_TILESIZE4_OFF, x.tile[4]);
+    dcr_write(d + VX_DCR_DXA_DESC_CFILL_OFF, x.cfill);
+    dcr_write(d + VX_DCR_DXA_DESC_SMEM_STRIDE_OFF, 0);
+}
+
+static const uint32_t MC_STRIDE = 0x1000;
+
+static void load_xfer(uint32_t slot, const Xfer& x) {
+    for (size_t i = 0; i < sizeof(dut->dxa_req_data) / sizeof(dut->dxa_req_data[0]); ++i)
+        dut->dxa_req_data[i] = 0;
+    if (x.bload || (x.prefetch && x.bytes)) {
+        set_bits(dut->dxa_req_data, R_SIZE, LMEM_LOG + 1, x.bytes);
+        set_bits(dut->dxa_req_data, R_GSRC, MADDR_W, x.base);
+        set_bits(dut->dxa_req_data, R_BLOAD, 1, x.bload);
+        set_bits(dut->dxa_req_data, R_META, 32, 0xC0000000u);
+    } else {
+        set_bits(dut->dxa_req_data, R_TLOAD, 1, 1);
+        set_bits(dut->dxa_req_data, R_META, 32, 0xC0000000u | slot);
+        for (int i = 0; i < 5; ++i)
+            set_bits(dut->dxa_req_data, R_COORDS + 32 * i, 32, uint32_t(x.c[i]));
+        for (int i = 0; i < 3; ++i)
+            set_bits(dut->dxa_req_data, R_OFFS + 16 * i, 16, x.offs[i]);
+    }
+    set_bits(dut->dxa_req_data, R_PF, 1, x.prefetch);
+    set_bits(dut->dxa_req_data, R_SMEM, LMEM_LOG, x.smem);
+    set_bits(dut->dxa_req_data, R_BLK, LMEM_LOG, x.blk_base);
+    set_bits(dut->dxa_req_data, R_MBAR, LMEM_LOG - 3, x.mbar);
+    set_bits(dut->dxa_req_data, R_GEN, 4, x.gen);
+    set_bits(dut->dxa_req_data, R_SLOT, NW_W, x.slot);
+    set_bits(dut->dxa_req_data, R_ROOM, LMEM_LOG + 1, x.room ? x.room : LMEM_BYTES - x.smem);
+    if (x.mc_mask) {
+        set_bits(dut->dxa_req_data, R_MCCL, 1, 1);
+        set_bits(dut->dxa_req_data, R_ROOM, LMEM_LOG + 1, MC_STRIDE - (x.smem % MC_STRIDE));
+        set_bits(dut->dxa_req_data, R_MCMASK, MAXC, x.mc_mask);
+        for (int r = 0; r < MAXC; ++r) {
+            // Rank r: slot r of this core, generation 8 + r.
+            uint64_t peer = uint64_t(8 + r) | (uint64_t(r) << 4);
+            set_bits(dut->dxa_req_data, R_PEERS + r * PEER_W, PEER_W, peer);
+        }
+    }
+    dut->dxa_req_valid = 1;
+}
+
+struct GRsp {
+    uint64_t line;
+    uint64_t tag;
+    uint64_t due;
+};
+
+// Runs the transfers back to back (or one at a time with `serial`) and
+// checks the local-memory image, the completions and the reads.
+static bool run_tensor(const char* name, std::vector<Xfer> xs, int ready_pct, int max_lat, bool serial = false) {
+    std::vector<uint8_t> mem(LMEM_BYTES), ref(LMEM_BYTES);
+    for (int i = 0; i < LMEM_BYTES; ++i)
+        mem[i] = ref[i] = pattern(i);
+    struct Done { uint32_t slot, gen, mbar, tx; };
+    std::vector<Done> dones;
+    uint64_t exp_reads = 0;
+    for (auto& x : xs) {
+        if (!x.bload && !x.bytes) {
+            const char* bad = dxa_ref::check_tensor(ref_desc(x), x.smem - x.blk_base, x.prefetch);
+            if (bad) {
+                printf("%s: vector %s breaks a rule: %s\n", name, x.name.c_str(), bad);
+                return false;
+            }
+        }
+        exp_reads += expect_reads(x);
+        if (x.prefetch)
+            continue;
+        std::vector<uint32_t> rcv;
+        if (x.mc_mask) {
+            for (int r = 0; r < MAXC; ++r)
+                if (x.mc_mask & (1u << r))
+                    rcv.push_back(r * MC_STRIDE);
+        } else {
+            rcv.push_back(x.blk_base);
+        }
+        uint32_t tx = 0;
+        for (auto base : rcv) {
+            uint32_t rel0 = x.smem - x.blk_base;
+            tx = walk(x, [&](uint32_t off, bool in, uint64_t a) {
+                for (uint32_t b = 0; b < (1u << x.esz); ++b) {
+                    uint32_t r = dxa_ref::swizzle(rel0 + off + b, x.swz);
+                    ref[base + r] = in ? gmem_byte(a + b) : dxa_ref::fill_byte(x.cfill, r);
+                }
+            });
+        }
+        for (size_t i = 0; i < rcv.size(); ++i) {
+            uint32_t slot = x.mc_mask ? 0 : x.slot, gen = x.mc_mask ? 0 : x.gen, mbar = x.mbar;
+            if (x.mc_mask) {
+                int r = 0, k = int(i);
+                for (; r < MAXC; ++r)
+                    if ((x.mc_mask >> r) & 1) { if (k == 0) break; --k; }
+                slot = r; gen = 8 + r; mbar = (r * MC_STRIDE) / 8 + x.mbar;
+            }
+            dones.push_back({slot, gen, mbar, tx});
+        }
+    }
+    std::vector<uint32_t> nrcv;   // completions per transfer
+    for (auto& x : xs)
+        nrcv.push_back(x.prefetch ? 0 : (x.mc_mask ? __builtin_popcount(x.mc_mask) : 1));
+
+    for (size_t i = 0; i < xs.size(); ++i)
+        if (!xs[i].bload && xs[i].bytes == 0)
+            program_desc(uint32_t(i % 16), xs[i]);
+    for (int i = 0; i < 4; ++i)
+        clock_cycle();
+
+    std::vector<GRsp> rsps;
+    size_t next = 0, lasts = 0;
+    uint64_t reads = 0, writes = 0, cyc = 0, idle = 0;
+    bool ok = true, after_last = false;
+    size_t cur = 0;            // the transfer whose writes are expected
+    uint32_t cur_lasts = 0;
+    auto issue_next = [&]() {
+        while (next < xs.size()) {
+            load_xfer(uint32_t(next % 16), xs[next]);
+            return;
+        }
+        dut->dxa_req_valid = 0;
+    };
+    issue_next();
+    while (cyc < 400000) {
+        // A random response whose latency has passed, any order.
+        int pick = -1;
+        std::vector<int> ready;
+        for (size_t i = 0; i < rsps.size(); ++i)
+            if (rsps[i].due <= cyc) ready.push_back(int(i));
+        if (!ready.empty() && (rnd() % 100) < 80)
+            pick = ready[rnd() % ready.size()];
+        dut->gmem_rsp_valid = (pick >= 0);
+        if (pick >= 0) {
+            const auto& r = rsps[pick];
+            for (int w = 0; w < CL / 4; ++w) {
+                uint32_t v = 0;
+                for (int b = 0; b < 4; ++b)
+                    v |= uint32_t(gmem_byte(r.line * CL + w * 4 + b)) << (8 * b);
+                dut->gmem_rsp_data[w] = v;
+            }
+            port_set(dut->gmem_rsp_tag, 0, 64, r.tag);
+        }
+        dut->gmem_req_ready = (int(rnd() % 100) < ready_pct) ? 1 : 0;
+        dut->lmem_req_ready = (int(rnd() % 100) < ready_pct) ? 1 : 0;
+        dut->eval();
+        bool req_taken = dut->dxa_req_valid && dut->dxa_req_ready;
+        if ((dut->gmem_req_valid & 1) && (dut->gmem_req_ready & 1)) {
+            ++reads;
+            uint64_t line = port_bits(dut->gmem_req_addr, 0, MADDR_W - clog2(CL));
+            uint64_t tag  = port_bits(dut->gmem_req_tag, 0, 64);
+            rsps.push_back({line, tag, cyc + 2 + rnd() % (max_lat - 1)});
+        }
+        if (pick >= 0 && (dut->gmem_rsp_ready & 1))
+            rsps.erase(rsps.begin() + pick);
+        if ((dut->lmem_req_valid & 1) && (dut->lmem_req_ready & 1)) {
+            uint32_t addr = dut->lmem_req_addr;
+            if (!(dut->lmem_req_rw & 1)) {
+                printf("%s: unexpected local-memory read\n", name);
+                ok = false;
+            }
+            ++writes;
+            while (cur < xs.size() && nrcv[cur] == 0) ++cur;   // prefetches write nothing
+            if (cur >= xs.size()) {
+                printf("%s: write after the last transfer, addr 0x%x\n", name, addr);
+                ok = false;
+            }
+            for (int b = 0; b < WORD_BYTES; ++b) {
+                if (port_bit(dut->lmem_req_byteen, b)) {
+                    uint32_t w = dut->lmem_req_data[b / 4];
+                    mem[addr * WORD_BYTES + b] = uint8_t(w >> (8 * (b % 4)));
+                }
+            }
+            uint64_t attr = dut->lmem_req_attr;
+            bool last = field(attr, A_LAST, 1);
+            if (after_last && !last) {
+                printf("%s: transfer %zu writes after its completion beat\n", name, cur);
+                ok = false;
+            }
+            if (last) {
+                if (lasts >= dones.size()) {
+                    printf("%s: extra completion beat\n", name);
+                    ok = false;
+                } else {
+                    const auto& d = dones[lasts];
+                    if (!field(attr, A_MODE, 1) || field(attr, A_PAY, PAY_W) != d.mbar
+                     || field(attr, A_TX, LMEM_LOG + 1) != d.tx || field(attr, A_SLOT, NW_W) != d.slot
+                     || field(attr, A_GEN, 4) != d.gen || field(attr, A_REMOTE, 1)) {
+                        printf("%s: completion %zu attr: mode=%lu mbar=0x%lx tx=%lu slot=%lu gen=%lu,"
+                               " expected mbar=0x%x tx=%u slot=%u gen=%u\n",
+                               name, lasts, (unsigned long)field(attr, A_MODE, 1),
+                               (unsigned long)field(attr, A_PAY, PAY_W), (unsigned long)field(attr, A_TX, LMEM_LOG + 1),
+                               (unsigned long)field(attr, A_SLOT, NW_W), (unsigned long)field(attr, A_GEN, 4),
+                               d.mbar, d.tx, d.slot, d.gen);
+                        ok = false;
+                    }
+                }
+                ++lasts;
+                after_last = true;
+                if (++cur_lasts == nrcv[cur]) {
+                    ++cur;
+                    cur_lasts = 0;
+                    after_last = false;
+                }
+            }
+        }
+        clock_cycle();
+        ++cyc;
+        if (req_taken) {
+            ++next;
+            if (serial)
+                dut->dxa_req_valid = 0;
+            else
+                issue_next();
+        }
+        bool quiet = (next >= xs.size()) && rsps.empty() && !dut->busy && (lasts == dones.size());
+        if (serial && !dut->dxa_req_valid && next < xs.size() && rsps.empty() && !dut->busy)
+            issue_next();
+        idle = quiet ? idle + 1 : 0;
+        if (idle > 64)
+            break;
+    }
+    dut->dxa_req_valid = 0;
+    dut->gmem_rsp_valid = 0;
+    dut->lmem_req_ready = 1;
+    dut->gmem_req_ready = 1;
+    if (lasts != dones.size()) {
+        printf("%s: %zu of %zu completions after %lu cycles\n", name, lasts, dones.size(), (unsigned long)cyc);
+        ok = false;
+    }
+    if (reads != exp_reads) {
+        printf("%s: %lu line reads, expected %lu\n", name, (unsigned long)reads, (unsigned long)exp_reads);
+        ok = false;
+    }
+    int bad = 0;
+    for (int i = 0; i < LMEM_BYTES; ++i) {
+        if (mem[i] != ref[i]) {
+            if (bad < 8)
+                printf("%s: byte 0x%x = 0x%02x, expected 0x%02x\n", name, i, mem[i], ref[i]);
+            ++bad;
+            ok = false;
+        }
+    }
+    if (bad)
+        printf("%s: %d bytes differ\n", name, bad);
+    if (ok)
+        printf("%s: %zu transfers, %lu reads, %lu writes in %lu cycles OK\n", name, xs.size(),
+               (unsigned long)reads, (unsigned long)writes, (unsigned long)cyc);
+    return ok;
+}
+
+static Xfer tile2d(const char* name, uint32_t esz, uint32_t size0, uint32_t size1, uint32_t tile0, uint32_t tile1,
+                   int32_t c0, int32_t c1, uint64_t base, uint32_t smem) {
+    Xfer x;
+    x.name = name;
+    x.rank = 2; x.esz = esz; x.base = base;
+    x.size[0] = size0; x.size[1] = size1;
+    x.stride[0] = ((size0 << esz) + 15) & ~15u;
+    x.tile[0] = tile0; x.tile[1] = tile1;
+    x.c[0] = c0; x.c[1] = c1;
+    x.smem = smem; x.mbar = 0x31;
+    return x;
+}
+
+static bool run_tensor_all() {
+    static_assert(R_END <= int(sizeof(((VVX_dxa_core_top*)nullptr)->dxa_req_data)) * 8,
+                  "request layout wider than the port");
+    const uint32_t q = LMEM_BYTES / 4;
+    const uint64_t G = 0x100000;
+    bool ok = true;
+    // In bounds, then a box past size0 and a halo at -1.
+    ok = run_tensor("tile-inb", {tile2d("inb", 2, 64, 32, 16, 8, 4, 3, G + 0x40, q)}, 100, 8, true) && ok;
+    ok = run_tensor("edge", {tile2d("edge", 2, 10, 8, 16, 4, 0, 2, G + 0x40, q)}, 100, 8, true) && ok;
+    ok = run_tensor("halo", {tile2d("halo", 2, 16, 16, 8, 4, -1, -1, G, q + 0x100)}, 100, 8, true) && ok;
+    {
+        Xfer a = tile2d("past", 1, 40, 12, 24, 6, 30, 9, G + 0x13, q);      // both past the end
+        Xfer b = tile2d("neg", 0, 37, 9, 50, 5, -20, -3, G + 0x7, q + 0x400); // lead, ib and trail, every row
+        b.cfill = 0x7fff7fffu;
+        Xfer c = tile2d("allout", 3, 8, 8, 4, 2, 9, 0, G, q + 0x800);         // whole rows filled
+        c.cfill = 0x7fffffffu;
+        Xfer d = tile2d("oddfill", 0, 37, 5, 21, 4, 3, 3, G + 0x5, q + 0xc13);  // rows past size1, bytes off-line
+        d.cfill = 0x44332211u;
+        ok = run_tensor("oob-rows-odd", {d}, 70, 20, true) && ok;
+        ok = run_tensor("oob-2d", {a, b, c}, 70, 20, true) && ok;
+        ok = run_tensor("oob-2d-stream", {a, b, c}, 70, 20) && ok;
+    }
+    {
+        // 5D, both sides of every dim.
+        Xfer x;
+        x.name = "oob5"; x.rank = 5; x.esz = 1; x.base = G + 0x2000;
+        uint32_t sz[5] = {11, 5, 4, 3, 3}, tl[5] = {16, 4, 3, 2, 2};
+        int32_t cc[5] = {-3, -1, 2, -1, 2};
+        uint32_t st = 0;
+        for (int d = 0; d < 5; ++d) { x.size[d] = sz[d]; x.tile[d] = tl[d]; x.c[d] = cc[d]; }
+        st = 32;
+        for (int d = 0; d < 4; ++d) { x.stride[d] = st; st *= sz[d + 1] + 1; }
+        x.smem = q; x.mbar = 0x40; x.cfill = 0x11223344;
+        ok = run_tensor("oob5", {x}, 80, 12, true) && ok;
+        // Element strides 1..8 in dims 1..4, with fill.
+        Xfer y = x;
+        y.name = "es"; y.c[0] = 0; y.c[1] = 0; y.c[2] = 1; y.c[3] = 0; y.c[4] = -1;
+        uint32_t sz2[5] = {16, 20, 30, 9, 12}, tl2[5] = {16, 7, 5, 8, 6}, es2[5] = {1, 3, 2, 8, 5};
+        st = 32;
+        for (int d = 0; d < 5; ++d) { y.size[d] = sz2[d]; y.tile[d] = tl2[d]; y.es[d] = es2[d]; }
+        for (int d = 0; d < 4; ++d) { y.stride[d] = st; st *= sz2[d + 1]; }
+        y.base = G + 0x40000;
+        ok = run_tensor("es", {y}, 80, 12, true) && ok;
+    }
+    // Every swizzle x element size x inner width up to the span, with fill;
+    // the destination block's base is not 128-byte aligned.
+    {
+        std::vector<Xfer> v;
+        const uint32_t blk = (WORD_BYTES > 64) ? 0x1080 : 0x1040;
+        for (uint32_t swz = 1; swz <= 3; ++swz) {
+            uint32_t span = 16u << swz;
+            for (uint32_t esz = 0; esz <= 3; ++esz) {
+                for (uint32_t inner : {16u, span / 2, span}) {
+                    if (inner < 16 || inner > span) continue;
+                    uint32_t t0 = inner >> esz;
+                    if (t0 == 0) continue;
+                    char nm[48];
+                    snprintf(nm, sizeof(nm), "swz%u-e%u-w%u", span, 1u << esz, inner);
+                    bool oob = ((swz + esz + inner) & 1);
+                    Xfer x = tile2d("", esz, oob ? t0 - 1 : 4 * t0, 40, t0, 12, oob ? -1 : int32_t(t0), oob ? -2 : 3,
+                                    G + 0x80000 + (v.size() << 12), blk + 0x200);
+                    x.name = nm; x.swz = swz; x.blk_base = blk; x.cfill = 0xa5a5a5a5u;
+                    v.push_back(x);
+                }
+            }
+        }
+        for (auto& x : v)
+            ok = run_tensor(x.name.c_str(), {x}, 90, 10, true) && ok;
+    }
+    // Interleave 16B (stride 1 and 2) and 32B (dim-0 stride 2, 32B swizzle), rank 3, with dim-0 fill.
+    {
+        Xfer x;
+        x.name = "il16"; x.rank = 3; x.esz = 1; x.il = 1; x.base = G + 0xc0000;
+        x.size[0] = 8; x.size[1] = 6; x.size[2] = 4;
+        x.stride[0] = 16; x.stride[1] = 16 * 6;
+        x.tile[0] = 8; x.tile[1] = 4; x.tile[2] = 2; x.c[1] = 1; x.c[2] = 1;
+        x.smem = q; x.mbar = 0x12;
+        ok = run_tensor("il16", {x}, 90, 10, true) && ok;
+        Xfer y = x;
+        y.name = "il16-es2"; y.es[0] = 2; y.c[0] = -3; y.size[0] = 7; y.tile[0] = 8;
+        ok = run_tensor("il16-es2", {y}, 90, 10, true) && ok;
+        Xfer z = x;
+        z.name = "il32"; z.il = 2; z.swz = 1; z.es[0] = 2; z.size[0] = 16; z.tile[0] = 16;
+        z.stride[0] = 32; z.stride[1] = 32 * 6; z.c[0] = 0;
+        ok = run_tensor("il32", {z}, 90, 10, true) && ok;
+        // A gather whose rows cross lines, with odd strides.
+        Xfer w = tile2d("", 0, 300, 4, 200, 3, -7, 2, G + 0xd0000 + 0x31, q);   // row 3 of 2..4 past size1
+        w.rank = 3; w.il = 1; w.size[2] = 2; w.tile[2] = 2; w.stride[1] = w.stride[0] * 4; w.cfill = 0x0f1e2d3cu;
+        for (uint32_t es0 : {3u, 5u, 7u}) {
+            char nm[32];
+            snprintf(nm, sizeof(nm), "gather-es%u", es0);
+            w.name = nm; w.es[0] = es0;
+            ok = run_tensor(nm, {w}, 90, 10, true) && ok;
+        }
+    }
+    // im2col 3D/4D/5D, pixels wrapping the box, padded corners, offsets, strides.
+    {
+        Xfer x;
+        x.name = "i2c3"; x.rank = 3; x.im2col = 1; x.esz = 1; x.base = G + 0x100000;
+        x.size[0] = 12; x.size[1] = 9; x.size[2] = 3;            // C, W, N
+        x.stride[0] = 32; x.stride[1] = 32 * 9;
+        x.cpp = 16; x.ppc = 20; x.lower[0] = -1; x.upper[0] = 1;
+        x.c[0] = -2; x.c[1] = -1; x.c[2] = 0; x.offs[0] = 1;
+        x.smem = q; x.mbar = 0x22; x.cfill = 0x5a6b7c8du;
+        ok = run_tensor("i2c3", {x}, 90, 12, true) && ok;
+        Xfer y;
+        y.name = "i2c4"; y.rank = 4; y.im2col = 1; y.esz = 2; y.base = G + 0x140000;
+        y.size[0] = 8; y.size[1] = 5; y.size[2] = 4; y.size[3] = 2;   // C, W, H, N
+        y.stride[0] = 32; y.stride[1] = 32 * 5; y.stride[2] = 32 * 5 * 4;
+        y.cpp = 8; y.ppc = 30; y.lower[0] = -1; y.lower[1] = -1; y.upper[0] = 0; y.upper[1] = 1;
+        y.es[1] = 2; y.c[0] = 0; y.c[1] = -1; y.c[2] = -1; y.c[3] = 0; y.offs[0] = 1; y.offs[1] = 0;
+        y.smem = q + 0x800; y.mbar = 0x23;
+        ok = run_tensor("i2c4", {y}, 90, 12, true) && ok;
+        Xfer z;
+        z.name = "i2c5"; z.rank = 5; z.im2col = 1; z.esz = 0; z.base = G + 0x180000 + 3;
+        z.size[0] = 20; z.size[1] = 4; z.size[2] = 3; z.size[3] = 3; z.size[4] = 2;  // C, W, H, D, N
+        z.stride[0] = 24; z.stride[1] = 24 * 4; z.stride[2] = 24 * 12; z.stride[3] = 24 * 36;
+        z.cpp = 24; z.ppc = 40; z.lower[0] = -1; z.lower[1] = 0; z.lower[2] = -1;
+        z.upper[0] = 1; z.upper[1] = 0; z.upper[2] = 0; z.es[1] = 1; z.es[2] = 2; z.es[3] = 1;
+        z.c[0] = 0; z.c[1] = -1; z.c[2] = 0; z.c[3] = -1; z.c[4] = 0; z.offs[0] = 0; z.offs[1] = 1; z.offs[2] = 1;
+        z.smem = q + 0x1000; z.mbar = 0x24;
+        ok = run_tensor("i2c5", {z}, 90, 12, true) && ok;
+        Xfer s = x;
+        s.name = "i2c3-swz128"; s.swz = 3; s.cpp = 64; s.size[0] = 70; s.stride[0] = 160; s.stride[1] = 160 * 9;
+        s.esz = 1; s.ppc = 12;
+        ok = run_tensor("i2c3-swz128", {s}, 90, 12, true) && ok;
+    }
+    // Global-to-local bulk copies, and prefetches of a box and of a range.
+    {
+        std::vector<Xfer> v;
+        for (uint32_t bytes : {16u, 48u, 208u, 2064u, 4096u}) {
+            Xfer x;
+            x.name = "bload"; x.bload = true; x.esz = 3; x.bytes = bytes;
+            x.base = G + 0x200000 + v.size() * 0x4000 + 16 * v.size();
+            x.smem = q + 16 * (v.size() + 1); x.mbar = 0x50 + v.size();
+            v.push_back(x);
+        }
+        ok = run_tensor("bload", v, 70, 16) && ok;
+        Xfer t = tile2d("pf", 2, 50, 10, 32, 8, -4, 5, G + 0x240000, 0);
+        t.prefetch = true;
+        Xfer b;
+        b.prefetch = true; b.esz = 3; b.bytes = 1040; b.base = G + 0x260000 + 0x30;
+        Xfer l = tile2d("after", 2, 50, 10, 32, 8, -4, 5, G + 0x240000, q);
+        ok = run_tensor("prefetch", {t, b}, 80, 10, true) && ok;
+        ok = run_tensor("prefetch-then-load", {t, l, b}, 80, 10) && ok;
+    }
+    // Cluster multicast to ranks 0 and 1 with 128B swizzle and fill.
+    {
+        Xfer x = tile2d("mc", 2, 30, 20, 32, 6, -2, 17, G + 0x280000, 0x100);
+        x.swz = 3; x.mc_mask = 0x3; x.mbar = 0x18; x.blk_base = 0;
+        if (MAXC >= 2)
+            ok = run_tensor("mc-swz128", {x}, 90, 10, true) && ok;
+        x.mc_mask = 0xa; x.c[0] = 3; x.c[1] = -1;
+        if (MAXC >= 4)
+            ok = run_tensor("mc-0xa-swz128", {x}, 80, 10, true) && ok;
+        // A global bulk copy multicast.
+        Xfer b;
+        b.bload = true; b.esz = 3; b.bytes = 1056; b.base = G + 0x2a0010; b.smem = 0x40; b.mbar = 0x1f8 / 8;
+        b.mc_mask = 0x3;
+        if (MAXC >= 2)
+            ok = run_tensor("bload-mc", {b}, 80, 10, true) && ok;
+    }
+    // Large sizes, coordinates and offsets: products and bounds past 32 bits.
+    {
+        Xfer h;
+        h.name = "bigsize0"; h.rank = 1; h.esz = 0; h.base = G + 0x300000;
+        h.size[0] = 0xFFFFFFF0u; h.tile[0] = 32; h.c[0] = -16;
+        h.smem = q + 0x40; h.mbar = 0x33;
+        ok = run_tensor("bigsize0", {h}, 90, 10, true) && ok;
+        Xfer b = tile2d("bigoff", 2, 64, 0x10000, 16, 2, 0, 0x9000, G, q + 0x80);
+        b.stride[0] = 0x10000;
+        ok = run_tensor("bigoff", {b}, 90, 10, true) && ok;
+        Xfer n = tile2d("bigsize1", 2, 64, 0xFFFFFFFFu, 16, 4, 0, -2, G + 0x10, q + 0x100);
+        ok = run_tensor("bigsize1", {n}, 90, 10, true) && ok;
+        Xfer w = tile2d("xwrap", 1, 40, 0xF0000000u, 16, 4, -3, 0x7FFFFFFE, G + 0x20, q + 0x200);
+        w.rank = 3; w.size[2] = 3; w.tile[2] = 2; w.c[2] = 1; w.stride[1] = 0x40000000u;
+        ok = run_tensor("xwrap", {w}, 90, 10, true) && ok;
+    }
+    // A bulk prefetch of the whole local memory (the largest size the unit passes on).
+    {
+        Xfer b;
+        b.prefetch = true; b.esz = 3; b.bytes = LMEM_BYTES; b.base = G + 0x380000;
+        ok = run_tensor("bpf-lmem", {b}, 100, 4, true) && ok;
+    }
+    // Prefetches with fill: entirely out, rows out, both sides; in streams with loads.
+    {
+        Xfer pa = tile2d("pf-allout", 2, 20, 10, 16, 4, 40, 2, G + 0x320000, 0);
+        pa.prefetch = true;
+        Xfer pb = tile2d("pf-rowsout", 2, 20, 10, 16, 4, 0, 12, G + 0x320000, 0);
+        pb.prefetch = true;
+        Xfer pd = tile2d("pf-lastout", 2, 20, 10, 16, 4, 0, 8, G + 0x320000, 0);  // last rows out
+        pd.prefetch = true;
+        Xfer pc = tile2d("pf", 2, 50, 10, 32, 8, -4, 5, G + 0x340000, 0);
+        pc.prefetch = true;
+        Xfer l1 = tile2d("l1", 2, 50, 10, 32, 8, -4, 5, G + 0x340000, q);
+        Xfer l2 = tile2d("l2", 2, 20, 10, 16, 4, 40, 2, G + 0x320000, q + 0x1000);
+        l2.cfill = 0x12345678;
+        Xfer bp;
+        bp.prefetch = true; bp.esz = 3; bp.bytes = 528; bp.base = G + 0x360010;
+        ok = run_tensor("pf-allout", {pa}, 100, 4, true) && ok;
+        ok = run_tensor("pf-lastout", {pd}, 80, 10, true) && ok;
+        ok = run_tensor("pf-stream", {pa, pb, pc, l1, pa, l2, pb, bp, pc, pd}, 70, 20) && ok;
+        ok = run_tensor("pf-stream2", {pa, pa, pb, l2, l2, bp, bp, pa}, 100, 3) && ok;
+    }
+    if (MAXC >= 2) {
+        Xfer w = tile2d("", 0, 300, 4, 200, 3, -7, 2, G + 0xd0000 + 0x31, 0x100);
+        w.rank = 3; w.il = 1; w.size[2] = 2; w.tile[2] = 2; w.stride[1] = w.stride[0] * 4; w.cfill = 0x0f1e2d3cu;
+        w.es[0] = 3; w.name = "gather-mc"; w.mc_mask = 0x3; w.blk_base = 0; w.mbar = 0x18;
+        ok = run_tensor("gather-mc", {w}, 80, 10, true) && ok;
+        Xfer w2 = w; w2.name = "gather-mc-swz"; w2.il = 2; w2.swz = 1; w2.es[0] = 2; w2.tile[0] = 32;
+        w2.size[0] = 21; w2.c[0] = -5; w2.stride[0] = 32; w2.stride[1] = 128; w2.smem = 0x400;
+        ok = run_tensor("gather-mc-swz", {w2, w}, 70, 20) && ok;
+    }
+    {
+        Xfer y;
+        y.name = "i2c4-nout"; y.rank = 4; y.im2col = 1; y.esz = 2; y.base = G + 0x140000;
+        y.size[0] = 8; y.size[1] = 5; y.size[2] = 4; y.size[3] = 2;
+        y.stride[0] = 32; y.stride[1] = 32 * 5; y.stride[2] = 32 * 5 * 4;
+        y.cpp = 8; y.ppc = 30; y.lower[0] = -1; y.lower[1] = -1; y.upper[0] = 0; y.upper[1] = 1;
+        y.es[1] = 2; y.es[2] = 3; y.c[0] = 0; y.c[1] = -1; y.c[2] = -1; y.c[3] = 1; y.offs[0] = 2; y.offs[1] = 1;
+        y.smem = q + 0x800; y.mbar = 0x23; y.cfill = 0xdeadbeefu;
+        ok = run_tensor("i2c4-nout", {y}, 90, 12, true) && ok;
+        Xfer y2 = y; y2.name = "i2c4-nall"; y2.c[3] = 5;
+        Xfer y3 = y; y3.name = "i2c4-c0"; y3.c[0] = 6; y3.cpp = 4; y3.c[3] = 0; y3.ppc = 60;
+        Xfer y4 = y2; y4.name = "i2c4-pf-nall"; y4.prefetch = true; y4.smem = 0;
+        ok = run_tensor("i2c-stream", {y, y2, y4, y3, y}, 70, 20) && ok;
+    }
+    {
+        Xfer z;
+        z.name = "il32-oob"; z.rank = 3; z.esz = 1; z.il = 2; z.swz = 1; z.es[0] = 2; z.base = G + 0x360000;
+        z.size[0] = 13; z.size[1] = 6; z.size[2] = 4; z.stride[0] = 32; z.stride[1] = 32 * 6;
+        z.tile[0] = 16; z.tile[1] = 4; z.tile[2] = 3; z.c[0] = -3; z.c[1] = 4; z.c[2] = 2;
+        z.smem = q; z.blk_base = q; z.mbar = 0x12; z.cfill = 0x7fff7fffu;
+        Xfer z2 = z; z2.name = "il16-swz64"; z2.il = 1; z2.swz = 2; z2.es[0] = 3; z2.c[0] = 5; z2.tile[0] = 8;
+        z2.smem = q + 0x400;
+        ok = run_tensor("il-swz", {z, z2, z}, 70, 20) && ok;
+    }
+    // The swizzle moves the last, partial 128-byte row's chunks to its end: a
+    // 192-byte box at block offset 0x300 spans 256 bytes, which fit exactly.
+    {
+        Xfer f = tile2d("swz-fp", 2, 16, 3, 16, 3, 0, 0, G + 0x3a0000, q + 0x300);
+        f.swz = 3; f.blk_base = q; f.room = 256;
+        ok = run_tensor("swz-fp", {f}, 90, 10, true) && ok;
+    }
+    return ok;
+}
+
+// Negative vectors: each must stop the simulation with the given assert.
+static void run_negative(const char* which) {
+    const uint32_t q = LMEM_BYTES / 4;
+    const uint64_t G = 0x100000;
+    Xfer f = tile2d("neg", 2, 16, 3, 16, 3, 0, 0, G, q + 0x300);
+    f.blk_base = q;
+    if (!strcmp(which, "box")) {
+        f.room = 191;                    // DXA box exceeds the destination block (dense bytes)
+    } else if (!strcmp(which, "swzbox")) {
+        f.swz = 3; f.room = 255;         // the same, by the swizzled footprint only
+    } else {
+        printf("unknown negative vector %s\n", which);
+        return;
+    }
+    run_tensor(which, {f}, 100, 4, true);
+}
+
 #endif
 
 int main(int argc, char** argv) {
@@ -600,7 +1316,16 @@ int main(int argc, char** argv) {
 #if !defined(VX_CFG_EXT_MBAR_ENABLE)
     ok = run_multicast();
 #else
-    ok = run_bulk_all();
+    dut->slot_stride = MC_STRIDE;
+    if (const char* neg = std::getenv("DXA_NEGATIVE")) {
+        run_negative(neg);
+        ok = false;
+    } else {
+        dut->slot_stride = 0x400;
+        ok = run_bulk_all();
+        dut->slot_stride = MC_STRIDE;
+        ok = run_tensor_all() && ok;
+    }
 #endif
 
     std::cout << (ok ? "PASSED" : "FAILED") << std::endl;

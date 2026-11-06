@@ -469,8 +469,13 @@ static op_string_t op_string(const Instr &instr) {
 #ifdef VX_CFG_EXT_DXA_ENABLE
     ,[&](DxaType /*dxa_type*/)-> op_string_t {
 #ifdef DXA_MBAR_ENABLE
-      if (std::get<DxaType>(instr.get_op_type()) == DxaType::BULK)
-        return {"DXA.BULK", ""};
+      switch (std::get<DxaType>(instr.get_op_type())) {
+      case DxaType::BULK:      return {"DXA.BULK", ""};
+      case DxaType::TLOAD:     return {"DXA.TLOAD", ""};
+      case DxaType::BLOAD:     return {"DXA.BLOAD", ""};
+      case DxaType::BPREFETCH: return {"DXA.BPREFETCH", ""};
+      default: break;
+      }
 #else
 #line 408
 #endif
@@ -999,9 +1004,15 @@ Instr::Ptr Decoder::decode(uint32_t code, uint64_t uuid) {
       instr->set_args(dxaArgs);
       instr->set_op_type(DxaType::ISSUE);
 #ifdef DXA_MBAR_ENABLE
-      // funct3 = 1 is the bulk copy; any other value stays the tensor issue.
-      if (funct3 == 1)
-        instr->set_op_type(DxaType::BULK);
+      // funct3 = 1 is the bulk copy, 2 the tensor load, 3 the global bulk
+      // load, 4 its prefetch; any other value stays the tensor issue.
+      switch (funct3) {
+      case 1: instr->set_op_type(DxaType::BULK); break;
+      case 2: instr->set_op_type(DxaType::TLOAD); break;
+      case 3: instr->set_op_type(DxaType::BLOAD); break;
+      case 4: instr->set_op_type(DxaType::BPREFETCH); break;
+      default: break;
+      }
 #elif defined(VX_CFG_EXT_DLMEM_ENABLE)
 #line 924
 #else

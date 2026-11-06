@@ -18,6 +18,7 @@
 #ifdef DXA_MBAR_ENABLE
 #include <iostream>
 #include "kmu/cta_gang.h"
+#include "dxa_ref.h"
 #else
 #line 20
 #endif
@@ -44,6 +45,13 @@ instr_trace_t* DxaUnit::process(instr_trace_t* trace) {
   //   Lane 3: rs1=coord1,    rs2=cta_mask
   auto& rs1 = trace->src_data[0];
   auto& rs2 = trace->src_data[1];
+#ifdef DXA_MBAR_ENABLE
+  if (this->issue_ptx(trace)) {
+    return trace;
+  }
+#else
+#line 43
+#endif
 
   uint64_t smem_addr = static_cast<uint64_t>(rs1.at(0).u);
   uint32_t meta      = rs1.at(1).u;
@@ -93,12 +101,23 @@ instr_trace_t* DxaUnit::process(instr_trace_t* trace) {
   req.src_addr  = 0;
   req.size      = 0;
   req.sent      = SimPlatform::instance().cycles();
+  req.tload     = false;
+  req.bload     = false;
+  req.prefetch  = false;
+  req.offs[0] = req.offs[1] = req.offs[2] = 0;
+  req.gsrc      = 0;
+  req.blk_off   = (smem_addr - dlmem_cfg().lmem_base - uint64_t(req.slot) * stride_)
+                & dlmem_ref::low_mask(dlmem_cfg().lmem_log);
   if (std::get<DxaType>(trace->op_type) == DxaType::BULK) {
     this->translate_bulk(trace, req);
   } else if (mode && cta_mask != 0) {
     this->cluster_receivers(trace, meta, cta_mask, req);
   } else {
     this->translate(trace, meta, cta_mask, req);
+  }
+  if (!req.win) {
+    // A local destination box must fit the issuing block.
+    req.win_room = (req.blk_off < stride_) ? uint32_t(stride_ - req.blk_off) : 0u;
   }
 #else
 #line 87
@@ -181,6 +200,7 @@ void DxaUnit::translate(const instr_trace_t* trace, uint32_t meta, uint32_t cta_
     req.smem_addr = cfg.lmem_base + uint64_t(dst.slot) * stride_ + off;
     req.win       = true;
     req.win_room  = uint32_t(stride_ - off);
+    req.blk_off   = off;
   }
   if (mbar_win) {
     req.mbar_off = uint32_t(((uint64_t(mbar.slot) * stride_) >> 3) + req.mbar_off);
@@ -220,6 +240,7 @@ void DxaUnit::cluster_receivers(const instr_trace_t* trace, uint32_t meta, uint3
   req.cluster  = true;
   req.win      = true;
   req.win_room = (off < stride_) ? uint32_t(stride_ - off) : 0u;
+  req.blk_off  = off;
   for (uint32_t r = 0; r < row.k; ++r) {
     if (((cta_mask >> r) & 1u) == 0)
       continue;
@@ -272,6 +293,9 @@ void DxaUnit::translate_bulk(const instr_trace_t* trace, DxaReq& req) const {
   const Ptr m = decode(mbar);
   const uint64_t s_off = src - own_base;
 
+  if ((mbar % 8) != 0) {
+    this->issue_abort(trace, "DXA mbarrier must be 8-byte aligned");
+  }
   if (size == 0 || (size % 16) != 0 || (src % 16) != 0 || (d.off % 16) != 0) {
     this->issue_abort(trace, "DXA bulk copy needs 16-byte size and alignment");
   }
@@ -285,6 +309,10 @@ void DxaUnit::translate_bulk(const instr_trace_t* trace, DxaReq& req) const {
   const dlmem_ref::Peer self{req.src_core, own};
   const dlmem_ref::Peer dblk = d.win ? row.peers.at(d.rank) : self;
   const dlmem_ref::Peer mblk = m.win ? row.peers.at(m.rank) : self;
+  // A shared::cta source into shared::cluster: never the issuer's own block.
+  if (dblk.core == self.core && dblk.slot == self.slot) {
+    this->issue_abort(trace, "DXA bulk copy into the issuing block");
+  }
   const bool m_own = m.win || m.off < stride_;
   if (!m_own || dblk.core != mblk.core || dblk.slot != mblk.slot) {
     this->issue_abort(trace, "DXA mbarrier must be in the destination block");
@@ -309,5 +337,151 @@ void DxaUnit::translate_bulk(const instr_trace_t* trace, DxaReq& req) const {
   DT(4, "dxa-unit bulk: core=" << core_->id() << ", wid=" << trace->wid << ", src=0x" << std::hex << src
      << ", size=0x" << size << ", dst={core=" << std::dec << dblk.core << ", slot=" << dblk.slot << "}, off=0x"
      << std::hex << d.off << ", mbar_off=0x" << req.mbar_off << std::dec << ", remote=" << req.remote);
+}
+
+// The PTX forms. TLOAD lanes: rs1 = {dst, mbar, {c1, c0}, {c3, c2}},
+// rs2 = {{ctl, c4}, {o3, o2, o1, cta_mask}}, ctl = {prefetch[4], slot[3:0]}.
+// BLOAD: rs1 = {dst, mbar, gsrc, size}, rs2 lane 1 = cta_mask. BPREFETCH:
+// rs1 = {0, 0, gsrc, size}.
+bool DxaUnit::issue_ptx(instr_trace_t* trace) {
+  const DxaType type = std::get<DxaType>(trace->op_type);
+  if (type != DxaType::TLOAD && type != DxaType::BLOAD && type != DxaType::BPREFETCH) {
+    return false;
+  }
+  DxaReq req;
+  req.core      = core_;
+  req.uuid      = trace->uuid;
+  req.wid       = trace->wid;
+  req.desc_slot = 0;
+  req.bar_id    = 0;
+  req.cta_mask  = 0;
+  req.smem_addr = 0;
+  for (auto& c : req.coords) c = 0;
+  req.mode      = true;
+  req.mbar_off  = 0;
+  req.slot      = warp_slot_.at(trace->wid);
+  req.gen       = slot_gen_.at(req.slot);
+  req.src_core  = core_->id() % dlmem_cfg().ncc;
+  req.dst_core  = req.src_core;
+  req.remote    = false;
+  req.win       = false;
+  req.win_room  = 0;
+  req.cluster   = false;
+  req.num_rcv   = 0;
+  req.bulk      = false;
+  req.src_addr  = 0;
+  req.size      = 0;
+  req.sent      = SimPlatform::instance().cycles();
+  req.tload     = (type == DxaType::TLOAD);
+  req.bload     = !req.tload;
+  req.prefetch  = (type == DxaType::BPREFETCH);
+  req.offs[0] = req.offs[1] = req.offs[2] = 0;
+  req.gsrc      = 0;
+  req.blk_off   = 0;
+  this->decode_ptx(trace, type, req);
+  req_out_.send(req);
+  DT(4, "dxa-unit submit: core=" << core_->id() << ", wid=" << trace->wid << ", " << type
+     << ", slot=" << req.desc_slot << ", prefetch=" << req.prefetch << ", cta_mask=0x" << std::hex
+     << req.cta_mask << ", dst=0x" << req.smem_addr << ", blk_off=0x" << req.blk_off << ", mbar_off=0x"
+     << req.mbar_off << std::dec);
+  return true;
+}
+
+void DxaUnit::decode_ptx(const instr_trace_t* trace, DxaType type, DxaReq& req) const {
+  const auto& rs1 = trace->src_data[0];
+  const auto& rs2 = trace->src_data[1];
+  const uint64_t l0 = rs1.at(0).u, l1 = rs1.at(1).u, l2 = rs1.at(2).u, l3 = rs1.at(3).u;
+  const uint64_t r0 = rs2.at(0).u, r1 = rs2.at(1).u;
+  uint64_t dst = l0, mbar = l1;
+  if (type == DxaType::TLOAD) {
+    req.coords[0] = uint32_t(l2);
+    req.coords[1] = uint32_t(l2 >> 32);
+    req.coords[2] = uint32_t(l3);
+    req.coords[3] = uint32_t(l3 >> 32);
+    req.coords[4] = uint32_t(r0);
+    const uint32_t ctl = uint32_t(r0 >> 32);
+    req.desc_slot = ctl & 0x0fu;
+    req.prefetch  = (ctl >> 4) & 1u;
+    req.cta_mask  = uint32_t(r1 & 0xffffu);
+    req.offs[0]   = uint32_t((r1 >> 16) & 0xffffu);
+    req.offs[1]   = uint32_t((r1 >> 32) & 0xffffu);
+    req.offs[2]   = uint32_t((r1 >> 48) & 0xffffu);
+  } else {
+    req.gsrc = l2;
+    req.size = uint32_t(l3);
+    req.cta_mask = (type == DxaType::BLOAD) ? uint32_t(r1 & 0xffffu) : 0u;
+  }
+  if (!req.prefetch && !dxa_ref::mbar_aligned(mbar)) {
+    this->issue_abort(trace, dxa_ref::MSG_MBAR_ALIGN);
+  }
+  if (type != DxaType::TLOAD) {
+    if (const char* msg = dxa_ref::check_bulk(type == DxaType::BLOAD ? dst : 0, l2, uint32_t(l3))) {
+      this->issue_abort(trace, msg);
+    }
+  }
+  if (req.prefetch) {
+    // No destination, no mbarrier and no multicast: the lines are only read.
+    req.cta_mask = 0;
+    req.mode = false;
+    return;
+  }
+
+  const auto cfg = dlmem_cfg();
+  const uint32_t rbits = dlmem_ref::rank_bits(cfg);
+  const uint32_t wl = cfg.lmem_log + rbits;
+  const uint64_t lmem_mask = dlmem_ref::low_mask(cfg.lmem_log);
+  const uint32_t own = req.slot;
+  const auto& row = slot_row_.at(own);
+  const uint64_t own_base = cfg.lmem_base + uint64_t(own) * stride_;
+  struct Ptr {
+    bool     win;
+    uint32_t rank;
+    uint64_t off;   // in the block
+  };
+  auto decode = [&](uint64_t a) {
+    if ((a >> wl) == (cfg.dlmem_base >> wl)) {
+      return Ptr{true, uint32_t((a >> cfg.lmem_log) & dlmem_ref::low_mask(rbits)), a & lmem_mask};
+    }
+    return Ptr{false, 0, (a - own_base) & lmem_mask};
+  };
+  const Ptr d = decode(dst);
+  const Ptr m = decode(mbar);
+
+  if (req.cta_mask != 0) {
+    // A cluster multicast: both pointers in the issuer's block.
+    if (d.win || m.win) {
+      this->issue_abort(trace, "DXA multicast needs a local address");
+    }
+    req.smem_addr = dst;
+    req.mbar_off  = uint32_t(((mbar - cfg.lmem_base) & lmem_mask) >> 3);
+    this->cluster_receivers(trace, 0u, req.cta_mask, req);
+    return;
+  }
+
+  if ((d.win && (d.rank >= row.k || d.off >= stride_))
+   || (m.win && (m.rank >= row.k || m.off >= stride_))) {
+    this->issue_abort(trace, "DXA destination rank outside the cluster");
+  }
+  const dlmem_ref::Peer self{req.src_core, own};
+  const dlmem_ref::Peer dblk = d.win ? row.peers.at(d.rank) : self;
+  const dlmem_ref::Peer mblk = m.win ? row.peers.at(m.rank) : self;
+  const bool m_own = m.win || m.off < stride_;
+  if (!m_own || dblk.core != mblk.core || dblk.slot != mblk.slot) {
+    this->issue_abort(trace, "DXA mbarrier must be in the destination block");
+  }
+  if (d.win || req.bload) {
+    req.smem_addr = cfg.lmem_base + uint64_t(dblk.slot) * stride_ + d.off;
+    req.win       = true;
+  } else {
+    req.smem_addr = dst;
+  }
+  // A destination box, local or not, must fit its block.
+  req.win_room = (d.off < stride_) ? uint32_t(stride_ - d.off) : 0u;
+  req.blk_off  = d.off;
+  req.mbar_off = uint32_t((uint64_t(mblk.slot) * stride_ + m.off) >> 3);
+  req.slot     = dblk.slot;
+  req.gen      = slot_gen_.at(dblk.slot);
+  req.dst_core = dblk.core;
+  req.remote   = (dblk.core != req.src_core);
 }
 #endif

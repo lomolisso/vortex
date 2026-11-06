@@ -959,7 +959,10 @@ module VX_decode import
                         ex_type = EX_SFU;
                         op_type = INST_OP_BITS'(INST_SFU_DXA);
                     `ifdef DXA_MBAR_ENABLE
-                        op_args.dxa.bulk = (funct3 == 3'd1);
+                        op_args.dxa.bulk      = (funct3 == 3'd1);
+                        op_args.dxa.tload     = (funct3 == 3'd2);
+                        op_args.dxa.bload     = (funct3 == 3'd3);
+                        op_args.dxa.bprefetch = (funct3 == 3'd4);
                     `endif
                         `USED_IREG (rs1);
                         `USED_IREG (rs2);

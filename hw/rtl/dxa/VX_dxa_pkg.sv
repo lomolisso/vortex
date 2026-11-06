@@ -48,6 +48,15 @@ package VX_dxa_pkg;
     // Total descriptor-meta bit budget (running sum through the last field); the
     // encoder packs it into the 32-bit meta ABI word, checked in VX_dxa_setup.
     localparam DXA_DESC_META_TOTAL_BITS     = DXA_DESC_META_L2PROMO_LSB + DXA_DESC_META_L2PROMO_BITS;
+`ifdef DXA_MBAR_ENABLE
+    // Tile (0) or im2col (1) box, past the fields above.
+    localparam DXA_DESC_META_IM2COL_LSB     = DXA_DESC_META_TOTAL_BITS;
+    // A dim-0 element count: a tile0 or channelsPerPixel field.
+    localparam DXA_N0_W = 17;
+    // A signed outer coordinate: a 32-bit coordinate plus an im2col offset or
+    // a box step, and an im2col corner up to size + upper + offset.
+    localparam DXA_X_W  = 34;
+`endif
 
 `ifdef DXA_MBAR_ENABLE
     // A cluster rank's block, as a multicast receiver.
@@ -61,6 +70,14 @@ package VX_dxa_pkg;
 `endif
     // DXA request data — core → DXA control path.
     typedef struct packed {
+    `ifdef DXA_MBAR_ENABLE
+        logic                            tload;        // funct3 2: a tensor load or prefetch
+        logic                            bload;        // funct3 3: a global-to-LMEM bulk copy
+        logic                            prefetch;     // reads only (tensor prefetch, funct3 4)
+        logic [2:0][15:0]                offs;         // im2col offsets of dims 1..3
+        logic [`VX_CFG_MEM_ADDR_WIDTH-1:0] gsrc;       // bload/prefetch source, a physical address
+        logic [DXA_SMEM_ADDR_W-1:0]      blk_base;     // the destination block's base: smem_addr - blk_base is block-relative
+    `endif
         logic [NC_WIDTH-1:0]      core_id;
         logic [UUID_WIDTH-1:0]    uuid;
         logic [NW_WIDTH-1:0]      wid;
@@ -125,6 +142,12 @@ package VX_dxa_pkg;
         logic [31:0] stride3;
         logic [31:0] smem_stride;
         logic [31:0] estride2;    // WGMMA tile geometry (tcN) for Flat/BlockMajor
+    `ifdef DXA_MBAR_ENABLE
+        logic [31:0] estride0;    // element strides of the row-major layout
+        logic [31:0] estride1;
+        logic [31:0] estride3;
+        logic [31:0] estride4;
+    `endif
     } dxa_desc_t;
 
     // Destination SMEM layout (2-bit LAYOUT meta field). Mirrors dxa.h::Layout
@@ -139,6 +162,42 @@ package VX_dxa_pkg;
     // Maximum outer dimensions for tile iteration (dims 1..4 for up to 5D).
     localparam DXA_MAX_OUTER_DIMS = 4;
 
+`ifdef DXA_MBAR_ENABLE
+    // The row-major box walk (PTX tile and im2col modes). A row is the n0
+    // dim-0 elements of one outer index (a pixel's channels in im2col): its
+    // elements [lo0, hi0) are in bounds unless an outer coordinate is out,
+    // the rest are filled. Outer coordinates are signed and step by es.
+    typedef struct packed {
+        logic                                en;
+        logic                                im2col;
+        logic                                prefetch;  // reads only: no LMEM write, no completion
+        logic [3:0]                          es0;       // > 1: dim-0 elements gathered from each line
+        logic [DXA_N0_W-1:0]                 n0;
+        logic [DXA_N0_W-1:0]                 lo0;
+        logic [DXA_N0_W-1:0]                 hi0;
+        logic [DXA_MAX_OUTER_DIMS-1:0][DXA_X_W-1:0] xinit;  // first coordinate (im2col: plus its offset)
+        logic [DXA_MAX_OUTER_DIMS-1:0][31:0] size;
+        logic [DXA_MAX_OUTER_DIMS-1:0][3:0]  es;
+        // im2col: a pixel coordinate past xhi wraps to xlo, its address
+        // component (relative to the first pixel's) to alo.
+        logic [DXA_MAX_OUTER_DIMS-1:0][DXA_X_W-1:0] xlo;
+        logic [DXA_MAX_OUTER_DIMS-1:0][DXA_X_W-1:0] xhi;
+        logic [DXA_MAX_OUTER_DIMS-1:0][`VX_CFG_MEM_ADDR_WIDTH-1:0] alo;
+        logic [10:0]                         ppc;       // pixels
+        logic [1:0]                          swizzle;
+        logic [DXA_SMEM_ADDR_W-1:0]          blk_base;
+    } dxa_tma_params_t;
+
+    // The writer's share of dxa_tma_params_t.
+    typedef struct packed {
+        logic                                en;
+        logic                                prefetch;
+        logic [3:0]                          es0;
+        logic [1:0]                          swizzle;
+        logic [DXA_SMEM_ADDR_W-1:0]          blk_base;
+    } dxa_tma_wr_t;
+
+`endif
     // Setup parameters: precomputed constants for addr_gen, rd_ctrl, cl2smem, wr_ctrl.
     // All multiplies happen during setup; fast path uses additions only.
     typedef struct packed {
@@ -148,7 +207,12 @@ package VX_dxa_pkg;
         // Rolling-cursor deltas applied at each outer-dim step:
         //   delta[0]: dim-0 step                = stride[0]
         //   delta[d>0]: dim (d-1)→d wrap event  = stride[d] - (tile[d-1]-1)*stride[d-1]
+    `ifdef DXA_MBAR_ENABLE
+        // Signed, at the address width, like the coordinate x stride offsets.
+        logic [DXA_MAX_OUTER_DIMS-1:0][`VX_CFG_MEM_ADDR_WIDTH-1:0] delta;
+    `else
         logic [DXA_MAX_OUTER_DIMS-1:0][31:0] delta;
+    `endif
         logic [DXA_MAX_OUTER_DIMS-1:0][31:0] dim_tiles;  // per-dim tile limits (tile1..tile4)
         logic [DXA_MAX_OUTER_DIMS-1:0][31:0] oob_limit;
         logic [31:0]                cfill;
@@ -168,6 +232,10 @@ package VX_dxa_pkg;
         logic [3:0]                 lg_tcN;      // log2(tcN)  (= log2(tcK))
         logic [3:0]                 lg_nsteps;   // log2(xtileN / tcN)
         logic [3:0]                 lg_bkK;      // log2(dense B block K extent, in elements)
+    `ifdef DXA_MBAR_ENABLE
+        // delta[d] is dim d+1's step in im2col.
+        dxa_tma_params_t            tma;
+    `endif
     } dxa_setup_params_t;
 
     // SMEM byte destination for B element (k = K-row, n = N-col) under the
@@ -223,6 +291,12 @@ package VX_dxa_pkg;
     `ifdef DXA_MBAR_ENABLE
         if (op_args.dxa.bulk) begin
             `TRACE(level, ("DXA.BULK"))
+        end else if (op_args.dxa.tload) begin
+            `TRACE(level, ("DXA.TLOAD"))
+        end else if (op_args.dxa.bload) begin
+            `TRACE(level, ("DXA.BLOAD"))
+        end else if (op_args.dxa.bprefetch) begin
+            `TRACE(level, ("DXA.BPREFETCH"))
         end else begin
             `TRACE(level, ("DXA.ISSUE"))
         end

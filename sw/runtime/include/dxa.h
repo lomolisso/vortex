@@ -297,6 +297,145 @@ inline int set_tile_geometry(
                       (blk_k << 16) | (tcN & 0xffffu));
 }
 
+// ── PTX tensor-map options (DXA with mbarriers, vx_dxa_load_*) ─────────
+//
+// Swizzle: the PTX §5.5.7 layouts with 16-byte chunks (CU_TENSOR_MAP_SWIZZLE_*).
+// Interleave: CU_TENSOR_MAP_INTERLEAVE_{NONE,16B,32B}; rank 3-5.
+enum class Swizzle : uint32_t {
+  None = 0,
+  B32  = 1,
+  B64  = 2,
+  B128 = 3,
+};
+
+enum class Interleave : uint32_t {
+  None = 0,
+  B16  = 1,
+  B32  = 2,
+};
+
+// Rewrites META (rank, elem_bytes, row-major layout, swizzle, interleave and
+// the im2col bit, which must repeat what program_im2col_Nd set), the element
+// strides ESTRIDE0..4 (1-8; nullptr = all 1) and CFILL: zero, or with
+// oob_nan the element type's NaN replicated to 32 bits (0x7FFF7FFF for
+// 2-byte elements, 0x7FFFFFFF otherwise). Call after program_Nd or
+// program_im2col_Nd.
+inline int set_tensor_options(
+    vx_device_h dev, uint32_t slot,
+    uint32_t rank, uint32_t elem_bytes,
+    Swizzle swizzle, Interleave interleave,
+    bool oob_nan,
+    const uint32_t elem_strides[5],
+    bool im2col = false) {
+  uint32_t dcr  = VX_DCR_DXA_DESC_BASE + slot * VX_DCR_DXA_DESC_STRIDE;
+  uint32_t meta = detail::pack_meta(rank, detail::elem_size_enc(elem_bytes))
+                | ((static_cast<uint32_t>(swizzle) & ((1u << DXA_DESC_META_SWIZZLE_BITS) - 1u))
+                   << DXA_DESC_META_SWIZZLE_LSB)
+                | ((static_cast<uint32_t>(interleave) & ((1u << DXA_DESC_META_INTERLEAVE_BITS) - 1u))
+                   << DXA_DESC_META_INTERLEAVE_LSB)
+                | ((im2col ? 1u : 0u) << DXA_DESC_META_IM2COL_LSB);
+  const uint32_t ones[5] = {1, 1, 1, 1, 1};
+  const uint32_t* es = elem_strides ? elem_strides : ones;
+  const uint32_t cfill = !oob_nan ? 0u : (elem_bytes == 2 ? 0x7FFF7FFFu : 0x7FFFFFFFu);
+  return detail::write_regs(dev, dcr, {
+    {VX_DCR_DXA_DESC_META_OFF,     meta},
+    {VX_DCR_DXA_DESC_ESTRIDE0_OFF, es[0]},
+    {VX_DCR_DXA_DESC_ESTRIDE1_OFF, es[1]},
+    {VX_DCR_DXA_DESC_ESTRIDE2_OFF, es[2]},
+    {VX_DCR_DXA_DESC_ESTRIDE3_OFF, es[3]},
+    {VX_DCR_DXA_DESC_ESTRIDE4_OFF, es[4]},
+    {VX_DCR_DXA_DESC_CFILL_OFF,    cfill},
+  });
+}
+
+namespace detail {
+
+// TILESIZE23 in im2col mode: the pixel-box corners, signed, S = rank - 2
+// spatial dims (W, H, D) of 16, 8 or 5 bits, lower corners first.
+inline uint32_t pack_corners(uint32_t rank, const int32_t* lower, const int32_t* upper) {
+  const uint32_t S = rank - 2;
+  const uint32_t bits = S == 1 ? 16 : S == 2 ? 8 : 5;
+  const uint32_t m = (1u << bits) - 1u;
+  uint32_t w = 0;
+  for (uint32_t s = 0; s < S; ++s) {
+    w |= ((uint32_t)lower[s] & m) << (s * bits);
+    w |= ((uint32_t)upper[s] & m) << ((S + s) * bits);
+  }
+  return w;
+}
+
+inline int program_im2col(
+    vx_device_h dev, uint32_t slot, uint32_t rank,
+    uint64_t base_addr,
+    const uint32_t* sizes, const uint32_t* strides_bytes,
+    uint32_t channels_per_pixel, uint32_t pixels_per_column,
+    const int32_t* lower, const int32_t* upper,
+    uint32_t elem_bytes) {
+  uint32_t dcr  = VX_DCR_DXA_DESC_BASE + slot * VX_DCR_DXA_DESC_STRIDE;
+  uint32_t meta = pack_meta(rank, elem_size_enc(elem_bytes)) | (1u << DXA_DESC_META_IM2COL_LSB);
+  if (int ret = write_regs(dev, dcr, {
+        {VX_DCR_DXA_DESC_BASE_LO_OFF,    (uint32_t)(base_addr & 0xffffffffu)},
+        {VX_DCR_DXA_DESC_BASE_HI_OFF,    (uint32_t)(base_addr >> 32)},
+        {VX_DCR_DXA_DESC_META_OFF,       meta},
+        {VX_DCR_DXA_DESC_ESTRIDE0_OFF,   1},
+        {VX_DCR_DXA_DESC_ESTRIDE1_OFF,   1},
+        {VX_DCR_DXA_DESC_ESTRIDE2_OFF,   1},
+        {VX_DCR_DXA_DESC_ESTRIDE3_OFF,   1},
+        {VX_DCR_DXA_DESC_ESTRIDE4_OFF,   1},
+        {VX_DCR_DXA_DESC_TILESIZE01_OFF, pack_2x16(channels_per_pixel, pixels_per_column)},
+        {VX_DCR_DXA_DESC_TILESIZE23_OFF, pack_corners(rank, lower, upper)},
+        {VX_DCR_DXA_DESC_TILESIZE4_OFF,  0},
+        {VX_DCR_DXA_DESC_CFILL_OFF,      0},
+      })) {
+    return ret;
+  }
+  for (uint32_t d = 0; d < rank; ++d) {
+    if (int ret = vx_dcr_write(dev, dcr + VX_DCR_DXA_DESC_SIZE0_OFF + d, sizes[d]))
+      return ret;
+  }
+  for (uint32_t d = 0; d + 1 < rank; ++d) {
+    if (int ret = vx_dcr_write(dev, dcr + VX_DCR_DXA_DESC_STRIDE0_OFF + d, strides_bytes[d]))
+      return ret;
+  }
+  return 0;
+}
+
+} // namespace detail
+
+// Program an im2col descriptor (PTX §5.5.4, cuTensorMapEncodeIm2col):
+// rank 3 (NWC), 4 (NHWC) or 5 (NDHWC), dims in order C, W[, H[, D]], N.
+//   sizes[R]: elements per dim; strides_bytes[R-1]: byte stride of dims 1..R-1
+//   channels_per_pixel 1-256, pixels_per_column 1-1024
+//   lower[S], upper[S]: the pixel-box corners for W, H, D (S = R - 2)
+// Set swizzle/NaN fill/traversal strides afterwards with
+// set_tensor_options(..., im2col = true).
+inline int program_im2col_3d(
+    vx_device_h dev, uint32_t slot, uint64_t base_addr,
+    const uint32_t sizes[3], const uint32_t strides_bytes[2],
+    uint32_t channels_per_pixel, uint32_t pixels_per_column,
+    const int32_t lower[1], const int32_t upper[1], uint32_t elem_bytes) {
+  return detail::program_im2col(dev, slot, 3, base_addr, sizes, strides_bytes, channels_per_pixel,
+                                pixels_per_column, lower, upper, elem_bytes);
+}
+
+inline int program_im2col_4d(
+    vx_device_h dev, uint32_t slot, uint64_t base_addr,
+    const uint32_t sizes[4], const uint32_t strides_bytes[3],
+    uint32_t channels_per_pixel, uint32_t pixels_per_column,
+    const int32_t lower[2], const int32_t upper[2], uint32_t elem_bytes) {
+  return detail::program_im2col(dev, slot, 4, base_addr, sizes, strides_bytes, channels_per_pixel,
+                                pixels_per_column, lower, upper, elem_bytes);
+}
+
+inline int program_im2col_5d(
+    vx_device_h dev, uint32_t slot, uint64_t base_addr,
+    const uint32_t sizes[5], const uint32_t strides_bytes[4],
+    uint32_t channels_per_pixel, uint32_t pixels_per_column,
+    const int32_t lower[3], const int32_t upper[3], uint32_t elem_bytes) {
+  return detail::program_im2col(dev, slot, 5, base_addr, sizes, strides_bytes, channels_per_pixel,
+                                pixels_per_column, lower, upper, elem_bytes);
+}
+
 } // namespace dxa
 } // namespace vortex
 

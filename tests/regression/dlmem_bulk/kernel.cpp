@@ -268,6 +268,12 @@ __kernel void neg_k(bulk_arg_t* __UNIFORM__ arg) {
     case NEG_BOX:
       vx_dxa_bulk_copy(cl.map_shared_rank(lm, 1) + arg->neg_off, src, size, peer_mbar);
       break;
+    case NEG_SELF:
+      vx_dxa_bulk_copy(dst, src, size, mbar);
+      break;
+    case NEG_MALIGN:
+      vx_dxa_bulk_copy(peer_dst, src, size, reinterpret_cast<uint64_t*>(reinterpret_cast<uint8_t*>(peer_mbar) + 4));
+      break;
     default:
       vx_dxa_bulk_copy(peer_dst, src, size, peer_mbar);
       break;
@@ -276,4 +282,238 @@ __kernel void neg_k(bulk_arg_t* __UNIFORM__ arg) {
   idle_cycles(arg->linger);
   auto out = reinterpret_cast<uint32_t*>(arg->err_addr) + (blockIdx.x * blockDim.x + tid) * ERR_WORDS;
   out[ERR_DONE] = 1;
+}
+
+namespace {
+
+// Rounds of: warp 0 arms its mbarrier with the bytes the previous rank sends
+// it this round, stores the round's words into the source, optionally
+// fences, and copies the source into the round's destination slot of the
+// next rank at once, then waits for its own phase; meanwhile the other warps
+// load and store their own words in a loop, on every bank, until warp 0
+// raises the flag. With a hog, rank 0 instead copies the hog's bytes of its
+// unchanged source each round, once the racer of its cluster is ready, and
+// when that copy holds the DMA port lets the round go; the racer then
+// stores and copies at once. Both counters are global words of the cluster.
+INL void race_peer(const bulk_arg_t* arg, uint32_t b, uint32_t r, uint32_t tid, uint32_t nthr) {
+  auto lm   = reinterpret_cast<uint8_t*>(__local_mem());
+  auto lw   = reinterpret_cast<volatile uint32_t*>(lm);
+  auto mbar = reinterpret_cast<uint64_t*>(lm + arg->lm_mbar);
+  auto flag = reinterpret_cast<volatile uint32_t*>(lm + lm_flag(arg));
+  const uint32_t nt = arg->warp_threads;
+  const uint32_t so = src_off(arg, r, 0);
+  const uint32_t q  = strict_dst(arg->mode, r, arg->k);
+  const uint32_t in = race_in(arg, r);
+  const vortex::cluster_group cl = vortex::this_cluster();
+  uint64_t* qmbar = cl.map_shared_rank(mbar, q);
+  volatile uint32_t* go    = reinterpret_cast<volatile uint32_t*>(arg->sync_addr) + 2 * (b / arg->k);
+  volatile uint32_t* ready = go + 1;
+  uint32_t err = 0, tries = 0;
+
+  if (get_sub_group_id() == 0 && is_hog(arg, r)) {
+    // Thread 0 alone arms, copies and lets the round go.
+    for (uint32_t j = 0; j < arg->rounds && !err; ++j) {
+      while (*ready <= j) {}
+      if (tid == 0) {
+        vx_mbar_arrive_tx(mbar, in);
+        vx_dxa_bulk_copy(cl.map_shared_rank(lm + dst_off(arg, r, 0), q), lm + so, arg->hog, qmbar);
+        idle_cycles(HOG_LEAD);
+        *go = j + 1;
+      }
+      err = wait_phase(mbar, j & 1, &tries);
+    }
+    *flag = 1;
+  } else if (get_sub_group_id() == 0 && arg->hog != 0) {
+    // The round's word of each thread and the copy's operands are ready
+    // before the round goes, so that the store follows the go at once.
+    const uint32_t size = arg->size, rounds = arg->rounds, fence = arg->fence;
+    for (uint32_t j = 0; j < rounds && !err; ++j) {
+      const uint32_t v = race_word(b, j, so / 4 + tid);
+      uint8_t* dst = cl.map_shared_rank(lm + dst_off(arg, r, j), q);
+      if (tid == 0) {
+        vx_mbar_arrive_tx(mbar, in);
+        *ready = j + 1;
+      }
+      while (*go <= j) {}
+      lw[so / 4 + tid] = v;
+      if (fence)
+        vx_fence_proxy_async();
+      vx_dxa_bulk_copy(dst, lm + so, size, qmbar);
+      err = wait_phase(mbar, j & 1, &tries);
+    }
+    *flag = 1;
+  } else if (get_sub_group_id() == 0) {
+    for (uint32_t j = 0; j < arg->rounds && !err; ++j) {
+      if (tid == 0)
+        vx_mbar_arrive_tx(mbar, in);
+      for (uint32_t w = so / 4 + tid; w < (so + arg->size) / 4; w += nt)
+        lw[w] = race_word(b, j, w);
+      if (arg->fence)
+        vx_fence_proxy_async();
+      bulk_copy(arg, cl.map_shared_rank(lm + dst_off(arg, r, j), q), lm + so, arg->size, qmbar);
+      err = wait_phase(mbar, j & 1, &tries);
+    }
+    *flag = 1;
+  } else {
+    volatile uint32_t* ham = lw + lm_ham(arg) / 4 + (tid - nt);
+    const uint32_t v = ham_word(b, tid - nt);
+    while (*flag == 0) {
+      *ham = v;
+      (void)*ham;
+    }
+  }
+  __syncthreads();
+  dump_lmem(arg, b, tid, nthr);
+  vortex::this_cluster().sync();
+  finish(arg, b, tid, nthr, err, tries);
+}
+
+} // namespace
+
+// Race with every copy into the next rank (a copy into the issuer's own block
+// is an error): the same fill and cluster barrier as copy_k, then race_peer.
+__kernel void race_k(bulk_arg_t* __UNIFORM__ arg) {
+  const uint32_t tid  = threadIdx.x;
+  const uint32_t nthr = blockDim.x;
+  const uint32_t b    = blockIdx.x;
+  const vortex::cluster_group cl = vortex::this_cluster();
+  const uint32_t r    = cl.block_rank();
+  auto lm   = reinterpret_cast<uint8_t*>(__local_mem());
+  auto lw   = reinterpret_cast<volatile uint32_t*>(lm);
+  auto mbar = reinterpret_cast<uint64_t*>(lm + arg->lm_mbar);
+  const uint32_t words = arg->lmem_bytes / sizeof(uint32_t);
+
+  if (tid == 0)
+    record(arg, b, r);
+  for (uint32_t w = tid; w < words; w += nthr) {
+    if (w / 2 != arg->lm_mbar / 8)
+      lw[w] = canary_word(b, w);
+  }
+  if (tid == 0) {
+    vx_mbar_init(mbar, 1);
+    // A hog's round counter starts in the data cache, so that the racers
+    // see each round go at once.
+    auto sync = reinterpret_cast<volatile uint32_t*>(arg->sync_addr) + 2 * (b / arg->k);
+    if (arg->hog != 0 && (sync[0] | sync[1]) != 0)
+      lw[lm_flag(arg) / 4] = 1;
+    lw[lm_flag(arg) / 4] = 0;
+  }
+  if (arg->fence)
+    vx_fence_proxy_async();
+  cl.sync();
+  race_peer(arg, b, r, tid, nthr);
+}
+
+// -m many: ranks 1.. copy into rank 0 and rank 0 into rank 1, otherwise as copy_k.
+__kernel void many_k(bulk_arg_t* __UNIFORM__ arg) {
+  const uint32_t tid  = threadIdx.x;
+  const uint32_t nthr = blockDim.x;
+  const uint32_t b    = blockIdx.x;
+  const uint32_t k    = arg->k;
+  const vortex::cluster_group cl = vortex::this_cluster();
+  const uint32_t r    = cl.block_rank();
+  auto lm   = reinterpret_cast<uint8_t*>(__local_mem());
+  auto lw   = reinterpret_cast<volatile uint32_t*>(lm);
+  auto mbar = reinterpret_cast<uint64_t*>(lm + arg->lm_mbar);
+  const uint32_t words = arg->lmem_bytes / sizeof(uint32_t);
+
+  if (tid == 0)
+    record(arg, b, r);
+  for (uint32_t w = tid; w < words; w += nthr) {
+    if (w / 2 != arg->lm_mbar / 8)
+      lw[w] = canary_word(b, w);
+  }
+  for (uint32_t i = 0; i < num_src_slots(arg); ++i) {
+    const uint32_t w0 = src_off(arg, r, i) / 4, w1 = w0 + copy_size(arg, r, i) / 4;
+    for (uint32_t w = w0 + (tid + nthr - w0 % nthr) % nthr; w < w1; w += nthr)
+      lw[w] = src_word(b, w);
+  }
+  if (tid == 0) {
+    vx_mbar_init(mbar, 1);
+    vx_mbar_arrive_tx(mbar, strict_incoming(arg, r));
+  }
+  if (arg->fence)
+    vx_fence_proxy_async();
+  cl.sync();
+
+  if (get_sub_group_id() == 0) {
+    const uint32_t q = strict_dst(arg->mode, r, k);
+    for (uint32_t i = 0; i < arg->copies; ++i) {
+      void* src = lm + src_off(arg, r, i);
+      void* dst = lm + dst_off(arg, r, i);
+      bulk_copy(arg, cl.map_shared_rank(dst, q), src, copy_size(arg, r, i), cl.map_shared_rank(mbar, q));
+    }
+  }
+
+  uint32_t tries = 0;
+  const uint32_t err = wait_phase(mbar, 0, &tries);
+  dump_lmem(arg, b, tid, nthr);
+  cl.sync();
+  finish(arg, b, tid, nthr, err, tries);
+}
+
+// -g: copies from global memory. Every block fills its local memory with
+// canaries, arms its mbarrier with the bytes it will receive and meets the
+// cluster; then warp 0 issues its copies (cta, pf: into itself through local
+// pointers, pf after prefetching every source into the L2; win: into the next
+// rank through the window; mc: rank 0 alone, into every rank of the mask at
+// its own offsets), every receiver waits for its phase and dumps its local
+// memory for the host's byte-exact check.
+__kernel void gload_k(bulk_arg_t* __UNIFORM__ arg) {
+  const uint32_t tid  = threadIdx.x;
+  const uint32_t nthr = blockDim.x;
+  const uint32_t b    = blockIdx.x;
+  const vortex::cluster_group cl = vortex::this_cluster();
+  const uint32_t r    = cl.block_rank();
+  auto lm   = reinterpret_cast<uint8_t*>(__local_mem());
+  auto lw   = reinterpret_cast<volatile uint32_t*>(lm);
+  auto mbar = reinterpret_cast<uint64_t*>(lm + arg->lm_mbar);
+  const uint32_t words = arg->lmem_bytes / sizeof(uint32_t);
+  const uint32_t in = g_incoming(arg, r);
+
+  if (tid == 0)
+    record(arg, b, r);
+  for (uint32_t w = tid; w < words; w += nthr) {
+    if (w / 2 != arg->lm_mbar / 8)
+      lw[w] = canary_word(b, w);
+  }
+  if (tid == 0) {
+    vx_mbar_init(mbar, 1);
+    if (in)
+      vx_mbar_arrive_tx(mbar, in);
+  }
+  vx_fence_proxy_async();
+  cl.sync();
+
+  if (get_sub_group_id() == 0) {
+    const uint32_t q = g_dst_rank(arg, r);
+    if (arg->gkind == GK_PF) {
+      for (uint32_t i = 0; i < 2; ++i) {
+        if (arg->pf_big[i])
+          vx_dxa_prefetch_l2(reinterpret_cast<const void*>(arg->gsrc_addr), arg->pf_big[i]);
+      }
+      for (uint32_t i = 0; i < arg->copies; ++i)
+        vx_dxa_prefetch_l2(reinterpret_cast<const void*>(arg->gsrc_addr + g_src_off(arg, b, i)), g_size(arg, i));
+    }
+    for (uint32_t i = 0; i < arg->copies; ++i) {
+      const void* src = reinterpret_cast<const void*>(arg->gsrc_addr + g_src_off(arg, b, i));
+      void* dst = lm + g_dst_off(arg, r, i);
+      const uint32_t size = g_size(arg, i);
+      if (arg->gkind == GK_MC) {
+        if (r == 0)
+          vx_dxa_bulk_load_multicast(dst, src, size, mbar, (uint16_t)arg->mask);
+      } else if (arg->gkind == GK_WIN) {
+        vx_dxa_bulk_load(cl.map_shared_rank(dst, q), src, size, cl.map_shared_rank(mbar, q));
+      } else {
+        vx_dxa_bulk_load(dst, src, size, mbar);
+      }
+    }
+  }
+
+  uint32_t tries = 0, err = 0;
+  if (in)
+    err = wait_phase(mbar, 0, &tries);
+  dump_lmem(arg, b, tid, nthr);
+  cl.sync();
+  finish(arg, b, tid, nthr, err, tries);
 }

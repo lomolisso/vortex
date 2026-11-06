@@ -1157,8 +1157,11 @@ package VX_gpu_pkg;
 `ifdef VX_CFG_EXT_DXA_ENABLE
 `ifdef DXA_MBAR_ENABLE
     typedef struct packed {
-        logic [INST_ARGS_BITS-2:0] __padding;
-        logic bulk;     // an LMEM-to-LMEM bulk copy (funct3 = 1)
+        logic [INST_ARGS_BITS-5:0] __padding;
+        logic bprefetch; // a global-memory prefetch of a byte range (funct3 = 4)
+        logic bload;     // a global-to-LMEM bulk copy (funct3 = 3)
+        logic tload;     // a tensor load or prefetch with raw pointers (funct3 = 2)
+        logic bulk;      // an LMEM-to-LMEM bulk copy (funct3 = 1)
     } dxa_args_t;
 `else
     typedef struct packed {

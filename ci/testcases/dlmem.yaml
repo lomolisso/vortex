@@ -821,7 +821,8 @@ tests:
               sim/simx/lsu_unit, sim/simx/Makefile, sw/kernel/include/vx_dxa.h,
               sw/kernel/include/vx_mbar.h, sw/kernel/include/vx_dlmem.h,
               sw/common/mbar_ref.h, sw/common/dlmem_ref.h, sw/runtime/include/dxa.h,
-              tests/regression/dlmem_dxa, tests/regression/dlmem_stress, VX_config.toml]
+              tests/regression/dlmem_dxa, tests/regression/dlmem_stress, VX_config.toml,
+              sw/common/dxa_ref.h, sw/common/dxa_meta.h]
     shape: {cores: 2, l2cache: true}
     args: "-k 2 -n 2"
   - id: dlmem_dxa-4c
@@ -1095,7 +1096,8 @@ tests:
               sim/simx/scheduler, sim/simx/barrier_unit, sim/simx/lsu_unit,
               sim/simx/Makefile, sw/kernel/include/vx_dxa.h, sw/kernel/include/vx_mbar.h,
               sw/kernel/include/vx_dlmem.h, sw/common/mbar_ref.h, sw/common/dlmem_ref.h,
-              tests/regression/dlmem_bulk, VX_config.toml]
+              tests/regression/dlmem_bulk, VX_config.toml,
+              sw/common/dxa_ref.h, sw/common/dxa_meta.h]
     shape: {cores: 2, l2cache: true}
     args: "-k 2 -n 2"
   # Two sockets of two cores: K = 4 crosses the cluster crossbar; K = 2 pairs
@@ -1115,14 +1117,6 @@ tests:
     touches: *dlmem_bulk_touches
     shape: {cores: 4, l2cache: true}
     args: "-k 2 -n 4"
-  # Local pointers into the issuer's own block.
-  - id: dlmem_bulk-self
-    app: dlmem_bulk
-    drivers: [simx, rtlsim]
-    configs+: "-DVX_CFG_EXT_A_ENABLE -DVX_CFG_EXT_MBAR_ENABLE -DVX_CFG_EXT_DXA_ENABLE"
-    touches: *dlmem_bulk_touches
-    shape: {cores: 2, l2cache: true}
-    args: "-m self -k 2 -n 2"
   # DEFAULT clusters: each copy goes to the other slot of the issuer's core.
   - id: dlmem_bulk-samecore
     app: dlmem_bulk
@@ -1131,9 +1125,9 @@ tests:
     touches: *dlmem_bulk_touches
     shape: {cores: 2, l2cache: true}
     args: "-p single-core -k 2 -n 2"
-  # Many to one: every rank issues two copies back to back into rank 0 (rank 0
-  # into itself through its own window address), whose one phase expects all
-  # eight, from four engines across both sockets.
+  # Many to one: ranks 1-3 issue two copies each back to back into rank 0,
+  # whose one phase expects all six, from three engines across both sockets;
+  # rank 0's two go to rank 1 (a copy into the issuer's own block is an error).
   - id: dlmem_bulk-many
     app: dlmem_bulk
     drivers: [simx, rtlsim]
@@ -1205,9 +1199,9 @@ tests:
     shape: {cores: 2, l2cache: true}
     args: "-p single-core -k 2 -n 2 -c 2 -s 256"
   # The proxy fence: per round warp 0 stores the round's words into its source,
-  # calls vx_fence_proxy_async() and copies the source into its own local
-  # memory at once, while three other warps load and store their own words
-  # on every bank and the core's other block does the same, keeping its DXA
+  # calls vx_fence_proxy_async() and copies the source into the next rank's
+  # local memory at once, while three other warps load and store their own
+  # words on every bank and the other block does the same, keeping its DXA
   # busy. Every destination byte must hold the round's value. The unfenced
   # run (no -f) only reports its stale bytes and is not a catalog case.
   - id: dlmem_bulk-race-fence
@@ -1240,6 +1234,90 @@ tests:
     touches: *dlmem_bulk_touches
     shape: {cores: 4, l2cache: true}
     args: "-k 4 -n 1 -c 4 -b 1"
+  # Global sources (cp.async.bulk.shared::cluster.global, funct3 = 3): copies
+  # of 16 B, 4 KB, 720 B and 48 B (and one of 64 KB per block, in a 128 KB local
+  # memory) read through the DXA's global-memory port into each block's own
+  # local memory; into the next rank through the window; multicast into the
+  # ranks of a mask (0b11, and 0b1010 without the issuer) on four cores; and
+  # after a bulk prefetch of every source into the L2. Byte-exact as above.
+  - id: dlmem_bulk-g
+    app: dlmem_bulk
+    drivers: [simx, rtlsim]
+    configs+: "-DVX_CFG_EXT_A_ENABLE -DVX_CFG_EXT_MBAR_ENABLE -DVX_CFG_EXT_DXA_ENABLE"
+    touches: &dlmem_bulk_g_touches [hw/rtl/dxa, hw/rtl/dlmem, hw/rtl/VX_socket.sv,
+              hw/rtl/VX_gpu_pkg.sv, hw/rtl/VX_define.vh, hw/rtl/VX_trace_pkg.sv,
+              hw/rtl/core/VX_core.sv, hw/rtl/core/VX_decode.sv, hw/rtl/core/VX_execute.sv,
+              hw/rtl/core/VX_sfu_unit.sv, hw/rtl/core/VX_mem_unit.sv,
+              hw/rtl/core/VX_cta_dispatch.sv, hw/rtl/core/VX_wctl_unit.sv,
+              hw/rtl/core/VX_bar_unit.sv, hw/rtl/core/VX_scheduler.sv,
+              hw/rtl/core/VX_lsu_slice.sv, hw/rtl/core/VX_lsu_unit.sv,
+              hw/rtl/core/VX_uop_sequencer.sv, hw/rtl/mem/VX_local_mem.sv,
+              hw/rtl/mem/VX_lmem_switch.sv, hw/rtl/cache, hw/rtl/interfaces, hw/rtl/VX_kmu.sv,
+              hw/rtl/Vortex.sv, hw/rtl/VX_cluster.sv, sim/simx/dxa, sim/simx/dlmem,
+              sim/simx/core, sim/simx/socket, sim/simx/cluster, sim/simx/processor.cpp,
+              sim/simx/cta_dispatcher, sim/simx/kmu, sim/simx/mem, sim/simx/types.h,
+              sim/simx/decode.cpp, sim/simx/mbar_waiters, sim/simx/amo, sim/simx/barrier_unit,
+              sim/simx/Makefile, sw/kernel/include/vx_dxa.h, sw/kernel/include/vx_mbar.h,
+              sw/kernel/include/vx_dlmem.h, sw/common/mbar_ref.h, sw/common/dxa_ref.h,
+              tests/regression/dlmem_bulk, VX_config.toml,
+              sw/common/dxa_meta.h]
+    shape: {cores: 2, l2cache: true}
+    args: "-g cta -k 2 -n 2"
+  - id: dlmem_bulk-g-64k
+    app: dlmem_bulk
+    drivers: [simx, rtlsim]
+    configs+: "-DVX_CFG_EXT_A_ENABLE -DVX_CFG_EXT_MBAR_ENABLE -DVX_CFG_EXT_DXA_ENABLE -DVX_CFG_LMEM_LOG_SIZE=17"
+    touches: *dlmem_bulk_g_touches
+    shape: {cores: 2, l2cache: true}
+    args: "-g cta -k 2 -n 1 -c 1 -s 65536"
+  - id: dlmem_bulk-g-win
+    app: dlmem_bulk
+    drivers: [simx, rtlsim]
+    configs+: "-DVX_CFG_EXT_A_ENABLE -DVX_CFG_EXT_MBAR_ENABLE -DVX_CFG_EXT_DXA_ENABLE"
+    touches: *dlmem_bulk_g_touches
+    shape: {cores: 2, l2cache: true}
+    args: "-g win -k 2 -n 2"
+  - id: dlmem_bulk-g-mc
+    app: dlmem_bulk
+    drivers: [simx, rtlsim]
+    configs+: "-DVX_CFG_EXT_A_ENABLE -DVX_CFG_EXT_MBAR_ENABLE -DVX_CFG_EXT_DXA_ENABLE"
+    touches: *dlmem_bulk_g_touches
+    shape: {cores: 4, l2cache: true}
+    args: "-g mc -k 4 -n 1 -M 0x3"
+  - id: dlmem_bulk-g-mc-sparse
+    app: dlmem_bulk
+    drivers: [simx, rtlsim]
+    configs+: "-DVX_CFG_EXT_A_ENABLE -DVX_CFG_EXT_MBAR_ENABLE -DVX_CFG_EXT_DXA_ENABLE"
+    touches: *dlmem_bulk_g_touches
+    shape: {cores: 4, l2cache: true}
+    args: "-g mc -k 4 -n 1 -M 0xA"
+  - id: dlmem_bulk-g-pf
+    app: dlmem_bulk
+    drivers: [simx, rtlsim]
+    configs+: "-DVX_CFG_EXT_A_ENABLE -DVX_CFG_EXT_MBAR_ENABLE -DVX_CFG_EXT_DXA_ENABLE"
+    touches: *dlmem_bulk_g_touches
+    shape: {cores: 2, l2cache: true}
+    args: "-g pf -k 2 -n 2"
+  # A bulk prefetch is a hint: sizes of twice the local memory and of it plus
+  # 16 bytes read at most a local memory's worth, and never stop the engine.
+  - id: dlmem_bulk-g-pf-big
+    app: dlmem_bulk
+    drivers: [simx, rtlsim]
+    configs+: "-DVX_CFG_EXT_A_ENABLE -DVX_CFG_EXT_MBAR_ENABLE -DVX_CFG_EXT_DXA_ENABLE"
+    touches: *dlmem_bulk_g_touches
+    shape: {cores: 2, l2cache: true}
+    args: "-g pf -P -k 2 -n 2"
+  # Parity of the global bulk multicast at XLEN 64: rank 0 of a SPREAD cluster
+  # of four multicasts the size mix into ranks 1 and 3; the global reads, the
+  # row flits and the completions behind them set the timing.
+  - id: parity-dlmem-bulk-g-mc
+    check: model_parity
+    app: dlmem_bulk
+    xlen: [64]
+    configs+: "-DVX_CFG_EXT_A_ENABLE -DVX_CFG_EXT_MBAR_ENABLE -DVX_CFG_EXT_DXA_ENABLE -DVX_CFG_MBAR_SUSPEND_CYCLES=4096"
+    touches: *dlmem_bulk_g_touches
+    shape: {cores: 4, l2cache: true}
+    args: "-g mc -k 4 -n 1 -M 0xA"
   # Bulk copies that must stop the simulation with the exact message, on a
   # SPREAD cluster of two blocks on four cores, rank 0 copying into rank 1: a
   # size that is not a multiple of 16; a source, then a destination, 8 bytes
@@ -1359,6 +1437,37 @@ tests:
     touches: *dlmem_bulk_touches
     env: {DRIVER: rtlsim, APP: dlmem_bulk, ARGS: "-x retired", EXPECT: "DXA write into a retired CTA slot"}
     run: *expect_fail_run
+  # A copy into the issuer's own block (strict PTX: the destination of a
+  # shared::cta -> shared::cluster copy is another block), and an mbarrier 4
+  # bytes off its doubleword.
+  - id: dlmem_bulk-x-self
+    via: script
+    driver: simx
+    configs+: *dlmem_dxa_neg
+    touches: *dlmem_bulk_touches
+    env: {DRIVER: simx, APP: dlmem_bulk, ARGS: "-x self", EXPECT: "DXA bulk copy into the issuing block"}
+    run: *expect_fail_run
+  - id: dlmem_bulk-x-self
+    via: script
+    driver: rtlsim
+    configs+: *dlmem_dxa_neg
+    touches: *dlmem_bulk_touches
+    env: {DRIVER: rtlsim, APP: dlmem_bulk, ARGS: "-x self", EXPECT: "DXA bulk copy into the issuing block"}
+    run: *expect_fail_run
+  - id: dlmem_bulk-x-mbar-align
+    via: script
+    driver: simx
+    configs+: *dlmem_dxa_neg
+    touches: *dlmem_bulk_touches
+    env: {DRIVER: simx, APP: dlmem_bulk, ARGS: "-x mbar-align", EXPECT: "DXA mbarrier must be 8-byte aligned"}
+    run: *expect_fail_run
+  - id: dlmem_bulk-x-mbar-align
+    via: script
+    driver: rtlsim
+    configs+: *dlmem_dxa_neg
+    touches: *dlmem_bulk_touches
+    env: {DRIVER: rtlsim, APP: dlmem_bulk, ARGS: "-x mbar-align", EXPECT: "DXA mbarrier must be 8-byte aligned"}
+    run: *expect_fail_run
 
   # --- DXA cluster multicast (dxa_copy_mcast -M) ---
   # One read of the box lands in every block of the cluster whose rank is in
@@ -1384,7 +1493,8 @@ tests:
               sw/kernel/include/vx_dxa.h, sw/kernel/include/vx_mbar.h,
               sw/kernel/include/vx_dlmem.h, sw/kernel/include/vx_barrier.h,
               sw/common/mbar_ref.h, sw/common/dlmem_ref.h, sw/runtime/include/dxa.h,
-              tests/regression/dxa_copy_mcast, VX_config.toml]
+              tests/regression/dxa_copy_mcast, VX_config.toml,
+              sw/common/dxa_ref.h, sw/common/dxa_meta.h]
     shape: {cores: 4, l2cache: true}
     args: "-M 0xF -s 4 -g 2"
   - id: dxa_copy_mcast-cluster-sparse5
@@ -1520,7 +1630,8 @@ tests:
               hw/rtl/VX_cluster.sv, sim/simx/dxa, sim/simx/dlmem, sim/simx/core, sim/simx/socket,
               sim/simx/cluster, sim/simx/cta_dispatcher, sim/simx/kmu, sim/simx/mem/local_mem,
               sim/simx/types.h, sw/kernel/include/vx_dxa.h, sw/kernel/include/vx_mbar.h,
-              sw/kernel/include/vx_dlmem.h, VX_config.toml]
+              sw/kernel/include/vx_dlmem.h, VX_config.toml,
+              sw/common/dxa_ref.h, sw/common/dxa_meta.h]
     shape: {cores: 4, l2cache: true}
     args: "-n16 -t4 -s 4"
   - id: sgemm2_dxa_mcast-spread-s2
