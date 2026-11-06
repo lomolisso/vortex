@@ -87,6 +87,9 @@ LsuUnit::LsuUnit(const SimContext& ctx, const char* name, Core* core)
 	, SpawnIn(this)
 #ifdef VX_CFG_EXT_MBAR_ENABLE
 	, MbarRetireOut(VX_CFG_NUM_LSU_BLOCKS, SimChannel<uint32_t>(this))
+	, CpaIssueOut(VX_CFG_NUM_LSU_BLOCKS, SimChannel<CpaIssue>(this))
+	, CpaRspOut(VX_CFG_NUM_LSU_BLOCKS, SimChannel<LsuRsp>(this, 4))
+	, CpaStatusIn(VX_CFG_NUM_LSU_BLOCKS, SimChannel<CpaStatus>(this, 4))
 #ifdef VX_CFG_EXT_DXA_ENABLE
 	, PfRspIn(VX_CFG_NUM_LSU_BLOCKS, SimChannel<LsuRsp>(this))
 #else
@@ -194,6 +197,13 @@ void LsuUnit::on_reset() {
 	#ifdef VX_CFG_EXT_MBAR_ENABLE
 		retire_beats_.at(b).clear();
 		out_retire_.at(b).clear();
+		cpa_status_.at(b) = CpaStatus::idle();
+		cpa_slot_.at(b) = -1;
+		cpa_lanes_.at(b).assign(VX_CFG_NUM_THREADS, CpaLane{});
+		cpa_open_.assign(VX_CFG_NUM_WARPS, 0);
+		cpa_arr_.at(b) = CpaIssue{};
+		cpa_reads_.at(b) = 0;
+		cpa_read_lanes_.at(b).assign(CpaUnit::SLOTS * CpaUnit::NUM_PIDS, 0);
 	#else
 	#line 159
 	#endif
@@ -274,6 +284,200 @@ static MemOp red_async_op(uint32_t red_op) {
 #endif
 	default: std::abort();
 	}
+}
+
+static bool is_cpa_copy(const LsuType* type) {
+	return type && *type == LsuType::CP_ASYNC;
+}
+
+static bool is_cpa_ctrl(const LsuType* type) {
+	return type && (*type == LsuType::CPA_COMMIT || *type == LsuType::CPA_WAIT || *type == LsuType::CPA_ARRIVE);
+}
+
+void LsuUnit::cpa_abort(const instr_trace_t* trace, uint32_t t, const char* msg, uint64_t addr) const {
+	std::cerr << SimPlatform::instance().cycles() << ": " << this->name() << " " << msg << ": wid=" << trace->wid
+	          << " lane=" << t << " addr=0x" << std::hex << addr << std::dec << " (#" << trace->uuid << ")" << std::endl;
+	std::abort();
+}
+
+// One lane of a cp.async uop: its destination, its share of the src-size (a
+// 16-byte copy's halves take min(ss, 8) and max(ss - 8, 0)) and the address
+// it reads, a fixed global word when that share is 0.
+uint64_t LsuUnit::cpa_lane(uint32_t b, const instr_trace_t* trace, uint32_t t, uint64_t src) {
+	const auto args = std::get<IntrLsuArgs>(trace->instr_ptr->get_args());
+	const bool q = (args.red_op == 4);
+	const uint32_t size = 1u << (args.width & 0x3);
+	const uint32_t cp_size = q ? 16 : size;
+	const uint64_t dst = Word(trace->src_data[2][t].u64 + args.offset);
+	const uint64_t ss = trace->src_data[1][t].u64;
+	uint64_t share = ss;
+	if (q) {
+		share = (args.offset == 0) ? std::min<uint64_t>(ss, 8) : ((ss > 8) ? ss - 8 : 0);
+	}
+	if (get_addr_type(dst) != AddrType::Shared) {
+		this->cpa_abort(trace, t, "cp.async destination must be the block's own shared memory", dst);
+	}
+	if (((dst - args.offset) % cp_size) != 0) {
+		this->cpa_abort(trace, t, "cp.async address must be aligned to its size", dst - args.offset);
+	}
+	if (ss > cp_size) {
+		this->cpa_abort(trace, t, "cp.async src-size exceeds cp-size", src - args.offset);
+	}
+	if (share != 0) {
+		const uint32_t wl = VX_CFG_LMEM_LOG_SIZE + log2ceil(VX_CFG_DLMEM_MAX_CLUSTER);
+		if (get_addr_type(src) != AddrType::Global || (src >> wl) == (uint64_t(VX_MEM_DLMEM_BASE_ADDR) >> wl)) {
+			this->cpa_abort(trace, t, "cp.async source must be global memory", src);
+		}
+		if (((src - args.offset) % cp_size) != 0) {
+			this->cpa_abort(trace, t, "cp.async address must be aligned to its size", src - args.offset);
+		}
+	}
+	auto& lane = cpa_lanes_.at(b).at(t);
+	lane.dst = dst;
+	lane.ss = uint32_t(share);
+	lane.src_off = 0;
+	return (share != 0) ? src : uint64_t(VX_MEM_USER_BASE_ADDR);
+}
+
+// A copy uop issues its packets as a load does, but takes a copy slot at its
+// first packet, which tags its reads, and retires at issue as a store does.
+// Its reads are not the warp's global loads: a fence does not wait for them.
+void LsuUnit::process_cpa_copy(uint32_t b, instr_trace_t* trace) {
+	auto& state = states_.at(b);
+	if (state.remain_addrs == 0) {
+		this->compute_addrs(b, trace);
+	}
+	while (state.remain_addrs != 0) {
+		uint32_t t0 = state.addr_list.size() - state.remain_addrs;
+		uint32_t n  = std::min<uint32_t>(VX_CFG_NUM_LSU_LANES, state.remain_addrs);
+		bool any = false;
+		for (uint32_t i = 0; i < n; ++i) {
+			any |= (state.addr_list.at(t0 + i).size != 0);
+		}
+		if (any)
+			break;
+		state.remain_addrs -= n;
+	}
+	if (state.remain_addrs <= VX_CFG_NUM_LSU_LANES && Outputs.at(b).full())
+		return; // stall
+	if (state.remain_addrs != 0) {
+		if (this->req_out(b).full() || this->pending_full(b))
+			return; // stall
+		const auto& status = cpa_status_.at(b);
+		if (cpa_slot_.at(b) < 0) {
+			// The uop's first packet takes a slot; its later packets fill it.
+			uint32_t slot = cpa_open_.at(trace->wid);
+			if (trace->sop) {
+				if (status.fifo_full.test(trace->wid) || status.free_slots == 0) {
+					if (!trace->log_once(true)) {
+						DT(4, this->name() << " cpa-full: " << *trace);
+					}
+					return; // stall
+				}
+				trace->log_once(false);
+				slot = __builtin_ctzll(status.free_slots);
+				cpa_open_.at(trace->wid) = slot;
+			}
+			const auto args = std::get<IntrLsuArgs>(trace->instr_ptr->get_args());
+			CpaIssue evt;
+			evt.kind = CpaIssue::COPY;
+			evt.wid  = trace->wid;
+			evt.uuid = trace->uuid;
+			evt.sop  = trace->sop;
+			evt.eop  = trace->eop;
+			evt.slot = slot;
+			evt.size = 1u << (args.width & 0x3);
+			evt.lanes = cpa_lanes_.at(b);
+			for (auto& e : state.addr_list) {
+				if (e.size == 0)
+					continue;
+				evt.tmask |= uint64_t(1) << e.tid;
+				evt.lanes.at(e.tid).src_off = uint32_t(e.addr & (VX_CFG_MEM_BLOCK_SIZE - 1));
+			}
+			CpaIssueOut.at(b).send(evt, 0);
+			cpa_slot_.at(b) = slot;
+		}
+		LsuReq lsu_req(VX_CFG_NUM_LSU_LANES);
+		lsu_req.op = MemOp::LD;
+		lsu_req.wid = trace->wid;
+		lsu_req.cta_id = trace->cta_id;
+		uint32_t t0 = state.addr_list.size() - state.remain_addrs;
+		uint32_t beat_n = std::min<uint32_t>(VX_CFG_NUM_LSU_LANES, state.remain_addrs);
+		for (uint32_t i = 0; i < beat_n; ++i) {
+			auto& e = state.addr_list.at(t0 + i);
+			if (e.size == 0)
+				continue;
+			lsu_req.mask.set(i);
+			lsu_req.addrs.at(i) = e.addr;
+			lsu_req.tids.at(i) = e.tid;
+		}
+		state.remain_addrs -= beat_n;
+		lsu_req.tag  = CPA_TAG_BASE + CpaUnit::rsp_tag(cpa_slot_.at(b), t0 / VX_CFG_NUM_LSU_LANES);
+		lsu_req.cid  = trace->cid;
+		lsu_req.uuid = trace->uuid;
+		this->req_out(b).send(lsu_req);
+		cpa_read_lanes_.at(b).at(lsu_req.tag - CPA_TAG_BASE) = lsu_req.mask.count();
+		++cpa_reads_.at(b);
+		DT(3, this->name() << " cpa-req: " << lsu_req);
+		uint32_t count = lsu_req.mask.count();
+		core_->perf_stats().loads += count;
+		pending_loads_ += count;
+	}
+	if (state.remain_addrs == 0) {
+		Outputs.at(b).send(trace);
+		state.req_queue.pop();
+		cpa_slot_.at(b) = -1;
+	}
+}
+
+// commit_group, wait_group and cp.async.mbarrier.arrive go to the block's
+// cp.async unit and retire at once; a commit stalls while the warp's group
+// boundaries are full, an arrive at its first packet while its last one is
+// pending. The unit acts on the last packet; an arrive gathers its lanes
+// over its packets.
+void LsuUnit::process_cpa_ctrl(uint32_t b, instr_trace_t* trace) {
+	auto& state = states_.at(b);
+	if (Outputs.at(b).full())
+		return; // stall
+	const auto type = std::get<LsuType>(trace->op_type);
+	const auto args = std::get<IntrLsuArgs>(trace->instr_ptr->get_args());
+	const auto& status = cpa_status_.at(b);
+	if (type == LsuType::CPA_COMMIT && status.groups_full.test(trace->wid))
+		return; // stall
+	if (type == LsuType::CPA_ARRIVE && trace->sop && status.arrive_pending.test(trace->wid))
+		return; // stall
+	auto& evt = cpa_arr_.at(b);
+	if (trace->sop) {
+		evt = CpaIssue{};
+		evt.wid  = trace->wid;
+		evt.uuid = trace->uuid;
+		evt.addrs.assign(VX_CFG_NUM_THREADS, 0);
+	}
+	if (type == LsuType::CPA_COMMIT) {
+		evt.kind = CpaIssue::COMMIT;
+	} else if (type == LsuType::CPA_WAIT) {
+		evt.kind = CpaIssue::WAIT;
+		evt.n = args.cpa_n;
+	} else {
+		evt.kind  = CpaIssue::ARRIVE;
+		evt.noinc = (args.red_op == 6);
+		for (uint32_t t = 0; t < VX_CFG_NUM_THREADS; ++t) {
+			if (!trace->tmask.test(t))
+				continue;
+			const uint64_t a = Word(trace->src_data[0][t].u64);
+			if (get_addr_type(a) != AddrType::Shared || (a & 7) != 0) {
+				this->cpa_abort(trace, t, "cp.async.mbarrier.arrive needs the block's own mbarrier", a);
+			}
+			evt.tmask |= uint64_t(1) << t;
+			evt.addrs.at(t) = a;
+		}
+	}
+	DT(3, this->name() << " cpa-" << type << ": " << *trace);
+	if (trace->eop) {
+		CpaIssueOut.at(b).send(evt, 0);
+	}
+	Outputs.at(b).send(trace);
+	state.req_queue.pop();
 }
 #ifdef VX_CFG_EXT_DXA_ENABLE
 
@@ -369,6 +573,15 @@ void LsuUnit::compute_addrs(uint32_t b, instr_trace_t* trace) {
 			// upper bits into the 64-bit address field.
 			e.addr = Word(rs1_data[t].i + (uint64_t)stride * rs2_data[t].u + offset);
 			e.size = data_bytes;
+		#ifdef VX_CFG_EXT_MBAR_ENABLE
+			if (is_cpa_copy(lsu_tag)) {
+				e.addr = this->cpa_lane(b, trace, t, e.addr);
+			}
+		#elif defined(VX_CFG_EXT_DLMEM_ENABLE)
+		#line 239
+		#else
+		#line 233
+		#endif
 			if (StackInterleave::contains(e.addr)) {
 				// Interleaving is word-granular; a wider access would straddle two threads.
 				if (e.size > StackInterleave::WORD_SIZE) {
@@ -451,6 +664,28 @@ void LsuUnit::process_response_step(uint32_t b) {
 		return;
 	auto& state = states_.at(b);
 	auto& lsu_rsp = lsu_rsp_in.peek();
+#ifdef VX_CFG_EXT_MBAR_ENABLE
+	// A cp.async response is always taken: its lanes land in their copy slot.
+	if (lsu_rsp.tag >= CPA_TAG_BASE) {
+		LsuRsp fwd = lsu_rsp;
+		fwd.tag -= CPA_TAG_BASE;
+		DT(3, this->name() << " cpa-rsp: " << lsu_rsp);
+		CpaRspOut.at(b).send(fwd, 0);
+		pending_loads_ -= lsu_rsp.mask.count();
+		auto& left = cpa_read_lanes_.at(b).at(fwd.tag);
+		__assert(left >= lsu_rsp.mask.count(), this->name() << ": cp.async response for no read, tag=" << fwd.tag);
+		left -= lsu_rsp.mask.count();
+		if (left == 0) {
+			--cpa_reads_.at(b);
+		}
+		lsu_rsp_in.pop();
+		return;
+	}
+#elif defined(VX_CFG_EXT_DLMEM_ENABLE)
+#line 289
+#else
+#line 283
+#endif
 	auto& entry = state.pending_reqs.at(lsu_rsp.tag);
 
 #ifdef TCU_META_ENABLE
@@ -596,6 +831,10 @@ void LsuUnit::ingest_inputs(uint32_t b) {
 #ifdef VX_CFG_EXT_MBAR_ENABLE
 	// A try_wait's warp stays suspended until the waiter table releases it.
 	if (is_try_wait(trace)) {
+		trace->resume_warp = false;
+	}
+	// So does a cp.async.wait_group's, until its cp.async unit does.
+	if (lsu_type_tag && *lsu_type_tag == LsuType::CPA_WAIT) {
 		trace->resume_warp = false;
 	}
 #ifdef VX_CFG_EXT_DXA_ENABLE
@@ -827,6 +1066,23 @@ void LsuUnit::process_request_step(uint32_t b) {
 #else
 #line 612
 #endif
+#ifdef VX_CFG_EXT_MBAR_ENABLE
+	if (is_cpa_copy(lsu_tag)) {
+		this->process_cpa_copy(b, trace);
+		return;
+	}
+	if (is_cpa_ctrl(lsu_tag)) {
+		this->process_cpa_ctrl(b, trace);
+		return;
+	}
+	// The cp.async reads in flight take their share of the pending table.
+	if ((!is_write || is_amo) && cpa_reads_.at(b) != 0 && this->pending_full(b))
+		return; // stall
+#elif defined(VX_CFG_EXT_DLMEM_ENABLE)
+#line 618
+#else
+#line 612
+#endif
 
 	// check pending queue capacity. AMO always needs a return → reserve
 	// like a load, even though it carries write-bearing semantics.
@@ -1022,6 +1278,16 @@ void LsuUnit::on_tick() {
 		// as it stood at the start of this cycle, THEN ingest one new trace for
 		// next cycle. Dispatching before ingest makes req_queue a 1-cycle stage
 		// rather than a same-tick passthrough.
+	#ifdef VX_CFG_EXT_MBAR_ENABLE
+		while (!CpaStatusIn.at(b).empty()) {
+			cpa_status_.at(b) = CpaStatusIn.at(b).peek();
+			CpaStatusIn.at(b).pop();
+		}
+	#elif defined(VX_CFG_EXT_DLMEM_ENABLE)
+	#line 796
+	#else
+	#line 790
+	#endif
 		this->process_response_step(b);
 		this->process_request_step(b);
 		this->ingest_inputs(b);

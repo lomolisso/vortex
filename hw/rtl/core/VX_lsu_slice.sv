@@ -38,6 +38,11 @@ module VX_lsu_slice import VX_gpu_pkg::*; #(
     // The last response of an mbarrier try_wait left the slice.
     output wire                       mbar_retire_valid,
     output wire [NW_WIDTH-1:0]        mbar_retire_wid,
+    // cp.async: the copies' local-memory writes and arrives, and the release of a wait_group.
+    VX_lsu_mem_if.master              cpa_lmem_if,
+    VX_sched_unlock_if.master         cpa_unlock_if,
+    // Per warp, no cp.async work left in the unit.
+    output wire [`VX_CFG_NUM_WARPS-1:0] cpa_idle,
 `endif
 
     // The slice exposes the memory-client side as a VX_lsu_sched_if master;
@@ -66,8 +71,8 @@ module VX_lsu_slice import VX_gpu_pkg::*; #(
     `UNUSED_SPARAM (INSTANCE_ID)
 
 `ifdef VX_CFG_EXT_MBAR_ENABLE
-    // tag_width = header + op_type + align + pkt_addr + gload + try_wait + aq + rl + fence
-    localparam TAG_WIDTH = $bits(lsu_header_t) + INST_LSU_BITS + (NUM_LANES * REQ_ASHIFT) + LSUQ_SIZEW + 1 + 1 + 2 + 1;
+    // tag_width = header + op_type + align + pkt_addr + gload + try_wait + cp.async + aq + rl + fence
+    localparam TAG_WIDTH = $bits(lsu_header_t) + INST_LSU_BITS + (NUM_LANES * REQ_ASHIFT) + LSUQ_SIZEW + 1 + 1 + 1 + 2 + 1;
 `elsif VX_CFG_EXT_DLMEM_ENABLE
     // tag_width = header + op_type + align + pkt_addr + gload + aq + rl + fence
     localparam TAG_WIDTH = $bits(lsu_header_t) + INST_LSU_BITS + (NUM_LANES * REQ_ASHIFT) + LSUQ_SIZEW + 1 + 2 + 1;
@@ -107,15 +112,58 @@ module VX_lsu_slice import VX_gpu_pkg::*; #(
 `endif
 
     wire [NUM_LANES-1:0][`VX_CFG_XLEN-1:0] full_addr;
+`ifdef VX_CFG_EXT_MBAR_ENABLE
+    wire [NUM_LANES-1:0][`VX_CFG_XLEN-1:0] agu_addr;
+`endif
     for (genvar i = 0; i < NUM_LANES; ++i) begin : g_full_addr
         VX_lsu_agu lsu_agu (
             .base   (execute_if.data.rs1_data[i]),
             .stride (execute_if.data.rs2_data[i]),
             .offset (execute_if.data.op_args.lsu.offset),
             .pack   (execute_if.data.op_args.lsu.pack),
+        `ifdef VX_CFG_EXT_MBAR_ENABLE
+            .addr   (agu_addr[i])
+        `else
             .addr   (full_addr[i])
+        `endif
         );
     end
+
+`ifdef VX_CFG_EXT_MBAR_ENABLE
+    // cp.async: is_async without is_store. A copy is a global read that retires
+    // at issue; its response goes to the cp.async unit, which writes the local
+    // destination. Commit, wait and the arrives send nothing to memory.
+    wire [INST_LSU_BITS-1:0] req_op = INST_LSU_BITS'(execute_if.data.op_type);
+    wire req_cpa      = execute_if.data.op_args.lsu.is_async && ~execute_if.data.op_args.lsu.is_store;
+    wire req_cpa4     = (req_op == INST_LSU_CPA4);
+    wire req_cpa16    = (req_op == INST_LSU_CPA16H);
+    wire req_cpa_copy = req_cpa && (req_cpa4 || (req_op == INST_LSU_CPA8) || req_cpa16);
+    wire req_cpa_nomem = req_cpa && ~req_cpa_copy;
+    wire req_cpa_arr  = req_cpa && ((req_op == INST_LSU_CPA_ARRIVE) || (req_op == INST_LSU_CPA_NOINC));
+    // The high half of a 16-byte copy: offset 8 on source and destination.
+    wire req_cpa_hi   = req_cpa16 && (execute_if.data.op_args.lsu.offset == 12'd8);
+
+    wire [CPA_OP_BITS-1:0] cpa_op = req_cpa_copy ? CPA_OP_COPY
+                                  : (req_op == INST_LSU_CPA_COMMIT) ? CPA_OP_COMMIT
+                                  : (req_op == INST_LSU_CPA_WAIT)   ? CPA_OP_WAIT
+                                                                    : CPA_OP_ARRIVE;
+
+    localparam [`VX_CFG_XLEN-1:0] CPA_SAFE_ADDR = `VX_CFG_XLEN'(`VX_MEM_USER_BASE_ADDR);
+
+    wire [NUM_LANES-1:0][`VX_CFG_XLEN-1:0] cpa_dst;
+    wire [NUM_LANES-1:0][3:0]              cpa_ss;
+    for (genvar i = 0; i < NUM_LANES; ++i) begin : g_cpa_lane
+        wire [`VX_CFG_XLEN-1:0] ss = execute_if.data.rs2_data[i];
+        // Each half of a 16-byte copy takes its share: low min(ss, 8), high max(ss - 8, 0).
+        wire [3:0] ss_cap = req_cpa4 ? 4'd4 : 4'd8;
+        wire [`VX_CFG_XLEN-1:0] ss_hi = (ss > `VX_CFG_XLEN'(8)) ? (ss - `VX_CFG_XLEN'(8)) : '0;
+        wire [`VX_CFG_XLEN-1:0] ss_u  = req_cpa_hi ? ss_hi : ss;
+        assign cpa_ss[i]  = (ss_u > `VX_CFG_XLEN'(ss_cap)) ? ss_cap : ss_u[3:0];
+        assign cpa_dst[i] = execute_if.data.rs3_data[i] + `VX_CFG_XLEN'(execute_if.data.op_args.lsu.offset);
+        // A lane with nothing to read reads a fixed global word instead of its source.
+        assign full_addr[i] = (req_cpa_copy && (cpa_ss[i] == 4'd0)) ? CPA_SAFE_ADDR : agu_addr[i];
+    end
+`endif
 
     // address type + AMO classification — per-lane mem_bus_attr_t
     // carried through the scheduler's USER channel and out via the
@@ -229,6 +277,9 @@ module VX_lsu_slice import VX_gpu_pkg::*; #(
 
     wire mem_rsp_sop_pkt, mem_rsp_eop_pkt;
     wire no_rsp_buf_valid, no_rsp_buf_ready;
+`ifdef VX_CFG_EXT_MBAR_ENABLE
+    wire rsp_cpa;
+`endif
 
     wire [LSUQ_SIZEW-1:0] pkt_waddr, pkt_raddr;
 
@@ -267,18 +318,58 @@ module VX_lsu_slice import VX_gpu_pkg::*; #(
 `else
     wire req_writes = execute_if.data.op_args.lsu.is_store;
 `endif
+`ifdef VX_CFG_EXT_MBAR_ENABLE
+    // cp.async reads are ordered by their groups and mbarriers, not by fences.
+    wire req_gload = req_has_global && ~mem_req_rw && ~req_cpa;
+`else
     wire req_gload = req_has_global && ~mem_req_rw;
+`endif
     wire rsp_gload;
 
     wire cfence_hold = req_is_cfence && (gload[execute_if.data.header.wid] != '0);
     wire cfence_skip = req_is_cfence && ~gdirty[execute_if.data.header.wid];
+`ifdef VX_CFG_EXT_MBAR_ENABLE
+    wire req_skip = (req_is_fence && (~execute_if.data.header.eop || cfence_skip)) || req_cpa_nomem;
+`else
     wire req_skip = req_is_fence && (~execute_if.data.header.eop || cfence_skip);
+`endif
 `else
     wire req_skip = req_is_fence && ~execute_if.data.header.eop;
 `endif
+`ifdef VX_CFG_EXT_MBAR_ENABLE
+    // A copy retires at issue like a store.
+    wire no_rsp_buf_enable = (mem_req_rw && ~execute_if.data.header.wb) || req_skip || req_cpa_copy;
+`else
     wire no_rsp_buf_enable = (mem_req_rw && ~execute_if.data.header.wb) || req_skip;
+`endif
 
-`ifdef VX_CFG_EXT_DLMEM_ENABLE
+`ifdef VX_CFG_EXT_MBAR_ENABLE
+    // The cp.async unit stalls the instruction it cannot take yet.
+    wire cpa_iss_ready;
+    wire cpa_stall = req_cpa && ~cpa_iss_ready;
+
+    assign mem_req_valid = execute_if.valid
+                        && ~req_skip
+                        && ~(no_rsp_buf_enable && ~no_rsp_buf_ready)
+                        && ~fence_lock
+                        && ~cfence_hold
+                        && ~cpa_stall;
+
+    assign no_rsp_buf_valid = execute_if.valid
+                           && no_rsp_buf_enable
+                           && (req_skip || mem_req_ready)
+                           && ~fence_lock
+                           && ~cfence_hold
+                           && ~cpa_stall;
+
+    wire execute_ready_base = (mem_req_ready || req_skip)
+                           && ~(no_rsp_buf_enable && ~no_rsp_buf_ready)
+                           && ~fence_lock
+                           && ~cfence_hold;
+
+    assign execute_if.ready = execute_ready_base && ~cpa_stall;
+
+`elsif VX_CFG_EXT_DLMEM_ENABLE
     assign mem_req_valid = execute_if.valid
                         && ~req_skip
                         && ~(no_rsp_buf_enable && ~no_rsp_buf_ready)
@@ -375,15 +466,23 @@ module VX_lsu_slice import VX_gpu_pkg::*; #(
     // memory misalignment not supported!
     for (genvar i = 0; i < NUM_LANES; ++i) begin : g_missalign
         wire lsu_req_fire = execute_if.valid && execute_if.ready;
+    `ifdef VX_CFG_EXT_MBAR_ENABLE
+        // cp.async lanes have their own checks, whose texts must win.
+        `RUNTIME_ASSERT((~lsu_req_fire || ~execute_if.data.header.tmask[i] || req_is_fence || req_cpa || (full_addr[i] % (1 << inst_lsu_wsize(execute_if.data.op_type))) == 0),
+            ("%t: misaligned memory access, wid=%0d, PC=0x%0h, addr=0x%0h, wsize=%0d! (#%0d)",
+                $time, execute_if.data.header.wid, to_fullPC(execute_if.data.header.PC), full_addr[i], inst_lsu_wsize(execute_if.data.op_type), execute_if.data.header.uuid))
+    `else
         `RUNTIME_ASSERT((~lsu_req_fire || ~execute_if.data.header.tmask[i] || req_is_fence || (full_addr[i] % (1 << inst_lsu_wsize(execute_if.data.op_type))) == 0),
             ("%t: misaligned memory access, wid=%0d, PC=0x%0h, addr=0x%0h, wsize=%0d! (#%0d)",
                 $time, execute_if.data.header.wid, to_fullPC(execute_if.data.header.PC), full_addr[i], inst_lsu_wsize(execute_if.data.op_type), execute_if.data.header.uuid))
+    `endif
     end
 
 `ifdef VX_CFG_EXT_MBAR_ENABLE
     // A 16-byte st.async reaches the slice as two 8-byte halves; only the high one has offset 8.
     wire execute_fire = execute_if.valid && execute_if.ready;
-    wire req_sq_hi    = execute_if.data.op_args.lsu.is_async && (execute_if.data.op_args.lsu.offset == 12'd8);
+    wire req_sq_hi    = execute_if.data.op_args.lsu.is_async && execute_if.data.op_args.lsu.is_store
+                     && (execute_if.data.op_args.lsu.offset == 12'd8);
     for (genvar i = 0; i < NUM_LANES; ++i) begin : g_sq_align
         `RUNTIME_ASSERT(~(execute_fire && req_sq_hi && execute_if.data.header.tmask[i] && (full_addr[i][3:0] != 4'd8)),
             ("%t: st.async 16-byte form needs a 16-byte aligned address: wid=%0d, PC=0x%0h, addr=0x%0h (#%0d)",
@@ -392,6 +491,54 @@ module VX_lsu_slice import VX_gpu_pkg::*; #(
     `RUNTIME_ASSERT(~(execute_if.valid && execute_if.data.op_args.lsu.is_async && (execute_if.data.op_type == INST_LSU_SQ)),
         ("%t: unsplit 16-byte st.async reached the LSU: wid=%0d, PC=0x%0h (#%0d)",
             $time, execute_if.data.header.wid, to_fullPC(execute_if.data.header.PC), execute_if.data.header.uuid))
+
+    // cp.async lanes, checked in this order; a lane reports its first failure only.
+    for (genvar i = 0; i < NUM_LANES; ++i) begin : g_cpa_check
+        wire [MEM_ADDRW-1:0] src_blk = agu_addr[i][MEM_ASHIFT +: MEM_ADDRW];
+        wire [MEM_ADDRW-1:0] dst_blk = cpa_dst[i][MEM_ASHIFT +: MEM_ADDRW];
+        wire [MEM_ADDRW-1:0] arr_blk = full_addr[i][MEM_ASHIFT +: MEM_ADDRW];
+        wire src_local = (src_blk[MEM_ADDRW-1:LMEM_BLK_LSB] == LMEM_BLK_BASE[MEM_ADDRW-1:LMEM_BLK_LSB]);
+        wire dst_local = (dst_blk[MEM_ADDRW-1:LMEM_BLK_LSB] == LMEM_BLK_BASE[MEM_ADDRW-1:LMEM_BLK_LSB]);
+        wire arr_local = (arr_blk[MEM_ADDRW-1:LMEM_BLK_LSB] == LMEM_BLK_BASE[MEM_ADDRW-1:LMEM_BLK_LSB]);
+        `UNUSED_VAR (dst_blk)
+        `UNUSED_VAR (arr_blk)
+        wire src_io  = (src_blk >= MEM_ADDRW'(`VX_CFG_XLEN'(`VX_MEM_IO_BASE_ADDR) >> MEM_ASHIFT))
+                    && (src_blk < MEM_ADDRW'(`VX_CFG_XLEN'(`VX_MEM_IO_END_ADDR) >> MEM_ASHIFT));
+        wire src_win = (src_blk[MEM_ADDRW-1:DLMEM_WIN_BLK_LSB] == DLMEM_WIN_BLK_BASE[MEM_ADDRW-1:DLMEM_WIN_BLK_LSB]);
+        wire src_global = ~src_local && ~src_win && ~src_io;
+        // Alignment is to the instruction's cp-size: 16 for both halves of a 16-byte copy.
+        wire [3:0] amask   = req_cpa4 ? 4'd3 : (req_cpa16 ? 4'd15 : 4'd7);
+        wire [4:0] cp_size = req_cpa4 ? 5'd4 : (req_cpa16 ? 5'd16 : 5'd8);
+        wire dst_mis = (| (execute_if.data.rs3_data[i][3:0] & amask));
+        wire src_mis = (| (execute_if.data.rs1_data[i][3:0] & amask));
+        wire ss_big  = (execute_if.data.rs2_data[i] > `VX_CFG_XLEN'(cp_size));
+        wire act     = execute_fire && req_cpa_copy && execute_if.data.header.tmask[i];
+        wire e_dst   = act && ~dst_local;
+        wire e_dmis  = act && ~e_dst && dst_mis;
+        wire e_ss    = act && ~e_dst && ~dst_mis && ss_big;
+        wire src_on  = act && ~e_dst && ~dst_mis && ~ss_big && (cpa_ss[i] != 4'd0);
+        wire e_src   = src_on && ~src_global;
+        wire e_smis  = src_on && src_global && src_mis;
+        wire arr_act = execute_fire && req_cpa_arr && execute_if.data.header.tmask[i];
+        wire e_mbar  = arr_act && (~arr_local || (full_addr[i][2:0] != 3'd0));
+        `RUNTIME_ASSERT(~e_dst,
+            ("%t: cp.async destination must be the block's own shared memory: wid=%0d, PC=0x%0h, lane=%0d, dst=0x%0h (#%0d)",
+                $time, execute_if.data.header.wid, to_fullPC(execute_if.data.header.PC), i, cpa_dst[i], execute_if.data.header.uuid))
+        `RUNTIME_ASSERT(~(e_dmis || e_smis),
+            ("%t: cp.async address must be aligned to its size: wid=%0d, PC=0x%0h, lane=%0d, src=0x%0h, dst=0x%0h, size=%0d (#%0d)",
+                $time, execute_if.data.header.wid, to_fullPC(execute_if.data.header.PC), i, execute_if.data.rs1_data[i],
+                execute_if.data.rs3_data[i], cp_size, execute_if.data.header.uuid))
+        `RUNTIME_ASSERT(~e_ss,
+            ("%t: cp.async src-size exceeds cp-size: wid=%0d, PC=0x%0h, lane=%0d, src-size=%0d, size=%0d (#%0d)",
+                $time, execute_if.data.header.wid, to_fullPC(execute_if.data.header.PC), i, execute_if.data.rs2_data[i],
+                cp_size, execute_if.data.header.uuid))
+        `RUNTIME_ASSERT(~e_src,
+            ("%t: cp.async source must be global memory: wid=%0d, PC=0x%0h, lane=%0d, src=0x%0h (#%0d)",
+                $time, execute_if.data.header.wid, to_fullPC(execute_if.data.header.PC), i, agu_addr[i], execute_if.data.header.uuid))
+        `RUNTIME_ASSERT(~e_mbar,
+            ("%t: cp.async.mbarrier.arrive needs the block's own mbarrier: wid=%0d, PC=0x%0h, lane=%0d, addr=0x%0h (#%0d)",
+                $time, execute_if.data.header.wid, to_fullPC(execute_if.data.header.PC), i, full_addr[i], execute_if.data.header.uuid))
+    end
 `endif
 
     // store data formatting
@@ -420,11 +567,21 @@ module VX_lsu_slice import VX_gpu_pkg::*; #(
         reg [`VX_CFG_LSU_PENDING_SIZE-1:0][PID_BITS:0] pkt_ctr;
         reg [`VX_CFG_LSU_PENDING_SIZE-1:0] pkt_sop, pkt_eop;
 
+    `ifdef VX_CFG_EXT_MBAR_ENABLE
+        // A cp.async read holds a cp.async slot, not a packet slot.
+        wire mem_req_rd_fire     = mem_req_fire && ~mem_req_rw && ~req_cpa_copy;
+        wire pkt_rsp_fire        = mem_rsp_fire && ~rsp_cpa;
+        wire mem_req_rd_sop_fire = mem_req_rd_fire && execute_if.data.header.sop;
+        wire mem_req_rd_eop_fire = mem_req_rd_fire && execute_if.data.header.eop;
+        wire mem_rsp_eop_fire    = pkt_rsp_fire && mem_rsp_eop;
+        wire mem_rsp_eop_pkt_fire= pkt_rsp_fire && mem_rsp_eop_pkt;
+    `else
         wire mem_req_rd_fire     = mem_req_fire && ~mem_req_rw;
         wire mem_req_rd_sop_fire = mem_req_rd_fire && execute_if.data.header.sop;
         wire mem_req_rd_eop_fire = mem_req_rd_fire && execute_if.data.header.eop;
         wire mem_rsp_eop_fire    = mem_rsp_fire && mem_rsp_eop;
         wire mem_rsp_eop_pkt_fire= mem_rsp_fire && mem_rsp_eop_pkt;
+    `endif
         wire full;
 
         VX_allocator #(
@@ -454,9 +611,15 @@ module VX_lsu_slice import VX_gpu_pkg::*; #(
                 if (mem_req_rd_eop_fire) begin
                     pkt_eop[pkt_waddr] <= 1;
                 end
+            `ifdef VX_CFG_EXT_MBAR_ENABLE
+                if (pkt_rsp_fire) begin
+                    pkt_sop[pkt_raddr] <= 0;
+                end
+            `else
                 if (mem_rsp_fire) begin
                     pkt_sop[pkt_raddr] <= 0;
                 end
+            `endif
                 if (mem_rsp_eop_pkt_fire) begin
                     pkt_eop[pkt_raddr] <= 0;
                 end
@@ -508,13 +671,16 @@ module VX_lsu_slice import VX_gpu_pkg::*; #(
     // the tag bits the DLMEM translation reads.
     wire req_tw = execute_if.data.op_args.lsu.amo_valid
                && (amo_op_e'(execute_if.data.op_args.lsu.amo_op) == AMO_OP_MBAR_TRY_WAIT);
+    // A copy's packet field names its cp.async slot.
+    wire [LSUQ_SIZEW-1:0] cpa_slot;
     assign mem_req_tag = {
         execute_if.data.header,
         execute_if.data.op_type,
         req_align,
-        pkt_waddr,
+        req_cpa_copy ? cpa_slot : pkt_waddr,
         req_gload,
         req_tw,
+        req_cpa_copy,
         req_aq,
         req_rl,
         req_is_fence
@@ -551,7 +717,8 @@ module VX_lsu_slice import VX_gpu_pkg::*; #(
     assign client_if.req_data.attr   = mem_req_attr;
     assign client_if.req_data.data   = mem_req_data;
 `ifdef VX_CFG_EXT_MBAR_ENABLE
-    assign client_if.req_data.is_async = execute_if.data.op_args.lsu.is_async;
+    // A cp.async read is a plain global read past the slice.
+    assign client_if.req_data.is_async = execute_if.data.op_args.lsu.is_async && execute_if.data.op_args.lsu.is_store;
     for (genvar i = 0; i < NUM_LANES; ++i) begin : g_mbar_addr
         assign client_if.req_data.mbar_addr[i] = execute_if.data.rs3_data[i][`VX_CFG_MEM_ADDR_WIDTH-1:REQ_ASHIFT];
     end
@@ -585,6 +752,7 @@ module VX_lsu_slice import VX_gpu_pkg::*; #(
         pkt_raddr,
         rsp_gload,
         rsp_tw,
+        rsp_cpa,
         rsp_aq,
         rsp_rl,
         rsp_is_fence
@@ -712,6 +880,9 @@ module VX_lsu_slice import VX_gpu_pkg::*; #(
 `ifdef VX_CFG_EXT_MBAR_ENABLE
     // So does a try_wait's mark, to its retire.
     wire result_rsp_tw, result_tw;
+    // A copy's response never waits: the cp.async unit lands it.
+    wire rsp_buf_ready;
+    assign mem_rsp_ready = rsp_cpa || rsp_buf_ready;
 `endif
 
     VX_elastic_buffer #(
@@ -726,8 +897,13 @@ module VX_lsu_slice import VX_gpu_pkg::*; #(
     ) rsp_buf (
         .clk       (clk),
         .reset     (reset),
+    `ifdef VX_CFG_EXT_MBAR_ENABLE
+        .valid_in  (mem_rsp_valid && ~rsp_cpa),
+        .ready_in  (rsp_buf_ready),
+    `else
         .valid_in  (mem_rsp_valid),
         .ready_in  (mem_rsp_ready),
+    `endif
     `ifdef VX_CFG_EXT_MBAR_ENABLE
         .data_in   ({rsp_tw, rsp_aq, rsp_hdr2, rsp_data}),
         .data_out  ({result_rsp_tw, result_rsp_aq, result_rsp_if.data}),
@@ -797,6 +973,46 @@ module VX_lsu_slice import VX_gpu_pkg::*; #(
     // A try_wait never takes the unlock above: the waiter table releases its warp.
     assign mbar_retire_valid = result_if.valid && result_if.ready && result_if.data.header.eop && result_tw;
     assign mbar_retire_wid   = result_if.data.header.wid;
+`endif
+
+`ifdef VX_CFG_EXT_MBAR_ENABLE
+    localparam LMEM_LOG = `VX_CFG_LMEM_LOG_SIZE;
+    wire [NUM_LANES-1:0][LMEM_LOG-1:0] cpa_iss_addr;
+    wire [NUM_LANES-1:0][63:0]         cpa_rsp_data;
+    for (genvar i = 0; i < NUM_LANES; ++i) begin : g_cpa_iss
+        assign cpa_iss_addr[i] = req_cpa_copy ? cpa_dst[i][LMEM_LOG-1:0] : full_addr[i][LMEM_LOG-1:0];
+        assign cpa_rsp_data[i] = 64'(mem_rsp_data[i]);
+    end
+
+    VX_cpa_unit #(
+        .INSTANCE_ID (`SFORMATF(("%s-cpa", INSTANCE_ID)))
+    ) cpa_unit (
+        .clk       (clk),
+        .reset     (reset),
+        .iss_valid (execute_if.valid && req_cpa && execute_ready_base),
+        .iss_op    (cpa_op),
+        .iss_noinc (req_op == INST_LSU_CPA_NOINC),
+        .iss_wid   (execute_if.data.header.wid),
+        .iss_pid   (`UP(PID_BITS)'(execute_if.data.header.pid)),
+        .iss_sop   (execute_if.data.header.sop),
+        .iss_eop   (execute_if.data.header.eop),
+        .iss_tmask (execute_if.data.header.tmask),
+        .iss_size8 (~req_cpa4),
+        .iss_n     (execute_if.data.op_args.lsu.offset[4:0]),
+        .iss_addr  (cpa_iss_addr),
+        .iss_ss    (cpa_ss),
+        .iss_ready (cpa_iss_ready),
+        .iss_slot  (cpa_slot),
+        .rsp_valid (mem_rsp_valid && rsp_cpa),
+        .rsp_slot  (pkt_raddr),
+        .rsp_pid   (`UP(PID_BITS)'(rsp_hdr.pid)),
+        .rsp_mask  (mem_rsp_mask),
+        .rsp_data  (cpa_rsp_data),
+        .rsp_align (rsp_align),
+        .lmem_if   (cpa_lmem_if),
+        .unlock_if (cpa_unlock_if),
+        .idle      (cpa_idle)
+    );
 `endif
 
 `ifdef DBG_TRACE_MEM

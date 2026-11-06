@@ -437,7 +437,19 @@ void SfuUnit::on_tick() {
 					if (is_exit && (!core_->lsu_drained() || core_->has_pending_instrs(trace->wid)
 					             || !core_->dlmem_drained(trace->wid)))
 						continue;
+				#ifdef VX_CFG_EXT_MBAR_ENABLE
+					// nor with cp.async copies or an arrive still to land in its
+					// block's local memory, which the next block may own by then
+					if (is_exit && !core_->cpa_idle(trace->wid))
+						continue;
 				}
+				#else
+				#line 427
+				}
+				#line 425
+				#endif
+			#else
+			#line 428
 			#endif
 			}
 		}

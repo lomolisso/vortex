@@ -60,6 +60,10 @@
 //   completes, or at the time limit, so the other lanes may return false
 //   early and poll again.
 // - vx_mbar_test_wait() never suspends: it reads the phase and returns.
+// - arrive_drop (PTX mbarrier.arrive_drop) also takes its arrivals off the
+//   expected count of every later phase; noComplete must not complete the
+//   phase, or the simulation stops. Both are flags of the one arrive op, so
+//   they reach a peer's object through the window like any arrive.
 
 #if !defined(__riscv_xlen) || __riscv_xlen != 64
 #error "mbarriers require XLEN 64"
@@ -70,6 +74,7 @@
 #endif
 
 #include <vx_intrinsics.h>
+#include <vx_dlmem.h>
 #include <stdbool.h>
 #include <stdint.h>
 
@@ -114,6 +119,48 @@ static inline __attribute__((always_inline)) uint64_t vx_mbar_arrive_relaxed(uin
 
 static inline __attribute__((always_inline)) uint64_t vx_mbar_arrive_tx_relaxed(uint64_t* p, uint32_t bytes) {
   return __VX_MBAR_OP(1, 1, p, (uint64_t)bytes);
+}
+
+// Operand flags of the arrive and arrive_tx ops (sw/common/mbar_ref.h).
+#define __VX_MBAR_DROP       (1ull << 62)
+#define __VX_MBAR_NOCOMPLETE (1ull << 61)
+
+// PTX mbarrier.arrive_drop: `count` arrivals, also taken off the expected
+// count of this and every later phase; count must stay below the expected
+// count. A drop that completes the phase reloads pending from the reduced count.
+static inline __attribute__((always_inline)) uint64_t vx_mbar_arrive_drop(uint64_t* p, uint32_t count) {
+  return __VX_MBAR_OP(0, 0, p, (uint64_t)count | __VX_MBAR_DROP);
+}
+
+static inline __attribute__((always_inline)) uint64_t vx_mbar_arrive_drop_relaxed(uint64_t* p, uint32_t count) {
+  return __VX_MBAR_OP(0, 1, p, (uint64_t)count | __VX_MBAR_DROP);
+}
+
+// PTX mbarrier.arrive_drop.expect_tx: tx += bytes, then one arrival that is
+// also dropped from the expected count.
+static inline __attribute__((always_inline)) uint64_t vx_mbar_arrive_drop_tx(uint64_t* p, uint32_t bytes) {
+  return __VX_MBAR_OP(1, 0, p, (uint64_t)bytes | __VX_MBAR_DROP);
+}
+
+static inline __attribute__((always_inline)) uint64_t vx_mbar_arrive_drop_tx_relaxed(uint64_t* p, uint32_t bytes) {
+  return __VX_MBAR_OP(1, 1, p, (uint64_t)bytes | __VX_MBAR_DROP);
+}
+
+// PTX mbarrier.arrive.noComplete: the caller guarantees these arrivals do not
+// complete the phase; one that would stops the simulation. A release, as in
+// PTX, where .relaxed cannot be combined with .noComplete.
+static inline __attribute__((always_inline)) uint64_t vx_mbar_arrive_nocomplete(uint64_t* p, uint32_t count) {
+  return __VX_MBAR_OP(0, 0, p, (uint64_t)count | __VX_MBAR_NOCOMPLETE);
+}
+
+static inline __attribute__((always_inline)) uint64_t vx_mbar_arrive_drop_nocomplete(uint64_t* p, uint32_t count) {
+  return __VX_MBAR_OP(0, 0, p, (uint64_t)count | __VX_MBAR_DROP | __VX_MBAR_NOCOMPLETE);
+}
+
+// PTX mbarrier.pending_count of the word an arrive returns: the pending count
+// before that arrive, as on the H100.
+static inline __attribute__((always_inline)) uint32_t vx_mbar_pending_count(uint64_t word) {
+  return (uint32_t)(word & 0xFFFFF);
 }
 
 // PTX mbarrier.arrive.release.cluster: the warp's earlier global stores are
@@ -163,6 +210,62 @@ static inline __attribute__((always_inline)) bool vx_mbar_try_wait_acquire_clust
     return false;
   vx_fence_cluster();
   return true;
+}
+
+// The .relaxed waits. On the H100 they are the .acquire instruction without
+// the cluster L1 invalidate, so here they are the plain waits, and
+// .relaxed.cluster is .acquire.cluster without its trailing cluster fence.
+static inline __attribute__((always_inline)) bool vx_mbar_test_wait_relaxed(uint64_t* p, uint64_t token) {
+  return vx_mbar_test_wait(p, token);
+}
+
+static inline __attribute__((always_inline)) bool vx_mbar_test_wait_parity_relaxed(uint64_t* p, uint32_t parity) {
+  return vx_mbar_test_wait_parity(p, parity);
+}
+
+static inline __attribute__((always_inline)) bool vx_mbar_try_wait_relaxed(uint64_t* p, uint64_t token) {
+  return vx_mbar_try_wait(p, token);
+}
+
+static inline __attribute__((always_inline)) bool vx_mbar_try_wait_parity_relaxed(uint64_t* p, uint32_t parity) {
+  return vx_mbar_try_wait_parity(p, parity);
+}
+
+static inline __attribute__((always_inline)) bool vx_mbar_test_wait_relaxed_cluster(uint64_t* p, uint64_t token) {
+  return vx_mbar_test_wait(p, token);
+}
+
+static inline __attribute__((always_inline)) bool vx_mbar_test_wait_parity_relaxed_cluster(uint64_t* p, uint32_t parity) {
+  return vx_mbar_test_wait_parity(p, parity);
+}
+
+static inline __attribute__((always_inline)) bool vx_mbar_try_wait_relaxed_cluster(uint64_t* p, uint64_t token) {
+  return vx_mbar_try_wait(p, token);
+}
+
+static inline __attribute__((always_inline)) bool vx_mbar_try_wait_parity_relaxed_cluster(uint64_t* p, uint32_t parity) {
+  return vx_mbar_try_wait_parity(p, parity);
+}
+
+// try_wait with PTX's suspendTimeHint (ns), which is ignored, as on the H100:
+// the time limit stays VX_CFG_MBAR_SUSPEND_CYCLES.
+static inline __attribute__((always_inline)) bool vx_mbar_try_wait_hint(uint64_t* p, uint64_t token, uint32_t hint_ns) {
+  (void)hint_ns;
+  return vx_mbar_try_wait(p, token);
+}
+
+static inline __attribute__((always_inline)) bool vx_mbar_try_wait_parity_hint(uint64_t* p, uint32_t parity, uint32_t hint_ns) {
+  (void)hint_ns;
+  return vx_mbar_try_wait_parity(p, parity);
+}
+
+// PTX fence.mbarrier_init.release.cluster: orders the warp's earlier
+// vx_mbar_init() stores before its later window and global accesses, so a peer
+// that learns of the object through one of them sees it initialised. On the
+// H100 the init is itself an mbarrier op and the fence emits nothing; here the
+// init is a plain store, ordered by the CTA fence.
+static inline __attribute__((always_inline)) void vx_fence_mbarrier_init_release_cluster(void) {
+  vx_fence_cta();
 }
 
 // st.async and red.async, like PTX st.async / red.async .shared::cluster
@@ -338,6 +441,15 @@ static inline __attribute__((always_inline)) void vx_red_async_dec_u32(void* add
 #ifdef __cplusplus
 }
 
+// The PTX spelling of the hinted forms.
+static inline __attribute__((always_inline)) bool vx_mbar_try_wait(uint64_t* p, uint64_t token, uint32_t hint_ns) {
+  return vx_mbar_try_wait_hint(p, token, hint_ns);
+}
+
+static inline __attribute__((always_inline)) bool vx_mbar_try_wait_parity(uint64_t* p, uint32_t parity, uint32_t hint_ns) {
+  return vx_mbar_try_wait_parity_hint(p, parity, hint_ns);
+}
+
 namespace vortex {
 
 // A handle on an mbarrier object, after cuda::barrier.
@@ -385,6 +497,10 @@ public:
   }
 
   void arrive_and_wait(uint32_t count = 1) const { wait(arrive(count)); }
+
+  // cuda::barrier::arrive_and_drop(): this and every later phase expect
+  // `count` fewer arrivals.
+  void arrive_and_drop(uint32_t count = 1) const { vx_mbar_arrive_drop(obj_, count); }
 
   uint64_t* native_handle() const { return obj_; }
 

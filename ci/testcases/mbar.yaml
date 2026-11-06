@@ -38,6 +38,7 @@ defaults:
             tests/regression/dlmem_atomic, tests/regression/dlmem_stress,
             tests/regression/lmem_bar_order, tests/regression/dlmem_amo_order, VX_types.toml,
             hw/rtl/core/VX_uop_sequencer.sv, hw/rtl/dlmem/VX_uop_release.sv, sim/simx/sequencer,
+            hw/rtl/core/VX_cpa_unit.sv, sim/simx/cpa_unit, hw/rtl/VX_trace_pkg.sv,
             sim/simx/instr.h, hw/rtl/cache, sim/simx/mem/cache, hw/rtl/VX_socket.sv,
             hw/rtl/tcu, sim/simx/tcu, sw/kernel/include/vx_tensor.h,
             tests/regression/sgemm_tcu_wg_mbar, tests/regression/sgemm_tcu_mx_mbar,
@@ -535,7 +536,9 @@ tests:
               sim/simx/lsu_unit, sim/simx/core, sim/simx/types.h, sim/simx/mem/local_mem,
               sim/simx/amo, sim/simx/socket, sim/simx/cluster, sim/simx/mbar_waiters,
               sim/simx/sequencer, sw/kernel/include/vx_mbar.h, sw/kernel/include/vx_dlmem.h,
-              sw/common/mbar_ref.h, sw/common/dlmem_ref.h, sw/common/amo_ref.h, VX_config.toml]
+              sw/common/mbar_ref.h, sw/common/dlmem_ref.h, sw/common/amo_ref.h, VX_config.toml,
+              hw/rtl/core/VX_cpa_unit.sv, sim/simx/cpa_unit, hw/rtl/core/VX_wctl_unit.sv,
+              sim/simx/sfu_unit]
     shape: {cores: 2, l2cache: true}
     args: "-k 2 -n 2"
   # The vector stores (v2.b32, v4.b32 as one 16-byte instruction from an
@@ -656,7 +659,8 @@ tests:
               sim/simx/sfu_unit, sim/simx/Makefile, hw/rtl/core/VX_scheduler.sv,
               sw/common/mbar_ref.h, sw/kernel/include/vx_dxa.h, sw/kernel/include/vx_mbar.h,
               tests/regression/dxa_mbar, tests/regression/dxa_copy,
-              tests/regression/dxa_kmajor_check, VX_config.toml]
+              tests/regression/dxa_kmajor_check, VX_config.toml, hw/rtl/core/VX_cpa_unit.sv,
+              sim/simx/cpa_unit]
     args: "-r 8"
   - id: dxa_mbar-legacy
     app: dxa_mbar
@@ -1088,3 +1092,317 @@ tests:
     configs: "-DVX_CFG_EXT_DLMEM_ENABLE -DVX_CFG_EXT_MBAR_ENABLE"
     env: {EXPECT: "mbarriers require the A extension"}
     run: *reject_run
+
+  # --- arrive_drop, noComplete, pending_count, relaxed waits, try_wait hints (mbar_ops) ---
+  # The mbarrier scripts of the H100 semantics probe, one
+  # object per script: arrive_drop before, between and as the completing op,
+  # two drops in a phase, a drop from the cluster peer, noComplete arrives and
+  # drops, pending_count over 21 arrives, plus arrive_drop.expect_tx and
+  # cuda::barrier::arrive_and_drop(). The host replays each script with
+  # mbar_ref (every returned word, wait result and final word) and checks every
+  # value the H100 recorded. remote: rank 1 issues every arrive and drop on
+  # rank 0's object through the window, the blocks meeting in a cluster sync
+  # after each step, in one socket and across two. relaxed: the relaxed
+  # arrives, drops and waits. hint: try_wait with a suspend-time hint, then a
+  # phase that never completes: every hinted try_wait times out like the
+  # unhinted one, as on the H100.
+  - id: mbar_ops
+    app: mbar_ops
+    drivers: [simx, rtlsim]
+    touches: &e4_touches [tests/regression/mbar_ops, tests/regression/cp_async,
+              tests/regression/mbar_init_fence, sw/common/mbar_ref.h, sw/kernel/include/vx_mbar.h,
+              sw/kernel/include/vx_cp_async.h, sw/kernel/include/vx_dlmem.h, hw/rtl/core/VX_cpa_unit.sv,
+              sim/simx/cpa_unit, hw/rtl/cache/VX_amo_alu.sv, hw/rtl/cache/VX_amo_unit.sv,
+              hw/rtl/mem/VX_local_mem.sv, hw/rtl/mem/VX_lmem_switch.sv, hw/rtl/dlmem, hw/rtl/VX_gpu_pkg.sv,
+              hw/rtl/VX_define.vh, hw/rtl/VX_trace_pkg.sv, hw/rtl/core/VX_decode.sv,
+              hw/rtl/core/VX_uop_sequencer.sv, hw/rtl/core/VX_lsu_slice.sv, hw/rtl/core/VX_lsu_unit.sv,
+              hw/rtl/core/VX_mem_unit.sv, hw/rtl/core/VX_scheduler.sv, hw/rtl/core/VX_core.sv,
+              hw/rtl/core/VX_execute.sv, hw/rtl/interfaces, hw/rtl/VX_socket.sv, hw/rtl/VX_cluster.sv,
+              hw/rtl/cache, sim/simx/types.h, sim/simx/decode.cpp, sim/simx/instr.h, sim/simx/sequencer,
+              sim/simx/lsu_unit, sim/simx/scheduler, sim/simx/core, sim/simx/amo, sim/simx/mem/local_mem,
+              sim/simx/dlmem, sim/simx/mbar_waiters, sim/simx/socket, sim/simx/cluster, sim/simx/Makefile,
+              sw/kernel/include/vx_spawn2.h, VX_config.toml, VX_types.toml, sim/simx/mem/lsu_mem_adapter,
+              hw/rtl/mem/VX_lsu_adapter.sv, hw/rtl/libs/VX_stream_xbar.sv,
+              tests/regression/Makefile, hw/rtl/core/VX_wctl_unit.sv, sim/simx/sfu_unit]
+    args: "-m local"
+  - id: mbar_ops-remote
+    app: mbar_ops
+    drivers: [simx, rtlsim]
+    configs+: "-DVX_CFG_SOCKET_SIZE=2"
+    touches: *e4_touches
+    shape: {cores: 2, l2cache: true}
+    args: "-m remote"
+  - id: mbar_ops-remote2s
+    app: mbar_ops
+    drivers: [simx, rtlsim]
+    touches: *e4_touches
+    shape: {cores: 2, l2cache: true}
+    args: "-m remote2s"
+  - id: mbar_ops-relaxed
+    app: mbar_ops
+    drivers: [simx, rtlsim]
+    touches: *e4_touches
+    args: "-m relaxed"
+  - id: mbar_ops-hint
+    app: mbar_ops
+    drivers: [simx, rtlsim]
+    touches: *e4_touches
+    args: "-m hint"
+  # Parity of the remote scripts: a cluster sync after every step and no
+  # spin, so the instruction count is exact; the remote ops, the network and
+  # the cluster barrier set the cycles.
+  - id: parity-mbar-ops
+    check: model_parity
+    app: mbar_ops
+    xlen: [64]
+    configs+: "-DVX_CFG_SOCKET_SIZE=2"
+    touches: *e4_touches
+    shape: {cores: 2, l2cache: true}
+    args: "-m remote"
+
+  # --- cp.async (cp_async) ---
+  # One block fills the core. zfill: 4, 8 and 16 bytes (.ca, and .cg for 16)
+  # with every src-size and ignore-src, the 4- and 8-byte ones also with the
+  # source and destination at different offsets in their doubleword, each
+  # into its own prefilled slot: byte-exact against the zero-fill rule, which
+  # the host first checks against the H100's values (ignore-src lanes get a
+  # local source, which they must not read). groups: per thread 4 groups of
+  # one copy from cold lines; wait_group 2 must show the first 2, wait_all all
+  # 4. bar: the H100 probe's four cp.async.mbarrier.arrive modes with 32
+  # threads: noinc completes the phase; the tx form plus an arrive never
+  # raises the pending count (each lane is its own update, so the counts are
+  # 32..1 where the H100's one warp-wide update reads 32 everywhere); the
+  # single-thread sequences complete only after the copy, with the next
+  # phase's expected count unchanged (the values read right after the arrive
+  # depend on whether the copy has landed, so they are only printed). stream: two blocks on two cores stream rows into a double buffer,
+  # each row completing on its buffer's mbarrier by noinc or by the tx form
+  # and an arrive; a thread sums another warp's part. pipe: RMSNorm's staging
+  # with __pipeline_memcpy_async, commit and wait_prior(1), the row's tail
+  # zero-filled.
+  - id: cp_async
+    app: cp_async
+    drivers: [simx, rtlsim]
+    touches: *e4_touches
+    args: "-m zfill"
+  - id: cp_async-groups
+    app: cp_async
+    drivers: [simx, rtlsim]
+    touches: *e4_touches
+    args: "-m groups"
+  - id: cp_async-bar
+    app: cp_async
+    drivers: [simx, rtlsim]
+    touches: *e4_touches
+    shape: {warps: 8}
+    args: "-m bar"
+  - id: cp_async-stream
+    app: cp_async
+    drivers: [simx, rtlsim]
+    touches: *e4_touches
+    shape: {cores: 2, l2cache: true}
+    args: "-m stream -r 16"
+  - id: cp_async-pipe
+    app: cp_async
+    drivers: [simx, rtlsim]
+    touches: *e4_touches
+    args: "-m pipe -r 16"
+  # Parity: no prefetch; per row every warp waits for its copies (wait_all),
+  # the block meets, then one try_wait and one test_wait, both unconditional,
+  # so the instruction count does not depend on when the copies land. The
+  # global reads, the local-memory writes, the arrives and the wake-up set
+  # the cycles.
+  - id: parity-cp-async
+    check: model_parity
+    app: cp_async
+    xlen: [64]
+    configs+: "-DVX_CFG_MBAR_SUSPEND_CYCLES=4096"
+    touches: *e4_touches
+    shape: {cores: 2, l2cache: true}
+    args: "-m stream -p -r 8"
+  # The same with 8 threads over 4 LSU lanes: every copy, commit, wait and
+  # arrive is two packets.
+  - id: parity-cp-async-pids
+    check: model_parity
+    app: cp_async
+    xlen: [64]
+    configs+: "-DVX_CFG_MBAR_SUSPEND_CYCLES=4096 -DVX_CFG_NUM_LSU_LANES=4"
+    touches: *e4_touches
+    shape: {cores: 2, l2cache: true, threads: 8}
+    args: "-m stream -p -r 8"
+  # mix: copies and global loads in flight together, so the reads of both
+  # share, and fill, the LSU's pending table.
+  - id: cp_async-mix
+    app: cp_async
+    drivers: [simx, rtlsim]
+    touches: *e4_touches
+    args: "-m mix -r 8"
+  - id: parity-cp-async-mix
+    check: model_parity
+    app: cp_async
+    xlen: [64]
+    touches: *e4_touches
+    args: "-m mix -r 8"
+  # orphan: each block exits with copies and an arrive in flight over its local
+  # memory; the next block on the core marks the same bytes and mbarrier and
+  # must find them unchanged, as on the H100, which keeps a block's shared
+  # memory until its copies complete.
+  - id: cp_async-orphan
+    app: cp_async
+    drivers: [simx, rtlsim]
+    touches: *e4_touches
+    args: "-m orphan"
+
+  # --- fence.mbarrier_init (mbar_init_fence) ---
+  # A lost-arrive reproducer: each round rank 0 initialises a fresh mbarrier with a
+  # plain store, fences with vx_fence_mbarrier_init_release_cluster(), and
+  # hands it to rank 1 with a relaxed window store; rank 1's remote arrive
+  # must find it initialised while rank 0's other warps hammer its banks with
+  # atomics. 256 rounds, two cores in one socket and in two.
+  - id: mbar_init_fence
+    app: mbar_init_fence
+    drivers: [simx, rtlsim]
+    configs+: "-DVX_CFG_SOCKET_SIZE=2"
+    touches: *e4_touches
+    shape: {cores: 2, l2cache: true}
+    args: "-n 256 -f init -H 1"
+  - id: mbar_init_fence-2s
+    app: mbar_init_fence
+    drivers: [simx, rtlsim]
+    touches: *e4_touches
+    shape: {cores: 2, l2cache: true}
+    args: "-n 256 -f init -H 1"
+
+  # Each must stop the simulation with the exact message: a noComplete arrive
+  # that completes the phase; an arrive_drop of the whole expected count; a
+  # test_wait on the object of another block on the same core (a SINGLE_CORE
+  # cluster of two one-warp blocks, on a 2-core device so that clusters of 2
+  # exist); cp.async into a peer block of such a cluster (window address) or
+  # into global memory; an 8-byte copy to a 4-byte aligned
+  # destination; src-size 17 on a 16-byte copy; cp.async.mbarrier.arrive on a
+  # peer's object; a source in local memory; and the reserved funct3 7.
+  - id: mbar_ops-x-nocomplete
+    via: script
+    driver: simx
+    touches: *e4_touches
+    env: {DRIVER: simx, APP: mbar_ops, ARGS: "-x nocomplete", EXPECT: "mbarrier.arrive.noComplete would complete the phase"}
+    run: *expect_fail_run
+  - id: mbar_ops-x-nocomplete
+    via: script
+    driver: rtlsim
+    touches: *e4_touches
+    env: {DRIVER: rtlsim, APP: mbar_ops, ARGS: "-x nocomplete", EXPECT: "mbarrier.arrive.noComplete would complete the phase"}
+    run: *expect_fail_run
+  - id: mbar_ops-x-dropzero
+    via: script
+    driver: simx
+    touches: *e4_touches
+    env: {DRIVER: simx, APP: mbar_ops, ARGS: "-x dropzero", EXPECT: "mbarrier.arrive_drop would leave no expected arrivals"}
+    run: *expect_fail_run
+  - id: mbar_ops-x-dropzero
+    via: script
+    driver: rtlsim
+    touches: *e4_touches
+    env: {DRIVER: rtlsim, APP: mbar_ops, ARGS: "-x dropzero", EXPECT: "mbarrier.arrive_drop would leave no expected arrivals"}
+    run: *expect_fail_run
+  - id: mbar_ops-x-samecore-wait
+    via: script
+    driver: simx
+    configs+: "-DVX_CFG_NUM_CORES=2 -DVX_CFG_L2_ENABLE"
+    touches: *e4_touches
+    env: {DRIVER: simx, APP: mbar_ops, ARGS: "-x samecore-wait", EXPECT: "remote mbarrier wait is not supported"}
+    run: *expect_fail_run
+  - id: mbar_ops-x-samecore-wait
+    via: script
+    driver: rtlsim
+    configs+: "-DVX_CFG_NUM_CORES=2 -DVX_CFG_L2_ENABLE"
+    touches: *e4_touches
+    env: {DRIVER: rtlsim, APP: mbar_ops, ARGS: "-x samecore-wait", EXPECT: "remote mbarrier wait is not supported"}
+    run: *expect_fail_run
+  - id: cp_async-x-remote-dst
+    via: script
+    driver: simx
+    configs+: "-DVX_CFG_NUM_CORES=2 -DVX_CFG_L2_ENABLE"
+    touches: *e4_touches
+    env: {DRIVER: simx, APP: cp_async, ARGS: "-x remote-dst", EXPECT: "cp.async destination must be the block's own shared memory"}
+    run: *expect_fail_run
+  - id: cp_async-x-remote-dst
+    via: script
+    driver: rtlsim
+    configs+: "-DVX_CFG_NUM_CORES=2 -DVX_CFG_L2_ENABLE"
+    touches: *e4_touches
+    env: {DRIVER: rtlsim, APP: cp_async, ARGS: "-x remote-dst", EXPECT: "cp.async destination must be the block's own shared memory"}
+    run: *expect_fail_run
+  - id: cp_async-x-global-dst
+    via: script
+    driver: simx
+    touches: *e4_touches
+    env: {DRIVER: simx, APP: cp_async, ARGS: "-x global-dst", EXPECT: "cp.async destination must be the block's own shared memory"}
+    run: *expect_fail_run
+  - id: cp_async-x-global-dst
+    via: script
+    driver: rtlsim
+    touches: *e4_touches
+    env: {DRIVER: rtlsim, APP: cp_async, ARGS: "-x global-dst", EXPECT: "cp.async destination must be the block's own shared memory"}
+    run: *expect_fail_run
+  - id: cp_async-x-misaligned
+    via: script
+    driver: simx
+    touches: *e4_touches
+    env: {DRIVER: simx, APP: cp_async, ARGS: "-x misaligned", EXPECT: "cp.async address must be aligned to its size"}
+    run: *expect_fail_run
+  - id: cp_async-x-misaligned
+    via: script
+    driver: rtlsim
+    touches: *e4_touches
+    env: {DRIVER: rtlsim, APP: cp_async, ARGS: "-x misaligned", EXPECT: "cp.async address must be aligned to its size"}
+    run: *expect_fail_run
+  - id: cp_async-x-srcsize
+    via: script
+    driver: simx
+    touches: *e4_touches
+    env: {DRIVER: simx, APP: cp_async, ARGS: "-x srcsize", EXPECT: "cp.async src-size exceeds cp-size"}
+    run: *expect_fail_run
+  - id: cp_async-x-srcsize
+    via: script
+    driver: rtlsim
+    touches: *e4_touches
+    env: {DRIVER: rtlsim, APP: cp_async, ARGS: "-x srcsize", EXPECT: "cp.async src-size exceeds cp-size"}
+    run: *expect_fail_run
+  - id: cp_async-x-remote-mbar
+    via: script
+    driver: simx
+    configs+: "-DVX_CFG_NUM_CORES=2 -DVX_CFG_L2_ENABLE"
+    touches: *e4_touches
+    env: {DRIVER: simx, APP: cp_async, ARGS: "-x remote-mbar", EXPECT: "cp.async.mbarrier.arrive needs the block's own mbarrier"}
+    run: *expect_fail_run
+  - id: cp_async-x-remote-mbar
+    via: script
+    driver: rtlsim
+    configs+: "-DVX_CFG_NUM_CORES=2 -DVX_CFG_L2_ENABLE"
+    touches: *e4_touches
+    env: {DRIVER: rtlsim, APP: cp_async, ARGS: "-x remote-mbar", EXPECT: "cp.async.mbarrier.arrive needs the block's own mbarrier"}
+    run: *expect_fail_run
+  - id: cp_async-x-local-src
+    via: script
+    driver: simx
+    touches: *e4_touches
+    env: {DRIVER: simx, APP: cp_async, ARGS: "-x local-src", EXPECT: "cp.async source must be global memory"}
+    run: *expect_fail_run
+  - id: cp_async-x-local-src
+    via: script
+    driver: rtlsim
+    touches: *e4_touches
+    env: {DRIVER: rtlsim, APP: cp_async, ARGS: "-x local-src", EXPECT: "cp.async source must be global memory"}
+    run: *expect_fail_run
+  - id: cp_async-x-encoding
+    via: script
+    driver: simx
+    touches: *e4_touches
+    env: {DRIVER: simx, APP: cp_async, ARGS: "-x encoding", EXPECT: "invalid cp.async encoding"}
+    run: *expect_fail_run
+  - id: cp_async-x-encoding
+    via: script
+    driver: rtlsim
+    touches: *e4_touches
+    env: {DRIVER: rtlsim, APP: cp_async, ARGS: "-x encoding", EXPECT: "invalid cp.async encoding"}
+    run: *expect_fail_run

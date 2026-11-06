@@ -143,6 +143,8 @@ module VX_dlmem_xlate import VX_gpu_pkg::*, VX_dlmem_pkg::*; #(
     wire [NUM_LANES-1:0]                     lane_mbar_global, lane_mbar_rwait;
     // st.async/red.async lanes: every one leaves through the egress, its own core's included.
     wire [NUM_LANES-1:0]                     lane_async, async_nowin, async_mbad, async_self;
+    // waits on the window address of another block of this core
+    wire [NUM_LANES-1:0]                     lane_mbar_swait;
     `STATIC_ASSERT (DLMEM_ASYNC_MB_LSB + LMEM_AW <= DLMEM_ASYNC_BIT, ("no room for the async lane encoding"))
     `STATIC_ASSERT (DLMEM_ASYNC_BIT > WIN_LSB, ("the async flag overlaps the DLMEM window"))
 `endif
@@ -246,10 +248,15 @@ module VX_dlmem_xlate import VX_gpu_pkg::*, VX_dlmem_pkg::*; #(
         assign lane_mbar_global[i] = act && is_mbar && ~attr.is_addr_local && ~rem;
         assign lane_mbar_rwait[i]  = act && attr.amo.amo_valid && (attr.amo.amo_op >= AMO_OP_MBAR_TEST_WAIT)
                                   && (attr.amo.amo_op <= AMO_OP_MBAR_TRY_WAIT) && rem;
+        assign lane_mbar_swait[i]  = act && attr.amo.amo_valid && (attr.amo.amo_op >= AMO_OP_MBAR_TEST_WAIT)
+                                  && (attr.amo.amo_op <= AMO_OP_MBAR_TRY_WAIT) && win && ~oob && ~mbad && is_self
+                                  && (peer.slot != my_slot);
     `else
         wire is_mbar = attr.amo.amo_valid && (attr.amo.amo_op >= AMO_OP_MBAR_ARRIVE);
         assign lane_mbar_global[i] = act && is_mbar && ~attr.is_addr_local && ~rem;
         assign lane_mbar_rwait[i]  = act && attr.amo.amo_valid && (attr.amo.amo_op >= AMO_OP_MBAR_TEST_WAIT) && rem;
+        assign lane_mbar_swait[i]  = act && attr.amo.amo_valid && (attr.amo.amo_op >= AMO_OP_MBAR_TEST_WAIT) && win
+                                  && ~oob && ~mbad && is_self && (peer.slot != my_slot);
     `endif
     `endif
 
@@ -392,6 +399,10 @@ module VX_dlmem_xlate import VX_gpu_pkg::*, VX_dlmem_pkg::*; #(
     `RUNTIME_ASSERT (~(out_fire && (| lane_mbar_rwait)),
         ("%t: %s remote mbarrier wait is not supported: wid=%0d lanes=0x%0h (#%0d)",
             $time, INSTANCE_ID, hdr_r.wid, lane_mbar_rwait, hdr_r.uuid))
+    // So is a wait on another block of the same core: its bank sees no waiter of that block.
+    `RUNTIME_ASSERT (~(out_fire && (| lane_mbar_swait)),
+        ("%t: %s remote mbarrier wait is not supported: wid=%0d lanes=0x%0h, another block of this core (#%0d)",
+            $time, INSTANCE_ID, hdr_r.wid, lane_mbar_swait, hdr_r.uuid))
     `RUNTIME_ASSERT (~(out_fire && (| async_nowin)),
         ("%t: %s st.async needs a cluster window address: wid=%0d lanes=0x%0h (#%0d)",
             $time, INSTANCE_ID, hdr_r.wid, async_nowin, hdr_r.uuid))

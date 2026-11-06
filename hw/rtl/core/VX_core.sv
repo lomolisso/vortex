@@ -138,6 +138,22 @@ module VX_core import VX_gpu_pkg::*, VX_tlb_pkg::*; #(
     wire [`VX_CFG_NUM_LSU_BLOCKS-1:0][NW_WIDTH-1:0] mbar_retire_wid;
     wire                                           mbar_unlock_valid;
     wire [`VX_CFG_NUM_WARPS-1:0]                   mbar_unlock_mask;
+    // cp.async units (one per LSU block) -> local memory, and their wait_group releases -> scheduler
+    VX_lsu_mem_if #(
+        .NUM_LANES (`VX_CFG_NUM_LSU_LANES),
+        .DATA_SIZE (LSU_WORD_SIZE),
+        .TAG_WIDTH (LSU_TAG_WIDTH)
+    ) cpa_lmem_if[`VX_CFG_NUM_LSU_BLOCKS]();
+    VX_sched_unlock_if cpa_unlock_if [`VX_CFG_NUM_LSU_BLOCKS]();
+    // Per warp, no cp.async work left in any block's unit.
+    wire [`VX_CFG_NUM_LSU_BLOCKS-1:0][`VX_CFG_NUM_WARPS-1:0] cpa_idle;
+    reg  [`VX_CFG_NUM_WARPS-1:0]                         cpa_warp_idle;
+    always @(*) begin
+        cpa_warp_idle = '1;
+        for (integer b = 0; b < `VX_CFG_NUM_LSU_BLOCKS; ++b) begin
+            cpa_warp_idle &= cpa_idle[b];
+        end
+    end
 `endif
     wire [`VX_CFG_NUM_LSU_BLOCKS-1:0] lsu_sched_raw_empty;
     wire [`VX_CFG_NUM_LSU_BLOCKS-1:0] xlate_empty;
@@ -318,6 +334,7 @@ module VX_core import VX_gpu_pkg::*, VX_tlb_pkg::*; #(
     `ifdef VX_CFG_EXT_MBAR_ENABLE
         .mbar_unlock_valid (mbar_unlock_valid),
         .mbar_unlock_mask (mbar_unlock_mask),
+        .cpa_unlock_if  (cpa_unlock_if),
     `endif
     `ifdef DXA_MBAR_ENABLE
         .cta_slot_valid (cta_slot_valid),
@@ -414,6 +431,9 @@ module VX_core import VX_gpu_pkg::*, VX_tlb_pkg::*; #(
     `ifdef VX_CFG_EXT_MBAR_ENABLE
         .mbar_retire_valid (mbar_retire_valid),
         .mbar_retire_wid (mbar_retire_wid),
+        .cpa_lmem_if    (cpa_lmem_if),
+        .cpa_unlock_if  (cpa_unlock_if),
+        .cpa_idle       (cpa_idle),
     `endif
 
     `ifdef TCU_META_ENABLE
@@ -642,6 +662,7 @@ module VX_core import VX_gpu_pkg::*, VX_tlb_pkg::*; #(
         .mbar_retire_wid (mbar_retire_wid),
         .mbar_unlock_valid (mbar_unlock_valid),
         .mbar_unlock_mask (mbar_unlock_mask),
+        .cpa_lmem_if   (cpa_lmem_if),
     `endif
     `ifdef DXA_MBAR_ENABLE
         .cta_slot_valid (cta_slot_valid),
@@ -761,7 +782,12 @@ module VX_core import VX_gpu_pkg::*, VX_tlb_pkg::*; #(
     // busy tracks only kernel execution: warps resident or stores not yet at L1.
     // ~mmu_empty also keeps the core busy while a translation or parked store is
     // still in flight, so kernel completion cannot race un-drained accesses.
-`ifdef VX_CFG_EXT_DLMEM_ENABLE
+`ifdef VX_CFG_EXT_MBAR_ENABLE
+    // A remote access in flight, a peer's access to this core's local memory,
+    // or cp.async work whose warp may already have exited.
+    assign busy = sched_busy || ~(&lsu_sched_empty) || ~mem_unit_empty || ~mmu_empty || ~dlmem_empty
+               || ~(&cpa_warp_idle);
+`elsif VX_CFG_EXT_DLMEM_ENABLE
     // A remote access in flight, or a peer's access to this core's local memory.
     assign busy = sched_busy || ~(&lsu_sched_empty) || ~mem_unit_empty || ~mmu_empty || ~dlmem_empty;
 `else
@@ -772,6 +798,9 @@ module VX_core import VX_gpu_pkg::*, VX_tlb_pkg::*; #(
     assign warp_ctl_if.lsu_sched_drained = (&lsu_sched_empty) && mmu_empty;
 `ifdef VX_CFG_EXT_DLMEM_ENABLE
     assign warp_ctl_if.dlmem_drained = dlmem_drained & lmem_acc_drained;
+`endif
+`ifdef VX_CFG_EXT_MBAR_ENABLE
+    assign warp_ctl_if.cpa_idle = cpa_warp_idle;
 `endif
 
 `ifdef PERF_ENABLE

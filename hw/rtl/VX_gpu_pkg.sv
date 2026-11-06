@@ -563,6 +563,16 @@ package VX_gpu_pkg;
 `ifdef VX_CFG_EXT_MBAR_ENABLE
     // 16-byte st.async: split by the uop sequencer into two 8-byte halves, so it never reaches the LSU.
     localparam INST_LSU_SQ =     4'b1100;
+    // cp.async (custom-2 funct7 3): is_async with is_store clear. A copy reads
+    // with its size's load; the 16-byte form splits like the 16-byte st.async.
+    localparam INST_LSU_CPA4       = INST_LSU_LWU;
+    localparam INST_LSU_CPA8       = INST_LSU_LD;
+    localparam INST_LSU_CPA16      = INST_LSU_SQ;
+    localparam INST_LSU_CPA16H     = 4'b0111; // an 8-byte half of a 16-byte copy; offset 8 marks the high one
+    localparam INST_LSU_CPA_COMMIT = 4'b1000;
+    localparam INST_LSU_CPA_WAIT   = 4'b1001; // N in the offset
+    localparam INST_LSU_CPA_ARRIVE = 4'b1010;
+    localparam INST_LSU_CPA_NOINC  = 4'b1011;
 `endif
     localparam INST_LSU_BITS =   4;
 
@@ -1589,14 +1599,28 @@ package VX_gpu_pkg;
     localparam LMEM_TAG_WIDTH_BASE  = LSU_TAG_WIDTH + `CLOG2(`VX_CFG_NUM_LSU_BLOCKS);
     localparam LMEM_TAG_WIDTH       = LMEM_TAG_WIDTH_BASE;
 
+`ifdef VX_CFG_EXT_MBAR_ENABLE
+    // cp.async unit of an LSU block: per warp an in-order FIFO of copy uops and
+    // its group boundaries; copy slots shared by the block's warps, their ids
+    // the local-memory write tags, the all-ones id left to arrives.
+    localparam CPA_DEPTH     = 8;
+    localparam CPA_GROUPS    = 8;
+    localparam CPA_SLOTS     = `MIN(`VX_CFG_LSU_PENDING_SIZE, (1 << LSU_TAG_ID_BITS) - 1);
+    localparam CPA_OP_BITS   = 2;
+    localparam CPA_OP_COPY   = 2'd0;
+    localparam CPA_OP_COMMIT = 2'd1;
+    localparam CPA_OP_WAIT   = 2'd2;
+    localparam CPA_OP_ARRIVE = 2'd3;
+`endif
+
     // Width of the tag carried over VX_lsu_sched_if: lsu_header + op_type
     // + per-lane align + packet allocator addr (+ global-load mark, AMO aq, rl in DLMEM builds)
     // + fence flag (matches the local TAG_WIDTH built inside VX_lsu_slice).
 `ifdef VX_CFG_EXT_MBAR_ENABLE
-    // plus the try_wait mark
+    // plus the try_wait and cp.async marks
     localparam LSU_CLIENT_TAG_WIDTH = $bits(lsu_header_t) + INST_LSU_BITS
                                     + (`VX_CFG_NUM_LSU_LANES * `CLOG2(LSU_WORD_SIZE))
-                                    + `LOG2UP(`VX_CFG_LSU_PENDING_SIZE) + 1 + 1 + 2 + 1;
+                                    + `LOG2UP(`VX_CFG_LSU_PENDING_SIZE) + 1 + 1 + 1 + 2 + 1;
 `elsif VX_CFG_EXT_DLMEM_ENABLE
     localparam LSU_CLIENT_TAG_WIDTH = $bits(lsu_header_t) + INST_LSU_BITS
                                     + (`VX_CFG_NUM_LSU_LANES * `CLOG2(LSU_WORD_SIZE))

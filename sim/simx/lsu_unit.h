@@ -22,6 +22,11 @@
 #ifdef VX_CFG_EXT_DLMEM_ENABLE
 #include <deque>
 #endif
+#ifdef VX_CFG_EXT_MBAR_ENABLE
+#include "cpa_unit.h"
+#else
+#line 24
+#endif
 
 // The TCU metadata SRAM is present when any metadata-consuming mode (MX or
 // sparse) is enabled. Internal derived macro — not a VX_CFG_* knob; same
@@ -112,6 +117,15 @@ public:
 	// The waiter table ticks before the commit that takes the result, so it
 	// sees the retire one cycle later and applies it as the earlier cycle's.
 	static constexpr uint32_t MBAR_RETIRE_DELAY = 1;
+
+	// Per block, toward its cp.async unit: the issue events and the read
+	// responses, in their cycle; back, its registered status.
+	std::vector<SimChannel<CpaIssue>>  CpaIssueOut;
+	std::vector<SimChannel<LsuRsp>>    CpaRspOut;
+	std::vector<SimChannel<CpaStatus>> CpaStatusIn;
+
+	// A cp.async read's memory tag, past the pending table's: its copy slot and packet.
+	static constexpr uint32_t CPA_TAG_BASE = VX_CFG_LSU_PENDING_SIZE;
 #endif
 #ifdef DXA_MBAR_ENABLE
 	// Per block: a proxy fence's answer from the translation stage, which
@@ -150,6 +164,16 @@ private:
 	static bool is_acquire_amo(const instr_trace_t* trace);
 #ifdef VX_CFG_EXT_MBAR_ENABLE
 	static bool is_try_wait(const instr_trace_t* trace);
+
+	// cp.async: the checks of a copy lane, which return the address it reads.
+	uint64_t cpa_lane(uint32_t b, const instr_trace_t* trace, uint32_t t, uint64_t src);
+	[[noreturn]] void cpa_abort(const instr_trace_t* trace, uint32_t t, const char* msg, uint64_t addr) const;
+	// A copy uop's packets: no pending-table entry, a copy slot instead.
+	void process_cpa_copy(uint32_t b, instr_trace_t* trace);
+	// commit_group, wait_group and the arrive: no memory access, retired at issue.
+	void process_cpa_ctrl(uint32_t b, instr_trace_t* trace);
+#else
+#line 143
 #endif
 
 	// Called for every result beat sent to Outputs[b].
@@ -160,6 +184,9 @@ private:
 
 	// Runs a CFENCE packet at the head of block b.
 	void process_cfence(uint32_t b, instr_trace_t* trace);
+#line 151
+#else
+#line 153
 #endif
 
   struct mem_addr_size_t {
@@ -227,6 +254,24 @@ private:
 	// acquire AMO in flight, so both share aq_done_.
 	std::array<std::vector<instr_trace_t*>, VX_CFG_NUM_LSU_BLOCKS> retire_beats_;
 	std::array<std::deque<int32_t>, VX_CFG_NUM_LSU_BLOCKS> out_retire_;
+	// Per block: the cp.async unit's status as registered, the slot of the copy
+	// uop being issued (-1 between uops) and that uop's lanes, per thread.
+	std::array<CpaStatus, VX_CFG_NUM_LSU_BLOCKS> cpa_status_;
+	std::array<int32_t, VX_CFG_NUM_LSU_BLOCKS> cpa_slot_;
+	std::array<std::vector<CpaLane>, VX_CFG_NUM_LSU_BLOCKS> cpa_lanes_;
+	// Per warp, the slot of its copy uop whose packets are issuing. Per block:
+	// the arrive being gathered over its packets; the cp.async read packets in
+	// flight, which hold pending-table capacity as loads do, and each one's
+	// lanes still to answer, by its tag.
+	std::vector<uint32_t> cpa_open_;
+	std::array<CpaIssue, VX_CFG_NUM_LSU_BLOCKS> cpa_arr_;
+	std::array<uint32_t, VX_CFG_NUM_LSU_BLOCKS> cpa_reads_;
+	std::array<std::vector<uint32_t>, VX_CFG_NUM_LSU_BLOCKS> cpa_read_lanes_;
+	bool pending_full(uint32_t b) const {
+		return states_.at(b).pending_reqs.size() + cpa_reads_.at(b) >= VX_CFG_LSU_PENDING_SIZE;
+	}
+#else
+#line 220
 #endif
 	// Per warp: a global write was sent since its last fence answered, and its
 	// global read packets (loads, LR, AMOs) still waiting for their response.
@@ -237,6 +282,9 @@ private:
 	std::vector<bool>     gdirty_;
 	std::vector<uint32_t> gload_;
 	std::vector<uint32_t> gload_dec_;
+#line 228
+#else
+#line 230
 #endif
 };
 

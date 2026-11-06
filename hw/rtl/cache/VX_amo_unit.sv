@@ -68,7 +68,7 @@ module VX_amo_unit import VX_gpu_pkg::*; #(
     output wire [63:0]                   compute_ret_word,
 `ifdef VX_CFG_EXT_MBAR_ENABLE
     output wire                          compute_mbar_flip,
-    output wire [1:0]                    compute_mbar_err,
+    output wire [3:0]                    compute_mbar_err,
 `endif
 
     // Reservation activity (single-fire per cycle).

@@ -101,9 +101,11 @@ endef
 # response merge, the local memory a store-acknowledging ingress input and
 # per-bank commit reports of every LSU-input access, and the memory unit is
 # linted with all of them wired. With mbarriers the banks also run the mbarrier
-# ops against mbar_ref and report their waiter events, and each erroneous op
-# must stop the last build with its assert; the final clean keeps a plain `run`
-# from reusing it. Then the mbarrier waiter table (run-mbar-waiters).
+# ops against mbar_ref, with the drop and noComplete operand flags, and report
+# their waiter events; an input behind a second crossbar (the cp.async lanes')
+# shares each bank round-robin; and each erroneous op must stop the last build with its
+# assert; the final clean keeps a plain `run` from reusing it. Then the
+# mbarrier waiter table (run-mbar-waiters).
 DLMEM_LMEM := -DVX_CFG_EXT_DLMEM_ENABLE
 MBAR_LMEM  := $(DLMEM_LMEM) $(LMEM_BASE) -DVX_CFG_EXT_MBAR_ENABLE
 run-lmem:
@@ -124,6 +126,10 @@ ifeq ($(XLEN),64)
 	grep -q "mbarrier tx out of range" local_mem/neg_txrange.log
 	! local_mem/local_mem --neg=align > local_mem/neg_align.log 2>&1
 	grep -q "mbarrier op is not a naturally aligned doubleword" local_mem/neg_align.log
+	! local_mem/local_mem --neg=nocomplete > local_mem/neg_nocomplete.log 2>&1
+	grep -q "mbarrier.arrive.noComplete would complete the phase" local_mem/neg_nocomplete.log
+	! local_mem/local_mem --neg=dropzero > local_mem/neg_dropzero.log 2>&1
+	grep -q "mbarrier.arrive_drop would leave no expected arrivals" local_mem/neg_dropzero.log
 	$(MAKE) -C local_mem clean
 	$(MAKE) run-mbar-waiters
 	$(call lmem_switch_case,$(DLMEM_LMEM) -DVX_CFG_NUM_LSU_LANES=1)
@@ -213,6 +219,33 @@ ifeq ($(XLEN),64)
 	$(MAKE) -C dxa_core clean
 else
 	@echo "run-dxa-bulk: mbarriers are RV64 only; nothing to run at XLEN $(XLEN)"
+endif
+
+# The cp.async unit (RV64 only, mbarriers): directed timing (a store ack at T
+# presents a waiting arrive at T+2 and unlocks a satisfied wait_group at T+3),
+# the issue stalls (a full copy FIFO, full group boundaries, a second arrive, no
+# free slot) and the zero fill of every cp-size x src-size x offset; then random
+# copies, commits, waits and arrives against out-of-order lane acks, checking
+# every written byte, each arrive after the warp's earlier copies, each unlock
+# against the groups pending. At the default shape (7 slots), with 8 warps (the
+# FIFO and boundaries fill), with two and four packets per warp, and 8 lanes.
+# $(1)=CONFIGS
+define cpa_unit_case
+	$(MAKE) -C cpa_unit clean
+	$(MAKE) -C cpa_unit CONFIGS="$(MBAR_LMEM) $(1)"
+	$(MAKE) -C cpa_unit run CONFIGS="$(MBAR_LMEM) $(1)" OPTS="--seed=1"
+	$(MAKE) -C cpa_unit run CONFIGS="$(MBAR_LMEM) $(1)" OPTS="--seed=2"
+endef
+run-cpa-unit:
+ifeq ($(XLEN),64)
+	$(call cpa_unit_case,)
+	$(call cpa_unit_case,-DVX_CFG_NUM_WARPS=8)
+	$(call cpa_unit_case,-DVX_CFG_NUM_THREADS=8 -DVX_CFG_NUM_LSU_LANES=4)
+	$(call cpa_unit_case,-DVX_CFG_NUM_THREADS=8)
+	$(call cpa_unit_case,-DVX_CFG_NUM_WARPS=16 -DVX_CFG_NUM_THREADS=16 -DVX_CFG_NUM_LSU_LANES=4)
+	$(MAKE) -C cpa_unit clean
+else
+	@echo "run-cpa-unit: mbarriers are RV64 only; nothing to run at XLEN $(XLEN)"
 endif
 
 # CTA launch path: the KMU's cluster walk under launch-bus back-pressure, and
@@ -373,7 +406,8 @@ endif
 # accesses. The bound-assert build must abort on an out-of-bounds lane; a build
 # with mbarriers counts their ops on local lanes, holds an arrive like a
 # release AMO, sends arrive and tx ops on remote lanes as remote AMOs, and must
-# abort on an op on a global lane and on a wait on a remote lane; a build with
+# abort on an op on a global lane and on a wait on a remote lane or on another
+# block of the same core; a build with
 # DXA and mbarriers also reads a random slot's row, bases and stride on the
 # table's DXA port every cycle and checks them against the rows written; the last
 # build sends a remote lane, holds a fence until its store is acknowledged and
@@ -429,6 +463,8 @@ ifeq ($(XLEN),64)
 	grep -q "remote mbarrier wait is not supported" dlmem_xlate/mbar_remote_wait.log
 	! dlmem_xlate/dlmem_xlate --mode=mbar-remote-trywait > dlmem_xlate/mbar_remote_trywait.log 2>&1
 	grep -q "remote mbarrier wait is not supported" dlmem_xlate/mbar_remote_trywait.log
+	! dlmem_xlate/dlmem_xlate --mode=mbar-samecore-wait > dlmem_xlate/mbar_samecore_wait.log 2>&1
+	grep -q "remote mbarrier wait is not supported" dlmem_xlate/mbar_samecore_wait.log
 	$(call dlmem_xlate_case,-DVX_CFG_NUM_CORES=4 -DVX_CFG_SOCKET_SIZE=2 -DVX_CFG_NUM_WARPS=8 \
 		-DVX_CFG_LMEM_LOG_SIZE=16 -DVX_CFG_EXT_A_ENABLE -DVX_CFG_EXT_MBAR_ENABLE -DVX_CFG_EXT_DXA_ENABLE,2,0,--seed=11,--mode=mbar,--mode=remote)
 	$(call dlmem_xlate_case,-DVX_CFG_NUM_CORES=2 -DVX_CFG_SOCKET_SIZE=1 -DVX_CFG_NUM_WARPS=4 \

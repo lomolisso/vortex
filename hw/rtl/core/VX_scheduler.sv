@@ -59,6 +59,8 @@ module VX_scheduler import VX_gpu_pkg::*; #(
     // the release of warps suspended in an mbarrier try_wait
     input wire              mbar_unlock_valid,
     input wire [`VX_CFG_NUM_WARPS-1:0] mbar_unlock_mask,
+    // per LSU block, the release of a warp stalled by a cp.async.wait_group
+    VX_sched_unlock_if.slave cpa_unlock_if [`VX_CFG_NUM_LSU_BLOCKS],
 `endif
 `ifdef DXA_MBAR_ENABLE
     // CTA slot state, for the DXA's retired-slot checks
@@ -230,7 +232,16 @@ module VX_scheduler import VX_gpu_pkg::*; #(
 `ifdef VX_CFG_EXT_DLMEM_ENABLE
     // Releases of warps a wstall'd instruction left stalled at decode: acquire AMOs, per LSU block,
     // then wgmma wait_groups, per TCU block.
+`ifdef VX_CFG_EXT_MBAR_ENABLE
+    // then cp.async wait_groups, per LSU block
 `ifdef TCU_WG_GROUPS_ENABLE
+    localparam NUM_UNLOCKS = `VX_CFG_NUM_LSU_BLOCKS + `VX_CFG_NUM_TCU_BLOCKS + `VX_CFG_NUM_LSU_BLOCKS;
+    localparam CPA_UNLOCK0 = `VX_CFG_NUM_LSU_BLOCKS + `VX_CFG_NUM_TCU_BLOCKS;
+`else
+    localparam NUM_UNLOCKS = `VX_CFG_NUM_LSU_BLOCKS + `VX_CFG_NUM_LSU_BLOCKS;
+    localparam CPA_UNLOCK0 = `VX_CFG_NUM_LSU_BLOCKS;
+`endif
+`elsif TCU_WG_GROUPS_ENABLE
     localparam NUM_UNLOCKS = `VX_CFG_NUM_LSU_BLOCKS + `VX_CFG_NUM_TCU_BLOCKS;
 `else
     localparam NUM_UNLOCKS = `VX_CFG_NUM_LSU_BLOCKS;
@@ -254,6 +265,17 @@ module VX_scheduler import VX_gpu_pkg::*; #(
             ("%s TCU unlock of a warp that is not stalled: block=%0d, wid=%0d", INSTANCE_ID, i, unlock_wid[U]))
         `RUNTIME_ASSERT(~(unlock_valid[U] && schedule_fire && (schedule_wid == unlock_wid[U])),
             ("%s TCU unlock of the warp being scheduled: block=%0d, wid=%0d", INSTANCE_ID, i, unlock_wid[U]))
+    end
+`endif
+`ifdef VX_CFG_EXT_MBAR_ENABLE
+    for (genvar i = 0; i < `VX_CFG_NUM_LSU_BLOCKS; ++i) begin : g_cpa_unlock
+        localparam U = CPA_UNLOCK0 + i;
+        assign unlock_valid[U] = cpa_unlock_if[i].valid;
+        assign unlock_wid[U]   = cpa_unlock_if[i].wid;
+        `RUNTIME_ASSERT(~unlock_valid[U] || stalled_warps[unlock_wid[U]],
+            ("%s cp.async unlock of a warp that is not stalled: block=%0d, wid=%0d", INSTANCE_ID, i, unlock_wid[U]))
+        `RUNTIME_ASSERT(~(unlock_valid[U] && schedule_fire && (schedule_wid == unlock_wid[U])),
+            ("%s cp.async unlock of the warp being scheduled: block=%0d, wid=%0d", INSTANCE_ID, i, unlock_wid[U]))
     end
 `endif
 `endif

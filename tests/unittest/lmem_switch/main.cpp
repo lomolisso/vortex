@@ -25,7 +25,8 @@
 // read-during-write shadow, reservations, the assert texts, the waiter-table
 // events (an insert for a try_wait that reads an incomplete phase, taken at
 // accept+1 with its warp; a flip for an op that completes one, at accept+2;
-// at most one per bank and cycle), and a random op stream on a few words. Last, the dcache's CTA fence: at an L1 that is not the
+// at most one per bank and cycle), the operand flags (arrive_drop, noComplete;
+// fixed and random vectors, and their two asserts), and a random op stream on a few words. Last, the dcache's CTA fence: at an L1 that is not the
 // shared level it drains an older write of another port, keeps the lines (a
 // later read hits), and sends nothing below marked as a fence; a GPU fence at
 // the same cache still walks.
@@ -365,6 +366,14 @@ int main() {
                 mbar_ref::MSG_TX_RANGE);
   mbar_negative("align", mbar_ref::init(1), mbar_ref::OP_ARRIVE, 1, 0x0f, mbar_ref::MSG_ALIGN);
   mbar_negative("align-wait", mbar_ref::init(1), mbar_ref::OP_TEST_WAIT, 0, 0xf0, mbar_ref::MSG_ALIGN);
+  mbar_negative("nocomplete", mbar_ref::init(1), mbar_ref::OP_ARRIVE, 1 | mbar_ref::FLAG_NOCOMPLETE, 0xff,
+                mbar_ref::MSG_NOCOMPLETE);
+  mbar_negative("nocomplete-tx", mbar_ref::pack(1, 1, -8, 0), mbar_ref::OP_ARRIVE_TX,
+                8 | mbar_ref::FLAG_NOCOMPLETE, 0xff, mbar_ref::MSG_NOCOMPLETE);
+  mbar_negative("dropzero", mbar_ref::init(2), mbar_ref::OP_ARRIVE, 2 | mbar_ref::FLAG_DROP, 0xff,
+                mbar_ref::MSG_DROPZERO);
+  mbar_negative("dropzero-tx", mbar_ref::pack(1, 1, 0, 0), mbar_ref::OP_ARRIVE_TX, 4 | mbar_ref::FLAG_DROP,
+                0xff, mbar_ref::MSG_DROPZERO);
 #endif
 
   auto& platform = SimPlatform::instance();
@@ -804,11 +813,39 @@ int main() {
         {"test_wait-0b",           pack(2, 2, 0, 1),                 OP_TEST_WAIT,   ~uint64_t(0)},
         {"try_wait-0",             init(4),                          OP_TRY_WAIT,    0},
         {"try_wait-1",             pack(4, 4, 8, 1),                 OP_TRY_WAIT,    0},
+        // Operand flags: arrive_drop, noComplete and both, plain and with tx.
+        {"drop",                   init(3),                          OP_ARRIVE,      1 | FLAG_DROP},
+        {"drop-count",             init(5),                          OP_ARRIVE,      2 | FLAG_DROP},
+        {"drop-complete",          pack(1, 3, 0, 0),                 OP_ARRIVE,      1 | FLAG_DROP},
+        {"drop-tx",                init(2),                          OP_ARRIVE_TX,   16 | FLAG_DROP},
+        {"drop-tx-complete",       pack(1, 3, -16, 1),               OP_ARRIVE_TX,   16 | FLAG_DROP},
+        {"nocomplete",             init(3),                          OP_ARRIVE,      1 | FLAG_NOCOMPLETE},
+        {"nocomplete-tx",          init(2),                          OP_ARRIVE_TX,   8 | FLAG_NOCOMPLETE},
+        {"drop-nocomplete",        init(3),                          OP_ARRIVE,      1 | FLAGS},
+        {"relaxed-drop",           pack(2, 4, 32, 0),                OP_ARRIVE,      1 | FLAG_DROP},
       };
+      std::vector<Vec> rnd;
+      {
+        // Random flagged arrivals that the golden model accepts.
+        std::mt19937_64 rng(5);
+        while (rnd.size() < 48) {
+          uint32_t exp  = 1 + uint32_t(rng() % 6);
+          uint32_t pend = 1 + uint32_t(rng() % exp);
+          int64_t  t    = int64_t(rng() % 3) * 16 - 16;
+          uint32_t op   = (rng() & 1) ? OP_ARRIVE : OP_ARRIVE_TX;
+          uint64_t opnd = (op == OP_ARRIVE) ? 1 + rng() % pend : 16 * (rng() % 3);
+          opnd |= (rng() & 1) ? FLAG_DROP : 0;
+          opnd |= (rng() % 3 == 0) ? FLAG_NOCOMPLETE : 0;
+          uint64_t old = pack(pend, exp, t, uint32_t(rng() & 1));
+          if (apply(op, old, opnd).err == ERR_NONE) {
+            rnd.push_back(Vec{"random-flags", old, op, opnd});
+          }
+        }
+      }
       uint32_t n = 0, flips = 0;
-      for (auto& v : vecs) {
+      auto run_vec = [&](const Vec& v, uint32_t row) {
         uint32_t port = n % NLSU;
-        uint64_t a = lmem_addr(n % NB, 20 + n);
+        uint64_t a = lmem_addr(n % NB, row);
         write(a, v.old);
         auto ref = apply(v.op, v.old, v.operand);
         CHECK(ref.err == ERR_NONE);
@@ -821,7 +858,7 @@ int main() {
           CHECK(evts->events.size() - ebase == want);
           if (evts->events.size() - ebase == 1) {
             auto& e = evts->events.back();
-            CHECK(e.bank == n % NB && e.evt.row == 20 + n && e.evt.flip == ref.flip);
+            CHECK(e.bank == n % NB && e.evt.row == row && e.evt.flip == ref.flip);
             CHECK(ref.flip || e.evt.wid == 1);
           }
         }
@@ -840,8 +877,18 @@ int main() {
         }
         flips += ref.flip;
         ++n;
+      };
+      for (auto& v : vecs) {
+        run_vec(v, 20 + n);
+      }
+      for (uint32_t k = 0; k < rnd.size(); ++k) {
+        run_vec(rnd[k], 100 + k);
       }
       // Hand-checked anchors for the golden model itself.
+      CHECK(expected(apply(OP_ARRIVE, init(3), 1 | FLAG_DROP).new_word) == 2);
+      CHECK(apply(OP_ARRIVE, pack(1, 3, 0, 0), 1 | FLAG_DROP).new_word == (init(2) | (uint64_t(1) << 63)));
+      CHECK(apply(OP_ARRIVE, init(1), 1 | FLAG_NOCOMPLETE).err == ERR_NOCOMPLETE);
+      CHECK((apply(OP_ARRIVE, init(1), 1 | FLAG_DROP).err & ERR_DROPZERO) != 0);
       CHECK(apply(OP_ARRIVE, (init(3) & ~COUNT_MAX) | 1, 1).new_word == (init(3) | (uint64_t(1) << 63)));
       CHECK(tx(apply(OP_COMPLETE_TX, init(1), 32).new_word) == -32);
       CHECK(apply(OP_EXPECT_TX, pack(0, 1, -32, 0), 32).flip);

@@ -46,6 +46,10 @@ module VX_local_mem import VX_gpu_pkg::*; #(
     // reported on lmem_commit once performed
     parameter [NUM_REQS-1:0] COMMIT_MASK = '0,
 `endif
+`ifdef VX_CFG_EXT_MBAR_ENABLE
+    // The last inputs reach the banks through a crossbar of their own.
+    parameter LOW_PRI_REQS      = 0,
+`endif
 
     // Response buffer
     parameter OUT_BUF           = 0
@@ -215,6 +219,99 @@ module VX_local_mem import VX_gpu_pkg::*; #(
         assign lsu_bus_if[i].req_ready = req_ready_in[i];
     end
 
+`ifdef VX_CFG_EXT_MBAR_ENABLE
+    // The last inputs have their own crossbar, so the others keep their
+    // arbitration exactly. Each bank alternates between the two crossbars when
+    // both present a request; with the last inputs idle it always takes the
+    // main one.
+    localparam HI_REQS      = NUM_REQS - LOW_PRI_REQS;
+    localparam HI_SEL_WIDTH = `UP(`CLOG2(HI_REQS));
+
+    wire [NUM_BANKS-1:0]                    hi_bank_valid;
+    wire [NUM_BANKS-1:0][REQ_DATAW-1:0]     hi_bank_data;
+    wire [NUM_BANKS-1:0][HI_SEL_WIDTH-1:0]  hi_bank_idx;
+    wire [NUM_BANKS-1:0]                    hi_bank_ready;
+
+    VX_stream_xbar #(
+        .NUM_INPUTS  (HI_REQS),
+        .NUM_OUTPUTS (NUM_BANKS),
+        .DATAW       (REQ_DATAW),
+        .PERF_CTR_BITS (PERF_CTR_BITS),
+        // Inputs are ordered block-major, so a fixed-priority grant would
+        // starve every higher-index LSU block at a contended bank.
+        .ARBITER     ("R"),
+        .OUT_BUF     (3) // output should be registered for the data_store addressing
+    ) req_xbar (
+        .clk       (clk),
+        .reset     (reset),
+    `ifdef PERF_ENABLE
+        .collisions (perf_collisions),
+    `else
+        `UNUSED_PIN (collisions),
+    `endif
+        .valid_in  (req_valid_in[HI_REQS-1:0]),
+        .data_in   (req_data_in[HI_REQS-1:0]),
+        .sel_in    (req_bank_idx[HI_REQS-1:0]),
+        .ready_in  (req_ready_in[HI_REQS-1:0]),
+        .valid_out (hi_bank_valid),
+        .data_out  (hi_bank_data),
+        .sel_out   (hi_bank_idx),
+        .ready_out (hi_bank_ready)
+    );
+
+    if (LOW_PRI_REQS != 0) begin : g_low_pri
+        localparam LO_SEL_WIDTH = `UP(`CLOG2(LOW_PRI_REQS));
+
+        wire [NUM_BANKS-1:0]                    lo_bank_valid;
+        wire [NUM_BANKS-1:0][REQ_DATAW-1:0]     lo_bank_data;
+        wire [NUM_BANKS-1:0][LO_SEL_WIDTH-1:0]  lo_bank_idx;
+        wire [NUM_BANKS-1:0]                    lo_bank_ready;
+
+        VX_stream_xbar #(
+            .NUM_INPUTS  (LOW_PRI_REQS),
+            .NUM_OUTPUTS (NUM_BANKS),
+            .DATAW       (REQ_DATAW),
+            .ARBITER     ("R"),
+            .OUT_BUF     (3)
+        ) low_xbar (
+            .clk       (clk),
+            .reset     (reset),
+            `UNUSED_PIN (collisions),
+            .valid_in  (req_valid_in[NUM_REQS-1:HI_REQS]),
+            .data_in   (req_data_in[NUM_REQS-1:HI_REQS]),
+            .sel_in    (req_bank_idx[NUM_REQS-1:HI_REQS]),
+            .ready_in  (req_ready_in[NUM_REQS-1:HI_REQS]),
+            .valid_out (lo_bank_valid),
+            .data_out  (lo_bank_data),
+            .sel_out   (lo_bank_idx),
+            .ready_out (lo_bank_ready)
+        );
+
+        for (genvar i = 0; i < NUM_BANKS; ++i) begin : g_pri
+            // Round-robin of the two: after a grant to the last inputs the main crossbar goes first.
+            reg  lo_last_r;
+            wire sel_lo = lo_bank_valid[i] && (~hi_bank_valid[i] || ~lo_last_r);
+            always @(posedge clk) begin
+                if (reset) begin
+                    lo_last_r <= 1'b1;
+                end else if (per_bank_req_valid[i] && per_bank_req_ready[i]) begin
+                    lo_last_r <= sel_lo;
+                end
+            end
+            assign per_bank_req_valid[i]    = hi_bank_valid[i] || lo_bank_valid[i];
+            assign per_bank_req_data_aos[i] = sel_lo ? lo_bank_data[i] : hi_bank_data[i];
+            assign per_bank_req_idx[i]      = sel_lo ? REQ_SEL_WIDTH'(HI_REQS + lo_bank_idx[i])
+                                                     : REQ_SEL_WIDTH'(hi_bank_idx[i]);
+            assign hi_bank_ready[i]         = per_bank_req_ready[i] && ~sel_lo;
+            assign lo_bank_ready[i]         = per_bank_req_ready[i] && sel_lo;
+        end
+    end else begin : g_no_low_pri
+        assign per_bank_req_valid    = hi_bank_valid;
+        assign per_bank_req_data_aos = hi_bank_data;
+        assign per_bank_req_idx      = hi_bank_idx;
+        assign hi_bank_ready         = per_bank_req_ready;
+    end
+`else
     VX_stream_xbar #(
         .NUM_INPUTS  (NUM_REQS),
         .NUM_OUTPUTS (NUM_BANKS),
@@ -241,6 +338,7 @@ module VX_local_mem import VX_gpu_pkg::*; #(
         .sel_out   (per_bank_req_idx),
         .ready_out (per_bank_req_ready)
     );
+`endif
 
     for (genvar i = 0; i < NUM_BANKS; ++i) begin : g_per_bank_req_data_soa
         assign {
@@ -625,7 +723,7 @@ module VX_local_mem import VX_gpu_pkg::*; #(
             localparam LMEM_HOLD_CREDIT_BITS = `MAX(3, `CLOG2(`VX_CFG_NUM_WARPS * `VX_CFG_NUM_THREADS));
         `ifdef VX_CFG_EXT_MBAR_ENABLE
             wire       amo_mbar_flip;
-            wire [1:0] amo_mbar_err;
+            wire [3:0] amo_mbar_err;
         `endif
             VX_amo_unit #(
                 .NUM_RES_ENTRIES  (`MIN(`VX_CFG_AMO_RS_SIZE, 4)),
@@ -706,6 +804,12 @@ module VX_local_mem import VX_gpu_pkg::*; #(
             `RUNTIME_ASSERT(~(amo_wb_valid_r && amo_mbar_err[1]),
                 ("%t: *** %s bank%0d: mbarrier tx out of range: row=0x%0h word=0x%h op=%0d bytes=0x%0h",
                     $time, INSTANCE_ID, i, amo_wb_addr_r, amo_old_r, amo_wb_op_r, amo_wb_rhs_r))
+            `RUNTIME_ASSERT(~(amo_wb_valid_r && amo_mbar_err[2]),
+                ("%t: *** %s bank%0d: mbarrier.arrive.noComplete would complete the phase: row=0x%0h word=0x%h operand=0x%0h",
+                    $time, INSTANCE_ID, i, amo_wb_addr_r, amo_old_r, amo_wb_rhs_r))
+            `RUNTIME_ASSERT(~(amo_wb_valid_r && amo_mbar_err[3]),
+                ("%t: *** %s bank%0d: mbarrier.arrive_drop would leave no expected arrivals: row=0x%0h word=0x%h operand=0x%0h",
+                    $time, INSTANCE_ID, i, amo_wb_addr_r, amo_old_r, amo_wb_rhs_r))
         `endif
 
             assign amo_wb_addr   = amo_wb_addr_r;

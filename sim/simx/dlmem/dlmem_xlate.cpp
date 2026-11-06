@@ -207,6 +207,15 @@ uint32_t DlmemXlate::translate(LsuReq& req, const dlmem_ref::Row& row) {
     if (is_mbar && global_lane < 0 && x.kind == dlmem_ref::NONE && get_addr_type(addr) != AddrType::Shared) {
       global_lane = i;
     }
+    // A wait on another block of this core is as unsupported as a remote one;
+    // the issuer's own window address is legal.
+    const bool is_wait = is_mbar && (req.op == MemOp::MBAR_TEST_WAIT || req.op == MemOp::MBAR_TRY_WAIT);
+    if (is_wait && remote_lane < 0 && x.kind == dlmem_ref::LOCAL && stride_ != 0
+     && (x.lmem_byte - (addr & dlmem_ref::low_mask(cfg_.lmem_log))) / stride_ != req.cta_id) {
+      remote_lane = i;
+      remote_addr = addr & ~uint64_t(LSU_WORD_SIZE - 1);
+      remote_core = x.core;
+    }
 #endif
 #ifdef VX_CFG_EXT_MBAR_ENABLE
     if (req.flags.async) {

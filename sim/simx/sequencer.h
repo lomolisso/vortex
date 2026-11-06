@@ -61,7 +61,7 @@ public:
   static bool is_release(const instr_trace_t* trace);
 #endif
 #ifdef VX_CFG_EXT_MBAR_ENABLE
-  // A 16-byte st.async issues as two 8-byte ones: [low half, high half].
+  // A 16-byte st.async or cp.async issues as two 8-byte ones: [low half, high half].
   static bool is_async_q(const instr_trace_t* trace);
 #else
 #line 62
@@ -80,7 +80,7 @@ private:
   enum class Release { None, Fence, Op };
 #endif
 #ifdef VX_CFG_EXT_MBAR_ENABLE
-  // The 16-byte st.async expander: the new low-half trace, then the
+  // The 16-byte st.async / cp.async expander: the new low-half trace, then the
   // instruction's own trace rewritten as the high half.
   enum class QPair { None, Low, High };
 #else

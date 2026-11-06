@@ -23,11 +23,15 @@
 // stores, and check every bank's waiter events: an insert {wid, row} one cycle
 // after a try_wait is taken that reads the phase not complete, a flip {row}
 // two cycles after a writing op is taken that completes it, nothing for any
-// other op; in op order per bank. --neg=<underflow|txrange|align> issues one
-// erroneous op, and the bank's assert must abort the run. Float-atomic builds
-// run inc/dec against amo_ref with their timing; --neg=fpsite issues a float
-// atomic, which only the last-level cache executes, and the bank's site assert
-// must abort the run.
+// other op; in op order per bank; and the drop and noComplete operand flags
+// of arrive and arrive_tx, directed and random against mbar_ref; and a
+// store-acknowledging input behind a second crossbar, whose stores complete
+// against an input that requests the same bank every cycle.
+// --neg=<underflow|txrange|align|nocomplete|dropzero> issues one erroneous op,
+// and the bank's assert must abort the run. Float-atomic builds run inc/dec
+// against amo_ref with their timing; --neg=fpsite issues a float atomic, which
+// only the last-level cache executes, and the bank's site assert must abort
+// the run.
 
 #include "vl_simulator.h"
 #include "VVX_local_mem_top.h"
@@ -365,6 +369,9 @@ struct Events {
   std::array<bool, NUM_BANKS>     commit{};
   std::array<uint32_t, NUM_BANKS> commit_wid{};
 #ifdef VX_CFG_EXT_MBAR_ENABLE
+  bool     low_acc = false;
+  bool     low_rsp = false;
+  uint32_t low_rsp_tag = 0;
   std::array<bool, NUM_BANKS>     mbar_evt{};
   std::array<bool, NUM_BANKS>     mbar_flip{};
   std::array<uint32_t, NUM_BANKS> mbar_wid{};
@@ -393,6 +400,10 @@ public:
   std::array<bool, NUM_REQS> rsp_ready;
   std::optional<DmaReq> dma;
   bool dma_rsp_ready = true;
+#ifdef VX_CFG_EXT_MBAR_ENABLE
+  // The store-acknowledging input behind the second crossbar.
+  std::optional<LsuReq> low;
+#endif
 
   Dut() {
     rsp_ready.fill(true);
@@ -439,6 +450,9 @@ public:
     }
 #endif
 #ifdef VX_CFG_EXT_MBAR_ENABLE
+    ev.low_acc = low.has_value() && t->low_req_ready;
+    ev.low_rsp = t->low_rsp_valid;
+    ev.low_rsp_tag = static_cast<uint32_t>(t->low_rsp_tag);
     for (uint32_t b = 0; b < NUM_BANKS; ++b) {
       ev.mbar_evt[b] = get_bits(t->mbar_evt_valid, b, 1);
       ev.mbar_flip[b] = get_bits(t->mbar_evt_flip, b, 1);
@@ -458,6 +472,11 @@ public:
     if (ev.dma_acc) {
       dma.reset();
     }
+#ifdef VX_CFG_EXT_MBAR_ENABLE
+    if (ev.low_acc) {
+      low.reset();
+    }
+#endif
     return ev;
   }
 
@@ -491,6 +510,15 @@ private:
     }
     t->dma_req_tag = d.tag;
     t->dma_rsp_ready = dma_rsp_ready;
+#ifdef VX_CFG_EXT_MBAR_ENABLE
+    LsuReq l = low.value_or(LsuReq{});
+    t->low_req_valid = low.has_value();
+    t->low_req_addr = l.addr;
+    t->low_req_byteen = l.byteen;
+    t->low_req_data = l.data;
+    t->low_req_tag = l.tag;
+    t->low_rsp_ready = 1;
+#endif
   }
 
   // Per bank and warp, LSU-input accesses accepted and not yet reported
@@ -706,6 +734,8 @@ public:
     #endif
     #ifdef VX_CFG_EXT_MBAR_ENABLE
       this->mbar_directed();
+      this->mbar_flags();
+      this->low_pri();
       this->mbar_events();
       for (uint32_t s = 0; s < opts_.stress_seeds; ++s) {
         this->mbar_stress(opts_.seed * 104729u + s);
@@ -2245,6 +2275,60 @@ private:
     std::printf("mbar directed: %s\n", (failures_ == before) ? "ok" : "FAILED");
   }
 
+  // The operand flags of arrive and arrive_tx: drop lowers the expected count
+  // with the pending one, noComplete must not complete the phase.
+  void mbar_flags() {
+    const uint32_t before = failures_;
+    using namespace mbar;
+    const uint64_t D = FLAG_DROP, NC = FLAG_NOCOMPLETE;
+    struct Vec { uint32_t op; uint64_t old; uint64_t operand; const char* what; };
+    const Vec vecs[] = {
+      {OP_ARRIVE,    init(3),                D | 1,       "drop 1 of 3, phase open"},
+      {OP_ARRIVE,    pack(1, 3, 0, 0),       D | 1,       "drop completes, reloads the new expected"},
+      {OP_ARRIVE,    pack(1, 3, 0, 1),       D | 1,       "drop completes phase 1"},
+      {OP_ARRIVE,    pack(4, 5, 0, 0),       D | 3,       "drop 3 of 5"},
+      {OP_ARRIVE,    pack(1, 3, 64, 0),      D | 1,       "drop, tx outstanding"},
+      {OP_ARRIVE,    pack(2, 3, 0, 0),       D | 0,       "drop 0"},
+      {OP_ARRIVE_TX, pack(1, 3, 0, 0),       D | 64,      "drop arrive_tx, tx left"},
+      {OP_ARRIVE_TX, pack(1, 3, -64, 0),     D | 64,      "drop arrive_tx completes"},
+      {OP_ARRIVE_TX, pack(2, 2, 0, 0),       D | 0,       "drop arrive_tx 0 bytes"},
+      {OP_ARRIVE,    init(3),                NC | 1,      "noComplete, phase open"},
+      {OP_ARRIVE,    pack(1, 3, 8, 0),       NC | 1,      "noComplete, tx keeps it open"},
+      {OP_ARRIVE_TX, pack(1, 3, 0, 0),       NC | 32,     "noComplete arrive_tx, bytes keep it open"},
+      {OP_ARRIVE,    init(4),                D | NC | 2,  "drop.noComplete, phase open"},
+      {OP_ARRIVE_TX, pack(2, 4, 0, 0),       D | NC | 16, "drop.noComplete arrive_tx"},
+      {OP_ARRIVE,    pack(2, 3, 0, 0) | (3ull << 61), D | 1, "drop, flag bits in the old word written zero"},
+    };
+    uint32_t n = 0;
+    for (const Vec& v : vecs) {
+      this->mbar_one(v.what, n % NUM_REQS, this->rand_below(NUM_ROWS), n % NUM_BANKS, v.op, v.old, v.operand);
+      ++n;
+    }
+    uint32_t nr = 0, tries = 0;
+    while (nr < 600 && tries < 100000) {
+      ++tries;
+      uint64_t w = this->rand_mbar_word();
+      if (pending(w) == 0) {
+        continue;
+      }
+      uint32_t op = this->rand_below(2) ? OP_ARRIVE : OP_ARRIVE_TX;
+      uint64_t operand = this->rand_mbar_operand(op, w);
+      uint32_t f = this->rand_below(4);
+      operand |= ((f & 1) ? D : 0) | ((f & 2) ? NC : 0);
+      if (apply(op, w, operand).err != ERR_NONE) {
+        continue;
+      }
+      this->mbar_one("random flag vector", this->rand_below(NUM_REQS), this->rand_below(NUM_ROWS),
+                     this->rand_below(NUM_BANKS), op, w, operand);
+      ++nr;
+    }
+    std::printf("mbar flags: %u directed and %u random vectors: %s\n", n, nr,
+                (failures_ == before && nr == 600) ? "ok" : "FAILED");
+    if (nr != 600) {
+      this->fail("FAIL mbar flags: too few error-free random vectors");
+    }
+  }
+
   // Waiter events of several ops, each placed by its op's commit report (an
   // atomic reports two cycles after its bank takes it, at write-back + 1):
   // insert = report - 2, flip = report - 1.
@@ -2921,6 +3005,79 @@ private:
                 (failures_ == before) ? "ok" : "FAILED");
   }
 
+  // The second crossbar's input shares each bank with the main crossbar
+  // round-robin: idle, it changes nothing (every other run here); against an
+  // input that requests the same bank every cycle, its stores still complete,
+  // and the two alternate.
+  void low_pri() {
+    const uint32_t before = failures_;
+    const uint32_t bank = 1 % NUM_BANKS, hot_row = 3 % NUM_ROWS, N = 16;
+    uint32_t sent = 0, acked = 0, hot = 0, hot_in_window = 0;
+    uint64_t first = 0, last = 0;
+    std::vector<uint64_t> vals(N);
+    for (uint32_t i = 0; i < N; ++i) {
+      vals[i] = this->rand_word();
+    }
+    LsuReq ld;
+    ld.byteen = FULL_BE;
+    ld.addr = word_addr(hot_row, bank);
+    ld.counted = false;
+    const uint64_t start = dut_.cycle();
+    while (acked < N && dut_.cycle() - start < 20 * N + 50) {
+      if (!dut_.lane[0]) {
+        dut_.lane[0] = ld;
+      }
+      if (!dut_.low && sent < N) {
+        LsuReq st;
+        st.rw = true;
+        st.byteen = FULL_BE;
+        st.addr = word_addr((10 + sent) % NUM_ROWS, bank);
+        st.data = vals[sent];
+        st.tag = sent;
+        dut_.low = st;
+      }
+      Events ev = dut_.clock();
+      if (ev.lsu_acc[0]) {
+        ++hot;
+        hot_in_window += (sent > 0 && sent < N);
+      }
+      if (ev.low_acc) {
+        first = (sent == 0) ? dut_.cycle() : first;
+        last = dut_.cycle();
+        ++sent;
+      }
+      if (ev.low_rsp) {
+        if (ev.low_rsp_tag != acked) {
+          this->fail(strf("FAIL low-priority input: ack tag %u, expected %u", ev.low_rsp_tag, acked));
+        }
+        ++acked;
+      }
+    }
+    dut_.lane[0].reset();
+    // the last hammer loads answer
+    for (int i = 0; i < 16; ++i) {
+      dut_.clock();
+    }
+    if (acked != N) {
+      this->fail(strf("FAIL low-priority input: %u of %u stores acknowledged against a hammered bank", acked, N));
+    }
+    // the hammering input keeps a grant between the low input's grants
+    if (hot_in_window + 2 < N - 1) {
+      this->fail(strf("FAIL low-priority input: the hammering input got %u grants while %u stores went in",
+                      hot_in_window, N));
+    }
+    for (uint32_t i = 0; i < N; ++i) {
+      uint32_t row = (10 + i) % NUM_ROWS;
+      this->gold(row, bank) = vals[i];
+      if (this->get_word(row, bank) != vals[i]) {
+        this->fail(strf("FAIL low-priority input: store %u not in the bank", i));
+      }
+    }
+    std::printf("low-priority input: %u stores in %" PRIu64 " cycles against a hammered bank, %u hammer grants "
+                "(%u between them): %s\n", N, last - first + 1, hot, hot_in_window,
+                (failures_ == before) ? "ok" : "FAILED");
+  }
+
   // One erroneous op; the bank must abort the run with its assert.
   int mbar_negative(const std::string& kind) {
     const uint32_t row = 5 % NUM_ROWS, bank = NUM_BANKS - 1;
@@ -2931,6 +3088,12 @@ private:
     } else if (kind == "txrange") {
       this->put_word(row, bank, mbar::init(1));
       r = mbar_req(mbar::OP_EXPECT_TX, row, bank, uint64_t(mbar::TX_MAX) + 1, 0);
+    } else if (kind == "nocomplete") {
+      this->put_word(row, bank, mbar::init(1));
+      r = mbar_req(mbar::OP_ARRIVE, row, bank, mbar::FLAG_NOCOMPLETE | 1, 0);
+    } else if (kind == "dropzero") {
+      this->put_word(row, bank, mbar::init(2));
+      r = mbar_req(mbar::OP_ARRIVE, row, bank, mbar::FLAG_DROP | 2, 0);
     } else if (kind == "align") {
       this->put_word(row, bank, mbar::init(5));
       r = mbar_req(mbar::OP_ARRIVE, row, bank, 1, 0);

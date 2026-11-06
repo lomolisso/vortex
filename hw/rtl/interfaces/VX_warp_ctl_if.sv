@@ -46,6 +46,10 @@ interface VX_warp_ctl_if import VX_gpu_pkg::*; ();
     // Per warp: no remote DLMEM access in flight and every local access committed.
     wire [`VX_CFG_NUM_WARPS-1:0] dlmem_drained;
 `endif
+`ifdef VX_CFG_EXT_MBAR_ENABLE
+    // Per warp: no cp.async copy or arrive left; an exit waits for it, a barrier does not.
+    wire [`VX_CFG_NUM_WARPS-1:0] cpa_idle;
+`endif
 
     // Return IPDOM stack address
     wire [NW_WIDTH-1:0] dvstack_wid;
@@ -80,6 +84,9 @@ interface VX_warp_ctl_if import VX_gpu_pkg::*; ();
         output bar_cluster,
         input  dlmem_drained,
     `endif
+    `ifdef VX_CFG_EXT_MBAR_ENABLE
+        input  cpa_idle,
+    `endif
 
         output dvstack_wid,
         input  dvstack_ptr
@@ -109,6 +116,9 @@ interface VX_warp_ctl_if import VX_gpu_pkg::*; ();
     `ifdef VX_CFG_EXT_DLMEM_ENABLE
         input  bar_cluster,
         output dlmem_drained,
+    `endif
+    `ifdef VX_CFG_EXT_MBAR_ENABLE
+        output cpa_idle,
     `endif
 
         input dvstack_wid,

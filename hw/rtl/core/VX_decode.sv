@@ -544,6 +544,43 @@ module VX_decode import
                     reg_ids[RV_RS3]  = make_reg_num(REG_TYPE_I, RV_REGS_BITS'(rd));
                     use_regs[RV_RS3] = 1'b1;
                 end
+                // cp.async: funct7 3, the op in funct3 (7 is reserved). A copy reads
+                // rs1 = global source, rs2 = src-size and, through the third operand
+                // slot, rd = local destination; nothing is written back.
+                if (funct7 == 7'd3 && funct3 != 3'd7) begin
+                    ex_type = EX_LSU;
+                    op_args.lsu.is_store     = 0;
+                    op_args.lsu.is_float     = 0;
+                    op_args.lsu.pack         = 0;
+                    op_args.lsu.offset       = 0;
+                    op_args.lsu.amo_unsigned = 1'b0;
+                    op_args.lsu.amo_aq       = 1'b0;
+                    op_args.lsu.amo_rl       = 1'b0;
+                    op_args.lsu.is_async     = 1'b1;
+                    case (funct3)
+                    3'd0: op_type = INST_OP_BITS'(INST_LSU_CPA_COMMIT);
+                    3'd1: begin
+                        // N is the rs2 field; the cp.async unit releases the warp.
+                        op_type = INST_OP_BITS'(INST_LSU_CPA_WAIT);
+                        op_args.lsu.offset = 12'(rs2);
+                        is_wstall = 1;
+                    end
+                    3'd2, 3'd3, 3'd4: begin
+                        op_type = (funct3 == 3'd2) ? INST_OP_BITS'(INST_LSU_CPA4)
+                                : (funct3 == 3'd3) ? INST_OP_BITS'(INST_LSU_CPA8)
+                                                   : INST_OP_BITS'(INST_LSU_CPA16);
+                        `USED_IREG (rs1);
+                        `USED_IREG (rs2);
+                        reg_ids[RV_RS3]  = make_reg_num(REG_TYPE_I, RV_REGS_BITS'(rd));
+                        use_regs[RV_RS3] = 1'b1;
+                    end
+                    default: begin
+                        op_type = (funct3 == 3'd5) ? INST_OP_BITS'(INST_LSU_CPA_ARRIVE)
+                                                   : INST_OP_BITS'(INST_LSU_CPA_NOINC);
+                        `USED_IREG (rs1);
+                    end
+                    endcase
+                end
             `endif
             end
         `endif
@@ -1113,6 +1150,9 @@ module VX_decode import
     `RUNTIME_ASSERT (~(async_fire && async_legal && (funct3 == 3'd4) && rs2[0]),
         ("%t: %s st.async 16-byte data needs an even register pair: wid=%0d PC=0x%0h rs2=x%0d (#%0d)",
             $time, INSTANCE_ID, fetch_if.data.wid, to_fullPC(fetch_if.data.PC), rs2, fetch_if.data.uuid))
+    `RUNTIME_ASSERT (~(fetch_fire && (opcode == INST_EXT3) && (funct7 == 7'd3) && (funct3 == 3'd7)),
+        ("%t: %s invalid cp.async encoding: wid=%0d PC=0x%0h instr=0x%h (#%0d)",
+            $time, INSTANCE_ID, fetch_if.data.wid, to_fullPC(fetch_if.data.PC), instr, fetch_if.data.uuid))
 `endif
 
     // Register decode_sched_if to break the long combinational path.

@@ -125,14 +125,24 @@ public:
   // with wgmma groups, per TCU block: the warp whose wait_group is satisfied.
   std::vector<SimChannel<uint32_t>> UnlockIn;
 #if defined(VX_CFG_EXT_MBAR_ENABLE) && defined(VX_CFG_TCU_WGMMA_ENABLE)
-  static constexpr uint32_t NUM_UNLOCKS = VX_CFG_NUM_LSU_BLOCKS + VX_CFG_NUM_TCU_BLOCKS;
+  static constexpr uint32_t NUM_UNLOCKS = 2 * VX_CFG_NUM_LSU_BLOCKS + VX_CFG_NUM_TCU_BLOCKS;
+#elif defined(VX_CFG_EXT_MBAR_ENABLE)
+  static constexpr uint32_t NUM_UNLOCKS = 2 * VX_CFG_NUM_LSU_BLOCKS;
 #else
+#line 130
   static constexpr uint32_t NUM_UNLOCKS = VX_CFG_NUM_LSU_BLOCKS;
 #endif
 #ifdef VX_CFG_EXT_MBAR_ENABLE
+  // Last, per LSU block: the warp whose cp.async wait_group is satisfied.
+  static constexpr uint32_t CPA_UNLOCK_BASE = NUM_UNLOCKS - VX_CFG_NUM_LSU_BLOCKS;
   // The warps the mbarrier waiter table releases, already past their stall register.
   SimChannel<WarpMask> MbarUnlockIn;
+#else
+#line 135
 #endif
+#line 134
+#else
+#line 136
 #endif
 
   Scheduler(const SimContext& ctx, const char* name, Core* core);

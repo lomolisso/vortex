@@ -158,6 +158,21 @@ module VX_mem_unit_top import VX_gpu_pkg::*; #(
     wire                         mbar_unlock_valid;
     wire [`VX_CFG_NUM_WARPS-1:0] mbar_unlock_mask;
     `UNUSED_VAR ({mbar_unlock_valid, mbar_unlock_mask})
+
+    // No cp.async unit writes.
+    VX_lsu_mem_if #(
+        .NUM_LANES (`VX_CFG_NUM_LSU_LANES),
+        .DATA_SIZE (LSU_WORD_SIZE),
+        .TAG_WIDTH (LSU_TAG_WIDTH)
+    ) cpa_lmem_if[`VX_CFG_NUM_LSU_BLOCKS]();
+    for (genvar i = 0; i < `VX_CFG_NUM_LSU_BLOCKS; ++i) begin : g_cpa_lmem_if
+        assign cpa_lmem_if[i].req_valid = 1'b0;
+        assign cpa_lmem_if[i].req_data  = '0;
+        assign cpa_lmem_if[i].rsp_ready = 1'b1;
+        `UNUSED_VAR (cpa_lmem_if[i].req_ready)
+        `UNUSED_VAR (cpa_lmem_if[i].rsp_valid)
+        `UNUSED_VAR (cpa_lmem_if[i].rsp_data)
+    end
 `endif
 
     VX_mem_unit #(
@@ -179,6 +194,7 @@ module VX_mem_unit_top import VX_gpu_pkg::*; #(
         .mbar_retire_wid   ('0),
         .mbar_unlock_valid (mbar_unlock_valid),
         .mbar_unlock_mask  (mbar_unlock_mask),
+        .cpa_lmem_if       (cpa_lmem_if),
     `endif
         .empty         (mem_unit_empty),
         .lsu_mem_if    (lsu_mem_if),

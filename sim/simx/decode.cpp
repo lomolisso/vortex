@@ -324,6 +324,17 @@ static op_string_t op_string(const Instr &instr) {
         auto a = std::get<IntrLsuArgs>(instrArgs);
         return {std::string("RED.ASYNC.") + red_names[a.red_op - 2] + ((a.width == 3) ? ".D" : ".W"), ""};
       }
+      case LsuType::CP_ASYNC: {
+        static const char* const cp_names[] = {"CP.ASYNC.4", "CP.ASYNC.8", "CP.ASYNC.16"};
+        auto a = std::get<IntrLsuArgs>(instrArgs);
+        return {cp_names[a.red_op - 2], a.offset ? to_hex_str(a.offset) : ""};
+      }
+      case LsuType::CPA_COMMIT: return {"CP.ASYNC.COMMIT_GROUP", ""};
+      case LsuType::CPA_WAIT:
+        return {"CP.ASYNC.WAIT_GROUP", std::to_string(std::get<IntrLsuArgs>(instrArgs).cpa_n)};
+      case LsuType::CPA_ARRIVE:
+        return {(std::get<IntrLsuArgs>(instrArgs).red_op == 6) ? "CP.ASYNC.MBARRIER.ARRIVE.NOINC"
+                                                                : "CP.ASYNC.MBARRIER.ARRIVE", ""};
 #ifdef VX_CFG_EXT_DXA_ENABLE
       case LsuType::PFENCE: return {"FENCE.PROXY.ASYNC", ""};
 #else
@@ -1253,6 +1264,44 @@ Instr::Ptr Decoder::decode(uint32_t code, uint64_t uuid) {
       break;
     }
   #ifdef VX_CFG_EXT_MBAR_ENABLE
+    // funct7 = 3 is cp.async: funct3 0 commit_group, 1 wait_group N (N the rs2
+    // field), 2/3/4 a 4/8/16-byte copy (rs1 the global source, rs2 the
+    // src-size register, rd the local destination, read and never written),
+    // 5 cp.async.mbarrier.arrive and 6 its .noinc form, on the mbarrier in rs1.
+    if (funct7 == 3) {
+      if (funct3 == 7) {
+        std::cerr << SimPlatform::instance().cycles() << ": " << this->name() << " invalid cp.async encoding"
+                  << ": code=0x" << std::hex << code << std::dec << " (#" << uuid << ")" << std::endl;
+        std::abort();
+      }
+      instr->set_fu_type(FUType::LSU);
+      IntrLsuArgs args{0, 0, 0};
+      args.red_op = funct3;
+      switch (funct3) {
+      case 0:
+        instr->set_op_type(LsuType::CPA_COMMIT);
+        break;
+      case 1:
+        instr->set_op_type(LsuType::CPA_WAIT);
+        args.cpa_n = rs2;
+        // the CpaUnit releases the warp once the groups are done
+        instr->set_wstall(true);
+        break;
+      case 2: case 3: case 4:
+        instr->set_op_type(LsuType::CP_ASYNC);
+        args.width = funct3;
+        instr->set_src_reg(0, rs1, RegType::Integer);
+        instr->set_src_reg(1, rs2, RegType::Integer);
+        instr->set_src_reg(2, rd, RegType::Integer);
+        break;
+      default:
+        instr->set_op_type(LsuType::CPA_ARRIVE);
+        instr->set_src_reg(0, rs1, RegType::Integer);
+        break;
+      }
+      instr->set_args(args);
+      break;
+    }
     // funct7 >= 4 is st.async / red.async, R-type: funct3 the width (2 W, 3 D,
     // 4 Q), funct5 the op, rs1 the window address, rs2 the data and rd the
     // mbarrier, which is read and never written. Q stores {x[rs2|1], x[rs2]}.

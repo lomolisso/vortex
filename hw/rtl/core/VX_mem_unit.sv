@@ -49,6 +49,8 @@ module VX_mem_unit import VX_gpu_pkg::*; #(
     input wire [`VX_CFG_NUM_LSU_BLOCKS-1:0][NW_WIDTH-1:0] mbar_retire_wid,
     output wire                                          mbar_unlock_valid,
     output wire [`VX_CFG_NUM_WARPS-1:0]                  mbar_unlock_mask,
+    // Per LSU block, the cp.async unit's writes and arrives
+    VX_lsu_mem_if.slave                                  cpa_lmem_if [`VX_CFG_NUM_LSU_BLOCKS],
 `endif
 
 `ifdef DXA_MBAR_ENABLE
@@ -150,11 +152,14 @@ module VX_mem_unit import VX_gpu_pkg::*; #(
 `ifdef DXA_MBAR_ENABLE
     // The DXA completion's complete_tx requests are one more input, after the ingress.
     localparam LMEM_DXA_COMPL_IDX = LSU_NUM_REQS + 1;
+    // Then the cp.async units' lanes, block-major.
+    localparam LMEM_CPA_IDX  = LSU_NUM_REQS + 2;
+    localparam LMEM_NUM_REQS = LMEM_CPA_IDX + LSU_NUM_REQS;
 
     VX_mem_bus_if #(
         .DATA_SIZE (LSU_WORD_SIZE),
         .TAG_WIDTH (LSU_TAG_WIDTH)
-    ) lmem_adapt_if[LSU_NUM_REQS + 2]();
+    ) lmem_adapt_if[LMEM_NUM_REQS]();
 
     VX_mem_bus_if #(
         .DATA_SIZE (LSU_WORD_SIZE),
@@ -162,6 +167,15 @@ module VX_mem_unit import VX_gpu_pkg::*; #(
     ) dxa_compl_if();
 
     `ASSIGN_VX_MEM_BUS_IF (lmem_adapt_if[LMEM_DXA_COMPL_IDX], dxa_compl_if);
+`elsif VX_CFG_EXT_MBAR_ENABLE
+    // The cp.async units' lanes, block-major, after the ingress.
+    localparam LMEM_CPA_IDX  = LSU_NUM_REQS + 1;
+    localparam LMEM_NUM_REQS = LMEM_CPA_IDX + LSU_NUM_REQS;
+
+    VX_mem_bus_if #(
+        .DATA_SIZE (LSU_WORD_SIZE),
+        .TAG_WIDTH (LSU_TAG_WIDTH)
+    ) lmem_adapt_if[LMEM_NUM_REQS]();
 `else
     VX_mem_bus_if #(
         .DATA_SIZE (LSU_WORD_SIZE),
@@ -217,6 +231,35 @@ module VX_mem_unit import VX_gpu_pkg::*; #(
             `ASSIGN_VX_MEM_BUS_IF (lmem_adapt_if[i * `VX_CFG_NUM_LSU_LANES + j], lmem_block_if[j]);
         end
     end
+
+`ifdef VX_CFG_EXT_MBAR_ENABLE
+    for (genvar i = 0; i < `VX_CFG_NUM_LSU_BLOCKS; ++i) begin : g_cpa_adapters
+
+        VX_mem_bus_if #(
+            .DATA_SIZE (LSU_WORD_SIZE),
+            .TAG_WIDTH (LSU_TAG_WIDTH)
+        ) cpa_block_if[`VX_CFG_NUM_LSU_LANES]();
+
+        VX_lsu_adapter #(
+            .NUM_LANES    (`VX_CFG_NUM_LSU_LANES),
+            .DATA_SIZE    (LSU_WORD_SIZE),
+            .TAG_WIDTH    (LSU_TAG_WIDTH),
+            .TAG_SEL_BITS (LSU_TAG_WIDTH - UUID_WIDTH),
+            .ARBITER      ("P"),
+            .REQ_OUT_BUF  (3),
+            .RSP_OUT_BUF  (0)
+        ) cpa_adapter (
+            .clk        (clk),
+            .reset      (reset),
+            .lsu_mem_if (cpa_lmem_if[i]),
+            .mem_bus_if (cpa_block_if)
+        );
+
+        for (genvar j = 0; j < `VX_CFG_NUM_LSU_LANES; ++j) begin : g_cpa_adapt_if
+            `ASSIGN_VX_MEM_BUS_IF (lmem_adapt_if[LMEM_CPA_IDX + i * `VX_CFG_NUM_LSU_LANES + j], cpa_block_if[j]);
+        end
+    end
+`endif
 
     // DMA arbiter: merge DXA writes and/or TCU reads onto single DMA port.
 
@@ -366,10 +409,13 @@ module VX_mem_unit import VX_gpu_pkg::*; #(
     VX_local_mem #(
         .INSTANCE_ID (`SFORMATF(("%s-lmem", INSTANCE_ID))),
         .SIZE        (1 << `VX_CFG_LMEM_LOG_SIZE),
-    `ifdef DXA_MBAR_ENABLE
-        .NUM_REQS    (LSU_NUM_REQS + 2),
-        .STORE_ACK_MASK ((LSU_NUM_REQS + 2)'(1) << LMEM_INGRESS_IDX),
-        .COMMIT_MASK (((LSU_NUM_REQS + 2)'(1) << LMEM_INGRESS_IDX) - (LSU_NUM_REQS + 2)'(1)),
+    `ifdef VX_CFG_EXT_MBAR_ENABLE
+        // The cp.async lanes' stores are acknowledged; they report no commits.
+        .NUM_REQS    (LMEM_NUM_REQS),
+        .STORE_ACK_MASK ((LMEM_NUM_REQS'(1) << LMEM_INGRESS_IDX)
+                       | (((LMEM_NUM_REQS'(1) << LSU_NUM_REQS) - LMEM_NUM_REQS'(1)) << LMEM_CPA_IDX)),
+        .COMMIT_MASK ((LMEM_NUM_REQS'(1) << LMEM_INGRESS_IDX) - LMEM_NUM_REQS'(1)),
+        .LOW_PRI_REQS (LSU_NUM_REQS),
     `elsif VX_CFG_EXT_DLMEM_ENABLE
         .NUM_REQS    (LSU_NUM_REQS + 1),
         .STORE_ACK_MASK ((LSU_NUM_REQS + 1)'(1) << LMEM_INGRESS_IDX),

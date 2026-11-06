@@ -42,7 +42,7 @@ module VX_amo_alu import VX_gpu_pkg::*; #(
     input  wire [63:0]  cmp,         // compare-and-swap comparand
 `ifdef VX_CFG_EXT_MBAR_ENABLE
     output wire         mbar_flip,   // the mbarrier op completed the phase
-    output wire [1:0]   mbar_err,    // {tx out of range, pending underflow}
+    output wire [3:0]   mbar_err,    // {drop to zero, noComplete completed, tx out of range, pending underflow}
 `endif
     output wire [63:0]  new_word,
     output wire [63:0]  ret_word
@@ -132,7 +132,8 @@ module VX_amo_alu import VX_gpu_pkg::*; #(
 
         // The object (sw/common/mbar_ref.h): pending[19:0] expected[39:20]
         // tx[60:40] (signed bytes) [62:61] zero phase[63]. Fields wrap at their
-        // widths, so an erroneous op still leaves a defined word.
+        // widths, so an erroneous op still leaves a defined word. An arrive's
+        // operand carries the drop (62) and noComplete (61) flags.
         localparam signed [22:0] TX_MAX = 23'sd1048575;
 
     `ifdef VX_CFG_EXT_FPAMO_ENABLE
@@ -141,32 +142,41 @@ module VX_amo_alu import VX_gpu_pkg::*; #(
         wire        is_mbar = (op >= AMO_OP_MBAR_ARRIVE);
     `endif
         wire        is_wait = (op == AMO_OP_MBAR_TEST_WAIT) || (op == AMO_OP_MBAR_TRY_WAIT);
+        wire        is_arr  = (op == AMO_OP_MBAR_ARRIVE) || (op == AMO_OP_MBAR_ARRIVE_TX);
+        wire        drop    = is_arr && rhs[62];
+        wire        nocomp  = is_arr && rhs[61];
+        // The flags are stripped before the count or the bytes are read.
+        wire [63:0] opnd    = is_arr ? {rhs[63], 2'b00, rhs[60:0]} : rhs;
         wire [19:0] pend    = old_word[19:0];
         wire [19:0] expd    = old_word[39:20];
         wire [20:0] tx      = old_word[60:40];
         wire        phase   = old_word[63];
         // A byte count of 2^21 or more cannot leave tx in range.
-        wire        big     = (| rhs[63:21]);
+        wire        big     = (| opnd[63:21]);
         wire signed [22:0] tx_o  = {{2{tx[20]}}, tx};
-        wire signed [22:0] bytes = {2'b00, rhs[20:0]};
+        wire signed [22:0] bytes = {2'b00, opnd[20:0]};
 
         reg signed [22:0] tx_n;
         reg [19:0]        pend_n;
+        reg [19:0]        arrivals;
         reg               underflow, bad_bytes;
         always @(*) begin
             tx_n      = tx_o;
             pend_n    = pend;
+            arrivals  = '0;
             underflow = 1'b0;
             bad_bytes = 1'b0;
             case (op)
             AMO_OP_MBAR_ARRIVE: begin
-                underflow = (rhs > 64'(pend));
-                pend_n    = pend - rhs[19:0];
+                underflow = (opnd > 64'(pend));
+                arrivals  = opnd[19:0];
+                pend_n    = pend - opnd[19:0];
             end
             AMO_OP_MBAR_ARRIVE_TX: begin
                 bad_bytes = big;
                 tx_n      = tx_o + bytes;
                 underflow = (pend == 20'd0);
+                arrivals  = 20'd1;
                 pend_n    = pend - 20'd1;
             end
             AMO_OP_MBAR_EXPECT_TX: begin
@@ -181,22 +191,26 @@ module VX_amo_alu import VX_gpu_pkg::*; #(
             endcase
         end
         wire tx_range = bad_bytes || (tx_n > TX_MAX) || (tx_n < -TX_MAX);
+        // A drop leaves this and every later phase with fewer expected arrivals.
+        wire        drop_zero = drop && (arrivals >= expd);
+        wire [19:0] expd_n    = drop ? (expd - arrivals) : expd;
 
         // Every writing op ends with the completion check, expect_tx included: a
-        // complete_tx may come first and leave tx negative.
+        // complete_tx may come first and leave tx negative. A completing drop
+        // reloads pending from the reduced expected count.
         wire        done   = (pend_n == 20'd0) && (tx_n[20:0] == 21'd0);
-        wire [63:0] mbar_new = {phase ^ done, 2'b00, tx_n[20:0], expd, done ? expd : pend_n};
+        wire [63:0] mbar_new = {phase ^ done, 2'b00, tx_n[20:0], expd_n, done ? expd_n : pend_n};
         wire        writes = is_mbar && ~is_wait;
 
         assign new_word  = writes ? mbar_new : (is_mbar ? old_word : rmw_new);
         assign ret_word  = (is_mbar && is_wait) ? {63'b0, phase != rhs[63]} : (is_mbar ? old_word : rmw_ret);
         assign mbar_flip = writes && done;
-        assign mbar_err  = writes ? {tx_range, underflow} : 2'b00;
+        assign mbar_err  = writes ? {drop_zero, nocomp && done, tx_range, underflow} : 4'b0000;
     end else begin : g_no_mbar
         assign new_word  = rmw_new;
         assign ret_word  = rmw_ret;
         assign mbar_flip = 1'b0;
-        assign mbar_err  = 2'b00;
+        assign mbar_err  = 4'b0000;
     end
 `else
     assign new_word = 64'(res);

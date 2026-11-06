@@ -172,6 +172,9 @@ public:
     #ifdef VX_CFG_EXT_DLMEM_ENABLE
       , LSU_NUM_REQS
     #endif
+    #ifdef VX_CFG_EXT_MBAR_ENABLE
+      , LSU_NUM_REQS
+    #endif
     #ifdef DXA_MBAR_ENABLE
       , LMEM_DXA_COMPL_PORT
       , LMEM_DXA_ROW_PORT
@@ -376,6 +379,26 @@ public:
         lsu->MbarRetireOut.at(b).bind(&mbar_waiters_->RetireIn.at(b));
       }
       mbar_waiters_->UnlockOut.bind(&scheduler_->MbarUnlockIn);
+      // Per LSU block, after the LSU: the cp.async unit takes the block's issue
+      // events and responses in their cycle; its writer's adapter follows it.
+      for (uint32_t b = 0; b < VX_CFG_NUM_LSU_BLOCKS; ++b) {
+        snprintf(sname, 100, "%s-cpa%d", name.c_str(), b);
+        auto cpa = CpaUnit::Create(sname, b);
+        cpa_units_.push_back(cpa);
+        snprintf(sname, 100, "%s-cpa_adapter%d", name.c_str(), b);
+        auto adapter = LsuMemAdapter::Create(sname, LSU_CHANNELS, 1);
+        lsu->CpaIssueOut.at(b).bind(&cpa->IssueIn);
+        lsu->CpaRspOut.at(b).bind(&cpa->RspIn);
+        cpa->StatusOut.bind(&lsu->CpaStatusIn.at(b));
+        cpa->UnlockOut.bind(&scheduler_->UnlockIn.at(Scheduler::CPA_UNLOCK_BASE + b));
+        cpa->ReqOut.bind(&adapter->ReqIn);
+        adapter->RspOut.bind(&cpa->AckIn);
+        for (uint32_t c = 0; c < LSU_CHANNELS; ++c) {
+          const uint32_t port = lmem_num_reqs + b * LSU_CHANNELS + c;
+          adapter->ReqOut.at(c).bind(&local_mem_->Inputs.at(port));
+          local_mem_->Outputs.at(port).bind(&adapter->RspIn.at(c));
+        }
+      }
     #endif
     #ifdef DXA_MBAR_ENABLE
       for (uint32_t b = 0; b < VX_CFG_NUM_LSU_BLOCKS; ++b) {
@@ -1000,6 +1023,19 @@ public:
       return true;
     }
   #endif
+  #ifdef VX_CFG_EXT_MBAR_ENABLE
+    // cp.async work a warp left behind holds the core, as an exit waits for it.
+    for (uint32_t w = 0; w < VX_CFG_NUM_WARPS; ++w) {
+      if (!this->cpa_idle(w))
+        return true;
+    }
+  #elif defined(VX_CFG_EXT_DLMEM_ENABLE) && defined(VX_CFG_EXT_DXA_ENABLE)
+  #line 967
+  #elif defined(VX_CFG_EXT_DLMEM_ENABLE)
+  #line 946
+  #else
+  #line 880
+  #endif
   #ifdef VX_CFG_VM_ENABLE
     // Parked translations hold no in-flight channel packet, so they are
     // invisible to SimPlatform::idle(); completion must wait for them.
@@ -1218,6 +1254,21 @@ public:
   SimChannel<uint32_t>& dlmem_ack_in() { return dlmem_wtrack_->DecIn; }
   SimChannel<uint32_t>& dlmem_done_in() { return dlmem_wtrack_->DoneIn; }
 #endif
+#ifdef VX_CFG_EXT_MBAR_ENABLE
+  bool cpa_idle(uint32_t wid) const {
+    for (auto& cpa : cpa_units_) {
+      if (!cpa->idle(wid))
+        return false;
+    }
+    return true;
+  }
+#elif defined(VX_CFG_EXT_DLMEM_ENABLE) && defined(VX_CFG_EXT_DXA_ENABLE)
+#line 1185
+#elif defined(VX_CFG_EXT_DLMEM_ENABLE)
+#line 1164
+#else
+#line 1098
+#endif
 
 #ifdef VX_CFG_VM_ENABLE
   // Device satp (from the DCR, via Cluster::set_mmu_satp) fans out to both
@@ -1317,6 +1368,9 @@ private:
   WarpMask active_warps_;
 #ifdef VX_CFG_EXT_MBAR_ENABLE
   MbarWaiterTable::Ptr mbar_waiters_;
+  std::vector<CpaUnit::Ptr> cpa_units_;
+#else
+#line 1289
 #endif
 #else
 #line 1245
@@ -1516,6 +1570,20 @@ SimChannel<uint32_t>& Core::dlmem_ack_in() {
 SimChannel<uint32_t>& Core::dlmem_done_in() {
   return impl_->dlmem_done_in();
 }
+#endif
+#ifdef VX_CFG_EXT_MBAR_ENABLE
+
+bool Core::cpa_idle(uint32_t wid) const {
+  return impl_->cpa_idle(wid);
+}
+#elif defined(VX_CFG_EXT_DLMEM_ENABLE) && defined(VX_CFG_EXT_DXA_ENABLE)
+#line 1482
+#elif defined(VX_CFG_EXT_DLMEM_ENABLE)
+#line 1451
+#elif defined(VX_CFG_EXT_DXA_ENABLE)
+#line 1430
+#else
+#line 1422
 #endif
 
 #ifdef VX_CFG_VM_ENABLE

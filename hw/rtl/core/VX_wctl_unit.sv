@@ -208,9 +208,18 @@ module VX_wctl_unit import VX_gpu_pkg::*; #(
     wire bar_drain = execute_if.valid && is_bar && (!warp_ctl_if.lsu_sched_drained || !wid_drained);
 
     // A committed store can still sit uncounted in the LSU or its translation stage.
+`ifdef VX_CFG_EXT_MBAR_ENABLE
+    // Nor may a warp leave cp.async copies or an arrive behind: its block's
+    // local memory could be handed to the next block before they land.
+    wire exit_drain = execute_if.valid && is_tmc && execute_if.data.header.eop
+                   && (rs1_data[`VX_CFG_NUM_THREADS-1:0] == '0)
+                   && (!warp_ctl_if.lsu_sched_drained || !wid_drained
+                    || !warp_ctl_if.cpa_idle[execute_if.data.header.wid]);
+`else
     wire exit_drain = execute_if.valid && is_tmc && execute_if.data.header.eop
                    && (rs1_data[`VX_CFG_NUM_THREADS-1:0] == '0)
                    && (!warp_ctl_if.lsu_sched_drained || !wid_drained);
+`endif
 `else
     // BAR (vx_barrier or vx_barrier_arrive) drains LSU before continuing.
     wire bar_drain = execute_if.valid && is_bar && !warp_ctl_if.lsu_sched_drained;

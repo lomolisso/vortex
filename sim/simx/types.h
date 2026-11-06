@@ -414,6 +414,12 @@ enum class LsuType {
   // completes on that block's mbarrier, which the instruction names in rd.
   , ST_ASYNC
   , RED_ASYNC
+  // cp.async: a copy uop reads global memory and the block's CpaUnit writes
+  // the local memory; commit_group, wait_group and the arrive retire at issue.
+  , CP_ASYNC
+  , CPA_COMMIT
+  , CPA_WAIT
+  , CPA_ARRIVE
 #ifdef VX_CFG_EXT_DXA_ENABLE
   // fence.proxy.async: the warp's earlier local-memory stores are committed
   // and its remote ones acknowledged before a later DXA copy reads them.
@@ -434,7 +440,8 @@ struct IntrLsuArgs {
   uint32_t stride : 4;  // per-uop multiplier: 0 = regular LD/ST; 0..N-1 = packLD uop_idx
   int32_t  offset;      // immediate addr offset (signed); 0 for packLD uops
 #ifdef VX_CFG_EXT_MBAR_ENABLE
-  uint32_t red_op = 0;  // red.async: the op's funct5; a default keeps {w, s, off} initialisers complete
+  uint32_t red_op = 0;  // red.async: the op's funct5, cp.async: its funct3; a default keeps {w, s, off} initialisers complete
+  uint32_t cpa_n  = 0;  // cp.async.wait_group: the groups that may stay pending
 #elif defined(VX_CFG_EXT_DLMEM_ENABLE)
 #line 389
 #else
@@ -452,6 +459,10 @@ inline std::ostream &operator<<(std::ostream &os, const LsuType& type) {
 #ifdef VX_CFG_EXT_MBAR_ENABLE
   case LsuType::ST_ASYNC:  os << "ST_ASYNC"; break;
   case LsuType::RED_ASYNC: os << "RED_ASYNC"; break;
+  case LsuType::CP_ASYNC:   os << "CP_ASYNC"; break;
+  case LsuType::CPA_COMMIT: os << "CPA_COMMIT"; break;
+  case LsuType::CPA_WAIT:   os << "CPA_WAIT"; break;
+  case LsuType::CPA_ARRIVE: os << "CPA_ARRIVE"; break;
 #ifdef VX_CFG_EXT_DXA_ENABLE
   case LsuType::PFENCE:    os << "PFENCE"; break;
 #else

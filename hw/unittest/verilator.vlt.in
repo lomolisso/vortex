@@ -7,3 +7,6 @@ lint_off -file "@VORTEX_HOME@/third_party/cvfpu/*"
 lint_off -rule BLKANDNBLK -file "@VORTEX_HOME@/third_party/hardfloat/*"
 lint_off -rule UNOPTFLAT -file "@VORTEX_HOME@/third_party/hardfloat/*"
 lint_off -file "@VORTEX_HOME@/third_party/hardfloat/*"
+
+// The DXA unit, which reads these constants, sits outside the unit-test tops.
+lint_off -rule UNUSEDPARAM -file "@VORTEX_HOME@/hw/rtl/dxa/VX_dxa_pkg.sv"

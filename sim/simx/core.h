@@ -201,6 +201,15 @@ public:
   SimChannel<uint32_t>& dlmem_ack_in();
   SimChannel<uint32_t>& dlmem_done_in();
 #endif
+#ifdef VX_CFG_EXT_MBAR_ENABLE
+
+  // No cp.async copy or arrive of the warp left in its block's unit.
+  bool cpa_idle(uint32_t wid) const;
+#elif defined(VX_CFG_EXT_DXA_ENABLE)
+#line 182
+#else
+#line 177
+#endif
 
   ProcessorImpl* processor() const;
 

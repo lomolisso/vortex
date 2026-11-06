@@ -20,7 +20,9 @@
 // The CFENCE uop reads no register and writes none; with TCU metadata it waits
 // for the metadata scoreboard bits, so earlier TCU_LD loads are ordered too.
 // The same pair splits a 16-byte st.async into its two 8-byte halves, low then
-// high, each completing its own 8 bytes on the mbarrier.
+// high, each completing its own 8 bytes on the mbarrier, and a 16-byte cp.async
+// into its two 8-byte copies, low then high, each taking its share of the
+// src-size in the LSU.
 
 module VX_uop_release import VX_gpu_pkg::*; (
     input  ibuffer_t ibuf_in,
@@ -41,10 +43,11 @@ module VX_uop_release import VX_gpu_pkg::*; (
 
 `ifdef VX_CFG_EXT_MBAR_ENABLE
     // A plain store with the reserved funct3=4 also decodes to op_type 4'b1100.
-    wire is_sq = (ibuf_in.ex_type == EX_LSU)
+    wire is_q  = (ibuf_in.ex_type == EX_LSU)
               && ibuf_in.op_args.lsu.is_async
               && (ibuf_in.op_type == INST_OP_BITS'(INST_LSU_SQ));
-    assign is_release = is_rl_amo || is_bar || is_sq;
+    wire is_sq = is_q && ibuf_in.op_args.lsu.is_store;
+    assign is_release = is_rl_amo || is_bar || is_q;
 `else
     assign is_release = is_rl_amo || is_bar;
 `endif
@@ -78,20 +81,23 @@ module VX_uop_release import VX_gpu_pkg::*; (
     end
 
 `ifdef VX_CFG_EXT_MBAR_ENABLE
-    // The high half's data is the odd register of the pair; x0 stands for a zero pair.
+    // The high st.async half's data is the odd register of the pair; x0 stands
+    // for a zero pair. Both cp.async halves read the same src-size register.
     ibuffer_t sq_lo, sq_hi;
     always_comb begin
         sq_lo = ibuf_in;
         sq_lo.uuid    = get_uop_uuid(ibuf_in.uuid, UOP_CTR_W'(0));
-        sq_lo.op_type = INST_OP_BITS'(INST_LSU_SD);
+        sq_lo.op_type = is_sq ? INST_OP_BITS'(INST_LSU_SD) : INST_OP_BITS'(INST_LSU_CPA16H);
         sq_hi = ibuf_in;
         sq_hi.uuid    = get_uop_uuid(ibuf_in.uuid, UOP_CTR_W'(1));
-        sq_hi.op_type = INST_OP_BITS'(INST_LSU_SD);
+        sq_hi.op_type = is_sq ? INST_OP_BITS'(INST_LSU_SD) : INST_OP_BITS'(INST_LSU_CPA16H);
         sq_hi.op_args.lsu.offset = 12'd8;
-        sq_hi.rs2     = ibuf_in.rs2 | NUM_REGS_BITS'(ibuf_in.rs2 != '0);
+        if (is_sq) begin
+            sq_hi.rs2 = ibuf_in.rs2 | NUM_REGS_BITS'(ibuf_in.rs2 != '0);
+        end
     end
-    assign ibuf_cfence = is_sq ? sq_lo : cfence;
-    assign ibuf_op     = is_sq ? sq_hi : op;
+    assign ibuf_cfence = is_q ? sq_lo : cfence;
+    assign ibuf_op     = is_q ? sq_hi : op;
 `else
     assign ibuf_op = op;
 `endif

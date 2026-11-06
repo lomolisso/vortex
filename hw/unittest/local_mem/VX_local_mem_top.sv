@@ -89,6 +89,20 @@ module VX_local_mem_top import VX_gpu_pkg::*; #(
     output wire [NUM_BANKS-1:0][BANK_ADDR_WIDTH-1:0] mbar_evt_row,
 `endif
 
+`ifdef VX_CFG_EXT_MBAR_ENABLE
+    // One more store-acknowledging input behind its own crossbar, as the
+    // cp.async units use them (LOW_PRI_REQS)
+    input  wire                                low_req_valid,
+    input  wire [ADDR_WIDTH-1:0]               low_req_addr,
+    input  wire [WORD_SIZE-1:0]                low_req_byteen,
+    input  wire [WORD_WIDTH-1:0]               low_req_data,
+    input  wire [TAG_VALUE_WIDTH-1:0]          low_req_tag,
+    output wire                                low_req_ready,
+    output wire                                low_rsp_valid,
+    output wire [TAG_VALUE_WIDTH-1:0]          low_rsp_tag,
+    input  wire                                low_rsp_ready,
+`endif
+
     // DMA request: one row of NUM_BANKS words at a bank address
     input  wire                                dma_req_valid,
     input  wire                                dma_req_rw,
@@ -111,11 +125,17 @@ module VX_local_mem_top import VX_gpu_pkg::*; #(
     `STATIC_ASSERT (HART_ID_WIDTH <= HART_IN_WIDTH,
         ("local_mem_top: hart id is %0d bits, the testbench packs %0d", HART_ID_WIDTH, HART_IN_WIDTH))
 
+`ifdef VX_CFG_EXT_MBAR_ENABLE
+    localparam NUM_ALL = NUM_REQS + 1;
+`else
+    localparam NUM_ALL = NUM_REQS;
+`endif
+
     VX_mem_bus_if #(
         .DATA_SIZE (WORD_SIZE),
         .TAG_WIDTH (TAG_WIDTH),
         .ADDR_WIDTH(ADDR_WIDTH)
-    ) lsu_bus_if[NUM_REQS]();
+    ) lsu_bus_if[NUM_ALL]();
 
     VX_mem_bus_if #(
         .DATA_SIZE (ROW_SIZE),
@@ -165,6 +185,22 @@ module VX_local_mem_top import VX_gpu_pkg::*; #(
         `UNUSED_VAR (lsu_bus_if[i].rsp_data.tag.uuid)
     end
 
+`ifdef VX_CFG_EXT_MBAR_ENABLE
+    assign lsu_bus_if[NUM_REQS].req_valid       = low_req_valid;
+    assign lsu_bus_if[NUM_REQS].req_data.rw     = 1'b1;
+    assign lsu_bus_if[NUM_REQS].req_data.byteen = low_req_byteen;
+    assign lsu_bus_if[NUM_REQS].req_data.addr   = low_req_addr;
+    assign lsu_bus_if[NUM_REQS].req_data.attr   = '0;
+    assign lsu_bus_if[NUM_REQS].req_data.data   = low_req_data;
+    assign lsu_bus_if[NUM_REQS].req_data.tag    = TAG_WIDTH'(low_req_tag);
+    assign low_req_ready = lsu_bus_if[NUM_REQS].req_ready;
+    assign low_rsp_valid = lsu_bus_if[NUM_REQS].rsp_valid;
+    assign low_rsp_tag   = lsu_bus_if[NUM_REQS].rsp_data.tag.value;
+    assign lsu_bus_if[NUM_REQS].rsp_ready = low_rsp_ready;
+    `UNUSED_VAR (lsu_bus_if[NUM_REQS].rsp_data.data)
+    `UNUSED_VAR (lsu_bus_if[NUM_REQS].rsp_data.tag.uuid)
+`endif
+
     // DMA port
     assign dma_bus_if.req_valid       = dma_req_valid;
     assign dma_bus_if.req_data.rw     = dma_req_rw;
@@ -197,7 +233,7 @@ module VX_local_mem_top import VX_gpu_pkg::*; #(
     VX_local_mem #(
         .INSTANCE_ID  (INSTANCE_ID),
         .SIZE         (SIZE),
-        .NUM_REQS     (NUM_REQS),
+        .NUM_REQS     (NUM_ALL),
         .NUM_BANKS    (NUM_BANKS),
         .WORD_SIZE    (WORD_SIZE),
         .ADDR_WIDTH   (ADDR_WIDTH),
@@ -205,7 +241,11 @@ module VX_local_mem_top import VX_gpu_pkg::*; #(
         .DMA_ENABLE   (1),
         .DMA_TAG_WIDTH(DMA_TAG_WIDTH),
         .AMO_ENABLE   (`VX_CFG_EXT_A_ENABLED),
-    `ifdef VX_CFG_EXT_DLMEM_ENABLE
+    `ifdef VX_CFG_EXT_MBAR_ENABLE
+        .STORE_ACK_MASK (NUM_ALL'(3) << (NUM_REQS - 1)),
+        .COMMIT_MASK  ((NUM_ALL'(1) << (NUM_REQS - 1)) - NUM_ALL'(1)),
+        .LOW_PRI_REQS (1),
+    `elsif VX_CFG_EXT_DLMEM_ENABLE
         .STORE_ACK_MASK (NUM_REQS'(1) << (NUM_REQS - 1)),
         .COMMIT_MASK  ((NUM_REQS'(1) << (NUM_REQS - 1)) - NUM_REQS'(1)),
     `endif

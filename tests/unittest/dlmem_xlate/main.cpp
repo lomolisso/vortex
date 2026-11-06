@@ -1891,6 +1891,25 @@ void run_abort() {
     bad.amo_rl = (c.op == MemOp::MBAR_ARRIVE || c.op == MemOp::MBAR_ARRIVE_TX);
     run_abort_case(c.name, two, bad, c.abort_on_remote, !c.expect.empty(), c.expect, c.want_wt);
   }
+  // Rank 1 is another block on this core (slot 1): a wait on its window address
+  // aborts like a remote one, while the issuer's own window address and an
+  // arrive into the peer stay legal.
+  const dlmem_ref::Row same{2, {{0, 2}, {0, 1}}};
+  const uint64_t peer = db + sram + 0x40;
+  const MbarCase scases[] = {
+    {"mbar-samecore-wait", MemOp::MBAR_TEST_WAIT, peer, peer + 8, false, 0,
+     std::string(mbar_ref::MSG_REMOTE) + ": wid=2 cta=2 lane=0 addr=" + hex(peer) + " core=0 (#8)"},
+    {"mbar-samecore-trywait-lane1", MemOp::MBAR_TRY_WAIT, db + 0x40, peer + 8, true, 0,
+     std::string(mbar_ref::MSG_REMOTE) + ": wid=2 cta=2 lane=1 addr=" + hex(peer + 8) + " core=0 (#8)"},
+    {"mbar-self-window-wait", MemOp::MBAR_TRY_WAIT, db + 0x40, cfg.lmem_base + 0x48, true, 0, ""},
+    {"mbar-samecore-arrive", MemOp::MBAR_ARRIVE, peer, peer + 8, true, 0, ""},
+  };
+  for (auto& c : scases) {
+    LsuReq bad = window_req(8, 2, c.addr0, c.op);
+    bad.addrs[1] = c.addr1;
+    bad.amo_rl = (c.op == MemOp::MBAR_ARRIVE);
+    run_abort_case(c.name, same, bad, c.abort_on_remote, !c.expect.empty(), c.expect, c.want_wt);
+  }
 #endif
 }
 

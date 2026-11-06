@@ -35,6 +35,12 @@ RTL_PKGS += $(RTL_DIR)/dlmem/VX_dlmem_pkg.sv
 RTL_INCLUDE += -I$(RTL_DIR)/dlmem
 endif
 
+# DXA builds import the bulk-copy package.
+ifneq (,$(filter -DVX_CFG_EXT_DXA_ENABLE,$(CONFIGS)))
+RTL_PKGS += $(RTL_DIR)/dxa/VX_dxa_pkg.sv
+RTL_INCLUDE += -I$(RTL_DIR)/dxa
+endif
+
 TOP := VX_core_top
 
 include ../common.mk

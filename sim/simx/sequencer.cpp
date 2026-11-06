@@ -80,21 +80,24 @@ instr_trace_t* Sequencer::make_cfence(instr_trace_t* trace) {
 #ifdef VX_CFG_EXT_MBAR_ENABLE
 bool Sequencer::is_async_q(const instr_trace_t* trace) {
   auto type = std::get_if<LsuType>(&trace->op_type);
-  return type && *type == LsuType::ST_ASYNC
+  return type && (*type == LsuType::ST_ASYNC || *type == LsuType::CP_ASYNC)
       && std::get<IntrLsuArgs>(trace->instr_ptr->get_args()).width == 4;
 }
 
 // The low half is a new trace, an 8-byte st.async of x[rs2] at offset 0. The
-// instruction's own trace becomes the high half: x[rs2|1] at offset 8.
+// instruction's own trace becomes the high half: x[rs2|1] at offset 8. A
+// cp.async keeps rs2, its src-size, and its funct3, which tells the LSU each
+// half's share of it; offset 8 applies to its source and destination.
 instr_trace_t* Sequencer::split_q(instr_trace_t* trace) {
   uint64_t uuid = trace->uuid;
   // The low half gets uop index 0 in bits [31:24], as the RTL get_uop_uuid; the high
   // half keeps the instruction's uuid, where the RTL writes uop index 1.
   uint64_t uop_uuid = uuid & ~uint64_t(0xff000000);
   auto& q = *trace->instr_ptr;
+  const LsuType type = std::get<LsuType>(trace->op_type);
   auto instr = std::allocate_shared<Instr>(instr_pool_, uop_uuid, FUType::LSU);
   instr->set_parent_uuid(uuid);
-  instr->set_op_type(LsuType::ST_ASYNC);
+  instr->set_op_type(type);
   IntrLsuArgs args = std::get<IntrLsuArgs>(q.get_args());
   args.width  = 3;
   args.offset = 0;
@@ -113,13 +116,13 @@ instr_trace_t* Sequencer::split_q(instr_trace_t* trace) {
   uop->tmask     = trace->tmask;
   uop->instr_ptr = instr;
   uop->fu_type   = FUType::LSU;
-  uop->op_type   = LsuType::ST_ASYNC;
+  uop->op_type   = type;
   uop->src_regs  = trace->src_regs;
 
   args.offset = 8;
   q.set_args(args);
   auto rs2 = q.get_src_reg(1);
-  if (rs2.idx != 0) {
+  if (type == LsuType::ST_ASYNC && rs2.idx != 0) {
     rs2.idx |= 1;
     q.set_src_reg(1, rs2.idx, rs2.type);
     trace->src_regs[1] = rs2;

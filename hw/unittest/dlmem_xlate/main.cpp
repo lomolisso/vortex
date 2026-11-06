@@ -55,9 +55,10 @@
 // remote, at the peer's address, opcode unchanged, counted by the remote-access
 // tracker; a release arrive is held behind its warp's unacknowledged remote
 // store, a relaxed one is not.
-// --mode=mbar-global / --mode=mbar-remote-wait / --mode=mbar-remote-trywait:
-// an arrive on a global lane, or a wait on a remote lane; the stage's assert
-// must abort the run.
+// --mode=mbar-global / --mode=mbar-remote-wait / --mode=mbar-remote-trywait /
+// --mode=mbar-samecore-wait: an arrive on a global lane, a wait on a remote
+// lane, or a wait on the window address of another block of the same core;
+// the stage's assert must abort the run.
 // --mode=all: directed, random, sched, fence, then rl (and mbar).
 
 #include "vl_simulator.h"
@@ -397,6 +398,9 @@ public:
     }
     if (opts_.mode == "mbar-remote-wait" || opts_.mode == "mbar-remote-trywait") {
       this->run_mbar_neg(true, opts_.mode == "mbar-remote-wait" ? kMbarTestWait : kMbarTestWait + 1);
+    }
+    if (opts_.mode == "mbar-samecore-wait") {
+      this->run_mbar_samecore_wait();
     }
     if (failures_ != 0) {
       std::printf("FAILED: %u check(s) failed\n", failures_);
@@ -1944,6 +1948,31 @@ private:
   #endif
   }
 
+  // A wait on rank 1 of a row whose rank 1 is another slot of this core: the
+  // lane stays local, and the stage's assert must abort.
+  void run_mbar_samecore_wait() {
+  #ifdef VX_CFG_EXT_MBAR_ENABLE
+    TblRow r;
+    r.k = 2;
+    r.peers.assign(maxc_, ref::Peer{my_core_, 0});
+    r.peers[1] = ref::Peer{my_core_, 1};
+    wr_stride_ = 64;
+    wr_ = std::make_pair(0u, r);
+    this->clock();
+    Request q = this->fence_req(0, false, false, cfg_.dlmem_base + (uint64_t(1) << lmem_log_) + 8);
+    for (auto& at : q.attr) {
+      set_bits(at, attr_local_pos_, 1, 0);
+    }
+    this->mark_mbar(q, kMbarTestWait);
+    std::printf("mbar: issuing a wait on another block of the same core; the stage's assert must abort here\n");
+    std::fflush(stdout);
+    this->offer_all({q}, 6);
+    this->fail("the wait on another block of the same core did not abort the run");
+  #else
+    this->fail("mbar modes need an mbarrier build");
+  #endif
+  }
+
   ///////////////////////////////////////////////////////////////////////////
 
   static constexpr uint32_t kAttrAmoValid = 4;   // MEM_ATTR_AMO_OFFS
@@ -2045,7 +2074,7 @@ private:
 
 static void usage(const char* prog) {
   std::printf("usage: %s [--mode=all|directed|random|sched|oob|remote|fence|rl|mbar|mbar-global|mbar-remote|"
-              "mbar-remote-wait|mbar-remote-trywait] [--seed=N] [--launches=N] [--cycles=N] [--watchdog=N] "
+              "mbar-remote-wait|mbar-remote-trywait|mbar-samecore-wait] [--seed=N] [--launches=N] [--cycles=N] [--watchdog=N] "
               "[--no-oob]\n", prog);
 }
 
@@ -2080,7 +2109,8 @@ int main(int argc, char** argv) {
   if (opts.mode != "all" && opts.mode != "directed" && opts.mode != "random" && opts.mode != "sched"
    && opts.mode != "oob" && opts.mode != "remote" && opts.mode != "fence" && opts.mode != "rl"
    && opts.mode != "mbar" && opts.mode != "mbar-global" && opts.mode != "mbar-remote"
-   && opts.mode != "mbar-remote-wait" && opts.mode != "mbar-remote-trywait") {
+   && opts.mode != "mbar-remote-wait" && opts.mode != "mbar-remote-trywait"
+   && opts.mode != "mbar-samecore-wait") {
     usage(argv[0]);
     return 2;
   }

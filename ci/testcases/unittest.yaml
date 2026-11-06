@@ -24,7 +24,9 @@ tests:
   # off: load/store/DMA only). The `hw` lane only builds local_mem without atomics.
   # Then the LSU's global/local switch at 1, 2 and 4 LSU lanes: every request
   # reaches each side it has lanes on exactly once, under independent back-pressure.
-  # At XLEN 64 also the mbarrier banks and the mbarrier waiter table.
+  # At XLEN 64 also the mbarrier banks (with the arrive_drop / noComplete
+  # operand flags against mbar_ref and their asserts, and the cp.async inputs
+  # sharing each bank round-robin) and the mbarrier waiter table.
   - id: hw-lmem
     via: script
     run: "make -C hw/unittest run-lmem"
@@ -32,7 +34,16 @@ tests:
               hw/rtl/VX_gpu_pkg.sv, hw/rtl/VX_define.vh, hw/rtl/core/VX_mem_unit.sv,
               hw/unittest/local_mem, hw/unittest/lmem_switch, hw/unittest/mem_unit,
               hw/unittest/Makefile, sw/common/mbar_ref.h, hw/rtl/dlmem/VX_mbar_waiters.sv,
-              hw/unittest/mbar_waiters]
+              hw/unittest/mbar_waiters, hw/rtl/mem/VX_local_mem.sv, hw/rtl/core/VX_lsu_slice.sv]
+  # The cp.async completion unit (RV64, mbarriers): per-warp completion FIFO
+  # full, out-of-order store acks, group boundaries and wait_group, the
+  # mbarrier arrive only after the data, and zero fill, over five warp,
+  # thread and LSU-lane shapes and two seeds each.
+  - id: hw-cpa-unit
+    via: script
+    xlen: [64]
+    run: "make -C hw/unittest run-cpa-unit"
+    touches: [hw/rtl/core/VX_cpa_unit.sv, hw/unittest/cpa_unit, hw/rtl/VX_gpu_pkg.sv, hw/unittest/Makefile]
   # CTA dispatcher and KMU: slot placement across launches, each launch opening
   # at slot 0 as SimX's does, with 4 and 8 CTA slots. In the xlen-64 tree the
   # same benches also run in DLMEM builds: the cluster rank on every launch beat
@@ -118,6 +129,15 @@ tests:
     via: script
     run: "make -C tests/unittest/amo_ref run"
     touches: [sw/common/amo_ref.h, tests/unittest/amo_ref, tests/regression/atomic_fp/probe_csv.h]
+  # The mbarrier golden model: the H100 scripts of the semantics probe
+  # replayed through mbar_ref, every pending count and test_wait
+  # result equal to the H100's; then arrive_drop and noComplete at their edges
+  # and their two errors.
+  - id: sw-mbar-ref
+    via: script
+    run: "make -C tests/unittest/mbar_ref run"
+    touches: [sw/common/mbar_ref.h, tests/unittest/mbar_ref, tests/regression/mbar_ops/scripts.h,
+              tests/regression/mbar_ops/common.h]
   # The SimX twin of the line reader at 4, 8 and 16 banks.
   - id: sw-dxa-bulk
     via: script

@@ -115,6 +115,7 @@ module VX_core_top import VX_gpu_pkg::*;
 
     // VX_core is master on dxa_req_bus_if; tie off the slave side here.
     assign dxa_req_bus_if.req_ready = 1'b1;
+    `UNUSED_VAR ({dxa_req_bus_if.req_valid, dxa_req_bus_if.req_data})
 
     assign dxa_lmem_bus_if.req_valid = 1'b0;
     assign dxa_lmem_bus_if.req_data  = '0;

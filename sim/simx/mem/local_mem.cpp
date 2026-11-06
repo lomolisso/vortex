@@ -65,6 +65,64 @@ protected:
 #ifdef VX_CFG_EXT_MBAR_ENABLE
 	// Per bank, the cycle the last mbarrier event lands.
 	std::vector<uint64_t> evt_due_;
+	// The cp.async writers' ports have their own round-robin per bank; a final
+	// two-input round-robin per bank picks between it and the other ports'.
+	MemCrossBar::Ptr      cpa_xbar_;
+	std::vector<bool>     cpa_pick_;   // this cycle, the bank took its request from cpa_xbar_
+	std::vector<bool>     cpa_last_;   // the final round-robin's last grant was cpa_xbar_'s
+	std::vector<bool>     picked_;
+	std::vector<uint64_t> pick_size_;
+
+	// Whether the bank takes its request this cycle from the cp.async ports. A
+	// bank that is `held` (a bulk DMA access) takes none from them, and a DMA
+	// request, which the RTL's DMA port serves past the two-input round-robin,
+	// goes first.
+	bool cpa_turn(uint32_t i, bool held) const {
+		if (!cpa_xbar_ || held)
+			return false;
+		const auto& main = mem_xbar_->ReqOut.at(i);
+		const auto& other = cpa_xbar_->ReqOut.at(i);
+		if (other.empty())
+			return false;
+		if (main.empty())
+			return true;
+		return !main.peek().flags.dma && !cpa_last_[i];
+	}
+
+	// The request the bank would start this cycle, if any.
+	const MemReq* bank_head(uint32_t i, bool held) const {
+		const auto& q = this->cpa_turn(i, held) ? cpa_xbar_->ReqOut.at(i) : mem_xbar_->ReqOut.at(i);
+		return q.empty() ? nullptr : &q.peek();
+	}
+
+	// The bank's request this cycle; only a grant of the two-input round-robin
+	// moves it, not a DMA request.
+	SimChannel<MemReq>& bank_queue(uint32_t i, bool held) {
+		auto& main = mem_xbar_->ReqOut.at(i);
+		const bool cpa = this->cpa_turn(i, held);
+		cpa_pick_[i] = cpa;
+		auto& q = cpa ? cpa_xbar_->ReqOut.at(i) : main;
+		picked_[i] = !q.empty() && !q.peek().flags.dma;
+		pick_size_[i] = q.size();
+		return q;
+	}
+
+	SimChannel<MemRsp>& bank_rsp(uint32_t i) {
+		return cpa_pick_[i] ? cpa_xbar_->RspIn.at(i) : mem_xbar_->RspIn.at(i);
+	}
+
+	// A grant the bank took moves the final round-robin.
+	void cpa_rr_update(uint32_t num_banks) {
+		for (uint32_t i = 0; i < num_banks; ++i) {
+			if (!picked_[i])
+				continue;
+			picked_[i] = false;
+			auto& q = cpa_pick_[i] ? cpa_xbar_->ReqOut.at(i) : mem_xbar_->ReqOut.at(i);
+			if (q.size() < pick_size_[i]) {
+				cpa_last_[i] = cpa_pick_[i];
+			}
+		}
+	}
 #else
 #line 64
 #endif
@@ -140,6 +198,28 @@ public:
 #else
 #line 124
 #endif
+#ifdef VX_CFG_EXT_MBAR_ENABLE
+		cpa_pick_.assign(num_banks, false);
+		cpa_last_.assign(num_banks, true);
+		picked_.assign(num_banks, false);
+		pick_size_.assign(num_banks, 0);
+		if (config.cpa_ports != 0) {
+			snprintf(sname, 100, "%s-cpa_xbar", simobject->name().c_str());
+			cpa_xbar_ = MemCrossBar::Create(sname, ArbiterType::RoundRobin, ArbiterType::Priority,
+			 config.cpa_ports, num_banks,
+			 [lg2_line_size, num_banks](const MemCrossBar::ReqType& req) {
+				return (uint32_t)((req.addr >> lg2_line_size) & (num_banks-1));
+			});
+			for (uint32_t k = 0; k < config.cpa_ports; ++k) {
+				simobject->Inputs.at(config.num_reqs + k).bind(&cpa_xbar_->ReqIn.at(k));
+				cpa_xbar_->RspOut.at(k).bind(&simobject->Outputs.at(config.num_reqs + k));
+			}
+		}
+#elif defined(VX_CFG_EXT_DXA_ENABLE)
+#line 129
+#else
+#line 124
+#endif
 	}
 
 	virtual ~Impl() {}
@@ -157,6 +237,9 @@ public:
 #endif
 #ifdef VX_CFG_EXT_MBAR_ENABLE
 		std::fill(evt_due_.begin(), evt_due_.end(), 0);
+		std::fill(cpa_pick_.begin(), cpa_pick_.end(), false);
+		std::fill(cpa_last_.begin(), cpa_last_.end(), true);
+		std::fill(picked_.begin(), picked_.end(), false);
 #else
 #line 139
 #endif
@@ -410,8 +493,8 @@ private:
 		const uint32_t bank = uint32_t(req.addr >> log2ceil(config_.line_size)) & ((1u << config_.B) - 1);
 		if (amo_busy_[bank] != 0)
 			return amo_busy_[bank] > 1;
-		const auto& queue = mem_xbar_->ReqOut.at(bank);
-		return !queue.empty() && (memop_is_atomic(queue.peek().op) || memop_is_mbar(queue.peek().op));
+		const MemReq* head = this->bank_head(bank, (bulk_hold_ >> bank) & 1);
+		return head && (memop_is_atomic(head->op) || memop_is_mbar(head->op));
 	}
 
 	const std::vector<SimChannel<MemReq>>* dxa_inputs_ = nullptr;
@@ -448,9 +531,9 @@ private:
 				continue;
 			if (amo_busy_[b] > 1)
 				return true;
-			const auto& queue = mem_xbar_->ReqOut.at(b);
-			if (amo_busy_[b] == 0 && !((bulk_hold_ >> b) & 1) && !queue.empty()
-			 && (memop_is_atomic(queue.peek().op) || memop_is_mbar(queue.peek().op)))
+			const MemReq* head = this->bank_head(b, false);
+			if (amo_busy_[b] == 0 && !((bulk_hold_ >> b) & 1) && head
+			 && (memop_is_atomic(head->op) || memop_is_mbar(head->op)))
 				return true;
 		}
 		return false;
@@ -558,7 +641,26 @@ public:
 			const uint64_t rdw_addr   = amo_rdw_addr_[i];
 			amo_rdw_valid_[i] = false;
 #endif
+#ifdef DXA_MBAR_ENABLE
+			auto& xbar_req_out = this->bank_queue(i, (bulk_banks >> i) & 1);
+#elif defined(VX_CFG_EXT_MBAR_ENABLE)
+			auto& xbar_req_out = this->bank_queue(i, false);
+#else
+#if defined(VX_CFG_EXT_DXA_ENABLE)
+#line 298
+#else
+#line 178
+#endif
 			auto& xbar_req_out = mem_xbar_->ReqOut.at(i);
+#endif
+#if defined(VX_CFG_EXT_MBAR_ENABLE)
+#elif defined(VX_CFG_EXT_DXA_ENABLE)
+#line 297
+#elif defined(VX_CFG_EXT_DLMEM_ENABLE)
+#line 177
+#else
+#line 179
+#endif
 #ifdef DXA_MBAR_ENABLE
 			if ((bulk_banks >> i) & 1) {
 				if (!bulk_stall_ && !xbar_req_out.empty() && is_bulk_dma(xbar_req_out.peek())) {
@@ -661,11 +763,11 @@ public:
 #ifdef VX_CFG_EXT_MBAR_ENABLE
 				if (is_mbar) {
 					const uint32_t err = mbar_ref::apply(mbar_op_code(op), old_word, rhs).err;
-					if (err & mbar_ref::ERR_UNDERFLOW) {
-						this->mbar_abort(i, bank_req, mbar_ref::MSG_UNDERFLOW, old_word, rhs);
-					}
-					if (err & mbar_ref::ERR_TX_RANGE) {
-						this->mbar_abort(i, bank_req, mbar_ref::MSG_TX_RANGE, old_word, rhs);
+					if (err != mbar_ref::ERR_NONE) {
+						const char* msg = (err & mbar_ref::ERR_UNDERFLOW) ? mbar_ref::MSG_UNDERFLOW
+						                : (err & mbar_ref::ERR_TX_RANGE) ? mbar_ref::MSG_TX_RANGE
+						                : (err & mbar_ref::ERR_NOCOMPLETE) ? mbar_ref::MSG_NOCOMPLETE : mbar_ref::MSG_DROPZERO;
+						this->mbar_abort(i, bank_req, msg, old_word, rhs);
 					}
 				}
 #endif
@@ -678,7 +780,30 @@ public:
 				const uint64_t ret_word = is_sc ? (sc_fail ? 1ull : 0ull) : rmw.ret_word;
 				amo_store_word(rsp_data->data(), byte_off, width, ret_word);
 				bank_rsp.data = rsp_data;
+#ifdef VX_CFG_EXT_MBAR_ENABLE
+				if (!this->bank_rsp(i).try_send(bank_rsp))
+#else
+#if defined(VX_CFG_EXT_FPAMO_ENABLE) && defined(VX_CFG_EXT_DXA_ENABLE)
+#line 400
+#elif defined(VX_CFG_EXT_FPAMO_ENABLE)
+#line 280
+#elif defined(VX_CFG_EXT_DXA_ENABLE)
+#line 377
+#else
+#line 257
+#endif
 				if (!mem_xbar_->RspIn.at(i).try_send(bank_rsp))
+#endif
+#if defined(VX_CFG_EXT_MBAR_ENABLE)
+#elif defined(VX_CFG_EXT_FPAMO_ENABLE) && defined(VX_CFG_EXT_DXA_ENABLE)
+#line 401
+#elif defined(VX_CFG_EXT_FPAMO_ENABLE)
+#line 281
+#elif defined(VX_CFG_EXT_DXA_ENABLE)
+#line 378
+#else
+#line 258
+#endif
 					continue; // stall; no state mutated yet
 
 				// An SC gives up its own reservation whether it succeeds or
@@ -781,7 +906,26 @@ public:
 					ram_.read(rsp_data->data(), line_addr, VX_CFG_MEM_BLOCK_SIZE);
 					bank_rsp.data = rsp_data;
 				}
+#ifdef VX_CFG_EXT_MBAR_ENABLE
+				if (!this->bank_rsp(i).try_send(bank_rsp))
+#else
+#if defined(VX_CFG_EXT_FPAMO_ENABLE)
+#line 349
+#elif VX_CFG_EXT_A_ENABLED
+#line 331
+#else
+#line 340
+#endif
 				if (!mem_xbar_->RspIn.at(i).try_send(bank_rsp))
+#endif
+#if defined(VX_CFG_EXT_MBAR_ENABLE)
+#elif defined(VX_CFG_EXT_FPAMO_ENABLE)
+#line 350
+#elif VX_CFG_EXT_A_ENABLED
+#line 332
+#else
+#line 341
+#endif
 					continue; // stall
 			}
 
@@ -812,6 +956,19 @@ public:
 			// remove input
 			xbar_req_out.pop();
 		}
+#ifdef VX_CFG_EXT_MBAR_ENABLE
+		if (cpa_xbar_) {
+			this->cpa_rr_update(num_banks);
+		}
+#elif defined(VX_CFG_EXT_FPAMO_ENABLE) && defined(VX_CFG_EXT_DXA_ENABLE)
+#line 378
+#elif defined(VX_CFG_EXT_DXA_ENABLE)
+#line 360
+#elif VX_CFG_EXT_A_ENABLED
+#line 351
+#else
+#line 360
+#endif
 	}
 
 	const PerfStats& perf_stats() const {
@@ -825,8 +982,32 @@ public:
 
 LocalMem::LocalMem(const SimContext& ctx, const char* name, const Config& config)
 	: SimObject<LocalMem>(ctx, name)
+#ifdef VX_CFG_EXT_MBAR_ENABLE
+	, Inputs(config.num_reqs + config.cpa_ports, this)
+	, Outputs(config.num_reqs + config.cpa_ports, this)
+#else
+#if defined(VX_CFG_EXT_FPAMO_ENABLE) && defined(VX_CFG_EXT_DXA_ENABLE)
+#line 391
+#elif defined(VX_CFG_EXT_DXA_ENABLE)
+#line 373
+#elif VX_CFG_EXT_A_ENABLED
+#line 364
+#else
+#line 373
+#endif
 	, Inputs(config.num_reqs, this)
 	, Outputs(config.num_reqs, this)
+#endif
+#if defined(VX_CFG_EXT_MBAR_ENABLE)
+#elif defined(VX_CFG_EXT_FPAMO_ENABLE) && defined(VX_CFG_EXT_DXA_ENABLE)
+#line 393
+#elif defined(VX_CFG_EXT_DXA_ENABLE)
+#line 375
+#elif VX_CFG_EXT_A_ENABLED
+#line 366
+#else
+#line 375
+#endif
 #ifdef VX_CFG_EXT_DLMEM_ENABLE
 	, CommitOut(1 << config.B, this)
 #endif

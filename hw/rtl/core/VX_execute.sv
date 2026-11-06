@@ -47,6 +47,11 @@ module VX_execute import VX_gpu_pkg::*; #(
     // Per LSU block, the retire of an mbarrier try_wait.
     output wire [`VX_CFG_NUM_LSU_BLOCKS-1:0]               mbar_retire_valid,
     output wire [`VX_CFG_NUM_LSU_BLOCKS-1:0][NW_WIDTH-1:0] mbar_retire_wid,
+    // Per LSU block, the cp.async unit's local-memory port and wait_group release.
+    VX_lsu_mem_if.master      cpa_lmem_if [`VX_CFG_NUM_LSU_BLOCKS],
+    VX_sched_unlock_if.master cpa_unlock_if [`VX_CFG_NUM_LSU_BLOCKS],
+    // Per LSU block and warp, no cp.async work left in the block's unit.
+    output wire [`VX_CFG_NUM_LSU_BLOCKS-1:0][`VX_CFG_NUM_WARPS-1:0] cpa_idle,
 `endif
 
 `ifdef TCU_META_ENABLE
@@ -138,6 +143,9 @@ module VX_execute import VX_gpu_pkg::*; #(
     `ifdef VX_CFG_EXT_MBAR_ENABLE
         .mbar_retire_valid   (mbar_retire_valid),
         .mbar_retire_wid     (mbar_retire_wid),
+        .per_block_cpa_lmem_if   (cpa_lmem_if),
+        .per_block_cpa_unlock_if (cpa_unlock_if),
+        .cpa_idle            (cpa_idle),
     `endif
         .per_block_client_if (lsu_client_if)
     );

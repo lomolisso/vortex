@@ -82,6 +82,25 @@ package VX_trace_pkg;
             default:     `TRACE(level, (".?"))
         endcase
     endtask
+
+    // The names SimX prints: both halves of a 16-byte copy as the instruction
+    // (the offset tells them apart), and a wait_group with its N.
+    task trace_cpa_op(input int level,
+                      input [INST_OP_BITS-1:0] op_type,
+                      input op_args_t op_args
+    );
+        case (INST_LSU_BITS'(op_type))
+            INST_LSU_CPA4:       `TRACE(level, ("CP.ASYNC.4"))
+            INST_LSU_CPA8:       `TRACE(level, ("CP.ASYNC.8"))
+            INST_LSU_CPA16:      `TRACE(level, ("CP.ASYNC.16"))
+            INST_LSU_CPA16H:     `TRACE(level, ("CP.ASYNC.16"))
+            INST_LSU_CPA_COMMIT: `TRACE(level, ("CP.ASYNC.COMMIT_GROUP"))
+            INST_LSU_CPA_WAIT:   `TRACE(level, ("CP.ASYNC.WAIT_GROUP %0d", op_args.lsu.offset[4:0]))
+            INST_LSU_CPA_ARRIVE: `TRACE(level, ("CP.ASYNC.MBARRIER.ARRIVE"))
+            INST_LSU_CPA_NOINC:  `TRACE(level, ("CP.ASYNC.MBARRIER.ARRIVE.NOINC"))
+            default:             `TRACE(level, ("CP.ASYNC.?"))
+        endcase
+    endtask
 `endif
 
     task trace_ex_op(input int level,
@@ -215,7 +234,9 @@ package VX_trace_pkg;
         end
         EX_LSU: begin
         `ifdef VX_CFG_EXT_MBAR_ENABLE
-            if (op_args.lsu.is_async) begin
+            if (op_args.lsu.is_async && ~op_args.lsu.is_store) begin
+                trace_cpa_op(level, op_type, op_args);
+            end else if (op_args.lsu.is_async) begin
                 trace_async_op(level, op_type, op_args);
             end else
         `endif

@@ -18,6 +18,7 @@
 // the test apps' host code; independent of VX_config.h.
 //
 // Layout: pending[19:0] expected[39:20] tx[60:40] (signed bytes) [62:61] zero phase[63].
+// The DROP and NOCOMPLETE flags live in the operand of an arrive, not in the word.
 
 #include <cstdint>
 
@@ -26,8 +27,8 @@ namespace mbar_ref {
 
 // amo_op codes; the custom-2 (0x5B) funct3 is the code minus OP_BASE.
 enum Op : uint32_t {
-  OP_ARRIVE      = 10,  // operand: arrival count
-  OP_ARRIVE_TX   = 11,  // operand: bytes; tx += bytes, then one arrival
+  OP_ARRIVE      = 10,  // operand: arrival count | flags
+  OP_ARRIVE_TX   = 11,  // operand: bytes | flags; tx += bytes, then one arrival
   OP_EXPECT_TX   = 12,  // operand: bytes
   OP_COMPLETE_TX = 13,  // operand: bytes
   OP_TEST_WAIT   = 14,  // operand: token
@@ -35,10 +36,20 @@ enum Op : uint32_t {
 };
 constexpr uint32_t OP_BASE = OP_ARRIVE;
 
+// Operand flags of OP_ARRIVE and OP_ARRIVE_TX, stripped before the count or
+// bytes are read. DROP (PTX arrive_drop): the op's arrivals also leave the
+// expected count of this and every later phase. NOCOMPLETE (PTX .noComplete):
+// the op must not complete the phase.
+constexpr uint64_t FLAG_DROP       = uint64_t(1) << 62;
+constexpr uint64_t FLAG_NOCOMPLETE = uint64_t(1) << 61;
+constexpr uint64_t FLAGS           = FLAG_DROP | FLAG_NOCOMPLETE;
+
 enum Err : uint32_t {
-  ERR_NONE      = 0,
-  ERR_UNDERFLOW = 1,  // more arrivals than pending
-  ERR_TX_RANGE  = 2,  // tx left [-TX_MAX, TX_MAX]
+  ERR_NONE       = 0,
+  ERR_UNDERFLOW  = 1,  // more arrivals than pending
+  ERR_TX_RANGE   = 2,  // tx left [-TX_MAX, TX_MAX]
+  ERR_NOCOMPLETE = 4,  // a NOCOMPLETE op completed the phase
+  ERR_DROPZERO   = 8,  // a DROP op left no expected arrivals
 };
 
 // Assert texts, identical in the RTL and SimX.
@@ -47,6 +58,8 @@ constexpr const char* MSG_TX_RANGE  = "mbarrier tx out of range";
 constexpr const char* MSG_ALIGN     = "mbarrier op is not a naturally aligned doubleword";
 constexpr const char* MSG_GLOBAL    = "mbarrier op on a global address";
 constexpr const char* MSG_REMOTE    = "remote mbarrier wait is not supported";
+constexpr const char* MSG_NOCOMPLETE = "mbarrier.arrive.noComplete would complete the phase";
+constexpr const char* MSG_DROPZERO   = "mbarrier.arrive_drop would leave no expected arrivals";
 
 constexpr uint32_t COUNT_BITS = 20;
 constexpr uint32_t TX_BITS    = 21;
@@ -98,21 +111,31 @@ inline Result apply(uint32_t op, uint64_t old, uint64_t operand) {
     return r;
   }
 
+  const bool is_arrive = (op == OP_ARRIVE || op == OP_ARRIVE_TX);
+  const bool drop       = is_arrive && (operand & FLAG_DROP) != 0;
+  const bool nocomplete = is_arrive && (operand & FLAG_NOCOMPLETE) != 0;
+  if (is_arrive)
+    operand &= ~FLAGS;
+
   int64_t pend = pending(old);
+  int64_t exp  = expected(old);
   int64_t t    = tx(old);
   // A byte count of 2^TX_BITS or more cannot leave tx in range.
   const bool big = (operand >> TX_BITS) != 0;
   const int64_t bytes = int64_t(operand & ((uint64_t(1) << TX_BITS) - 1));
+  int64_t arrivals = 0;
 
   switch (op) {
   case OP_ARRIVE:
     if (operand > uint64_t(pend)) r.err |= ERR_UNDERFLOW;
-    pend -= int64_t(operand & COUNT_MAX);
+    arrivals = int64_t(operand & COUNT_MAX);
+    pend -= arrivals;
     break;
   case OP_ARRIVE_TX:
     if (big) r.err |= ERR_TX_RANGE;
     t += bytes;
     if (pend == 0) r.err |= ERR_UNDERFLOW;
+    arrivals = 1;
     pend -= 1;
     break;
   case OP_EXPECT_TX:
@@ -128,19 +151,26 @@ inline Result apply(uint32_t op, uint64_t old, uint64_t operand) {
     return r;
   }
   if (t > TX_MAX || t < -TX_MAX) r.err |= ERR_TX_RANGE;
+  if (drop) {
+    if (arrivals >= exp) r.err |= ERR_DROPZERO;
+    exp -= arrivals;
+  }
 
   // Fields wrap at their widths, as in the bank; only an erroneous op can wrap.
   pend = int64_t(uint64_t(pend) & COUNT_MAX);
+  exp  = int64_t(uint64_t(exp) & COUNT_MAX);
   t    = tx(pack(0, 0, t, 0));
   uint32_t ph = phase(old);
   // The completion rule follows every writing op, expect_tx included: a
-  // complete_tx may arrive first and leave tx negative.
+  // complete_tx may arrive first and leave tx negative. A drop that completes
+  // the phase reloads pending from the reduced expected count.
   if (pend == 0 && t == 0) {
     ph ^= 1;
-    pend = expected(old);
+    pend = exp;
     r.flip = true;
+    if (nocomplete) r.err |= ERR_NOCOMPLETE;
   }
-  r.new_word = pack(uint64_t(pend), expected(old), t, ph);
+  r.new_word = pack(uint64_t(pend), uint64_t(exp), t, ph);
   r.writes = true;
   return r;
 }
