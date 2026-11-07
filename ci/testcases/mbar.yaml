@@ -43,7 +43,10 @@ defaults:
             hw/rtl/tcu, sim/simx/tcu, sw/kernel/include/vx_tensor.h,
             tests/regression/sgemm_tcu_wg_mbar, tests/regression/sgemm_tcu_mx_mbar,
             sim/simx/mbar_waiters, sim/simx/Makefile, tests/regression/mbar_wait,
-            tests/regression/mbar_remote, sw/common/dxa_ref.h, sw/common/dxa_meta.h]
+            tests/regression/mbar_remote, sw/common/dxa_ref.h, sw/common/dxa_meta.h,
+            hw/rtl/core/VX_bg_unit.sv, hw/rtl/core/VX_sfu_unit.sv, sim/simx/bg_unit, sim/simx/dxa/dxa_bg.h,
+            sim/simx/dxa/dxa_core.cpp, sim/simx/dxa/dxa_core.h, sim/simx/dxa/dxa_unit.cpp,
+            sim/simx/dxa/dxa_unit.h, sim/simx/sfu_unit]
 tests:
   # One block of 4 warps x 4 threads. basic: every thread arrives with 1 and
   # waits on its token for 32 phases; the stores before each arrive must be
@@ -661,7 +664,10 @@ tests:
               tests/regression/dxa_mbar, tests/regression/dxa_copy,
               tests/regression/dxa_kmajor_check, VX_config.toml, hw/rtl/core/VX_cpa_unit.sv,
               sim/simx/cpa_unit, sw/common/dxa_ref.h, sw/common/dxa_meta.h,
-              hw/rtl/core/VX_decode.sv, sim/simx/decode.cpp]
+              hw/rtl/core/VX_decode.sv, sim/simx/decode.cpp,
+              hw/rtl/cache/VX_cache_amo.sv, hw/rtl/core/VX_bg_unit.sv, hw/rtl/core/VX_lsu_slice.sv,
+              hw/rtl/dlmem/VX_dlmem_ingress.sv, sim/simx/bg_unit, sim/simx/dlmem/dlmem_ingress.cpp,
+              sim/simx/dlmem/dlmem_ingress.h, sim/simx/lsu_unit, sim/simx/mem/cache.cpp]
     args: "-r 8"
   - id: dxa_mbar-legacy
     app: dxa_mbar
@@ -1440,7 +1446,8 @@ tests:
               tests/regression/dxa_kmajor_check, VX_config.toml, hw/rtl/core/VX_cpa_unit.sv,
               sim/simx/cpa_unit, tests/regression/dxa_load, sw/common/dxa_ref.h,
               sw/common/dxa_meta.h, sw/runtime/include/dxa.h, hw/rtl/core/VX_decode.sv,
-              sim/simx/decode.cpp]
+              sim/simx/decode.cpp, hw/rtl/cache/VX_cache_amo.sv, hw/rtl/core/VX_bg_unit.sv,
+              hw/rtl/core/VX_lsu_slice.sv, sim/simx/bg_unit, sim/simx/lsu_unit, sim/simx/mem/cache.cpp]
     args: "-m edge"
   # Signed coordinates, boxes starting at -1 (and further) in dims 0 and 1.
   - id: dxa_load-halo
@@ -1684,4 +1691,385 @@ tests:
     configs+: "-DVX_CFG_EXT_DXA_ENABLE"
     touches: *dxa_load_touches
     env: {DRIVER: rtlsim, APP: dxa_load, ARGS: "-x layout", EXPECT: "DXA swizzle and element strides need the row-major layout"}
+    run: *expect_fail_run
+
+  # --- PTX TMA stores, reductions, bulk groups, proxy fence (dxa_store, funct3 5 and 6) ---
+  # cp.async.bulk{,.tensor}.global.shared::cta.bulk_group and
+  # cp.reduce.async.bulk{,.tensor}.global.shared::cta.bulk_group: one block fills
+  # its local memory with a pattern (typed values under the reductions), warp 0
+  # issues the stores and ends with commit + wait_group 0; the host checks the
+  # whole 1 MB global buffer byte for byte (canaries around every box, typed
+  # values under the reductions) against sw/common/dxa_ref.h. Without an L2 the
+  # writes go to memory directly; the reductions need an L2 (or L3) and FPAMO
+  # for the float, inc and dec pairs.
+  # Bulk stores of 16 B up to the local memory, then one of 64 KB.
+  - id: dxa_store-bst
+    app: dxa_store
+    drivers: [simx, rtlsim]
+    configs+: "-DVX_CFG_EXT_DXA_ENABLE"
+    touches: &dxa_store_touches [hw/rtl/dxa, sim/simx/dxa, hw/rtl/core/VX_mem_unit.sv,
+              hw/rtl/mem/VX_local_mem.sv, hw/rtl/core/VX_cta_dispatch.sv, hw/rtl/core/VX_core.sv,
+              hw/rtl/core/VX_execute.sv, hw/rtl/core/VX_sfu_unit.sv, hw/rtl/core/VX_wctl_unit.sv,
+              hw/rtl/core/VX_bar_unit.sv, hw/rtl/VX_socket.sv, hw/rtl/VX_gpu_pkg.sv,
+              hw/rtl/VX_define.vh, hw/rtl/cache, hw/rtl/dlmem, hw/rtl/mem/VX_lmem_switch.sv,
+              hw/rtl/VX_kmu.sv, hw/rtl/VX_cluster.sv, hw/rtl/interfaces, hw/rtl/core/VX_scheduler.sv,
+              hw/rtl/core/VX_decode.sv, hw/rtl/core/VX_lsu_slice.sv, hw/rtl/core/VX_lsu_unit.sv,
+              hw/rtl/core/VX_bg_unit.sv, hw/rtl/core/VX_cpa_unit.sv, sim/simx/mem,
+              sim/simx/core, sim/simx/socket, sim/simx/cta_dispatcher, sim/simx/types.h,
+              sim/simx/instr.h, sim/simx/decode.cpp, sim/simx/mbar_waiters, sim/simx/amo,
+              sim/simx/scheduler, sim/simx/barrier_unit, sim/simx/sfu_unit, sim/simx/lsu_unit,
+              sim/simx/bg_unit, sim/simx/cpa_unit, sim/simx/Makefile, sim/simx/dlmem, sim/simx/kmu,
+              sim/simx/cluster, sw/common/mbar_ref.h, sw/common/dlmem_ref.h, sw/common/amo_ref.h,
+              sw/common/dxa_ref.h, sw/common/dxa_meta.h, sw/runtime/include/dxa.h,
+              sw/kernel/include/vx_dxa.h, sw/kernel/include/vx_mbar.h, sw/kernel/include/vx_dlmem.h,
+              tests/regression/dxa_store, VX_config.toml]
+    args: "-m bst"
+  - id: dxa_store-bst-64k
+    app: dxa_store
+    drivers: [simx, rtlsim]
+    configs+: "-DVX_CFG_EXT_DXA_ENABLE -DVX_CFG_LMEM_LOG_SIZE=17"
+    touches: *dxa_store_touches
+    args: "-m bst -z 65536"
+  # 1D-5D tile stores in bounds; boxes past the end of every dimension (not written).
+  - id: dxa_store-tst
+    app: dxa_store
+    drivers: [simx, rtlsim]
+    configs+: "-DVX_CFG_EXT_DXA_ENABLE"
+    touches: *dxa_store_touches
+    args: "-m tst"
+  - id: dxa_store-edge
+    app: dxa_store
+    drivers: [simx, rtlsim]
+    configs+: "-DVX_CFG_EXT_DXA_ENABLE"
+    touches: *dxa_store_touches
+    args: "-m edge"
+  - id: dxa_store-edge-l2
+    app: dxa_store
+    drivers: [simx, rtlsim]
+    configs+: "-DVX_CFG_EXT_DXA_ENABLE"
+    touches: *dxa_store_touches
+    shape: {l2cache: true}
+    args: "-m edge"
+  # Swizzle x element 1/2/4/8 x inner widths, in bounds and past the end.
+  - id: dxa_store-swz32
+    app: dxa_store
+    drivers: [simx, rtlsim]
+    configs+: "-DVX_CFG_EXT_DXA_ENABLE"
+    touches: *dxa_store_touches
+    args: "-m swz -s 32"
+  - id: dxa_store-swz64
+    app: dxa_store
+    drivers: [simx, rtlsim]
+    configs+: "-DVX_CFG_EXT_DXA_ENABLE"
+    touches: *dxa_store_touches
+    args: "-m swz -s 64"
+  - id: dxa_store-swz128
+    app: dxa_store
+    drivers: [simx, rtlsim]
+    configs+: "-DVX_CFG_EXT_DXA_ENABLE"
+    touches: *dxa_store_touches
+    args: "-m swz -s 128"
+  # Element strides 1-8 in dims 1-4; 16B interleave (dim-0 strides) and 32B interleave with 32B swizzle.
+  - id: dxa_store-es
+    app: dxa_store
+    drivers: [simx, rtlsim]
+    configs+: "-DVX_CFG_EXT_DXA_ENABLE"
+    touches: *dxa_store_touches
+    args: "-m es"
+  - id: dxa_store-il16
+    app: dxa_store
+    drivers: [simx, rtlsim]
+    configs+: "-DVX_CFG_EXT_DXA_ENABLE"
+    touches: *dxa_store_touches
+    args: "-m il16"
+  - id: dxa_store-il32
+    app: dxa_store
+    drivers: [simx, rtlsim]
+    configs+: "-DVX_CFG_EXT_DXA_ENABLE"
+    touches: *dxa_store_touches
+    args: "-m il32"
+  # im2col_no_offs stores: pixels outside the tensor are skipped.
+  - id: dxa_store-i2c3
+    app: dxa_store
+    drivers: [simx, rtlsim]
+    configs+: "-DVX_CFG_EXT_DXA_ENABLE"
+    touches: *dxa_store_touches
+    args: "-m i2c3"
+  - id: dxa_store-i2c4
+    app: dxa_store
+    drivers: [simx, rtlsim]
+    configs+: "-DVX_CFG_EXT_DXA_ENABLE"
+    touches: *dxa_store_touches
+    args: "-m i2c4"
+  - id: dxa_store-i2c5
+    app: dxa_store
+    drivers: [simx, rtlsim]
+    configs+: "-DVX_CFG_EXT_DXA_ENABLE"
+    touches: *dxa_store_touches
+    args: "-m i2c5"
+  # Bulk global reductions, every legal op x type (integer pairs without FPAMO), in the LLC atomic unit.
+  - id: dxa_store-rg-int
+    app: dxa_store
+    drivers: [simx, rtlsim]
+    configs+: "-DVX_CFG_EXT_DXA_ENABLE"
+    touches: *dxa_store_touches
+    shape: {l2cache: true}
+    args: "-m rg"
+  - id: dxa_store-rg
+    app: dxa_store
+    drivers: [simx, rtlsim]
+    configs+: "-DVX_CFG_EXT_DXA_ENABLE -DVX_CFG_EXT_ZACAS_ENABLE -DVX_CFG_EXT_FPAMO_ENABLE"
+    touches: *dxa_store_touches
+    shape: {l2cache: true}
+    args: "-m rg"
+  # Tensor reductions with out-of-bounds edges, swizzle, strides, interleave and im2col.
+  - id: dxa_store-rt-int
+    app: dxa_store
+    drivers: [simx, rtlsim]
+    configs+: "-DVX_CFG_EXT_DXA_ENABLE"
+    touches: *dxa_store_touches
+    shape: {l2cache: true}
+    args: "-m rt"
+  - id: dxa_store-rt
+    app: dxa_store
+    drivers: [simx, rtlsim]
+    configs+: "-DVX_CFG_EXT_DXA_ENABLE -DVX_CFG_EXT_ZACAS_ENABLE -DVX_CFG_EXT_FPAMO_ENABLE"
+    touches: *dxa_store_touches
+    shape: {l2cache: true}
+    args: "-m rt"
+  # Bulk groups: wait_group 3..0 each followed by fence.proxy.async.global and generic loads of the groups it completes; N >= 8; an empty group; ten groups back to back (8 pending); one group of 70 operations.
+  - id: dxa_store-grp
+    app: dxa_store
+    drivers: [simx, rtlsim]
+    configs+: "-DVX_CFG_EXT_DXA_ENABLE"
+    touches: *dxa_store_touches
+    args: "-m grp"
+  - id: dxa_store-grp-l2
+    app: dxa_store
+    drivers: [simx, rtlsim]
+    configs+: "-DVX_CFG_EXT_DXA_ENABLE"
+    touches: *dxa_store_touches
+    shape: {l2cache: true}
+    args: "-m grp"
+  # wait_group.read 0, the sources overwritten, wait_group 0: global holds the old bytes.
+  - id: dxa_store-rdreuse
+    app: dxa_store
+    drivers: [simx, rtlsim]
+    configs+: "-DVX_CFG_EXT_DXA_ENABLE -DVX_CFG_EXT_ZACAS_ENABLE -DVX_CFG_EXT_FPAMO_ENABLE"
+    touches: *dxa_store_touches
+    shape: {l2cache: true}
+    args: "-m rdreuse"
+  - id: dxa_store-rdreuse-nol2
+    app: dxa_store
+    drivers: [simx, rtlsim]
+    configs+: "-DVX_CFG_EXT_DXA_ENABLE"
+    touches: *dxa_store_touches
+    args: "-m rdreuse"
+  # fence.proxy.async.global both ways: generic stores then a bulk load (i7a), a cached line then a bulk store, wait_group and a generic load (i7b); with and without an L2.
+  - id: dxa_store-i7a
+    app: dxa_store
+    drivers: [simx, rtlsim]
+    configs+: "-DVX_CFG_EXT_DXA_ENABLE"
+    touches: *dxa_store_touches
+    args: "-m i7a"
+  - id: dxa_store-i7a-l2
+    app: dxa_store
+    drivers: [simx, rtlsim]
+    configs+: "-DVX_CFG_EXT_DXA_ENABLE"
+    touches: *dxa_store_touches
+    shape: {l2cache: true}
+    args: "-m i7a"
+  - id: dxa_store-i7b
+    app: dxa_store
+    drivers: [simx, rtlsim]
+    configs+: "-DVX_CFG_EXT_DXA_ENABLE"
+    touches: *dxa_store_touches
+    args: "-m i7b"
+  - id: dxa_store-i7b-l2
+    app: dxa_store
+    drivers: [simx, rtlsim]
+    configs+: "-DVX_CFG_EXT_DXA_ENABLE"
+    touches: *dxa_store_touches
+    shape: {l2cache: true}
+    args: "-m i7b"
+  # i7b with the first 16 bytes stored generically: with 1 core and no L2 the
+  # data cache is write-back, and the dirty line's write-back must keep the
+  # bytes the bulk store wrote around the cache.
+  - id: dxa_store-i7c
+    app: dxa_store
+    drivers: [simx, rtlsim]
+    configs+: "-DVX_CFG_EXT_DXA_ENABLE"
+    touches: *dxa_store_touches
+    args: "-m i7c"
+  - id: dxa_store-i7c-l2
+    app: dxa_store
+    drivers: [simx, rtlsim]
+    configs+: "-DVX_CFG_EXT_DXA_ENABLE"
+    touches: *dxa_store_touches
+    shape: {l2cache: true}
+    args: "-m i7c"
+  # A 64 KB bulk store waited for with wait_group.read 0 only, then the kernel
+  # ends: the end of the kernel waits for the writes (with an L2 and an L3,
+  # each store's fence walks the L2).
+  - id: dxa_store-exit
+    app: dxa_store
+    drivers: [simx, rtlsim]
+    configs+: "-DVX_CFG_EXT_DXA_ENABLE -DVX_CFG_LMEM_LOG_SIZE=17"
+    touches: *dxa_store_touches
+    args: "-m exit"
+  - id: dxa_store-exit-l2l3
+    app: dxa_store
+    drivers: [simx, rtlsim]
+    configs+: "-DVX_CFG_EXT_DXA_ENABLE -DVX_CFG_LMEM_LOG_SIZE=17"
+    touches: *dxa_store_touches
+    shape: {l2cache: true, l3cache: true}
+    args: "-m exit"
+  # Parity at XLEN 64, perf mode (the jobs repeated into fresh global regions,
+  # each repeat one group closed by wait_group 0; no fill and no check, so the
+  # timed loop is most of the run): a 2D tile store with 128B swizzle and an
+  # out-of-bounds edge; bulk f32 and u32 adds into the L2 (every repeat
+  # cold); the tensor reductions of -m rt.
+  - id: parity-dxa-store-swz
+    check: model_parity
+    app: dxa_store
+    xlen: [64]
+    configs+: "-DVX_CFG_EXT_DXA_ENABLE -DVX_CFG_MBAR_SUSPEND_CYCLES=4096"
+    touches: *dxa_store_touches
+    args: "-m swz-oob -p"
+  - id: parity-dxa-red-g-f32
+    check: model_parity
+    app: dxa_store
+    xlen: [64]
+    configs+: "-DVX_CFG_EXT_DXA_ENABLE -DVX_CFG_EXT_ZACAS_ENABLE -DVX_CFG_EXT_FPAMO_ENABLE -DVX_CFG_MBAR_SUSPEND_CYCLES=4096"
+    touches: *dxa_store_touches
+    shape: {l2cache: true}
+    args: "-m rg -o add -t f32 -p"
+  - id: parity-dxa-red-g-u32
+    check: model_parity
+    app: dxa_store
+    xlen: [64]
+    configs+: "-DVX_CFG_EXT_DXA_ENABLE -DVX_CFG_MBAR_SUSPEND_CYCLES=4096"
+    touches: *dxa_store_touches
+    shape: {l2cache: true}
+    args: "-m rg -o add -t u32 -p"
+  - id: parity-dxa-red-t
+    check: model_parity
+    app: dxa_store
+    xlen: [64]
+    configs+: "-DVX_CFG_EXT_DXA_ENABLE -DVX_CFG_EXT_ZACAS_ENABLE -DVX_CFG_EXT_FPAMO_ENABLE -DVX_CFG_MBAR_SUSPEND_CYCLES=4096"
+    touches: *dxa_store_touches
+    shape: {l2cache: true}
+    args: "-m rt -p"
+  # Stores, reductions and fences that must stop the simulation with the exact message.
+  - id: dxa_store-x-neg
+    via: script
+    driver: simx
+    configs+: "-DVX_CFG_EXT_DXA_ENABLE"
+    touches: *dxa_store_touches
+    env: {DRIVER: simx, APP: dxa_store, ARGS: "-x neg", EXPECT: "DXA tensor store starts below the tensor"}
+    run: *expect_fail_run
+  - id: dxa_store-x-neg
+    via: script
+    driver: rtlsim
+    configs+: "-DVX_CFG_EXT_DXA_ENABLE"
+    touches: *dxa_store_touches
+    env: {DRIVER: rtlsim, APP: dxa_store, ARGS: "-x neg", EXPECT: "DXA tensor store starts below the tensor"}
+    run: *expect_fail_run
+  - id: dxa_store-x-nol2
+    via: script
+    driver: simx
+    configs+: "-DVX_CFG_EXT_DXA_ENABLE"
+    touches: *dxa_store_touches
+    env: {DRIVER: simx, APP: dxa_store, ARGS: "-x nol2", EXPECT: "DXA global reduction needs an L2 or L3"}
+    run: *expect_fail_run
+  - id: dxa_store-x-nol2
+    via: script
+    driver: rtlsim
+    configs+: "-DVX_CFG_EXT_DXA_ENABLE"
+    touches: *dxa_store_touches
+    env: {DRIVER: rtlsim, APP: dxa_store, ARGS: "-x nol2", EXPECT: "DXA global reduction needs an L2 or L3"}
+    run: *expect_fail_run
+  - id: dxa_store-x-nofp
+    via: script
+    driver: simx
+    configs+: "-DVX_CFG_EXT_DXA_ENABLE -DVX_CFG_L2_ENABLE"
+    touches: *dxa_store_touches
+    env: {DRIVER: simx, APP: dxa_store, ARGS: "-x nofp", EXPECT: "DXA reduction needs FPAMO"}
+    run: *expect_fail_run
+  - id: dxa_store-x-nofp
+    via: script
+    driver: rtlsim
+    configs+: "-DVX_CFG_EXT_DXA_ENABLE -DVX_CFG_L2_ENABLE"
+    touches: *dxa_store_touches
+    env: {DRIVER: rtlsim, APP: dxa_store, ARGS: "-x nofp", EXPECT: "DXA reduction needs FPAMO"}
+    run: *expect_fail_run
+  - id: dxa_store-x-badred
+    via: script
+    driver: simx
+    configs+: "-DVX_CFG_EXT_DXA_ENABLE -DVX_CFG_L2_ENABLE"
+    touches: *dxa_store_touches
+    env: {DRIVER: simx, APP: dxa_store, ARGS: "-x badred", EXPECT: "DXA invalid reduction"}
+    run: *expect_fail_run
+  - id: dxa_store-x-badred
+    via: script
+    driver: rtlsim
+    configs+: "-DVX_CFG_EXT_DXA_ENABLE -DVX_CFG_L2_ENABLE"
+    touches: *dxa_store_touches
+    env: {DRIVER: rtlsim, APP: dxa_store, ARGS: "-x badred", EXPECT: "DXA invalid reduction"}
+    run: *expect_fail_run
+  - id: dxa_store-x-tsize
+    via: script
+    driver: simx
+    configs+: "-DVX_CFG_EXT_DXA_ENABLE -DVX_CFG_L2_ENABLE"
+    touches: *dxa_store_touches
+    env: {DRIVER: simx, APP: dxa_store, ARGS: "-x tsize", EXPECT: "DXA reduction type does not match the element size"}
+    run: *expect_fail_run
+  - id: dxa_store-x-tsize
+    via: script
+    driver: rtlsim
+    configs+: "-DVX_CFG_EXT_DXA_ENABLE -DVX_CFG_L2_ENABLE"
+    touches: *dxa_store_touches
+    env: {DRIVER: rtlsim, APP: dxa_store, ARGS: "-x tsize", EXPECT: "DXA reduction type does not match the element size"}
+    run: *expect_fail_run
+  - id: dxa_store-x-enc
+    via: script
+    driver: simx
+    configs+: "-DVX_CFG_EXT_DXA_ENABLE"
+    touches: *dxa_store_touches
+    env: {DRIVER: simx, APP: dxa_store, ARGS: "-x enc", EXPECT: "invalid DXA encoding"}
+    run: *expect_fail_run
+  - id: dxa_store-x-enc
+    via: script
+    driver: rtlsim
+    configs+: "-DVX_CFG_EXT_DXA_ENABLE"
+    touches: *dxa_store_touches
+    env: {DRIVER: rtlsim, APP: dxa_store, ARGS: "-x enc", EXPECT: "invalid DXA encoding"}
+    run: *expect_fail_run
+  - id: dxa_store-x-pfence
+    via: script
+    driver: simx
+    configs+: "-DVX_CFG_EXT_DXA_ENABLE"
+    touches: *dxa_store_touches
+    env: {DRIVER: simx, APP: dxa_store, ARGS: "-x pfence", EXPECT: "invalid proxy fence"}
+    run: *expect_fail_run
+  - id: dxa_store-x-pfence
+    via: script
+    driver: rtlsim
+    configs+: "-DVX_CFG_EXT_DXA_ENABLE"
+    touches: *dxa_store_touches
+    env: {DRIVER: rtlsim, APP: dxa_store, ARGS: "-x pfence", EXPECT: "invalid proxy fence"}
+    run: *expect_fail_run
+  - id: dxa_store-x-layout
+    via: script
+    driver: simx
+    configs+: "-DVX_CFG_EXT_DXA_ENABLE"
+    touches: *dxa_store_touches
+    env: {DRIVER: simx, APP: dxa_store, ARGS: "-x layout", EXPECT: "DXA store needs a tile or im2col layout"}
+    run: *expect_fail_run
+  - id: dxa_store-x-layout
+    via: script
+    driver: rtlsim
+    configs+: "-DVX_CFG_EXT_DXA_ENABLE"
+    touches: *dxa_store_touches
+    env: {DRIVER: rtlsim, APP: dxa_store, ARGS: "-x layout", EXPECT: "DXA store needs a tile or im2col layout"}
     run: *expect_fail_run

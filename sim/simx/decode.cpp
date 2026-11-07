@@ -474,6 +474,12 @@ static op_string_t op_string(const Instr &instr) {
       case DxaType::TLOAD:     return {"DXA.TLOAD", ""};
       case DxaType::BLOAD:     return {"DXA.BLOAD", ""};
       case DxaType::BPREFETCH: return {"DXA.BPREFETCH", ""};
+      case DxaType::STORE:     return {"DXA.STORE", ""};
+      case DxaType::BGOP: {
+        static const char* const bg_names[] = {"DXA.BULK.COMMIT_GROUP", "DXA.BULK.WAIT_GROUP", "DXA.BULK.WAIT_GROUP.READ"};
+        auto a = std::get<IntrDxaArgs>(instrArgs);
+        return {bg_names[a.bg_op], (a.bg_op != 0) ? std::to_string(a.bg_n) : ""};
+      }
       default: break;
       }
 #else
@@ -1005,14 +1011,35 @@ Instr::Ptr Decoder::decode(uint32_t code, uint64_t uuid) {
       instr->set_op_type(DxaType::ISSUE);
 #ifdef DXA_MBAR_ENABLE
       // funct3 = 1 is the bulk copy, 2 the tensor load, 3 the global bulk
-      // load, 4 its prefetch; any other value stays the tensor issue.
+      // load, 4 its prefetch, 5 the store family, 6 the bulk-group ops; 0
+      // stays the tensor issue.
       switch (funct3) {
       case 1: instr->set_op_type(DxaType::BULK); break;
       case 2: instr->set_op_type(DxaType::TLOAD); break;
       case 3: instr->set_op_type(DxaType::BLOAD); break;
       case 4: instr->set_op_type(DxaType::BPREFETCH); break;
+      case 5: instr->set_op_type(DxaType::STORE); break;
+      case 6: {
+        // The register fields are operands: rs1 the op, rs2 the wait's N.
+        if (rs1 > 2) {
+          std::cerr << SimPlatform::instance().cycles() << ": " << this->name()
+                    << " invalid DXA encoding: code=0x" << std::hex << code << std::dec
+                    << " (#" << uuid << ")" << std::endl;
+          std::abort();
+        }
+        instr->set_op_type(DxaType::BGOP);
+        instr->set_args(IntrDxaArgs{rs1, rs2});
+        instr->set_wstall(rs1 != 0);
+      } break;
+      case 7:
+        std::cerr << SimPlatform::instance().cycles() << ": " << this->name()
+                  << " invalid DXA encoding: code=0x" << std::hex << code << std::dec
+                  << " (#" << uuid << ")" << std::endl;
+        std::abort();
       default: break;
       }
+      if (funct3 == 6)
+        break;
 #elif defined(VX_CFG_EXT_DLMEM_ENABLE)
 #line 924
 #else
@@ -1346,11 +1373,22 @@ Instr::Ptr Decoder::decode(uint32_t code, uint64_t uuid) {
       break;
     }
   #ifdef VX_CFG_EXT_DXA_ENABLE
-    // funct7 = 1, funct3 = 7 is fence.proxy.async.
+    // funct7 = 1, funct3 = 7 is fence.proxy.async; the rs1 field selects the
+    // form and no register is read: x0 the shared-memory one; x1 .global and
+    // x2 the one without a state space are a full fence, which also drains
+    // the warp's global stores and walks the core's data cache.
     if (funct7 == 1 && funct3 == 7) {
+      if (rs1 > 2) {
+        std::cerr << SimPlatform::instance().cycles() << ": " << this->name()
+                  << " invalid proxy fence: code=0x" << std::hex << code << std::dec
+                  << " (#" << uuid << ")" << std::endl;
+        std::abort();
+      }
       instr->set_fu_type(FUType::LSU);
-      instr->set_op_type(LsuType::PFENCE);
-      instr->set_args(IntrLsuArgs{0, 0, 0});
+      instr->set_op_type((rs1 == 0) ? LsuType::PFENCE : LsuType::FENCE);
+      IntrLsuArgs args{0, 0, 0};
+      args.red_op = rs1;
+      instr->set_args(args);
       // the warp issues nothing more until the fence retires
       instr->set_wstall(true);
       break;

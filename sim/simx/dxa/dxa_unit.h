@@ -15,6 +15,11 @@
 
 #include "types.h"
 #include "instr_trace.h"
+#ifdef DXA_MBAR_ENABLE
+#include "dxa_bg.h"
+#else
+#line 17
+#endif
 
 namespace vortex {
 
@@ -76,6 +81,19 @@ struct DxaReq {
   uint32_t offs[3];       // the im2col offsets along W, H, D
   uint64_t gsrc;          // a bulk load's global source, and size its bytes
   uint64_t blk_off;       // smem_addr's offset in its block, the swizzle's base
+  // A store-family operation (funct3 = 5): `kind` is the DXA_ST_* form, with
+  // its reduction op and type; src_addr is the source in the issuing core's
+  // local memory, gdst a global destination. A cluster reduction's
+  // destination and mbarrier are smem_addr, mbar_off and the receiver fields.
+  bool     store    = false;
+  uint32_t st_kind  = 0;
+  uint32_t red_op   = 0;
+  uint32_t red_type = 0;
+  uint64_t gdst     = 0;
+  // A bulk_group operation (kinds 0-2 and 4) and its group.
+  bool     bg       = false;
+  uint32_t bg_seq   = 0;
+  uint32_t hart_id  = 0;  // the issuing warp's thread 0
 #else
 #line 43
 #endif
@@ -105,11 +123,35 @@ private:
   Core*               core_;
   SimChannel<DxaReq>& req_out_;
 #ifdef DXA_MBAR_ENABLE
+public:
+  // A bulk-group event per COMMIT, WAIT and bulk_group operation, to the
+  // core's bulk-group unit, and the warps' group state back from it. The
+  // SFU owns them, as it owns req_out.
+  SimChannel<DxaBgEvt>   BgEvtOut{req_out_.module()};
+  SimChannel<DxaBgState> BgStateIn{req_out_.module(), 4 * VX_CFG_NUM_WARPS + 8};
+
+  void bg_state(const DxaBgState& s);
+  void bg_reset();
+
+private:
+  bool issue_store(instr_trace_t* trace);
+  bool issue_bgop(instr_trace_t* trace);
+  void decode_store(const instr_trace_t* trace, DxaReq& req) const;
+
+  std::vector<DxaBgState> bg_mirror_ = std::vector<DxaBgState>(VX_CFG_NUM_WARPS);
+  // The open group's sequence, per warp. Every COMMIT starts here, so it
+  // equals the bulk-group unit's without waiting for its state.
+  std::vector<uint32_t>   bg_seq_    = std::vector<uint32_t>(VX_CFG_NUM_WARPS, 0);
+
   // Resolves a DLMEM window destination and mbarrier through the issuing
   // block's peer row, as the RTL reads it from the core's peer table.
   void translate(const instr_trace_t* trace, uint32_t meta, uint32_t cta_mask, DxaReq& req) const;
   void cluster_receivers(const instr_trace_t* trace, uint32_t meta, uint32_t cta_mask, DxaReq& req) const;
   void translate_bulk(const instr_trace_t* trace, DxaReq& req) const;
+  void translate_bulk(const instr_trace_t* trace, DxaReq& req, uint64_t dst, uint64_t mbar,
+                      uint64_t src, uint64_t size) const;
+  void translate_red_cluster(const instr_trace_t* trace, DxaReq& req, uint64_t dst, uint64_t mbar,
+                             uint64_t src, uint64_t size) const;
   bool issue_ptx(instr_trace_t* trace);
   void decode_ptx(const instr_trace_t* trace, DxaType type, DxaReq& req) const;
 

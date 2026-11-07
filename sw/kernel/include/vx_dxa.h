@@ -20,6 +20,7 @@
 #ifdef VX_CFG_EXT_MBAR_ENABLE
 #include <vx_mbar.h>
 #include <vx_dlmem.h>
+#include <dxa_meta.h>
 #endif
 
 #ifdef __cplusplus
@@ -552,6 +553,220 @@ inline void vx_dxa_prefetch_l2(const void* gsrc, uint32_t size) {
       : "i"(VX_DXA_EXT_OPCODE), "i"(VX_DXA_FUNCT7), "r"(a0)
       : "memory");
 }
+
+// TMA stores and reductions, PTX cp.async.bulk{,.tensor}.global.shared::cta,
+// cp.reduce.async.bulk{,.tensor}: the engine reads `src`, a local pointer
+// into the issuer's own block, as the async proxy (order earlier stores to it
+// with vx_fence_proxy_async()), and writes global memory (physical addresses,
+// VX_MEM_PHYS) or, for the cluster reduction, another block of the cluster.
+// Every form but the cluster reduction is a .bulk_group operation: it joins
+// the warp's open group (vx_bulk_commit_group); `src` may be reused once
+// vx_bulk_wait_group_read<N>() has released the group, and the writes are
+// performed once vx_bulk_wait_group<N>() has; a later generic load of them
+// also needs vx_fence_proxy_async_global(). Groups are tracked per warp.
+// funct3 = 5: rs1 = wgather(src, a1, a2, a3), rs2 = wgather({ctl, c4}, 0, 0, 0),
+// ctl = kind | op << 3 | type << 7 | slot << 11 (DXA_ST_CTL_* in dxa_meta.h);
+// a1, a2, a3 = gdst, size, 0 (bulk store, global reduction), dst, size, mbar
+// (cluster reduction), {c1, c0}, {c3, c2}, 0 (tensor forms).
+
+inline uint32_t vx_dxa_st_ctl(uint32_t kind, uint32_t op, uint32_t type, uint32_t slot) {
+  return ((kind & ((1u << DXA_ST_CTL_KIND_BITS) - 1)) << DXA_ST_CTL_KIND_LSB)
+       | ((op & ((1u << DXA_ST_CTL_OP_BITS) - 1)) << DXA_ST_CTL_OP_LSB)
+       | ((type & ((1u << DXA_ST_CTL_TYPE_BITS) - 1)) << DXA_ST_CTL_TYPE_LSB)
+       | ((slot & ((1u << DXA_ST_CTL_SLOT_BITS) - 1)) << DXA_ST_CTL_SLOT_LSB);
+}
+
+inline void __vx_dxa_store(uint32_t ctl, const void* src, size_t a1, size_t a2, size_t a3, int32_t c4) {
+  const size_t r1 = vx_wgather((size_t)(uintptr_t)src, a1, a2, a3);
+  const size_t r2 = vx_wgather(((size_t)ctl << 32) | (size_t)(uint32_t)c4, (size_t)0, (size_t)0, (size_t)0);
+  __asm__ volatile (
+      ".insn r %0, 5, %1, x0, %2, %3\n\t"
+      :
+      : "i"(VX_DXA_EXT_OPCODE), "i"(VX_DXA_FUNCT7), "r"(r1), "r"(r2)
+      : "memory");
+}
+
+inline void __vx_dxa_store_tensor(uint32_t ctl, const void* src, int32_t c0, int32_t c1, int32_t c2, int32_t c3,
+                                  int32_t c4) {
+  __vx_dxa_store(ctl, src, __vx_dxa_pair(c0, c1), __vx_dxa_pair(c2, c3), (size_t)0, c4);
+}
+
+// cp.async.bulk.global.shared::cta.bulk_group: `size` bytes from `src` to
+// `gdst`; `size` is a nonzero multiple of 16, both addresses 16-byte aligned.
+inline void vx_dxa_bulk_store(void* gdst, const void* src, uint32_t size) {
+  __vx_dxa_store(vx_dxa_st_ctl(DXA_ST_BULK, 0, 0, 0), src, (size_t)(uintptr_t)gdst, (size_t)size, (size_t)0, 0);
+}
+
+// cp.async.bulk.tensor.{1..5}d.global.shared::cta.{tile,im2col_no_offs}.bulk_group:
+// the box of descriptor `slot` at the coordinates, read from `src` in the
+// layout a load of the same box writes; elements outside the tensor are not
+// written. Tile mode: a coordinate below 0 is an error. The im2col forms take
+// (c, w[, h[, d]], n) and the descriptor's im2col mode, all offsets 0.
+inline void vx_dxa_store_1d(uint32_t slot, const void* src, int32_t c0) {
+  __vx_dxa_store_tensor(vx_dxa_st_ctl(DXA_ST_TENSOR, 0, 0, slot), src, c0, 0, 0, 0, 0);
+}
+inline void vx_dxa_store_2d(uint32_t slot, const void* src, int32_t c0, int32_t c1) {
+  __vx_dxa_store_tensor(vx_dxa_st_ctl(DXA_ST_TENSOR, 0, 0, slot), src, c0, c1, 0, 0, 0);
+}
+inline void vx_dxa_store_3d(uint32_t slot, const void* src, int32_t c0, int32_t c1, int32_t c2) {
+  __vx_dxa_store_tensor(vx_dxa_st_ctl(DXA_ST_TENSOR, 0, 0, slot), src, c0, c1, c2, 0, 0);
+}
+inline void vx_dxa_store_4d(uint32_t slot, const void* src, int32_t c0, int32_t c1, int32_t c2, int32_t c3) {
+  __vx_dxa_store_tensor(vx_dxa_st_ctl(DXA_ST_TENSOR, 0, 0, slot), src, c0, c1, c2, c3, 0);
+}
+inline void vx_dxa_store_5d(uint32_t slot, const void* src, int32_t c0, int32_t c1, int32_t c2, int32_t c3,
+                            int32_t c4) {
+  __vx_dxa_store_tensor(vx_dxa_st_ctl(DXA_ST_TENSOR, 0, 0, slot), src, c0, c1, c2, c3, c4);
+}
+inline void vx_dxa_store_im2col_3d(uint32_t slot, const void* src, int32_t c, int32_t w, int32_t n) {
+  vx_dxa_store_3d(slot, src, c, w, n);
+}
+inline void vx_dxa_store_im2col_4d(uint32_t slot, const void* src, int32_t c, int32_t w, int32_t h, int32_t n) {
+  vx_dxa_store_4d(slot, src, c, w, h, n);
+}
+inline void vx_dxa_store_im2col_5d(uint32_t slot, const void* src, int32_t c, int32_t w, int32_t h, int32_t d,
+                                   int32_t n) {
+  vx_dxa_store_5d(slot, src, c, w, h, d, n);
+}
+
+// cp.reduce.async.bulk.global.shared::cta.bulk_group.<op>.<type>:
+// gdst[i] = op(gdst[i], src[i]) per element, each atomic, in no order, at the
+// last-level cache (an L2 or L3 is required). `op` is DXA_RED_*, `type`
+// DXA_RT_* (dxa_meta.h); the size and alignment rules of the bulk store apply.
+//   and, or, xor   b32, b64
+//   min, max       u32, s32, u64, s64, f16, bf16
+//   add            u32, s32, u64, f32, f64, f16 and bf16 (.noftz)
+//   inc, dec       u32
+// f16, bf16, f32, f64, inc and dec need VX_CFG_EXT_FPAMO_ENABLE.
+inline void vx_dxa_reduce_global(void* gdst, const void* src, uint32_t size, uint32_t op, uint32_t type) {
+  __vx_dxa_store(vx_dxa_st_ctl(DXA_ST_RED_GLOBAL, op, type, 0), src, (size_t)(uintptr_t)gdst, (size_t)size,
+                 (size_t)0, 0);
+}
+
+// cp.reduce.async.bulk.shared::cluster.shared::cta.mbarrier::complete_tx::bytes.<op>.<type>:
+// dst[i] = op(dst[i], src[i]) per element in another block of the cluster
+// (a window address, or a local pointer into another block), each element
+// applying complete_tx(element bytes) to `mbar`, which is 8-byte aligned and
+// lies in the destination block. Not a bulk_group operation: `src` may be
+// reused once the mbarrier's phase completes.
+//   and, or, xor   b32
+//   add, min, max  u32, s32
+//   inc, dec       u32 (VX_CFG_EXT_FPAMO_ENABLE)
+//   add            u64
+inline void vx_dxa_reduce_cluster(void* dst, const void* src, uint32_t size, uint64_t* mbar, uint32_t op,
+                                  uint32_t type) {
+  __vx_dxa_store(vx_dxa_st_ctl(DXA_ST_RED_CLUSTER, op, type, 0), src, (size_t)(uintptr_t)dst, (size_t)size,
+                 (size_t)(uintptr_t)mbar, 0);
+}
+
+// cp.reduce.async.bulk.tensor.{1..5}d.global.shared::cta.<op>.{tile,im2col_no_offs}.bulk_group:
+// the tensor store's walk with the global reduction's per-element op. The
+// type's size must be the descriptor's element size.
+inline void vx_dxa_reduce_1d(uint32_t slot, const void* src, uint32_t op, uint32_t type, int32_t c0) {
+  __vx_dxa_store_tensor(vx_dxa_st_ctl(DXA_ST_RED_TENSOR, op, type, slot), src, c0, 0, 0, 0, 0);
+}
+inline void vx_dxa_reduce_2d(uint32_t slot, const void* src, uint32_t op, uint32_t type, int32_t c0, int32_t c1) {
+  __vx_dxa_store_tensor(vx_dxa_st_ctl(DXA_ST_RED_TENSOR, op, type, slot), src, c0, c1, 0, 0, 0);
+}
+inline void vx_dxa_reduce_3d(uint32_t slot, const void* src, uint32_t op, uint32_t type, int32_t c0, int32_t c1,
+                             int32_t c2) {
+  __vx_dxa_store_tensor(vx_dxa_st_ctl(DXA_ST_RED_TENSOR, op, type, slot), src, c0, c1, c2, 0, 0);
+}
+inline void vx_dxa_reduce_4d(uint32_t slot, const void* src, uint32_t op, uint32_t type, int32_t c0, int32_t c1,
+                             int32_t c2, int32_t c3) {
+  __vx_dxa_store_tensor(vx_dxa_st_ctl(DXA_ST_RED_TENSOR, op, type, slot), src, c0, c1, c2, c3, 0);
+}
+inline void vx_dxa_reduce_5d(uint32_t slot, const void* src, uint32_t op, uint32_t type, int32_t c0, int32_t c1,
+                             int32_t c2, int32_t c3, int32_t c4) {
+  __vx_dxa_store_tensor(vx_dxa_st_ctl(DXA_ST_RED_TENSOR, op, type, slot), src, c0, c1, c2, c3, c4);
+}
+inline void vx_dxa_reduce_im2col_3d(uint32_t slot, const void* src, uint32_t op, uint32_t type, int32_t c,
+                                    int32_t w, int32_t n) {
+  vx_dxa_reduce_3d(slot, src, op, type, c, w, n);
+}
+inline void vx_dxa_reduce_im2col_4d(uint32_t slot, const void* src, uint32_t op, uint32_t type, int32_t c,
+                                    int32_t w, int32_t h, int32_t n) {
+  vx_dxa_reduce_4d(slot, src, op, type, c, w, h, n);
+}
+inline void vx_dxa_reduce_im2col_5d(uint32_t slot, const void* src, uint32_t op, uint32_t type, int32_t c,
+                                    int32_t w, int32_t h, int32_t d, int32_t n) {
+  vx_dxa_reduce_5d(slot, src, op, type, c, w, h, d, n);
+}
+
+// Typed forms of every legal pair; f16 and bf16 elements are their bit patterns.
+#define __VX_DXA_RED_G(op, ty, T, OP, RT)                                                          \
+  inline void vx_dxa_reduce_global_##op##_##ty(T* gdst, const T* src, uint32_t size) {             \
+    vx_dxa_reduce_global(gdst, src, size, OP, RT);                                                 \
+  }
+#define __VX_DXA_RED_C(op, ty, T, OP, RT)                                                          \
+  inline void vx_dxa_reduce_cluster_##op##_##ty(T* dst, const T* src, uint32_t size, uint64_t* mbar) { \
+    vx_dxa_reduce_cluster(dst, src, size, mbar, OP, RT);                                           \
+  }
+__VX_DXA_RED_G(and, b32, uint32_t, DXA_RED_AND, DXA_RT_U32)
+__VX_DXA_RED_G(or,  b32, uint32_t, DXA_RED_OR,  DXA_RT_U32)
+__VX_DXA_RED_G(xor, b32, uint32_t, DXA_RED_XOR, DXA_RT_U32)
+__VX_DXA_RED_G(and, b64, uint64_t, DXA_RED_AND, DXA_RT_U64)
+__VX_DXA_RED_G(or,  b64, uint64_t, DXA_RED_OR,  DXA_RT_U64)
+__VX_DXA_RED_G(xor, b64, uint64_t, DXA_RED_XOR, DXA_RT_U64)
+__VX_DXA_RED_G(min, u32, uint32_t, DXA_RED_MIN, DXA_RT_U32)
+__VX_DXA_RED_G(min, s32, int32_t,  DXA_RED_MIN, DXA_RT_S32)
+__VX_DXA_RED_G(min, u64, uint64_t, DXA_RED_MIN, DXA_RT_U64)
+__VX_DXA_RED_G(min, s64, int64_t,  DXA_RED_MIN, DXA_RT_S64)
+__VX_DXA_RED_G(min, f16, uint16_t, DXA_RED_MIN, DXA_RT_F16)
+__VX_DXA_RED_G(min, bf16, uint16_t, DXA_RED_MIN, DXA_RT_BF16)
+__VX_DXA_RED_G(max, u32, uint32_t, DXA_RED_MAX, DXA_RT_U32)
+__VX_DXA_RED_G(max, s32, int32_t,  DXA_RED_MAX, DXA_RT_S32)
+__VX_DXA_RED_G(max, u64, uint64_t, DXA_RED_MAX, DXA_RT_U64)
+__VX_DXA_RED_G(max, s64, int64_t,  DXA_RED_MAX, DXA_RT_S64)
+__VX_DXA_RED_G(max, f16, uint16_t, DXA_RED_MAX, DXA_RT_F16)
+__VX_DXA_RED_G(max, bf16, uint16_t, DXA_RED_MAX, DXA_RT_BF16)
+__VX_DXA_RED_G(add, u32, uint32_t, DXA_RED_ADD, DXA_RT_U32)
+__VX_DXA_RED_G(add, s32, int32_t,  DXA_RED_ADD, DXA_RT_S32)
+__VX_DXA_RED_G(add, u64, uint64_t, DXA_RED_ADD, DXA_RT_U64)
+__VX_DXA_RED_G(add, f32, float,    DXA_RED_ADD, DXA_RT_F32)
+__VX_DXA_RED_G(add, f64, double,   DXA_RED_ADD, DXA_RT_F64)
+__VX_DXA_RED_G(add, f16, uint16_t, DXA_RED_ADD, DXA_RT_F16)
+__VX_DXA_RED_G(add, bf16, uint16_t, DXA_RED_ADD, DXA_RT_BF16)
+__VX_DXA_RED_G(inc, u32, uint32_t, DXA_RED_INC, DXA_RT_U32)
+__VX_DXA_RED_G(dec, u32, uint32_t, DXA_RED_DEC, DXA_RT_U32)
+__VX_DXA_RED_C(and, b32, uint32_t, DXA_RED_AND, DXA_RT_U32)
+__VX_DXA_RED_C(or,  b32, uint32_t, DXA_RED_OR,  DXA_RT_U32)
+__VX_DXA_RED_C(xor, b32, uint32_t, DXA_RED_XOR, DXA_RT_U32)
+__VX_DXA_RED_C(add, u32, uint32_t, DXA_RED_ADD, DXA_RT_U32)
+__VX_DXA_RED_C(add, s32, int32_t,  DXA_RED_ADD, DXA_RT_S32)
+__VX_DXA_RED_C(min, u32, uint32_t, DXA_RED_MIN, DXA_RT_U32)
+__VX_DXA_RED_C(min, s32, int32_t,  DXA_RED_MIN, DXA_RT_S32)
+__VX_DXA_RED_C(max, u32, uint32_t, DXA_RED_MAX, DXA_RT_U32)
+__VX_DXA_RED_C(max, s32, int32_t,  DXA_RED_MAX, DXA_RT_S32)
+__VX_DXA_RED_C(inc, u32, uint32_t, DXA_RED_INC, DXA_RT_U32)
+__VX_DXA_RED_C(dec, u32, uint32_t, DXA_RED_DEC, DXA_RT_U32)
+__VX_DXA_RED_C(add, u64, uint64_t, DXA_RED_ADD, DXA_RT_U64)
+#undef __VX_DXA_RED_G
+#undef __VX_DXA_RED_C
+
+// cp.async.bulk.commit_group: closes the warp's open group, even an empty one.
+// funct3 = 6, rs1 field = op, rs2 field = N; no register is read.
+inline void vx_bulk_commit_group(void) {
+  __asm__ volatile (".insn r %0, 6, %1, x0, x0, x0" :: "i"(VX_DXA_EXT_OPCODE), "i"(VX_DXA_FUNCT7) : "memory");
+}
+
+// commit_group, then cp.async.bulk.wait_group 0.
+inline void vx_bulk_wait_all(void) {
+  vx_bulk_commit_group();
+  __asm__ volatile (".insn r %0, 6, %1, x0, x1, x0" :: "i"(VX_DXA_EXT_OPCODE), "i"(VX_DXA_FUNCT7) : "memory");
+}
+
+// fence.proxy.async.global: vx_fence_proxy_async(), and the warp's earlier
+// global stores reach the level the DXA reads and writes, and the core's data
+// cache is invalidated, so that a later generic load sees a DXA write that a
+// wait_group has released. vx_fence_proxy_async_all is fence.proxy.async with
+// no state space, the same fence.
+inline void vx_fence_proxy_async_global(void) {
+  __asm__ volatile (".insn r %0, 7, 1, x0, x1, x0" :: "i"(RISCV_CUSTOM2) : "memory");
+}
+inline void vx_fence_proxy_async_all(void) {
+  __asm__ volatile (".insn r %0, 7, 1, x0, x2, x0" :: "i"(RISCV_CUSTOM2) : "memory");
+}
 #endif // VX_CFG_EXT_MBAR_ENABLE
 
 // Multicast DXA issues read GMEM once and replay SMEM writes to multiple
@@ -992,5 +1207,25 @@ public:
 } // namespace vortex
 
 #endif // __cplusplus
+
+#if defined(__cplusplus) && defined(VX_CFG_EXT_MBAR_ENABLE)
+// cp.async.bulk.wait_group N: holds the warp until every committed group of
+// the warp but the N most recent has its writes performed; operations not
+// yet committed are not waited for. N >= DXA_BG_GROUPS returns at once.
+template <unsigned N>
+inline void vx_bulk_wait_group() {
+  static_assert(N < 32, "wait_group N is 0-31");
+  __asm__ volatile (".insn r %0, 6, %1, x0, x1, x%2" :: "i"(VX_DXA_EXT_OPCODE), "i"(VX_DXA_FUNCT7), "i"(N)
+                    : "memory");
+}
+
+// cp.async.bulk.wait_group.read N: the same, until the groups' sources have been read.
+template <unsigned N>
+inline void vx_bulk_wait_group_read() {
+  static_assert(N < 32, "wait_group.read N is 0-31");
+  __asm__ volatile (".insn r %0, 6, %1, x0, x2, x%2" :: "i"(VX_DXA_EXT_OPCODE), "i"(VX_DXA_FUNCT7), "i"(N)
+                    : "memory");
+}
+#endif
 
 #endif // __VX_DXA_H__

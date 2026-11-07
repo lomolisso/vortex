@@ -1157,7 +1157,11 @@ package VX_gpu_pkg;
 `ifdef VX_CFG_EXT_DXA_ENABLE
 `ifdef DXA_MBAR_ENABLE
     typedef struct packed {
-        logic [INST_ARGS_BITS-5:0] __padding;
+        logic [INST_ARGS_BITS-14:0] __padding;
+        logic [4:0] bg_n;    // a bulk wait_group's N: the rs2 register field
+        logic [1:0] bg_kind; // the rs1 register field: 0 commit_group, 1 wait_group, 2 wait_group.read
+        logic bgop;      // a bulk async-group operation (funct3 = 6)
+        logic store;     // a store or reduction from LMEM (funct3 = 5)
         logic bprefetch; // a global-memory prefetch of a byte range (funct3 = 4)
         logic bload;     // a global-to-LMEM bulk copy (funct3 = 3)
         logic tload;     // a tensor load or prefetch with raw pointers (funct3 = 2)

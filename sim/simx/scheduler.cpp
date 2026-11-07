@@ -88,6 +88,13 @@ Scheduler::Scheduler(const SimContext& ctx, const char* name, Core* core)
 #ifdef VX_CFG_EXT_RASTER_ENABLE
   fwd_is_fragment_.assign(VX_CFG_NUM_WARPS, false);
 #endif
+#ifdef DXA_MBAR_ENABLE
+  UnlockIn.emplace_back(this);
+#elif defined(VX_CFG_EXT_MBAR_ENABLE)
+#line 88
+#else
+#line 83
+#endif
 }
 
 Scheduler::~Scheduler() {}

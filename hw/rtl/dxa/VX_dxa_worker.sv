@@ -31,6 +31,16 @@ module VX_dxa_worker import VX_gpu_pkg::*, VX_dxa_pkg::*; #(
     VX_mem_bus_if.master gmem_bus_if,
 `ifdef DXA_MBAR_ENABLE
     input wire [`VX_CFG_SOCKET_SIZE-1:0][`VX_CFG_LMEM_LOG_SIZE:0] slot_stride,
+    // Cluster-reduction packets, to the row egress.
+    output wire                     amo_valid,
+    output VX_dlmem_pkg::dlmem_req_pkt_t amo_pkt,
+    output wire [DLMEM_CORE_W-1:0]  amo_dst,
+    input  wire                     amo_ready,
+    // Bulk-group completion events, to the issuing core.
+    output wire                     bg_evt_valid,
+    output wire [NC_WIDTH-1:0]      bg_evt_core,
+    output dxa_bg_compl_t           bg_evt,
+    input  wire                     bg_evt_ready,
 `endif
     VX_mem_bus_if.master smem_bus_if
 );
@@ -65,6 +75,9 @@ module VX_dxa_worker import VX_gpu_pkg::*, VX_dxa_pkg::*; #(
 `ifdef DXA_MBAR_ENABLE
     dxa_compl_t                 active_compl;
     wire                        active_bulk;
+    dxa_st_t                    active_st;
+    wire                        active_bg;
+    wire [DXA_BG_SEQ_W-1:0]     active_bg_seq;
 `endif
     wire                        active_is_multicast;
     wire [`VX_CFG_NUM_WARPS-1:0]       active_cta_mask;
@@ -121,6 +134,12 @@ module VX_dxa_worker import VX_gpu_pkg::*, VX_dxa_pkg::*; #(
 
     // smem_wr → setup (completion)
     wire                        transfer_done;
+`ifdef DXA_MBAR_ENABLE
+    wire                        sw_transfer_done;
+    wire                        st_done;
+    wire                        st_progress;
+    assign transfer_done = sw_transfer_done || st_done;
+`endif
     wire [31:0]                 wr_done_count;
     wire                        smem_req_fire;
 
@@ -138,6 +157,11 @@ module VX_dxa_worker import VX_gpu_pkg::*, VX_dxa_pkg::*; #(
     wire [GMEM_DATAW-1:0]       lr_rsp_data;
     wire [TAG_W-1:0]            lr_rsp_tag;
     wire                        lr_rsp_ready;
+    wire                        st_rd_valid;
+    wire [DXA_LMEM_ADDR_W-1:0]  st_rd_addr;
+    wire                        st_rd_ready;
+    wire                        st_rsp_valid;
+    wire [SMEM_BYTES*8-1:0]     st_rsp_data;
 
     VX_mem_bus_if #(
         .DATA_SIZE   (DXA_LMEM_WORD_SIZE),
@@ -176,6 +200,9 @@ module VX_dxa_worker import VX_gpu_pkg::*, VX_dxa_pkg::*; #(
     `ifdef DXA_MBAR_ENABLE
         .active_compl         (active_compl),
         .active_bulk          (active_bulk),
+        .active_st            (active_st),
+        .active_bg            (active_bg),
+        .active_bg_seq        (active_bg_seq),
     `endif
         .active_is_multicast  (active_is_multicast),
         .active_cta_mask      (active_cta_mask),
@@ -225,6 +252,28 @@ module VX_dxa_worker import VX_gpu_pkg::*, VX_dxa_pkg::*; #(
 
     // The request issuer registers its own gmem output (VX_mem_bus_slice), so
     // gmem_bus_if is already a clean flopped producer boundary here.
+`ifdef DXA_MBAR_ENABLE
+    // A store's tokens go to the store engine, its requests share the port.
+    wire st_mode = active_st.en;
+    wire gr_ag_ready, st_ag_ready;
+    assign ag_ready = st_mode ? st_ag_ready : gr_ag_ready;
+
+    VX_mem_bus_if #(
+        .DATA_SIZE (GMEM_BYTES),
+        .TAG_WIDTH (GMEM_TAG_WIDTH)
+    ) gr_bus_if(), st_bus_if();
+
+    assign gmem_bus_if.req_valid = gr_bus_if.req_valid || st_bus_if.req_valid;
+    assign gmem_bus_if.req_data  = st_bus_if.req_valid ? st_bus_if.req_data : gr_bus_if.req_data;
+    assign gr_bus_if.req_ready   = gmem_bus_if.req_ready;
+    assign st_bus_if.req_ready   = gmem_bus_if.req_ready;
+    assign gr_bus_if.rsp_valid   = gmem_bus_if.rsp_valid && ~st_mode;
+    assign st_bus_if.rsp_valid   = gmem_bus_if.rsp_valid && st_mode;
+    assign gr_bus_if.rsp_data    = gmem_bus_if.rsp_data;
+    assign st_bus_if.rsp_data    = gmem_bus_if.rsp_data;
+    assign gmem_bus_if.rsp_ready = st_mode ? st_bus_if.rsp_ready : gr_bus_if.rsp_ready;
+`endif
+
     VX_dxa_gmem_req #(
         .MAX_OUTSTANDING (MAX_OUTSTANDING),
         .GMEM_ADDR_WIDTH (GMEM_ADDR_WIDTH),
@@ -241,8 +290,13 @@ module VX_dxa_worker import VX_gpu_pkg::*, VX_dxa_pkg::*; #(
         .transfer_active    (transfer_active),
         .transfer_start     (pipeline_start),
         .active_uuid        (active_uuid),
+    `ifdef DXA_MBAR_ENABLE
+        .ag_valid           (ag_valid && ~st_mode),
+        .ag_ready           (gr_ag_ready),
+    `else
         .ag_valid           (ag_valid),
         .ag_ready           (ag_ready),
+    `endif
         .ag_cl_addr         (ag_cl_addr),
         .ag_smem_byte_addr  (ag_smem_byte_addr),
         .ag_byte_offset     (ag_byte_offset),
@@ -261,8 +315,10 @@ module VX_dxa_worker import VX_gpu_pkg::*, VX_dxa_pkg::*; #(
         .lmem_rsp_data      (lr_rsp_data),
         .lmem_rsp_tag       (lr_rsp_tag),
         .lmem_rsp_ready     (lr_rsp_ready),
-    `endif
+        .gmem_bus_if        (gr_bus_if),
+    `else
         .gmem_bus_if        (gmem_bus_if),
+    `endif
         .sw_valid           (sw_valid),
         .sw_ready           (sw_ready),
         .sw_tag             (sw_tag),
@@ -331,7 +387,11 @@ module VX_dxa_worker import VX_gpu_pkg::*, VX_dxa_pkg::*; #(
     `else
         .smem_bus_if           (smem_bus_if),
     `endif
+    `ifdef DXA_MBAR_ENABLE
+        .transfer_done         (sw_transfer_done),
+    `else
         .transfer_done         (transfer_done),
+    `endif
         .wr_done_count         (wr_done_count),
         .smem_req_fire         (smem_req_fire),
         .is_multicast          (active_is_multicast),
@@ -370,6 +430,12 @@ module VX_dxa_worker import VX_gpu_pkg::*, VX_dxa_pkg::*; #(
         .reset          (reset),
         .core_id        (active_core_id),
         .uuid           (active_uuid),
+        .word_mode      (st_mode),
+        .word_req_valid (st_rd_valid),
+        .word_req_addr  (st_rd_addr),
+        .word_req_ready (st_rd_ready),
+        .word_rsp_valid (st_rsp_valid),
+        .word_rsp_data  (st_rsp_data),
         .line_req_valid (lr_req_valid),
         .line_req_addr  (lr_req_addr),
         .line_req_tag   (lr_req_tag),
@@ -382,6 +448,64 @@ module VX_dxa_worker import VX_gpu_pkg::*, VX_dxa_pkg::*; #(
         .smem_bus_if    (smem_bus_if)
     );
 
+    // ════════════════════════════════════════════════════════════════════
+    // Store engine (funct3 5): local memory to global memory or a block.
+    // ════════════════════════════════════════════════════════════════════
+    wire st_evt_valid, st_evt_rd, st_evt_wr;
+
+    VX_dxa_st #(
+        .INSTANCE_ID    (`SFORMATF(("%s-st", INSTANCE_ID))),
+        .CL_SIZE        (GMEM_BYTES),
+        .WORD_SIZE      (SMEM_BYTES),
+        .LINE_ADDR_W    (GMEM_ADDR_WIDTH),
+        .GMEM_TAG_WIDTH (GMEM_TAG_WIDTH)
+    ) st_eng (
+        .clk               (clk),
+        .reset             (reset),
+        .start             (pipeline_start),
+        .active            (transfer_active && st_mode),
+        .st                (active_st),
+        .bg                (active_bg),
+        .tma               (ag_tma_wr),
+        .elem_bytes        (ag_elem_bytes),
+        .core_id           (active_core_id),
+        .uuid              (active_uuid),
+        .dst_core          (active_compl.dst_core),
+        .dst_slot          (active_compl.slot),
+        .mbar_off          (active_compl.mbar_off),
+        .ag_valid          (ag_valid && st_mode),
+        .ag_ready          (st_ag_ready),
+        .ag_cl_addr        (ag_cl_addr),
+        .ag_smem_byte_addr (ag_smem_byte_addr),
+        .ag_byte_offset    (ag_byte_offset),
+        .ag_valid_length   (ag_valid_length),
+        .ag_oob            (ag_oob),
+        .ag_last           (ag_last),
+        .rd_valid          (st_rd_valid),
+        .rd_addr           (st_rd_addr),
+        .rd_ready          (st_rd_ready),
+        .rsp_valid         (st_rsp_valid),
+        .rsp_data          (st_rsp_data),
+        .gmem_bus_if       (st_bus_if),
+        .amo_valid         (amo_valid),
+        .amo_pkt           (amo_pkt),
+        .amo_dst           (amo_dst),
+        .amo_ready         (amo_ready),
+        .evt_valid         (st_evt_valid),
+        .evt_read_done     (st_evt_rd),
+        .evt_write_done    (st_evt_wr),
+        .evt_ready         (bg_evt_ready),
+        .done              (st_done),
+        .progress          (st_progress)
+    );
+
+    assign bg_evt_valid    = st_evt_valid;
+    assign bg_evt_core     = active_core_id;
+    assign bg_evt.wid        = active_wid;
+    assign bg_evt.seq        = active_bg_seq;
+    assign bg_evt.read_done  = st_evt_rd;
+    assign bg_evt.write_done = st_evt_wr;
+
 `endif
     // ════════════════════════════════════════════════════════════════════
     // Watchdog
@@ -393,7 +517,11 @@ module VX_dxa_worker import VX_gpu_pkg::*, VX_dxa_pkg::*; #(
         .clk              (clk),
         .reset            (reset),
         .transfer_active  (transfer_active),
+    `ifdef DXA_MBAR_ENABLE
+        .gmem_req_fire    (gmem_req_fire || st_progress),
+    `else
         .gmem_req_fire    (gmem_req_fire),
+    `endif
         .gmem_rsp_valid   (sw_valid && sw_ready),  // any CL delivered to smem_wr
         .smem_req_fire    (smem_req_fire),
         .active_core_id   (active_core_id),

@@ -87,11 +87,22 @@ bool SfuUnit::rtu_trace2_reserve_slot(uint32_t wid) {
 #endif
 
 
+#ifdef DXA_MBAR_ENABLE
+void SfuUnit::on_reset() {
+	dxa_unit_->bg_reset();
+}
+#else
+#line 84
+#endif
 void SfuUnit::on_tick() {
 #ifdef DXA_MBAR_ENABLE
 	while (!dxa_slot_in.empty()) {
 		dxa_unit_->slot_evt(dxa_slot_in.peek());
 		dxa_slot_in.pop();
+	}
+	while (!dxa_unit_->BgStateIn.empty()) {
+		dxa_unit_->bg_state(dxa_unit_->BgStateIn.peek());
+		dxa_unit_->BgStateIn.pop();
 	}
 #else
 #line 85
@@ -466,6 +477,19 @@ void SfuUnit::on_tick() {
 			if (!dxa_unit_->process(trace)) {
 				continue;
 			}
+#ifdef DXA_MBAR_ENABLE
+			// A wait_group's warp stays parked until the bulk-group unit releases it.
+			if (std::get<DxaType>(trace->op_type) == DxaType::BGOP
+			 && std::get<IntrDxaArgs>(trace->instr_ptr->get_args()).bg_op != 0) {
+				release_warp = false;
+			}
+#endif
+#endif
+#if defined(DXA_MBAR_ENABLE)
+#elif defined(VX_CFG_EXT_MBAR_ENABLE)
+#line 454
+#else
+#line 444
 #endif
 		}
 

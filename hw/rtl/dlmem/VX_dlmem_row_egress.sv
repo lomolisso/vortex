@@ -20,6 +20,8 @@
 // bank order, one flit per cycle. After the copy's last beat it sends one
 // completion flit carrying the mbarrier word offset and the box bytes. The
 // flits of one socket follow one path to each core, so they arrive in order.
+// Cluster-reduction packets come whole, one per element, and leave between
+// beats: never inside a beat whose flits are partly sent.
 module VX_dlmem_row_egress import VX_gpu_pkg::*, VX_dlmem_pkg::*; #(
     parameter `STRING INSTANCE_ID = "",
     parameter TAG_WIDTH = 1,
@@ -36,6 +38,11 @@ module VX_dlmem_row_egress import VX_gpu_pkg::*, VX_dlmem_pkg::*; #(
     input  dxa_lmem_attr_t                     beat_attr,
     input  wire [TAG_WIDTH-1:0]                beat_tag,
     output wire                                beat_ready,
+
+    input  wire                                amo_valid,
+    input  dlmem_req_pkt_t                     amo_pkt,
+    input  wire [DLMEM_CORE_W-1:0]             amo_dst,
+    output wire                                amo_ready,
 
     VX_dlmem_bus_if.master                     row_out_if
 );
@@ -102,14 +109,16 @@ module VX_dlmem_row_egress import VX_gpu_pkg::*, VX_dlmem_pkg::*; #(
         end
     end
 
-    wire flit_valid = beat_valid && (has_data || beat_attr.last);
+    wire sel_amo    = amo_valid && (sent_r == '0);
+    wire flit_valid = beat_valid && (has_data || beat_attr.last) && ~sel_amo;
     wire flit_ready;
     wire flit_fire  = flit_valid && flit_ready;
+    assign amo_ready = sel_amo && flit_ready;
 
     // A beat leaves with its last flit; a beat without data or completion
     // carries nothing to send.
-    assign beat_ready = beat_valid && (flit_fire ? (has_data ? (last_data && ~beat_attr.last) : 1'b1)
-                                                 : ~flit_valid);
+    assign beat_ready = beat_valid && ~sel_amo && (flit_fire ? (has_data ? (last_data && ~beat_attr.last) : 1'b1)
+                                                             : ~flit_valid);
 
     always @(posedge clk) begin
         if (reset) begin
@@ -128,9 +137,9 @@ module VX_dlmem_row_egress import VX_gpu_pkg::*, VX_dlmem_pkg::*; #(
     ) out_buf (
         .clk       (clk),
         .reset     (reset),
-        .valid_in  (flit_valid),
+        .valid_in  (flit_valid || sel_amo),
         .ready_in  (flit_ready),
-        .data_in   ({beat_attr.dst_core, flit}),
+        .data_in   (sel_amo ? {amo_dst, amo_pkt} : {beat_attr.dst_core, flit}),
         .data_out  ({row_out_if.dst, row_out_if.data}),
         .valid_out (row_out_if.valid),
         .ready_out (row_out_if.ready)
@@ -141,6 +150,10 @@ module VX_dlmem_row_egress import VX_gpu_pkg::*, VX_dlmem_pkg::*; #(
 
 `ifdef DBG_TRACE_DXA
     always @(posedge clk) begin
+        if (~reset && amo_valid && amo_ready) begin
+            $write("DXA_TL,%0d,ROW_AMO,%s,dst=%0d,addr=0x%0h,byteen=0x%0h,mbar=0x%0h\n",
+                $time, INSTANCE_ID, amo_dst, amo_pkt.addr, amo_pkt.byteen, amo_pkt.mbar_addr);
+        end
         if (~reset && flit_fire) begin
             if (has_data) begin
                 $write("DXA_TL,%0d,ROW_FLIT,%s,dst=%0d,slot=%0d,addr=0x%0h,byteen=0x%0h\n",

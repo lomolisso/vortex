@@ -21,6 +21,11 @@
 #ifdef VX_CFG_VM_ENABLE
 #include "mem/tlb_types.h"
 #endif
+#ifdef DXA_MBAR_ENABLE
+#include "dxa/dxa_bg.h"
+#else
+#line 23
+#endif
 
 namespace vortex {
 
@@ -90,6 +95,14 @@ public:
 #ifdef VX_CFG_EXT_DLMEM_ENABLE
   // Warps the scheduler activated in a cycle (a CTA dispatch or a wspawn), toward the LSU.
   SimChannel<WarpMask> warp_spawn_out;
+#endif
+#ifdef DXA_MBAR_ENABLE
+  // The progress of the core's bulk_group operations, from the socket's DXA.
+  SimChannel<DxaBgCompl> BgComplIn{this, 4};
+#elif defined(VX_CFG_EXT_DXA_ENABLE)
+#line 91
+#else
+#line 88
 #endif
 
 #ifdef VX_CFG_EXT_RASTER_ENABLE

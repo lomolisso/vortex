@@ -27,6 +27,9 @@
 // has returned (after its bank commit), a complete_tx of its bytes on its
 // mbarrier, whose response is dropped. The ack follows the complete_tx's
 // acceptance and carries no data.
+// A DXA cluster reduction's row flit (with an mbarrier) runs the same way,
+// an atomic then its complete_tx, but is posted: its slot frees once the
+// complete_tx is taken, and nothing answers.
 module VX_dlmem_ingress import VX_gpu_pkg::*, VX_dlmem_pkg::*; #(
     parameter `STRING INSTANCE_ID = "",
     parameter NUM_SLOTS = DLMEM_INGRESS_SLOTS,
@@ -92,8 +95,9 @@ module VX_dlmem_ingress import VX_gpu_pkg::*, VX_dlmem_pkg::*; #(
 
 `ifdef DXA_MBAR_ENABLE
     wire is_row   = (req_pkt.op == DLMEM_OP_DXA);
-    wire is_data  = is_row && ~req_pkt.amo_unsigned;
-    wire is_compl = is_row && req_pkt.amo_unsigned;
+    wire is_ramo  = is_row && req_pkt.mbar_valid;
+    wire is_data  = is_row && ~is_ramo && ~req_pkt.amo_unsigned;
+    wire is_compl = is_row && ~is_ramo && req_pkt.amo_unsigned;
 
     wire cx_valid;
     wire lmem_req_valid = req_in_if.valid && ~is_data && free_valid && ~cx_valid;
@@ -152,7 +156,7 @@ module VX_dlmem_ingress import VX_gpu_pkg::*, VX_dlmem_pkg::*; #(
         lmem_attr                  = '0;
         lmem_attr.is_addr_local    = 1'b1;
     `ifdef DXA_MBAR_ENABLE
-        lmem_attr.amo.amo_valid    = (req_pkt.op == DLMEM_OP_AMO) || is_compl;
+        lmem_attr.amo.amo_valid    = (req_pkt.op == DLMEM_OP_AMO) || is_compl || is_ramo;
         lmem_attr.amo.amo_op       = req_pkt.amo_op;
         lmem_attr.amo.amo_unsigned = req_pkt.amo_unsigned && ~is_compl;
     `else
@@ -265,9 +269,11 @@ module VX_dlmem_ingress import VX_gpu_pkg::*, VX_dlmem_pkg::*; #(
     // A completion's slot frees in turn without a response; an async slot's
     // ack waits for its complete_tx.
     reg [NUM_SLOTS-1:0] posted_r;
+    reg [NUM_SLOTS-1:0] ramo_r;
     wire              cx_ok    = ~async_r[head_slot] || cx_sent_r[head_slot] || cx_fire;
     wire              rsp_send = ~cpl_empty && ~posted_r[head_slot] && cx_ok;
-    wire              rsp_fire = ~cpl_empty && (posted_r[head_slot] || (rsp_buf_ready && cx_ok));
+    wire              rsp_fire = ~cpl_empty && (posted_r[head_slot] ? (~ramo_r[head_slot] || cx_ok)
+                                                                     : (rsp_buf_ready && cx_ok));
 `elsif VX_CFG_EXT_MBAR_ENABLE
     wire              cx_ok    = ~async_r[head_slot] || cx_sent_r[head_slot] || cx_fire;
     wire              rsp_send = ~cpl_empty && cx_ok;
@@ -311,7 +317,8 @@ module VX_dlmem_ingress import VX_gpu_pkg::*, VX_dlmem_pkg::*; #(
             end
             if (alloc_s) begin
             `ifdef DXA_MBAR_ENABLE
-                posted_r[s] <= is_compl;
+                posted_r[s] <= is_compl || is_ramo;
+                ramo_r[s]   <= is_ramo;
             `endif
             `ifdef VX_CFG_EXT_MBAR_ENABLE
                 async_r[s]     <= req_pkt.mbar_valid;

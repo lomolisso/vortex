@@ -248,6 +248,31 @@ else
 	@echo "run-cpa-unit: mbarriers are RV64 only; nothing to run at XLEN $(XLEN)"
 endif
 
+# The bulk async-group unit (RV64 only, DXA with mbarriers): directed timing
+# (a satisfied wait pulses its unlock at T+1, a completion at T satisfies a
+# waiting warp's unlock at T+2, a commit at T gives the next operation the new
+# group's seq at T+1, a completed head retires at T+2), the stalls at 63
+# operations in the open group and at 8 committed groups, and the release
+# order of two ready warps; then random operations, commits and waits of every
+# warp against out-of-order read and write completions, every cycle compared
+# with a model of the rule and every unlock checked against the warp's groups.
+# $(1)=CONFIGS
+define bg_unit_case
+	$(MAKE) -C bg_unit clean
+	$(MAKE) -C bg_unit CONFIGS="$(MBAR_LMEM) -DVX_CFG_EXT_DXA_ENABLE $(1)"
+	$(MAKE) -C bg_unit run CONFIGS="$(MBAR_LMEM) -DVX_CFG_EXT_DXA_ENABLE $(1)" OPTS="--seed=1"
+	$(MAKE) -C bg_unit run CONFIGS="$(MBAR_LMEM) -DVX_CFG_EXT_DXA_ENABLE $(1)" OPTS="--seed=2"
+endef
+run-bg-unit:
+ifeq ($(XLEN),64)
+	$(call bg_unit_case,)
+	$(call bg_unit_case,-DVX_CFG_NUM_WARPS=8)
+	$(call bg_unit_case,-DVX_CFG_NUM_WARPS=16 -DVX_CFG_NUM_THREADS=16)
+	$(MAKE) -C bg_unit clean
+else
+	@echo "run-bg-unit: mbarriers are RV64 only; nothing to run at XLEN $(XLEN)"
+endif
+
 # CTA launch path: the KMU's cluster walk under launch-bus back-pressure, and
 # the dispatcher's slot placement across launches checked against SimX's
 # per-launch pointer reset, with 4 and 8 CTA slots. With DLMEM (RV64 only) both
@@ -736,6 +761,7 @@ clean:
 	$(MAKE) -C lmem_switch clean
 	$(MAKE) -C mem_unit clean
 	$(MAKE) -C mbar_waiters clean
+	$(MAKE) -C bg_unit clean
 	$(MAKE) -C tcu_fedp clean
 	$(MAKE) -C cta_dispatcher clean
 	$(MAKE) -C kmu clean

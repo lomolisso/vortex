@@ -44,6 +44,16 @@ tests:
     xlen: [64]
     run: "make -C hw/unittest run-cpa-unit"
     touches: [hw/rtl/core/VX_cpa_unit.sv, hw/unittest/cpa_unit, hw/rtl/VX_gpu_pkg.sv, hw/unittest/Makefile]
+  # The bulk async-group unit (RV64, DXA with mbarriers): directed timing of
+  # the waits, commits, retirement and unlock pulses, the stalls at 8 committed
+  # groups and 63 pending operations, and random operations, commits and waits
+  # against out-of-order read and write completions, at 4, 8 and 16 warps.
+  - id: hw-bg-unit
+    via: script
+    xlen: [64]
+    run: "make -C hw/unittest run-bg-unit"
+    touches: [hw/rtl/core/VX_bg_unit.sv, hw/unittest/bg_unit, hw/rtl/dxa/VX_dxa_pkg.sv, hw/rtl/VX_gpu_pkg.sv,
+              hw/unittest/Makefile, hw/rtl/dlmem/VX_dlmem_pkg.sv, hw/rtl/libs, hw/unittest/common.mk]
   # CTA dispatcher and KMU: slot placement across launches, each launch opening
   # at slot 0 as SimX's does, with 4 and 8 CTA slots. In the xlen-64 tree the
   # same benches also run in DLMEM builds: the cluster rank on every launch beat
@@ -98,7 +108,7 @@ tests:
     via: script
     run: "make -C hw/unittest/dxa_core clean && make -C hw/unittest/dxa_core run"
     touches: [hw/rtl/dxa, hw/rtl/VX_gpu_pkg.sv, hw/rtl/VX_define.vh, hw/unittest/dxa_core,
-              hw/unittest/common.mk, sw/common/dxa_ref.h, sw/common/dxa_meta.h]
+              hw/unittest/common.mk, sw/common/dxa_ref.h, sw/common/dxa_meta.h, sw/common/amo_ref.h]
   # DXA bulk copy (RV64, DXA with mbarriers): the engine's LMEM line reader at
   # DMA words narrower than, equal to and wider than a line, under random
   # back-pressure and response delay; byte-exact memory and completion attr; then
@@ -109,7 +119,8 @@ tests:
     run: "make -C hw/unittest run-dxa-bulk"
     touches: &dxa_bulk_bench_touches [hw/rtl/dxa, hw/rtl/VX_gpu_pkg.sv, hw/rtl/VX_define.vh,
               hw/rtl/dlmem/VX_dlmem_pkg.sv, hw/unittest/dxa_core, hw/unittest/Makefile,
-              hw/unittest/common.mk, sw/common/dxa_ref.h, sw/common/dxa_meta.h]
+              hw/unittest/common.mk, sw/common/dxa_ref.h, sw/common/dxa_meta.h,
+              hw/rtl/dlmem/VX_dlmem_row_egress.sv, sw/common/amo_ref.h]
   # The same bench with 4 cores, so a cluster holds 4 blocks and the cluster
   # multicast vectors (masks 0b11 and 0b1010, a multicast global bulk load) run.
   - id: hw-dxa-bulk-mc
@@ -146,14 +157,22 @@ tests:
     run: "make -C tests/unittest/mbar_ref run"
     touches: [sw/common/mbar_ref.h, tests/unittest/mbar_ref, tests/regression/mbar_ops/scripts.h,
               tests/regression/mbar_ops/common.h]
-  # The DXA tensor-load golden model: the PTX §5.5.7 swizzle tables cell for
-  # cell, the three §5.5.4 im2col examples pixel for pixel, the complete_tx
-  # counts, per-element fill with signed coordinates and element strides, the
-  # encodings and the order of the asserts.
+  # The DXA golden model: the PTX §5.5.7 swizzle tables cell for cell, the
+  # three §5.5.4 im2col examples pixel for pixel, the complete_tx counts,
+  # per-element fill with signed coordinates and element strides, the
+  # encodings and the order of the asserts; the stores' byte map, the
+  # reduction tables and semantics, the store and bulk-group encodings.
   - id: sw-dxa-ref
     via: script
     run: "make -C tests/unittest/dxa_ref run"
-    touches: [sw/common/dxa_ref.h, sw/common/dxa_meta.h, tests/unittest/dxa_ref]
+    touches: [sw/common/dxa_ref.h, sw/common/dxa_meta.h, sw/common/amo_ref.h, tests/unittest/dxa_ref]
+  # The SimX twin of the bulk async-group unit, with the same cycle rules.
+  - id: sw-bg-unit
+    via: script
+    xlen: [64]
+    run: "make -C tests/unittest/bg_unit run"
+    touches: [sim/simx/bg_unit.h, sim/simx/bg_unit.cpp, sim/simx/dxa/dxa_bg.h, sim/simx/Makefile,
+              tests/unittest/bg_unit, tests/unittest/Makefile]
   # The SimX twin of the line reader at 4, 8 and 16 banks.
   - id: sw-dxa-bulk
     via: script

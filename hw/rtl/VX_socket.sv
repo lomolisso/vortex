@@ -714,6 +714,9 @@ module VX_socket import VX_gpu_pkg::*, VX_tlb_pkg::*;
         .DATAW (VX_dlmem_pkg::DLMEM_REQ_DATAW),
         .DST_W (DLMEM_CORE_W)
     ) dxa_row_if();
+    // Bulk-group completion events, per core.
+    wire [`VX_CFG_SOCKET_SIZE-1:0] per_core_bg_compl_valid;
+    dxa_bg_compl_t [`VX_CFG_SOCKET_SIZE-1:0] per_core_bg_compl;
 `endif
 
     VX_dxa_core #(
@@ -733,6 +736,8 @@ module VX_socket import VX_gpu_pkg::*, VX_tlb_pkg::*;
     `ifdef DXA_MBAR_ENABLE
         .row_out_if       (dxa_row_if),
         .slot_stride      (per_core_slot_stride),
+        .bg_compl_valid   (per_core_bg_compl_valid),
+        .bg_compl         (per_core_bg_compl),
     `endif
         `UNUSED_PIN (busy)
     );
@@ -971,6 +976,8 @@ module VX_socket import VX_gpu_pkg::*, VX_tlb_pkg::*;
         `endif
         `ifdef DXA_MBAR_ENABLE
             .dxa_slot_stride(per_core_slot_stride[core_id]),
+            .dxa_bg_compl_valid (per_core_bg_compl_valid[core_id]),
+            .dxa_bg_compl   (per_core_bg_compl[core_id]),
         `endif
 
         `ifdef VX_CFG_EXT_TEX_ENABLE

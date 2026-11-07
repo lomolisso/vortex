@@ -138,7 +138,7 @@ void DlmemIngress::on_tick() {
     SlotIn.pop();
   }
   if (!NetReqIn.empty() && NetReqIn.peek().dxa) {
-    if (this->accept_dxa(NetReqIn.peek())) {
+    if (NetReqIn.peek().mbar_valid ? this->accept_dxa_red(NetReqIn.peek()) : this->accept_dxa(NetReqIn.peek())) {
       NetReqIn.pop();
     }
   } else
@@ -212,7 +212,7 @@ void DlmemIngress::on_tick() {
 #endif
 #ifdef DXA_MBAR_ENABLE
   // A COMPL's complete_tx sends nothing: its slot frees in turn.
-  if (!done_.empty() && slots_.at(done_.front()).posted) {
+  if (!done_.empty() && slots_.at(done_.front()).posted && (!slots_.at(done_.front()).mbar || cx_ok)) {
     DT(4, this->name() << " retire posted slot" << done_.front());
     slots_.at(done_.front()) = Slot();
     done_.pop_front();
@@ -296,5 +296,38 @@ MemReq DlmemIngress::complete_tx(uint32_t s) const {
              uint32_t(slots_.size() + s), 0, slot.uuid);
   req.flags.local = 1;
   return req;
+}
+#endif
+#ifdef DXA_MBAR_ENABLE
+// A cluster reduction's element: its atomic, then its complete_tx, then the
+// slot frees as posted, with no response.
+bool DlmemIngress::accept_dxa_red(const DlmemReqPkt& pkt) {
+  if (LmemDmaOut.size() != 0 || LmemReqOut.full() || this->cx_valid())
+    return false;
+  int32_t s = -1;
+  for (uint32_t i = 0; i < slots_.size(); ++i) {
+    if (!slots_[i].busy) {
+      s = i;
+      break;
+    }
+  }
+  if (s < 0)
+    return false;
+  this->check_slot(pkt);
+  auto& slot = slots_[s];
+  slot = Slot();
+  slot.busy      = true;
+  slot.posted    = true;
+  slot.mbar      = true;
+  slot.mbar_addr = pkt.mbar_addr;
+  slot.bytes     = __builtin_popcountll(pkt.byteen);
+  slot.uuid      = pkt.uuid;
+  MemReq req(pkt.op, config_.lmem_base + pkt.lmem_addr, pkt.data, pkt.byteen, uint32_t(s), pkt.hart_id, pkt.uuid);
+  req.flags = pkt.flags;
+  req.flags.local = 1;
+  req.flags.strsp = 0;
+  LmemReqOut.send(req, 1);
+  DT(3, this->name() << " dxa red in, slot" << s << ": " << pkt);
+  return true;
 }
 #endif

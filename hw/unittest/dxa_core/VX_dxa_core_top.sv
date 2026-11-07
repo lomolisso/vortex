@@ -76,6 +76,13 @@ module VX_dxa_core_top import VX_gpu_pkg::*, VX_dxa_pkg::*; #(
     output wire [`VX_CFG_SOCKET_SIZE-1:0]                       lmem_rsp_ready,
     // Each requesting core's slot stride (cluster multicasts).
     input  wire [`VX_CFG_SOCKET_SIZE-1:0][`VX_CFG_LMEM_LOG_SIZE:0] slot_stride,
+    // DLMEM row flits (cluster reductions), and bulk-group completion events.
+    output wire                                                 row_out_valid,
+    output wire [VX_dlmem_pkg::DLMEM_REQ_DATAW-1:0]             row_out_data,
+    output wire [DLMEM_CORE_W-1:0]                              row_out_dst,
+    input  wire                                                 row_out_ready,
+    output wire [`VX_CFG_SOCKET_SIZE-1:0]                       bg_compl_valid,
+    output wire [`VX_CFG_SOCKET_SIZE-1:0][$bits(dxa_bg_compl_t)-1:0] bg_compl,
 `endif
 
     // -----------------------------------------------------------------------
@@ -183,10 +190,13 @@ module VX_dxa_core_top import VX_gpu_pkg::*, VX_dxa_pkg::*; #(
         .DST_W (DLMEM_CORE_W)
     ) row_out_if();
 
-    assign row_out_if.ready = 1'b1;
-    `UNUSED_VAR (row_out_if.valid)
-    `UNUSED_VAR (row_out_if.data)
-    `UNUSED_VAR (row_out_if.dst)
+    assign row_out_if.ready = row_out_ready;
+    assign row_out_valid    = row_out_if.valid;
+    assign row_out_data     = row_out_if.data;
+    assign row_out_dst      = row_out_if.dst;
+
+    dxa_bg_compl_t [`VX_CFG_SOCKET_SIZE-1:0] bg_compl_w;
+    assign bg_compl = bg_compl_w;
 `endif
 
     VX_dxa_core #(
@@ -206,6 +216,8 @@ module VX_dxa_core_top import VX_gpu_pkg::*, VX_dxa_pkg::*; #(
     `ifdef DXA_MBAR_ENABLE
         .row_out_if        (row_out_if),
         .slot_stride       (slot_stride),
+        .bg_compl_valid    (bg_compl_valid),
+        .bg_compl          (bg_compl_w),
     `endif
         .busy              (busy)
     );

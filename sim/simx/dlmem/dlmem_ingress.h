@@ -93,9 +93,12 @@ private:
 #ifdef DXA_MBAR_ENABLE
   // Takes the head DXA flit if it can; false leaves it at the head.
   bool accept_dxa(const DlmemReqPkt& pkt);
+  bool accept_dxa_red(const DlmemReqPkt& pkt);
   void check_slot(const DlmemReqPkt& pkt) const;
 
   std::vector<bool> slot_valid_;
+#else
+#line 99
 #endif
 #ifdef VX_CFG_EXT_MBAR_ENABLE
   bool cx_valid() const;

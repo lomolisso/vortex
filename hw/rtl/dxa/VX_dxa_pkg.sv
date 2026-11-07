@@ -67,10 +67,58 @@ package VX_dxa_pkg;
         logic [DXA_CTA_GEN_W-1:0]  gen;      // a local receiver's slot generation
     } dxa_mc_peer_t;
 
+    // Bulk async-groups: committed groups tracked per warp, and the open
+    // group's sequence number that tags each operation.
+    localparam DXA_BG_GROUPS = 8;
+    localparam DXA_BG_SEQ_W  = `CLOG2(DXA_BG_GROUPS);
+
+    localparam DXA_BG_KIND_OP        = 2'd0;
+    localparam DXA_BG_KIND_COMMIT    = 2'd1;
+    localparam DXA_BG_KIND_WAIT      = 2'd2;
+    localparam DXA_BG_KIND_WAIT_READ = 2'd3;
+
+    // One per DXA instruction of a warp, at its send.
+    typedef struct packed {
+        logic [NW_WIDTH-1:0]       wid;
+        logic [1:0]                kind;     // DXA_BG_KIND_*
+        logic [4:0]                n;        // the wait's N
+    } dxa_bg_evt_t;
+
+    // A bulk_group operation's progress, back to its core.
+    typedef struct packed {
+        logic [NW_WIDTH-1:0]       wid;
+        logic [DXA_BG_SEQ_W-1:0]   seq;
+        logic                      read_done;   // its last LMEM source read returned
+        logic                      write_done;  // its writes are performed
+    } dxa_bg_compl_t;
+
+    // Store family (funct3 5) kinds.
+    localparam DXA_ST_BULK    = 3'd0;  // shared::cta -> global
+    localparam DXA_ST_TENSOR  = 3'd1;
+    localparam DXA_ST_RED_G   = 3'd2;  // bulk reduction into global memory
+    localparam DXA_ST_RED_C   = 3'd3;  // bulk reduction into a cluster block
+    localparam DXA_ST_RED_T   = 3'd4;  // tensor reduction into global memory
+
+    // A store-family transfer: it reads the issuer's local memory at
+    // smem_addr and writes, or reduces into, global memory or a block.
+    typedef struct packed {
+        logic                            en;
+        logic [2:0]                      kind;      // DXA_ST_*
+        amo_op_e                         amo_op;
+        logic                            amo_uns;
+        logic                            w8;        // 8-byte words (elements)
+        logic [1:0]                      tsize;     // log2 of the type's bytes
+        logic [HART_ID_WIDTH-1:0]        hart_id;
+    } dxa_st_t;
+
 `endif
     // DXA request data — core → DXA control path.
     typedef struct packed {
     `ifdef DXA_MBAR_ENABLE
+        dxa_st_t                         st;
+        // A bulk_group operation (a store or a global reduction) and its group.
+        logic                            bg;
+        logic [DXA_BG_SEQ_W-1:0]         bg_seq;
         logic                            tload;        // funct3 2: a tensor load or prefetch
         logic                            bload;        // funct3 3: a global-to-LMEM bulk copy
         logic                            prefetch;     // reads only (tensor prefetch, funct3 4)

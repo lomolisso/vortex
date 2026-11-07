@@ -47,7 +47,8 @@ interface VX_warp_ctl_if import VX_gpu_pkg::*; ();
     wire [`VX_CFG_NUM_WARPS-1:0] dlmem_drained;
 `endif
 `ifdef VX_CFG_EXT_MBAR_ENABLE
-    // Per warp: no cp.async copy or arrive left; an exit waits for it, a barrier does not.
+    // Per warp: no cp.async copy or arrive, nor a bulk_group source read, left; an exit
+    // waits for it, a barrier does not.
     wire [`VX_CFG_NUM_WARPS-1:0] cpa_idle;
 `endif
 

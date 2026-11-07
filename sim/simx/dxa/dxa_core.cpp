@@ -190,6 +190,59 @@ public:
     uint64_t                first_line = 0;      // the first cycle its address generator emits a line
     uint64_t                tok_start  = 0;      // the cycle smem_wr's current line began to drain
     dxa_ref::Desc           ref;                 // the descriptor, decoded by the golden model
+    // A store-family transfer: the walk runs from the issuer's local memory
+    // (the request's smem side) to global memory, or to a cluster block.
+    // addr_gen sends an in-bounds token's local-memory reads, one a cycle,
+    // and moves on at its last; the responses are assembled in order, one a
+    // cycle, into the token's line image; a complete token waits in the
+    // one-entry output slot, which emits its requests one a cycle.
+    struct StRead {
+      uint64_t word = 0;                     // the physical word read
+      std::array<bool, DxaCore::LMEM_PORTS_PER_CORE> got{};
+      std::array<uint8_t, DxaCore::LMEM_ROW_SIZE> data{};
+      bool     done = false;
+      uint64_t at = 0;                       // the cycle its last block landed
+    };
+    struct StByte {
+      uint32_t line_off;                     // in the token's line
+      uint64_t phys;                         // its local-memory source byte
+    };
+    struct StTok {
+      LineWork lw;
+      std::vector<StByte> bytes;
+      uint32_t reads = 0;
+      uint32_t got = 0;
+      std::array<uint8_t, VX_CFG_L1_LINE_SIZE> img{};
+      uint64_t mask = 0;
+    };
+    struct StWork {
+      uint32_t kind = 0;
+      uint32_t op = 0;
+      uint32_t type = 0;
+      uint64_t dst = 0;                      // a cluster reduction's destination
+      std::vector<uint64_t> rd;              // addr_gen's token: its reads
+      uint32_t rd_sent = 0;
+      std::deque<StRead> reads;              // sent, not yet assembled (the credits)
+      std::deque<StTok> toks;                // their tokens, in order
+      bool     slot_valid = false;
+      bool     slot_freed = false;           // emptied in this cycle
+      uint64_t slot_at = 0;                  // its first emission cycle
+      StTok    slot;
+      std::vector<std::pair<uint32_t, uint64_t>> emits;   // the slot's requests: line offset, byte enables there
+      uint32_t emit_idx = 0;
+      uint32_t writes = 0;
+      uint32_t amo_sent = 0;
+      uint32_t amo_rcvd = 0;
+      uint64_t last_line = 0;
+      uint64_t last_wr = 0;                  // the cycle the last write was accepted
+      bool     fence_sent = false;
+      bool     rd_done = false;
+      bool     wr_done = false;
+      bool     wr_new = false;               // write_done in this cycle
+      uint64_t end_at = 0;
+    };
+    bool                    store = false;
+    StWork                  st;
 #else
 #line 137
 #endif
@@ -220,7 +273,17 @@ public:
     for (auto& q : cs_q_) {
       q.clear();
     }
+    for (auto& q : bg_evq_) {
+      q.clear();
+    }
+    std::fill(bg_rr_.begin(), bg_rr_.end(), 0);
+    for (auto& w : workers_) {
+      w.store = false;
+      w.st = Worker::StWork();
+    }
     lmem_rr_ = 0;
+    red_buf_.clear();
+    red_rr_ = 0;
 #else
 #line 153
 #endif
@@ -310,6 +373,13 @@ public:
         auto& rsp = ch.peek();
         uint32_t slot_id = uint32_t(rsp.tag) & (VX_CFG_DXA_MAX_INFLIGHT - 1);
         auto& w = workers_[worker_id];
+#ifdef DXA_MBAR_ENABLE
+        if (w.store) {
+          this->store_gmem_rsp(w);
+        } else
+#else
+#line 254
+#endif
         if (slot_id < w.inflight.size() && w.inflight[slot_id].allocated) {
           w.inflight[slot_id].rsp_arrived = true;
           w.inflight[slot_id].rsp_data    = rsp.data;
@@ -320,13 +390,14 @@ public:
 
 #ifdef DXA_MBAR_ENABLE
     this->drain_lmem_rsp();
+    this->tick_bg_events();
     this->tick_core_switch();
     this->tick_stream();
     // While a bulk copy runs, the workers' bus operations pass the RTL's
     // lmem_arb one a cycle, in round-robin order.
     lmem_arb_ = false;
     for (auto& w : workers_) {
-      lmem_arb_ |= (w.state == WState::RUNNING && w.req.bulk);
+      lmem_arb_ |= (w.state == WState::RUNNING && (w.req.bulk || w.store));
     }
     if (lmem_arb_) {
       this->tick_lmem_arb();
@@ -485,6 +556,11 @@ private:
     w.swz_mask   = 0;
     w.first_line = 0;
     w.tok_start  = 0;
+    w.store      = false;
+    if (req.store) {
+      this->start_store(w);
+      return;
+    }
     this->load_receivers(w, req);
     if (req.bulk) {
       this->start_bulk(w);
@@ -736,7 +812,7 @@ private:
   // ── gmem_req: issue MemReqs with available inflight slots ────────────
   void tick_worker_gmem_req(Worker& w) {
 #ifdef DXA_MBAR_ENABLE
-    if (w.req.bulk) {
+    if (w.req.bulk || w.store) {
       return;
     }
     if (w.first_line != 0 && SimPlatform::instance().cycles() < w.first_line) {
@@ -1188,6 +1264,10 @@ private:
   // output buffer does.
   void tick_stream() {
     auto& out = simobject_->row_out;
+    // A cluster reduction's packet takes the egress when no copy beat is half
+    // sent, ahead of a waiting beat.
+    this->tick_red_arb();
+    const bool red_taken = row_flits_.empty() && this->egress_red();
     if (!row_flits_.empty()) {
       if (out.full())
         return;
@@ -1214,6 +1294,8 @@ private:
       stream_.pop();
       return;
     }
+    if (red_taken)
+      return;
     if (switched ? !this->core_switch_empty() : !this->core_inputs_empty())
       return;
     this->load_row_beat(head);
@@ -2004,6 +2086,10 @@ private:
   // registers load.
   void tick_lmem_arb() {
     for (auto& w : workers_) {
+      if (w.state == WState::RUNNING && w.store) {
+        this->store_pre(w);
+        continue;
+      }
       if (w.state != WState::RUNNING || !w.req.bulk)
         continue;
       if (w.issued_order.empty() && w.ag_idx == w.work_list.size()) {
@@ -2024,7 +2110,9 @@ private:
         continue;
       const uint32_t writes = w.writes_emitted;
       lmem_sent_ = false;
-      if (w.req.bulk) {
+      if (w.store) {
+        this->store_bus_op(w);
+      } else if (w.req.bulk) {
         this->bulk_bus_op(w);
       } else {
         this->tick_worker_smem_wr(w);
@@ -2034,7 +2122,9 @@ private:
       }
     }
     for (auto& w : workers_) {
-      if (w.state == WState::RUNNING && w.req.bulk) {
+      if (w.state == WState::RUNNING && w.store) {
+        this->store_post(w);
+      } else if (w.state == WState::RUNNING && w.req.bulk) {
         this->bulk_capture(w);
       }
     }
@@ -2163,6 +2253,10 @@ private:
   void bulk_fill(uint32_t p, const MemRsp& rsp, uint64_t at) {
     const uint32_t blk = p % kWordBlocks;
     auto& w = workers_.at(uint32_t(rsp.tag) / VX_CFG_DXA_MAX_INFLIGHT);
+    if (w.store) {
+      this->store_fill(w, blk, rsp, at);
+      return;
+    }
     Worker::RdLine* e = nullptr;
     for (auto& l : w.rd_lines) {
       if (l.filled.at(blk) < kLineReads) {
@@ -2188,6 +2282,554 @@ private:
          << (cycle_ - at) << " (#" << rsp.uuid << ")");
     }
   }
+
+  // ── The store family (LMEM → global memory, or a cluster block) ──────
+  static MemOp red_memop(uint32_t code) {
+    switch (code) {
+    case dxa_ref::AMO_ADD: return MemOp::AMO_ADD;
+    case dxa_ref::AMO_XOR: return MemOp::AMO_XOR;
+    case dxa_ref::AMO_OR:  return MemOp::AMO_OR;
+    case dxa_ref::AMO_AND: return MemOp::AMO_AND;
+    case dxa_ref::AMO_MIN: return MemOp::AMO_MIN;
+    case dxa_ref::AMO_MAX: return MemOp::AMO_MAX;
+#ifdef VX_CFG_EXT_FPAMO_ENABLE
+    case dxa_ref::AMO_INC:      return MemOp::AMO_INC;
+    case dxa_ref::AMO_DEC:      return MemOp::AMO_DEC;
+    case dxa_ref::AMO_FADD:     return MemOp::AMO_FADD;
+    case dxa_ref::AMO_FADD2:    return MemOp::AMO_FADD2;
+    case dxa_ref::AMO_FADD2_BF: return MemOp::AMO_FADD2_BF;
+    case dxa_ref::AMO_FMIN2:    return MemOp::AMO_FMIN2;
+    case dxa_ref::AMO_FMAX2:    return MemOp::AMO_FMAX2;
+    case dxa_ref::AMO_FMIN2_BF: return MemOp::AMO_FMIN2_BF;
+    case dxa_ref::AMO_FMAX2_BF: return MemOp::AMO_FMAX2_BF;
+#endif
+    default:
+      std::cerr << "*** DXA reduction without an atomic: op=0x" << std::hex << code << std::dec << std::endl;
+      std::abort();
+    }
+  }
+
+  // The walk is a load's of the same box: a tensor store's descriptor and
+  // coordinates, or a bulk operation's synthetic rank-1 descriptor over its
+  // destination (global, or a cluster block's local memory). Its local-memory
+  // side is the source in the issuer's block.
+  void start_store(Worker& w) {
+    DxaReq& req = w.req;
+    w.store = true;
+    w.st = Worker::StWork();
+    auto& st = w.st;
+    st.kind = req.st_kind;
+    st.op   = req.red_op;
+    st.type = req.red_type;
+    w.rd_lines.clear();
+    w.pend_slot  = UINT32_MAX;
+    w.defer_slot = UINT32_MAX;
+    w.xfer_base  = 0;
+    w.rcv_writes.clear();
+    w.rcvs.clear();
+    w.smem_stride = 0;
+    const bool tensor = dxa_ref::is_tensor(st.kind);
+    if (tensor) {
+      w.desc = descriptors_.at(req.desc_slot);
+      // VX_dxa_setup's order: the reduction type's size, then the layout,
+      // then the load's descriptor rules, then the coordinates.
+      const dxa_ref::Desc d = ref_desc(w.desc);
+      if (st.kind == dxa_ref::ST_RED_TENSOR && dxa_ref::type_bytes(st.type) != d.elem) {
+        this->dxa_abort(w, dxa_ref::MSG_RED_SIZE);
+      }
+      if (d.layout != dxa_ref::LAYOUT_ROW) {
+        this->dxa_abort(w, dxa_ref::MSG_ST_LAYOUT);
+      }
+    } else {
+      DxaReq b = req;
+      st.dst    = req.smem_addr;
+      b.gsrc    = (st.kind == dxa_ref::ST_RED_CLUSTER) ? req.smem_addr : req.gdst;
+      b.prefetch = false;
+      w.desc = bulk_desc(b);
+      req.smem_addr = req.src_addr;
+      req.blk_off   = 0;
+    }
+    this->setup_ptx(w);
+    w.first_line = req.sent + ptx_first_line(std::max(w.ref.rank, 1u));
+    if (tensor) {
+      const uint64_t extent = this->box_extent(w);
+      if (extent > req.win_room) {
+        this->dxa_abort(w, "DXA box exceeds the destination block: " + std::to_string(extent)
+                        + " bytes, room " + std::to_string(req.win_room));
+      }
+      dxa_ref::Req q;
+      for (uint32_t i = 0; i < dxa_ref::MAX_RANK; ++i) {
+        q.coord[i] = int32_t(req.coords[i]);
+      }
+      if (const char* msg = dxa_ref::check_tensor_store(w.ref, q, uint32_t(req.blk_off))) {
+        this->dxa_abort(w, msg);
+      }
+    } else {
+      w.ptx = true;
+    }
+    this->enumerate_ptx(w);
+    if (w.work_list.empty()) {
+      this->dxa_abort(w, "invalid DXA rank: no work for the box");
+    }
+    w.state = WState::RUNNING;
+    DT(3, simobject_->name() << "[" << w.worker_id << "] store start: core=" << req.core->id() << ", wid="
+       << req.wid << ", kind=" << st.kind << ", src=0x" << std::hex << req.src_addr << ", gdst=0x" << req.gdst
+       << ", dst=0x" << st.dst << std::dec << ", size=" << req.size << ", slot=" << req.desc_slot
+       << ", tokens=" << w.work_list.size() << ", seq=" << req.bg_seq << " (#" << req.uuid << ")");
+  }
+
+  // A token's bytes, in line order: (line offset, physical source byte).
+  void store_bytes(const Worker& w, const LineWork& lw, Worker::StTok& t) const {
+    const uint32_t num  = lw.km_num_elems ? lw.km_num_elems : 1;
+    const uint32_t wlen = lw.valid_length;
+    const uint32_t step = lw.src_step ? lw.src_step : wlen;
+    const bool tiled = desc_dest_tiled(w.desc.meta);
+    const uint32_t t_eb = desc_elem_bytes(w.desc.meta);
+    const uint32_t t_ratio  = tiled ? std::max<uint32_t>(1u, 4u / t_eb) : 1u;
+    const uint32_t t_tcN    = tiled ? desc_geo_tcn(w.desc) : 1u;
+    const uint32_t t_bkK    = tiled ? desc_geo_bkk(w.desc) : 1u;
+    const uint32_t t_nsteps = tiled ? std::max<uint32_t>(1u, uint32_t(w.desc.tile_sizes[0]) / t_tcN) : 1u;
+    for (uint32_t e = 0; e < num; ++e) {
+      uint64_t dense;
+      if (tiled) {
+        const uint32_t de = tiled_dest_elem(DestLayout(lw.dest_layout), lw.tile_k_row, lw.tile_n_base + e,
+                                            t_ratio, t_tcN, t_nsteps, t_bkK);
+        dense = w.req.smem_addr + uint64_t(de) * t_eb;
+      } else {
+        dense = lw.smem_word_addr + lw.smem_byte_offset + uint64_t(e) * lw.km_lane_stride;
+      }
+      for (uint32_t b = 0; b < wlen; ++b) {
+        t.bytes.push_back({lw.cl_byte_offset + e * step + b, this->swizzle(w, dense + b)});
+      }
+    }
+  }
+
+  // Its reads: one per local-memory word its source spans, ascending, each
+  // at the physical word the swizzle moves that word to; one per element for
+  // a gather (or a scattering layout).
+  std::vector<uint64_t> store_reads(const Worker& w, const LineWork& lw) const {
+    constexpr uint64_t kRowMask = ~uint64_t(kRowSize - 1);
+    std::vector<uint64_t> rd;
+    const uint32_t num = lw.km_num_elems ? lw.km_num_elems : 1;
+    const uint64_t s = lw.smem_word_addr + lw.smem_byte_offset;
+    if (lw.src_step != 0 || num > 1) {
+      Worker::StTok t;
+      this->store_bytes(w, lw, t);
+      for (uint32_t e = 0; e < num; ++e) {
+        rd.push_back(t.bytes.at(e * lw.valid_length).phys & kRowMask);
+      }
+      return rd;
+    }
+    for (uint64_t a = s & kRowMask; a < s + lw.valid_length; a += kRowSize) {
+      rd.push_back(this->swizzle(w, a) & kRowMask);
+    }
+    return rd;
+  }
+
+  // addr_gen's cycle: an out-of-bounds token is taken without a request; an
+  // in-bounds token sends its next read when a credit and the bus allow, and
+  // leaves with its last one.
+  void store_bus_op(Worker& w) {
+    auto& st = w.st;
+    if (w.ag_idx >= w.work_list.size() || SimPlatform::instance().cycles() < w.first_line)
+      return;
+    const LineWork& lw = w.work_list.at(w.ag_idx);
+    if (lw.oob) {
+      ++w.ag_idx;
+      return;
+    }
+    if (st.rd.empty()) {
+      st.rd = this->store_reads(w, lw);
+      st.rd_sent = 0;
+    }
+    if (st.reads.size() >= kStCredits || lmem_taken_)
+      return;
+    lmem_taken_ = true;
+    const uint32_t cid = w.req.core->id() % kCoresPerSocket;
+    const bool to_stream = !stream_.empty();
+    if (to_stream ? stream_.full() : !this->bulk_bus_ready(cid))
+      return;
+    const uint64_t word = st.rd.at(st.rd_sent);
+    StreamBeat sb;
+    sb.core  = cid;
+    sb.count = kWordBlocks;
+    sb.ready = cycle_ + 1;
+    for (uint32_t p = 0; p < kWordBlocks; ++p) {
+      MemReq req;
+      req.op        = MemOp::LD;
+      req.addr      = word + uint64_t(p) * kLmemWordSize;
+      req.tag       = w.worker_id * VX_CFG_DXA_MAX_INFLIGHT;
+      req.hart_id   = w.req.core->id();
+      req.uuid      = w.req.uuid;
+      req.flags.dma = 1;
+      req.dxa.bulk  = true;
+      sb.writes.at(p) = req;
+      sb.ports.at(p)  = cid * kWordBlocks + p;
+    }
+    if (to_stream) {
+      stream_.push(sb);
+    } else {
+      this->bulk_send(sb);
+    }
+    if (st.rd_sent == 0) {
+      // The token joins the assembly with its first read, whose response may
+      // land before its last read goes.
+      Worker::StTok t;
+      t.lw    = lw;
+      t.reads = uint32_t(st.rd.size());
+      this->store_bytes(w, lw, t);
+      st.toks.push_back(std::move(t));
+    }
+    Worker::StRead r;
+    r.word = word;
+    st.reads.push_back(r);
+    DT(3, simobject_->name() << "[" << w.worker_id << "] store rd: addr=0x" << std::hex << word << std::dec
+       << ", token=" << w.ag_idx << ", read=" << st.rd_sent << " (#" << w.req.uuid << ")");
+    lmem_sent_ = true;
+    if (++st.rd_sent < st.rd.size())
+      return;
+    st.rd.clear();
+    st.rd_sent = 0;
+    ++w.ag_idx;
+  }
+
+  // A read's blocks land in order per port.
+  void store_fill(Worker& w, uint32_t blk, const MemRsp& rsp, uint64_t at) {
+    Worker::StRead* r = nullptr;
+    for (auto& e : w.st.reads) {
+      if (!e.got.at(blk)) {
+        r = &e;
+        break;
+      }
+    }
+    __assert(r != nullptr && rsp.data, simobject_->name() << " DXA store read response without a read");
+    r->got.at(blk) = true;
+    if (kRowSize > kLmemWordSize) {
+      std::memcpy(r->data.data() + blk * kLmemWordSize, rsp.data->data(), kLmemWordSize);
+    } else {
+      std::memcpy(r->data.data(), rsp.data->data() + (r->word & (kLmemWordSize - 1)), kRowSize);
+    }
+    for (bool g : r->got) {
+      if (!g)
+        return;
+    }
+    r->done = true;
+    r->at   = at;
+  }
+
+  // The output slot's requests: the store's one write; a global reduction's
+  // words holding token bytes, ascending; a cluster reduction's elements.
+  void store_load_slot(Worker& w, Worker::StTok&& t) {
+    auto& st = w.st;
+    st.slot = std::move(t);
+    st.slot_valid = true;
+    st.slot_at = cycle_ + 1;
+    st.emit_idx = 0;
+    st.emits.clear();
+    auto& sl = st.slot;
+    if (st.kind == dxa_ref::ST_BULK || st.kind == dxa_ref::ST_TENSOR) {
+      st.emits.push_back({0, sl.mask});
+      return;
+    }
+    const uint32_t wb = (st.kind == dxa_ref::ST_RED_CLUSTER) ? dxa_ref::type_bytes(st.type)
+                                                             : dxa_ref::red_word_bytes(st.type);
+    const uint64_t wmask = (wb == 8) ? 0xffull : 0xfull;
+    const bool half = (dxa_ref::type_bytes(st.type) == 2);
+    for (uint32_t off = 0; off < VX_CFG_L1_LINE_SIZE; off += wb) {
+      const uint64_t m = (sl.mask >> off) & wmask;
+      if (m == 0)
+        continue;
+      // A 16-bit pair cut by the box edge sends only its half's bytes.
+      __assert(m == wmask || (half && (m == 0x3 || m == 0xc)),
+               simobject_->name() << " DXA reduction word partly covered: off=" << off);
+      st.emits.push_back({off, m});
+    }
+  }
+
+  // The cycle's start for a store worker: its end, then the output slot's
+  // request toward global memory, then the store's trailing fence.
+  void store_pre(Worker& w) {
+    auto& st = w.st;
+    if (st.end_at != 0 && cycle_ >= st.end_at) {
+      DT(3, simobject_->name() << "[" << w.worker_id << "] store end (#" << w.req.uuid << ")");
+      this->finish_worker(w);
+      return;
+    }
+    auto& ch = gmem_arb_->ReqIn.at(w.worker_id);
+    const bool st_amo = (st.kind != dxa_ref::ST_BULK && st.kind != dxa_ref::ST_TENSOR);
+    if (st_amo && st.slot_valid
+        && (st.amo_sent - st.amo_rcvd >= kStAmoWindow
+         || (st.amo_sent != 0 && st.slot.lw.gmem_cl_addr != st.last_line && st.amo_sent - st.amo_rcvd > 1))) {
+      return;
+    }
+    if (st.slot_valid && st.slot_at <= cycle_ && st.kind != dxa_ref::ST_RED_CLUSTER) {
+      const auto& sl = st.slot;
+      const uint64_t line = sl.lw.gmem_cl_addr;
+      auto blk = make_mem_block();
+      std::memcpy(blk->data(), sl.img.data(), VX_CFG_L1_LINE_SIZE);
+      MemReq mreq;
+      mreq.tag  = 0;
+      mreq.uuid = w.req.uuid;
+      mreq.data = blk;
+      if (st.kind == dxa_ref::ST_BULK || st.kind == dxa_ref::ST_TENSOR) {
+        mreq.op      = MemOp::ST;
+        mreq.addr    = line;
+        mreq.byteen  = sl.mask;
+        mreq.hart_id = w.req.core->id();
+      } else {
+        const uint32_t off = st.emits.at(st.emit_idx).first;
+        const auto amo = dxa_ref::red_amo(st.op, st.type);
+        mreq.op      = red_memop(amo.amo_op);
+        mreq.addr    = line + off;
+        mreq.byteen  = st.emits.at(st.emit_idx).second << off;
+        mreq.hart_id = w.req.hart_id;
+        mreq.flags.amo_unsigned = amo.is_unsigned;
+      }
+      if (ch.try_send(mreq)) {
+        DT(3, simobject_->name() << "[" << w.worker_id << "] store " << (mreq.op == MemOp::ST ? "wr" : "amo")
+           << ": addr=0x" << std::hex << mreq.addr << ", byteen=0x" << mreq.byteen << ", word=0x"
+           << *reinterpret_cast<const uint64_t*>(blk->data() + (uint32_t(mreq.addr & (VX_CFG_L1_LINE_SIZE - 1)) & ~7u)) << std::dec
+           << " (#" << w.req.uuid << ")");
+        if (mreq.op == MemOp::ST) {
+          ++st.writes;
+          st.last_line = line;
+          st.last_wr = cycle_;
+        } else {
+          ++st.amo_sent;
+          st.last_line = line;
+        }
+        if (++st.emit_idx == st.emits.size()) {
+          st.slot_valid = false;
+          st.slot_freed = true;
+        }
+      }
+      return;
+    }
+    const bool stores = (st.kind == dxa_ref::ST_BULK || st.kind == dxa_ref::ST_TENSOR);
+    if (stores && st.writes != 0 && !st.fence_sent && this->store_drained(w) && cycle_ > st.last_wr) {
+      MemReq f;
+      f.op          = MemOp::LD;
+      f.addr        = st.last_line;
+      f.tag         = 0;
+      f.hart_id     = w.req.core->id();
+      f.uuid        = w.req.uuid;
+      f.flags.fence = 1;
+      if (ch.try_send(f)) {
+        st.fence_sent = true;
+        DT(3, simobject_->name() << "[" << w.worker_id << "] store fence: line=0x" << std::hex << f.addr
+           << std::dec << " (#" << w.req.uuid << ")");
+      }
+    }
+  }
+
+  // Every token taken, assembled and emitted.
+  bool store_drained(const Worker& w) const {
+    const auto& st = w.st;
+    return w.ag_idx >= w.work_list.size() && st.rd.empty() && st.reads.empty() && st.toks.empty()
+        && !st.slot_valid;
+  }
+
+  // An AMO response, or the fence's.
+  void store_gmem_rsp(Worker& w) {
+    auto& st = w.st;
+    if (st.kind == dxa_ref::ST_BULK || st.kind == dxa_ref::ST_TENSOR) {
+      __assert(st.fence_sent && !st.wr_done, simobject_->name() << " DXA store response without its fence");
+      st.wr_done = true;
+      st.wr_new  = true;
+      return;
+    }
+    __assert(st.amo_rcvd < st.amo_sent, simobject_->name() << " DXA reduction response without a request");
+    ++st.amo_rcvd;
+    if (st.amo_rcvd == st.amo_sent && this->store_drained(w)) {
+      st.wr_done = true;
+      st.wr_new  = true;
+    }
+  }
+
+  // The cycle's end for a store worker: assembly of the oldest landed
+  // response, then the operation's completions.
+  void store_post(Worker& w) {
+    this->store_step(w);
+    w.st.slot_freed = false;
+    w.st.wr_new = false;
+  }
+
+  void store_step(Worker& w) {
+    auto& st = w.st;
+    // A token's last response waits while the output slot stays full.
+    if (!st.reads.empty() && st.reads.front().done && st.reads.front().at < cycle_
+        && (st.toks.front().got + 1 < st.toks.front().reads || !st.slot_valid || st.slot_freed)) {
+      const auto& r = st.reads.front();
+      auto& t = st.toks.front();
+      for (const auto& b : t.bytes) {
+        if (b.phys >= r.word && b.phys < r.word + kRowSize) {
+          t.img.at(b.line_off) = r.data.at(b.phys - r.word);
+          t.mask |= uint64_t(1) << b.line_off;
+        }
+      }
+      st.reads.pop_front();
+      if (++t.got == t.reads) {
+        Worker::StTok done = std::move(t);
+        st.toks.pop_front();
+        this->store_load_slot(w, std::move(done));
+      }
+    }
+    if (st.end_at != 0)
+      return;
+    const bool reads_over = w.ag_idx >= w.work_list.size() && st.rd.empty() && st.reads.empty()
+                         && st.toks.empty();
+    if (st.kind == dxa_ref::ST_RED_CLUSTER) {
+      if (reads_over && !st.slot_valid) {
+        st.end_at = cycle_ + kStEndDelay;
+      }
+      return;
+    }
+    const bool rd_new = !st.rd_done && reads_over;
+    if (rd_new) {
+      st.rd_done = true;
+      const bool stores = (st.kind == dxa_ref::ST_BULK || st.kind == dxa_ref::ST_TENSOR);
+      const bool none = stores ? (st.writes == 0 && !st.slot_valid) : (st.amo_sent == 0 && !st.slot_valid);
+      if (none) {
+        st.wr_done = true;
+        st.wr_new  = true;
+      }
+    }
+    if (!st.wr_done && !st.slot_valid && st.amo_sent != 0 && st.amo_rcvd == st.amo_sent
+        && this->store_drained(w)) {
+      st.wr_done = true;
+      st.wr_new  = true;
+    }
+    if (rd_new || st.wr_new) {
+      DxaBgCompl c;
+      c.wid        = w.req.wid;
+      c.seq        = w.req.bg_seq;
+      c.read_done  = rd_new;
+      c.write_done = st.wr_new;
+      bg_evq_.at(w.worker_id).push_back({c, cycle_ + kBgEvtDelay, w.req.core->id() % kCoresPerSocket});
+      DT(3, simobject_->name() << "[" << w.worker_id << "] bg-compl " << c << " (#" << w.req.uuid << ")");
+    }
+    if (st.wr_new) {
+      st.end_at = cycle_ + kStEndDelay;
+    }
+  }
+
+  // Whether worker w's output slot offers a cluster reduction's packet now.
+  bool red_offer(const Worker& w) const {
+    const auto& st = w.st;
+    return w.state == WState::RUNNING && w.store && st.kind == dxa_ref::ST_RED_CLUSTER && st.slot_valid
+        && st.slot_at <= cycle_;
+  }
+
+  // Worker w's next element packet; its slot frees with the last one.
+  DlmemReqPkt red_take(Worker& w) {
+    constexpr uint64_t lmem_mask = (uint64_t(1) << VX_CFG_LMEM_LOG_SIZE) - 1;
+    auto& st = w.st;
+    const auto& sl = st.slot;
+    const uint32_t eb  = dxa_ref::type_bytes(st.type);
+    const uint32_t off = st.emits.at(st.emit_idx).first;
+    const uint64_t addr = sl.lw.gmem_cl_addr + off;
+    const uint32_t boff = uint32_t(addr & (VX_CFG_MEM_BLOCK_SIZE - 1));
+    const auto amo = dxa_ref::red_amo(st.op, st.type);
+    auto blk = make_mem_block();
+    std::memset(blk->data(), 0, blk->size());
+    std::memcpy(blk->data() + boff, sl.img.data() + off, eb);
+    DlmemReqPkt f;
+    f.dst        = w.req.dst_core;
+    f.src        = w.req.src_core;
+    f.op         = red_memop(amo.amo_op);
+    f.lmem_addr  = addr & lmem_mask;
+    f.data       = blk;
+    f.byteen     = ((eb == 8) ? 0xffull : 0xfull) << boff;
+    f.hart_id    = w.req.hart_id;
+    f.tag        = w.req.slot;
+    f.uuid       = w.req.uuid;
+    f.dxa        = true;
+    f.mbar_valid = true;
+    f.mbar_addr  = (uint64_t(w.req.mbar_off) << 3) & lmem_mask;
+    f.flags.amo_unsigned = amo.is_unsigned;
+    if (++st.emit_idx == st.emits.size()) {
+      st.slot_valid = false;
+      st.slot_freed = true;
+    }
+    return f;
+  }
+
+  // With several workers their packets meet in a round-robin arbiter whose
+  // two-entry output buffer is registered: a packet it takes in a cycle
+  // reaches the row egress the next one.
+  void tick_red_arb() {
+    const uint32_t n = uint32_t(workers_.size());
+    if (n < 2 || red_buf_.size() >= 2)
+      return;
+    for (uint32_t k = 0; k < n; ++k) {
+      const uint32_t i = (red_rr_ + k) % n;
+      if (!this->red_offer(workers_.at(i)))
+        continue;
+      red_buf_.push_back({this->red_take(workers_.at(i)), cycle_ + 1});
+      red_rr_ = (i + 1) % n;
+      return;
+    }
+  }
+
+  // A cluster reduction's next element packet to the row egress: the
+  // arbiter's head, or with one worker its output slot's.
+  bool egress_red() {
+    auto& out = simobject_->row_out;
+    if (out.full())
+      return false;
+    if (workers_.size() > 1) {
+      if (red_buf_.empty() || red_buf_.front().second > cycle_)
+        return false;
+      const DlmemReqPkt f = red_buf_.front().first;
+      red_buf_.pop_front();
+      out.send(f, 0);
+      DT(3, simobject_->name() << " red pkt: " << f);
+      return true;
+    }
+    for (auto& w : workers_) {
+      if (!this->red_offer(w))
+        continue;
+      const DlmemReqPkt f = this->red_take(w);
+      out.send(f, 0);
+      DT(3, simobject_->name() << "[" << w.worker_id << "] red pkt: " << f);
+      return true;
+    }
+    return false;
+  }
+
+  // Each core's arbiter passes one ready event a cycle, in round-robin worker
+  // order; the core sees it the cycle after.
+  void tick_bg_events() {
+    const uint32_t n = uint32_t(workers_.size());
+    for (uint32_t c = 0; c < kCoresPerSocket; ++c) {
+      for (uint32_t k = 0; k < n; ++k) {
+        const uint32_t i = (bg_rr_.at(c) + k) % n;
+        auto& q = bg_evq_.at(i);
+        if (q.empty() || q.front().at > cycle_ || q.front().core != c)
+          continue;
+        simobject_->BgComplOut.at(c).send(q.front().c, 1);
+        q.pop_front();
+        bg_rr_.at(c) = (i + 1) % n;
+        break;
+      }
+    }
+  }
+
+  // A worker's reads in flight or waiting for assembly.
+  static constexpr uint32_t kStCredits = 8;
+  // Atomics a worker has toward the last-level cache before their responses:
+  // the hardware path (the engine's output slice, the socket arbiter's output
+  // buffer and the cache bank) holds this many while the bank holds admission.
+  // The path is in order, so the first atomic of the next line, which may go
+  // to another bank, waits until at most one of the line before is unanswered.
+  static constexpr uint32_t kStAmoWindow = 5;
+  // The engine registers what is seen here (the reads assembled, the last
+  // response arrived) before it is a completion condition. The core sees the
+  // event three cycles after that, through the worker's event register, its
+  // elastic buffer and the core arbiter's output register; the worker ends
+  // the cycle after the condition.
+  static constexpr uint64_t kBgEvtDelay = 3;
+  static constexpr uint64_t kStEndDelay = 2;
 #else
 #line 1194
 #endif
@@ -2245,6 +2887,19 @@ private:
   // Per core: a bulk copy's accesses in the engine's output stage at a
   // larger socket, a cycle each before the core switch takes them.
   std::vector<std::deque<StreamBeat>> cs_q_ = std::vector<std::deque<StreamBeat>>(kCoresPerSocket);
+  // Per worker: its bulk-group completion events and the cycle each reaches
+  // the per-core arbiter; per core: that arbiter's round-robin start.
+  struct BgEv {
+    DxaBgCompl c;
+    uint64_t   at;     // the cycle it reaches its core's arbiter
+    uint32_t   core;   // socket-relative
+  };
+  std::vector<std::deque<BgEv>> bg_evq_ = std::vector<std::deque<BgEv>>(VX_CFG_NUM_DXA_CORES);
+  std::vector<uint32_t> bg_rr_ = std::vector<uint32_t>(kCoresPerSocket, 0);
+  // The workers' cluster-reduction arbiter: its registered output buffer
+  // (packet, the cycle it reaches the row egress) and round-robin start.
+  std::deque<std::pair<DlmemReqPkt, uint64_t>> red_buf_;
+  uint32_t red_rr_ = 0;
 #else
 #line 935
 #endif
@@ -2266,6 +2921,7 @@ DxaCore::DxaCore(const SimContext& ctx, const char* name, Socket* socket)
 #ifdef DXA_MBAR_ENABLE
   , row_out(this)
   , lmem_rsp_in(kCoresPerSocket * LMEM_PORTS_PER_CORE, this)
+  , BgComplOut(kCoresPerSocket, this)
 #else
 #line 950
 #endif

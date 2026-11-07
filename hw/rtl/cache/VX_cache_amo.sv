@@ -614,8 +614,20 @@ module VX_cache_amo import VX_gpu_pkg::*; #(
             ("%t: atomic not supported at this site: op=%0d width=%0d addr=0x%0h", $time, amo_st1.amo_op, width_st1, addr_st1))
         // A float or inc/dec atomic is a naturally aligned word or doubleword of its lane.
         wire st1_is_fpamo = (amo_st1.amo_op >= AMO_OP_INC);
+    `ifdef DXA_MBAR_ENABLE
+        // A DXA reduction's 16-bit pair at a box edge: one half of a packed op,
+        // computed in lane 0 of the float unit and written back alone.
+        wire st1_half = ((amo_st1.amo_op == AMO_OP_FADD2) || (amo_st1.amo_op == AMO_OP_FADD2_BF)
+                      || (amo_st1.amo_op == AMO_OP_FMIN2) || (amo_st1.amo_op == AMO_OP_FMAX2)
+                      || (amo_st1.amo_op == AMO_OP_FMIN2_BF) || (amo_st1.amo_op == AMO_OP_FMAX2_BF))
+                     && ((lane_byteen_st1 == LANE_SIZE'(8'h03)) || (lane_byteen_st1 == LANE_SIZE'(8'h0c))
+                      || (lane_byteen_st1 == LANE_SIZE'(8'h30)) || (lane_byteen_st1 == LANE_SIZE'(8'hc0)));
+        wire st1_be_ok = (lane_byteen_st1 == LANE_SIZE'(8'h0f)) || (lane_byteen_st1 == LANE_SIZE'(8'hf0))
+                      || (lane_byteen_st1 == LANE_SIZE'(8'hff)) || st1_half;
+    `else
         wire st1_be_ok = (lane_byteen_st1 == LANE_SIZE'(8'h0f)) || (lane_byteen_st1 == LANE_SIZE'(8'hf0))
                       || (lane_byteen_st1 == LANE_SIZE'(8'hff));
+    `endif
         `RUNTIME_ASSERT (~(amo_st1.amo_valid && valid_st1 && is_creq_st1 && st1_is_fpamo && ~st1_be_ok),
             ("%t: atomic is not naturally aligned (addr=0x%0h byteen=0x%h)", $time, addr_st1, lane_byteen_st1))
 

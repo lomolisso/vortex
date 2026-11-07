@@ -63,6 +63,8 @@ module VX_scheduler import VX_gpu_pkg::*; #(
     VX_sched_unlock_if.slave cpa_unlock_if [`VX_CFG_NUM_LSU_BLOCKS],
 `endif
 `ifdef DXA_MBAR_ENABLE
+    // the release of a warp stalled by a bulk wait_group
+    VX_sched_unlock_if.slave bg_unlock_if,
     // CTA slot state, for the DXA's retired-slot checks
     output wire [`VX_CFG_NUM_WARPS-1:0] cta_slot_valid,
     output wire [`VX_CFG_NUM_WARPS-1:0][DXA_CTA_GEN_W-1:0] cta_slot_gen,
@@ -234,12 +236,24 @@ module VX_scheduler import VX_gpu_pkg::*; #(
     // then wgmma wait_groups, per TCU block.
 `ifdef VX_CFG_EXT_MBAR_ENABLE
     // then cp.async wait_groups, per LSU block
+`ifdef DXA_MBAR_ENABLE
+    // then bulk wait_groups, one input
+`ifdef TCU_WG_GROUPS_ENABLE
+    localparam NUM_UNLOCKS = `VX_CFG_NUM_LSU_BLOCKS + `VX_CFG_NUM_TCU_BLOCKS + `VX_CFG_NUM_LSU_BLOCKS + 1;
+    localparam CPA_UNLOCK0 = `VX_CFG_NUM_LSU_BLOCKS + `VX_CFG_NUM_TCU_BLOCKS;
+`else
+    localparam NUM_UNLOCKS = `VX_CFG_NUM_LSU_BLOCKS + `VX_CFG_NUM_LSU_BLOCKS + 1;
+    localparam CPA_UNLOCK0 = `VX_CFG_NUM_LSU_BLOCKS;
+`endif
+    localparam BG_UNLOCK = NUM_UNLOCKS - 1;
+`else
 `ifdef TCU_WG_GROUPS_ENABLE
     localparam NUM_UNLOCKS = `VX_CFG_NUM_LSU_BLOCKS + `VX_CFG_NUM_TCU_BLOCKS + `VX_CFG_NUM_LSU_BLOCKS;
     localparam CPA_UNLOCK0 = `VX_CFG_NUM_LSU_BLOCKS + `VX_CFG_NUM_TCU_BLOCKS;
 `else
     localparam NUM_UNLOCKS = `VX_CFG_NUM_LSU_BLOCKS + `VX_CFG_NUM_LSU_BLOCKS;
     localparam CPA_UNLOCK0 = `VX_CFG_NUM_LSU_BLOCKS;
+`endif
 `endif
 `elsif TCU_WG_GROUPS_ENABLE
     localparam NUM_UNLOCKS = `VX_CFG_NUM_LSU_BLOCKS + `VX_CFG_NUM_TCU_BLOCKS;
@@ -277,6 +291,14 @@ module VX_scheduler import VX_gpu_pkg::*; #(
         `RUNTIME_ASSERT(~(unlock_valid[U] && schedule_fire && (schedule_wid == unlock_wid[U])),
             ("%s cp.async unlock of the warp being scheduled: block=%0d, wid=%0d", INSTANCE_ID, i, unlock_wid[U]))
     end
+`endif
+`ifdef DXA_MBAR_ENABLE
+    assign unlock_valid[BG_UNLOCK] = bg_unlock_if.valid;
+    assign unlock_wid[BG_UNLOCK]   = bg_unlock_if.wid;
+    `RUNTIME_ASSERT(~unlock_valid[BG_UNLOCK] || stalled_warps[unlock_wid[BG_UNLOCK]],
+        ("%s bulk wait_group unlock of a warp that is not stalled: wid=%0d", INSTANCE_ID, unlock_wid[BG_UNLOCK]))
+    `RUNTIME_ASSERT(~(unlock_valid[BG_UNLOCK] && schedule_fire && (schedule_wid == unlock_wid[BG_UNLOCK])),
+        ("%s bulk wait_group unlock of the warp being scheduled: wid=%0d", INSTANCE_ID, unlock_wid[BG_UNLOCK]))
 `endif
 `endif
 `ifdef VX_CFG_EXT_MBAR_ENABLE

@@ -517,3 +517,207 @@ __kernel void gload_k(bulk_arg_t* __UNIFORM__ arg) {
   cl.sync();
   finish(arg, b, tid, nthr, err, tries);
 }
+
+// -g rc, rcwin (and -x rcself): cluster reductions. Every block fills its
+// local memory with canaries, its sources and its destinations with the
+// pairs' values, arms its
+// mbarrier with the bytes it will receive and meets the cluster; warp 0 then
+// reduces each source into the same pair's destination of rank (r + 1) % K
+// through the window, each element completing on that block's mbarrier;
+// every block waits for its phase and dumps its local memory.
+__kernel void red_k(bulk_arg_t* __UNIFORM__ arg) {
+  const uint32_t tid  = threadIdx.x;
+  const uint32_t nthr = blockDim.x;
+  const uint32_t b    = blockIdx.x;
+  const vortex::cluster_group cl = vortex::this_cluster();
+  const uint32_t r    = cl.block_rank();
+  auto lm   = reinterpret_cast<uint8_t*>(__local_mem());
+  auto lw   = reinterpret_cast<volatile uint32_t*>(lm);
+  auto mbar = reinterpret_cast<uint64_t*>(lm + arg->lm_mbar);
+  const uint32_t words = arg->lmem_bytes / sizeof(uint32_t);
+  const uint32_t pairs = rc_count(arg);
+
+  if (tid == 0)
+    record(arg, b, r);
+  if (arg->neg) {
+    // -x rcself: rank 0 reduces into its own block through local pointers.
+    if (tid == 0)
+      vx_mbar_init(mbar, 1);
+    __syncthreads();
+    if (r == 0 && get_sub_group_id() == 0)
+      vx_dxa_reduce_cluster(lm + lm_dst(arg), lm + LM_SRC, arg->size, mbar, DXA_RED_ADD, DXA_RT_U32);
+    idle_cycles(arg->linger);
+    auto out = reinterpret_cast<uint32_t*>(arg->err_addr) + (b * nthr + tid) * ERR_WORDS;
+    out[ERR_DONE] = 1;
+    return;
+  }
+  for (uint32_t w = tid; w < words; w += nthr) {
+    if (w / 2 != arg->lm_mbar / 8)
+      lw[w] = canary_word(b, w);
+  }
+  __syncthreads();
+  for (uint32_t j = 0; j < pairs; ++j) {
+    const uint32_t E = rc_elem(rc_pair(arg, j)), n = rc_size(arg, j) / E;
+    for (uint32_t e = tid; e < 2 * n; e += nthr) {
+      const uint32_t role = e / n, x = e % n;
+      uint8_t* p = lm + (role ? rc_dst_off(arg, j) : rc_src_off(arg, j)) + x * E;
+      const uint64_t v = rc_val(b, role, j, x, E);
+      if (E == 8)
+        *reinterpret_cast<volatile uint64_t*>(p) = v;
+      else
+        *reinterpret_cast<volatile uint32_t*>(p) = (uint32_t)v;
+    }
+  }
+  if (tid == 0) {
+    vx_mbar_init(mbar, 1);
+    vx_mbar_arrive_tx(mbar, rc_incoming(arg));
+  }
+  vx_fence_proxy_async();
+  cl.sync();
+
+  if (get_sub_group_id() == 0) {
+    const uint32_t q = (r + 1) % arg->k;
+    uint64_t* qmbar = cl.map_shared_rank(mbar, q);
+    for (uint32_t j = 0; j < pairs; ++j) {
+      const uint32_t i = rc_pair(arg, j);
+      vx_dxa_reduce_cluster(cl.map_shared_rank(lm + rc_dst_off(arg, j), q), lm + rc_src_off(arg, j),
+                            rc_size(arg, j), qmbar, rc_op(i), rc_type(i));
+    }
+  }
+
+  uint32_t tries = 0;
+  const uint32_t err = wait_phase(mbar, 0, &tries);
+  dump_lmem(arg, b, tid, nthr);
+  cl.sync();
+  finish(arg, b, tid, nthr, err, tries);
+}
+
+// -g rcloc (and -x rcclu): GK_RCWIN through local pointers. The cluster runs
+// on one core; rank r addresses rank q = (r + 1) % K's destination and
+// mbarrier at its own local base plus (slot q - slot r) block strides, the
+// slots read from the blocks' records. -x rcclu: rank 0 reduces into the
+// first slot of the core outside its cluster.
+__kernel void redl_k(bulk_arg_t* __UNIFORM__ arg) {
+  const uint32_t tid  = threadIdx.x;
+  const uint32_t nthr = blockDim.x;
+  const uint32_t b    = blockIdx.x;
+  const vortex::cluster_group cl = vortex::this_cluster();
+  const uint32_t r    = cl.block_rank();
+  auto lm   = reinterpret_cast<uint8_t*>(__local_mem());
+  auto lw   = reinterpret_cast<volatile uint32_t*>(lm);
+  auto mbar = reinterpret_cast<uint64_t*>(lm + arg->lm_mbar);
+  auto recs = reinterpret_cast<const volatile uint32_t*>(arg->rec_addr);
+  const uint32_t words = arg->lmem_bytes / sizeof(uint32_t);
+  const uint32_t pairs = rc_count(arg);
+  const uint32_t slot  = get_local_group_id();
+  auto local_of = [&](uint32_t s) { return lm + ((int64_t)s - (int64_t)slot) * (int64_t)arg->lmem_bytes; };
+
+  if (tid == 0)
+    record(arg, b, r);
+  __atomic_thread_fence(__ATOMIC_SEQ_CST);
+  if (arg->neg) {
+    if (tid == 0)
+      vx_mbar_init(mbar, 1);
+    cl.sync();
+    if (r == 0 && get_sub_group_id() == 0) {
+      uint32_t t = 0;
+      for (bool used = true; used; ) {
+        used = false;
+        for (uint32_t q = 0; q < arg->k; ++q)
+          used |= (recs[(b - r + q) * REC_WORDS + REC_SLOT] == t);
+        t += used;
+      }
+      uint8_t* other = local_of(t);
+      vx_dxa_reduce_cluster(other + rc_dst_base(arg), lm + LM_SRC, arg->size,
+                            reinterpret_cast<uint64_t*>(other + arg->lm_mbar), DXA_RED_ADD, DXA_RT_U32);
+    }
+    idle_cycles(arg->linger);
+    auto out = reinterpret_cast<uint32_t*>(arg->err_addr) + (b * nthr + tid) * ERR_WORDS;
+    out[ERR_DONE] = 1;
+    return;
+  }
+  for (uint32_t w = tid; w < words; w += nthr) {
+    if (w / 2 != arg->lm_mbar / 8)
+      lw[w] = canary_word(b, w);
+  }
+  __syncthreads();
+  for (uint32_t j = 0; j < pairs; ++j) {
+    const uint32_t E = rc_elem(rc_pair(arg, j)), n = rc_size(arg, j) / E;
+    for (uint32_t e = tid; e < 2 * n; e += nthr) {
+      const uint32_t role = e / n, x = e % n;
+      uint8_t* p = lm + (role ? rc_dst_off(arg, j) : rc_src_off(arg, j)) + x * E;
+      const uint64_t v = rc_val(b, role, j, x, E);
+      if (E == 8)
+        *reinterpret_cast<volatile uint64_t*>(p) = v;
+      else
+        *reinterpret_cast<volatile uint32_t*>(p) = (uint32_t)v;
+    }
+  }
+  if (tid == 0) {
+    vx_mbar_init(mbar, 1);
+    vx_mbar_arrive_tx(mbar, rc_incoming(arg));
+  }
+  vx_fence_proxy_async();
+  cl.sync();
+
+  if (get_sub_group_id() == 0) {
+    const uint32_t q = (r + 1) % arg->k;
+    uint8_t* qlm = local_of(recs[(b - r + q) * REC_WORDS + REC_SLOT]);
+    for (uint32_t j = 0; j < pairs; ++j) {
+      const uint32_t i = rc_pair(arg, j);
+      vx_dxa_reduce_cluster(qlm + rc_dst_off(arg, j), lm + rc_src_off(arg, j), rc_size(arg, j),
+                            reinterpret_cast<uint64_t*>(qlm + arg->lm_mbar), rc_op(i), rc_type(i));
+    }
+  }
+
+  uint32_t tries = 0;
+  const uint32_t err = wait_phase(mbar, 0, &tries);
+  dump_lmem(arg, b, tid, nthr);
+  cl.sync();
+  finish(arg, b, tid, nthr, err, tries);
+}
+
+// -g rcp: timed cluster reductions. Rounds of: every block arms its mbarrier
+// with the bytes it receives and meets the cluster; warp 0 reduces its source
+// into rank (r + 1) % K's destination through the window, completing on that
+// block's mbarrier; every block waits for the round's phase. Thread 0 times
+// the rounds from the first reduction to the last phase. No fill and no dump:
+// the checked runs are -g rc and rcwin.
+__kernel void redp_k(bulk_arg_t* __UNIFORM__ arg) {
+  const uint32_t tid  = threadIdx.x;
+  const uint32_t nthr = blockDim.x;
+  const uint32_t b    = blockIdx.x;
+  const vortex::cluster_group cl = vortex::this_cluster();
+  const uint32_t r    = cl.block_rank();
+  auto lm   = reinterpret_cast<uint8_t*>(__local_mem());
+  auto mbar = reinterpret_cast<uint64_t*>(lm + arg->lm_mbar);
+  const uint32_t i = rc_pair(arg, 0);
+
+  if (tid == 0) {
+    record(arg, b, r);
+    vx_mbar_init(mbar, 1);
+  }
+  const uint32_t q = (r + 1) % arg->k;
+  void* qdst = cl.map_shared_rank(lm + rcp_dst(arg), q);
+  uint64_t* qmbar = cl.map_shared_rank(mbar, q);
+  uint32_t tries = 0, err = 0;
+  uint64_t t0 = 0;
+  for (uint32_t round = 0; round < arg->rounds; ++round) {
+    if (tid == 0)
+      vx_mbar_arrive_tx(mbar, arg->size);
+    cl.sync();
+    if (round == 0)
+      t0 = vx_rdcycle();
+    if (get_sub_group_id() == 0)
+      vx_dxa_reduce_cluster(qdst, lm + rcp_src(arg), arg->size, qmbar, rc_op(i), rc_type(i));
+    uint32_t t = 0;
+    err |= wait_phase(mbar, round & 1u, &t);
+    tries += t;
+  }
+  const uint64_t t1 = vx_rdcycle();
+  cl.sync();
+  auto out = reinterpret_cast<uint32_t*>(arg->err_addr) + (b * nthr + tid) * ERR_WORDS;
+  if (tid == 0)
+    out[ERR_CYCLES] = (uint32_t)(t1 - t0);
+  finish(arg, b, tid, nthr, err, tries);
+}

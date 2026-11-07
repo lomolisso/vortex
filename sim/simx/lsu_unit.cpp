@@ -219,9 +219,13 @@ void LsuUnit::on_reset() {
 #ifdef VX_CFG_EXT_DLMEM_ENABLE
 bool LsuUnit::is_acquire_amo(const instr_trace_t* trace) {
 #ifdef DXA_MBAR_ENABLE
-	// A proxy fence releases its warp as an acquire does, when it retires.
+	// A proxy fence releases its warp as an acquire does, when it retires; its
+	// global forms are full fences.
 	auto* lsu_type = std::get_if<LsuType>(&trace->op_type);
 	if (lsu_type && *lsu_type == LsuType::PFENCE)
+		return true;
+	if (lsu_type && *lsu_type == LsuType::FENCE
+	 && std::get<IntrLsuArgs>(trace->instr_ptr->get_args()).red_op != 0)
 		return true;
 #elif defined(VX_CFG_EXT_MBAR_ENABLE)
 #line 203

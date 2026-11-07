@@ -56,6 +56,10 @@ module VX_dxa_setup import VX_gpu_pkg::*, VX_dxa_pkg::*; (
     output wire dxa_compl_t            active_compl,
     // The transfer is a bulk copy: its lines come from the issuer's local memory.
     output wire                        active_bulk,
+    // A store-family transfer, and its bulk group.
+    output wire dxa_st_t               active_st,
+    output wire                        active_bg,
+    output wire [DXA_BG_SEQ_W-1:0]     active_bg_seq,
 `endif
 
     // Multicast (always available; active when cta_mask has >1 bit set).
@@ -215,10 +219,16 @@ module VX_dxa_setup import VX_gpu_pkg::*, VX_dxa_pkg::*; (
     wire dec_es_off  = ~dec_tiled_l && ((raw_es0 != 4'd1) || (raw_es1 != 4'd1) || (raw_es2 != 4'd1)
                                      || (raw_es3 != 4'd1) || (raw_es4 != 4'd1));
     wire raw_im2col  = desc_data.meta[DXA_DESC_META_IM2COL_LSB];
+    // A tensor store or reduction: its reduction type has the descriptor's
+    // element size, its layout is row-major (tile or im2col), then the load's
+    // rules, then a tile box starts inside the tensor.
+    wire st_tensor = req_data.st.en && ((req_data.st.kind == DXA_ST_TENSOR) || (req_data.st.kind == DXA_ST_RED_T));
+    wire a_st_size = st_tensor && (req_data.st.kind == DXA_ST_RED_T) && (req_data.st.tsize != esize_enc);
+    wire a_st_layout = st_tensor && ~a_st_size && ~dec_tma;
     // The first rule a request breaks, in the golden model's order (dxa_ref.h check_tensor).
-    wire a_i2c    = raw_im2col && ~rank_ge3;
-    wire a_layout = ~a_i2c && ~dec_tma && ((dec_swz != 2'd0) || dec_es_off);
-    wire a_ok1    = ~a_i2c && ~a_layout;
+    wire a_i2c    = ~a_st_layout && raw_im2col && ~rank_ge3;
+    wire a_layout = ~a_st_layout && ~a_i2c && ~dec_tma && ((dec_swz != 2'd0) || dec_es_off);
+    wire a_ok1    = ~a_st_layout && ~a_i2c && ~a_layout;
     wire a_ilinv  = a_ok1 && (dec_il == 2'd3);
     wire a_ilrank = a_ok1 && ~a_ilinv && (dec_il != 2'd0) && ~rank_ge3;
     wire a_il32   = a_ok1 && ~a_ilinv && ~a_ilrank && (dec_il == 2'd2) && (dec_swz != 2'd1);
@@ -263,6 +273,8 @@ module VX_dxa_setup import VX_gpu_pkg::*, VX_dxa_pkg::*; (
     `RUNTIME_ASSERT(!launch_accept || !dec_blk_chk || (dec_fp_bytes <= 128'(req_data.win_room)),
         ("DXA box exceeds the destination block: tiles=%0d,%0d,%0d,%0d,%0d elem_bytes=%0d bytes=%0d room=%0d",
          dec_tile0, dec_tile1, dec_tile2, dec_tile3, dec_tile4, dec_elem_bytes, dec_fp_bytes, req_data.win_room))
+    `RUNTIME_ASSERT(!launch_accept || !a_st_layout,
+        ("%t: *** DXA store needs a tile or im2col layout: layout=%0d", $time, dec_dest_mode))
     `RUNTIME_ASSERT(!launch_accept || !a_i2c,
         ("DXA im2col needs rank 3 to 5: rank=%0d", dec_rank))
     `RUNTIME_ASSERT(!launch_accept || !a_layout,
@@ -281,6 +293,16 @@ module VX_dxa_setup import VX_gpu_pkg::*, VX_dxa_pkg::*; (
         ("DXA swizzle needs a 128-byte aligned destination: offset=0x%0h", dec_blk_off))
     `RUNTIME_ASSERT(!launch_accept || (dec_swz == 2'd0) || (DXA_LMEM_WORD_SIZE <= 128),
         ("DXA swizzle needs a local-memory word of at most 128 bytes: word=%0d", DXA_LMEM_WORD_SIZE))
+    wire [4:0] c_neg = {req_data.coords[4][31], req_data.coords[3][31], req_data.coords[2][31],
+                        req_data.coords[1][31], req_data.coords[0][31]};
+    wire [4:0] c_in_rank = {rank_ge5, rank_ge4, rank_ge3, rank_ge2, 1'b1};
+    wire a_st_neg  = st_tensor && ~a_st_size && ~a_st_layout && ~dec_im2col && ((c_neg & c_in_rank) != '0);
+    `RUNTIME_ASSERT(!launch_accept || !a_st_neg,
+        ("DXA tensor store starts below the tensor: c=%0d,%0d,%0d,%0d,%0d", $signed(req_data.coords[0]),
+         $signed(req_data.coords[1]), $signed(req_data.coords[2]), $signed(req_data.coords[3]), $signed(req_data.coords[4])))
+    `RUNTIME_ASSERT(!launch_accept || !a_st_size,
+        ("DXA reduction type does not match the element size: type bytes=%0d elem_bytes=%0d",
+         (1 << req_data.st.tsize), dec_elem_bytes))
 `else
     `UNUSED_VAR (dec_il)
 `endif
@@ -394,6 +416,9 @@ module VX_dxa_setup import VX_gpu_pkg::*, VX_dxa_pkg::*; (
     dxa_compl_t                            r_compl;
     reg                                    r_bulk;
     dxa_tma_params_t                       r_tma;
+    dxa_st_t                               r_st;
+    reg                                    r_bg;
+    reg [DXA_BG_SEQ_W-1:0]                 r_bg_seq;
 `endif
 
     // ════════════════════════════════════════════════════════════════════
@@ -432,6 +457,9 @@ module VX_dxa_setup import VX_gpu_pkg::*, VX_dxa_pkg::*; (
     dxa_compl_t                            s_compl;
     reg                                    s_bulk;
     dxa_tma_params_t                       s_tma;
+    dxa_st_t                               s_st;
+    reg                                    s_bg;
+    reg [DXA_BG_SEQ_W-1:0]                 s_bg_seq;
 `endif
 
     assign active_core_id          = r_core_id;
@@ -445,6 +473,9 @@ module VX_dxa_setup import VX_gpu_pkg::*, VX_dxa_pkg::*; (
 `ifdef DXA_MBAR_ENABLE
     assign active_compl            = r_compl;
     assign active_bulk             = r_bulk;
+    assign active_st               = r_st;
+    assign active_bg               = r_bg;
+    assign active_bg_seq           = r_bg_seq;
 `endif
 
     // ════════════════════════════════════════════════════════════════════
@@ -765,6 +796,8 @@ module VX_dxa_setup import VX_gpu_pkg::*, VX_dxa_pkg::*; (
         `ifdef DXA_MBAR_ENABLE
             r_bulk             <= 1'b0;
             r_tma              <= '0;
+            r_st               <= '0;
+            r_bg               <= 1'b0;
         `endif
         end else begin
             // Default: pipeline_start is a 1-cycle pulse.
@@ -800,6 +833,9 @@ module VX_dxa_setup import VX_gpu_pkg::*, VX_dxa_pkg::*; (
                 r_compl             <= s_compl;
                 r_bulk              <= s_bulk;
                 r_tma               <= s_tma;
+                r_st                <= s_st;
+                r_bg                <= s_bg;
+                r_bg_seq            <= s_bg_seq;
             `endif
                 state_r             <= TS_ACTIVE;
                 pipeline_start_r    <= 1'b1;
@@ -853,6 +889,9 @@ module VX_dxa_setup import VX_gpu_pkg::*, VX_dxa_pkg::*; (
                     s_compl.peers       <= req_data.mc_peers;
                     lat_tile4           <= DXA_TX_BYTES_W'(dec_tile4);
                     s_bulk              <= req_data.bulk;
+                    s_st                <= req_data.st;
+                    s_bg                <= req_data.bg;
+                    s_bg_seq            <= req_data.bg_seq;
                 `endif
                     // Rolling-cursor deltas: delta[0] is the inner-dim step.
                     // Higher deltas are precomputed below (Phase 1-3 captures).

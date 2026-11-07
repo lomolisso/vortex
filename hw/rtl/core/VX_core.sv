@@ -52,6 +52,9 @@ module VX_core import VX_gpu_pkg::*, VX_tlb_pkg::*; #(
 `ifdef DXA_MBAR_ENABLE
     // The launch's slot stride, for the socket DXA's cluster multicasts.
     output wire [`VX_CFG_LMEM_LOG_SIZE:0] dxa_slot_stride,
+    // bulk_group operation progress from the socket DXA, always accepted
+    input wire                       dxa_bg_compl_valid,
+    input VX_dxa_pkg::dxa_bg_compl_t dxa_bg_compl,
 `endif
 
 `ifdef VX_CFG_EXT_TEX_ENABLE
@@ -145,6 +148,13 @@ module VX_core import VX_gpu_pkg::*, VX_tlb_pkg::*; #(
         .TAG_WIDTH (LSU_TAG_WIDTH)
     ) cpa_lmem_if[`VX_CFG_NUM_LSU_BLOCKS]();
     VX_sched_unlock_if cpa_unlock_if [`VX_CFG_NUM_LSU_BLOCKS]();
+`ifdef DXA_MBAR_ENABLE
+    // bulk async-group wait releases -> scheduler
+    VX_sched_unlock_if bg_unlock_if();
+    // Per warp, a bulk_group source not yet read; any bulk_group write not yet performed.
+    wire [`VX_CFG_NUM_WARPS-1:0] bg_rd_pending;
+    wire                         bg_wr_pending;
+`endif
     // Per warp, no cp.async work left in any block's unit.
     wire [`VX_CFG_NUM_LSU_BLOCKS-1:0][`VX_CFG_NUM_WARPS-1:0] cpa_idle;
     reg  [`VX_CFG_NUM_WARPS-1:0]                         cpa_warp_idle;
@@ -337,6 +347,7 @@ module VX_core import VX_gpu_pkg::*, VX_tlb_pkg::*; #(
         .cpa_unlock_if  (cpa_unlock_if),
     `endif
     `ifdef DXA_MBAR_ENABLE
+        .bg_unlock_if   (bg_unlock_if),
         .cta_slot_valid (cta_slot_valid),
         .cta_slot_gen   (cta_slot_gen),
         .cta_warp_slot  (cta_warp_slot),
@@ -455,6 +466,11 @@ module VX_core import VX_gpu_pkg::*, VX_tlb_pkg::*; #(
         .dxa_txbar_bus_if(dxa_txbar_bus_if),
     `endif
     `ifdef DXA_MBAR_ENABLE
+        .dxa_bg_compl_valid (dxa_bg_compl_valid),
+        .dxa_bg_compl   (dxa_bg_compl),
+        .bg_unlock_if   (bg_unlock_if),
+        .bg_rd_pending  (bg_rd_pending),
+        .bg_wr_pending  (bg_wr_pending),
         .cta_warp_slot  (cta_warp_slot),
         .cta_slot_gen   (cta_slot_gen),
         .dxa_peer_rd_slot (dxa_peer_rd_slot),
@@ -782,7 +798,11 @@ module VX_core import VX_gpu_pkg::*, VX_tlb_pkg::*; #(
     // busy tracks only kernel execution: warps resident or stores not yet at L1.
     // ~mmu_empty also keeps the core busy while a translation or parked store is
     // still in flight, so kernel completion cannot race un-drained accesses.
-`ifdef VX_CFG_EXT_MBAR_ENABLE
+`ifdef DXA_MBAR_ENABLE
+    // Also a bulk_group write not yet performed: a grid completes only with its bulk writes.
+    assign busy = sched_busy || ~(&lsu_sched_empty) || ~mem_unit_empty || ~mmu_empty || ~dlmem_empty
+               || ~(&cpa_warp_idle) || bg_wr_pending;
+`elsif VX_CFG_EXT_MBAR_ENABLE
     // A remote access in flight, a peer's access to this core's local memory,
     // or cp.async work whose warp may already have exited.
     assign busy = sched_busy || ~(&lsu_sched_empty) || ~mem_unit_empty || ~mmu_empty || ~dlmem_empty
@@ -799,7 +819,11 @@ module VX_core import VX_gpu_pkg::*, VX_tlb_pkg::*; #(
 `ifdef VX_CFG_EXT_DLMEM_ENABLE
     assign warp_ctl_if.dlmem_drained = dlmem_drained & lmem_acc_drained;
 `endif
-`ifdef VX_CFG_EXT_MBAR_ENABLE
+`ifdef DXA_MBAR_ENABLE
+    // A warp's exit also waits for its bulk_group sources to be read: its
+    // block's local memory could be handed to the next block.
+    assign warp_ctl_if.cpa_idle = cpa_warp_idle & ~bg_rd_pending;
+`elsif VX_CFG_EXT_MBAR_ENABLE
     assign warp_ctl_if.cpa_idle = cpa_warp_idle;
 `endif
 

@@ -83,6 +83,10 @@ ifneq ($(filter -DVX_CFG_EXT_MBAR_ENABLE, $(XCONFIGS)),)
 	SRCS += $(SRC_DIR)/cpa_unit.cpp
 endif
 
+ifneq ($(and $(filter -DVX_CFG_EXT_DXA_ENABLE, $(XCONFIGS)),$(filter -DVX_CFG_EXT_MBAR_ENABLE, $(XCONFIGS))),)
+	SRCS += $(SRC_DIR)/bg_unit.cpp
+endif
+
 # Graphics SW helpers (TextureSampler / DepthTencil / Blender / Rasterizer).
 # Added once if any of TEX/OM/RASTER is enabled.
 ifneq ($(or $(filter -DVX_CFG_EXT_TEX_ENABLE, $(XCONFIGS)),$(filter -DVX_CFG_EXT_OM_ENABLE, $(XCONFIGS)),$(filter -DVX_CFG_EXT_RASTER_ENABLE, $(XCONFIGS))),)
@@ -191,6 +195,8 @@ DXA_BULK_TEST_OBJ  := $(OBJ_DIR)/tests/dxa_bulk_test.o
 DXA_BULK_TEST      := $(DESTDIR)/dxa_bulk_test
 CPA_UNIT_TEST_OBJ  := $(OBJ_DIR)/tests/cpa_unit_test.o
 CPA_UNIT_TEST      := $(DESTDIR)/cpa_unit_test
+BG_UNIT_TEST_OBJ   := $(OBJ_DIR)/tests/bg_unit_test.o
+BG_UNIT_TEST       := $(DESTDIR)/bg_unit_test
 
 DEPS := $(OBJS:.o=.d) $(MAIN_OBJ:.o=.d) $(DXA_OOO_TEST_OBJ:.o=.d) $(RVC_TEST_OBJ:.o=.d)
 DEPS += $(DLMEM_NOC_OBJS:.o=.d) $(DLMEM_NOC_TEST_OBJ:.o=.d)
@@ -202,6 +208,7 @@ DEPS += $(MBAR_WAITERS_TEST_OBJ:.o=.d)
 DEPS += $(DXA_COMPL_TEST_OBJ:.o=.d)
 DEPS += $(DXA_BULK_TEST_OBJ:.o=.d)
 DEPS += $(CPA_UNIT_TEST_OBJ:.o=.d)
+DEPS += $(BG_UNIT_TEST_OBJ:.o=.d)
 
 # generate .d files alongside .o files
 CXXFLAGS += -MMD -MP -MF $(@:.o=.d)
@@ -224,7 +231,7 @@ PROJECT := simx
 VORTEX_LIB := libvortex.so
 VORTEX_GEM5_LIB := libvortex-gem5.so
 
-.PHONY: all force test-dxa-ooo test-rvc-decompress test-dlmem-noc test-cta-gang test-dlmem-xlate test-dlmem-ep test-lmem-switch test-mbar-waiters test-dxa-compl test-dxa-bulk test-cpa-unit clean clean-lib clean-exe clean-obj libvortex clean-libvortex libvortex-gem5 clean-libvortex-gem5
+.PHONY: all force test-dxa-ooo test-rvc-decompress test-dlmem-noc test-cta-gang test-dlmem-xlate test-dlmem-ep test-lmem-switch test-mbar-waiters test-dxa-compl test-dxa-bulk test-cpa-unit test-bg-unit clean clean-lib clean-exe clean-obj libvortex clean-libvortex libvortex-gem5 clean-libvortex-gem5
 
 ifeq ($(USE_SST), 1)
 all: $(DESTDIR)/$(PROJECT) $(DESTDIR)/$(VORTEX_LIB)
@@ -303,6 +310,10 @@ $(CPA_UNIT_TEST_OBJ): $(VORTEX_HOME)/tests/unittest/cpa_unit/main.cpp $(CONFIG_F
 	@mkdir -p $(@D)
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
+$(BG_UNIT_TEST_OBJ): $(VORTEX_HOME)/tests/unittest/bg_unit/main.cpp $(CONFIG_FILE)
+	@mkdir -p $(@D)
+	$(CXX) $(CXXFLAGS) -c $< -o $@
+
 # Main executable
 $(DESTDIR)/$(PROJECT): $(OBJS) $(MAIN_OBJ)
 	$(CXX) $(CXXFLAGS) $^ $(LDFLAGS) -o $@
@@ -371,6 +382,12 @@ test-cpa-unit: $(CPA_UNIT_TEST)
 	$(CPA_UNIT_TEST) $(CPA_UNIT_OPTS)
 
 $(CPA_UNIT_TEST): $(OBJS) $(CPA_UNIT_TEST_OBJ)
+	$(CXX) $(CXXFLAGS) $^ $(LDFLAGS) -o $@
+
+test-bg-unit: $(BG_UNIT_TEST)
+	$(BG_UNIT_TEST) $(BG_UNIT_OPTS)
+
+$(BG_UNIT_TEST): $(OBJS) $(BG_UNIT_TEST_OBJ)
 	$(CXX) $(CXXFLAGS) $^ $(LDFLAGS) -o $@
 
 # Shared library

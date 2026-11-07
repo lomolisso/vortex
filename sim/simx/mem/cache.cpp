@@ -778,6 +778,13 @@ protected:
     fd_step_ = 0;
     fd_count_ = 0;
     fd_mshr_.clear();
+#ifdef DXA_MBAR_ENABLE
+    amo_pending_.clear();
+#elif defined(VX_CFG_EXT_FPAMO_ENABLE)
+#line 778
+#else
+#line 766
+#endif
     fd_mreq_ = 0;
     mreq_sent_ = 0;
     amo_hold_ = 0;
@@ -968,6 +975,17 @@ private:
     // a committing atomic holds it
     if (!this->core_req_in.empty() && fw_state_ != FenceWalk::Walk && amo_hold_ == 0) {
       auto &core_req = this->core_req_in.peek();
+#ifdef DXA_MBAR_ENABLE
+      // Where atomics commit, the input holds a request while an atomic to its
+      // line has not committed (it waits on its fill in the MSHR).
+      if (this->amoPending(core_req.addr)) {
+        return;
+      }
+#elif defined(VX_CFG_EXT_FPAMO_ENABLE)
+#line 968
+#else
+#line 922
+#endif
       // Conservative MSHR occupancy check: any request that may miss must
       // reserve a slot. Counts both currently-allocated entries and
       // in-flight pipe requests that haven't reached MSHR allocation yet.
@@ -1078,6 +1096,13 @@ private:
             }
             if (is_amo) {
               this->commitWriterAdd(adm_set_id, adm_addr_tag, adm_sector, coalesced.adm_seq);
+#ifdef DXA_MBAR_ENABLE
+              this->amoPendingAdd(core_req.addr, coalesced.adm_seq, true);
+#elif defined(VX_CFG_EXT_FPAMO_ENABLE)
+#line 1078
+#else
+#line 1032
+#endif
             }
             DT(3, this->name() << " mshr-coalesce@admission: " << coalesced);
             // Chain joiners count as misses, matching the pipe-exit chaining
@@ -1131,6 +1156,13 @@ private:
         if (is_amo) {
           this->commitWriterAdd(params_.addr_set_id(core_req.addr), params_.addr_tag(core_req.addr),
                                 params_.addr_sector_id(core_req.addr), bank_req.adm_seq);
+#ifdef DXA_MBAR_ENABLE
+          this->amoPendingAdd(core_req.addr, bank_req.adm_seq, !this->sectorResident(core_req.addr));
+#elif defined(VX_CFG_EXT_FPAMO_ENABLE)
+#line 1131
+#else
+#line 1080
+#endif
         }
       }
 #if VX_CFG_EXT_A_ENABLED
@@ -1367,6 +1399,14 @@ private:
       std::memset(store_block->data(), 0, store_block->size());
       amo_store_word(store_block->data(), byte_off, width, rmw.new_word);
       uint64_t byteen = amo_byteen(byte_off, width);
+#ifdef DXA_MBAR_ENABLE
+      // A DXA reduction's 16-bit pair at a box edge writes only its own half.
+      byteen &= bank_req.byteen;
+#elif defined(VX_CFG_EXT_FPAMO_ENABLE)
+#line 1367
+#else
+#line 1294
+#endif
       sector_merge(hit_sec, store_block, byteen);
       if (config_.write_back) {
         hit_sec.dirty = true;
@@ -1394,6 +1434,13 @@ private:
     crsp_sent_ = true;
     DT(3, this->name() << " amo-rsp op=" << op << " sc_fail=" << sc_fail << ": " << rsp);
     this->commitWriterErase(bank_req.adm_seq);
+#ifdef DXA_MBAR_ENABLE
+    this->amoPendingErase(bank_req.adm_seq);
+#elif defined(VX_CFG_EXT_FPAMO_ENABLE)
+#line 1394
+#else
+#line 1321
+#endif
     return true;
   }
 #endif
@@ -2169,6 +2216,57 @@ private:
   uint64_t   mreq_sent_;  // memory requests sent so far
 
   uint32_t   amo_hold_;   // cycles core admission stays held by a committing atomic
+#ifdef DXA_MBAR_ENABLE
+  // Atomics admitted where atomics commit and not yet committed. The input
+  // holds a request one cycle behind an atomic that allocates on a miss, and
+  // from the cycle after that a request to the line of an atomic waiting in
+  // the MSHR, until the atomic commits; the request right behind the miss
+  // still enters (the hardware's same-line probe is registered).
+  struct amo_pending_t {
+    uint32_t set_id;
+    uint64_t addr_tag;
+    uint32_t sector_id;
+    uint64_t seq;
+    uint64_t at;      // admission cycle
+    bool     miss;
+  };
+  std::vector<amo_pending_t> amo_pending_;
+
+  void amoPendingAdd(uint64_t addr, uint64_t seq, bool miss) {
+    if (config_.is_llc) {
+      amo_pending_.push_back({params_.addr_set_id(addr), params_.addr_tag(addr), params_.addr_sector_id(addr),
+                              seq, SimPlatform::instance().cycles(), miss});
+    }
+  }
+
+  void amoPendingErase(uint64_t seq) {
+    for (auto it = amo_pending_.begin(); it != amo_pending_.end(); ++it) {
+      if (it->seq == seq) {
+        amo_pending_.erase(it);
+        return;
+      }
+    }
+  }
+
+  bool amoPending(uint64_t addr) const {
+    const uint64_t now = SimPlatform::instance().cycles();
+    const uint32_t set_id = params_.addr_set_id(addr);
+    const uint64_t addr_tag = params_.addr_tag(addr);
+    const uint32_t sector_id = params_.addr_sector_id(addr);
+    for (const auto &w : amo_pending_) {
+      const uint64_t age = now - w.at;
+      if (w.miss && age == 1)
+        return true;
+      if (age >= 3 && w.set_id == set_id && w.addr_tag == addr_tag && w.sector_id == sector_id)
+        return true;
+    }
+    return false;
+  }
+#elif defined(VX_CFG_EXT_FPAMO_ENABLE)
+#line 2169
+#else
+#line 2093
+#endif
 #ifdef VX_CFG_EXT_FPAMO_ENABLE
   // Float atomics admitted per cache input, and the cycles the replay port
   // stays held behind a replayed float atomic.
@@ -2285,7 +2383,24 @@ public:
     if (config_.bypass)
       return;
     // calculate cache initialization cycles
+#ifdef DXA_MBAR_ENABLE
+    // The tag walk runs once from power-on and goes on across launches; a
+    // launch's reset finds tags the previous launch's flush invalidated.
+    const uint32_t init_left = powered_on_ ? init_cycles_ : params_.sets_per_bank;
+    powered_on_ = true;
+#elif defined(VX_CFG_EXT_FPAMO_ENABLE)
+#line 2285
+#else
+#line 2193
+#endif
     init_cycles_ = params_.sets_per_bank;
+#ifdef DXA_MBAR_ENABLE
+    init_cycles_ = init_left;
+#elif defined(VX_CFG_EXT_FPAMO_ENABLE)
+#line 2286
+#else
+#line 2194
+#endif
     fence_state_ = FenceLock::Idle;
     drain_phase_ = DrainPhase::Transit;
     for (uint32_t i = 0; i < config_.num_inputs; ++i) {
@@ -2701,6 +2816,13 @@ private:
   std::vector<uint64_t> fp_sent_ = std::vector<uint64_t>(config_.num_inputs, 0); // per input: float atomics sent
   std::vector<uint32_t> fp_bank_ = std::vector<uint32_t>(config_.num_inputs, 0); // per input: bank of the last one
   std::vector<bool>     fp_waited_ = std::vector<bool>(config_.num_inputs, false); // per input: it waited on a hold
+#else
+#line 2559
+#endif
+#ifdef DXA_MBAR_ENABLE
+  bool powered_on_ = false;  // the power-on tag walk has started
+#elif defined(VX_CFG_EXT_FPAMO_ENABLE)
+#line 2704
 #else
 #line 2559
 #endif

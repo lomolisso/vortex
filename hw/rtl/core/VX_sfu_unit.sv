@@ -49,6 +49,13 @@ import VX_raster_pkg::*;
     input  dlmem_row_t                               dxa_peer_row,
     input wire [`VX_CFG_NUM_WARPS-1:0][`VX_CFG_LMEM_LOG_SIZE-1:0] dxa_peer_slot_base,
     input wire [`VX_CFG_LMEM_LOG_SIZE:0]             dxa_peer_stride,
+    // bulk_group operation progress from the socket DXA, and the waits' releases
+    input wire                                       dxa_bg_compl_valid,
+    input VX_dxa_pkg::dxa_bg_compl_t                 dxa_bg_compl,
+    VX_sched_unlock_if.master                        bg_unlock_if,
+    // per warp a bulk_group source not yet read; any write not yet performed
+    output wire [`VX_CFG_NUM_WARPS-1:0]              bg_rd_pending,
+    output wire                                      bg_wr_pending,
 `endif
 
 `ifdef VX_CFG_EXT_TEX_ENABLE
@@ -214,6 +221,30 @@ import VX_raster_pkg::*;
     );
 
 `ifdef VX_CFG_EXT_DXA_ENABLE
+`ifdef DXA_MBAR_ENABLE
+    wire                              bg_evt_valid;
+    VX_dxa_pkg::dxa_bg_evt_t          bg_evt;
+    wire [`VX_CFG_NUM_WARPS-1:0]      bg_stall_op, bg_stall_commit;
+    wire [`VX_CFG_NUM_WARPS-1:0][VX_dxa_pkg::DXA_BG_SEQ_W-1:0] bg_seq;
+
+    VX_bg_unit #(
+        .INSTANCE_ID (`SFORMATF(("%s-bg", INSTANCE_ID)))
+    ) bg_unit (
+        .clk          (clk),
+        .reset        (reset),
+        .evt_valid    (bg_evt_valid),
+        .evt          (bg_evt),
+        .compl_valid  (dxa_bg_compl_valid),
+        .compl        (dxa_bg_compl),
+        .stall_op     (bg_stall_op),
+        .stall_commit (bg_stall_commit),
+        .seq          (bg_seq),
+        .rd_pending   (bg_rd_pending),
+        .wr_pending   (bg_wr_pending),
+        .unlock_if    (bg_unlock_if)
+    );
+`endif
+
     VX_dxa_unit #(
         .INSTANCE_ID (`SFORMATF(("%s-dxa", INSTANCE_ID))),
         .CORE_ID (CORE_ID)
@@ -229,6 +260,11 @@ import VX_raster_pkg::*;
         .peer_row      (dxa_peer_row),
         .peer_slot_base (dxa_peer_slot_base),
         .peer_stride   (dxa_peer_stride),
+        .bg_evt_valid  (bg_evt_valid),
+        .bg_evt        (bg_evt),
+        .bg_stall_op   (bg_stall_op),
+        .bg_stall_commit (bg_stall_commit),
+        .bg_seq        (bg_seq),
     `endif
         .dxa_req_bus_if (dxa_req_bus_if)
     );

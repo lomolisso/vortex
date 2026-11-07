@@ -261,6 +261,10 @@ module VX_decode import
     `ifdef VX_CFG_EXT_MBAR_ENABLE
         op_args.lsu.is_async = 1'b0;
     `endif
+    `ifdef DXA_MBAR_ENABLE
+        // A full fence with amo_aq set is a global proxy fence.
+        op_args.lsu.amo_aq = 1'b0;
+    `endif
     `ifdef VX_CFG_EXT_OM_ENABLE
         // Same reason: op_args defaults to 'x, and a stale export_mask makes
         // VX_gfx_uops expand an ORDINARY store into an aperture record --
@@ -488,12 +492,17 @@ module VX_decode import
                 if (funct7 == 7'd1 && funct3 == 3'd7) begin
                     // vx_fence_proxy_async: the warp waits until the fence retires,
                     // so a later DXA read of local memory sees its earlier stores.
+                    // The rs1 field selects the state space: x0 shared memory only;
+                    // x1 (global) and x2 (all) also take the full fence's path, which
+                    // drains the warp's global stores below the dcache and walks the
+                    // dcache, and amo_aq marks it for the unlock at its retire.
                     ex_type = EX_LSU;
-                    op_type = INST_LSU_PFENCE;
+                    op_type = (rs1 == 5'd0) ? INST_LSU_PFENCE : INST_LSU_FENCE;
                     op_args.lsu.is_store = 0;
                     op_args.lsu.is_float = 0;
                     op_args.lsu.pack     = 0;
                     op_args.lsu.offset   = 0;
+                    op_args.lsu.amo_aq   = (rs1 != 5'd0);
                     is_wstall = 1;
                 end
             `endif
@@ -963,9 +972,22 @@ module VX_decode import
                         op_args.dxa.tload     = (funct3 == 3'd2);
                         op_args.dxa.bload     = (funct3 == 3'd3);
                         op_args.dxa.bprefetch = (funct3 == 3'd4);
-                    `endif
+                        op_args.dxa.store     = (funct3 == 3'd5);
+                        op_args.dxa.bgop      = (funct3 == 3'd6);
+                        op_args.dxa.bg_kind   = rs1[1:0];
+                        op_args.dxa.bg_n      = rs2;
+                        if (funct3 == 3'd6) begin
+                            // The register fields are the group op and N; a wait
+                            // holds its warp until the bulk-group unit releases it.
+                            is_wstall = (rs1 == 5'd1) || (rs1 == 5'd2);
+                        end else begin
+                            `USED_IREG (rs1);
+                            `USED_IREG (rs2);
+                        end
+                    `else
                         `USED_IREG (rs1);
                         `USED_IREG (rs2);
+                    `endif
                     end
                 `endif
                     7'h04: begin // Load packing: vx_packlb_f / vx_packlh_f
@@ -1155,6 +1177,16 @@ module VX_decode import
             $time, INSTANCE_ID, fetch_if.data.wid, to_fullPC(fetch_if.data.PC), rs2, fetch_if.data.uuid))
     `RUNTIME_ASSERT (~(fetch_fire && (opcode == INST_EXT3) && (funct7 == 7'd3) && (funct3 == 3'd7)),
         ("%t: %s invalid cp.async encoding: wid=%0d PC=0x%0h instr=0x%h (#%0d)",
+            $time, INSTANCE_ID, fetch_if.data.wid, to_fullPC(fetch_if.data.PC), instr, fetch_if.data.uuid))
+`endif
+
+`ifdef DXA_MBAR_ENABLE
+    wire dxa_fire = fetch_fire && (opcode == INST_EXT1) && (funct7 == 7'd3);
+    `RUNTIME_ASSERT (~(dxa_fire && ((funct3 == 3'd7) || ((funct3 == 3'd6) && (rs1 > 5'd2)))),
+        ("%t: %s invalid DXA encoding: wid=%0d PC=0x%0h instr=0x%h (#%0d)",
+            $time, INSTANCE_ID, fetch_if.data.wid, to_fullPC(fetch_if.data.PC), instr, fetch_if.data.uuid))
+    `RUNTIME_ASSERT (~(fetch_fire && (opcode == INST_EXT3) && (funct7 == 7'd1) && (funct3 == 3'd7) && (rs1 > 5'd2)),
+        ("%t: %s invalid proxy fence: wid=%0d PC=0x%0h instr=0x%h (#%0d)",
             $time, INSTANCE_ID, fetch_if.data.wid, to_fullPC(fetch_if.data.PC), instr, fetch_if.data.uuid))
 `endif
 

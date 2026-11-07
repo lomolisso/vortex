@@ -137,6 +137,12 @@ public:
   static constexpr uint32_t CPA_UNLOCK_BASE = NUM_UNLOCKS - VX_CFG_NUM_LSU_BLOCKS;
   // The warps the mbarrier waiter table releases, already past their stall register.
   SimChannel<WarpMask> MbarUnlockIn;
+#ifdef DXA_MBAR_ENABLE
+  // After the others: the warp whose bulk wait_group is satisfied.
+  static constexpr uint32_t BG_UNLOCK = NUM_UNLOCKS;
+#else
+#line 133
+#endif
 #else
 #line 135
 #endif

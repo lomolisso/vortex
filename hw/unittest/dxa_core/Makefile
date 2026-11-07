@@ -26,6 +26,9 @@ RTL_INCLUDE += -I$(RTL_DIR)/interfaces -I$(RTL_DIR)/mem -I$(RTL_DIR)/vm -I$(RTL_
 ifneq (,$(filter -DVX_CFG_EXT_MBAR_ENABLE,$(CONFIGS)))
 RTL_PKGS := $(RTL_DIR)/VX_gpu_pkg.sv $(RTL_DIR)/dlmem/VX_dlmem_pkg.sv $(RTL_DIR)/dxa/VX_dxa_pkg.sv
 RTL_INCLUDE += -I$(RTL_DIR)/dlmem
+# The reduction vectors' golden model (dxa_ref.h, amo_ref.h) runs on softfloat.
+CXXFLAGS += -I$(THIRD_PARTY_DIR)/softfloat/source/include
+LDFLAGS += $(THIRD_PARTY_DIR)/softfloat/build/Linux-x86_64-GCC/softfloat.a
 endif
 
 TOP := VX_dxa_core_top

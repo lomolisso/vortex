@@ -79,6 +79,12 @@ module VX_execute import VX_gpu_pkg::*; #(
     input  dlmem_row_t                               dxa_peer_row,
     input wire [`VX_CFG_NUM_WARPS-1:0][`VX_CFG_LMEM_LOG_SIZE-1:0] dxa_peer_slot_base,
     input wire [`VX_CFG_LMEM_LOG_SIZE:0]             dxa_peer_stride,
+    // bulk_group operation progress from the socket DXA, and the waits' releases
+    input wire                                       dxa_bg_compl_valid,
+    input VX_dxa_pkg::dxa_bg_compl_t                 dxa_bg_compl,
+    VX_sched_unlock_if.master                        bg_unlock_if,
+    output wire [`VX_CFG_NUM_WARPS-1:0]              bg_rd_pending,
+    output wire                                      bg_wr_pending,
 `endif
 
 `ifdef VX_CFG_EXT_TEX_ENABLE
@@ -211,6 +217,11 @@ module VX_execute import VX_gpu_pkg::*; #(
         .dxa_peer_row   (dxa_peer_row),
         .dxa_peer_slot_base (dxa_peer_slot_base),
         .dxa_peer_stride (dxa_peer_stride),
+        .dxa_bg_compl_valid (dxa_bg_compl_valid),
+        .dxa_bg_compl   (dxa_bg_compl),
+        .bg_unlock_if   (bg_unlock_if),
+        .bg_rd_pending  (bg_rd_pending),
+        .bg_wr_pending  (bg_wr_pending),
     `endif
     `ifdef VX_CFG_EXT_TEX_ENABLE
         .tex_bus_if     (tex_bus_if),

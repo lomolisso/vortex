@@ -655,8 +655,10 @@ module VX_lsu_slice import VX_gpu_pkg::*; #(
 `ifdef VX_CFG_EXT_DLMEM_ENABLE
     wire req_aq, req_rl;
 `ifdef DXA_MBAR_ENABLE
-    // A proxy fence unlocks its warp as an acquire does, when it retires.
-    assign req_aq = (execute_if.data.op_args.lsu.amo_valid && execute_if.data.op_args.lsu.amo_aq)
+    // A proxy fence unlocks its warp as an acquire does, when it retires; the
+    // global form is a full fence with amo_aq set.
+    assign req_aq = (execute_if.data.op_args.lsu.amo_aq
+                     && (execute_if.data.op_args.lsu.amo_valid || (execute_if.data.op_type == INST_LSU_FENCE)))
                  || (execute_if.data.op_type == INST_LSU_PFENCE);
     assign req_rl = execute_if.data.op_args.lsu.amo_valid && execute_if.data.op_args.lsu.amo_rl;
 `elsif VX_CFG_EXT_A_ENABLE

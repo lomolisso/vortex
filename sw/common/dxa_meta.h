@@ -35,3 +35,56 @@
 // META[13]: 0 tile mode, 1 im2col mode (DXA with mbarriers only).
 #define DXA_DESC_META_IM2COL_BITS 1
 #define DXA_DESC_META_IM2COL_LSB  13
+
+// Stores, reductions and bulk groups (DXA with mbarriers, XLEN 64).
+// custom-0 funct7 3: funct3 5 = STORE family, funct3 6 = bulk-group op.
+#define DXA_F3_STORE 5
+#define DXA_F3_BGOP  6
+
+// STORE ctl word (rs2 lane 0, bits [63:32]): kind, reduction op, type, descriptor slot.
+#define DXA_ST_CTL_KIND_LSB  0
+#define DXA_ST_CTL_KIND_BITS 3
+#define DXA_ST_CTL_OP_LSB    3
+#define DXA_ST_CTL_OP_BITS   4
+#define DXA_ST_CTL_TYPE_LSB  7
+#define DXA_ST_CTL_TYPE_BITS 4
+#define DXA_ST_CTL_SLOT_LSB  11
+#define DXA_ST_CTL_SLOT_BITS 4
+
+#define DXA_ST_BULK        0  // cp.async.bulk.global.shared::cta.bulk_group
+#define DXA_ST_TENSOR      1  // cp.async.bulk.tensor.Nd.global.shared::cta.bulk_group
+#define DXA_ST_RED_GLOBAL  2  // cp.reduce.async.bulk.global.shared::cta.bulk_group
+#define DXA_ST_RED_CLUSTER 3  // cp.reduce.async.bulk.shared::cluster.shared::cta.mbarrier
+#define DXA_ST_RED_TENSOR  4  // cp.reduce.async.bulk.tensor.Nd.global.shared::cta.bulk_group
+
+#define DXA_RED_ADD 0
+#define DXA_RED_MIN 1
+#define DXA_RED_MAX 2
+#define DXA_RED_INC 3
+#define DXA_RED_DEC 4
+#define DXA_RED_AND 5
+#define DXA_RED_OR  6
+#define DXA_RED_XOR 7
+
+#define DXA_RT_U32  0  // also b32
+#define DXA_RT_S32  1
+#define DXA_RT_U64  2  // also b64
+#define DXA_RT_S64  3
+#define DXA_RT_F32  4
+#define DXA_RT_F64  5
+#define DXA_RT_F16  6
+#define DXA_RT_BF16 7
+
+// funct3 6: the rs1 register field is the op, the rs2 register field is N.
+#define DXA_BG_COMMIT    0
+#define DXA_BG_WAIT      1
+#define DXA_BG_WAIT_READ 2
+
+// Per warp: committed groups not yet complete, operations in the open group.
+#define DXA_BG_GROUPS  8
+#define DXA_BG_MAX_OPS 63
+
+// custom-2 funct3 7 funct7 1 (fence.proxy.async): the rs1 register field.
+#define DXA_PFENCE_SHARED 0
+#define DXA_PFENCE_GLOBAL 1
+#define DXA_PFENCE_ALL    2

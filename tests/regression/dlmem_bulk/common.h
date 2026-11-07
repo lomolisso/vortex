@@ -2,6 +2,7 @@
 #define _COMMON_H_
 
 #include <stdint.h>
+#include <dxa_meta.h>
 
 #define MODE_RING   0   // rank r copies into rank (r + 1) % K
 #define MODE_MANY   1   // ranks 1.. copy into rank 0, back to back, and rank 0 into rank 1
@@ -20,7 +21,9 @@
 #define NEG_RETIRED 8   // the destination block exits before the copy reaches it
 #define NEG_SELF    9   // a copy into the issuer's own block through local pointers
 #define NEG_MALIGN  10  // an mbarrier 4 bytes off its doubleword
-#define NUM_NEGS    11
+#define NEG_RCSELF  11  // a cluster reduction into the issuer's own block
+#define NEG_RCCLU   12  // a cluster reduction by a local pointer into a block of the core outside the cluster
+#define NUM_NEGS    13
 
 // -g: copies from global memory (cp.async.bulk.shared::cluster.global)
 #define GK_NONE     0
@@ -28,7 +31,11 @@
 #define GK_WIN      2   // rank r loads into rank (r + 1) % K through the window
 #define GK_MC       3   // rank 0 multicasts every copy into the ranks of the mask
 #define GK_PF       4   // GK_CTA, each copy's source prefetched into the L2 first
-#define NUM_GKINDS  5
+#define GK_RC       5   // cluster reductions: rank r reduces into rank (r + 1) % K through the window
+#define GK_RCWIN    6   // GK_RC with the cluster on one core: the window destination is on the issuer's core
+#define GK_RCLOC    7   // GK_RCWIN through local pointers into the destination block and its mbarrier
+#define GK_RCP      8   // timed cluster reductions: rounds of one pair, -s bytes into rank (r + 1) % K
+#define NUM_GKINDS  9
 
 #define MAX_CLUSTER 8
 #define MAX_COPIES  8
@@ -60,7 +67,7 @@ typedef struct {
   uint32_t hog;          // race: rank 0 copies this many bytes per round instead of racing; 0: none
   uint64_t gsrc_addr;    // -g: the global source buffer
   uint32_t gkind;
-  uint32_t mask;         // -g mc: the ctaMask
+  uint32_t mask;         // -g mc: the ctaMask; -g rc, rcwin, rcloc, rcp: the reduction pairs (bit i = rc_pair(i))
   uint32_t pf_big[2];    // -g pf -P: bulk prefetches of the source buffer larger than a local memory
 } bulk_arg_t;
 
@@ -93,6 +100,7 @@ static inline bool is_hog(const bulk_arg_t* a, uint32_t r) {
 #define ERR_DONE    0   // 1 once the thread finished
 #define ERR_WAIT    1   // the mbarrier phase did not complete within WAIT_LIMIT try_waits
 #define ERR_TRIES   2   // try_waits of the thread
+#define ERR_CYCLES  3   // -g rcp, thread 0 of each block: cycles of the timed rounds
 #define ERR_WORDS   4
 
 #define WAIT_LIMIT  64
@@ -268,6 +276,113 @@ static inline uint32_t g_incoming(const bulk_arg_t* a, uint32_t q) {
   if (a->gkind == GK_MC)
     return ((a->mask >> q) & 1u) ? per : 0;
   return per;
+}
+
+// -g rc, rcwin, rcloc, rcp: the PTX cluster reductions (op, type) in a fixed order.
+#define RC_PAIRS 12
+
+static inline uint32_t rc_op(uint32_t i) {
+  const uint32_t op[RC_PAIRS] = {DXA_RED_AND, DXA_RED_OR, DXA_RED_XOR, DXA_RED_ADD, DXA_RED_ADD, DXA_RED_MIN,
+                                 DXA_RED_MIN, DXA_RED_MAX, DXA_RED_MAX, DXA_RED_INC, DXA_RED_DEC, DXA_RED_ADD};
+  return op[i];
+}
+
+static inline uint32_t rc_type(uint32_t i) {
+  const uint32_t ty[RC_PAIRS] = {DXA_RT_U32, DXA_RT_U32, DXA_RT_U32, DXA_RT_U32, DXA_RT_S32, DXA_RT_U32,
+                                 DXA_RT_S32, DXA_RT_U32, DXA_RT_S32, DXA_RT_U32, DXA_RT_U32, DXA_RT_U64};
+  return ty[i];
+}
+
+static inline uint32_t rc_elem(uint32_t i) {
+  return rc_type(i) == DXA_RT_U64 ? 8 : 4;
+}
+
+// The j-th selected pair of the mask, and how many there are.
+static inline uint32_t rc_count(const bulk_arg_t* a) {
+  uint32_t n = 0;
+  for (uint32_t i = 0; i < RC_PAIRS; ++i)
+    n += (a->mask >> i) & 1u;
+  return n;
+}
+
+static inline uint32_t rc_pair(const bulk_arg_t* a, uint32_t j) {
+  for (uint32_t i = 0; i < RC_PAIRS; ++i) {
+    if (((a->mask >> i) & 1u) && j-- == 0)
+      return i;
+  }
+  return 0;
+}
+
+static inline uint32_t rc_size(const bulk_arg_t* a, uint32_t j) {
+  return a->size ? a->size : mix_size(j);
+}
+
+static inline uint32_t rc_slot(const bulk_arg_t* a, uint32_t j) {
+  return (rc_size(a, j) + 48 + 64 + 63) / 64 * 64;
+}
+
+static inline uint32_t rc_src_off(const bulk_arg_t* a, uint32_t j) {
+  uint32_t o = LM_SRC;
+  for (uint32_t i = 0; i < j; ++i)
+    o += rc_slot(a, i);
+  return o + 16 * ((j + a->salign) % 4);
+}
+
+static inline uint32_t rc_dst_base(const bulk_arg_t* a) {
+  uint32_t o = LM_SRC;
+  for (uint32_t i = 0; i < rc_count(a); ++i)
+    o += rc_slot(a, i);
+  return o;
+}
+
+static inline uint32_t rc_dst_off(const bulk_arg_t* a, uint32_t j) {
+  uint32_t o = rc_dst_base(a);
+  for (uint32_t i = 0; i < j; ++i)
+    o += rc_slot(a, i);
+  return o + 16 * ((3 * j + a->dalign) % 4);
+}
+
+static inline uint32_t rc_end(const bulk_arg_t* a) {
+  return rc_dst_off(a, rc_count(a));
+}
+
+// Bytes each block receives (from rank r - 1).
+static inline uint32_t rc_incoming(const bulk_arg_t* a) {
+  uint32_t n = 0;
+  for (uint32_t j = 0; j < rc_count(a); ++j)
+    n += rc_size(a, j);
+  return n;
+}
+
+// Element e of selected pair j's source (role 0) or destination (role 1) in
+// block b: small, extreme or random, at the element's width.
+static inline uint64_t rc_val(uint32_t b, uint32_t role, uint32_t j, uint32_t e, uint32_t bytes) {
+  const uint32_t h = mix32(0x3C0000u + b * 64 + role * 32 + j, e);
+  const uint64_t mask = bytes == 8 ? ~0ull : 0xFFFFFFFFull;
+  const uint64_t top = bytes == 8 ? (1ull << 63) : (1ull << 31);
+  switch (h & 7u) {
+  case 0:
+  case 1:  return (h >> 8) & 15u;
+  case 2: {
+    const uint64_t ext[4] = {0, top - 1, top, mask};
+    return ext[(h >> 8) & 3u];
+  }
+  default: return ((((uint64_t)mix32(h, 3u)) << 32) | h) & mask;
+  }
+}
+
+// -g rcp: the source and the destination of the timed reductions.
+static inline uint32_t rcp_src(const bulk_arg_t* a) {
+  (void)a;
+  return LM_SRC;
+}
+
+static inline uint32_t rcp_dst(const bulk_arg_t* a) {
+  return LM_SRC + (a->size + 63) / 64 * 64 + 64;
+}
+
+static inline uint32_t rcp_end(const bulk_arg_t* a) {
+  return rcp_dst(a) + a->size + 64;
 }
 
 #endif

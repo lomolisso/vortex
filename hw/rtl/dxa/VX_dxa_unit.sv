@@ -30,6 +30,13 @@ module VX_dxa_unit import VX_gpu_pkg::*, VX_dxa_pkg::*; #(
     input  dlmem_row_t                               peer_row,
     input wire [`VX_CFG_NUM_WARPS-1:0][`VX_CFG_LMEM_LOG_SIZE-1:0] peer_slot_base,
     input wire [`VX_CFG_LMEM_LOG_SIZE:0]             peer_stride,
+    // Bulk async-groups: an event per group operation, and per warp the
+    // issue stalls and the open group's sequence.
+    output wire                                      bg_evt_valid,
+    output dxa_bg_evt_t                              bg_evt,
+    input wire [`VX_CFG_NUM_WARPS-1:0]               bg_stall_op,
+    input wire [`VX_CFG_NUM_WARPS-1:0]               bg_stall_commit,
+    input wire [`VX_CFG_NUM_WARPS-1:0][DXA_BG_SEQ_W-1:0] bg_seq,
 `endif
     VX_dxa_req_bus_if.master dxa_req_bus_if
 );
@@ -133,24 +140,47 @@ module VX_dxa_unit import VX_gpu_pkg::*, VX_dxa_pkg::*; #(
     wire is_tload = execute_if.data.op_args.dxa.tload;
     wire is_bload = execute_if.data.op_args.dxa.bload;
     wire is_bpf   = execute_if.data.op_args.dxa.bprefetch;
+    // The store family (funct3 5): lane 0 rs2[63:32] is its control word,
+    // lane 0 rs1 the source in the issuer's block. A bulk-group op (funct3 6)
+    // reads no register and sends no request.
+    wire is_store = execute_if.data.op_args.dxa.store;
+    wire is_bgop  = execute_if.data.op_args.dxa.bgop;
+    wire [31:0] st_ctl  = lane0_rs2[63:32];
+    wire [2:0]  st_kind = st_ctl[2:0];
+    wire [3:0]  st_rop  = st_ctl[6:3];
+    wire [3:0]  st_typ  = st_ctl[10:7];
+    wire st_tensor = is_store && ((st_kind == DXA_ST_TENSOR) || (st_kind == DXA_ST_RED_T));
+    wire st_lin    = is_store && ((st_kind == DXA_ST_BULK) || (st_kind == DXA_ST_RED_G) || (st_kind == DXA_ST_RED_C));
+    wire st_red_c  = is_store && (st_kind == DXA_ST_RED_C);
+    wire st_red    = is_store && ((st_kind == DXA_ST_RED_G) || (st_kind == DXA_ST_RED_C) || (st_kind == DXA_ST_RED_T));
+    wire st_bg     = is_store && (st_kind != DXA_ST_RED_C) && (st_kind <= DXA_ST_RED_T);
+    wire [31:0] st_meta = {2'b11, 26'd0, st_ctl[14:11]};
+    `UNUSED_VAR (st_ctl[31:15])
     wire is_lin   = is_bulk || is_bload || is_bpf;
     wire is_raw   = is_bulk || is_tload || is_bload;
     wire is_pf    = (is_tload && lane0_rs2[36]) || is_bpf;
     wire [31:0] tl_meta = {2'b11, 26'd0, lane0_rs2[35:32]};
-    assign dxa_req_data_in.meta      = is_tload ? tl_meta : (is_lin ? 32'hC0000000 : lane1_rs1[31:0]);
-    assign dxa_req_data_in.coords[0] = is_lin ? 32'd0 : lane2_rs1[31:0];
-    assign dxa_req_data_in.coords[1] = is_lin ? 32'd0 : (is_tload ? lane2_rs1[63:32] : lane3_rs1[31:0]);
-    assign dxa_req_data_in.coords[2] = is_lin ? 32'd0 : (is_tload ? lane3_rs1[31:0] : lane0_rs2[31:0]);
-    assign dxa_req_data_in.coords[3] = is_lin ? 32'd0 : (is_tload ? lane3_rs1[63:32] : lane1_rs2[31:0]);
-    assign dxa_req_data_in.coords[4] = is_lin ? 32'd0 : (is_tload ? lane0_rs2[31:0] : lane2_rs2[31:0]);
-    assign dxa_req_data_in.cta_mask  = (is_lin || is_tload) ? '0 : lane3_rs2[`VX_CFG_NUM_WARPS-1:0];
+    wire [31:0] ld_meta = is_tload ? tl_meta : (is_lin ? 32'hC0000000 : lane1_rs1[31:0]);
+    wire [4:0][31:0] ld_coords, st_coords;
+    assign ld_coords[0] = is_lin ? 32'd0 : lane2_rs1[31:0];
+    assign ld_coords[1] = is_lin ? 32'd0 : (is_tload ? lane2_rs1[63:32] : lane3_rs1[31:0]);
+    assign ld_coords[2] = is_lin ? 32'd0 : (is_tload ? lane3_rs1[31:0] : lane0_rs2[31:0]);
+    assign ld_coords[3] = is_lin ? 32'd0 : (is_tload ? lane3_rs1[63:32] : lane1_rs2[31:0]);
+    assign ld_coords[4] = is_lin ? 32'd0 : (is_tload ? lane0_rs2[31:0] : lane2_rs2[31:0]);
+    assign st_coords[0] = st_tensor ? lane1_rs1[31:0] : 32'd0;
+    assign st_coords[1] = st_tensor ? lane1_rs1[63:32] : 32'd0;
+    assign st_coords[2] = st_tensor ? lane2_rs1[31:0] : 32'd0;
+    assign st_coords[3] = st_tensor ? lane2_rs1[63:32] : 32'd0;
+    assign st_coords[4] = st_tensor ? lane0_rs2[31:0] : 32'd0;
+    assign dxa_req_data_in.meta      = is_store ? (st_tensor ? st_meta : 32'hC0000000) : ld_meta;
+    assign dxa_req_data_in.coords    = is_store ? st_coords : ld_coords;
+    assign dxa_req_data_in.cta_mask  = (is_lin || is_tload || is_store) ? '0 : lane3_rs2[`VX_CFG_NUM_WARPS-1:0];
     assign dxa_req_data_in.tload     = is_tload;
     assign dxa_req_data_in.bload     = is_bload;
     assign dxa_req_data_in.prefetch  = is_pf;
     assign dxa_req_data_in.offs[0]   = is_tload ? lane1_rs2[31:16] : 16'd0;
     assign dxa_req_data_in.offs[1]   = is_tload ? lane1_rs2[47:32] : 16'd0;
     assign dxa_req_data_in.offs[2]   = is_tload ? lane1_rs2[63:48] : 16'd0;
-    assign dxa_req_data_in.gsrc      = (is_bload || is_bpf) ? lane2_rs1[`VX_CFG_MEM_ADDR_WIDTH-1:0] : '0;
 `else
     assign dxa_req_data_in.meta      = lane1_rs1[31:0];
     assign dxa_req_data_in.coords[0] = lane2_rs1[31:0];
@@ -176,15 +206,22 @@ module VX_dxa_unit import VX_gpu_pkg::*, VX_dxa_pkg::*; #(
     wire [NW_WIDTH-1:0] issue_slot = cta_warp_slot[execute_if.data.header.wid];
     assign peer_rd_slot = issue_slot;
 
+    // The raw pointers: a cluster reduction's destination is lane 1 and a
+    // store's mbarrier lane 3, its source lane 0 and its size lane 2.
+    wire [`VX_CFG_XLEN-1:0] dst_ptr  = st_red_c ? lane1_rs1 : lane0_rs1;
+    wire [`VX_CFG_XLEN-1:0] mb_ptr   = is_store ? lane3_rs1 : lane1_rs1;
+    wire [`VX_CFG_XLEN-1:0] src_ptr  = is_store ? lane0_rs1 : lane2_rs1;
+    wire [`VX_CFG_XLEN-1:0] size_val = is_store ? lane2_rs1 : lane3_rs1;
+
     wire [RB_W-1:0] dst_rank;
     if (RB != 0) begin : g_dst_rank
-        assign dst_rank = lane0_rs1[LMEM_LOG +: RB];
+        assign dst_rank = dst_ptr[LMEM_LOG +: RB];
     end else begin : g_dst_rank0
         assign dst_rank = '0;
     end
-    wire [LMEM_LOG-1:0] dst_off = lane0_rs1[LMEM_LOG-1:0];
-    // A prefetch has no destination.
-    wire dst_win = ~is_pf && ((lane0_rs1 >> WIN_LSB) == (DLMEM_BASE_B >> WIN_LSB));
+    wire [LMEM_LOG-1:0] dst_off = dst_ptr[LMEM_LOG-1:0];
+    // A prefetch has no destination, a store or reduction into global memory none in a block.
+    wire dst_win = ~is_pf && (~is_store || st_red_c) && ((dst_ptr >> WIN_LSB) == (DLMEM_BASE_B >> WIN_LSB));
 
     wire mbar_mode = lane1_rs1[30];
     wire mbar_win  = mbar_mode && lane1_rs1[29];
@@ -206,18 +243,18 @@ module VX_dxa_unit import VX_gpu_pkg::*, VX_dxa_pkg::*; #(
     localparam [`VX_CFG_XLEN-1:0] LMEM_BASE_B = `VX_CFG_XLEN'(`VX_MEM_LMEM_BASE_ADDR);
     wire [RB_W-1:0] bk_mb_rank;
     if (RB != 0) begin : g_bk_mb_rank
-        assign bk_mb_rank = lane1_rs1[LMEM_LOG +: RB];
+        assign bk_mb_rank = mb_ptr[LMEM_LOG +: RB];
     end else begin : g_bk_mb_rank0
         assign bk_mb_rank = '0;
     end
-    wire [LMEM_LOG-1:0] bk_mb_off = lane1_rs1[LMEM_LOG-1:0];
-    wire bk_mb_win = ((lane1_rs1 >> WIN_LSB) == (DLMEM_BASE_B >> WIN_LSB));
+    wire [LMEM_LOG-1:0] bk_mb_off = mb_ptr[LMEM_LOG-1:0];
+    wire bk_mb_win = ((mb_ptr >> WIN_LSB) == (DLMEM_BASE_B >> WIN_LSB));
     dlmem_peer_t bk_mb_peer;
     assign bk_mb_peer = peer_row.peers[bk_mb_rank];
     wire [LMEM_LOG-1:0] bk_mb_base = peer_slot_base[bk_mb_peer.slot];
-    wire [`VX_CFG_XLEN-1:0] bk_mb_rel  = lane1_rs1 - LMEM_BASE_B;
-    wire [`VX_CFG_XLEN-1:0] bk_src_rel = lane2_rs1 - LMEM_BASE_B;
-    wire [`VX_CFG_XLEN-1:0] bk_size    = lane3_rs1;
+    wire [`VX_CFG_XLEN-1:0] bk_mb_rel  = mb_ptr - LMEM_BASE_B;
+    wire [`VX_CFG_XLEN-1:0] bk_src_rel = src_ptr - LMEM_BASE_B;
+    wire [`VX_CFG_XLEN-1:0] bk_size    = size_val;
     wire [LMEM_LOG-1:0] bk_mb_lmem = bk_mb_win ? (bk_mb_base + bk_mb_off) : bk_mb_rel[LMEM_LOG-1:0];
     `UNUSED_VAR (bk_mb_lmem[2:0])
 
@@ -227,7 +264,7 @@ module VX_dxa_unit import VX_gpu_pkg::*, VX_dxa_pkg::*; #(
     wire [31:0] mc_mask_w = (is_tload || is_bload) ? 32'(lane1_rs2[15:0]) : lane3_rs2[31:0];
     wire mbar_mode_e = is_raw || mbar_mode;
     wire mbar_win_e  = is_raw ? bk_mb_win : mbar_win;
-    wire mc_mode    = ~is_bulk && ~is_pf && mbar_mode_e && (mc_mask_w != '0);
+    wire mc_mode    = ~is_bulk && ~is_pf && ~is_store && ~is_bgop && mbar_mode_e && (mc_mask_w != '0);
     wire mc_cluster = mc_mode && ~dst_win && ~mbar_win_e;
     wire [LMEM_LOG-1:0] own_base = peer_slot_base[issue_slot];
     wire [LMEM_LOG-1:0] mc_off   = lmem_rel_byte_addr[LMEM_LOG-1:0] - own_base;
@@ -247,24 +284,132 @@ module VX_dxa_unit import VX_gpu_pkg::*, VX_dxa_pkg::*; #(
         assign row_other[r] = (32'(r) < 32'(peer_row.k)) && mc_peers[r].remote;
     end
 
-    assign dxa_req_data_in.smem_addr = mc_cluster ? mc_off
+    // A cluster reduction's destination by a local pointer: the block of the
+    // issuer's core holding it.
+    wire [`VX_CFG_XLEN-1:0] dst_rel = dst_ptr - LMEM_BASE_B;
+    reg  [NW_WIDTH-1:0] st_dloc_slot;
+    reg                 st_dloc_ok;
+    always @(*) begin
+        st_dloc_slot = issue_slot;
+        st_dloc_ok   = 1'b0;
+        for (integer w = `VX_CFG_NUM_WARPS - 1; w >= 0; --w) begin
+            if ((dst_rel >= `VX_CFG_XLEN'(peer_slot_base[w]))
+             && (dst_rel < (`VX_CFG_XLEN'(peer_slot_base[w]) + `VX_CFG_XLEN'(peer_stride)))) begin
+                st_dloc_slot = NW_WIDTH'(w);
+                st_dloc_ok   = 1'b1;
+            end
+        end
+    end
+    // That block must be a member of the issuer's cluster.
+    wire [DLMEM_MAX_CLUSTER-1:0] st_dloc_rank;
+    for (genvar r = 0; r < DLMEM_MAX_CLUSTER; ++r) begin : g_dloc_rank
+        assign st_dloc_rank[r] = (32'(r) < 32'(peer_row.k))
+                              && (peer_row.peers[r].core == DLMEM_CORE_W'(MY_CORE))
+                              && (peer_row.peers[r].slot == st_dloc_slot);
+    end
+    wire st_dloc_out = ~dst_win && st_dloc_ok && ~(| st_dloc_rank);
+    wire [DLMEM_CORE_W-1:0] st_dst_core = dst_win ? dst_peer.core : DLMEM_CORE_W'(MY_CORE);
+    wire [NW_WIDTH-1:0]     st_dst_slot = dst_win ? dst_peer.slot : st_dloc_slot;
+    wire [LMEM_LOG-1:0]     st_dst_lmem = dst_win ? (dst_base + dst_off) : dst_rel[LMEM_LOG-1:0];
+
+    assign dxa_req_data_in.smem_addr = is_store ? lmem_rel_byte_addr[DXA_SMEM_ADDR_W-1:0]
+                                     : mc_cluster ? mc_off
                                      : (dst_win ? (dst_base + dst_off) : lmem_rel_byte_addr[DXA_SMEM_ADDR_W-1:0]);
-    assign dxa_req_data_in.blk_base  = mc_cluster ? '0 : (dst_win ? dst_base : own_base);
-    assign dxa_req_data_in.slot      = dst_slot;
+    assign dxa_req_data_in.blk_base  = is_store ? own_base : (mc_cluster ? '0 : (dst_win ? dst_base : own_base));
+    assign dxa_req_data_in.slot      = is_store ? st_dst_slot : dst_slot;
     assign dxa_req_data_in.gen       = cta_slot_gen[dst_slot];
-    assign dxa_req_data_in.remote    = dst_remote;
-    assign dxa_req_data_in.dst_core  = dst_peer.core;
-    assign dxa_req_data_in.dst_slot  = dst_peer.slot;
+    assign dxa_req_data_in.remote    = ~is_store && dst_remote;
+    assign dxa_req_data_in.dst_core  = is_store ? st_dst_core : dst_peer.core;
+    assign dxa_req_data_in.dst_slot  = is_store ? st_dst_slot : dst_peer.slot;
     assign dxa_req_data_in.mbar_off  = mc_cluster ? mc_mbar_rel
-                                     : is_raw ? bk_mb_lmem[LMEM_LOG-1:3]
+                                     : (is_raw || is_store) ? bk_mb_lmem[LMEM_LOG-1:3]
                                      : (mbar_win ? (mbar_base[LMEM_LOG-1:3] + mbar_off_w) : mbar_off_w);
-    assign dxa_req_data_in.win       = dst_win;
-    assign dxa_req_data_in.win_room  = mc_cluster ? mc_room
+    assign dxa_req_data_in.win       = dst_win && ~is_store;
+    assign dxa_req_data_in.win_room  = is_store ? own_room
+                                     : mc_cluster ? mc_room
                                      : (dst_win ? (peer_stride - (LMEM_LOG+1)'(dst_off)) : own_room);
     assign dxa_req_data_in.mc_cluster = mc_cluster;
     assign dxa_req_data_in.mc_mask   = mc_mask_w[DLMEM_MAX_CLUSTER-1:0];
     assign dxa_req_data_in.mc_peers  = mc_peers;
     assign dxa_req_data_in.bulk      = is_bulk;
+    // A bulk store or global reduction's destination is gdst, a cluster
+    // reduction's the destination's local-memory byte address.
+    assign dxa_req_data_in.gsrc      = (is_bload || is_bpf) ? lane2_rs1[`VX_CFG_MEM_ADDR_WIDTH-1:0]
+                                     : (st_lin && ~st_red_c) ? lane1_rs1[`VX_CFG_MEM_ADDR_WIDTH-1:0]
+                                     : st_red_c ? `VX_CFG_MEM_ADDR_WIDTH'(st_dst_lmem) : '0;
+
+    // The reduction: op x type to the cache's atomic, with its legality.
+    // op: 0 add, 1 min, 2 max, 3 inc, 4 dec, 5 and, 6 or, 7 xor; type: 0 b32/u32,
+    // 1 s32, 2 b64/u64, 3 s64, 4 f32, 5 f64, 6 f16, 7 bf16.
+    wire t_int32 = (st_typ == 4'd0) || (st_typ == 4'd1);
+    wire t_int64 = (st_typ == 4'd2) || (st_typ == 4'd3);
+    wire t_fp    = (st_typ >= 4'd4) && (st_typ <= 4'd7);
+    wire t_h     = (st_typ == 4'd6) || (st_typ == 4'd7);
+    wire op_bit  = (st_rop >= 4'd5) && (st_rop <= 4'd7);
+    wire op_mm   = (st_rop == 4'd1) || (st_rop == 4'd2);
+    wire op_id   = (st_rop == 4'd3) || (st_rop == 4'd4);
+    wire red_ok_g = op_bit ? ((st_typ == 4'd0) || (st_typ == 4'd2))
+                  : op_mm  ? (t_int32 || t_int64 || t_h)
+                  : (st_rop == 4'd0) ? ((st_typ <= 4'd2) || t_fp)
+                  : op_id  ? (st_typ == 4'd0)
+                  : 1'b0;
+    wire red_ok_c = op_bit ? (st_typ == 4'd0)
+                  : op_mm  ? t_int32
+                  : (st_rop == 4'd0) ? (t_int32 || (st_typ == 4'd2))
+                  : op_id  ? (st_typ == 4'd0)
+                  : 1'b0;
+    wire red_ok   = st_red_c ? red_ok_c : red_ok_g;
+    wire red_fp   = t_fp || op_id;
+    // An illegal store-family request never reaches the engine (nor its group).
+    wire st_enc   = (st_kind > DXA_ST_RED_T);
+    wire st_inv   = st_red && ~red_ok;
+    wire st_nofp  = st_red && red_ok && red_fp && (`VX_CFG_EXT_FPAMO_ENABLED == 0);
+    wire st_nol2  = st_red && ~st_red_c && red_ok && ~st_nofp
+                 && (`VX_CFG_L2_ENABLED == 0) && (`VX_CFG_L3_ENABLED == 0);
+    wire st_drop  = is_store && (st_enc || st_inv || st_nofp || st_nol2);
+
+    dxa_st_t st_req;
+    always @(*) begin
+        st_req         = '0;
+        st_req.en      = is_store;
+        st_req.kind    = st_kind;
+        st_req.amo_uns = (st_typ == 4'd0) || (st_typ == 4'd2);
+        st_req.w8      = t_int64 || (st_typ == 4'd5);
+        st_req.tsize   = t_h ? 2'd1 : ((t_int64 || (st_typ == 4'd5)) ? 2'd3 : 2'd2);
+        st_req.hart_id = HART_ID_WIDTH'((HART_ID_WIDTH'(CORE_ID) << (NW_BITS + NT_BITS))
+                       | (HART_ID_WIDTH'(execute_if.data.header.wid) << NT_BITS));
+        case (st_rop)
+        4'd1:    st_req.amo_op = AMO_OP_MIN;
+        4'd2:    st_req.amo_op = AMO_OP_MAX;
+        4'd5:    st_req.amo_op = AMO_OP_AND;
+        4'd6:    st_req.amo_op = AMO_OP_OR;
+        4'd7:    st_req.amo_op = AMO_OP_XOR;
+        default: st_req.amo_op = AMO_OP_ADD;
+        endcase
+    `ifdef VX_CFG_EXT_FPAMO_ENABLE
+        case (st_rop)
+        4'd0: begin
+            if ((st_typ == 4'd4) || (st_typ == 4'd5)) st_req.amo_op = AMO_OP_FADD;
+            if (st_typ == 4'd6) st_req.amo_op = AMO_OP_FADD2;
+            if (st_typ == 4'd7) st_req.amo_op = AMO_OP_FADD2_BF;
+        end
+        4'd1: begin
+            if (st_typ == 4'd6) st_req.amo_op = AMO_OP_FMIN2;
+            if (st_typ == 4'd7) st_req.amo_op = AMO_OP_FMIN2_BF;
+        end
+        4'd2: begin
+            if (st_typ == 4'd6) st_req.amo_op = AMO_OP_FMAX2;
+            if (st_typ == 4'd7) st_req.amo_op = AMO_OP_FMAX2_BF;
+        end
+        4'd3: st_req.amo_op = AMO_OP_INC;
+        4'd4: st_req.amo_op = AMO_OP_DEC;
+        default: ;
+        endcase
+    `endif
+    end
+    assign dxa_req_data_in.st     = st_req;
+    assign dxa_req_data_in.bg     = st_bg;
+    assign dxa_req_data_in.bg_seq = bg_seq[execute_if.data.header.wid];
     assign dxa_req_data_in.src_addr  = bk_src_rel[LMEM_LOG-1:0];
     // A bulk prefetch is a hint: it reads at most the local memory's size.
     wire [31:0] bpf_size = bk_size[31:0];
@@ -283,24 +428,33 @@ module VX_dxa_unit import VX_gpu_pkg::*, VX_dxa_pkg::*; #(
     // Bulk copy checks: a local address must lie in the issuer's own block.
     wire [`VX_CFG_XLEN-1:0] own_lo = `VX_CFG_XLEN'(own_base);
     wire [`VX_CFG_XLEN-1:0] own_hi = own_lo + `VX_CFG_XLEN'(peer_stride);
-    wire [`VX_CFG_XLEN-1:0] bk_dst_off = dst_win ? `VX_CFG_XLEN'(dst_off) : (lmem_rel_byte_addr - own_lo);
+    wire [`VX_CFG_XLEN-1:0] bk_dst_off = dst_win ? `VX_CFG_XLEN'(dst_off) : (dst_rel - own_lo);
     wire bk_src_in  = (bk_src_rel >= own_lo) && (bk_src_rel < own_hi);
     wire bk_mb_in   = (bk_mb_rel >= own_lo) && (bk_mb_rel < own_hi);
-    wire bk_align   = (bk_size == '0) || (bk_size[3:0] != '0) || (bk_src_rel[3:0] != '0) || (bk_dst_off[3:0] != '0);
+    wire bk_align   = (bk_size == '0) || (bk_size[3:0] != '0) || (bk_src_rel[3:0] != '0) || (bk_dst_off[3:0] != '0)
+                   || (st_lin && ~st_red_c && (lane1_rs1[3:0] != '0));
     wire bk_src_out = ~bk_src_in || (bk_size > (own_hi - bk_src_rel));
     wire bk_mb_oob  = bk_mb_win && ((32'(bk_mb_rank) >= 32'(peer_row.k)) || ({1'b0, bk_mb_off} >= peer_stride));
     wire bk_rank    = dst_oob || bk_mb_oob;
     wire [DLMEM_CORE_W-1:0] bk_mb_core = bk_mb_win ? bk_mb_peer.core : DLMEM_CORE_W'(MY_CORE);
     wire [NW_WIDTH-1:0]     bk_mb_slot = bk_mb_win ? bk_mb_peer.slot : issue_slot;
     wire bk_mbar    = (~bk_mb_win && ~bk_mb_in) || (dst_blk_core != bk_mb_core) || (dst_slot != bk_mb_slot);
+    // A cluster reduction's mbarrier lies in its destination block.
+    wire [`VX_CFG_XLEN-1:0] st_dblk_lo = dst_win ? `VX_CFG_XLEN'(dst_base) : `VX_CFG_XLEN'(peer_slot_base[st_dloc_slot]);
+    wire [`VX_CFG_XLEN-1:0] st_mb_lmem = bk_mb_win ? `VX_CFG_XLEN'(bk_mb_base + bk_mb_off) : bk_mb_rel;
+    wire [`VX_CFG_XLEN-1:0] st_dst_lmem_x = `VX_CFG_XLEN'(st_dst_lmem);
+    wire st_mbar    = (st_dst_core != (bk_mb_win ? bk_mb_peer.core : DLMEM_CORE_W'(MY_CORE)))
+                   || (st_mb_lmem < st_dblk_lo) || (st_mb_lmem >= (st_dblk_lo + `VX_CFG_XLEN'(peer_stride)));
     wire bk_box     = (bk_dst_off >= `VX_CFG_XLEN'(peer_stride))
                    || (bk_size > (`VX_CFG_XLEN'(peer_stride) - bk_dst_off));
     // A global source (bload, bulk prefetch) has the same 16-byte rules.
     wire gb_align   = (is_bpf ? (bpf_size == '0) : (bk_size == '0)) || (bk_size[3:0] != '0) || (lane2_rs1[3:0] != '0)
                    || (is_bload && (bk_dst_off[3:0] != '0));
     // An LMEM-to-LMEM copy by a local pointer or by its own rank names the issuer's block.
-    wire bk_self    = ~dst_win || ((dst_peer.core == DLMEM_CORE_W'(MY_CORE)) && (dst_peer.slot == issue_slot));
-    wire mb_misalign = (lane1_rs1[2:0] != '0);
+    wire bk_self    = st_red_c ? (dst_win ? ((dst_peer.core == DLMEM_CORE_W'(MY_CORE)) && (dst_peer.slot == issue_slot))
+                                          : (~st_dloc_ok || (st_dloc_slot == issue_slot)))
+                               : (~dst_win || ((dst_peer.core == DLMEM_CORE_W'(MY_CORE)) && (dst_peer.slot == issue_slot)));
+    wire mb_misalign = (mb_ptr[2:0] != '0);
 `endif
     // smem_addr (LMEM byte width) and meta/coords (32-bit ABI) take low bits;
     // high bits unused when XLEN exceeds the field width
@@ -316,14 +470,31 @@ module VX_dxa_unit import VX_gpu_pkg::*, VX_dxa_pkg::*; #(
     // dxa_req_arb and this unit. Barrier transaction registration is
     // handled by software via vx_barrier.h::expect_tx.
     wire dxa_buf_ready, wb_ready;
+`ifdef DXA_MBAR_ENABLE
+    // A bulk_group operation waits while its warp's open group is full or
+    // every group slot is taken; a commit while every slot is taken.
+    wire bg_stall = (st_bg && bg_stall_op[execute_if.data.header.wid])
+                 || (is_bgop && (execute_if.data.op_args.dxa.bg_kind == 2'd0)
+                     && bg_stall_commit[execute_if.data.header.wid]);
+    wire send_ready = (is_bgop || dxa_buf_ready) && ~bg_stall;
+    wire accept = (send_ready || ~is_send) && wb_ready;
+`else
     wire accept = (dxa_buf_ready || ~is_send) && wb_ready;
+`endif
     wire fire   = execute_if.valid && accept;
 
     assign execute_if.ready = accept;
 
 `ifdef DXA_MBAR_ENABLE
+    assign bg_evt_valid = fire && is_send && ((st_bg && ~st_drop) || is_bgop);
+    assign bg_evt.wid   = execute_if.data.header.wid;
+    assign bg_evt.kind  = is_bgop ? (execute_if.data.op_args.dxa.bg_kind + 2'd1) : DXA_BG_KIND_OP;
+    assign bg_evt.n     = is_bgop ? execute_if.data.op_args.dxa.bg_n : 5'd0;
+`endif
+
+`ifdef DXA_MBAR_ENABLE
     wire bulk_fire  = fire && is_send && is_bulk;
-    wire issue_fire = fire && is_send && ~is_raw && ~is_bpf;
+    wire issue_fire = fire && is_send && ~is_raw && ~is_bpf && ~is_store && ~is_bgop;
     wire ld_fire    = fire && is_send && (is_tload || is_bload) && ~is_pf;
     wire bpf_fire   = fire && is_send && is_bpf;
     wire is_mcast   = ($countones(dxa_req_data_in.cta_mask) > 1);
@@ -396,6 +567,46 @@ module VX_dxa_unit import VX_gpu_pkg::*, VX_dxa_pkg::*; #(
                       && ~(~mc_mode && (bk_rank || bk_mbar)) && bk_box),
         ("%t: *** %s DXA box exceeds the destination block: wid=%0d dst=0x%0h size=%0d stride=0x%0h",
          $time, INSTANCE_ID, execute_if.data.header.wid, lane0_rs1, lane3_rs1, peer_stride))
+    // The store family, in the order of the golden model.
+    wire st_fire  = fire && is_send && is_store;
+    wire st_ok0   = st_fire && ~st_enc && ~st_inv && ~st_nofp && ~st_nol2;
+    wire st_lok   = st_ok0 && st_lin;
+    `RUNTIME_ASSERT(~(st_fire && st_enc),
+        ("%t: *** %s invalid DXA encoding: wid=%0d kind=%0d", $time, INSTANCE_ID, execute_if.data.header.wid, st_kind))
+    `RUNTIME_ASSERT(~(st_fire && ~st_enc && st_inv),
+        ("%t: *** %s DXA invalid reduction: wid=%0d op=%0d type=%0d", $time, INSTANCE_ID,
+         execute_if.data.header.wid, st_rop, st_typ))
+    `RUNTIME_ASSERT(~(st_fire && ~st_enc && st_nofp),
+        ("%t: *** %s DXA reduction needs FPAMO: wid=%0d op=%0d type=%0d", $time, INSTANCE_ID,
+         execute_if.data.header.wid, st_rop, st_typ))
+    `RUNTIME_ASSERT(~(st_fire && ~st_enc && st_nol2),
+        ("%t: *** %s DXA global reduction needs an L2 or L3: wid=%0d", $time, INSTANCE_ID, execute_if.data.header.wid))
+    wire st_mbok  = st_lok && st_red_c && ~mb_misalign;
+    `RUNTIME_ASSERT(~(st_lok && st_red_c && mb_misalign),
+        ("%t: *** %s DXA mbarrier must be 8-byte aligned: wid=%0d mbar=0x%0h",
+         $time, INSTANCE_ID, execute_if.data.header.wid, lane3_rs1))
+    wire st_aok   = (st_lok && ~st_red_c) || st_mbok;
+    `RUNTIME_ASSERT(~(st_aok && bk_align),
+        ("%t: *** %s DXA bulk copy needs 16-byte size and alignment: wid=%0d dst=0x%0h src=0x%0h size=%0d",
+         $time, INSTANCE_ID, execute_if.data.header.wid, lane1_rs1, lane0_rs1, lane2_rs1))
+    `RUNTIME_ASSERT(~(st_aok && ~bk_align && bk_src_out),
+        ("%t: *** %s DXA bulk copy source outside the block: wid=%0d src=0x%0h size=%0d stride=0x%0h",
+         $time, INSTANCE_ID, execute_if.data.header.wid, lane0_rs1, lane2_rs1, peer_stride))
+    wire st_cok   = st_mbok && ~bk_align && ~bk_src_out;
+    `RUNTIME_ASSERT(~(st_cok && (bk_rank || st_dloc_out)),
+        ("%t: *** %s DXA destination rank outside the cluster: wid=%0d dst=0x%0h mbar=0x%0h k=%0d stride=0x%0h",
+         $time, INSTANCE_ID, execute_if.data.header.wid, lane1_rs1, lane3_rs1, peer_row.k, peer_stride))
+    wire st_rok   = st_cok && ~bk_rank && ~st_dloc_out;
+    `RUNTIME_ASSERT(~(st_rok && bk_self),
+        ("%t: *** %s DXA bulk copy into the issuing block: wid=%0d dst=0x%0h",
+         $time, INSTANCE_ID, execute_if.data.header.wid, lane1_rs1))
+    `RUNTIME_ASSERT(~(st_rok && ~bk_self && st_mbar),
+        ("%t: *** %s DXA mbarrier must be in the destination block: wid=%0d dst=0x%0h mbar=0x%0h",
+         $time, INSTANCE_ID, execute_if.data.header.wid, lane1_rs1, lane3_rs1))
+    `RUNTIME_ASSERT(~(st_rok && ~bk_self && ~st_mbar
+                      && (bk_size > (`VX_CFG_XLEN'(peer_stride) - (st_dst_lmem_x - st_dblk_lo)))),
+        ("%t: *** %s DXA box exceeds the destination block: wid=%0d dst=0x%0h size=%0d stride=0x%0h",
+         $time, INSTANCE_ID, execute_if.data.header.wid, lane1_rs1, lane2_rs1, peer_stride))
 `endif
 
     VX_elastic_buffer #(
@@ -405,7 +616,11 @@ module VX_dxa_unit import VX_gpu_pkg::*, VX_dxa_pkg::*; #(
     ) dxa_req_buf (
         .clk       (clk),
         .reset     (reset),
+    `ifdef DXA_MBAR_ENABLE
+        .valid_in  (fire && is_send && ~is_bgop && ~st_drop),
+    `else
         .valid_in  (fire && is_send),
+    `endif
         .ready_in  (dxa_buf_ready),
         .data_in   (dxa_req_data_in),
         .valid_out (dxa_req_bus_if.req_valid),

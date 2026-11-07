@@ -57,6 +57,15 @@ module VX_dxa_lmem_rd import VX_gpu_pkg::*, VX_dxa_pkg::*; #(
     output wire [TAG_W-1:0]            line_rsp_tag,
     input  wire                        line_rsp_ready,
 
+    // Word reads of a store, in place of the line reads: one local-memory
+    // word each, answered in order, never refused.
+    input  wire                        word_mode,
+    input  wire                        word_req_valid,
+    input  wire [DXA_LMEM_ADDR_W-1:0]  word_req_addr,
+    output wire                        word_req_ready,
+    output wire                        word_rsp_valid,
+    output wire [WORD_SIZE*8-1:0]      word_rsp_data,
+
     // The writer's beats (smem_wr), and the worker's local-memory bus.
     VX_mem_bus_if.slave                wr_bus_if,
     VX_mem_bus_if.master               smem_bus_if
@@ -125,18 +134,22 @@ module VX_dxa_lmem_rd import VX_gpu_pkg::*, VX_dxa_pkg::*; #(
         `UNUSED_VAR (issue_k_r)
     end
 
-    wire rd_fire = rd_valid && smem_bus_if.req_ready;
+    wire rd_fire = rd_valid && smem_bus_if.req_ready && ~word_mode;
 
-    assign smem_bus_if.req_valid = rd_valid || wr_bus_if.req_valid;
-    assign smem_bus_if.req_data.rw     = rd_valid ? 1'b0               : wr_bus_if.req_data.rw;
-    assign smem_bus_if.req_data.addr   = rd_valid ? rd_addr            : wr_bus_if.req_data.addr;
-    assign smem_bus_if.req_data.data   = rd_valid ? '0                 : wr_bus_if.req_data.data;
-    assign smem_bus_if.req_data.byteen = rd_valid ? {WORD_SIZE{1'b1}}  : wr_bus_if.req_data.byteen;
-    assign smem_bus_if.req_data.attr   = rd_valid ? '0                 : wr_bus_if.req_data.attr;
-    assign smem_bus_if.req_data.tag.uuid  = rd_valid ? uuid : wr_bus_if.req_data.tag.uuid;
-    assign smem_bus_if.req_data.tag.value = rd_valid ? ((SMEM_TAG_VALUE_W'(core_id) << ENGINE_VALUE_W) | SMEM_TAG_VALUE_W'(1))
-                                                     : wr_bus_if.req_data.tag.value;
-    assign wr_bus_if.req_ready = smem_bus_if.req_ready && ~rd_valid;
+    wire              any_rd   = word_mode ? word_req_valid : rd_valid;
+    wire [ADDR_W-1:0] any_addr = word_mode ? word_req_addr : rd_addr;
+    assign word_req_ready = word_mode && smem_bus_if.req_ready;
+
+    assign smem_bus_if.req_valid = any_rd || wr_bus_if.req_valid;
+    assign smem_bus_if.req_data.rw     = any_rd ? 1'b0               : wr_bus_if.req_data.rw;
+    assign smem_bus_if.req_data.addr   = any_rd ? any_addr           : wr_bus_if.req_data.addr;
+    assign smem_bus_if.req_data.data   = any_rd ? '0                 : wr_bus_if.req_data.data;
+    assign smem_bus_if.req_data.byteen = any_rd ? {WORD_SIZE{1'b1}}  : wr_bus_if.req_data.byteen;
+    assign smem_bus_if.req_data.attr   = any_rd ? '0                 : wr_bus_if.req_data.attr;
+    assign smem_bus_if.req_data.tag.uuid  = any_rd ? uuid : wr_bus_if.req_data.tag.uuid;
+    assign smem_bus_if.req_data.tag.value = any_rd ? ((SMEM_TAG_VALUE_W'(core_id) << ENGINE_VALUE_W) | SMEM_TAG_VALUE_W'(1))
+                                                   : wr_bus_if.req_data.tag.value;
+    assign wr_bus_if.req_ready = smem_bus_if.req_ready && ~any_rd;
 
     // Writes are posted.
     assign wr_bus_if.rsp_valid = 1'b0;
@@ -145,7 +158,9 @@ module VX_dxa_lmem_rd import VX_gpu_pkg::*, VX_dxa_pkg::*; #(
 
     // ---- responses ----
     assign smem_bus_if.rsp_ready = 1'b1;
-    wire rsp_fire = smem_bus_if.rsp_valid;
+    wire rsp_fire = smem_bus_if.rsp_valid && ~word_mode;
+    assign word_rsp_valid = smem_bus_if.rsp_valid && word_mode;
+    assign word_rsp_data  = smem_bus_if.rsp_data.data;
     wire fill_last = (fill_k_r == RD_W'(NUM_RDS - 1));
     `UNUSED_VAR (smem_bus_if.rsp_data.tag)
 

@@ -430,6 +430,8 @@ public:
       auto& ingress = dlmem_ingress_.at(c);
       ingress->LmemDmaOut.bind(&core->local_mem()->Inputs.at(Core::LMEM_DXA_ROW_PORT));
       core->scheduler().cta_dispatcher()->DxaSlotOut.at(2).bind(&ingress->SlotIn);
+      // The progress of the core's bulk_group operations.
+      dxa_core_->BgComplOut.at(c).bind(&core->BgComplIn);
     }
 #else
 #line 411

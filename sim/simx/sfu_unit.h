@@ -67,6 +67,9 @@ public:
 #ifdef DXA_MBAR_ENABLE
 	// The core's CTA slots, for the slot and generation a DXA request records.
 	SimChannel<CtaSlotEvt> dxa_slot_in;
+
+	// The DXA sub-unit, whose bulk-group ports the core binds.
+	DxaUnit& dxa_unit() { return *dxa_unit_; }
 #else
 #line 66
 #endif
@@ -121,6 +124,11 @@ public:
 
 protected:
 	void on_tick() override;
+#ifdef DXA_MBAR_ENABLE
+	void on_reset() override;
+#else
+#line 117
+#endif
 
 private:
 	uint32_t latency_of(const instr_trace_t* trace) const;

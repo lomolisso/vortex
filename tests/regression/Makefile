@@ -24,7 +24,8 @@ ifeq ($(XLEN),64)
 TESTS += cta_gang cluster_rank cluster_sync dlmem_local \
          dlmem_store dlmem_load dlmem_atomic dlmem_stress lmem_bar_order \
          dlmem_amo_order mbar_local mbar_wait mbar_remote sgemm_tcu_wg_mbar sgemm_tcu_mx_mbar \
-         dxa_mbar dxa_load dlmem_dxa dlmem_st_async dlmem_bulk atomic_fp mbar_ops cp_async mbar_init_fence
+         dxa_mbar dxa_load dxa_store dlmem_dxa dlmem_st_async dlmem_bulk atomic_fp mbar_ops cp_async \
+         mbar_init_fence
 endif
 
 # --- common exclude list ---------------------------------------------

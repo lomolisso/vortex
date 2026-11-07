@@ -282,6 +282,8 @@ module VX_core_top import VX_gpu_pkg::*;
     `endif
     `ifdef DXA_MBAR_ENABLE
         `UNUSED_PIN (dxa_slot_stride),
+        .dxa_bg_compl_valid (1'b0),
+        .dxa_bg_compl   ('0),
     `endif
 
     `ifdef VX_CFG_EXT_TEX_ENABLE

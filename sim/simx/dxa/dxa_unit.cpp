@@ -34,6 +34,19 @@ instr_trace_t* DxaUnit::process(instr_trace_t* trace) {
   if (trace->pid >= 0 && trace->pid != int(3 / VX_CFG_NUM_SFU_LANES)) {
     return trace;
   }
+#ifdef DXA_MBAR_ENABLE
+  {
+    const DxaType type = std::get<DxaType>(trace->op_type);
+    if (type == DxaType::STORE) {
+      return this->issue_store(trace) ? trace : nullptr;
+    }
+    if (type == DxaType::BGOP) {
+      return this->issue_bgop(trace) ? trace : nullptr;
+    }
+  }
+#else
+#line 32
+#endif
   if (req_out_.full()) {
     return nullptr;
   }
@@ -265,10 +278,11 @@ void DxaUnit::cluster_receivers(const instr_trace_t* trace, uint32_t meta, uint3
 // plus the size against its block is the engine's, as for a box.
 void DxaUnit::translate_bulk(const instr_trace_t* trace, DxaReq& req) const {
   const auto& rs1 = trace->src_data[0];
-  const uint64_t dst  = static_cast<uint64_t>(rs1.at(0).u);
-  const uint64_t mbar = static_cast<uint64_t>(rs1.at(1).u);
-  const uint64_t src  = static_cast<uint64_t>(rs1.at(2).u);
-  const uint64_t size = static_cast<uint64_t>(rs1.at(3).u);
+  this->translate_bulk(trace, req, rs1.at(0).u, rs1.at(1).u, rs1.at(2).u, rs1.at(3).u);
+}
+
+void DxaUnit::translate_bulk(const instr_trace_t* trace, DxaReq& req, uint64_t dst, uint64_t mbar,
+                             uint64_t src, uint64_t size) const {
   const auto cfg = dlmem_cfg();
   const uint32_t rbits = dlmem_ref::rank_bits(cfg);
   const uint32_t wl = cfg.lmem_log + rbits;
@@ -337,6 +351,103 @@ void DxaUnit::translate_bulk(const instr_trace_t* trace, DxaReq& req) const {
   DT(4, "dxa-unit bulk: core=" << core_->id() << ", wid=" << trace->wid << ", src=0x" << std::hex << src
      << ", size=0x" << size << ", dst={core=" << std::dec << dblk.core << ", slot=" << dblk.slot << "}, off=0x"
      << std::hex << d.off << ", mbar_off=0x" << req.mbar_off << std::dec << ", remote=" << req.remote);
+}
+
+// A cluster reduction's local-memory source into another block of the
+// issuer's cluster. dst and mbar are each a window address, resolved through
+// the issuing block's peer row, or a local pointer into the block of this core
+// whose slot holds it (the lowest slot whose [base, base + stride) does, as
+// the RTL searches). The checks run in the RTL's order: the mbarrier's
+// alignment, the 16-byte rules, the source, the cluster, the issuing block,
+// the mbarrier's block.
+void DxaUnit::translate_red_cluster(const instr_trace_t* trace, DxaReq& req, uint64_t dst, uint64_t mbar,
+                                    uint64_t src, uint64_t size) const {
+  const auto cfg = dlmem_cfg();
+  const uint32_t rbits = dlmem_ref::rank_bits(cfg);
+  const uint32_t wl = cfg.lmem_log + rbits;
+  const uint32_t own = req.slot;
+  const auto& row = slot_row_.at(own);
+  const uint64_t lmem_mask = dlmem_ref::low_mask(cfg.lmem_log);
+  const uint64_t own_base = (uint64_t(own) * stride_) & lmem_mask;
+  const uint64_t own_lo = cfg.lmem_base + own_base;
+
+  struct Ptr {
+    bool     win;
+    bool     ok;     // a window address, or a local one some slot holds
+    uint32_t rank;   // window
+    uint32_t slot;   // local
+    uint64_t off;    // in the block
+  };
+  auto decode = [&](uint64_t a) {
+    if ((a >> wl) == (cfg.dlmem_base >> wl)) {
+      return Ptr{true, true, uint32_t((a >> cfg.lmem_log) & dlmem_ref::low_mask(rbits)), 0, a & lmem_mask};
+    }
+    const uint64_t rel = a - cfg.lmem_base;
+    for (uint32_t w = 0; w < VX_CFG_NUM_WARPS; ++w) {
+      const uint64_t base = (uint64_t(w) * stride_) & lmem_mask;
+      if (rel >= base && rel < base + stride_) {
+        return Ptr{false, true, 0, w, rel - base};
+      }
+    }
+    return Ptr{false, false, 0, own, 0};
+  };
+  const Ptr d = decode(dst);
+  const Ptr m = decode(mbar);
+  const uint64_t s_off = src - own_lo;
+  const uint64_t d_align = d.win ? d.off : dst - own_lo;
+
+  if (!dxa_ref::mbar_aligned(mbar)) {
+    this->issue_abort(trace, dxa_ref::MSG_MBAR_ALIGN);
+  }
+  if (size == 0 || (size % 16) != 0 || (src % 16) != 0 || (d_align % 16) != 0) {
+    this->issue_abort(trace, dxa_ref::MSG_BULK_ALIGN);
+  }
+  if (s_off >= stride_ || size > stride_ - s_off) {
+    this->issue_abort(trace, dxa_ref::MSG_BULK_SRC);
+  }
+  const dlmem_ref::Peer self{req.src_core, own};
+  auto member = [&](const dlmem_ref::Peer& p) {
+    for (uint32_t r = 0; r < row.k; ++r) {
+      if (row.peers.at(r).core == p.core && row.peers.at(r).slot == p.slot)
+        return true;
+    }
+    return false;
+  };
+  const dlmem_ref::Peer dloc{req.src_core, d.slot};
+  if ((d.win && (d.rank >= row.k || d.off >= stride_))
+   || (m.win && (m.rank >= row.k || m.off >= stride_))
+   || (!d.win && d.ok && !member(dloc))) {
+    this->issue_abort(trace, "DXA destination rank outside the cluster");
+  }
+  const dlmem_ref::Peer dblk = d.win ? row.peers.at(d.rank) : dloc;
+  if (!d.ok || (dblk.core == self.core && dblk.slot == self.slot)) {
+    this->issue_abort(trace, dxa_ref::MSG_BULK_SELF);
+  }
+  const dlmem_ref::Peer mblk = m.win ? row.peers.at(m.rank) : dlmem_ref::Peer{req.src_core, m.slot};
+  if (!m.ok || dblk.core != mblk.core || dblk.slot != mblk.slot) {
+    this->issue_abort(trace, "DXA mbarrier must be in the destination block");
+  }
+  if (d.off >= stride_ || size > stride_ - d.off) {
+    this->issue_abort(trace, "DXA box exceeds the destination block");
+  }
+
+  const uint64_t dbase = d.win ? uint64_t(dblk.slot) * stride_ : (uint64_t(dblk.slot) * stride_) & lmem_mask;
+  const uint64_t mbase = m.win ? uint64_t(mblk.slot) * stride_ : (uint64_t(mblk.slot) * stride_) & lmem_mask;
+  req.mode      = true;
+  req.src_addr  = src;
+  req.size      = uint32_t(size);
+  req.smem_addr = cfg.lmem_base + dbase + d.off;
+  req.mbar_off  = uint32_t((mbase + m.off) >> 3);
+  req.slot      = dblk.slot;
+  req.gen       = slot_gen_.at(dblk.slot);
+  req.dst_core  = dblk.core;
+  req.remote    = (dblk.core != req.src_core);
+  req.win       = true;
+  req.win_room  = (d.off < stride_) ? uint32_t(stride_ - d.off) : 0u;
+  DT(4, "dxa-unit cluster reduction: core=" << core_->id() << ", wid=" << trace->wid << ", src=0x" << std::hex
+     << src << ", size=0x" << size << ", dst={core=" << std::dec << dblk.core << ", slot=" << dblk.slot
+     << "}, off=0x" << std::hex << d.off << ", mbar_off=0x" << req.mbar_off << std::dec << ", remote="
+     << req.remote);
 }
 
 // The PTX forms. TLOAD lanes: rs1 = {dst, mbar, {c1, c0}, {c3, c2}},
@@ -483,5 +594,168 @@ void DxaUnit::decode_ptx(const instr_trace_t* trace, DxaType type, DxaReq& req) 
   req.gen      = slot_gen_.at(dblk.slot);
   req.dst_core = dblk.core;
   req.remote   = (dblk.core != req.src_core);
+}
+
+// The bulk-group unit restarts with the device, its warps' groups empty.
+void DxaUnit::bg_reset() {
+  std::fill(bg_seq_.begin(), bg_seq_.end(), 0);
+  for (uint32_t w = 0; w < bg_mirror_.size(); ++w) {
+    bg_mirror_[w] = DxaBgState();
+    bg_mirror_[w].wid = w;
+  }
+}
+
+void DxaUnit::bg_state(const DxaBgState& s) {
+  auto& m = bg_mirror_.at(s.wid);
+  m = s;
+  DT(4, "dxa-unit bg-state: core=" << core_->id() << ", " << s);
+}
+
+// The bulk-group ops read no register: the op and N are instruction fields.
+// A commit holds while the warp has every group slot pending.
+bool DxaUnit::issue_bgop(instr_trace_t* trace) {
+  const auto args = std::get<IntrDxaArgs>(trace->instr_ptr->get_args());
+  const uint32_t wid = trace->wid;
+  if (const char* msg = dxa_ref::check_bgop(args.bg_op)) {
+    this->issue_abort(trace, msg);
+  }
+  if (BgEvtOut.full()) {
+    return false;
+  }
+  DxaBgEvt e;
+  e.wid = wid;
+  switch (args.bg_op) {
+  case dxa_ref::BG_COMMIT:
+    if (bg_mirror_.at(wid).stall_commit) {
+      return false;
+    }
+    e.kind = DxaBgEvt::COMMIT;
+    bg_seq_.at(wid) = (bg_seq_.at(wid) + 1) & (DXA_BG_GROUPS - 1);
+    break;
+  case dxa_ref::BG_WAIT:
+    e.kind = DxaBgEvt::WAIT;
+    e.n = args.bg_n;
+    break;
+  default:
+    e.kind = DxaBgEvt::WAIT_READ;
+    e.n = args.bg_n;
+    break;
+  }
+  BgEvtOut.send(e, 0);
+  DT(4, "dxa-unit bg-op: core=" << core_->id() << ", " << e << ", seq=" << bg_seq_.at(wid));
+  return true;
+}
+
+// The store family. Lanes: rs1 = {src, a1, a2, mbar}, rs2 lane 0 = {ctl, c4};
+// a1/a2 are {gdst, size} for the bulk forms, {dst, size} for a cluster
+// reduction and {{c1, c0}, {c3, c2}} for the tensor forms.
+bool DxaUnit::issue_store(instr_trace_t* trace) {
+  const auto& rs2 = trace->src_data[1];
+  const uint32_t ctl  = uint32_t(uint64_t(rs2.at(0).u) >> 32);
+  const uint32_t kind = (ctl >> DXA_ST_CTL_KIND_LSB) & ((1u << DXA_ST_CTL_KIND_BITS) - 1u);
+  const uint32_t op   = (ctl >> DXA_ST_CTL_OP_LSB) & ((1u << DXA_ST_CTL_OP_BITS) - 1u);
+  const uint32_t type = (ctl >> DXA_ST_CTL_TYPE_LSB) & ((1u << DXA_ST_CTL_TYPE_BITS) - 1u);
+#ifdef VX_CFG_EXT_FPAMO_ENABLE
+  constexpr bool has_fpamo = true;
+#else
+  constexpr bool has_fpamo = false;
+#endif
+  constexpr bool has_llc = (VX_CFG_L2_ENABLED != 0) || (VX_CFG_L3_ENABLED != 0);
+  if (const char* msg = dxa_ref::check_store_ctl(kind, op, type, has_llc, has_fpamo)) {
+    this->issue_abort(trace, msg);
+  }
+  const bool bg = dxa_ref::is_bulk_group(kind);
+  const uint32_t wid = trace->wid;
+  if (req_out_.full() || (bg && (BgEvtOut.full() || bg_mirror_.at(wid).stall_op))) {
+    return false;
+  }
+  DxaReq req;
+  req.core      = core_;
+  req.uuid      = trace->uuid;
+  req.wid       = wid;
+  req.desc_slot = 0;
+  req.bar_id    = 0;
+  req.cta_mask  = 0;
+  req.smem_addr = 0;
+  for (auto& c : req.coords) c = 0;
+  req.mode      = false;
+  req.mbar_off  = 0;
+  req.slot      = warp_slot_.at(wid);
+  req.gen       = slot_gen_.at(req.slot);
+  req.src_core  = core_->id() % dlmem_cfg().ncc;
+  req.dst_core  = req.src_core;
+  req.remote    = false;
+  req.win       = false;
+  req.win_room  = 0;
+  req.cluster   = false;
+  req.num_rcv   = 0;
+  req.bulk      = false;
+  req.src_addr  = 0;
+  req.size      = 0;
+  req.sent      = SimPlatform::instance().cycles();
+  req.tload     = false;
+  req.bload     = false;
+  req.prefetch  = false;
+  req.offs[0] = req.offs[1] = req.offs[2] = 0;
+  req.gsrc      = 0;
+  req.blk_off   = 0;
+  req.store     = true;
+  req.st_kind   = kind;
+  req.red_op    = op;
+  req.red_type  = type;
+  req.gdst      = 0;
+  req.bg        = bg;
+  req.bg_seq    = bg_seq_.at(wid);
+  req.hart_id   = make_hart_id(core_->id(), wid, 0);
+  this->decode_store(trace, req);
+  req_out_.send(req);
+  if (bg) {
+    DxaBgEvt e;
+    e.wid  = wid;
+    e.kind = DxaBgEvt::OP;
+    BgEvtOut.send(e, 0);
+  }
+  DT(4, "dxa-unit store: core=" << core_->id() << ", wid=" << wid << ", kind=" << kind << ", op="
+     << dxa_ref::red_op_name(op) << ", type=" << dxa_ref::red_type_name(type, op) << ", src=0x" << std::hex
+     << req.src_addr << ", gdst=0x" << req.gdst << ", dst=0x" << req.smem_addr << std::dec << ", size="
+     << req.size << ", slot=" << req.desc_slot << ", bg=" << bg << ", seq=" << req.bg_seq);
+  return true;
+}
+
+void DxaUnit::decode_store(const instr_trace_t* trace, DxaReq& req) const {
+  const auto& rs1 = trace->src_data[0];
+  const auto& rs2 = trace->src_data[1];
+  const uint64_t src = rs1.at(0).u, l1 = rs1.at(1).u, l2 = rs1.at(2).u, l3 = rs1.at(3).u;
+  const uint64_t r0 = rs2.at(0).u;
+  const auto cfg = dlmem_cfg();
+  const uint64_t own_base = cfg.lmem_base + uint64_t(req.slot) * stride_;
+  const uint64_t s_off = src - own_base;
+  req.src_addr = src;
+  if (dxa_ref::is_tensor(req.st_kind)) {
+    // The box is read from the issuer's block at src, laid out as a load of
+    // the same box writes it there.
+    req.coords[0] = uint32_t(l1);
+    req.coords[1] = uint32_t(l1 >> 32);
+    req.coords[2] = uint32_t(l2);
+    req.coords[3] = uint32_t(l2 >> 32);
+    req.coords[4] = uint32_t(r0);
+    req.desc_slot = (uint32_t(r0 >> 32) >> DXA_ST_CTL_SLOT_LSB) & ((1u << DXA_ST_CTL_SLOT_BITS) - 1u);
+    req.smem_addr = src;
+    req.blk_off   = s_off & dlmem_ref::low_mask(cfg.lmem_log);
+    req.win_room  = (req.blk_off < stride_) ? uint32_t(stride_ - req.blk_off) : 0u;
+    return;
+  }
+  if (req.st_kind == dxa_ref::ST_RED_CLUSTER) {
+    this->translate_red_cluster(trace, req, l1, l3, src, l2);
+    return;
+  }
+  if (const char* msg = dxa_ref::check_bulk(src, l1, uint32_t(l2))) {
+    this->issue_abort(trace, msg);
+  }
+  if (s_off >= stride_ || l2 > stride_ - s_off) {
+    this->issue_abort(trace, dxa_ref::MSG_BULK_SRC);
+  }
+  req.gdst = l1;
+  req.size = uint32_t(l2);
 }
 #endif

@@ -440,7 +440,7 @@ struct IntrLsuArgs {
   uint32_t stride : 4;  // per-uop multiplier: 0 = regular LD/ST; 0..N-1 = packLD uop_idx
   int32_t  offset;      // immediate addr offset (signed); 0 for packLD uops
 #ifdef VX_CFG_EXT_MBAR_ENABLE
-  uint32_t red_op = 0;  // red.async: the op's funct5, cp.async: its funct3; a default keeps {w, s, off} initialisers complete
+  uint32_t red_op = 0;  // red.async: the op's funct5, cp.async: its funct3, a proxy fence: its rs1 field (its form); a default keeps {w, s, off} initialisers complete
   uint32_t cpa_n  = 0;  // cp.async.wait_group: the groups that may stay pending
 #elif defined(VX_CFG_EXT_DLMEM_ENABLE)
 #line 389
@@ -787,12 +787,25 @@ enum class DxaType {
   , TLOAD      // the PTX tensor load or tensor prefetch
   , BLOAD      // cp.async.bulk from global memory into a cluster block
   , BPREFETCH  // cp.async.bulk.prefetch.L2.global
+  , STORE      // a bulk or tensor store or reduction out of the block's local memory
+  , BGOP       // cp.async.bulk commit_group, wait_group and wait_group.read
 #else
 #line 637
 #endif
 };
 
+#ifdef VX_CFG_EXT_MBAR_ENABLE
+// BGOP: the instruction's rs1 field (0 commit, 1 wait, 2 wait.read) and its
+// rs2 field (the wait's N); no register is read.
+struct IntrDxaArgs {
+  uint32_t bg_op = 0;
+  uint32_t bg_n  = 0;
+};
+#else
+#line 640
 struct IntrDxaArgs {};
+#line 640
+#endif
 
 inline std::ostream &operator<<(std::ostream &os, const DxaType& type) {
   switch (type) {
@@ -802,6 +815,8 @@ inline std::ostream &operator<<(std::ostream &os, const DxaType& type) {
   case DxaType::TLOAD: os << "DXA.TLOAD"; break;
   case DxaType::BLOAD: os << "DXA.BLOAD"; break;
   case DxaType::BPREFETCH: os << "DXA.BPREFETCH"; break;
+  case DxaType::STORE: os << "DXA.STORE"; break;
+  case DxaType::BGOP:  os << "DXA.BGOP"; break;
 #else
 #line 644
 #endif

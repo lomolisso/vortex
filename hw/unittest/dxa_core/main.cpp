@@ -27,7 +27,14 @@
 // dimension, element strides, every swizzle, interleave, im2col, a cluster
 // multicast), each transfer's completion beat must be its last write and carry
 // its byte count, every in-bounds line must be read once per row token, and a
-// prefetch must read its lines and write nothing.
+// prefetch must read its lines and write nothing. Then the store direction:
+// bulk and tensor stores (out-of-bounds edges, swizzle, strides, interleave,
+// im2col), global reductions of every op x type through a last-level-cache
+// atomic model, tensor reductions, and cluster reductions as DLMEM atomic
+// packets: global memory and the destination block must match dxa_ref.h byte
+// for byte, the line writes, atomics, packets, local-memory reads and fences
+// must be the counts of the token walk, and every bulk_group operation must
+// report one read_done and one write_done, the last after its final response.
 
 #include <iostream>
 #include <cassert>
@@ -36,6 +43,7 @@
 #include <cstring>
 #include <deque>
 #include <map>
+#include <set>
 #include <vector>
 #include <type_traits>
 #include <functional>
@@ -45,6 +53,7 @@
 #if defined(VX_CFG_EXT_MBAR_ENABLE)
 #include <dxa_ref.h>
 namespace dxa_ref = vortex::dxa_ref;
+namespace amo_ref = vortex::amo_ref;
 #endif
 #include "VVX_dxa_core_top.h"
 #include "verilated.h"
@@ -1253,6 +1262,631 @@ static bool run_tensor_all() {
     return ok;
 }
 
+// ---- Stores and reductions (funct3 5) -------------------------------------
+
+#ifdef VX_CFG_EXT_FPAMO_ENABLE
+static constexpr int AOW = 5;
+#else
+static constexpr int AOW = 4;
+#endif
+#ifdef VX_CFG_EXT_ZACAS_ENABLE
+static constexpr int ZCW = VX_CFG_XLEN;
+#else
+static constexpr int ZCW = 0;
+#endif
+static constexpr int HART_W   = up1(clog2(VX_CFG_NUM_CLUSTERS * NCC) + clog2(VX_CFG_NUM_WARPS) + clog2(VX_CFG_NUM_THREADS));
+static constexpr int AMO_BITS = 1 + AOW + 1 + ZCW + HART_W;
+static constexpr int ATTR_FENCE = 4 + AMO_BITS;
+// The store fields sit above the tensor-load ones: bg_seq, bg, then dxa_st_t up.
+static constexpr int R_BGSEQ    = R_TLOAD + 1;
+static constexpr int R_BG       = R_BGSEQ + 3;
+static constexpr int R_ST_HART  = R_BG + 1;
+static constexpr int R_ST_TSIZE = R_ST_HART + HART_W;
+static constexpr int R_ST_W8    = R_ST_TSIZE + 2;
+static constexpr int R_ST_UNS   = R_ST_W8 + 1;
+static constexpr int R_ST_OP    = R_ST_UNS + 1;
+static constexpr int R_ST_KIND  = R_ST_OP + AOW;
+static constexpr int R_ST_EN    = R_ST_KIND + 3;
+static constexpr int R_SEND     = R_ST_EN + 1;
+// dlmem_req_pkt_t from its last field up.
+static constexpr int PEND_W   = up1(clog2(VX_CFG_DLMEM_PENDING_SIZE));
+static constexpr int P_TAG    = 0;
+static constexpr int P_MBADDR = P_TAG + max2(PEND_W, NW_W);
+static constexpr int P_MBV    = P_MBADDR + LMEM_LOG - 3;
+static constexpr int P_CMP    = P_MBV + 1;
+static constexpr int P_HART   = P_CMP + ZCW;
+static constexpr int P_UNS    = P_HART + HART_W;
+static constexpr int P_AOP    = P_UNS + 1;
+static constexpr int P_DATA   = P_AOP + AOW;
+static constexpr int P_BYTEEN = P_DATA + 64;
+static constexpr int P_ADDR   = P_BYTEEN + 8;
+static constexpr int P_OP     = P_ADDR + LMEM_LOG - 3;
+
+// A store-family transfer: x's box and descriptor, or a bulk range (x.bytes
+// from x.smem to x.base), as the engine receives it.
+struct St {
+    Xfer x;
+    uint32_t kind = dxa_ref::ST_BULK, op = 0, type = 0;
+    uint32_t dcore = 0, dslot = 2, wid = 1, seq = 0;
+};
+
+static St st_bulk(uint32_t kind, uint32_t src, uint64_t dst, uint32_t bytes, uint32_t op = 0, uint32_t type = 0) {
+    St s;
+    s.kind = kind; s.op = op; s.type = type;
+    s.x.esz = 3; s.x.bytes = bytes; s.x.base = dst; s.x.smem = src; s.x.mbar = 0;
+    return s;
+}
+
+static void load_st(uint32_t slot, const St& s) {
+    const Xfer& x = s.x;
+    for (size_t i = 0; i < sizeof(dut->dxa_req_data) / sizeof(dut->dxa_req_data[0]); ++i)
+        dut->dxa_req_data[i] = 0;
+    bool tensor = dxa_ref::is_tensor(s.kind);
+    if (tensor) {
+        set_bits(dut->dxa_req_data, R_META, 32, 0xC0000000u | slot);
+        for (int i = 0; i < 5; ++i)
+            set_bits(dut->dxa_req_data, R_COORDS + 32 * i, 32, uint32_t(x.c[i]));
+    } else {
+        set_bits(dut->dxa_req_data, R_META, 32, 0xC0000000u);
+        set_bits(dut->dxa_req_data, R_SIZE, LMEM_LOG + 1, x.bytes);
+        set_bits(dut->dxa_req_data, R_GSRC, MADDR_W, x.base);
+    }
+    set_bits(dut->dxa_req_data, R_SMEM, LMEM_LOG, x.smem);
+    set_bits(dut->dxa_req_data, R_BLK, LMEM_LOG, x.blk_base);
+    set_bits(dut->dxa_req_data, R_ROOM, LMEM_LOG + 1, x.room ? x.room : LMEM_BYTES - x.smem);
+    set_bits(dut->dxa_req_data, R_WID, NW_W, s.wid);
+    set_bits(dut->dxa_req_data, R_MBAR, LMEM_LOG - 3, x.mbar);
+    set_bits(dut->dxa_req_data, R_SLOT, NW_W, s.dslot);
+    set_bits(dut->dxa_req_data, R_DCORE, CORE_W, s.dcore);
+    bool bg = dxa_ref::is_bulk_group(s.kind);
+    set_bits(dut->dxa_req_data, R_BG, 1, bg);
+    set_bits(dut->dxa_req_data, R_BGSEQ, 3, s.seq);
+    set_bits(dut->dxa_req_data, R_ST_EN, 1, 1);
+    set_bits(dut->dxa_req_data, R_ST_KIND, 3, s.kind);
+    if (dxa_ref::is_reduce(s.kind)) {
+        auto a = dxa_ref::red_amo(s.op, s.type);
+        uint32_t tb = dxa_ref::type_bytes(s.type);
+        set_bits(dut->dxa_req_data, R_ST_OP, AOW, a.amo_op);
+        set_bits(dut->dxa_req_data, R_ST_UNS, 1, a.is_unsigned);
+        set_bits(dut->dxa_req_data, R_ST_W8, 1, tb == 8);
+        set_bits(dut->dxa_req_data, R_ST_TSIZE, 2, tb == 8 ? 3 : (tb == 2 ? 1 : 2));
+        set_bits(dut->dxa_req_data, R_ST_HART, HART_W, uint64_t(s.wid) << clog2(VX_CFG_NUM_THREADS));
+    }
+    dut->dxa_req_valid = 1;
+}
+
+// The last-level cache's atomic on a 4- or 8-byte word.
+static uint64_t llc_amo(uint32_t op, bool uns, uint32_t width, uint64_t old, uint64_t rhs) {
+    const uint64_t m = width == 8 ? ~0ull : 0xffffffffull;
+    old &= m; rhs &= m;
+    const int64_t so = width == 8 ? int64_t(old) : int64_t(int32_t(uint32_t(old)));
+    const int64_t sr = width == 8 ? int64_t(rhs) : int64_t(int32_t(uint32_t(rhs)));
+    switch (op) {
+    case 0x02: return (old + rhs) & m;
+    case 0x04: return old ^ rhs;
+    case 0x05: return old | rhs;
+    case 0x06: return old & rhs;
+    case 0x07: return uns ? (old < rhs ? old : rhs) : (so < sr ? old : rhs);
+    case 0x08: return uns ? (old > rhs ? old : rhs) : (so > sr ? old : rhs);
+    default:   return amo_ref::apply(op, width == 8 ? amo_ref::W_D : amo_ref::W_W, old, rhs, amo_ref::SITE_LLC) & m;
+    }
+}
+
+// Runs the transfers back to back and checks global memory byte for byte
+// (with the LLC atomics), a cluster reduction's destination block, the
+// request counts, and every bulk_group operation's completion events.
+static bool run_store(const char* name, std::vector<St> ss, int ready_pct, int max_lat) {
+    if (const char* only = std::getenv("DXA_ONLY")) {
+        if (!strstr(name, only))
+            return true;
+    }
+    rng_state = 1;
+    for (const char* c = name; *c; ++c)
+        rng_state = rng_state * 131 + uint8_t(*c);
+    std::vector<uint8_t> lmem(LMEM_BYTES), dmem(LMEM_BYTES), dexp(LMEM_BYTES);
+    for (int i = 0; i < LMEM_BYTES; ++i) {
+        lmem[i] = pattern(i);
+        dmem[i] = dexp[i] = pattern(i * 7 + 3);
+    }
+    std::map<uint64_t, uint8_t> gmem, gexp;
+    auto gget = [](std::map<uint64_t, uint8_t>& m, uint64_t a) -> uint8_t& {
+        auto it = m.find(a);
+        if (it == m.end())
+            it = m.emplace(a, gmem_byte(a)).first;
+        return it->second;
+    };
+    uint64_t exp_wr = 0, exp_amo = 0, exp_pkt = 0, exp_rd = 0, st_lines = 0, st_fences = 0;
+    for (auto& s : ss) {
+        uint64_t wr0 = exp_wr;
+        Xfer& x = s.x;
+        bool tensor = dxa_ref::is_tensor(s.kind);
+        auto d = ref_desc(x);
+        dxa_ref::Req q;
+        for (int i = 0; i < 5; ++i) q.coord[i] = x.c[i];
+        if (tensor) {
+            const char* bad = dxa_ref::check_tensor_store(d, q, x.smem - x.blk_base);
+            if (bad) {
+                printf("%s: vector %s breaks a rule: %s\n", name, x.name.c_str(), bad);
+                return false;
+            }
+        }
+        // Tokens: the in-bounds elements of a row grouped by global line;
+        // each reads its local-memory words (one per element if gathered).
+        uint32_t e = 1u << x.esz, cnt = 0;
+        uint32_t per_row = x.bytes ? x.bytes / e : (x.im2col ? x.cpp : box_n(x, 0));
+        bool gath = tensor && !x.im2col && x.es[0] != 1;
+        int64_t tok_line = -1;
+        uint32_t tok_s = 0, tok_end = 0, tok_n = 0;
+        uint32_t src0 = tensor ? x.smem - x.blk_base : x.smem;
+        auto flush = [&]() {
+            if (tok_line < 0) return;
+            ++exp_wr;
+            if (gath) {
+                exp_rd += tok_n;
+            } else if (x.swz) {
+                std::set<uint32_t> words;
+                for (uint32_t b = tok_s; b < tok_end; ++b)
+                    words.insert((x.blk_base + dxa_ref::swizzle(b, x.swz)) / WORD_BYTES);
+                exp_rd += words.size();
+            } else {
+                exp_rd += (x.blk_base + tok_end - 1) / WORD_BYTES - (x.blk_base + tok_s) / WORD_BYTES + 1;
+            }
+            tok_line = -1;
+        };
+        walk(x, [&](uint32_t off, bool in, uint64_t a) {
+            if (in) {
+                int64_t ln = int64_t(a / CL);
+                if (ln != tok_line) {
+                    flush();
+                    tok_line = ln; tok_s = src0 + off; tok_n = 0;
+                }
+                tok_end = src0 + off + e;
+                ++tok_n;
+            } else {
+                flush();
+            }
+            if (++cnt == per_row) {
+                flush();
+                cnt = 0;
+            }
+        });
+        flush();
+        // The golden image.
+        const uint8_t* blk = lmem.data() + x.blk_base;
+        if (s.kind == dxa_ref::ST_TENSOR) {
+            dxa_ref::for_each_store_byte(d, q, src0, [&](uint32_t r, uint64_t ga) { gget(gexp, ga) = blk[r]; });
+        } else if (s.kind == dxa_ref::ST_BULK) {
+            for (uint32_t i = 0; i < x.bytes; ++i)
+                gget(gexp, x.base + i) = lmem[x.smem + i];
+        } else if (s.kind == dxa_ref::ST_RED_CLUSTER) {
+            dxa_ref::reduce_bytes(s.op, s.type, dexp.data() + x.base, lmem.data() + x.smem, x.bytes);
+            exp_pkt += x.bytes / dxa_ref::type_bytes(s.type);
+        } else {
+            // Global reductions: the golden per element, each element's bytes
+            // contiguous in the map; one request per word holding one.
+            uint32_t E = dxa_ref::type_bytes(s.type), W = dxa_ref::red_word_bytes(s.type);
+            std::set<uint64_t> words;
+            auto red_elem = [&](uint64_t ga, const uint8_t* sp) {
+                uint8_t g[8];
+                for (uint32_t b = 0; b < E; ++b) g[b] = gget(gexp, ga + b);
+                uint64_t r = dxa_ref::reduce_elem(s.op, s.type, dxa_ref::load_le(g, E), dxa_ref::load_le(sp, E));
+                for (uint32_t b = 0; b < E; ++b) gget(gexp, ga + b) = uint8_t(r >> (8 * b));
+                words.insert(ga / W);
+            };
+            if (s.kind == dxa_ref::ST_RED_GLOBAL) {
+                for (uint32_t i = 0; i < x.bytes; i += E)
+                    red_elem(x.base + i, lmem.data() + x.smem + i);
+            } else {
+                dxa_ref::for_each_element(d, q, [&](uint32_t off, bool in, uint64_t ga) {
+                    if (!in) return;
+                    uint8_t sb[8];
+                    for (uint32_t b = 0; b < E; ++b) sb[b] = blk[dxa_ref::swizzle(src0 + off + b, x.swz)];
+                    red_elem(ga, sb);
+                });
+            }
+            exp_amo += words.size();
+        }
+        if (s.kind == dxa_ref::ST_BULK || s.kind == dxa_ref::ST_TENSOR) {
+            st_lines += exp_wr - wr0;
+            if (exp_wr != wr0) ++st_fences;
+        }
+    }
+    for (size_t i = 0; i < ss.size(); ++i)
+        if (dxa_ref::is_tensor(ss[i].kind))
+            program_desc(uint32_t(i % 16), ss[i].x);
+    for (int i = 0; i < 4; ++i)
+        clock_cycle();
+
+    struct Rsp { uint64_t tag, due; };
+    std::vector<Rsp> grsps;
+    std::deque<RdRsp> lrsps;
+    size_t next = 0;
+    uint64_t lreads = 0, gwrites = 0, gamos = 0, gfences = 0, pkts = 0, cyc = 0, idle = 0;
+    uint64_t last_perf = 0;       // last fence/AMO response given
+    std::vector<std::pair<uint32_t, uint32_t>> evts;   // (bits, cycle)
+    size_t bg_ops = 0;
+    for (auto& s : ss) bg_ops += dxa_ref::is_bulk_group(s.kind);
+    const St* cl = nullptr;
+    for (auto& s : ss)
+        if (s.kind == dxa_ref::ST_RED_CLUSTER && !cl) cl = &s;
+    bool ok = true;
+    auto issue_next = [&]() {
+        if (next < ss.size()) load_st(uint32_t(next % 16), ss[next]);
+        else dut->dxa_req_valid = 0;
+    };
+    issue_next();
+    while (cyc < 400000) {
+        int pick = -1;
+        std::vector<int> ready;
+        for (size_t i = 0; i < grsps.size(); ++i)
+            if (grsps[i].due <= cyc) ready.push_back(int(i));
+        if (!ready.empty() && (rnd() % 100) < 80)
+            pick = ready[rnd() % ready.size()];
+        dut->gmem_rsp_valid = (pick >= 0);
+        if (pick >= 0)
+            port_set(dut->gmem_rsp_tag, 0, 64, grsps[pick].tag);
+        bool lrsp = !lrsps.empty() && lrsps.front().due <= cyc;
+        dut->lmem_rsp_valid = lrsp;
+        if (lrsp) {
+            const auto& r = lrsps.front();
+            for (int w = 0; w < WORD_BYTES / 4; ++w) {
+                uint32_t v = 0;
+                for (int b = 0; b < 4; ++b)
+                    v |= uint32_t(lmem[r.addr * WORD_BYTES + w * 4 + b]) << (8 * b);
+                dut->lmem_rsp_data[w] = v;
+            }
+            dut->lmem_rsp_tag = r.tag;
+        }
+        dut->gmem_req_ready = (int(rnd() % 100) < ready_pct) ? 1 : 0;
+        dut->lmem_req_ready = (int(rnd() % 100) < ready_pct) ? 1 : 0;
+        dut->row_out_ready  = (int(rnd() % 100) < ready_pct) ? 1 : 0;
+        dut->eval();
+        bool req_taken = dut->dxa_req_valid && dut->dxa_req_ready;
+        if (lrsp && !(dut->lmem_rsp_ready & 1)) {
+            printf("%s: read response refused\n", name);
+            ok = false;
+        }
+        if ((dut->lmem_req_valid & 1) && (dut->lmem_req_ready & 1)) {
+            if (dut->lmem_req_rw & 1) {
+                printf("%s: unexpected local-memory write\n", name);
+                ok = false;
+            } else {
+                ++lreads;
+                uint64_t prev = lrsps.empty() ? cyc : lrsps.back().due;
+                uint64_t due = cyc + 1 + rnd() % 4;
+                lrsps.push_back({uint32_t(dut->lmem_req_addr), (uint64_t)dut->lmem_req_tag, due > prev ? due : prev});
+            }
+        }
+        if (lrsp)
+            lrsps.pop_front();
+        if ((dut->gmem_req_valid & 1) && (dut->gmem_req_ready & 1)) {
+            uint64_t line = port_bits(dut->gmem_req_addr, 0, MADDR_W - clog2(CL));
+            uint64_t tag  = port_bits(dut->gmem_req_tag, 0, 64);
+            bool flush = port_bits(dut->gmem_req_attr, 0, 1);
+            bool fence = port_bits(dut->gmem_req_attr, ATTR_FENCE, 1);
+            bool amo   = port_bits(dut->gmem_req_attr, 4, 1);
+            std::vector<int> be;
+            for (int b = 0; b < CL; ++b)
+                if (port_bit(dut->gmem_req_byteen, b)) be.push_back(b);
+            auto dbyte = [&](int b) { return uint8_t(dut->gmem_req_data[b / 4] >> (8 * (b % 4))); };
+            if (dut->gmem_req_rw & 1) {
+                ++gwrites;
+                if (flush || amo) { printf("%s: a write with fence/atomic attributes\n", name); ok = false; }
+                for (int b : be) gget(gmem, line * CL + b) = dbyte(b);
+            } else if (flush || fence) {
+                ++gfences;
+                if (!(flush && fence)) { printf("%s: fence without is_flush and is_fence\n", name); ok = false; }
+                grsps.push_back({tag, cyc + 2 + rnd() % (max_lat - 1)});
+            } else if (amo) {
+                ++gamos;
+                uint32_t op  = uint32_t(port_bits(dut->gmem_req_attr, 5, AOW));
+                bool uns     = port_bits(dut->gmem_req_attr, 5 + AOW, 1);
+                uint32_t w   = uint32_t(be.size());
+                bool half_ok = (w == 2) && (op >= 0x14 && op <= 0x19);
+                if ((w != 4 && w != 8 && !half_ok) || (be[0] % w) || be.back() != be[0] + int(w) - 1) {
+                    printf("%s: atomic with byte enables of %u bytes at %d\n", name, w, be.empty() ? -1 : be[0]);
+                    ok = false;
+                } else {
+                    uint64_t a = line * CL + be[0], old = 0, rhs = 0;
+                    for (uint32_t b = 0; b < w; ++b) {
+                        old |= uint64_t(gget(gmem, a + b)) << (8 * b);
+                        rhs |= uint64_t(dbyte(be[0] + b)) << (8 * b);
+                    }
+                    // A 16-bit pair's half: the packed op on its lane only.
+                    uint64_t r = (w == 2) ? (llc_amo(op, uns, 4, old, rhs) & 0xffff) : llc_amo(op, uns, w, old, rhs);
+                    for (uint32_t b = 0; b < w; ++b) gget(gmem, a + b) = uint8_t(r >> (8 * b));
+                }
+                grsps.push_back({tag, cyc + 2 + rnd() % (max_lat - 1)});
+            } else {
+                printf("%s: unexpected global read\n", name);
+                ok = false;
+            }
+        }
+        if (pick >= 0 && (dut->gmem_rsp_ready & 1)) {
+            grsps.erase(grsps.begin() + pick);
+            last_perf = cyc;
+        }
+        if (dut->row_out_valid && dut->row_out_ready) {
+            ++pkts;
+            auto pb = [&](int lsb, int w) { return port_bits(dut->row_out_data, lsb, w); };
+            uint32_t be = uint32_t(pb(P_BYTEEN, 8)), op = uint32_t(pb(P_AOP, AOW));
+            uint64_t addr = pb(P_ADDR, LMEM_LOG - 3) * 8, data = pb(P_DATA, 64);
+            if (pb(P_OP, 2) != 3 || !pb(P_MBV, 1) || !cl || pb(P_MBADDR, LMEM_LOG - 3) != cl->x.mbar
+             || uint32_t(dut->row_out_dst) != cl->dcore) {
+                printf("%s: packet op %lu mbar_valid %lu mbar 0x%lx dst %u\n", name, (unsigned long)pb(P_OP, 2),
+                       (unsigned long)pb(P_MBV, 1), (unsigned long)pb(P_MBADDR, LMEM_LOG - 3), uint32_t(dut->row_out_dst));
+                ok = false;
+            }
+            uint32_t w = __builtin_popcount(be), lo = __builtin_ctz(be ? be : 1);
+            if ((w != 4 && w != 8) || (lo % w)) { printf("%s: packet byteen 0x%x\n", name, be); ok = false; }
+            else {
+                uint64_t old = 0;
+                for (uint32_t b = 0; b < w; ++b) old |= uint64_t(dmem[addr + lo + b]) << (8 * b);
+                uint64_t r = llc_amo(op, pb(P_UNS, 1), w, old, data >> (8 * lo));
+                for (uint32_t b = 0; b < w; ++b) dmem[addr + lo + b] = uint8_t(r >> (8 * b));
+            }
+        }
+        if (dut->bg_compl_valid & 1)
+            evts.push_back({uint32_t(dut->bg_compl), uint32_t(cyc)});
+        clock_cycle();
+        ++cyc;
+        if (req_taken) { ++next; issue_next(); }
+        // The engine's busy covers its setup only: wait for every expected request and event.
+        size_t wr_evts = 0;
+        for (auto& e : evts) wr_evts += e.first & 1;
+        bool quiet = (next >= ss.size()) && grsps.empty() && lrsps.empty() && !dut->busy
+                  && pkts >= exp_pkt && gwrites >= st_lines && gfences >= st_fences && gamos >= exp_amo
+                  && wr_evts >= bg_ops;
+        idle = quiet ? idle + 1 : 0;
+        if (idle > 64) break;
+    }
+    dut->dxa_req_valid = 0; dut->gmem_rsp_valid = 0; dut->lmem_rsp_valid = 0;
+    dut->lmem_req_ready = 1; dut->gmem_req_ready = 1; dut->row_out_ready = 1;
+
+    // Requests: lines written by stores, words by global reductions, elements by cluster ones.
+    if (gwrites != st_lines) { printf("%s: %lu line writes, expected %lu\n", name, (unsigned long)gwrites, (unsigned long)st_lines); ok = false; }
+    if (gfences != st_fences) { printf("%s: %lu fences, expected %lu\n", name, (unsigned long)gfences, (unsigned long)st_fences); ok = false; }
+    if (gamos != exp_amo) { printf("%s: %lu atomics, expected %lu\n", name, (unsigned long)gamos, (unsigned long)exp_amo); ok = false; }
+    if (pkts != exp_pkt) { printf("%s: %lu packets, expected %lu\n", name, (unsigned long)pkts, (unsigned long)exp_pkt); ok = false; }
+    if (lreads != exp_rd) { printf("%s: %lu local-memory reads, expected %lu\n", name, (unsigned long)lreads, (unsigned long)exp_rd); ok = false; }
+    // Completion events: one read_done and one write_done per bulk_group op, in order.
+    {
+        size_t k = 0;
+        for (auto& s : ss) {
+            if (!dxa_ref::is_bulk_group(s.kind)) continue;
+            bool rd = false, wr = false;
+            while (k < evts.size() && !(rd && wr)) {
+                uint32_t v = evts[k].first;
+                uint32_t wid = v >> 5, seq = (v >> 2) & 7;
+                if (wid != s.wid || seq != s.seq) {
+                    printf("%s: event wid %u seq %u, expected wid %u seq %u\n", name, wid, seq, s.wid, s.seq);
+                    ok = false;
+                }
+                if (((v >> 1) & 1) && rd) { printf("%s: second read_done\n", name); ok = false; }
+                if ((v & 1) && wr) { printf("%s: second write_done\n", name); ok = false; }
+                if ((v & 1) && !rd && !((v >> 1) & 1)) { printf("%s: write_done before read_done\n", name); ok = false; }
+                rd |= (v >> 1) & 1; wr |= v & 1;
+                ++k;
+            }
+            if (!rd || !wr) { printf("%s: op of seq %u: read_done %d write_done %d\n", name, s.seq, rd, wr); ok = false; }
+        }
+        for (; k < evts.size(); ++k) {
+            printf("%s: extra event 0x%x\n", name, evts[k].first);
+            ok = false;
+        }
+        // The last write_done comes after the last fence or atomic response.
+        for (auto it = evts.rbegin(); it != evts.rend(); ++it) {
+            if (it->first & 1) {
+                if ((gfences || gamos) && it->second <= last_perf) {
+                    printf("%s: write_done at %u, not after the last response at %lu\n", name, it->second, (unsigned long)last_perf);
+                    ok = false;
+                }
+                break;
+            }
+        }
+    }
+    int bad = 0;
+    std::set<uint64_t> keys;
+    for (auto& kv : gmem) keys.insert(kv.first);
+    for (auto& kv : gexp) keys.insert(kv.first);
+    for (uint64_t a : keys) {
+        uint8_t v = gget(gmem, a), w = gget(gexp, a);
+        if (v != w) {
+            if (bad < 8) printf("%s: global byte 0x%lx = 0x%02x, expected 0x%02x\n", name, (unsigned long)a, v, w);
+            ++bad;
+        }
+    }
+    for (int i = 0; i < LMEM_BYTES; ++i) {
+        if (dmem[i] != dexp[i]) {
+            if (bad < 8) printf("%s: block byte 0x%x = 0x%02x, expected 0x%02x\n", name, i, dmem[i], dexp[i]);
+            ++bad;
+        }
+    }
+    if (bad) { printf("%s: %d bytes differ\n", name, bad); ok = false; }
+    if (ok)
+        printf("%s: %zu transfers, %lu reads, %lu writes, %lu atomics, %lu packets in %lu cycles OK\n", name, ss.size(),
+               (unsigned long)lreads, (unsigned long)gwrites, (unsigned long)gamos, (unsigned long)pkts, (unsigned long)cyc);
+    return ok;
+}
+
+static St st_tensor(const Xfer& x, uint32_t kind = dxa_ref::ST_TENSOR, uint32_t op = 0, uint32_t type = 0) {
+    St s;
+    s.x = x; s.kind = kind; s.op = op; s.type = type;
+    return s;
+}
+
+static bool run_store_all() {
+    static_assert(R_SEND <= int(sizeof(((VVX_dxa_core_top*)nullptr)->dxa_req_data)) * 8,
+                  "request layout wider than the port");
+    const uint32_t q = LMEM_BYTES / 4;
+    const uint64_t G = 0x400000;
+    bool ok = true;
+    // Bulk stores, aligned and not to a line, 16 B .. 4 KB.
+    {
+        std::vector<St> v;
+        uint32_t seq = 0;
+        for (uint32_t bytes : {16u, 48u, 208u, 2064u, 4096u}) {
+            St s = st_bulk(dxa_ref::ST_BULK, q + 16 * (v.size() + 1), G + v.size() * 0x4000 + 16 * v.size(), bytes);
+            s.seq = seq++ & 7;
+            v.push_back(s);
+        }
+        ok = run_store("bst", {v[0]}, 100, 8) && ok;
+        ok = run_store("bst-stream", v, 70, 16) && ok;
+    }
+    // Tensor stores: in bounds, past the end, a halo (rows out), 5D, strides.
+    {
+        auto T = [&](const char* nm, uint32_t esz, uint32_t s0, uint32_t s1, uint32_t t0, uint32_t t1, int32_t c0, int32_t c1,
+                     uint64_t base, uint32_t smem) {
+            return st_tensor(tile2d(nm, esz, s0, s1, t0, t1, c0, c1, base, smem));
+        };
+        ok = run_store("tst-inb", {T("inb", 2, 64, 32, 16, 8, 4, 3, G + 0x40, q)}, 100, 8) && ok;
+        ok = run_store("tst-edge", {T("edge", 2, 10, 8, 16, 4, 0, 6, G + 0x40, q)}, 90, 8) && ok;
+        ok = run_store("tst-past", {T("past", 1, 40, 12, 24, 6, 30, 9, G + 0x13, q), T("odd", 0, 37, 5, 21, 4, 3, 3, G + 0x5, q + 0xc13)}, 70, 20) && ok;
+        Xfer x;
+        x.name = "oob5"; x.rank = 5; x.esz = 1; x.base = G + 0x2000;
+        uint32_t sz[5] = {11, 5, 4, 3, 3}, tl[5] = {16, 4, 3, 2, 2};
+        int32_t cc[5] = {3, 1, 2, 1, 2};
+        for (int d = 0; d < 5; ++d) { x.size[d] = sz[d]; x.tile[d] = tl[d]; x.c[d] = cc[d]; }
+        uint32_t st = 32;
+        for (int d = 0; d < 4; ++d) { x.stride[d] = st; st *= sz[d + 1] + 1; }
+        x.smem = q;
+        ok = run_store("tst-5d", {st_tensor(x)}, 80, 12) && ok;
+        Xfer y = x;
+        y.name = "es"; y.c[0] = 0; y.c[1] = 0; y.c[2] = 1; y.c[3] = 0; y.c[4] = 0;
+        uint32_t sz2[5] = {16, 20, 30, 9, 12}, tl2[5] = {16, 7, 5, 8, 6}, es2[5] = {1, 3, 2, 8, 5};
+        st = 32;
+        for (int d = 0; d < 5; ++d) { y.size[d] = sz2[d]; y.tile[d] = tl2[d]; y.es[d] = es2[d]; }
+        for (int d = 0; d < 4; ++d) { y.stride[d] = st; st *= sz2[d + 1]; }
+        y.base = G + 0x40000;
+        ok = run_store("tst-es", {st_tensor(y)}, 80, 12) && ok;
+    }
+    // Every swizzle x element size, an out-of-bounds edge on odd vectors.
+    {
+        const uint32_t blk = (WORD_BYTES > 64) ? 0x1080 : 0x1040;
+        int n = 0;
+        for (uint32_t swz = 1; swz <= 3; ++swz) {
+            uint32_t span = 16u << swz;
+            for (uint32_t esz = 0; esz <= 3; ++esz) {
+                uint32_t t0 = span >> esz;
+                bool oob = (swz + esz) & 1;
+                char nm[48];
+                snprintf(nm, sizeof(nm), "tst-swz%u-e%u", span, 1u << esz);
+                Xfer x = tile2d(nm, esz, oob ? t0 - 1 : 4 * t0, 40, t0, 12, oob ? 1 : int32_t(t0), oob ? 32 : 3,
+                                G + 0x80000 + (uint64_t(n++) << 12), blk + 0x200);
+                x.swz = swz; x.blk_base = blk;
+                ok = run_store(nm, {st_tensor(x)}, 90, 10) && ok;
+            }
+        }
+    }
+    // Interleave and dim-0 strides (gathered tokens), im2col.
+    {
+        Xfer x;
+        x.name = "il16"; x.rank = 3; x.esz = 1; x.il = 1; x.base = G + 0xc0000;
+        x.size[0] = 8; x.size[1] = 6; x.size[2] = 4;
+        x.stride[0] = 16; x.stride[1] = 16 * 6;
+        x.tile[0] = 8; x.tile[1] = 4; x.tile[2] = 2; x.c[1] = 1; x.c[2] = 1;
+        x.smem = q;
+        ok = run_store("tst-il16", {st_tensor(x)}, 90, 10) && ok;
+        Xfer y = x;
+        y.name = "il16-es2"; y.es[0] = 2; y.c[0] = 3; y.size[0] = 7; y.tile[0] = 8;
+        ok = run_store("tst-il16-es2", {st_tensor(y)}, 90, 10) && ok;
+        Xfer z = x;
+        z.name = "il32"; z.il = 2; z.swz = 1; z.es[0] = 2; z.size[0] = 16; z.tile[0] = 16;
+        z.stride[0] = 32; z.stride[1] = 32 * 6; z.c[0] = 0;
+        ok = run_store("tst-il32", {st_tensor(z)}, 90, 10) && ok;
+        Xfer w = tile2d("", 0, 300, 4, 200, 3, 7, 2, G + 0xd0000 + 0x31, q);
+        w.rank = 3; w.il = 1; w.size[2] = 2; w.tile[2] = 2; w.stride[1] = w.stride[0] * 4;
+        for (uint32_t es0 : {3u, 5u, 7u}) {
+            char nm[32];
+            snprintf(nm, sizeof(nm), "tst-gather-es%u", es0);
+            w.name = nm; w.es[0] = es0;
+            ok = run_store(nm, {st_tensor(w)}, 90, 10) && ok;
+        }
+        Xfer i3;
+        i3.name = "i2c3"; i3.rank = 3; i3.im2col = 1; i3.esz = 1; i3.base = G + 0x100000;
+        i3.size[0] = 12; i3.size[1] = 9; i3.size[2] = 3;
+        i3.stride[0] = 32; i3.stride[1] = 32 * 9;
+        i3.cpp = 16; i3.ppc = 20; i3.lower[0] = -1; i3.upper[0] = 1;
+        i3.c[0] = -2; i3.c[1] = -1; i3.c[2] = 0;
+        i3.smem = q;
+        ok = run_store("tst-i2c3", {st_tensor(i3)}, 90, 12) && ok;
+        Xfer i5;
+        i5.name = "i2c5"; i5.rank = 5; i5.im2col = 1; i5.esz = 0; i5.base = G + 0x180000 + 3;
+        i5.size[0] = 20; i5.size[1] = 4; i5.size[2] = 3; i5.size[3] = 3; i5.size[4] = 2;
+        i5.stride[0] = 24; i5.stride[1] = 24 * 4; i5.stride[2] = 24 * 12; i5.stride[3] = 24 * 36;
+        i5.cpp = 24; i5.ppc = 40; i5.lower[0] = -1; i5.lower[1] = 0; i5.lower[2] = -1;
+        i5.upper[0] = 1; i5.upper[1] = 0; i5.upper[2] = 0;
+        i5.c[0] = 0; i5.c[1] = -1; i5.c[2] = 0; i5.c[3] = -1; i5.c[4] = 0;
+        i5.smem = q + 0x1000;
+        ok = run_store("tst-i2c5", {st_tensor(i5)}, 90, 12) && ok;
+    }
+#ifdef VX_CFG_EXT_FPAMO_ENABLE
+    const bool fp = true;
+#else
+    const bool fp = false;
+#endif
+    // Every op x type of a global bulk reduction, two shapes each.
+    {
+        int n = 0;
+        for (uint32_t op = 0; op < 8; ++op) {
+            for (uint32_t ty = 0; ty < 8; ++ty) {
+                if (!dxa_ref::red_legal(dxa_ref::ST_RED_GLOBAL, op, ty)) continue;
+                if (dxa_ref::red_needs_fpamo(op, ty) && !fp) continue;
+                char nm[48];
+                snprintf(nm, sizeof(nm), "rg-%s-%s", dxa_ref::red_op_name(op), dxa_ref::red_type_name(ty, op));
+                St a = st_bulk(dxa_ref::ST_RED_GLOBAL, q + 0x30, G + 0x200000 + n * 0x1000 + 0x10, 208, op, ty);
+                St b = st_bulk(dxa_ref::ST_RED_GLOBAL, q + 0x400, G + 0x200000 + n * 0x1000 + 0x800, 64, op, ty);
+                b.seq = 1;
+                ok = run_store(nm, {a, b}, 80, 12) && ok;
+                ++n;
+            }
+        }
+    }
+    // Tensor reductions with out-of-bounds edges and odd starts (16-bit pairs split).
+    {
+        struct { uint32_t op, ty, esz; } cs[] = {{0, 0, 2}, {1, 1, 2}, {2, 3, 3}, {5, 2, 3}, {0, 4, 2}, {0, 5, 3},
+                                                  {0, 6, 1}, {1, 7, 1}, {2, 6, 1}, {3, 0, 2}};
+        int n = 0;
+        for (auto& c : cs) {
+            if (dxa_ref::red_needs_fpamo(c.op, c.ty) && !fp) continue;
+            char nm[48];
+            snprintf(nm, sizeof(nm), "rt-%s-%s", dxa_ref::red_op_name(c.op), dxa_ref::red_type_name(c.ty, c.op));
+            Xfer x = tile2d(nm, c.esz, 37, 9, 16, 4, 3 + (n & 1), 6, G + 0x300000 + (uint64_t(n) << 13), q + 0x100);
+            if (c.esz == 1 && (n & 2)) { x.swz = 2; x.blk_base = q; x.tile[0] = 32; x.size[0] = 70; x.c[0] = 41; }
+            ok = run_store(nm, {st_tensor(x, dxa_ref::ST_RED_TENSOR, c.op, c.ty)}, 80, 12) && ok;
+            ++n;
+        }
+    }
+    // Every op x type of a cluster reduction, into a block of another core.
+    {
+        for (uint32_t op = 0; op < 8; ++op) {
+            for (uint32_t ty = 0; ty < 8; ++ty) {
+                if (!dxa_ref::red_legal(dxa_ref::ST_RED_CLUSTER, op, ty)) continue;
+                if (dxa_ref::red_needs_fpamo(op, ty) && !fp) continue;
+                char nm[48];
+                snprintf(nm, sizeof(nm), "rc-%s-%s", dxa_ref::red_op_name(op), dxa_ref::red_type_name(ty, op));
+                St a = st_bulk(dxa_ref::ST_RED_CLUSTER, q + 0x40, 2 * q + 0x90, 208, op, ty);
+                a.dcore = (NCC > 1) ? 1 : 0; a.x.mbar = (2 * q + 0x8) / 8;
+                ok = run_store(nm, {a}, 80, 10) && ok;
+            }
+        }
+    }
+    // A stream of every kind, then loads after stores.
+    {
+        St a = st_bulk(dxa_ref::ST_BULK, q + 0x20, G + 0x500010, 336);
+        St b = st_tensor(tile2d("m", 2, 30, 20, 32, 6, 2, 17, G + 0x510000, q + 0x400));
+        b.seq = 1;
+        St c = st_bulk(dxa_ref::ST_RED_CLUSTER, q + 0x800, 2 * q + 0x40, 64, 0, 0);
+        c.x.mbar = (2 * q) / 8;
+        St d = st_bulk(dxa_ref::ST_RED_GLOBAL, q + 0x900, G + 0x520020, 96, 0, 2);
+        d.seq = 2;
+        ok = run_store("st-stream", {a, b, c, d, a}, 60, 20) && ok;
+        Xfer l = tile2d("after", 2, 50, 10, 32, 8, -4, 5, G + 0x240000, q);
+        ok = run_tensor("load-after-store", {l}, 80, 10, true) && ok;
+    }
+    return ok;
+}
+
 // Negative vectors: each must stop the simulation with the given assert.
 static void run_negative(const char* which) {
     const uint32_t q = LMEM_BYTES / 4;
@@ -1304,6 +1938,7 @@ int main(int argc, char** argv) {
 #if defined(VX_CFG_EXT_MBAR_ENABLE)
     dut->lmem_rsp_valid = 0;
     dut->slot_stride    = 0x400;
+    dut->row_out_ready  = 1;
 #endif
 
     reset_dut();
@@ -1325,6 +1960,7 @@ int main(int argc, char** argv) {
         ok = run_bulk_all();
         dut->slot_stride = MC_STRIDE;
         ok = run_tensor_all() && ok;
+        ok = run_store_all() && ok;
     }
 #endif
 

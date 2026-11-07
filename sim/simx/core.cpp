@@ -63,6 +63,13 @@
 #endif
 #ifdef VX_CFG_EXT_DXA_ENABLE
 #include "dxa_compl.h"
+#ifdef DXA_MBAR_ENABLE
+#include "bg_unit.h"
+#elif defined(VX_CFG_EXT_DLMEM_ENABLE)
+#line 63
+#else
+#line 60
+#endif
 #elif defined(VX_CFG_EXT_DLMEM_ENABLE)
 #line 61
 #else
@@ -431,7 +438,19 @@ public:
       auto cta = scheduler_->cta_dispatcher();
       cta->DxaSlotOut.at(0).bind(&dxa_compl_->SlotIn);
       cta->DxaSlotOut.at(1).bind(&sfu->dxa_slot_in);
+      // Created after the SFU, so it takes the DXA unit's group events in
+      // their cycle.
+      snprintf(sname, 100, "%s-bg_unit", name.c_str());
+      bg_unit_ = BgUnit::Create(sname);
+      sfu->dxa_unit().BgEvtOut.bind(&bg_unit_->EvtIn);
+      bg_unit_->StateOut.bind(&sfu->dxa_unit().BgStateIn);
+      bg_unit_->UnlockOut.bind(&scheduler_->UnlockIn.at(Scheduler::BG_UNLOCK));
+      simobject_->BgComplIn.bind(&bg_unit_->ComplIn);
     }
+  #elif defined(VX_CFG_EXT_DLMEM_ENABLE)
+  #line 379
+  #else
+  #line 354
   #endif
   #elif defined(VX_CFG_EXT_DLMEM_ENABLE)
   #line 361
@@ -1029,6 +1048,13 @@ public:
       if (!this->cpa_idle(w))
         return true;
     }
+  #ifdef DXA_MBAR_ENABLE
+    // A grid ends only once its bulk writes are performed.
+    if (bg_unit_ && bg_unit_->wr_pending())
+      return true;
+  #else
+  #line 954
+  #endif
   #elif defined(VX_CFG_EXT_DLMEM_ENABLE) && defined(VX_CFG_EXT_DXA_ENABLE)
   #line 967
   #elif defined(VX_CFG_EXT_DLMEM_ENABLE)
@@ -1260,6 +1286,13 @@ public:
       if (!cpa->idle(wid))
         return false;
     }
+#ifdef DXA_MBAR_ENABLE
+    // Nor with a bulk_group operation still reading its source in the block.
+    if (bg_unit_ && bg_unit_->rd_pending(wid))
+      return false;
+#else
+#line 1185
+#endif
     return true;
   }
 #elif defined(VX_CFG_EXT_DLMEM_ENABLE) && defined(VX_CFG_EXT_DXA_ENABLE)
@@ -1377,6 +1410,13 @@ private:
 #endif
 #ifdef VX_CFG_EXT_DXA_ENABLE
   DxaCompl::Ptr dxa_compl_;
+#ifdef DXA_MBAR_ENABLE
+  BgUnit::Ptr bg_unit_;
+#elif defined(VX_CFG_EXT_DLMEM_ENABLE)
+#line 1292
+#else
+#line 1247
+#endif
 
 public:
   const DxaCompl::Ptr& dxa_compl() const { return dxa_compl_; }

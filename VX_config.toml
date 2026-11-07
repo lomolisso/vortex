@@ -214,7 +214,9 @@ VX_CFG_DCACHE_NUM_WAYS = 4
 # stays moderate: NT 1/2/4/8/16/32/64 -> word 4/8/8/16/16/32/32, banks 1/1/2/2/4/4/8.
 VX_CFG_DCACHE_WORD_SIZE = "expr: min($VX_CFG_L1_LINE_SIZE, min($VX_CFG_MEM_BLOCK_SIZE, ($VX_CFG_XLEN / 8) * pow(2, (clog2($VX_CFG_NUM_LSU_LANES) + 1) / 2)))"
 VX_CFG_DCACHE_WRITEBACK = "expr: int($dcache_is_llc and $single_core)"
-VX_CFG_DCACHE_DIRTYBYTES = 0
+# The DXA writes global memory around the dcache: a write-back dcache must write
+# back only the bytes it dirtied, or it overwrites the DXA's bytes in the line.
+VX_CFG_DCACHE_DIRTYBYTES = "expr: $VX_CFG_DCACHE_WRITEBACK if ($VX_CFG_EXT_DXA_ENABLE and $VX_CFG_EXT_MBAR_ENABLE) else 0"
 VX_CFG_DCACHE_REPL_POLICY = "expr: $__cache_repl_fifo"
 VX_CFG_DCACHE_MSHR_SIZE = 16
 # dcache is unsectored: line = sector = mem transaction granule = L1_LINE (which

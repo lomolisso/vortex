@@ -18,6 +18,7 @@
 #include "dxa_unit.h"
 #ifdef DXA_MBAR_ENABLE
 #include "dlmem/dlmem_types.h"
+#include "dxa_bg.h"
 #else
 #line 18
 #endif
@@ -97,6 +98,10 @@ public:
   // The line reader's entries per worker (VX_dxa_lmem_rd DEPTH), apart from
   // the DXA_MAX_INFLIGHT tags of its lines.
   static constexpr uint32_t LMEM_RD_DEPTH = 7;
+
+  // Per core: the progress of its warps' bulk_group operations, at most one
+  // event a cycle, to the core's bulk-group unit.
+  std::vector<SimChannel<DxaBgCompl>> BgComplOut;
 #else
 #line 81
 #endif

@@ -32,6 +32,9 @@ module VX_dxa_core import VX_gpu_pkg::*, VX_dxa_pkg::*; #(
     VX_dlmem_bus_if.master row_out_if,
     // Each requesting core's slot stride, a launch constant.
     input wire [`VX_CFG_SOCKET_SIZE-1:0][`VX_CFG_LMEM_LOG_SIZE:0] slot_stride,
+    // Bulk-group completion events, per requesting core, never refused.
+    output wire [`VX_CFG_SOCKET_SIZE-1:0] bg_compl_valid,
+    output dxa_bg_compl_t [`VX_CFG_SOCKET_SIZE-1:0] bg_compl,
 `endif
     output wire busy
 );
@@ -140,16 +143,20 @@ module VX_dxa_core import VX_gpu_pkg::*, VX_dxa_pkg::*; #(
     // or a global address (bload and its prefetch).
     wire is_gbulk = queue_out_bus_if[0].req_data.bload
                  || (queue_out_bus_if[0].req_data.prefetch && ~queue_out_bus_if[0].req_data.tload);
+    // A bulk store or reduction walks its destination, gsrc, from the source.
+    wire       q_st_en   = queue_out_bus_if[0].req_data.st.en;
+    wire [2:0] q_st_kind = queue_out_bus_if[0].req_data.st.kind;
+    wire is_sbulk = q_st_en && ((q_st_kind == DXA_ST_BULK) || (q_st_kind == DXA_ST_RED_G) || (q_st_kind == DXA_ST_RED_C));
     dxa_desc_t bulk_desc;
     always @(*) begin
         bulk_desc           = '0;
-        bulk_desc.base_addr = is_gbulk ? queue_out_bus_if[0].req_data.gsrc
+        bulk_desc.base_addr = (is_gbulk || is_sbulk) ? queue_out_bus_if[0].req_data.gsrc
                                        : `VX_CFG_MEM_ADDR_WIDTH'(queue_out_bus_if[0].req_data.src_addr);
         bulk_desc.meta      = (32'd1 << DXA_DESC_META_DIM_LSB) | (32'd3 << DXA_DESC_META_ELEMSZ_LSB);
         bulk_desc.tile01    = 32'(queue_out_bus_if[0].req_data.size >> 3);
         bulk_desc.size0     = 32'(queue_out_bus_if[0].req_data.size >> 3);
     end
-    assign dispatch_in_if[0].desc_data = (queue_out_bus_if[0].req_data.bulk || is_gbulk) ? bulk_desc : desc_read_data;
+    assign dispatch_in_if[0].desc_data = (queue_out_bus_if[0].req_data.bulk || is_gbulk || is_sbulk) ? bulk_desc : desc_read_data;
 `else
     assign dispatch_in_if[0].desc_data = desc_read_data;
 `endif
@@ -187,6 +194,14 @@ module VX_dxa_core import VX_gpu_pkg::*, VX_dxa_pkg::*; #(
 `ifdef PERF_ENABLE
     dxa_perf_t worker_dxa_perf [`VX_CFG_NUM_DXA_CORES];
 `endif
+`ifdef DXA_MBAR_ENABLE
+    localparam AMO_DATAW = DLMEM_CORE_W + VX_dlmem_pkg::DLMEM_REQ_DATAW;
+    wire [`VX_CFG_NUM_DXA_CORES-1:0]                 w_amo_valid, w_amo_ready;
+    wire [`VX_CFG_NUM_DXA_CORES-1:0][AMO_DATAW-1:0]  w_amo_data;
+    wire [`VX_CFG_NUM_DXA_CORES-1:0]                 w_evt_valid, w_evt_ready;
+    wire [`VX_CFG_NUM_DXA_CORES-1:0][NC_WIDTH-1:0]   w_evt_core;
+    dxa_bg_compl_t [`VX_CFG_NUM_DXA_CORES-1:0]       w_evt;
+`endif
 
     for (genvar i = 0; i < `VX_CFG_NUM_DXA_CORES; ++i) begin : g_workers
         VX_dxa_worker #(
@@ -203,10 +218,112 @@ module VX_dxa_core import VX_gpu_pkg::*, VX_dxa_pkg::*; #(
             .gmem_bus_if    (worker_gmem_bus_if[i]),
         `ifdef DXA_MBAR_ENABLE
             .slot_stride    (slot_stride),
+            .amo_valid      (w_amo_valid[i]),
+            .amo_pkt        (w_amo_data[i][VX_dlmem_pkg::DLMEM_REQ_DATAW-1:0]),
+            .amo_dst        (w_amo_data[i][VX_dlmem_pkg::DLMEM_REQ_DATAW +: DLMEM_CORE_W]),
+            .amo_ready      (w_amo_ready[i]),
+            .bg_evt_valid   (w_evt_valid[i]),
+            .bg_evt_core    (w_evt_core[i]),
+            .bg_evt         (w_evt[i]),
+            .bg_evt_ready   (w_evt_ready[i]),
         `endif
             .smem_bus_if    (worker_smem_bus_if[i])
         );
     end
+
+`ifdef DXA_MBAR_ENABLE
+    // Cluster-reduction packets of the workers, into the row egress.
+    wire                 amo_valid, amo_ready;
+    wire [AMO_DATAW-1:0] amo_data;
+
+    VX_stream_arb #(
+        .NUM_INPUTS  (`VX_CFG_NUM_DXA_CORES),
+        .NUM_OUTPUTS (1),
+        .DATAW       (AMO_DATAW),
+        .ARBITER     ("R"),
+        .OUT_BUF     ((`VX_CFG_NUM_DXA_CORES > 1) ? 3 : 0)
+    ) amo_arb (
+        .clk       (clk),
+        .reset     (reset),
+        .valid_in  (w_amo_valid),
+        .data_in   (w_amo_data),
+        .ready_in  (w_amo_ready),
+        .valid_out (amo_valid),
+        .data_out  (amo_data),
+        .ready_out (amo_ready),
+        `UNUSED_PIN (sel_out)
+    );
+
+    // Completion events: a buffer per worker, then per core one event a cycle.
+    localparam EVT_DATAW = NC_WIDTH + $bits(dxa_bg_compl_t);
+    wire [`VX_CFG_NUM_DXA_CORES-1:0]                 eb_valid;
+    wire [`VX_CFG_NUM_DXA_CORES-1:0][EVT_DATAW-1:0]  eb_data;
+    wire [`VX_CFG_NUM_DXA_CORES-1:0]                 eb_ready;
+    wire [`VX_CFG_SOCKET_SIZE-1:0][`VX_CFG_NUM_DXA_CORES-1:0] eb_ready_c;
+
+    for (genvar i = 0; i < `VX_CFG_NUM_DXA_CORES; ++i) begin : g_evt_buf
+        VX_elastic_buffer #(
+            .DATAW   (EVT_DATAW),
+            .SIZE    (2),
+            .OUT_REG (1)
+        ) evt_buf (
+            .clk       (clk),
+            .reset     (reset),
+            .valid_in  (w_evt_valid[i]),
+            .ready_in  (w_evt_ready[i]),
+            .data_in   ({w_evt_core[i], w_evt[i]}),
+            .data_out  (eb_data[i]),
+            .valid_out (eb_valid[i]),
+            .ready_out (eb_ready[i])
+        );
+        wire [NC_WIDTH-1:0] eb_core = eb_data[i][$bits(dxa_bg_compl_t) +: NC_WIDTH];
+        wire [`UP(`CLOG2(`VX_CFG_SOCKET_SIZE))-1:0] eb_lc;
+        if (`VX_CFG_SOCKET_SIZE > 1) begin : g_lc
+            assign eb_lc = eb_core[`CLOG2(`VX_CFG_SOCKET_SIZE)-1:0];
+        end else begin : g_lc0
+            assign eb_lc = '0;
+            `UNUSED_VAR (eb_core)
+        end
+        wire [`VX_CFG_SOCKET_SIZE-1:0] eb_rdy;
+        for (genvar c = 0; c < `VX_CFG_SOCKET_SIZE; ++c) begin : g_rdy
+            assign eb_rdy[c] = eb_ready_c[c][i] && (32'(eb_lc) == c);
+        end
+        assign eb_ready[i] = (| eb_rdy);
+    end
+
+    for (genvar c = 0; c < `VX_CFG_SOCKET_SIZE; ++c) begin : g_evt_core
+        wire [`VX_CFG_NUM_DXA_CORES-1:0] cv;
+        for (genvar i = 0; i < `VX_CFG_NUM_DXA_CORES; ++i) begin : g_cv
+            wire [NC_WIDTH-1:0] cv_core = eb_data[i][$bits(dxa_bg_compl_t) +: NC_WIDTH];
+            if (`VX_CFG_SOCKET_SIZE > 1) begin : g_m
+                assign cv[i] = eb_valid[i] && (32'(cv_core[`CLOG2(`VX_CFG_SOCKET_SIZE)-1:0]) == c);
+            end else begin : g_m0
+                assign cv[i] = eb_valid[i];
+                `UNUSED_VAR (cv_core)
+            end
+        end
+        wire [EVT_DATAW-1:0] co_data;
+        VX_stream_arb #(
+            .NUM_INPUTS  (`VX_CFG_NUM_DXA_CORES),
+            .NUM_OUTPUTS (1),
+            .DATAW       (EVT_DATAW),
+            .ARBITER     ("R"),
+            .OUT_BUF     (3)
+        ) evt_arb (
+            .clk       (clk),
+            .reset     (reset),
+            .valid_in  (cv),
+            .data_in   (eb_data),
+            .ready_in  (eb_ready_c[c]),
+            .valid_out (bg_compl_valid[c]),
+            .data_out  (co_data),
+            .ready_out (1'b1),
+            `UNUSED_PIN (sel_out)
+        );
+        assign bg_compl[c] = co_data[$bits(dxa_bg_compl_t)-1:0];
+        `UNUSED_VAR (co_data[$bits(dxa_bg_compl_t) +: NC_WIDTH])
+    end
+`endif
 
     // ================================================================
     // Output arbitration
@@ -286,6 +403,10 @@ module VX_dxa_core import VX_gpu_pkg::*, VX_dxa_pkg::*; #(
         .beat_attr   (arb_out_attr),
         .beat_tag    (lmem_arb_out_if[0].req_data.tag),
         .beat_ready  (row_beat_ready),
+        .amo_valid   (amo_valid),
+        .amo_pkt     (amo_data[VX_dlmem_pkg::DLMEM_REQ_DATAW-1:0]),
+        .amo_dst     (amo_data[VX_dlmem_pkg::DLMEM_REQ_DATAW +: DLMEM_CORE_W]),
+        .amo_ready   (amo_ready),
         .row_out_if  (row_out_if)
     );
 `endif
