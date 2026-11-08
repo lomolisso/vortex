@@ -145,6 +145,8 @@ module VX_dxa_unit import VX_gpu_pkg::*, VX_dxa_pkg::*; #(
     // reads no register and sends no request.
     wire is_store = execute_if.data.op_args.dxa.store;
     wire is_bgop  = execute_if.data.op_args.dxa.bgop;
+    // A tensormap op (funct3 7): lane 0 rs1 is the map, the rs2 field the op.
+    wire is_tmop  = execute_if.data.op_args.dxa.tmop;
     wire [31:0] st_ctl  = lane0_rs2[63:32];
     wire [2:0]  st_kind = st_ctl[2:0];
     wire [3:0]  st_rop  = st_ctl[6:3];
@@ -155,12 +157,20 @@ module VX_dxa_unit import VX_gpu_pkg::*, VX_dxa_pkg::*; #(
     wire st_red    = is_store && ((st_kind == DXA_ST_RED_G) || (st_kind == DXA_ST_RED_C) || (st_kind == DXA_ST_RED_T));
     wire st_bg     = is_store && (st_kind != DXA_ST_RED_C) && (st_kind <= DXA_ST_RED_T);
     wire [31:0] st_meta = {2'b11, 26'd0, st_ctl[14:11]};
-    `UNUSED_VAR (st_ctl[31:15])
+    `UNUSED_VAR (st_ctl[31:16])
+    // A tensor map in place of the slot: a tensor load's ctl bit 5 with the
+    // map in lane 2 rs2, a tensor store or reduction's ctl bit 15 with it in
+    // lane 1 rs2, a tensormap op's lane 0 rs1.
+    wire tl_map  = is_tload && lane0_rs2[37];
+    wire st_map  = st_tensor && st_ctl[15];
+    wire tm_form = tl_map || st_map || is_tmop;
+    wire [`VX_CFG_XLEN-1:0] tm_ptr = is_tmop ? lane0_rs1 : (st_map ? lane1_rs2 : lane2_rs2);
+    `UNUSED_VAR (tm_ptr)
     wire is_lin   = is_bulk || is_bload || is_bpf;
     wire is_raw   = is_bulk || is_tload || is_bload;
     wire is_pf    = (is_tload && lane0_rs2[36]) || is_bpf;
     wire [31:0] tl_meta = {2'b11, 26'd0, lane0_rs2[35:32]};
-    wire [31:0] ld_meta = is_tload ? tl_meta : (is_lin ? 32'hC0000000 : lane1_rs1[31:0]);
+    wire [31:0] ld_meta = is_tload ? tl_meta : ((is_lin || is_tmop) ? 32'hC0000000 : lane1_rs1[31:0]);
     wire [4:0][31:0] ld_coords, st_coords;
     assign ld_coords[0] = is_lin ? 32'd0 : lane2_rs1[31:0];
     assign ld_coords[1] = is_lin ? 32'd0 : (is_tload ? lane2_rs1[63:32] : lane3_rs1[31:0]);
@@ -264,7 +274,7 @@ module VX_dxa_unit import VX_gpu_pkg::*, VX_dxa_pkg::*; #(
     wire [31:0] mc_mask_w = (is_tload || is_bload) ? 32'(lane1_rs2[15:0]) : lane3_rs2[31:0];
     wire mbar_mode_e = is_raw || mbar_mode;
     wire mbar_win_e  = is_raw ? bk_mb_win : mbar_win;
-    wire mc_mode    = ~is_bulk && ~is_pf && ~is_store && ~is_bgop && mbar_mode_e && (mc_mask_w != '0);
+    wire mc_mode    = ~is_bulk && ~is_pf && ~is_store && ~is_bgop && ~is_tmop && mbar_mode_e && (mc_mask_w != '0);
     wire mc_cluster = mc_mode && ~dst_win && ~mbar_win_e;
     wire [LMEM_LOG-1:0] own_base = peer_slot_base[issue_slot];
     wire [LMEM_LOG-1:0] mc_off   = lmem_rel_byte_addr[LMEM_LOG-1:0] - own_base;
@@ -341,73 +351,56 @@ module VX_dxa_unit import VX_gpu_pkg::*, VX_dxa_pkg::*; #(
     // The reduction: op x type to the cache's atomic, with its legality.
     // op: 0 add, 1 min, 2 max, 3 inc, 4 dec, 5 and, 6 or, 7 xor; type: 0 b32/u32,
     // 1 s32, 2 b64/u64, 3 s64, 4 f32, 5 f64, 6 f16, 7 bf16.
+    // Type 15 is the map's element type, decoded at the queue head.
     wire t_int32 = (st_typ == 4'd0) || (st_typ == 4'd1);
-    wire t_int64 = (st_typ == 4'd2) || (st_typ == 4'd3);
-    wire t_fp    = (st_typ >= 4'd4) && (st_typ <= 4'd7);
-    wire t_h     = (st_typ == 4'd6) || (st_typ == 4'd7);
     wire op_bit  = (st_rop >= 4'd5) && (st_rop <= 4'd7);
     wire op_mm   = (st_rop == 4'd1) || (st_rop == 4'd2);
     wire op_id   = (st_rop == 4'd3) || (st_rop == 4'd4);
-    wire red_ok_g = op_bit ? ((st_typ == 4'd0) || (st_typ == 4'd2))
-                  : op_mm  ? (t_int32 || t_int64 || t_h)
-                  : (st_rop == 4'd0) ? ((st_typ <= 4'd2) || t_fp)
-                  : op_id  ? (st_typ == 4'd0)
-                  : 1'b0;
+    wire red_ok_g = dxa_red_ok_g(st_rop, st_typ);
     wire red_ok_c = op_bit ? (st_typ == 4'd0)
                   : op_mm  ? t_int32
                   : (st_rop == 4'd0) ? (t_int32 || (st_typ == 4'd2))
                   : op_id  ? (st_typ == 4'd0)
                   : 1'b0;
     wire red_ok   = st_red_c ? red_ok_c : red_ok_g;
-    wire red_fp   = t_fp || op_id;
+    wire red_fp   = dxa_red_fp(st_rop, st_typ);
     // An illegal store-family request never reaches the engine (nor its group).
     wire st_enc   = (st_kind > DXA_ST_RED_T);
-    wire st_inv   = st_red && ~red_ok;
+    wire st_rt15  = is_store && (st_kind == DXA_ST_RED_T) && (st_typ == DXA_RT_FROM_MAP);
+    wire st_t15   = st_rt15 && ~st_map;
+    wire st_mt    = st_rt15 && st_map;
+    wire st_inv   = st_red && ~red_ok && ~st_rt15;
     wire st_nofp  = st_red && red_ok && red_fp && (`VX_CFG_EXT_FPAMO_ENABLED == 0);
-    wire st_nol2  = st_red && ~st_red_c && red_ok && ~st_nofp
+    wire st_nol2  = st_red && ~st_red_c && (red_ok || st_mt) && ~st_nofp
                  && (`VX_CFG_L2_ENABLED == 0) && (`VX_CFG_L3_ENABLED == 0);
-    wire st_drop  = is_store && (st_enc || st_inv || st_nofp || st_nol2);
+    wire st_drop  = is_store && (st_enc || st_t15 || st_inv || st_nofp || st_nol2);
 
     dxa_st_t st_req;
     always @(*) begin
-        st_req         = '0;
+        st_req         = dxa_red_st(st_rop, st_typ);
         st_req.en      = is_store;
         st_req.kind    = st_kind;
-        st_req.amo_uns = (st_typ == 4'd0) || (st_typ == 4'd2);
-        st_req.w8      = t_int64 || (st_typ == 4'd5);
-        st_req.tsize   = t_h ? 2'd1 : ((t_int64 || (st_typ == 4'd5)) ? 2'd3 : 2'd2);
         st_req.hart_id = HART_ID_WIDTH'((HART_ID_WIDTH'(CORE_ID) << (NW_BITS + NT_BITS))
                        | (HART_ID_WIDTH'(execute_if.data.header.wid) << NT_BITS));
-        case (st_rop)
-        4'd1:    st_req.amo_op = AMO_OP_MIN;
-        4'd2:    st_req.amo_op = AMO_OP_MAX;
-        4'd5:    st_req.amo_op = AMO_OP_AND;
-        4'd6:    st_req.amo_op = AMO_OP_OR;
-        4'd7:    st_req.amo_op = AMO_OP_XOR;
-        default: st_req.amo_op = AMO_OP_ADD;
-        endcase
-    `ifdef VX_CFG_EXT_FPAMO_ENABLE
-        case (st_rop)
-        4'd0: begin
-            if ((st_typ == 4'd4) || (st_typ == 4'd5)) st_req.amo_op = AMO_OP_FADD;
-            if (st_typ == 4'd6) st_req.amo_op = AMO_OP_FADD2;
-            if (st_typ == 4'd7) st_req.amo_op = AMO_OP_FADD2_BF;
-        end
-        4'd1: begin
-            if (st_typ == 4'd6) st_req.amo_op = AMO_OP_FMIN2;
-            if (st_typ == 4'd7) st_req.amo_op = AMO_OP_FMIN2_BF;
-        end
-        4'd2: begin
-            if (st_typ == 4'd6) st_req.amo_op = AMO_OP_FMAX2;
-            if (st_typ == 4'd7) st_req.amo_op = AMO_OP_FMAX2_BF;
-        end
-        4'd3: st_req.amo_op = AMO_OP_INC;
-        4'd4: st_req.amo_op = AMO_OP_DEC;
-        default: ;
-        endcase
-    `endif
     end
     assign dxa_req_data_in.st     = st_req;
+
+    // A map's address must be 64-byte aligned global memory: not the local
+    // memory aperture, not the DLMEM window. Such a request is dropped.
+    wire tm_misal = tm_form && (tm_ptr[DXA_TMAP_ALIGN-1:0] != '0);
+    wire tm_local = tm_form && ~tm_misal
+                 && (((tm_ptr >> LMEM_LOG) == (LMEM_BASE_B >> LMEM_LOG))
+                  || ((tm_ptr >> WIN_LSB) == (DLMEM_BASE_B >> WIN_LSB)));
+    wire tm_bad   = tm_misal || tm_local;
+    wire tm_opbad = is_tmop && (execute_if.data.op_args.dxa.bg_n > 5'd1);
+    wire tm_drop  = tm_bad || tm_opbad;
+    dxa_tm_req_t tm_req;
+    assign tm_req.en   = tm_form;
+    assign tm_req.op   = ~is_tmop ? DXA_TM_USE : (execute_if.data.op_args.dxa.bg_n[0] ? DXA_TM_INVAL : DXA_TM_PREFETCH);
+    assign tm_req.addr = tm_ptr[`VX_CFG_MEM_ADDR_WIDTH-1:DXA_TMAP_ALIGN];
+    assign tm_req.rt   = st_mt;
+    assign tm_req.rop  = st_rop;
+    assign dxa_req_data_in.tm = tm_req;
     assign dxa_req_data_in.bg     = st_bg;
     assign dxa_req_data_in.bg_seq = bg_seq[execute_if.data.header.wid];
     assign dxa_req_data_in.src_addr  = bk_src_rel[LMEM_LOG-1:0];
@@ -486,7 +479,7 @@ module VX_dxa_unit import VX_gpu_pkg::*, VX_dxa_pkg::*; #(
     assign execute_if.ready = accept;
 
 `ifdef DXA_MBAR_ENABLE
-    assign bg_evt_valid = fire && is_send && ((st_bg && ~st_drop) || is_bgop);
+    assign bg_evt_valid = fire && is_send && ((st_bg && ~st_drop && ~tm_drop) || is_bgop);
     assign bg_evt.wid   = execute_if.data.header.wid;
     assign bg_evt.kind  = is_bgop ? (execute_if.data.op_args.dxa.bg_kind + 2'd1) : DXA_BG_KIND_OP;
     assign bg_evt.n     = is_bgop ? execute_if.data.op_args.dxa.bg_n : 5'd0;
@@ -494,8 +487,15 @@ module VX_dxa_unit import VX_gpu_pkg::*, VX_dxa_pkg::*; #(
 
 `ifdef DXA_MBAR_ENABLE
     wire bulk_fire  = fire && is_send && is_bulk;
-    wire issue_fire = fire && is_send && ~is_raw && ~is_bpf && ~is_store && ~is_bgop;
-    wire ld_fire    = fire && is_send && (is_tload || is_bload) && ~is_pf;
+    wire issue_fire = fire && is_send && ~is_raw && ~is_bpf && ~is_store && ~is_bgop && ~is_tmop;
+    wire ld_fire    = fire && is_send && (is_tload || is_bload) && ~is_pf && ~tm_bad;
+    wire tm_fire    = fire && is_send && tm_form;
+    `RUNTIME_ASSERT(~(tm_fire && tm_misal),
+        ("%t: *** %s DXA tensor map is not 64-byte aligned: wid=%0d map=0x%0h",
+         $time, INSTANCE_ID, execute_if.data.header.wid, tm_ptr))
+    `RUNTIME_ASSERT(~(tm_fire && tm_local),
+        ("%t: *** %s DXA tensor map must be in global memory: wid=%0d map=0x%0h",
+         $time, INSTANCE_ID, execute_if.data.header.wid, tm_ptr))
     wire bpf_fire   = fire && is_send && is_bpf;
     wire is_mcast   = ($countones(dxa_req_data_in.cta_mask) > 1);
     wire mc_rank_oob = ((mc_mask_w >> peer_row.k) != '0);
@@ -568,11 +568,14 @@ module VX_dxa_unit import VX_gpu_pkg::*, VX_dxa_pkg::*; #(
         ("%t: *** %s DXA box exceeds the destination block: wid=%0d dst=0x%0h size=%0d stride=0x%0h",
          $time, INSTANCE_ID, execute_if.data.header.wid, lane0_rs1, lane3_rs1, peer_stride))
     // The store family, in the order of the golden model.
-    wire st_fire  = fire && is_send && is_store;
-    wire st_ok0   = st_fire && ~st_enc && ~st_inv && ~st_nofp && ~st_nol2;
+    wire st_fire  = fire && is_send && is_store && ~tm_bad;
+    wire st_ok0   = st_fire && ~st_enc && ~st_t15 && ~st_inv && ~st_nofp && ~st_nol2;
     wire st_lok   = st_ok0 && st_lin;
     `RUNTIME_ASSERT(~(st_fire && st_enc),
         ("%t: *** %s invalid DXA encoding: wid=%0d kind=%0d", $time, INSTANCE_ID, execute_if.data.header.wid, st_kind))
+    `RUNTIME_ASSERT(~(st_fire && ~st_enc && st_t15),
+        ("%t: *** %s DXA reduction type 15 needs a tensor map: wid=%0d op=%0d", $time, INSTANCE_ID,
+         execute_if.data.header.wid, st_rop))
     `RUNTIME_ASSERT(~(st_fire && ~st_enc && st_inv),
         ("%t: *** %s DXA invalid reduction: wid=%0d op=%0d type=%0d", $time, INSTANCE_ID,
          execute_if.data.header.wid, st_rop, st_typ))
@@ -617,7 +620,7 @@ module VX_dxa_unit import VX_gpu_pkg::*, VX_dxa_pkg::*; #(
         .clk       (clk),
         .reset     (reset),
     `ifdef DXA_MBAR_ENABLE
-        .valid_in  (fire && is_send && ~is_bgop && ~st_drop),
+        .valid_in  (fire && is_send && ~is_bgop && ~st_drop && ~tm_drop),
     `else
         .valid_in  (fire && is_send),
     `endif

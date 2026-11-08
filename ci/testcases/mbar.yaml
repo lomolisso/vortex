@@ -19,7 +19,7 @@ defaults:
             sw/common/mbar_ref.h, sw/kernel/include/vx_mbar.h, tests/regression/mbar_local,
             VX_config.toml, hw/rtl/cache/VX_cache_amo.sv, hw/rtl/core/VX_wctl_unit.sv,
             hw/rtl/interfaces/VX_warp_ctl_if.sv, sim/simx/sfu_unit.cpp,
-            sw/kernel/include/vx_dlmem.h, sw/kernel/include/vx_dxa.h,
+            sw/kernel/include/vx_dlmem.h, sw/kernel/include/vx_dxa.h, sw/common/dxa_tmap.h,
             hw/rtl/mem/VX_lmem_switch.sv, hw/rtl/core/VX_lsu_unit.sv,
             hw/rtl/core/VX_scheduler.sv, sw/common/dlmem_ref.h, hw/rtl/dxa, hw/rtl/VX_kmu.sv,
             hw/rtl/Vortex.sv, hw/rtl/VX_cluster.sv, hw/rtl/interfaces/VX_kmu_bus_if.sv,
@@ -660,7 +660,7 @@ tests:
               sim/simx/core, sim/simx/socket, sim/simx/cta_dispatcher, sim/simx/types.h,
               sim/simx/mbar_waiters, sim/simx/amo, sim/simx/scheduler, sim/simx/barrier_unit,
               sim/simx/sfu_unit, sim/simx/Makefile, hw/rtl/core/VX_scheduler.sv,
-              sw/common/mbar_ref.h, sw/kernel/include/vx_dxa.h, sw/kernel/include/vx_mbar.h,
+              sw/common/mbar_ref.h, sw/kernel/include/vx_dxa.h, sw/common/dxa_tmap.h, sw/kernel/include/vx_mbar.h,
               tests/regression/dxa_mbar, tests/regression/dxa_copy,
               tests/regression/dxa_kmajor_check, VX_config.toml, hw/rtl/core/VX_cpa_unit.sv,
               sim/simx/cpa_unit, sw/common/dxa_ref.h, sw/common/dxa_meta.h,
@@ -1439,7 +1439,7 @@ tests:
               sim/simx/mbar_waiters, sim/simx/amo, sim/simx/scheduler, sim/simx/barrier_unit,
               sim/simx/sfu_unit, sim/simx/Makefile, sim/simx/dlmem, sim/simx/kmu,
               sim/simx/cluster, hw/rtl/core/VX_scheduler.sv,
-              sw/common/mbar_ref.h, sw/common/dlmem_ref.h, sw/kernel/include/vx_dxa.h,
+              sw/common/mbar_ref.h, sw/common/dlmem_ref.h, sw/kernel/include/vx_dxa.h, sw/common/dxa_tmap.h,
               sw/kernel/include/vx_mbar.h, sw/kernel/include/vx_dlmem.h,
               sw/kernel/include/vx_barrier.h,
               tests/regression/dxa_mbar, tests/regression/dxa_copy,
@@ -1720,7 +1720,7 @@ tests:
               sim/simx/scheduler, sim/simx/barrier_unit, sim/simx/sfu_unit, sim/simx/lsu_unit,
               sim/simx/bg_unit, sim/simx/cpa_unit, sim/simx/Makefile, sim/simx/dlmem, sim/simx/kmu,
               sim/simx/cluster, sw/common/mbar_ref.h, sw/common/dlmem_ref.h, sw/common/amo_ref.h,
-              sw/common/dxa_ref.h, sw/common/dxa_meta.h, sw/runtime/include/dxa.h,
+              sw/common/dxa_ref.h, sw/common/dxa_tmap.h, sw/common/dxa_meta.h, sw/runtime/include/dxa.h,
               sw/kernel/include/vx_dxa.h, sw/kernel/include/vx_mbar.h, sw/kernel/include/vx_dlmem.h,
               tests/regression/dxa_store, VX_config.toml]
     args: "-m bst"
@@ -2072,4 +2072,215 @@ tests:
     configs+: "-DVX_CFG_EXT_DXA_ENABLE"
     touches: *dxa_store_touches
     env: {DRIVER: rtlsim, APP: dxa_store, ARGS: "-x layout", EXPECT: "DXA store needs a tile or im2col layout"}
+    run: *expect_fail_run
+  # --- PTX tensor maps in memory (dxa_tmap: the map forms of funct3 2 and 5, funct3 7) ---
+  # The host encodes CUtensorMap-style maps (vortex::dxa::encode_tiled /
+  # encode_im2col) into the kernel argument and a global maps buffer; the
+  # block's warps run map-form loads, stores and reductions, prefetch.tensormap,
+  # the tensormap acquire and release, tensormap.replace and cp_fenceproxy. The
+  # host replays the jobs through sw/common/dxa_ref.h and checks every byte of
+  # local memory, the global buffer and the maps buffer.
+  # A map in the argument: a 2D load with fill and a tensor store, the same box through a slot equal.
+  - id: dxa_tmap-param
+    app: dxa_tmap
+    drivers: [simx, rtlsim]
+    configs+: "-DVX_CFG_EXT_DXA_ENABLE"
+    touches: &dxa_tmap_touches [hw/rtl/dxa, sim/simx/dxa, hw/rtl/core/VX_mem_unit.sv,
+              hw/rtl/mem/VX_local_mem.sv, hw/rtl/core/VX_cta_dispatch.sv, hw/rtl/core/VX_core.sv,
+              hw/rtl/core/VX_execute.sv, hw/rtl/core/VX_sfu_unit.sv, hw/rtl/core/VX_wctl_unit.sv,
+              hw/rtl/core/VX_bar_unit.sv, hw/rtl/VX_socket.sv, hw/rtl/VX_gpu_pkg.sv,
+              hw/rtl/VX_define.vh, hw/rtl/cache, hw/rtl/dlmem, hw/rtl/mem/VX_lmem_switch.sv,
+              hw/rtl/VX_kmu.sv, hw/rtl/VX_cluster.sv, hw/rtl/interfaces, hw/rtl/core/VX_scheduler.sv,
+              hw/rtl/core/VX_decode.sv, hw/rtl/core/VX_lsu_slice.sv, hw/rtl/core/VX_lsu_unit.sv,
+              hw/rtl/core/VX_bg_unit.sv, hw/rtl/core/VX_cpa_unit.sv, sim/simx/mem,
+              sim/simx/core, sim/simx/socket, sim/simx/cta_dispatcher, sim/simx/types.h,
+              sim/simx/instr.h, sim/simx/decode.cpp, sim/simx/mbar_waiters, sim/simx/amo,
+              sim/simx/scheduler, sim/simx/barrier_unit, sim/simx/sfu_unit, sim/simx/lsu_unit,
+              sim/simx/bg_unit, sim/simx/cpa_unit, sim/simx/Makefile, sim/simx/dlmem, sim/simx/kmu,
+              sim/simx/cluster, sw/common/mbar_ref.h, sw/common/dlmem_ref.h, sw/common/amo_ref.h,
+              sw/common/dxa_ref.h, sw/common/dxa_meta.h, sw/common/dxa_tmap.h, sw/runtime/include/dxa.h,
+              sw/kernel/include/vx_dxa.h, sw/kernel/include/vx_mbar.h, sw/kernel/include/vx_dlmem.h,
+              tests/regression/dxa_tmap, VX_config.toml]
+    args: "-m param"
+  # Maps in a global buffer: a 3D swizzled load with element strides and fill, 2D stores.
+  - id: dxa_tmap-global
+    app: dxa_tmap
+    drivers: [simx, rtlsim]
+    configs+: "-DVX_CFG_EXT_DXA_ENABLE"
+    touches: *dxa_tmap_touches
+    args: "-m global"
+  # A 4D im2col load through a map, with corners, offsets and a W traversal stride.
+  - id: dxa_tmap-im2col
+    app: dxa_tmap
+    drivers: [simx, rtlsim]
+    configs+: "-DVX_CFG_EXT_DXA_ENABLE"
+    touches: *dxa_tmap_touches
+    args: "-m im2col"
+  # A multicast load through the argument map, a cluster of 2 on 2 cores.
+  - id: dxa_tmap-mcast
+    app: dxa_tmap
+    drivers: [simx, rtlsim]
+    configs+: "-DVX_CFG_EXT_DXA_ENABLE"
+    touches: *dxa_tmap_touches
+    shape: {cores: 2, l2cache: true}
+    args: "-m mcast"
+  # Map-typed tensor reductions: f32 add and u32 max into the L2.
+  - id: dxa_tmap-red
+    app: dxa_tmap
+    drivers: [simx, rtlsim]
+    configs+: "-DVX_CFG_EXT_DXA_ENABLE -DVX_CFG_EXT_ZACAS_ENABLE -DVX_CFG_EXT_FPAMO_ENABLE"
+    touches: *dxa_tmap_touches
+    shape: {l2cache: true}
+    args: "-m red"
+  # Two launches, the same argument address and different maps: each launch uses its own.
+  - id: dxa_tmap-relaunch
+    app: dxa_tmap
+    drivers: [simx, rtlsim]
+    configs+: "-DVX_CFG_EXT_DXA_ENABLE"
+    touches: *dxa_tmap_touches
+    args: "-m relaunch"
+  # 12 maps used in rotation through the 8-entry descriptor cache.
+  - id: dxa_tmap-evict
+    app: dxa_tmap
+    drivers: [simx, rtlsim]
+    configs+: "-DVX_CFG_EXT_DXA_ENABLE"
+    touches: *dxa_tmap_touches
+    args: "-m evict"
+  # prefetch.tensormap, then a load as fast as a cached map and faster than a cold one.
+  - id: dxa_tmap-prefetch
+    app: dxa_tmap
+    drivers: [simx, rtlsim]
+    configs+: "-DVX_CFG_EXT_DXA_ENABLE"
+    touches: *dxa_tmap_touches
+    args: "-m prefetch"
+  # A shared-memory copy, replace global_address, cp_fenceproxy, acquire, __syncthreads, another warp loads.
+  - id: dxa_tmap-replace-smem
+    app: dxa_tmap
+    drivers: [simx, rtlsim]
+    configs+: "-DVX_CFG_EXT_DXA_ENABLE"
+    touches: *dxa_tmap_touches
+    args: "-m replace-smem"
+  # PTX 9.7.13.4: replace on the global map, release, acquire, load.
+  - id: dxa_tmap-replace-global
+    app: dxa_tmap
+    drivers: [simx, rtlsim]
+    configs+: "-DVX_CFG_EXT_DXA_ENABLE"
+    touches: *dxa_tmap_touches
+    args: "-m replace-global"
+  # Every field from a zero buffer, cp_fenceproxy, acquire, load; the map equals the encoder.
+  - id: dxa_tmap-replace-zero
+    app: dxa_tmap
+    drivers: [simx, rtlsim]
+    configs+: "-DVX_CFG_EXT_DXA_ENABLE"
+    touches: *dxa_tmap_touches
+    args: "-m replace-zero"
+  # replace-zero with cp_fenceproxy called by lanes 0 and 2 only: the whole map still reaches global memory.
+  - id: dxa_tmap-replace-partial
+    app: dxa_tmap
+    drivers: [simx, rtlsim]
+    configs+: "-DVX_CFG_EXT_DXA_ENABLE"
+    touches: *dxa_tmap_touches
+    args: "-m replace-partial"
+  # Two DXA workers: the descriptor fetch shares the GMEM port behind the worker arbiter.
+  - id: dxa_tmap-param-dxa2
+    app: dxa_tmap
+    drivers: [simx, rtlsim]
+    configs+: "-DVX_CFG_EXT_DXA_ENABLE -DVX_CFG_NUM_DXA_CORES=2"
+    touches: *dxa_tmap_touches
+    args: "-m param"
+  - id: dxa_tmap-evict-dxa2
+    app: dxa_tmap
+    drivers: [simx, rtlsim]
+    configs+: "-DVX_CFG_EXT_DXA_ENABLE -DVX_CFG_NUM_DXA_CORES=2"
+    touches: *dxa_tmap_touches
+    args: "-m evict"
+  # Parity at XLEN 64, perf mode (no canaries, no dump): a first batch caches
+  # 8 maps, then 48 prefetch.tensormap back to back, each through a map not
+  # yet cached (the descriptor fetches at the queue head bound the run) or
+  # through the 8 cached maps, and one load behind them. Each wait is a
+  # try_wait and a test_wait, the same instructions whether it slept or not.
+  - id: parity-dxa-tmap-miss
+    check: model_parity
+    app: dxa_tmap
+    xlen: [64]
+    configs+: "-DVX_CFG_EXT_DXA_ENABLE -DVX_CFG_MBAR_SUSPEND_CYCLES=4096"
+    touches: *dxa_tmap_touches
+    args: "-p miss"
+  - id: parity-dxa-tmap-hit
+    check: model_parity
+    app: dxa_tmap
+    xlen: [64]
+    configs+: "-DVX_CFG_EXT_DXA_ENABLE -DVX_CFG_MBAR_SUSPEND_CYCLES=4096"
+    touches: *dxa_tmap_touches
+    args: "-p hit"
+  # Map uses that must stop the simulation with the exact message.
+  - id: dxa_tmap-x-unaligned
+    via: script
+    driver: simx
+    configs+: "-DVX_CFG_EXT_DXA_ENABLE"
+    touches: *dxa_tmap_touches
+    env: {DRIVER: simx, APP: dxa_tmap, ARGS: "-x unaligned", EXPECT: "DXA tensor map is not 64-byte aligned"}
+    run: *expect_fail_run
+  - id: dxa_tmap-x-unaligned
+    via: script
+    driver: rtlsim
+    configs+: "-DVX_CFG_EXT_DXA_ENABLE"
+    touches: *dxa_tmap_touches
+    env: {DRIVER: rtlsim, APP: dxa_tmap, ARGS: "-x unaligned", EXPECT: "DXA tensor map is not 64-byte aligned"}
+    run: *expect_fail_run
+  - id: dxa_tmap-x-smem
+    via: script
+    driver: simx
+    configs+: "-DVX_CFG_EXT_DXA_ENABLE"
+    touches: *dxa_tmap_touches
+    env: {DRIVER: simx, APP: dxa_tmap, ARGS: "-x smem", EXPECT: "DXA tensor map must be in global memory"}
+    run: *expect_fail_run
+  - id: dxa_tmap-x-smem
+    via: script
+    driver: rtlsim
+    configs+: "-DVX_CFG_EXT_DXA_ENABLE"
+    touches: *dxa_tmap_touches
+    env: {DRIVER: rtlsim, APP: dxa_tmap, ARGS: "-x smem", EXPECT: "DXA tensor map must be in global memory"}
+    run: *expect_fail_run
+  - id: dxa_tmap-x-zero
+    via: script
+    driver: simx
+    configs+: "-DVX_CFG_EXT_DXA_ENABLE"
+    touches: *dxa_tmap_touches
+    env: {DRIVER: simx, APP: dxa_tmap, ARGS: "-x zero", EXPECT: "DXA tensor map rank must be 1-5"}
+    run: *expect_fail_run
+  - id: dxa_tmap-x-zero
+    via: script
+    driver: rtlsim
+    configs+: "-DVX_CFG_EXT_DXA_ENABLE"
+    touches: *dxa_tmap_touches
+    env: {DRIVER: rtlsim, APP: dxa_tmap, ARGS: "-x zero", EXPECT: "DXA tensor map rank must be 1-5"}
+    run: *expect_fail_run
+  - id: dxa_tmap-x-wide
+    via: script
+    driver: simx
+    configs+: "-DVX_CFG_EXT_DXA_ENABLE"
+    touches: *dxa_tmap_touches
+    env: {DRIVER: simx, APP: dxa_tmap, ARGS: "-x wide", EXPECT: "DXA tensor stride needs 32 bits"}
+    run: *expect_fail_run
+  - id: dxa_tmap-x-wide
+    via: script
+    driver: rtlsim
+    configs+: "-DVX_CFG_EXT_DXA_ENABLE"
+    touches: *dxa_tmap_touches
+    env: {DRIVER: rtlsim, APP: dxa_tmap, ARGS: "-x wide", EXPECT: "DXA tensor stride needs 32 bits"}
+    run: *expect_fail_run
+  - id: dxa_tmap-x-redtype
+    via: script
+    driver: simx
+    configs+: "-DVX_CFG_EXT_DXA_ENABLE -DVX_CFG_L2_ENABLE"
+    touches: *dxa_tmap_touches
+    env: {DRIVER: simx, APP: dxa_tmap, ARGS: "-x redtype", EXPECT: "DXA tensor reduction type not supported by the map"}
+    run: *expect_fail_run
+  - id: dxa_tmap-x-redtype
+    via: script
+    driver: rtlsim
+    configs+: "-DVX_CFG_EXT_DXA_ENABLE -DVX_CFG_L2_ENABLE"
+    touches: *dxa_tmap_touches
+    env: {DRIVER: rtlsim, APP: dxa_tmap, ARGS: "-x redtype", EXPECT: "DXA tensor reduction type not supported by the map"}
     run: *expect_fail_run

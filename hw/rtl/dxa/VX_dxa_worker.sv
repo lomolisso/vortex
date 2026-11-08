@@ -566,6 +566,10 @@ module VX_dxa_worker import VX_gpu_pkg::*, VX_dxa_pkg::*; #(
     assign dxa_perf.lmem_writes  = perf_lmem_writes_r;
     assign dxa_perf.gmem_latency = perf_gmem_lt_r;
     assign dxa_perf.noslot_stalls = perf_noslot_r;
+`ifdef DXA_MBAR_ENABLE
+    assign dxa_perf.tmap_hits    = '0;
+    assign dxa_perf.tmap_misses  = '0;
+`endif
 `else
     `UNUSED_VAR (stall_no_slot)
 `endif

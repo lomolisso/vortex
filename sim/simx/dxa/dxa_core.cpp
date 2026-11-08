@@ -22,6 +22,7 @@
 #include <iostream>
 #include <string>
 #include "dxa_ref.h"
+#include "dxa_tmap.h"
 #else
 #line 24
 #endif
@@ -284,6 +285,14 @@ public:
     lmem_rr_ = 0;
     red_buf_.clear();
     red_rr_ = 0;
+    for (auto& m : maps_) {
+      m.valid = false;
+    }
+    map_rr_     = 0;
+    fetch_      = Fetch();
+    fetch_port_ = false;
+    head_entry_ = 0;
+    head_hit_   = false;
 #else
 #line 153
 #endif
@@ -304,9 +313,29 @@ public:
   }
 
   int dcr_write(uint32_t addr, uint32_t value) {
+#ifdef DXA_MBAR_ENABLE
+    // A launch's KMU writes drop every cached map and restart the victim
+    // order; a fetch in flight still lands, but is not kept. The slots stay.
+    if (addr >= VX_DCR_KMU_STATE_BEGIN && addr < VX_DCR_KMU_STATE_END) {
+      for (auto& m : maps_) {
+        m.valid = false;
+      }
+      map_rr_ = 0;
+      fetch_.killed = fetch_.active;
+      return 0;
+    }
+    return set_desc_word(descriptors_.at(VX_DCR_DXA_DESC_SLOT(addr)), VX_DCR_DXA_DESC_WORD(addr), value);
+  }
+
+  // One descriptor word: a slot's DCR write, or a fetched map's word.
+  static int set_desc_word(Descriptor& d, uint32_t word, uint32_t value) {
+#else
+#line 171
     uint32_t slot = VX_DCR_DXA_DESC_SLOT(addr);
     uint32_t word = VX_DCR_DXA_DESC_WORD(addr);
     auto& d = descriptors_.at(slot);
+#endif
+#line 174
     switch (word) {
     case VX_DCR_DXA_DESC_BASE_LO_OFF:   d.base_addr = (d.base_addr & 0xffffffff00000000ull) | value; break;
     case VX_DCR_DXA_DESC_BASE_HI_OFF:   d.base_addr = (d.base_addr & 0x00000000ffffffffull) | (uint64_t(value) << 32); break;
@@ -374,6 +403,9 @@ public:
         uint32_t slot_id = uint32_t(rsp.tag) & (VX_CFG_DXA_MAX_INFLIGHT - 1);
         auto& w = workers_[worker_id];
 #ifdef DXA_MBAR_ENABLE
+        if (worker_id == 0 && uint64_t(rsp.tag) >= kFetchTag) {
+          this->fetch_rsp(rsp);
+        } else
         if (w.store) {
           this->store_gmem_rsp(w);
         } else
@@ -389,6 +421,9 @@ public:
     }
 
 #ifdef DXA_MBAR_ENABLE
+    // The map fetch's line reads take the GMEM port ahead of the workers.
+    fetch_port_ = false;
+    this->tick_fetch_send();
     this->drain_lmem_rsp();
     this->tick_bg_events();
     this->tick_core_switch();
@@ -428,10 +463,27 @@ public:
     }
 
     // 3) Dispatch from queue to idle workers.
+#ifdef DXA_MBAR_ENABLE
+    // A map operand at the queue head is looked up first; a miss blocks the
+    // head until its map is fetched, and the tensormap ops end there.
+    bool ready = this->head_ready();
+    for (auto& w : workers_) {
+      if (w.state == WState::IDLE && ready) {
+        const bool fetched = queue_.front().fetched;
+        start_worker(w, queue_.front()), queue_.pop_front();
+        this->head_popped(fetched);
+        // A map operand behind is looked up from the next cycle.
+        ready = !queue_.empty() && !queue_.front().map && !queue_.front().tmop && !queue_.front().held;
+      }
+    }
+#else
+#line 251
     for (auto& w : workers_) {
       if (w.state == WState::IDLE && !queue_.empty())
         start_worker(w, queue_.front()), queue_.pop_front();
     }
+#line 254
+#endif
 
     // 4) Drain DxaUnit channels → req queue (round-robin).
     drain_req_in();
@@ -587,6 +639,10 @@ private:
     w.desc = descriptors_.at(req.desc_slot);
     w.smem_stride = w.desc.smem_stride;
 #ifdef DXA_MBAR_ENABLE
+    if (req.map) {
+      w.desc = maps_.at(head_entry_).desc;
+      w.smem_stride = w.desc.smem_stride;
+    }
     if (req.bload) {
       if (!req.prefetch && req.size > req.win_room) {
         this->dxa_abort(w, "DXA box exceeds the destination block: " + std::to_string(req.size)
@@ -873,8 +929,19 @@ private:
     mreq.hart_id   = w.req.core->id();
     mreq.uuid  = w.req.uuid;
 
+#ifdef DXA_MBAR_ENABLE
+    if (fetch_port_) return;  // the map fetch holds the GMEM port
+#else
+#line 621
+#endif
     auto& ch = gmem_arb_->ReqIn.at(w.worker_id);
+#ifdef DXA_MBAR_ENABLE
+    if (!ch.try_send(mreq, kGmemReqDelay)) return; // arb backpressure
+#else
+#line 623
     if (!ch.try_send(mreq)) return; // arb backpressure
+#endif
+#line 624
 
     w.inflight[slot].allocated   = true;
     w.inflight[slot].rsp_arrived = false;
@@ -2283,6 +2350,216 @@ private:
     }
   }
 
+  // ── Tensor maps in memory (dxa_tmap.h) ──────────────────────────────
+  // The fetch's line reads carry tags no worker produces, steered back from
+  // worker 0's response port.
+  static constexpr uint64_t kFetchTag = uint64_t(VX_CFG_DXA_MAX_INFLIGHT) * VX_CFG_NUM_DXA_CORES;
+  static constexpr uint32_t kMapBytes = TMAP_WORDS * 4;
+  // A GMEM request reaches the socket's memory arbiter in the cycle it leaves
+  // the engine, as in VX_dxa_core, whose worker arbiter registers it only
+  // with more than one worker; the map fetch joins after that arbiter.
+  static constexpr uint64_t kGmemReqDelay = (VX_CFG_NUM_DXA_CORES > 1) ? 1 : 0;
+#ifdef VX_CFG_EXT_FPAMO_ENABLE
+  static constexpr bool kHasFpamo = true;
+#else
+  static constexpr bool kHasFpamo = false;
+#endif
+  // The fetch timeline (VX_dxa_core MAP state): the cycles from the head's
+  // miss to its first line read, and from the last line's response to the
+  // head's lookup that reads the filled entry as a hit.
+  static constexpr uint64_t kFetchFirst = 1;
+  static constexpr uint64_t kFetchHit   = 1;
+  // The cycles from a request leaving its unit to its first lookup at an
+  // empty queue's head.
+  static constexpr uint64_t kSentToHead = 2;
+
+  static uint64_t map_tag(uint64_t addr) { return addr >> 6; }
+
+  // Words 0-21 are a slot's words, decoded as a slot's DCR writes.
+  static_assert(TMAP_W_META == VX_DCR_DXA_DESC_META_OFF && TMAP_W_SMEM_STRIDE == VX_DCR_DXA_DESC_SMEM_STRIDE_OFF,
+                "a tensor map's words 0-21 are a slot's");
+  static Descriptor map_desc(const uint32_t* w) {
+    Descriptor d;
+    for (uint32_t k = 0; k <= TMAP_W_SMEM_STRIDE; ++k) {
+      set_desc_word(d, k, w[k]);
+    }
+    return d;
+  }
+
+  int map_lookup(uint64_t addr) const {
+    for (uint32_t e = 0; e < maps_.size(); ++e) {
+      if (maps_[e].valid && maps_[e].tag == map_tag(addr))
+        return int(e);
+    }
+    return -1;
+  }
+
+  [[noreturn]] void head_abort(const DxaReq& req, const char* msg) {
+    std::cerr << SimPlatform::instance().cycles() << ": *** " << simobject_->name() << " " << msg
+              << ": core=" << req.core->id() << " wid=" << req.wid << " map=0x" << std::hex << req.map_addr
+              << std::dec << " (#" << req.uuid << ")" << std::endl;
+    std::abort();
+  }
+
+  // The lines covering the map: two at 64-byte lines.
+  void fetch_start(const DxaReq& req) {
+    fetch_ = Fetch();
+    fetch_.active  = true;
+    fetch_.addr    = req.map_addr;
+    const uint64_t first = req.map_addr & kGmemLineMask;
+    fetch_.lines   = uint32_t((req.map_addr + kMapBytes - first + kGmemLineSize - 1) / kGmemLineSize);
+    fetch_.send_at = cycle_ + kFetchFirst;
+    fetch_.hart_id = req.core->id();
+    fetch_.uuid    = req.uuid;
+    DT(3, simobject_->name() << " tmap miss: map=0x" << std::hex << req.map_addr << std::dec << ", lines="
+       << fetch_.lines << " (#" << req.uuid << ")");
+  }
+
+  // Ahead of the workers' requests: a line read a cycle while any is left.
+  void tick_fetch_send() {
+    if (!fetch_.active || fetch_.sent == fetch_.lines || cycle_ < fetch_.send_at)
+      return;
+    fetch_port_ = true;
+    MemReq mreq;
+    mreq.addr    = (fetch_.addr & kGmemLineMask) + uint64_t(fetch_.sent) * kGmemLineSize;
+    mreq.tag     = (kFetchTag + fetch_.sent) << log2ceil(VX_CFG_NUM_DXA_CORES);
+    mreq.hart_id = fetch_.hart_id;
+    mreq.uuid    = fetch_.uuid;
+    if (simobject_->gmem_req_out.at(0).try_send(mreq, 0)) {
+      DT(3, simobject_->name() << " tmap rd: addr=0x" << std::hex << mreq.addr << std::dec << " (#"
+         << fetch_.uuid << ")");
+      ++fetch_.sent;
+    }
+  }
+
+  // The map's bytes of a line; the last response fills the victim entry,
+  // unless a launch killed the fetch.
+  void fetch_rsp(const MemRsp& rsp) {
+    __assert(fetch_.active && rsp.data, simobject_->name() << " DXA map line response without a fetch");
+    const uint32_t i = uint32_t(uint64_t(rsp.tag) - kFetchTag);
+    const uint64_t line = (fetch_.addr & kGmemLineMask) + uint64_t(i) * kGmemLineSize;
+    for (uint32_t b = 0; b < kGmemLineSize; ++b) {
+      const uint64_t a = line + b;
+      if (a >= fetch_.addr && a < fetch_.addr + kMapBytes) {
+        const uint32_t off = uint32_t(a - fetch_.addr);
+        fetch_.w[off / 4] &= ~(0xffu << (8 * (off % 4)));
+        fetch_.w[off / 4] |= uint32_t(rsp.data->data()[b]) << (8 * (off % 4));
+      }
+    }
+    if (++fetch_.got < fetch_.lines)
+      return;
+    fetch_.hit_at = cycle_ + kFetchHit;
+    if (fetch_.killed) {
+      DT(3, simobject_->name() << " tmap fill killed: map=0x" << std::hex << fetch_.addr << std::dec << " (#"
+         << fetch_.uuid << ")");
+      return;
+    }
+    uint32_t e = 0;
+    while (e < maps_.size() && maps_[e].valid) {
+      ++e;
+    }
+    if (e == maps_.size()) {
+      e = map_rr_;
+      map_rr_ = (map_rr_ + 1) % uint32_t(maps_.size());
+    }
+    auto& m = maps_[e];
+    m.valid = true;
+    m.tag   = map_tag(fetch_.addr);
+    std::copy(fetch_.w.begin(), fetch_.w.begin() + TMAP_FETCH_WORDS, m.w.begin());
+    m.desc  = map_desc(m.w.data());
+    DT(3, simobject_->name() << " tmap fill: map=0x" << std::hex << fetch_.addr << std::dec << ", entry=" << e
+       << " (#" << fetch_.uuid << ")");
+  }
+
+  // The head's lookup, once a cycle before dispatch: a slot or bulk request
+  // goes on as before; a map request goes on once its map hits; PREFETCH and
+  // INVAL end at the head. Returns whether the head may start on a worker.
+  bool head_ready() {
+    if (!queue_.empty()) {
+      auto& h = queue_.front();
+      if (h.held) {
+        // A map operation ahead kept it from the head: its timeline starts here.
+        h.held = false;
+        h.sent = std::max(h.sent, cycle_ - std::min(cycle_, kSentToHead));
+      }
+      if (!h.map && !h.tmop)
+        return true;
+      if (head_hit_)
+        return true;  // presented: dispatch takes the entry it hit
+      if (h.head_at == 0) {
+        h.head_at = cycle_;
+        if (h.tmop && h.tmap_op == DXA_TMAP_INVAL) {
+          const int e = this->map_lookup(h.map_addr);
+          if (e >= 0) {
+            maps_[e].valid = false;
+          }
+          DT(3, simobject_->name() << " tmap inval: map=0x" << std::hex << h.map_addr << std::dec << ", entry="
+             << e << " (#" << h.uuid << ")");
+          this->head_pop();
+          return false;
+        }
+        if (this->map_lookup(h.map_addr) >= 0) {
+          ++perf_stats_.tmap_hits;
+        } else {
+          ++perf_stats_.tmap_misses;
+          h.fetched = true;
+          this->fetch_start(h);
+          return false;
+        }
+      } else if (fetch_.active) {
+        if (fetch_.got < fetch_.lines || cycle_ < fetch_.hit_at)
+          return false;
+        fetch_.active = false;
+        // The fill is read as a hit; the miss's cycles delay the request's timeline.
+        h.sent += cycle_ - h.head_at;
+        h.head_at = cycle_;
+      }
+      const int e = this->map_lookup(h.map_addr);
+      if (e < 0) {
+        // A launch kept the fill out: a PREFETCH ends, a transfer misses again.
+        if (h.tmop) {
+          DT(3, simobject_->name() << " tmap prefetch dropped: map=0x" << std::hex << h.map_addr << std::dec
+             << " (#" << h.uuid << ")");
+          this->head_pop();
+          return false;
+        }
+        ++perf_stats_.tmap_misses;
+        this->fetch_start(h);
+        return false;
+      }
+      if (h.tmop) {
+        DT(3, simobject_->name() << " tmap prefetch: map=0x" << std::hex << h.map_addr << std::dec << ", entry="
+           << e << " (#" << h.uuid << ")");
+        this->head_pop();
+        return false;
+      }
+      if (const char* msg = dxa_ref::check_map_words(maps_[e].w.data())) {
+        this->head_abort(h, msg);
+      }
+      head_entry_ = uint32_t(e);
+      head_hit_   = true;
+      return true;
+    }
+    return false;
+  }
+
+  // A tensormap op leaves the head in its lookup cycle; the next request is
+  // looked up from the next cycle.
+  void head_pop() {
+    queue_.pop_front();
+    if (!queue_.empty()) {
+      queue_.front().held = true;
+    }
+  }
+
+  // A request dispatched after its map's fetch held the one behind it.
+  void head_popped(bool fetched) {
+    head_hit_ = false;
+    if (fetched && !queue_.empty()) {
+      queue_.front().held = true;
+    }
+  }
+
   // ── The store family (LMEM → global memory, or a cluster block) ──────
   static MemOp red_memop(uint32_t code) {
     switch (code) {
@@ -2330,7 +2607,19 @@ private:
     w.smem_stride = 0;
     const bool tensor = dxa_ref::is_tensor(st.kind);
     if (tensor) {
-      w.desc = descriptors_.at(req.desc_slot);
+      w.desc = req.map ? maps_.at(head_entry_).desc : descriptors_.at(req.desc_slot);
+      if (req.map && st.kind == dxa_ref::ST_RED_TENSOR && st.type == dxa_ref::RT_FROM_MAP) {
+        // The map's element type is the reduction's.
+        uint32_t type = 0;
+        if (const char* msg = dxa_ref::map_red_type(st.op, maps_.at(head_entry_).w.data(), &type)) {
+          this->dxa_abort(w, msg);
+        }
+        if (dxa_ref::red_needs_fpamo(st.op, type) && !kHasFpamo) {
+          this->dxa_abort(w, dxa_ref::MSG_RED_FPAMO);
+        }
+        st.type = type;
+        req.red_type = type;
+      }
       // VX_dxa_setup's order: the reduction type's size, then the layout,
       // then the load's descriptor rules, then the coordinates.
       const dxa_ref::Desc d = ref_desc(w.desc);
@@ -2555,6 +2844,9 @@ private:
       this->finish_worker(w);
       return;
     }
+    if (fetch_port_) {
+      return;  // the map fetch holds the GMEM port
+    }
     auto& ch = gmem_arb_->ReqIn.at(w.worker_id);
     const bool st_amo = (st.kind != dxa_ref::ST_BULK && st.kind != dxa_ref::ST_TENSOR);
     if (st_amo && st.slot_valid
@@ -2585,7 +2877,7 @@ private:
         mreq.hart_id = w.req.hart_id;
         mreq.flags.amo_unsigned = amo.is_unsigned;
       }
-      if (ch.try_send(mreq)) {
+      if (ch.try_send(mreq, kGmemReqDelay)) {
         DT(3, simobject_->name() << "[" << w.worker_id << "] store " << (mreq.op == MemOp::ST ? "wr" : "amo")
            << ": addr=0x" << std::hex << mreq.addr << ", byteen=0x" << mreq.byteen << ", word=0x"
            << *reinterpret_cast<const uint64_t*>(blk->data() + (uint32_t(mreq.addr & (VX_CFG_L1_LINE_SIZE - 1)) & ~7u)) << std::dec
@@ -2614,7 +2906,7 @@ private:
       f.hart_id     = w.req.core->id();
       f.uuid        = w.req.uuid;
       f.flags.fence = 1;
-      if (ch.try_send(f)) {
+      if (ch.try_send(f, kGmemReqDelay)) {
         st.fence_sent = true;
         DT(3, simobject_->name() << "[" << w.worker_id << "] store fence: line=0x" << std::hex << f.addr
            << std::dec << " (#" << w.req.uuid << ")");
@@ -2900,6 +3192,36 @@ private:
   // (packet, the cycle it reaches the row egress) and round-robin start.
   std::deque<std::pair<DlmemReqPkt, uint64_t>> red_buf_;
   uint32_t red_rr_ = 0;
+  // The descriptor cache's tensor-map entries, beside the slots: tagged by the
+  // map's address above its 64-byte offset, with the map's first words.
+  struct MapEntry {
+    bool       valid = false;
+    uint64_t   tag   = 0;
+    Descriptor desc;
+    std::array<uint32_t, TMAP_FETCH_WORDS> w{};
+  };
+  std::array<MapEntry, DXA_TMAP_ENTRIES> maps_;
+  uint32_t map_rr_     = 0;     // the next victim once every entry is valid
+  uint32_t head_entry_ = 0;     // the queue head's entry, once it hits
+  bool     head_hit_   = false; // the queue head hit and waits for a worker
+  // The queue head's map fetch: its line reads, one a cycle from send_at,
+  // their responses in any order, and the cycle the head is looked up again;
+  // killed by a launch's KMU write, its fill is not kept.
+  struct Fetch {
+    bool     active  = false;
+    bool     killed  = false;
+    uint64_t addr    = 0;
+    uint32_t lines   = 0;
+    uint32_t sent    = 0;
+    uint32_t got     = 0;
+    uint64_t send_at = 0;
+    uint64_t hit_at  = 0;
+    uint32_t hart_id = 0;
+    uint64_t uuid    = 0;
+    std::array<uint32_t, TMAP_WORDS> w{};
+  };
+  Fetch fetch_;
+  bool  fetch_port_ = false;    // the fetch holds the GMEM port this cycle
 #else
 #line 935
 #endif

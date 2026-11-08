@@ -30,6 +30,27 @@ package VX_dxa_pkg;
 
     localparam DXA_DESC_SLOT_BITS = `CLOG2(`VX_DCR_DXA_DESC_COUNT);
     localparam DXA_DESC_SLOT_W    = `UP(DXA_DESC_SLOT_BITS);
+`ifdef DXA_MBAR_ENABLE
+    // Tensor maps in global memory, cached beside the DCR slots: map entry e
+    // is descriptor RAM index COUNT + e, tagged by the map's 64-byte line.
+    localparam DXA_TMAP_ENTRIES   = 8;
+    localparam DXA_TMAP_IDX_W     = `CLOG2(DXA_TMAP_ENTRIES);
+    localparam DXA_TMAP_BYTES     = 128;
+    localparam DXA_TMAP_ALIGN     = 6;
+    localparam DXA_TMAP_TAG_W     = `VX_CFG_MEM_ADDR_WIDTH - DXA_TMAP_ALIGN;
+    localparam DXA_DESC_ENTRIES   = `VX_DCR_DXA_DESC_COUNT + DXA_TMAP_ENTRIES;
+    localparam DXA_DESC_ADDR_W    = `CLOG2(DXA_DESC_ENTRIES);
+    // Map words past the slot encoding: stride bits 39:32 (byte i = dim i+1)
+    // and {fill mode[4], element type[3:0]} (PTX tensormap element types).
+    localparam DXA_TMAP_W_STRIDE_HI = 22;
+    localparam DXA_TMAP_W_ETYPE     = 23;
+    // What a map-naming request does at the queue head.
+    localparam DXA_TM_USE      = 2'd0;
+    localparam DXA_TM_PREFETCH = 2'd1;
+    localparam DXA_TM_INVAL    = 2'd2;
+    // A tensor reduction's type field: the map's element type.
+    localparam DXA_RT_FROM_MAP = 4'd15;
+`endif
 
     // Descriptor-meta field widths and bit offsets (offsets = running sum of the
     // widths). RTL-owned; the host/SimX encoder-decoder derive the same locally.
@@ -111,10 +132,97 @@ package VX_dxa_pkg;
         logic [HART_ID_WIDTH-1:0]        hart_id;
     } dxa_st_t;
 
+    // A request naming a tensor map instead of a descriptor slot.
+    typedef struct packed {
+        logic                            en;
+        logic [1:0]                      op;        // DXA_TM_*
+        logic [DXA_TMAP_TAG_W-1:0]       addr;      // the map's address bits [MEM_ADDR_WIDTH-1:6]
+        logic                            rt;        // a tensor reduction typed by the map
+        logic [3:0]                      rop;       // and its op
+    } dxa_tm_req_t;
+
+    // A reduction's op (0 add, 1 min, 2 max, 3 inc, 4 dec, 5 and, 6 or, 7 xor)
+    // and type (0 b32/u32, 1 s32, 2 b64/u64, 3 s64, 4 f32, 5 f64, 6 f16, 7 bf16)
+    // into a global reduction's legality, float need and cache atomic.
+    function automatic logic dxa_red_ok_g(input logic [3:0] rop, input logic [3:0] typ);
+        logic t_int32, t_int64, t_fp, t_h, op_bit, op_mm, op_id;
+        t_int32 = (typ == 4'd0) || (typ == 4'd1);
+        t_int64 = (typ == 4'd2) || (typ == 4'd3);
+        t_fp    = (typ >= 4'd4) && (typ <= 4'd7);
+        t_h     = (typ == 4'd6) || (typ == 4'd7);
+        op_bit  = (rop >= 4'd5) && (rop <= 4'd7);
+        op_mm   = (rop == 4'd1) || (rop == 4'd2);
+        op_id   = (rop == 4'd3) || (rop == 4'd4);
+        dxa_red_ok_g = op_bit ? ((typ == 4'd0) || (typ == 4'd2))
+                     : op_mm  ? (t_int32 || t_int64 || t_h)
+                     : (rop == 4'd0) ? ((typ <= 4'd2) || t_fp)
+                     : op_id  ? (typ == 4'd0)
+                     : 1'b0;
+    endfunction
+
+    function automatic logic dxa_red_fp(input logic [3:0] rop, input logic [3:0] typ);
+        dxa_red_fp = ((typ >= 4'd4) && (typ <= 4'd7)) || (rop == 4'd3) || (rop == 4'd4);
+    endfunction
+
+    // The atomic fields of dxa_st_t; en, kind and hart_id are left 0.
+    function automatic dxa_st_t dxa_red_st(input logic [3:0] rop, input logic [3:0] typ);
+        logic t_int64, t_h;
+        t_int64 = (typ == 4'd2) || (typ == 4'd3);
+        t_h     = (typ == 4'd6) || (typ == 4'd7);
+        dxa_red_st         = '0;
+        dxa_red_st.amo_uns = (typ == 4'd0) || (typ == 4'd2);
+        dxa_red_st.w8      = t_int64 || (typ == 4'd5);
+        dxa_red_st.tsize   = t_h ? 2'd1 : ((t_int64 || (typ == 4'd5)) ? 2'd3 : 2'd2);
+        case (rop)
+        4'd1:    dxa_red_st.amo_op = AMO_OP_MIN;
+        4'd2:    dxa_red_st.amo_op = AMO_OP_MAX;
+        4'd5:    dxa_red_st.amo_op = AMO_OP_AND;
+        4'd6:    dxa_red_st.amo_op = AMO_OP_OR;
+        4'd7:    dxa_red_st.amo_op = AMO_OP_XOR;
+        default: dxa_red_st.amo_op = AMO_OP_ADD;
+        endcase
+    `ifdef VX_CFG_EXT_FPAMO_ENABLE
+        case (rop)
+        4'd0: begin
+            if ((typ == 4'd4) || (typ == 4'd5)) dxa_red_st.amo_op = AMO_OP_FADD;
+            if (typ == 4'd6) dxa_red_st.amo_op = AMO_OP_FADD2;
+            if (typ == 4'd7) dxa_red_st.amo_op = AMO_OP_FADD2_BF;
+        end
+        4'd1: begin
+            if (typ == 4'd6) dxa_red_st.amo_op = AMO_OP_FMIN2;
+            if (typ == 4'd7) dxa_red_st.amo_op = AMO_OP_FMIN2_BF;
+        end
+        4'd2: begin
+            if (typ == 4'd6) dxa_red_st.amo_op = AMO_OP_FMAX2;
+            if (typ == 4'd7) dxa_red_st.amo_op = AMO_OP_FMAX2_BF;
+        end
+        4'd3: dxa_red_st.amo_op = AMO_OP_INC;
+        4'd4: dxa_red_st.amo_op = AMO_OP_DEC;
+        default: ;
+        endcase
+    `endif
+    endfunction
+
+    // A map element type as a reduction type; DXA_RT_FROM_MAP when it has none.
+    function automatic logic [3:0] dxa_tmap_red_type(input logic [3:0] et);
+        case (et)
+        4'd2:       dxa_tmap_red_type = 4'd0;   // u32
+        4'd3:       dxa_tmap_red_type = 4'd1;   // s32
+        4'd4:       dxa_tmap_red_type = 4'd2;   // u64
+        4'd5:       dxa_tmap_red_type = 4'd3;   // s64
+        4'd6:       dxa_tmap_red_type = 4'd6;   // f16
+        4'd7, 4'd8: dxa_tmap_red_type = 4'd4;   // f32, f32.ftz
+        4'd9:       dxa_tmap_red_type = 4'd5;   // f64
+        4'd10:      dxa_tmap_red_type = 4'd7;   // bf16
+        default:    dxa_tmap_red_type = DXA_RT_FROM_MAP;
+        endcase
+    endfunction
+
 `endif
     // DXA request data — core → DXA control path.
     typedef struct packed {
     `ifdef DXA_MBAR_ENABLE
+        dxa_tm_req_t                     tm;
         dxa_st_t                         st;
         // A bulk_group operation (a store or a global reduction) and its group.
         logic                            bg;
@@ -345,6 +453,8 @@ package VX_dxa_pkg;
             `TRACE(level, ("DXA.BLOAD"))
         end else if (op_args.dxa.bprefetch) begin
             `TRACE(level, ("DXA.BPREFETCH"))
+        end else if (op_args.dxa.tmop) begin
+            `TRACE(level, ("DXA.TENSORMAP"))
         end else begin
             `TRACE(level, ("DXA.ISSUE"))
         end

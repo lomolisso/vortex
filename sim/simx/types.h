@@ -789,6 +789,7 @@ enum class DxaType {
   , BPREFETCH  // cp.async.bulk.prefetch.L2.global
   , STORE      // a bulk or tensor store or reduction out of the block's local memory
   , BGOP       // cp.async.bulk commit_group, wait_group and wait_group.read
+  , TMAP       // prefetch.tensormap and fence.proxy.tensormap acquire (funct3 7)
 #else
 #line 637
 #endif
@@ -796,7 +797,8 @@ enum class DxaType {
 
 #ifdef VX_CFG_EXT_MBAR_ENABLE
 // BGOP: the instruction's rs1 field (0 commit, 1 wait, 2 wait.read) and its
-// rs2 field (the wait's N); no register is read.
+// rs2 field (the wait's N); no register is read. TMAP: the op in bg_n (the
+// rs2 field), only rs1 read.
 struct IntrDxaArgs {
   uint32_t bg_op = 0;
   uint32_t bg_n  = 0;
@@ -817,6 +819,7 @@ inline std::ostream &operator<<(std::ostream &os, const DxaType& type) {
   case DxaType::BPREFETCH: os << "DXA.BPREFETCH"; break;
   case DxaType::STORE: os << "DXA.STORE"; break;
   case DxaType::BGOP:  os << "DXA.BGOP"; break;
+  case DxaType::TMAP:  os << "DXA.TMAP"; break;
 #else
 #line 644
 #endif

@@ -22,7 +22,19 @@ module VX_dxa_desc_table import VX_gpu_pkg::*, VX_dxa_pkg::*; (
 
     VX_dcr_bus_if.slave dcr_bus_if,
 
+`ifdef DXA_MBAR_ENABLE
+    // Map entries are RAM indexes COUNT + e, filled one map line at a time.
+    input wire [DXA_DESC_ADDR_W-1:0] read_addr,
+    input wire                       fill_valid,
+    input wire [DXA_TMAP_IDX_W-1:0]  fill_entry,
+    input wire [`VX_DCR_DXA_DESC_STRIDE-1:0] fill_wren,
+    input wire [`VX_DCR_DXA_DESC_STRIDE*32-1:0] fill_wdata,
+    output wire                      fill_ready,
+    output wire [31:0]               read_w22,
+    output wire [31:0]               read_w23,
+`else
     input wire [DXA_DESC_SLOT_W-1:0] read_addr,
+`endif
     output dxa_desc_t read_desc
 );
     localparam NUM_SLOTS = `VX_DCR_DXA_DESC_COUNT;
@@ -62,6 +74,36 @@ module VX_dxa_desc_table import VX_gpu_pkg::*, VX_dxa_pkg::*; (
     // (ENTRY_W × NUM_SLOTS) descriptor store infer true BRAM instead of
     // distributed LUTRAM. The 1-cycle read latency is absorbed by the fetch
     // register in VX_dxa_core.
+`ifdef DXA_MBAR_ENABLE
+    // DCR writes keep the write port; a fill is held while one is presented.
+    assign fill_ready = ~dcr_write;
+    wire                       ram_write = dcr_write || fill_valid;
+    wire [STRIDE-1:0]          ram_wren  = dcr_write ? dcr_wren : fill_wren;
+    wire [DXA_DESC_ADDR_W-1:0] ram_waddr = dcr_write ? DXA_DESC_ADDR_W'(dcr_slot)
+                                         : DXA_DESC_ADDR_W'(NUM_SLOTS + 32'(fill_entry));
+    wire [ENTRY_W-1:0]         ram_wdata = dcr_write ? dcr_wdata : fill_wdata;
+
+    VX_dp_ram #(
+        .DATAW    (ENTRY_W),
+        .SIZE     (DXA_DESC_ENTRIES),
+        .WRENW    (STRIDE),
+        .OUT_REG  (1),
+        .RDW_MODE ("W")
+    ) desc_store (
+        .clk   (clk),
+        .reset (reset),
+        .read  (1'b1),
+        .write (ram_write),
+        .wren  (ram_wren),
+        .raddr (read_addr),
+        .waddr (ram_waddr),
+        .wdata (ram_wdata),
+        .rdata (entry_rdata)
+    );
+
+    assign read_w22 = entry_rdata[DXA_TMAP_W_STRIDE_HI*32 +: 32];
+    assign read_w23 = entry_rdata[DXA_TMAP_W_ETYPE*32 +: 32];
+`else
     VX_dp_ram #(
         .DATAW    (ENTRY_W),
         .SIZE     (NUM_SLOTS),
@@ -79,6 +121,7 @@ module VX_dxa_desc_table import VX_gpu_pkg::*, VX_dxa_pkg::*; (
         .wdata (dcr_wdata),
         .rdata (entry_rdata)
     );
+`endif
 
     // Unpack fields
     assign read_desc.base_addr = `VX_CFG_MEM_ADDR_WIDTH'({

@@ -94,6 +94,17 @@ struct DxaReq {
   bool     bg       = false;
   uint32_t bg_seq   = 0;
   uint32_t hart_id  = 0;  // the issuing warp's thread 0
+  // A map-form tensor operation, whose descriptor is the 128-byte tensor map
+  // at map_addr in global memory; or a tensormap op (funct3 7), tmop.
+  bool     map      = false;
+  uint64_t map_addr = 0;
+  bool     tmop     = false;
+  uint32_t tmap_op  = 0;   // DXA_TMAP_PREFETCH or DXA_TMAP_INVAL
+  // The engine's queue-head bookkeeping: the cycle it was first looked up,
+  // whether its map was fetched, and whether a map operation ahead held it.
+  uint64_t head_at  = 0;
+  bool     fetched  = false;
+  bool     held     = false;
 #else
 #line 43
 #endif
@@ -136,6 +147,8 @@ public:
 private:
   bool issue_store(instr_trace_t* trace);
   bool issue_bgop(instr_trace_t* trace);
+  bool issue_tmap(instr_trace_t* trace);
+  void check_map(const instr_trace_t* trace, uint64_t map) const;
   void decode_store(const instr_trace_t* trace, DxaReq& req) const;
 
   std::vector<DxaBgState> bg_mirror_ = std::vector<DxaBgState>(VX_CFG_NUM_WARPS);

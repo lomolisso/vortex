@@ -21,6 +21,9 @@
 #include <vx_mbar.h>
 #include <vx_dlmem.h>
 #include <dxa_meta.h>
+#ifdef __cplusplus
+#include <dxa_tmap.h>
+#endif
 #endif
 
 #ifdef __cplusplus
@@ -1227,5 +1230,375 @@ inline void vx_bulk_wait_group_read() {
                     : "memory");
 }
 #endif
+
+#if defined(__cplusplus) && defined(VX_CFG_EXT_MBAR_ENABLE)
+// ════════════════════════════════════════════════════════════════════════
+//  Tensor maps in memory (PTX §5.5.8, the CUtensorMap model)
+//
+//  The map forms of the PTX tensor operations name a vx_tensor_map_t
+//  (dxa_tmap.h) in global memory, 64-byte aligned, physical (VX_MEM_PHYS), in
+//  place of a descriptor slot: a kernel-argument member (`&arg->map`, the
+//  __grid_constant__ form), a .const map or a global buffer. The DXA reads it
+//  into its descriptor cache at the level below the L1D; every launch empties
+//  the cache. A map written by the kernel is published with a release
+//  (vx_tensormap_cp_fenceproxy or vx_fence_proxy_tensormap_release) and
+//  picked up by each block with vx_fence_proxy_tensormap_acquire.
+//  funct3 2: rs2 lane 0 ctl bit 5 = map, rs2 lane 2 = the map; funct3 5: ctl
+//  bit 15 = map, rs2 lane 1 = the map; a map-form reduction's type is the map's.
+//  As every DXA op, these take their operands from thread 0, which must be
+//  active (prefetch and acquire read the map address from its rs1).
+// ════════════════════════════════════════════════════════════════════════
+
+inline void __vx_dxa_tload_map(uint32_t ctl, const vx_tensor_map_t* map, void* dst, uint64_t* mbar,
+                               int32_t c0, int32_t c1, int32_t c2, int32_t c3, int32_t c4,
+                               uint32_t o1, uint32_t o2, uint32_t o3, uint32_t cta_mask) {
+  const size_t a0 = vx_wgather((size_t)(uintptr_t)dst,
+                               (size_t)(uintptr_t)mbar,
+                               __vx_dxa_pair(c0, c1),
+                               __vx_dxa_pair(c2, c3));
+  const size_t a1 = vx_wgather(((size_t)(ctl | (1u << DXA_TL_CTL_MAP_LSB)) << 32) | (size_t)(uint32_t)c4,
+                               ((size_t)(o3 & 0xFFFFu) << 48) | ((size_t)(o2 & 0xFFFFu) << 32)
+                                 | ((size_t)(o1 & 0xFFFFu) << 16) | (size_t)(cta_mask & 0xFFFFu),
+                               (size_t)(uintptr_t)map,
+                               (size_t)0);
+  __asm__ volatile (
+      ".insn r %0, 2, %1, x0, %2, %3\n\t"
+      :
+      : "i"(VX_DXA_EXT_OPCODE), "i"(VX_DXA_FUNCT7), "r"(a0), "r"(a1)
+      : "memory");
+}
+
+inline void vx_dxa_load_1d(const vx_tensor_map_t* map, void* dst, uint64_t* mbar, int32_t c0) {
+  __vx_dxa_tload_map(0, map, dst, mbar, c0, 0, 0, 0, 0, 0, 0, 0, 0);
+}
+inline void vx_dxa_load_2d(const vx_tensor_map_t* map, void* dst, uint64_t* mbar, int32_t c0, int32_t c1) {
+  __vx_dxa_tload_map(0, map, dst, mbar, c0, c1, 0, 0, 0, 0, 0, 0, 0);
+}
+inline void vx_dxa_load_3d(const vx_tensor_map_t* map, void* dst, uint64_t* mbar, int32_t c0, int32_t c1,
+                           int32_t c2) {
+  __vx_dxa_tload_map(0, map, dst, mbar, c0, c1, c2, 0, 0, 0, 0, 0, 0);
+}
+inline void vx_dxa_load_4d(const vx_tensor_map_t* map, void* dst, uint64_t* mbar, int32_t c0, int32_t c1,
+                           int32_t c2, int32_t c3) {
+  __vx_dxa_tload_map(0, map, dst, mbar, c0, c1, c2, c3, 0, 0, 0, 0, 0);
+}
+inline void vx_dxa_load_5d(const vx_tensor_map_t* map, void* dst, uint64_t* mbar, int32_t c0, int32_t c1,
+                           int32_t c2, int32_t c3, int32_t c4) {
+  __vx_dxa_tload_map(0, map, dst, mbar, c0, c1, c2, c3, c4, 0, 0, 0, 0);
+}
+
+inline void vx_dxa_load_1d_multicast(const vx_tensor_map_t* map, void* dst, uint64_t* mbar, int32_t c0,
+                                     uint16_t cta_mask) {
+  __vx_dxa_tload_map(0, map, dst, mbar, c0, 0, 0, 0, 0, 0, 0, 0, cta_mask);
+}
+inline void vx_dxa_load_2d_multicast(const vx_tensor_map_t* map, void* dst, uint64_t* mbar, int32_t c0,
+                                     int32_t c1, uint16_t cta_mask) {
+  __vx_dxa_tload_map(0, map, dst, mbar, c0, c1, 0, 0, 0, 0, 0, 0, cta_mask);
+}
+inline void vx_dxa_load_3d_multicast(const vx_tensor_map_t* map, void* dst, uint64_t* mbar, int32_t c0,
+                                     int32_t c1, int32_t c2, uint16_t cta_mask) {
+  __vx_dxa_tload_map(0, map, dst, mbar, c0, c1, c2, 0, 0, 0, 0, 0, cta_mask);
+}
+inline void vx_dxa_load_4d_multicast(const vx_tensor_map_t* map, void* dst, uint64_t* mbar, int32_t c0,
+                                     int32_t c1, int32_t c2, int32_t c3, uint16_t cta_mask) {
+  __vx_dxa_tload_map(0, map, dst, mbar, c0, c1, c2, c3, 0, 0, 0, 0, cta_mask);
+}
+inline void vx_dxa_load_5d_multicast(const vx_tensor_map_t* map, void* dst, uint64_t* mbar, int32_t c0,
+                                     int32_t c1, int32_t c2, int32_t c3, int32_t c4, uint16_t cta_mask) {
+  __vx_dxa_tload_map(0, map, dst, mbar, c0, c1, c2, c3, c4, 0, 0, 0, cta_mask);
+}
+
+inline void vx_dxa_load_im2col_3d(const vx_tensor_map_t* map, void* dst, uint64_t* mbar, int32_t c0,
+                                  int32_t c1, int32_t c2, uint16_t o1) {
+  __vx_dxa_tload_map(0, map, dst, mbar, c0, c1, c2, 0, 0, o1, 0, 0, 0);
+}
+inline void vx_dxa_load_im2col_4d(const vx_tensor_map_t* map, void* dst, uint64_t* mbar, int32_t c0,
+                                  int32_t c1, int32_t c2, int32_t c3, uint16_t o1, uint16_t o2) {
+  __vx_dxa_tload_map(0, map, dst, mbar, c0, c1, c2, c3, 0, o1, o2, 0, 0);
+}
+inline void vx_dxa_load_im2col_5d(const vx_tensor_map_t* map, void* dst, uint64_t* mbar, int32_t c0,
+                                  int32_t c1, int32_t c2, int32_t c3, int32_t c4, uint16_t o1, uint16_t o2,
+                                  uint16_t o3) {
+  __vx_dxa_tload_map(0, map, dst, mbar, c0, c1, c2, c3, c4, o1, o2, o3, 0);
+}
+inline void vx_dxa_load_im2col_3d_multicast(const vx_tensor_map_t* map, void* dst, uint64_t* mbar,
+                                            int32_t c0, int32_t c1, int32_t c2, uint16_t o1,
+                                            uint16_t cta_mask) {
+  __vx_dxa_tload_map(0, map, dst, mbar, c0, c1, c2, 0, 0, o1, 0, 0, cta_mask);
+}
+inline void vx_dxa_load_im2col_4d_multicast(const vx_tensor_map_t* map, void* dst, uint64_t* mbar,
+                                            int32_t c0, int32_t c1, int32_t c2, int32_t c3, uint16_t o1,
+                                            uint16_t o2, uint16_t cta_mask) {
+  __vx_dxa_tload_map(0, map, dst, mbar, c0, c1, c2, c3, 0, o1, o2, 0, cta_mask);
+}
+inline void vx_dxa_load_im2col_5d_multicast(const vx_tensor_map_t* map, void* dst, uint64_t* mbar,
+                                            int32_t c0, int32_t c1, int32_t c2, int32_t c3, int32_t c4,
+                                            uint16_t o1, uint16_t o2, uint16_t o3, uint16_t cta_mask) {
+  __vx_dxa_tload_map(0, map, dst, mbar, c0, c1, c2, c3, c4, o1, o2, o3, cta_mask);
+}
+
+// The .L2::cache_hint forms drop the hint.
+inline void vx_dxa_load_1d_hint(const vx_tensor_map_t* map, void* dst, uint64_t* mbar, int32_t c0,
+                                uint64_t l2_hint) {
+  (void)l2_hint;
+  vx_dxa_load_1d(map, dst, mbar, c0);
+}
+inline void vx_dxa_load_2d_hint(const vx_tensor_map_t* map, void* dst, uint64_t* mbar, int32_t c0, int32_t c1,
+                                uint64_t l2_hint) {
+  (void)l2_hint;
+  vx_dxa_load_2d(map, dst, mbar, c0, c1);
+}
+inline void vx_dxa_load_3d_hint(const vx_tensor_map_t* map, void* dst, uint64_t* mbar, int32_t c0, int32_t c1,
+                                int32_t c2, uint64_t l2_hint) {
+  (void)l2_hint;
+  vx_dxa_load_3d(map, dst, mbar, c0, c1, c2);
+}
+inline void vx_dxa_load_4d_hint(const vx_tensor_map_t* map, void* dst, uint64_t* mbar, int32_t c0, int32_t c1,
+                                int32_t c2, int32_t c3, uint64_t l2_hint) {
+  (void)l2_hint;
+  vx_dxa_load_4d(map, dst, mbar, c0, c1, c2, c3);
+}
+inline void vx_dxa_load_5d_hint(const vx_tensor_map_t* map, void* dst, uint64_t* mbar, int32_t c0, int32_t c1,
+                                int32_t c2, int32_t c3, int32_t c4, uint64_t l2_hint) {
+  (void)l2_hint;
+  vx_dxa_load_5d(map, dst, mbar, c0, c1, c2, c3, c4);
+}
+inline void vx_dxa_load_1d_multicast_hint(const vx_tensor_map_t* map, void* dst, uint64_t* mbar, int32_t c0,
+                                          uint16_t cta_mask, uint64_t l2_hint) {
+  (void)l2_hint;
+  vx_dxa_load_1d_multicast(map, dst, mbar, c0, cta_mask);
+}
+inline void vx_dxa_load_2d_multicast_hint(const vx_tensor_map_t* map, void* dst, uint64_t* mbar, int32_t c0,
+                                          int32_t c1, uint16_t cta_mask, uint64_t l2_hint) {
+  (void)l2_hint;
+  vx_dxa_load_2d_multicast(map, dst, mbar, c0, c1, cta_mask);
+}
+inline void vx_dxa_load_3d_multicast_hint(const vx_tensor_map_t* map, void* dst, uint64_t* mbar, int32_t c0,
+                                          int32_t c1, int32_t c2, uint16_t cta_mask, uint64_t l2_hint) {
+  (void)l2_hint;
+  vx_dxa_load_3d_multicast(map, dst, mbar, c0, c1, c2, cta_mask);
+}
+inline void vx_dxa_load_4d_multicast_hint(const vx_tensor_map_t* map, void* dst, uint64_t* mbar, int32_t c0,
+                                          int32_t c1, int32_t c2, int32_t c3, uint16_t cta_mask,
+                                          uint64_t l2_hint) {
+  (void)l2_hint;
+  vx_dxa_load_4d_multicast(map, dst, mbar, c0, c1, c2, c3, cta_mask);
+}
+inline void vx_dxa_load_5d_multicast_hint(const vx_tensor_map_t* map, void* dst, uint64_t* mbar, int32_t c0,
+                                          int32_t c1, int32_t c2, int32_t c3, int32_t c4, uint16_t cta_mask,
+                                          uint64_t l2_hint) {
+  (void)l2_hint;
+  vx_dxa_load_5d_multicast(map, dst, mbar, c0, c1, c2, c3, c4, cta_mask);
+}
+inline void vx_dxa_load_im2col_3d_hint(const vx_tensor_map_t* map, void* dst, uint64_t* mbar, int32_t c0,
+                                       int32_t c1, int32_t c2, uint16_t o1, uint64_t l2_hint) {
+  (void)l2_hint;
+  vx_dxa_load_im2col_3d(map, dst, mbar, c0, c1, c2, o1);
+}
+inline void vx_dxa_load_im2col_4d_hint(const vx_tensor_map_t* map, void* dst, uint64_t* mbar, int32_t c0,
+                                       int32_t c1, int32_t c2, int32_t c3, uint16_t o1, uint16_t o2,
+                                       uint64_t l2_hint) {
+  (void)l2_hint;
+  vx_dxa_load_im2col_4d(map, dst, mbar, c0, c1, c2, c3, o1, o2);
+}
+inline void vx_dxa_load_im2col_5d_hint(const vx_tensor_map_t* map, void* dst, uint64_t* mbar, int32_t c0,
+                                       int32_t c1, int32_t c2, int32_t c3, int32_t c4, uint16_t o1, uint16_t o2,
+                                       uint16_t o3, uint64_t l2_hint) {
+  (void)l2_hint;
+  vx_dxa_load_im2col_5d(map, dst, mbar, c0, c1, c2, c3, c4, o1, o2, o3);
+}
+inline void vx_dxa_load_im2col_3d_multicast_hint(const vx_tensor_map_t* map, void* dst, uint64_t* mbar,
+                                                 int32_t c0, int32_t c1, int32_t c2, uint16_t o1,
+                                                 uint16_t cta_mask, uint64_t l2_hint) {
+  (void)l2_hint;
+  vx_dxa_load_im2col_3d_multicast(map, dst, mbar, c0, c1, c2, o1, cta_mask);
+}
+inline void vx_dxa_load_im2col_4d_multicast_hint(const vx_tensor_map_t* map, void* dst, uint64_t* mbar,
+                                                 int32_t c0, int32_t c1, int32_t c2, int32_t c3, uint16_t o1,
+                                                 uint16_t o2, uint16_t cta_mask, uint64_t l2_hint) {
+  (void)l2_hint;
+  vx_dxa_load_im2col_4d_multicast(map, dst, mbar, c0, c1, c2, c3, o1, o2, cta_mask);
+}
+inline void vx_dxa_load_im2col_5d_multicast_hint(const vx_tensor_map_t* map, void* dst, uint64_t* mbar,
+                                                 int32_t c0, int32_t c1, int32_t c2, int32_t c3, int32_t c4,
+                                                 uint16_t o1, uint16_t o2, uint16_t o3, uint16_t cta_mask,
+                                                 uint64_t l2_hint) {
+  (void)l2_hint;
+  vx_dxa_load_im2col_5d_multicast(map, dst, mbar, c0, c1, c2, c3, c4, o1, o2, o3, cta_mask);
+}
+
+inline void vx_dxa_prefetch_1d(const vx_tensor_map_t* map, int32_t c0) {
+  __vx_dxa_tload_map(VX_DXA_CTL_PREFETCH, map, 0, 0, c0, 0, 0, 0, 0, 0, 0, 0, 0);
+}
+inline void vx_dxa_prefetch_2d(const vx_tensor_map_t* map, int32_t c0, int32_t c1) {
+  __vx_dxa_tload_map(VX_DXA_CTL_PREFETCH, map, 0, 0, c0, c1, 0, 0, 0, 0, 0, 0, 0);
+}
+inline void vx_dxa_prefetch_3d(const vx_tensor_map_t* map, int32_t c0, int32_t c1, int32_t c2) {
+  __vx_dxa_tload_map(VX_DXA_CTL_PREFETCH, map, 0, 0, c0, c1, c2, 0, 0, 0, 0, 0, 0);
+}
+inline void vx_dxa_prefetch_4d(const vx_tensor_map_t* map, int32_t c0, int32_t c1, int32_t c2, int32_t c3) {
+  __vx_dxa_tload_map(VX_DXA_CTL_PREFETCH, map, 0, 0, c0, c1, c2, c3, 0, 0, 0, 0, 0);
+}
+inline void vx_dxa_prefetch_5d(const vx_tensor_map_t* map, int32_t c0, int32_t c1, int32_t c2, int32_t c3,
+                               int32_t c4) {
+  __vx_dxa_tload_map(VX_DXA_CTL_PREFETCH, map, 0, 0, c0, c1, c2, c3, c4, 0, 0, 0, 0);
+}
+inline void vx_dxa_prefetch_im2col_3d(const vx_tensor_map_t* map, int32_t c0, int32_t c1, int32_t c2,
+                                      uint16_t o1) {
+  __vx_dxa_tload_map(VX_DXA_CTL_PREFETCH, map, 0, 0, c0, c1, c2, 0, 0, o1, 0, 0, 0);
+}
+inline void vx_dxa_prefetch_im2col_4d(const vx_tensor_map_t* map, int32_t c0, int32_t c1, int32_t c2,
+                                      int32_t c3, uint16_t o1, uint16_t o2) {
+  __vx_dxa_tload_map(VX_DXA_CTL_PREFETCH, map, 0, 0, c0, c1, c2, c3, 0, o1, o2, 0, 0);
+}
+inline void vx_dxa_prefetch_im2col_5d(const vx_tensor_map_t* map, int32_t c0, int32_t c1, int32_t c2,
+                                      int32_t c3, int32_t c4, uint16_t o1, uint16_t o2, uint16_t o3) {
+  __vx_dxa_tload_map(VX_DXA_CTL_PREFETCH, map, 0, 0, c0, c1, c2, c3, c4, o1, o2, o3, 0);
+}
+
+inline void __vx_dxa_store_tensor_map(uint32_t ctl, const vx_tensor_map_t* map, const void* src, int32_t c0,
+                                      int32_t c1, int32_t c2, int32_t c3, int32_t c4) {
+  const size_t r1 = vx_wgather((size_t)(uintptr_t)src, __vx_dxa_pair(c0, c1), __vx_dxa_pair(c2, c3), (size_t)0);
+  const size_t r2 = vx_wgather(((size_t)(ctl | (1u << DXA_ST_CTL_MAP_LSB)) << 32) | (size_t)(uint32_t)c4,
+                               (size_t)(uintptr_t)map, (size_t)0, (size_t)0);
+  __asm__ volatile (
+      ".insn r %0, 5, %1, x0, %2, %3\n\t"
+      :
+      : "i"(VX_DXA_EXT_OPCODE), "i"(VX_DXA_FUNCT7), "r"(r1), "r"(r2)
+      : "memory");
+}
+
+inline void vx_dxa_store_1d(const vx_tensor_map_t* map, const void* src, int32_t c0) {
+  __vx_dxa_store_tensor_map(vx_dxa_st_ctl(DXA_ST_TENSOR, 0, 0, 0), map, src, c0, 0, 0, 0, 0);
+}
+inline void vx_dxa_store_2d(const vx_tensor_map_t* map, const void* src, int32_t c0, int32_t c1) {
+  __vx_dxa_store_tensor_map(vx_dxa_st_ctl(DXA_ST_TENSOR, 0, 0, 0), map, src, c0, c1, 0, 0, 0);
+}
+inline void vx_dxa_store_3d(const vx_tensor_map_t* map, const void* src, int32_t c0, int32_t c1, int32_t c2) {
+  __vx_dxa_store_tensor_map(vx_dxa_st_ctl(DXA_ST_TENSOR, 0, 0, 0), map, src, c0, c1, c2, 0, 0);
+}
+inline void vx_dxa_store_4d(const vx_tensor_map_t* map, const void* src, int32_t c0, int32_t c1, int32_t c2,
+                            int32_t c3) {
+  __vx_dxa_store_tensor_map(vx_dxa_st_ctl(DXA_ST_TENSOR, 0, 0, 0), map, src, c0, c1, c2, c3, 0);
+}
+inline void vx_dxa_store_5d(const vx_tensor_map_t* map, const void* src, int32_t c0, int32_t c1, int32_t c2,
+                            int32_t c3, int32_t c4) {
+  __vx_dxa_store_tensor_map(vx_dxa_st_ctl(DXA_ST_TENSOR, 0, 0, 0), map, src, c0, c1, c2, c3, c4);
+}
+inline void vx_dxa_store_im2col_3d(const vx_tensor_map_t* map, const void* src, int32_t c, int32_t w, int32_t n) {
+  vx_dxa_store_3d(map, src, c, w, n);
+}
+inline void vx_dxa_store_im2col_4d(const vx_tensor_map_t* map, const void* src, int32_t c, int32_t w, int32_t h,
+                                   int32_t n) {
+  vx_dxa_store_4d(map, src, c, w, h, n);
+}
+inline void vx_dxa_store_im2col_5d(const vx_tensor_map_t* map, const void* src, int32_t c, int32_t w, int32_t h,
+                                   int32_t d, int32_t n) {
+  vx_dxa_store_5d(map, src, c, w, h, d, n);
+}
+
+// The element type comes from the map (u32, s32, u64, s64, f16, bf16, f32,
+// f32.ftz, f64), with the op x type pairs of vx_dxa_reduce_global.
+inline void vx_dxa_reduce_1d(const vx_tensor_map_t* map, const void* src, uint32_t op, int32_t c0) {
+  __vx_dxa_store_tensor_map(vx_dxa_st_ctl(DXA_ST_RED_TENSOR, op, DXA_RT_FROM_MAP, 0), map, src, c0, 0, 0, 0, 0);
+}
+inline void vx_dxa_reduce_2d(const vx_tensor_map_t* map, const void* src, uint32_t op, int32_t c0, int32_t c1) {
+  __vx_dxa_store_tensor_map(vx_dxa_st_ctl(DXA_ST_RED_TENSOR, op, DXA_RT_FROM_MAP, 0), map, src, c0, c1, 0, 0, 0);
+}
+inline void vx_dxa_reduce_3d(const vx_tensor_map_t* map, const void* src, uint32_t op, int32_t c0, int32_t c1,
+                             int32_t c2) {
+  __vx_dxa_store_tensor_map(vx_dxa_st_ctl(DXA_ST_RED_TENSOR, op, DXA_RT_FROM_MAP, 0), map, src, c0, c1, c2, 0, 0);
+}
+inline void vx_dxa_reduce_4d(const vx_tensor_map_t* map, const void* src, uint32_t op, int32_t c0, int32_t c1,
+                             int32_t c2, int32_t c3) {
+  __vx_dxa_store_tensor_map(vx_dxa_st_ctl(DXA_ST_RED_TENSOR, op, DXA_RT_FROM_MAP, 0), map, src, c0, c1, c2, c3, 0);
+}
+inline void vx_dxa_reduce_5d(const vx_tensor_map_t* map, const void* src, uint32_t op, int32_t c0, int32_t c1,
+                             int32_t c2, int32_t c3, int32_t c4) {
+  __vx_dxa_store_tensor_map(vx_dxa_st_ctl(DXA_ST_RED_TENSOR, op, DXA_RT_FROM_MAP, 0), map, src, c0, c1, c2, c3,
+                            c4);
+}
+inline void vx_dxa_reduce_im2col_3d(const vx_tensor_map_t* map, const void* src, uint32_t op, int32_t c,
+                                    int32_t w, int32_t n) {
+  vx_dxa_reduce_3d(map, src, op, c, w, n);
+}
+inline void vx_dxa_reduce_im2col_4d(const vx_tensor_map_t* map, const void* src, uint32_t op, int32_t c,
+                                    int32_t w, int32_t h, int32_t n) {
+  vx_dxa_reduce_4d(map, src, op, c, w, h, n);
+}
+inline void vx_dxa_reduce_im2col_5d(const vx_tensor_map_t* map, const void* src, uint32_t op, int32_t c,
+                                    int32_t w, int32_t h, int32_t d, int32_t n) {
+  vx_dxa_reduce_5d(map, src, op, c, w, h, d, n);
+}
+
+// prefetch{.param,.const,.global}.tensormap [map]: brings the map into the
+// descriptor cache; the warp does not wait. funct3 7, rs1 = map, rs2 field 0.
+inline void vx_prefetch_tensormap(const vx_tensor_map_t* map) {
+  __asm__ volatile (".insn r %0, 7, %1, x0, %2, x0"
+                    :: "i"(VX_DXA_EXT_OPCODE), "i"(VX_DXA_FUNCT7), "r"(map) : "memory");
+}
+
+// fence.proxy.tensormap::generic.acquire.{cta,cluster,gpu,sys} [map], 128:
+// drops the cached copy of `map`, so the issuing core's later tensor
+// operations (and its block's, after a block barrier) read it again. Each
+// block that uses a rewritten map acquires it itself. rs2 field 1.
+inline void vx_fence_proxy_tensormap_acquire(const vx_tensor_map_t* map) {
+  __asm__ volatile (".insn r %0, 7, %1, x0, %2, x1"
+                    :: "i"(VX_DXA_EXT_OPCODE), "i"(VX_DXA_FUNCT7), "r"(map) : "memory");
+}
+
+// fence.proxy.tensormap::generic.release.{cta,cluster,gpu,sys}: the warp's
+// earlier generic writes of a map reach the level the DXA reads maps from.
+inline void vx_fence_proxy_tensormap_release(void) {
+  vx_fence_proxy_async_global();
+}
+
+// tensormap.cp_fenceproxy.global.shared::cta.tensormap::generic.release.*.sync.aligned
+// [gdst], [ssrc], 128: copies the map from shared to global memory with
+// ordinary loads and stores, then releases it. Every active thread copies all
+// words (the same values), so a partial warp still copies the whole map.
+inline void vx_tensormap_cp_fenceproxy(vx_tensor_map_t* gdst, const vx_tensor_map_t* ssrc) {
+  auto d = reinterpret_cast<volatile uint32_t*>(gdst->w);
+  auto s = reinterpret_cast<const volatile uint32_t*>(ssrc->w);
+  for (uint32_t k = 0; k < TMAP_WORDS; ++k)
+    d[k] = s[k];
+  vx_fence_proxy_tensormap_release();
+}
+
+// tensormap.replace.tile.<field>{.global,.shared::cta}.b1024 on a map in
+// global or shared memory (a generic address), with PTX's operand meanings
+// (rank is rank - 1; elemtype, interleave, swizzle and fill take the Table 33
+// codes). A weak generic write: publish it with a release.
+inline void vx_tensormap_replace_global_address(vx_tensor_map_t* map, uint64_t addr) {
+  vortex::dxa_tmap::replace_global_address(map->w, addr);
+}
+inline void vx_tensormap_replace_rank(vx_tensor_map_t* map, uint32_t rank_minus_1) {
+  vortex::dxa_tmap::replace_rank(map->w, rank_minus_1);
+}
+inline void vx_tensormap_replace_box_dim(vx_tensor_map_t* map, uint32_t ord, uint32_t v) {
+  vortex::dxa_tmap::replace_box_dim(map->w, ord, v);
+}
+inline void vx_tensormap_replace_global_dim(vx_tensor_map_t* map, uint32_t ord, uint32_t v) {
+  vortex::dxa_tmap::replace_global_dim(map->w, ord, v);
+}
+inline void vx_tensormap_replace_global_stride(vx_tensor_map_t* map, uint32_t ord, uint64_t v) {
+  vortex::dxa_tmap::replace_global_stride(map->w, ord, v);
+}
+inline void vx_tensormap_replace_element_stride(vx_tensor_map_t* map, uint32_t ord, uint32_t v) {
+  vortex::dxa_tmap::replace_element_stride(map->w, ord, v);
+}
+inline void vx_tensormap_replace_elemtype(vx_tensor_map_t* map, uint32_t code) {
+  vortex::dxa_tmap::replace_elemtype(map->w, code);
+}
+inline void vx_tensormap_replace_interleave_layout(vx_tensor_map_t* map, uint32_t v) {
+  vortex::dxa_tmap::replace_interleave_layout(map->w, v);
+}
+inline void vx_tensormap_replace_swizzle_mode(vx_tensor_map_t* map, uint32_t v) {
+  vortex::dxa_tmap::replace_swizzle_mode(map->w, v);
+}
+inline void vx_tensormap_replace_fill_mode(vx_tensor_map_t* map, uint32_t v) {
+  vortex::dxa_tmap::replace_fill_mode(map->w, v);
+}
+#endif // __cplusplus && VX_CFG_EXT_MBAR_ENABLE
 
 #endif // __VX_DXA_H__

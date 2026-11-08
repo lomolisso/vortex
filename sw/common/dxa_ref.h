@@ -27,6 +27,7 @@
 #include <cstddef>
 #include <VX_types.h>
 #include "dxa_meta.h"
+#include "dxa_tmap.h"
 
 namespace vortex {
 namespace dxa_ref {
@@ -737,6 +738,8 @@ struct Store {
   uint64_t mbar = 0;
   uint32_t size = 0;
   Req q;
+  bool     map_form = false;  // the tensor kinds only: ctl bit 15, the map address in rs2 lane 1
+  uint64_t map = 0;
 };
 
 inline uint32_t st_ctl(uint32_t kind, uint32_t op, uint32_t type, uint32_t slot) {
@@ -758,7 +761,11 @@ inline Ops pack_store(const Store& s) {
     o.rs1[3] = s.kind == ST_RED_CLUSTER ? s.mbar : 0;
   }
   const uint32_t c4 = is_tensor(s.kind) ? (uint32_t)s.q.coord[4] : 0u;
-  o.rs2[0] = ((uint64_t)st_ctl(s.kind, s.op, s.type, s.slot) << 32) | c4;
+  const uint32_t ctl = st_ctl(s.kind, s.op, s.type, s.map_form ? 0u : s.slot)
+                     | (s.map_form ? (1u << DXA_ST_CTL_MAP_LSB) : 0u);
+  o.rs2[0] = ((uint64_t)ctl << 32) | c4;
+  if (s.map_form)
+    o.rs2[1] = s.map;
   return o;
 }
 
@@ -769,6 +776,8 @@ inline Store unpack_store(const Ops& o) {
   s.op   = field(ctl, DXA_ST_CTL_OP_LSB, DXA_ST_CTL_OP_BITS);
   s.type = field(ctl, DXA_ST_CTL_TYPE_LSB, DXA_ST_CTL_TYPE_BITS);
   s.slot = field(ctl, DXA_ST_CTL_SLOT_LSB, DXA_ST_CTL_SLOT_BITS);
+  s.map_form = field(ctl, DXA_ST_CTL_MAP_LSB, 1) != 0;
+  s.map  = s.map_form ? o.rs2[1] : 0;
   s.src  = o.rs1[0];
   if (is_tensor(s.kind)) {
     s.q.coord[0] = (int32_t)(uint32_t)o.rs1[1];
@@ -793,6 +802,58 @@ inline uint32_t insn_bgop(uint32_t op, uint32_t n) {
 
 inline uint32_t insn_pfence(uint32_t sel) {
   return (1u << 25) | ((sel & 31u) << 15) | (7u << 12) | 0x5Bu;
+}
+
+///////////////////////////////////////////////////////////////////////////////
+// Tensor maps in memory (dxa_tmap.h): the map forms of funct3 2 and 5, and
+// the tensormap ops of funct3 7.
+
+enum : uint32_t { F3_TMAP = DXA_F3_TMAP, TMAP_PREFETCH = DXA_TMAP_PREFETCH, TMAP_INVAL = DXA_TMAP_INVAL };
+constexpr uint32_t TMAP_ENTRIES = DXA_TMAP_ENTRIES;
+constexpr uint32_t CTL_MAP      = 1u << DXA_TL_CTL_MAP_LSB;
+constexpr uint32_t ST_CTL_MAP   = 1u << DXA_ST_CTL_MAP_LSB;
+constexpr uint32_t RT_FROM_MAP  = DXA_RT_FROM_MAP;
+
+constexpr const char* MSG_TMAP_ALIGN    = "DXA tensor map is not 64-byte aligned";
+constexpr const char* MSG_TMAP_GLOBAL   = "DXA tensor map must be in global memory";
+constexpr const char* MSG_TMAP_STRIDE   = "DXA tensor stride needs 32 bits";
+constexpr const char* MSG_TMAP_RANK     = "DXA tensor map rank must be 1-5";
+constexpr const char* MSG_TMAP_REDTYPE  = "DXA tensor reduction type not supported by the map";
+constexpr const char* MSG_TMAP_SLOT_RT  = "DXA reduction type 15 needs a tensor map";
+constexpr const char* MSG_TMAP_OP       = "DXA tensormap op not supported";
+
+// The map-form TLOAD: the slot bits 0, the map bit, the map address in rs2 lane 2.
+inline Ops pack_tload_map(uint64_t map, bool prefetch, uint64_t dst, uint64_t mbar, const Req& q,
+                          uint16_t cta_mask) {
+  Ops o = pack_tload(0, prefetch, dst, mbar, q, cta_mask);
+  o.rs2[0] |= (uint64_t)CTL_MAP << 32;
+  o.rs2[2] = map;
+  return o;
+}
+
+// The decode-time asserts of a map's words, in order (the descriptor asserts follow).
+inline const char* check_map_words(const uint32_t* w) {
+  if (w[TMAP_W_STRIDE_HI] != 0)
+    return MSG_TMAP_STRIDE;
+  const uint32_t r = dxa_tmap::rank(w);
+  if (r == 0 || r > MAX_RANK)
+    return MSG_TMAP_RANK;
+  return nullptr;
+}
+
+// A map-form tensor reduction's type (DXA_RT_FROM_MAP): the map's element
+// type, which must give a legal op x type pair; *type is the resolved DXA_RT_*.
+inline const char* map_red_type(uint32_t op, const uint32_t* w, uint32_t* type) {
+  const uint32_t rt = dxa_tmap::red_type(dxa_tmap::elem_type(w));
+  if (rt == TMAP_RT_NONE || !red_legal(ST_RED_TENSOR, op, rt))
+    return MSG_TMAP_REDTYPE;
+  *type = rt;
+  return nullptr;
+}
+
+// funct3 7: custom-0, funct7 3, rs1 = the register holding the map address, the op in the rs2 field.
+inline uint32_t insn_tmap(uint32_t op, uint32_t rs1) {
+  return (3u << 25) | ((op & 31u) << 20) | ((rs1 & 31u) << 15) | (F3_TMAP << 12) | 0x0Bu;
 }
 
 } // namespace dxa_ref

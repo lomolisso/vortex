@@ -184,6 +184,7 @@ module VX_dxa_setup import VX_gpu_pkg::*, VX_dxa_pkg::*; (
     `UNUSED_VAR (desc_data.estride1[31:4])
     `UNUSED_VAR (desc_data.estride3[31:4])
     `UNUSED_VAR (desc_data.estride4[31:4])
+    `UNUSED_VAR (req_data.tm)
     // Other layouts step by one; im2col steps the batch (the last dim) by one.
     wire [3:0] dec_es0 = (dec_tma && ~dec_im2col) ? raw_es0 : 4'd1;
     wire [3:0] dec_es1 = dec_tma ? raw_es1 : 4'd1;

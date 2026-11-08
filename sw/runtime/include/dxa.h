@@ -20,6 +20,7 @@
 #include <vortex.h>
 #include <VX_types.h>
 #include <dxa_meta.h>
+#include <dxa_tmap.h>
 
 namespace vortex {
 namespace dxa {
@@ -434,6 +435,258 @@ inline int program_im2col_5d(
     const int32_t lower[3], const int32_t upper[3], uint32_t elem_bytes) {
   return detail::program_im2col(dev, slot, 5, base_addr, sizes, strides_bytes, channels_per_pixel,
                                 pixels_per_column, lower, upper, elem_bytes);
+}
+
+// ── Tensor maps in memory (DXA with mbarriers, XLEN 64) ─────────────
+//
+// The cuTensorMapEncode* model: a vx_tensor_map_t (dxa_tmap.h) is filled on
+// the host, copied into device memory (a kernel-argument member or a global
+// buffer, physical as every DXA address) and named by the map forms of
+// vx_dxa_load_* / vx_dxa_store_* / vx_dxa_reduce_*. The enums keep the CUDA
+// driver API order (CUtensorMap*). Every function checks the driver API's
+// rules and returns VX_SUCCESS, VX_ERR_INVALID_VALUE for a broken rule, or
+// VX_ERR_NOT_SUPPORTED for a value the H100 (CC 9.0) or Vortex does not take;
+// on an error the map is left unchanged.
+
+enum class TensorMapDataType : uint32_t {
+  UInt8 = 0, UInt16, UInt32, Int32, UInt64, Int64, Float16, Float32, Float64, BFloat16,
+  Float32Ftz, TFloat32, TFloat32Ftz, U4x16Align8B, U4x16Align16B, U6x16Align16B,
+};
+
+enum class TensorMapInterleave : uint32_t { None = 0, B16, B32 };
+
+enum class TensorMapSwizzle : uint32_t {
+  None = 0, B32, B64, B128, B128Atom32B, B128Atom32BFlip8B, B128Atom64B,
+};
+
+enum class TensorMapL2Promotion : uint32_t { None = 0, L2_64B, L2_128B, L2_256B };
+
+enum class TensorMapFloatOOBfill : uint32_t { None = 0, NanRequestZeroFma };
+
+namespace detail {
+
+// CUtensorMapDataType -> PTX Table 33 element type (the order differs from FLOAT64 on).
+inline uint32_t tmap_elem_type(TensorMapDataType t) {
+  static const uint8_t k[13] = {TMAP_ET_U8, TMAP_ET_U16, TMAP_ET_U32, TMAP_ET_S32, TMAP_ET_U64,
+                                TMAP_ET_S64, TMAP_ET_F16, TMAP_ET_F32, TMAP_ET_F64, TMAP_ET_BF16,
+                                TMAP_ET_F32_FTZ, TMAP_ET_TF32, TMAP_ET_TF32_FTZ};
+  return k[static_cast<uint32_t>(t)];
+}
+
+inline bool tmap_aligned(const vx_tensor_map_t* map) {
+  return map && ((uintptr_t)map & 63u) == 0;
+}
+
+// The rules cuTensorMapEncodeTiled and cuTensorMapEncodeIm2col share, and the
+// word fields they give. box0_bytes is the swizzle's inner box (boxDim[0] or
+// channelsPerPixel times the element size).
+struct TmapCommon {
+  uint32_t et = 0;
+  uint32_t bytes = 0;
+  uint32_t estride[5] = {0, 0, 0, 0, 0};  // dims past the rank stay 0 (read as 1), as a zero buffer has them
+};
+
+inline int tmap_check_common(const vx_tensor_map_t* map, TensorMapDataType dtype, uint32_t rank,
+                             uint64_t gaddr, const uint64_t* gdim, const uint64_t* gstrides,
+                             const uint32_t* estrides, TensorMapInterleave il, TensorMapSwizzle swz,
+                             TensorMapL2Promotion l2, TensorMapFloatOOBfill oob, bool im2col,
+                             uint32_t box0_elems, TmapCommon* c) {
+  const uint32_t t = static_cast<uint32_t>(dtype), i = static_cast<uint32_t>(il),
+                 z = static_cast<uint32_t>(swz), p = static_cast<uint32_t>(l2),
+                 f = static_cast<uint32_t>(oob);
+  if (!tmap_aligned(map))
+    return VX_ERR_INVALID_VALUE;
+  if (t > static_cast<uint32_t>(TensorMapDataType::U6x16Align16B) || i > 2 || z > 6 || p > 3 || f > 1)
+    return VX_ERR_INVALID_VALUE;                                                  // enum ranges
+  if (t >= static_cast<uint32_t>(TensorMapDataType::U4x16Align8B) || z >= 4)
+    return VX_ERR_NOT_SUPPORTED;                                                  // CC 10.0 values
+  c->et = tmap_elem_type(dtype);
+  c->bytes = dxa_tmap::elem_bytes(c->et);
+  if (f && !dxa_tmap::elem_float(c->et))                                          // NaN fill: float types only
+    return VX_ERR_INVALID_VALUE;
+  if (im2col ? (rank < 3 || rank > 5) : (rank < 1 || rank > 5))
+    return VX_ERR_INVALID_VALUE;
+  if (il != TensorMapInterleave::None && rank < 3)                                // interleave: rank >= 3
+    return VX_ERR_INVALID_VALUE;
+  const uint64_t align = il == TensorMapInterleave::B32 ? 32 : 16;
+  if (gaddr % align)
+    return VX_ERR_INVALID_VALUE;
+  if (!gdim || (rank > 1 && !gstrides) || !estrides)
+    return VX_ERR_INVALID_VALUE;
+  bool wide = false;
+  for (uint32_t d = 0; d < rank; ++d) {
+    if (gdim[d] == 0 || gdim[d] > (1ull << 32))
+      return VX_ERR_INVALID_VALUE;
+    wide |= gdim[d] == (1ull << 32);
+  }
+  for (uint32_t d = 0; d + 1 < rank; ++d) {
+    if (gstrides[d] % align || gstrides[d] >= (1ull << 40))
+      return VX_ERR_INVALID_VALUE;
+    wide |= gstrides[d] >= (1ull << 32);
+  }
+  for (uint32_t d = 0; d < rank; ++d) {
+    if (estrides[d] == 0 || estrides[d] > 8)
+      return VX_ERR_INVALID_VALUE;
+  }
+  if (il == TensorMapInterleave::None && swz != TensorMapSwizzle::None) {         // inner box <= swizzle span
+    const uint32_t span = swz == TensorMapSwizzle::B32 ? 32 : swz == TensorMapSwizzle::B64 ? 64 : 128;
+    if ((uint64_t)box0_elems * c->bytes > span)
+      return VX_ERR_INVALID_VALUE;
+  }
+  if (il == TensorMapInterleave::B32 && swz != TensorMapSwizzle::B32)
+    return VX_ERR_INVALID_VALUE;
+  if (wide)                                                     // Vortex: 32-bit dims and strides
+    return VX_ERR_NOT_SUPPORTED;
+  if (im2col && il != TensorMapInterleave::None && estrides[0] != 1)
+    return VX_ERR_NOT_SUPPORTED;                                // Vortex: no dim-0 stride in im2col
+  for (uint32_t d = 0; d < rank; ++d)
+    c->estride[d] = estrides[d];
+  if (il == TensorMapInterleave::None)
+    c->estride[0] = 1;                                          // ignored without interleave
+  return VX_SUCCESS;
+}
+
+inline void tmap_fill_common(uint32_t* w, const TmapCommon& c, uint32_t rank, uint64_t gaddr,
+                             const uint64_t* gdim, const uint64_t* gstrides, TensorMapInterleave il,
+                             TensorMapSwizzle swz, TensorMapL2Promotion l2, TensorMapFloatOOBfill oob,
+                             bool im2col) {
+  for (uint32_t k = 0; k < TMAP_WORDS; ++k)
+    w[k] = 0;
+  w[TMAP_W_BASE_LO] = (uint32_t)gaddr;
+  w[TMAP_W_BASE_HI] = (uint32_t)(gaddr >> 32);
+  for (uint32_t d = 0; d < rank; ++d)
+    w[TMAP_W_SIZE0 + d] = (uint32_t)gdim[d];
+  for (uint32_t d = 0; d + 1 < rank; ++d)
+    w[TMAP_W_STRIDE0 + d] = (uint32_t)gstrides[d];
+  w[TMAP_W_META] = dxa_tmap::pack_meta(rank, c.bytes, static_cast<uint32_t>(Layout::RowMajor),
+                                       static_cast<uint32_t>(swz), static_cast<uint32_t>(il),
+                                       static_cast<uint32_t>(l2), im2col);
+  for (uint32_t d = 0; d < 5; ++d)
+    w[TMAP_W_ESTRIDE0 + d] = c.estride[d];
+  const uint32_t fill = static_cast<uint32_t>(oob);
+  w[TMAP_W_CFILL] = dxa_tmap::cfill(fill, c.bytes);
+  w[TMAP_W_TYPE] = dxa_tmap::pack_type(c.et, fill);
+}
+
+inline void tmap_store(vx_tensor_map_t* map, const uint32_t* w) {
+  for (uint32_t k = 0; k < TMAP_WORDS; ++k)
+    map->w[k] = w[k];
+}
+
+} // namespace detail
+
+// cuTensorMapEncodeTiled: global_dim[rank], global_strides[rank - 1] (bytes,
+// of dims 1..rank-1), box_dim[rank], element_strides[rank] (with
+// TensorMapInterleave::None the first is ignored and stored as 1).
+inline int encode_tiled(vx_tensor_map_t* map, TensorMapDataType dtype, uint32_t rank, uint64_t global_address,
+                        const uint64_t* global_dim, const uint64_t* global_strides, const uint32_t* box_dim,
+                        const uint32_t* element_strides, TensorMapInterleave interleave,
+                        TensorMapSwizzle swizzle, TensorMapL2Promotion l2_promotion,
+                        TensorMapFloatOOBfill oob_fill) {
+  detail::TmapCommon c;
+  const uint32_t box0 = box_dim && rank >= 1 && rank <= 5 ? box_dim[0] : 0;
+  if (int r = detail::tmap_check_common(map, dtype, rank, global_address, global_dim, global_strides,
+                                        element_strides, interleave, swizzle, l2_promotion, oob_fill,
+                                        false, box0, &c))
+    return r;
+  if (!box_dim)
+    return VX_ERR_INVALID_VALUE;
+  for (uint32_t d = 0; d < rank; ++d) {
+    if (box_dim[d] == 0 || box_dim[d] > 256)
+      return VX_ERR_INVALID_VALUE;
+  }
+  if (interleave == TensorMapInterleave::None && (box_dim[0] * c.bytes) % 16)    // inner box: 16-byte multiple
+    return VX_ERR_INVALID_VALUE;
+  uint32_t w[TMAP_WORDS];
+  detail::tmap_fill_common(w, c, rank, global_address, global_dim, global_strides, interleave, swizzle,
+                           l2_promotion, oob_fill, false);
+  uint32_t b[5] = {0, 0, 0, 0, 0};
+  for (uint32_t d = 0; d < rank; ++d)
+    b[d] = box_dim[d];
+  w[TMAP_W_TILESIZE01] = dxa_tmap::pack_2x16(b[0], b[1]);
+  w[TMAP_W_TILESIZE23] = dxa_tmap::pack_2x16(b[2], b[3]);
+  w[TMAP_W_TILESIZE4]  = b[4];
+  detail::tmap_store(map, w);
+  return VX_SUCCESS;
+}
+
+// cuTensorMapEncodeIm2col: rank 3 (NWC), 4 (NHWC) or 5 (NDHWC), dims in
+// order C, W[, H[, D]], N; pixel_box_lower/upper[rank - 2] in order W, H, D
+// (index 0 = W, as CUTLASS passes them).
+inline int encode_im2col(vx_tensor_map_t* map, TensorMapDataType dtype, uint32_t rank, uint64_t global_address,
+                         const uint64_t* global_dim, const uint64_t* global_strides,
+                         const int32_t* pixel_box_lower, const int32_t* pixel_box_upper,
+                         uint32_t channels_per_pixel, uint32_t pixels_per_column,
+                         const uint32_t* element_strides, TensorMapInterleave interleave,
+                         TensorMapSwizzle swizzle, TensorMapL2Promotion l2_promotion,
+                         TensorMapFloatOOBfill oob_fill) {
+  detail::TmapCommon c;
+  if (int r = detail::tmap_check_common(map, dtype, rank, global_address, global_dim, global_strides,
+                                        element_strides, interleave, swizzle, l2_promotion, oob_fill,
+                                        true, channels_per_pixel, &c))
+    return r;
+  if (!pixel_box_lower || !pixel_box_upper)
+    return VX_ERR_INVALID_VALUE;
+  const uint32_t S = rank - 2;
+  const int32_t lim = S == 1 ? 32768 : S == 2 ? 128 : 16;
+  for (uint32_t s = 0; s < S; ++s) {
+    const int32_t lo = pixel_box_lower[s], hi = pixel_box_upper[s];
+    if (lo < -lim || lo >= lim || hi < -lim || hi >= lim)                          // corner range by rank
+      return VX_ERR_INVALID_VALUE;
+    if ((int64_t)global_dim[s + 1] + hi - lo <= 0)                                // non-zero bounding box
+      return VX_ERR_INVALID_VALUE;
+  }
+  if (channels_per_pixel == 0 || channels_per_pixel > 256 || pixels_per_column == 0
+      || pixels_per_column > 1024)
+    return VX_ERR_INVALID_VALUE;
+  uint32_t w[TMAP_WORDS];
+  detail::tmap_fill_common(w, c, rank, global_address, global_dim, global_strides, interleave, swizzle,
+                           l2_promotion, oob_fill, true);
+  w[TMAP_W_TILESIZE01] = dxa_tmap::pack_2x16(channels_per_pixel, pixels_per_column);
+  w[TMAP_W_TILESIZE23] = dxa_tmap::pack_corners(rank, pixel_box_lower, pixel_box_upper);
+  detail::tmap_store(map, w);
+  return VX_SUCCESS;
+}
+
+// cuTensorMapReplaceAddress: the new address keeps the encode-time alignment
+// rule (16 B, 32 B with TensorMapInterleave::B32).
+inline int replace_address(vx_tensor_map_t* map, uint64_t global_address) {
+  if (!detail::tmap_aligned(map))
+    return VX_ERR_INVALID_VALUE;
+  const uint32_t il = dxa_tmap::field(map->w[TMAP_W_META], DXA_DESC_META_INTERLEAVE_LSB,
+                                      DXA_DESC_META_INTERLEAVE_BITS);
+  if (global_address % (il == static_cast<uint32_t>(TensorMapInterleave::B32) ? 32 : 16))
+    return VX_ERR_INVALID_VALUE;
+  dxa_tmap::replace_global_address(map->w, global_address);
+  return VX_SUCCESS;
+}
+
+// Vortex extension, the map form of set_layout + set_tile_geometry: the
+// destination smem layout of a tile map. The K-major, Flat and BlockMajor
+// layouts take rank <= 2, no swizzle and element strides 1; Flat and
+// BlockMajor also take the WGMMA tile geometry (tcN, blk_k) in ESTRIDE2.
+inline int set_layout(vx_tensor_map_t* map, Layout layout, uint32_t tcN, uint32_t blk_k) {
+  if (!detail::tmap_aligned(map) || static_cast<uint32_t>(layout) > 3)
+    return VX_ERR_INVALID_VALUE;
+  uint32_t* w = map->w;
+  const uint32_t meta = w[TMAP_W_META];
+  if (layout != Layout::RowMajor) {
+    if (dxa_tmap::field(meta, DXA_DESC_META_IM2COL_LSB, DXA_DESC_META_IM2COL_BITS)
+        || dxa_tmap::rank(w) > 2
+        || dxa_tmap::field(meta, DXA_DESC_META_SWIZZLE_LSB, DXA_DESC_META_SWIZZLE_BITS))
+      return VX_ERR_INVALID_VALUE;
+    for (uint32_t d = 0; d < 2; ++d) {
+      if (w[TMAP_W_ESTRIDE0 + d] > 1)
+        return VX_ERR_INVALID_VALUE;
+    }
+  }
+  w[TMAP_W_META] = dxa_tmap::set_field(meta, DXA_DESC_META_LAYOUT_LSB, DXA_DESC_META_LAYOUT_BITS,
+                                       static_cast<uint32_t>(layout));
+  if (layout == Layout::Flat || layout == Layout::BlockMajor)
+    w[TMAP_W_ESTRIDE0 + 2] = (blk_k << 16) | (tcN & 0xffffu);
+  else if (dxa_tmap::rank(w) <= 2)
+    w[TMAP_W_ESTRIDE0 + 2] = 0;
+  return VX_SUCCESS;
 }
 
 } // namespace dxa

@@ -6,7 +6,7 @@ defaults:
   - 64
   tier: smoke
   configs: "-DVX_CFG_EXT_DXA_ENABLE"
-  touches: [hw/rtl/dxa, sim/simx/dxa, sw/kernel/include/vx_dxa.h,
+  touches: [hw/rtl/dxa, sim/simx/dxa, sw/kernel/include/vx_dxa.h, sw/common/dxa_tmap.h,
             tests/regression/dxa_copy_mcast, tests/regression/sgemm2_dxa_mcast]
 tests:
 - id: dxa_copy-1
@@ -119,7 +119,7 @@ tests:
   touches: &copy_split_touches [hw/rtl/dxa, sim/simx/dxa, tests/regression/dxa_copy,
             hw/rtl/core/VX_alu_int.sv, hw/rtl/core/VX_alu_unit.sv, hw/rtl/core/VX_sfu_unit.sv,
             hw/rtl/core/VX_lane_dispatch.sv, hw/rtl/core/VX_opc_unit.sv,
-            sim/simx/alu_unit, sim/simx/dispatcher, sw/kernel/include/vx_dxa.h,
+            sim/simx/alu_unit, sim/simx/dispatcher, sw/kernel/include/vx_dxa.h, sw/common/dxa_tmap.h,
             sw/kernel/include/vx_intrinsics.h, sim/simx/mem/local_mem, sim/simx/socket.cpp,
             sim/simx/types.h, sim/simx/barrier_unit, sim/simx/core.cpp, hw/rtl/core/VX_mem_unit.sv]
   via: blackbox
@@ -229,7 +229,7 @@ tests:
 # right after the tile in local memory, which the copy must leave alone.
 - id: dxa_copy-oob-d2
   touches: &copy_check_touches [hw/rtl/dxa, sim/simx/dxa, tests/regression/dxa_copy,
-            sw/kernel/include/vx_dxa.h, sw/runtime/include/dxa.h, sim/simx/mem/local_mem,
+            sw/kernel/include/vx_dxa.h, sw/common/dxa_tmap.h, sw/runtime/include/dxa.h, sim/simx/mem/local_mem,
             sim/simx/socket.cpp, sim/simx/types.h, sim/simx/barrier_unit, sim/simx/core.cpp,
             hw/rtl/core/VX_mem_unit.sv]
   via: blackbox

@@ -480,6 +480,12 @@ static op_string_t op_string(const Instr &instr) {
         auto a = std::get<IntrDxaArgs>(instrArgs);
         return {bg_names[a.bg_op], (a.bg_op != 0) ? std::to_string(a.bg_n) : ""};
       }
+      case DxaType::TMAP: {
+        auto a = std::get<IntrDxaArgs>(instrArgs);
+        if (a.bg_n == 0) return {"DXA.TMAP.PREFETCH", ""};
+        if (a.bg_n == 1) return {"DXA.TMAP.INVAL", ""};
+        return {"DXA.TMAP", std::to_string(a.bg_n)};
+      }
       default: break;
       }
 #else
@@ -1032,13 +1038,21 @@ Instr::Ptr Decoder::decode(uint32_t code, uint64_t uuid) {
         instr->set_wstall(rs1 != 0);
       } break;
       case 7:
-        std::cerr << SimPlatform::instance().cycles() << ": " << this->name()
-                  << " invalid DXA encoding: code=0x" << std::hex << code << std::dec
-                  << " (#" << uuid << ")" << std::endl;
-        std::abort();
+        // The tensormap ops: rs1 holds the map address, the rs2 field is the
+        // op (0 prefetch.tensormap, 1 fence.proxy.tensormap acquire).
+        if (rs2 > 1) {
+          std::cerr << SimPlatform::instance().cycles() << ": " << this->name()
+                    << " DXA tensormap op not supported: code=0x" << std::hex << code << std::dec
+                    << " (#" << uuid << ")" << std::endl;
+          std::abort();
+        }
+        instr->set_op_type(DxaType::TMAP);
+        instr->set_args(IntrDxaArgs{0, rs2});
+        instr->set_src_reg(0, rs1, RegType::Integer);
+        break;
       default: break;
       }
-      if (funct3 == 6)
+      if (funct3 == 6 || funct3 == 7)
         break;
 #elif defined(VX_CFG_EXT_DLMEM_ENABLE)
 #line 924

@@ -974,12 +974,16 @@ module VX_decode import
                         op_args.dxa.bprefetch = (funct3 == 3'd4);
                         op_args.dxa.store     = (funct3 == 3'd5);
                         op_args.dxa.bgop      = (funct3 == 3'd6);
+                        op_args.dxa.tmop      = (funct3 == 3'd7);
                         op_args.dxa.bg_kind   = rs1[1:0];
                         op_args.dxa.bg_n      = rs2;
                         if (funct3 == 3'd6) begin
                             // The register fields are the group op and N; a wait
                             // holds its warp until the bulk-group unit releases it.
                             is_wstall = (rs1 == 5'd1) || (rs1 == 5'd2);
+                        end else if (funct3 == 3'd7) begin
+                            // rs1 is the tensor map; the rs2 field is the op.
+                            `USED_IREG (rs1);
                         end else begin
                             `USED_IREG (rs1);
                             `USED_IREG (rs2);
@@ -1182,8 +1186,11 @@ module VX_decode import
 
 `ifdef DXA_MBAR_ENABLE
     wire dxa_fire = fetch_fire && (opcode == INST_EXT1) && (funct7 == 7'd3);
-    `RUNTIME_ASSERT (~(dxa_fire && ((funct3 == 3'd7) || ((funct3 == 3'd6) && (rs1 > 5'd2)))),
+    `RUNTIME_ASSERT (~(dxa_fire && (funct3 == 3'd6) && (rs1 > 5'd2)),
         ("%t: %s invalid DXA encoding: wid=%0d PC=0x%0h instr=0x%h (#%0d)",
+            $time, INSTANCE_ID, fetch_if.data.wid, to_fullPC(fetch_if.data.PC), instr, fetch_if.data.uuid))
+    `RUNTIME_ASSERT (~(dxa_fire && (funct3 == 3'd7) && (rs2 > 5'd1)),
+        ("%t: %s DXA tensormap op not supported: wid=%0d PC=0x%0h instr=0x%h (#%0d)",
             $time, INSTANCE_ID, fetch_if.data.wid, to_fullPC(fetch_if.data.PC), instr, fetch_if.data.uuid))
     `RUNTIME_ASSERT (~(fetch_fire && (opcode == INST_EXT3) && (funct7 == 7'd1) && (funct3 == 3'd7) && (rs1 > 5'd2)),
         ("%t: %s invalid proxy fence: wid=%0d PC=0x%0h instr=0x%h (#%0d)",

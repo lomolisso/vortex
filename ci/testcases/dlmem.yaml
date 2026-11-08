@@ -43,7 +43,7 @@ defaults:
             hw/rtl/dxa/VX_dxa_st.sv, hw/rtl/dxa/VX_dxa_unit.sv, hw/rtl/dxa/VX_dxa_worker.sv,
             sim/simx/Makefile, sim/simx/bg_unit, sim/simx/dxa/dxa_bg.h, sim/simx/dxa/dxa_core.cpp,
             sim/simx/dxa/dxa_core.h, sim/simx/dxa/dxa_unit.cpp, sim/simx/dxa/dxa_unit.h, sim/simx/sfu_unit,
-            sw/common/dxa_meta.h, sw/common/dxa_ref.h, sw/kernel/include/vx_dxa.h]
+            sw/common/dxa_meta.h, sw/common/dxa_ref.h, sw/common/dxa_tmap.h, sw/kernel/include/vx_dxa.h]
 tests:
   # The cluster-rank CSR over three launches (K = 1, 2 as 1x2x1, 4 as 2x1x2),
   # each CTA's rank against its intra-cluster index, and the rank address map
@@ -824,7 +824,7 @@ tests:
               sim/simx/cluster, sim/simx/processor.cpp, sim/simx/cta_dispatcher,
               sim/simx/kmu, sim/simx/mem/local_mem, sim/simx/types.h, sim/simx/mbar_waiters,
               sim/simx/amo, sim/simx/sfu_unit, sim/simx/scheduler, sim/simx/barrier_unit,
-              sim/simx/lsu_unit, sim/simx/Makefile, sw/kernel/include/vx_dxa.h,
+              sim/simx/lsu_unit, sim/simx/Makefile, sw/kernel/include/vx_dxa.h, sw/common/dxa_tmap.h,
               sw/kernel/include/vx_mbar.h, sw/kernel/include/vx_dlmem.h,
               sw/common/mbar_ref.h, sw/common/dlmem_ref.h, sw/runtime/include/dxa.h,
               tests/regression/dlmem_dxa, tests/regression/dlmem_stress, VX_config.toml,
@@ -1102,7 +1102,7 @@ tests:
               sim/simx/types.h, sim/simx/instr.h, sim/simx/decode.cpp,
               sim/simx/sequencer, sim/simx/mbar_waiters, sim/simx/amo, sim/simx/sfu_unit,
               sim/simx/scheduler, sim/simx/barrier_unit, sim/simx/lsu_unit,
-              sim/simx/Makefile, sw/kernel/include/vx_dxa.h, sw/kernel/include/vx_mbar.h,
+              sim/simx/Makefile, sw/kernel/include/vx_dxa.h, sw/common/dxa_tmap.h, sw/kernel/include/vx_mbar.h,
               sw/kernel/include/vx_dlmem.h, sw/common/mbar_ref.h, sw/common/dlmem_ref.h,
               tests/regression/dlmem_bulk, VX_config.toml,
               sw/common/dxa_ref.h, sw/common/dxa_meta.h, sw/common/amo_ref.h,
@@ -1267,7 +1267,7 @@ tests:
               sim/simx/core, sim/simx/socket, sim/simx/cluster, sim/simx/processor.cpp,
               sim/simx/cta_dispatcher, sim/simx/kmu, sim/simx/mem, sim/simx/types.h,
               sim/simx/decode.cpp, sim/simx/mbar_waiters, sim/simx/amo, sim/simx/barrier_unit,
-              sim/simx/Makefile, sw/kernel/include/vx_dxa.h, sw/kernel/include/vx_mbar.h,
+              sim/simx/Makefile, sw/kernel/include/vx_dxa.h, sw/common/dxa_tmap.h, sw/kernel/include/vx_mbar.h,
               sw/kernel/include/vx_dlmem.h, sw/common/mbar_ref.h, sw/common/dxa_ref.h,
               tests/regression/dlmem_bulk, VX_config.toml,
               sw/common/dxa_meta.h, sw/common/amo_ref.h, hw/rtl/core/VX_bg_unit.sv, sim/simx/bg_unit,
@@ -1587,7 +1587,7 @@ tests:
               sim/simx/core, sim/simx/socket, sim/simx/cluster, sim/simx/processor.cpp,
               sim/simx/cta_dispatcher, sim/simx/kmu, sim/simx/mem/local_mem, sim/simx/types.h,
               sim/simx/mbar_waiters, sim/simx/amo, sim/simx/barrier_unit, sim/simx/Makefile,
-              sw/kernel/include/vx_dxa.h, sw/kernel/include/vx_mbar.h,
+              sw/kernel/include/vx_dxa.h, sw/common/dxa_tmap.h, sw/kernel/include/vx_mbar.h,
               sw/kernel/include/vx_dlmem.h, sw/kernel/include/vx_barrier.h,
               sw/common/mbar_ref.h, sw/common/dlmem_ref.h, sw/runtime/include/dxa.h,
               tests/regression/dxa_copy_mcast, VX_config.toml,
@@ -1730,7 +1730,7 @@ tests:
               hw/rtl/core/VX_cta_dispatch.sv, hw/rtl/mem/VX_local_mem.sv, hw/rtl/VX_kmu.sv,
               hw/rtl/VX_cluster.sv, sim/simx/dxa, sim/simx/dlmem, sim/simx/core, sim/simx/socket,
               sim/simx/cluster, sim/simx/cta_dispatcher, sim/simx/kmu, sim/simx/mem/local_mem,
-              sim/simx/types.h, sw/kernel/include/vx_dxa.h, sw/kernel/include/vx_mbar.h,
+              sim/simx/types.h, sw/kernel/include/vx_dxa.h, sw/common/dxa_tmap.h, sw/kernel/include/vx_mbar.h,
               sw/kernel/include/vx_dlmem.h, VX_config.toml,
               sw/common/dxa_ref.h, sw/common/dxa_meta.h,
               hw/rtl/cache/VX_cache_amo.sv, hw/rtl/core/VX_bg_unit.sv, hw/rtl/core/VX_core.sv,

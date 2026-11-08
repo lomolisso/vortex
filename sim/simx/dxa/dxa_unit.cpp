@@ -43,6 +43,9 @@ instr_trace_t* DxaUnit::process(instr_trace_t* trace) {
     if (type == DxaType::BGOP) {
       return this->issue_bgop(trace) ? trace : nullptr;
     }
+    if (type == DxaType::TMAP) {
+      return this->issue_tmap(trace) ? trace : nullptr;
+    }
   }
 #else
 #line 32
@@ -513,6 +516,11 @@ void DxaUnit::decode_ptx(const instr_trace_t* trace, DxaType type, DxaReq& req) 
     const uint32_t ctl = uint32_t(r0 >> 32);
     req.desc_slot = ctl & 0x0fu;
     req.prefetch  = (ctl >> 4) & 1u;
+    if ((ctl >> DXA_TL_CTL_MAP_LSB) & 1u) {
+      req.map      = true;
+      req.map_addr = rs2.at(2).u;
+      this->check_map(trace, req.map_addr);
+    }
     req.cta_mask  = uint32_t(r1 & 0xffffu);
     req.offs[0]   = uint32_t((r1 >> 16) & 0xffffu);
     req.offs[1]   = uint32_t((r1 >> 32) & 0xffffu);
@@ -646,6 +654,47 @@ bool DxaUnit::issue_bgop(instr_trace_t* trace) {
   return true;
 }
 
+// A tensor map is a 64-byte aligned object in global memory: never in the
+// local-memory aperture or the DLMEM window.
+void DxaUnit::check_map(const instr_trace_t* trace, uint64_t map) const {
+  if ((map % 64) != 0) {
+    this->issue_abort(trace, dxa_ref::MSG_TMAP_ALIGN);
+  }
+  const auto cfg = dlmem_cfg();
+  const uint32_t wl = cfg.lmem_log + dlmem_ref::rank_bits(cfg);
+  if ((map >> cfg.lmem_log) == (cfg.lmem_base >> cfg.lmem_log) || (map >> wl) == (cfg.dlmem_base >> wl)) {
+    this->issue_abort(trace, dxa_ref::MSG_TMAP_GLOBAL);
+  }
+}
+
+// The tensormap ops: rs1 lane 0 is the map address, the op an instruction
+// field. They go in order with the core's other DXA requests, join no bulk
+// group and carry no mbarrier; the warp does not wait.
+bool DxaUnit::issue_tmap(instr_trace_t* trace) {
+  const auto args = std::get<IntrDxaArgs>(trace->instr_ptr->get_args());
+  const uint64_t map = trace->src_data[0].at(0).u;
+  this->check_map(trace, map);
+  if (req_out_.full()) {
+    return false;
+  }
+  DxaReq req{};
+  req.core      = core_;
+  req.uuid      = trace->uuid;
+  req.wid       = trace->wid;
+  req.slot      = warp_slot_.at(trace->wid);
+  req.gen       = slot_gen_.at(req.slot);
+  req.src_core  = core_->id() % dlmem_cfg().ncc;
+  req.dst_core  = req.src_core;
+  req.sent      = SimPlatform::instance().cycles();
+  req.tmop      = true;
+  req.tmap_op   = args.bg_n;
+  req.map_addr  = map;
+  req_out_.send(req);
+  DT(4, "dxa-unit tensormap: core=" << core_->id() << ", wid=" << trace->wid << ", op=" << args.bg_n
+     << ", map=0x" << std::hex << map << std::dec);
+  return true;
+}
+
 // The store family. Lanes: rs1 = {src, a1, a2, mbar}, rs2 lane 0 = {ctl, c4};
 // a1/a2 are {gdst, size} for the bulk forms, {dst, size} for a cluster
 // reduction and {{c1, c0}, {c3, c2}} for the tensor forms.
@@ -661,8 +710,20 @@ bool DxaUnit::issue_store(instr_trace_t* trace) {
   constexpr bool has_fpamo = false;
 #endif
   constexpr bool has_llc = (VX_CFG_L2_ENABLED != 0) || (VX_CFG_L3_ENABLED != 0);
-  if (const char* msg = dxa_ref::check_store_ctl(kind, op, type, has_llc, has_fpamo)) {
-    this->issue_abort(trace, msg);
+  // A tensor form's map bit, checked first; a map-form tensor reduction may
+  // take its type from the map, which the engine checks once it has read it.
+  const bool map = dxa_ref::is_tensor(kind) && ((ctl >> DXA_ST_CTL_MAP_LSB) & 1u);
+  if (map) {
+    this->check_map(trace, rs2.at(1).u);
+  }
+  const char* ctl_msg = nullptr;
+  if (kind == dxa_ref::ST_RED_TENSOR && type == dxa_ref::RT_FROM_MAP) {
+    ctl_msg = !map ? dxa_ref::MSG_TMAP_SLOT_RT : (!has_llc ? dxa_ref::MSG_RED_LLC : nullptr);
+  } else {
+    ctl_msg = dxa_ref::check_store_ctl(kind, op, type, has_llc, has_fpamo);
+  }
+  if (ctl_msg) {
+    this->issue_abort(trace, ctl_msg);
   }
   const bool bg = dxa_ref::is_bulk_group(kind);
   const uint32_t wid = trace->wid;
@@ -740,6 +801,10 @@ void DxaUnit::decode_store(const instr_trace_t* trace, DxaReq& req) const {
     req.coords[3] = uint32_t(l2 >> 32);
     req.coords[4] = uint32_t(r0);
     req.desc_slot = (uint32_t(r0 >> 32) >> DXA_ST_CTL_SLOT_LSB) & ((1u << DXA_ST_CTL_SLOT_BITS) - 1u);
+    if ((uint32_t(r0 >> 32) >> DXA_ST_CTL_MAP_LSB) & 1u) {
+      req.map      = true;
+      req.map_addr = rs2.at(1).u;
+    }
     req.smem_addr = src;
     req.blk_off   = s_off & dlmem_ref::low_mask(cfg.lmem_log);
     req.win_room  = (req.blk_off < stride_) ? uint32_t(stride_ - req.blk_off) : 0u;

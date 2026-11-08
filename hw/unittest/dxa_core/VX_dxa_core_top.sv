@@ -36,6 +36,10 @@ module VX_dxa_core_top import VX_gpu_pkg::*, VX_dxa_pkg::*; #(
     output wire [PERF_CTR_BITS-1:0] perf_gmem_dedup,
     output wire [PERF_CTR_BITS-1:0] perf_lmem_writes,
     output wire [PERF_CTR_BITS-1:0] perf_gmem_latency,
+`ifdef DXA_MBAR_ENABLE
+    output wire [PERF_CTR_BITS-1:0] perf_tmap_hits,
+    output wire [PERF_CTR_BITS-1:0] perf_tmap_misses,
+`endif
 `endif
 
     output wire busy,
@@ -180,6 +184,11 @@ module VX_dxa_core_top import VX_gpu_pkg::*, VX_dxa_pkg::*; #(
     assign perf_gmem_dedup  = dxa_perf.gmem_dedup;
     assign perf_lmem_writes = dxa_perf.lmem_writes;
     assign perf_gmem_latency= dxa_perf.gmem_latency;
+    `UNUSED_VAR (dxa_perf.noslot_stalls)
+`ifdef DXA_MBAR_ENABLE
+    assign perf_tmap_hits   = dxa_perf.tmap_hits;
+    assign perf_tmap_misses = dxa_perf.tmap_misses;
+`endif
 `endif
 
     `UNUSED_PARAM (ENABLE)

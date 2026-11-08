@@ -1157,7 +1157,8 @@ package VX_gpu_pkg;
 `ifdef VX_CFG_EXT_DXA_ENABLE
 `ifdef DXA_MBAR_ENABLE
     typedef struct packed {
-        logic [INST_ARGS_BITS-14:0] __padding;
+        logic [INST_ARGS_BITS-15:0] __padding;
+        logic tmop;      // a tensormap op (funct3 = 7): the rs2 register field (bg_n) is the op
         logic [4:0] bg_n;    // a bulk wait_group's N: the rs2 register field
         logic [1:0] bg_kind; // the rs1 register field: 0 commit_group, 1 wait_group, 2 wait_group.read
         logic bgop;      // a bulk async-group operation (funct3 = 6)
@@ -1496,6 +1497,10 @@ package VX_gpu_pkg;
         logic [PERF_CTR_BITS-1:0] lmem_writes;
         logic [PERF_CTR_BITS-1:0] gmem_latency;
         logic [PERF_CTR_BITS-1:0] noslot_stalls;
+    `ifdef DXA_MBAR_ENABLE
+        logic [PERF_CTR_BITS-1:0] tmap_hits;
+        logic [PERF_CTR_BITS-1:0] tmap_misses;
+    `endif
     } dxa_perf_t;
 `endif
 

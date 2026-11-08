@@ -88,3 +88,23 @@
 #define DXA_PFENCE_SHARED 0
 #define DXA_PFENCE_GLOBAL 1
 #define DXA_PFENCE_ALL    2
+
+// Tensor maps in memory (DXA with mbarriers, XLEN 64; layout in dxa_tmap.h).
+// Address-tagged descriptor-cache entries beside the VX_DCR_DXA_DESC_COUNT slots.
+#define DXA_TMAP_ENTRIES 8
+
+// TLOAD ctl word (funct3 2, rs2 lane 0 bits [63:32]): bit 5 = the map form,
+// with the map address in rs2 lane 2 and the slot bits [3:0] zero.
+#define DXA_TL_CTL_MAP_LSB 5
+
+// STORE ctl word (funct3 5): bit 15 = the map form of a tensor store or
+// reduction, with the map address in rs2 lane 1 and the slot bits zero.
+#define DXA_ST_CTL_MAP_LSB 15
+
+// Reduction type of a map-form tensor reduction: the map's element type.
+#define DXA_RT_FROM_MAP 15
+
+// funct3 7: tensormap op; rs1 lane 0 = the map address, the rs2 register field is the op.
+#define DXA_F3_TMAP      7
+#define DXA_TMAP_PREFETCH 0  // prefetch.tensormap
+#define DXA_TMAP_INVAL    1  // fence.proxy.tensormap::generic.acquire

@@ -491,6 +491,16 @@ public:
     if (addr >= VX_DCR_DXA_STATE_BEGIN && addr < VX_DCR_DXA_STATE_END) {
       return dxa_core_->dcr_write(addr, value);
     }
+#ifdef DXA_MBAR_ENABLE
+    // A launch drops the DXA's cached tensor maps; the cores still take the write.
+    if (addr >= VX_DCR_KMU_STATE_BEGIN && addr < VX_DCR_KMU_STATE_END) {
+      dxa_core_->dcr_write(addr, value);
+    }
+#else
+#line 464
+#endif
+#else
+#line 470
 #endif
 #ifdef VX_CFG_EXT_TEX_ENABLE
     if (addr >= VX_DCR_TEX_STATE_BEGIN && addr < VX_DCR_TEX_STATE_END) {

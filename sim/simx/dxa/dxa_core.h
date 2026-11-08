@@ -43,6 +43,12 @@ public:
     uint64_t lmem_writes    = 0;
     uint64_t total_latency  = 0;
     uint64_t noslot_stalls  = 0;
+#ifdef DXA_MBAR_ENABLE
+    uint64_t tmap_hits      = 0;  // tensor-map lookups at the queue head
+    uint64_t tmap_misses    = 0;
+#else
+#line 39
+#endif
 
     PerfStats& operator+=(const PerfStats& rhs) {
       transfers     += rhs.transfers;
@@ -51,6 +57,12 @@ public:
       lmem_writes   += rhs.lmem_writes;
       total_latency += rhs.total_latency;
       noslot_stalls += rhs.noslot_stalls;
+#ifdef DXA_MBAR_ENABLE
+      tmap_hits     += rhs.tmap_hits;
+      tmap_misses   += rhs.tmap_misses;
+#else
+#line 47
+#endif
       return *this;
     }
   };

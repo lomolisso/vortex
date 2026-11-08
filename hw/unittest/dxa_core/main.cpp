@@ -41,6 +41,7 @@
 #include <cstdlib>
 #include <cstdio>
 #include <cstring>
+#include <array>
 #include <deque>
 #include <map>
 #include <set>
@@ -661,7 +662,31 @@ struct Xfer {
     uint32_t bytes = 0;
     uint32_t mc_mask = 0;                 // a cluster multicast to local slots 0..MAXC-1
     uint32_t room = 0;                    // bytes from smem to its block's end (0: to the memory's end)
+    // tensor maps
+    bool     use_map = false;             // the request names the map at `map` instead of a slot
+    uint64_t map = 0;
+    int      tmop = 0;                    // a tensormap op: 1 prefetch, 2 invalidate (no transfer)
+    bool     kmu = false;                 // a launch: a KMU-state DCR write (no transfer)
+    uint32_t etype = 7;                   // the map's element type (word 23)
+    uint32_t w22 = 0;                     // the map's stride bits 39:32 (must be 0)
+    bool     rank0 = false;               // a map with rank 0
+    bool     kill = false;                // a launch lands during this request's map fetch
+    bool     in_loop = false;             // a launch driven in a cycle of the run loop
 };
+
+// Tensor-map support of the request and memory models, defined with the map vectors.
+static void load_tm(const Xfer& x);
+static bool tm_line(uint64_t line, uint8_t* bytes);
+static void tm_store(const Xfer& x);
+static int  g_rsp_rev = 0;                // answer a map's lines last first
+static bool g_maps_first = false;         // every engine read follows the last map read
+static uint64_t g_map_reads = 0;
+// A DCR write inside the run loop, given the map responses accepted so far and
+// whether a map line is presented this cycle; and a hook after the slots are programmed.
+static std::function<bool(uint64_t, bool, uint32_t&, uint32_t&)> g_dcr_hook;
+static std::function<void()> g_after_program;
+static std::function<bool(uint64_t)> g_map_gate;   // true: no map line is answered this cycle
+static uint64_t g_dcr_held = 0, g_dcr_taken = 0;   // map responses presented with a slot DCR write
 
 static dxa_ref::Desc ref_desc(const Xfer& x) {
     dxa_ref::Desc d;
@@ -812,7 +837,9 @@ static bool run_tensor(const char* name, std::vector<Xfer> xs, int ready_pct, in
     std::vector<Done> dones;
     uint64_t exp_reads = 0;
     for (auto& x : xs) {
-        if (!x.bload && !x.bytes) {
+        if (x.tmop || x.kmu)
+            continue;
+        if (!x.bload && !x.bytes && !x.rank0) {
             const char* bad = dxa_ref::check_tensor(ref_desc(x), x.smem - x.blk_base, x.prefetch);
             if (bad) {
                 printf("%s: vector %s breaks a rule: %s\n", name, x.name.c_str(), bad);
@@ -853,11 +880,13 @@ static bool run_tensor(const char* name, std::vector<Xfer> xs, int ready_pct, in
     }
     std::vector<uint32_t> nrcv;   // completions per transfer
     for (auto& x : xs)
-        nrcv.push_back(x.prefetch ? 0 : (x.mc_mask ? __builtin_popcount(x.mc_mask) : 1));
+        nrcv.push_back((x.prefetch || x.tmop || x.kmu) ? 0 : (x.mc_mask ? __builtin_popcount(x.mc_mask) : 1));
 
     for (size_t i = 0; i < xs.size(); ++i)
-        if (!xs[i].bload && xs[i].bytes == 0)
+        if (!xs[i].bload && xs[i].bytes == 0 && !xs[i].use_map && !xs[i].tmop && !xs[i].kmu)
             program_desc(uint32_t(i % 16), xs[i]);
+    if (g_after_program)
+        g_after_program();
     for (int i = 0; i < 4; ++i)
         clock_cycle();
 
@@ -867,45 +896,97 @@ static bool run_tensor(const char* name, std::vector<Xfer> xs, int ready_pct, in
     bool ok = true, after_last = false;
     size_t cur = 0;            // the transfer whose writes are expected
     uint32_t cur_lasts = 0;
+    bool launch_due = false;
     auto issue_next = [&]() {
+        while (next < xs.size() && xs[next].kmu) {
+            if (xs[next].in_loop)
+                launch_due = true;
+            else
+                dcr_write(VX_DCR_KMU_STATE_BEGIN, 0);
+            ++next;
+        }
         while (next < xs.size()) {
             load_xfer(uint32_t(next % 16), xs[next]);
+            load_tm(xs[next]);
+            tm_store(xs[next]);
             return;
         }
         dut->dxa_req_valid = 0;
     };
+    uint64_t map_reads = 0, last_map_read = 0, first_eng_read = ~0ull, map_rsps = 0;
+    std::vector<uint64_t> map_pending;   // map lines asked and not answered
+    g_dcr_held = g_dcr_taken = 0;
     issue_next();
     while (cyc < 400000) {
         // A random response whose latency has passed, any order.
         int pick = -1;
         std::vector<int> ready;
-        for (size_t i = 0; i < rsps.size(); ++i)
-            if (rsps[i].due <= cyc) ready.push_back(int(i));
+        for (size_t i = 0; i < rsps.size(); ++i) {
+            if (rsps[i].due > cyc)
+                continue;
+            if (g_map_gate && g_map_gate(map_rsps) && tm_line(rsps[i].line, nullptr))
+                continue;
+            bool later = false;   // a later line of the same map still unanswered
+            if (g_rsp_rev && tm_line(rsps[i].line, nullptr))
+                for (auto& o : rsps)
+                    later |= (o.line > rsps[i].line) && tm_line(o.line, nullptr);
+            if (!later)
+                ready.push_back(int(i));
+        }
         if (!ready.empty() && (rnd() % 100) < 80)
             pick = ready[rnd() % ready.size()];
         dut->gmem_rsp_valid = (pick >= 0);
+        bool map_rsp = false;
         if (pick >= 0) {
             const auto& r = rsps[pick];
+            uint8_t mb[256];
+            bool is_map = tm_line(r.line, mb);
+            map_rsp = is_map;
             for (int w = 0; w < CL / 4; ++w) {
                 uint32_t v = 0;
                 for (int b = 0; b < 4; ++b)
-                    v |= uint32_t(gmem_byte(r.line * CL + w * 4 + b)) << (8 * b);
+                    v |= uint32_t(is_map ? mb[w * 4 + b] : gmem_byte(r.line * CL + w * 4 + b)) << (8 * b);
                 dut->gmem_rsp_data[w] = v;
             }
             port_set(dut->gmem_rsp_tag, 0, 64, r.tag);
         }
         dut->gmem_req_ready = (int(rnd() % 100) < ready_pct) ? 1 : 0;
         dut->lmem_req_ready = (int(rnd() % 100) < ready_pct) ? 1 : 0;
+        uint32_t dcr_addr = 0, dcr_data = 0;
+        bool dcr = g_dcr_hook && g_dcr_hook(map_rsps, map_rsp, dcr_addr, dcr_data);
+        if (launch_due && !dcr) {
+            dcr = true;
+            launch_due = false;
+            dcr_addr = VX_DCR_KMU_STATE_BEGIN;
+        }
+        if (dcr) {
+            dut->dcr_req_valid = 1;
+            dut->dcr_req_rw    = 1;
+            dut->dcr_req_addr  = dcr_addr;
+            dut->dcr_req_data  = dcr_data;
+        }
         dut->eval();
         bool req_taken = dut->dxa_req_valid && dut->dxa_req_ready;
+        if (dcr && map_rsp && dcr_addr >= VX_DCR_DXA_DESC_BASE) {
+            if (dut->gmem_rsp_ready & 1) ++g_dcr_taken; else ++g_dcr_held;
+        }
         if ((dut->gmem_req_valid & 1) && (dut->gmem_req_ready & 1)) {
-            ++reads;
             uint64_t line = port_bits(dut->gmem_req_addr, 0, MADDR_W - clog2(CL));
             uint64_t tag  = port_bits(dut->gmem_req_tag, 0, 64);
+            if (tm_line(line, nullptr)) {
+                ++map_reads;
+                last_map_read = cyc;
+            } else {
+                ++reads;
+                if (first_eng_read == ~0ull)
+                    first_eng_read = cyc;
+            }
             rsps.push_back({line, tag, cyc + 2 + rnd() % (max_lat - 1)});
         }
-        if (pick >= 0 && (dut->gmem_rsp_ready & 1))
+        if (pick >= 0 && (dut->gmem_rsp_ready & 1)) {
+            map_rsps += map_rsp;
             rsps.erase(rsps.begin() + pick);
+        }
         if ((dut->lmem_req_valid & 1) && (dut->lmem_req_ready & 1)) {
             uint32_t addr = dut->lmem_req_addr;
             if (!(dut->lmem_req_rw & 1)) {
@@ -958,6 +1039,10 @@ static bool run_tensor(const char* name, std::vector<Xfer> xs, int ready_pct, in
             }
         }
         clock_cycle();
+        if (dcr) {
+            dut->dcr_req_valid = 0;
+            dut->dcr_req_rw    = 0;
+        }
         ++cyc;
         if (req_taken) {
             ++next;
@@ -966,7 +1051,7 @@ static bool run_tensor(const char* name, std::vector<Xfer> xs, int ready_pct, in
             else
                 issue_next();
         }
-        bool quiet = (next >= xs.size()) && rsps.empty() && !dut->busy && (lasts == dones.size());
+        bool quiet = (next >= xs.size()) && !launch_due && rsps.empty() && !dut->busy && (lasts == dones.size());
         if (serial && !dut->dxa_req_valid && next < xs.size() && rsps.empty() && !dut->busy)
             issue_next();
         idle = quiet ? idle + 1 : 0;
@@ -978,11 +1063,18 @@ static bool run_tensor(const char* name, std::vector<Xfer> xs, int ready_pct, in
     dut->lmem_req_ready = 1;
     dut->gmem_req_ready = 1;
     if (lasts != dones.size()) {
-        printf("%s: %zu of %zu completions after %lu cycles\n", name, lasts, dones.size(), (unsigned long)cyc);
+        printf("%s: %zu of %zu completions after %lu cycles (step %zu of %zu issued, %zu responses due, busy %d)\n",
+               name, lasts, dones.size(), (unsigned long)cyc, next, xs.size(), rsps.size(), int(dut->busy));
         ok = false;
     }
     if (reads != exp_reads) {
         printf("%s: %lu line reads, expected %lu\n", name, (unsigned long)reads, (unsigned long)exp_reads);
+        ok = false;
+    }
+    g_map_reads = map_reads;
+    if (g_maps_first && map_reads && first_eng_read <= last_map_read) {
+        printf("%s: an engine read at cycle %lu before the last map read at %lu\n", name,
+               (unsigned long)first_eng_read, (unsigned long)last_map_read);
         ok = false;
     }
     int bad = 0;
@@ -1887,6 +1979,344 @@ static bool run_store_all() {
     return ok;
 }
 
+// ---- Tensor maps in global memory ----------------------------------------
+
+// dxa_tm_req_t, above the store fields: rop, rt, addr, op, en.
+static constexpr int TM_TAG_W  = MADDR_W - 6;
+static constexpr int R_TM_ROP  = R_SEND;
+static constexpr int R_TM_RT   = R_TM_ROP + 4;
+static constexpr int R_TM_ADDR = R_TM_RT + 1;
+static constexpr int R_TM_OP   = R_TM_ADDR + TM_TAG_W;
+static constexpr int R_TM_EN   = R_TM_OP + 2;
+static constexpr int R_TM_END  = R_TM_EN + 1;
+static constexpr int TM_ENTRIES = 8;
+static constexpr uint64_t TMAP_BASE = 0x40000000ull;
+
+// The 128-byte map in memory: the slot words, then words 22-23, then junk.
+static std::array<uint32_t, 32> map_words(const Xfer& x) {
+    std::array<uint32_t, 32> w{};
+    w[VX_DCR_DXA_DESC_BASE_LO_OFF] = uint32_t(x.base);
+    w[VX_DCR_DXA_DESC_BASE_HI_OFF] = uint32_t(x.base >> 32);
+    for (int i = 0; i < 5; ++i)
+        w[VX_DCR_DXA_DESC_SIZE0_OFF + i] = x.size[i];
+    for (int i = 0; i < 4; ++i)
+        w[VX_DCR_DXA_DESC_STRIDE0_OFF + i] = x.stride[i];
+    w[VX_DCR_DXA_DESC_META_OFF] = (x.rank0 ? 0 : x.rank) | (x.esz << 3) | (x.swz << 7) | (x.il << 9) | (x.im2col << 13);
+    for (int i = 0; i < 5; ++i)
+        w[VX_DCR_DXA_DESC_ESTRIDE0_OFF + i] = x.es[i];
+    w[VX_DCR_DXA_DESC_TILESIZE01_OFF] = (x.tile[1] << 16) | x.tile[0];
+    w[VX_DCR_DXA_DESC_TILESIZE23_OFF] = (x.tile[3] << 16) | x.tile[2];
+    w[VX_DCR_DXA_DESC_TILESIZE4_OFF]  = x.tile[4];
+    w[VX_DCR_DXA_DESC_CFILL_OFF]      = x.cfill;
+    w[VX_DCR_DXA_DESC_SMEM_STRIDE_OFF] = 0;
+    w[22] = x.w22;
+    w[23] = x.etype;
+    for (int i = 24; i < 32; ++i)
+        w[i] = 0xdead0000u | uint32_t(i);
+    return w;
+}
+
+static std::map<uint64_t, std::array<uint32_t, 32>> g_maps;
+// Maps whose memory holds stale words (g_stale) until the vector's launch writes
+// the new ones (g_new, kept from the steps).
+static std::map<uint64_t, std::array<uint32_t, 32>> g_stale, g_new;
+
+static void tm_store(const Xfer& x) {
+    if (x.use_map && !g_new.count(x.map))
+        g_maps[x.map] = map_words(x);
+}
+
+// A line of the map region and its bytes (bytes outside a map read as plain memory).
+static bool tm_line(uint64_t line, uint8_t* bytes) {
+    uint64_t a = line * CL;
+    if (a + CL <= TMAP_BASE || a >= TMAP_BASE + 0x100000)
+        return false;
+    if (bytes) {
+        for (int i = 0; i < CL; ++i) {
+            uint64_t b = a + i;
+            bytes[i] = gmem_byte(b);
+            for (auto& m : g_maps)
+                if (b >= m.first && b < m.first + 128)
+                    bytes[i] = uint8_t(m.second[(b - m.first) / 4] >> (8 * ((b - m.first) % 4)));
+        }
+    }
+    return true;
+}
+
+static void load_tm(const Xfer& x) {
+    if (!x.use_map && !x.tmop)
+        return;
+    set_bits(dut->dxa_req_data, R_TM_EN, 1, 1);
+    set_bits(dut->dxa_req_data, R_TM_OP, 2, uint32_t(x.tmop));
+    set_bits(dut->dxa_req_data, R_TM_ADDR, TM_TAG_W, x.map >> 6);
+    if (x.tmop) {
+        set_bits(dut->dxa_req_data, R_TLOAD, 1, 0);
+        set_bits(dut->dxa_req_data, R_PF, 1, 0);
+        for (int i = 0; i < 5; ++i)
+            set_bits(dut->dxa_req_data, R_COORDS + 32 * i, 32, 0);
+    }
+    set_bits(dut->dxa_req_data, R_META, 32, 0xC0000000u);   // slot bits 0
+}
+
+// The descriptor cache: 8 entries, the lowest invalid one or a round-robin victim.
+struct TmModel {
+    bool v[TM_ENTRIES] = {};
+    uint64_t tag[TM_ENTRIES] = {};
+    int rr = 0;
+    uint64_t misses = 0, hits = 0, lines = 0;
+    bool find(uint64_t a) const {
+        for (int e = 0; e < TM_ENTRIES; ++e)
+            if (v[e] && tag[e] == a) return true;
+        return false;
+    }
+    void launch() {
+        for (auto& b : v) b = false;
+        rr = 0;
+    }
+    void step(const Xfer& x) {
+        if (x.kmu) {
+            launch();
+            return;
+        }
+        if (!x.use_map && !x.tmop)
+            return;
+        if (x.tmop == 2) {
+            for (int e = 0; e < TM_ENTRIES; ++e)
+                if (v[e] && tag[e] == x.map) v[e] = false;
+            return;
+        }
+        if (find(x.map)) { ++hits; return; }
+        ++misses;
+        lines += ((x.map % CL) + 127) / CL + 1;
+        if (x.kill) {
+            // The killed fetch fills nothing; a transfer misses again, a prefetch pops.
+            launch();
+            if (x.tmop)
+                return;
+            ++misses;
+            lines += ((x.map % CL) + 127) / CL + 1;
+        }
+        int e = -1;
+        for (int i = 0; i < TM_ENTRIES && e < 0; ++i)
+            if (!v[i]) e = i;
+        if (e < 0) { e = rr; rr = (rr + 1) % TM_ENTRIES; }
+        v[e] = true; tag[e] = x.map;
+    }
+};
+
+static uint64_t tm_addr(int k) { return TMAP_BASE + 0x40 + uint64_t(k) * 0xc0; }
+
+static Xfer tm_use(const char* name, int k, int32_t c0, int32_t c1, uint64_t base, uint32_t smem) {
+    Xfer x = tile2d(name, 2, 64, 32, 16, 8, c0, c1, base, smem);
+    x.use_map = true;
+    x.map = tm_addr(k);
+    return x;
+}
+
+static Xfer tm_op(int op, int k) {
+    Xfer x;
+    x.name = op == 1 ? "prefetch" : "inval";
+    x.tmop = op;
+    x.map = tm_addr(k);
+    return x;
+}
+
+static Xfer tm_kmu() {
+    Xfer x;
+    x.name = "launch";
+    x.kmu = true;
+    return x;
+}
+
+// Runs the steps, then checks the map line reads against the cache model.
+// A map's memory holds the descriptor of the step that names it, from its
+// first use on (a prefetch reads the map of its next use).
+static bool run_tmap(const char* name, const std::vector<Xfer>& xs, int ready_pct, int max_lat,
+                     bool serial = true, int rev = 0, bool maps_first = false) {
+    if (R_TM_END > int(sizeof(dut->dxa_req_data)) * 8) {
+        printf("%s: the request has no tensor-map fields\n", name);
+        return false;
+    }
+    TmModel m;
+    for (auto& x : xs)
+        m.step(x);
+    g_maps.clear();
+    for (auto& x : xs)
+        if (x.use_map && !g_maps.count(x.map))
+            g_maps[x.map] = map_words(x);
+    g_new.clear();
+    for (auto& st : g_stale) {
+        g_new[st.first] = g_maps[st.first];
+        g_maps[st.first] = st.second;
+    }
+#ifdef PERF_ENABLE
+    uint64_t h0 = dut->perf_tmap_hits, m0 = dut->perf_tmap_misses;
+#endif
+    g_rsp_rev = rev;
+    g_maps_first = maps_first;
+    bool ok = run_tensor(name, xs, ready_pct, max_lat, serial);
+    g_rsp_rev = 0;
+    g_maps_first = false;
+    if (g_map_reads != m.lines) {
+        printf("%s: %lu map line reads, expected %lu (%lu misses)\n", name, (unsigned long)g_map_reads,
+               (unsigned long)m.lines, (unsigned long)m.misses);
+        ok = false;
+    }
+#ifdef PERF_ENABLE
+    if (dut->perf_tmap_hits - h0 != m.hits || dut->perf_tmap_misses - m0 != m.misses) {
+        printf("%s: perf hits=%lu misses=%lu, expected %lu %lu\n", name, (unsigned long)(dut->perf_tmap_hits - h0),
+               (unsigned long)(dut->perf_tmap_misses - m0), (unsigned long)m.hits, (unsigned long)m.misses);
+        ok = false;
+    }
+#endif
+    if (ok)
+        printf("%s: %lu map misses, %lu hits OK\n", name, (unsigned long)m.misses, (unsigned long)m.hits);
+    return ok;
+}
+
+static bool run_tmap_all() {
+    const uint32_t q = LMEM_BYTES / 4;
+    const uint64_t G = 0x100000;
+    bool ok = true;
+    // A miss reads the map's two lines, then the same map hits; the lines
+    // answered in any order, then last first.
+    for (int rev = 0; rev < 2; ++rev) {
+        Xfer a = tm_use("a", 0, 4, 3, G + 0x40, q);
+        Xfer b = tm_use("b", 0, -3, 30, G + 0x40, q + 0x200);
+        Xfer c = tm_use("c", 1, 8, 2, G + 0x1000, q + 0x400);
+        ok = run_tmap(rev ? "tm-miss-rev" : "tm-miss-hit", {tm_kmu(), a, b, c, a}, 100, 12, true, rev) && ok;
+    }
+    // Nine maps evict entry 0, map 0 again evicts entry 1, map 2 still hits.
+    {
+        std::vector<Xfer> xs = {tm_kmu()};
+        for (int k = 0; k < 9; ++k)
+            xs.push_back(tm_use("ev", k, k, k % 4, G + 0x2000 * k, q + 0x200 * (k % 4)));
+        xs.push_back(tm_use("ev0", 0, 1, 1, G, q));
+        xs.push_back(tm_use("ev2", 2, 2, 2, G + 0x4000, q + 0x200));
+        xs.push_back(tm_use("ev1", 1, 3, 3, G + 0x2000, q + 0x400));
+        ok = run_tmap("tm-evict", xs, 70, 20) && ok;
+    }
+    // An invalidate drops the entry, so a rewritten map is read again; one of
+    // a map not cached changes nothing, nor does one of another map.
+    {
+        Xfer a = tm_use("inv-a", 3, 4, 3, G + 0x40, q);
+        Xfer a2 = tm_use("inv-a2", 3, 1, 5, G + 0x8000, q + 0x200);
+        Xfer b = tm_use("inv-b", 4, 0, 0, G + 0x3000, q + 0x400);
+        ok = run_tmap("tm-inval", {tm_kmu(), a, b, tm_op(2, 3), a2, tm_op(2, 5), tm_op(2, 4), a2}, 80, 12) && ok;
+    }
+    // A prefetch fills the entry without a transfer; a prefetch of a cached
+    // map only pops.
+    {
+        Xfer a = tm_use("pf-a", 6, 2, 2, G + 0x9000, q);
+        ok = run_tmap("tm-prefetch", {tm_kmu(), tm_op(1, 6), a, tm_op(1, 6), a}, 80, 12) && ok;
+    }
+    // A launch (KMU DCR write) drops every map; a slot request keeps them.
+    {
+        Xfer a = tm_use("ln-a", 7, 4, 3, G + 0x40, q);
+        Xfer a2 = tm_use("ln-a2", 7, 5, 1, G + 0xa000, q + 0x200);
+        Xfer s = tile2d("ln-slot", 2, 40, 12, 16, 4, 1, 1, G + 0x5000, q + 0x400);
+        ok = run_tmap("tm-launch", {tm_kmu(), a, s, a, tm_kmu(), a2}, 80, 12) && ok;
+    }
+    // A slot request behind a missing map waits for the fill; requests stream.
+    {
+        Xfer a = tm_use("bh-a", 8, 4, 3, G + 0x40, q);
+        Xfer s = tile2d("bh-slot", 2, 50, 10, 32, 8, -4, 5, G + 0x240000, q + 0x400);
+        Xfer b = tm_use("bh-b", 8, 9, 0, G + 0x40, q + 0x800);
+        ok = run_tmap("tm-behind", {tm_kmu(), a, s, b}, 100, 30, false, 1, true) && ok;
+    }
+    // A launch during a map fetch, after its first line is answered from an
+    // older map: the fetch fills nothing and the transfer reads the map again
+    // (a prefetch only pops), so the old words are never used; the map then hits.
+    for (int pf = 0; pf < 2; ++pf) {
+        const char* name = pf ? "tm-kill-pf" : "tm-kill";
+        Xfer a = tm_use("kl-a", 9, -3, 2, G + 0x40, q);
+        Xfer a2 = tm_use("kl-a2", 9, 6, 1, G + 0x40, q + 0x400);
+        Xfer old = tm_use("kl-old", 9, 0, 0, G + 0x6000, q);
+        old.tile[0] = 8;                  // differs from a in both map lines
+        old.cfill = 0x5a5a5a5au;
+        g_stale[a.map] = map_words(old);
+        bool fired = false;
+        // The launch goes between the two line responses: the second waits for it.
+        g_map_gate = [&](uint64_t done) { return !fired && done == 1; };
+        g_dcr_hook = [&](uint64_t done, bool map_rsp, uint32_t& addr, uint32_t& data) {
+            if (fired || done != 1 || map_rsp)
+                return false;
+            fired = true;
+            g_maps[a.map] = g_new[a.map];
+            g_new.erase(a.map);
+            addr = VX_DCR_KMU_STATE_BEGIN;
+            data = 0;
+            return true;
+        };
+        Xfer first = pf ? tm_op(1, 9) : a;
+        first.kill = true;
+        std::vector<Xfer> xs = {tm_kmu(), first};
+        if (pf)
+            xs.push_back(a);
+        xs.push_back(a2);
+        ok = run_tmap(name, xs, 80, 12) && ok;
+        if (!fired) {
+            printf("%s: no launch during the fetch\n", name);
+            ok = false;
+        }
+        g_dcr_hook = nullptr;
+        g_map_gate = nullptr;
+        g_stale.clear();
+        g_new.clear();
+    }
+    // A launch restarts the victim order: nine maps (the ninth evicts entry 0),
+    // a launch, nine more (the ninth evicts entry 0 again); the other seven hit.
+    {
+        std::vector<Xfer> xs = {tm_kmu()};
+        for (int k = 0; k < 9; ++k)
+            xs.push_back(tm_use("rr", k, k, k % 4, G + 0x2000 * k, q + 0x200 * (k % 4)));
+        xs.push_back(tm_kmu());
+        xs.back().in_loop = true;
+        for (int k = 10; k < 19; ++k)
+            xs.push_back(tm_use("rr2", k, k % 7, k % 4, G + 0x2000 * (k % 9), q + 0x200 * (k % 4)));
+        for (int k = 11; k < 18; ++k)
+            xs.push_back(tm_use("rr-hit", k, k % 5, k % 3, G + 0x2000 * (k % 9), q + 0x200 * (k % 4)));
+        ok = run_tmap("tm-rr-launch", xs, 70, 20) && ok;
+    }
+    // A slot DCR write in the cycle a map line is answered: the line is held
+    // that cycle and written after, and the DCR write lands too (it repairs the
+    // descriptor of the slot request queued behind the map).
+    {
+        Xfer a = tm_use("dw-a", 12, 4, 3, G + 0x40, q);
+        Xfer s = tile2d("dw-slot", 2, 50, 10, 32, 8, -4, 5, G + 0x240000, q + 0x400);
+        s.cfill = 0x11223344u;
+        Xfer b = tm_use("dw-b", 12, 9, 0, G + 0x40, q + 0x800);
+        const uint32_t d = VX_DCR_DXA_DESC_BASE + 2 * VX_DCR_DXA_DESC_STRIDE;   // s is step 2
+        const uint32_t fix[2][2] = {{d + VX_DCR_DXA_DESC_BASE_LO_OFF, uint32_t(s.base)},
+                                    {d + VX_DCR_DXA_DESC_CFILL_OFF, s.cfill}};
+        g_after_program = [&]() {
+            dcr_write(fix[0][0], fix[0][1] + 0x1000);
+            dcr_write(fix[1][0], 0);
+        };
+        int n = 0;
+        g_dcr_hook = [&](uint64_t, bool map_rsp, uint32_t& addr, uint32_t& data) {
+            if (!map_rsp || n >= 2)
+                return false;
+            addr = fix[n][0];
+            data = fix[n][1];
+            ++n;
+            return true;
+        };
+        bool r = run_tmap("tm-dcr-fill", {tm_kmu(), a, s, b}, 100, 30, false);
+        if (n != 2 || g_dcr_held != 2 || g_dcr_taken) {
+            printf("tm-dcr-fill: %d slot DCR writes on a map response, %lu held, %lu taken\n", n,
+                   (unsigned long)g_dcr_held, (unsigned long)g_dcr_taken);
+            r = false;
+        } else if (r) {
+            printf("tm-dcr-fill: 2 map responses held a cycle by a slot DCR write OK\n");
+        }
+        ok = r && ok;
+        g_dcr_hook = nullptr;
+        g_after_program = nullptr;
+    }
+    return ok;
+}
+
 // Negative vectors: each must stop the simulation with the given assert.
 static void run_negative(const char* which) {
     const uint32_t q = LMEM_BYTES / 4;
@@ -1897,6 +2327,13 @@ static void run_negative(const char* which) {
         f.room = 191;                    // DXA box exceeds the destination block (dense bytes)
     } else if (!strcmp(which, "swzbox")) {
         f.swz = 3; f.room = 255;         // the same, by the swizzled footprint only
+    } else if (!strcmp(which, "tmrank") || !strcmp(which, "tmwide")) {
+        // DXA tensor map rank must be 1-5; DXA tensor stride needs 32 bits
+        Xfer m = tm_use(which, 0, 0, 0, G, q);
+        m.rank0 = !strcmp(which, "tmrank");
+        m.w22 = m.rank0 ? 0 : 0x100;
+        run_tmap(which, {tm_kmu(), m}, 100, 4);
+        return;
     } else {
         printf("unknown negative vector %s\n", which);
         return;
@@ -1961,6 +2398,7 @@ int main(int argc, char** argv) {
         dut->slot_stride = MC_STRIDE;
         ok = run_tensor_all() && ok;
         ok = run_store_all() && ok;
+        ok = run_tmap_all() && ok;
     }
 #endif
 

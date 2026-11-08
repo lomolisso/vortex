@@ -47,6 +47,31 @@ module VX_dxa_core import VX_gpu_pkg::*, VX_dxa_pkg::*; #(
     // ================================================================
     // Descriptor table (single read port, driven by dispatch queue)
     // ================================================================
+`ifdef DXA_MBAR_ENABLE
+    localparam TM_STRIDE = `VX_DCR_DXA_DESC_STRIDE;
+    wire [DXA_DESC_ADDR_W-1:0] desc_read_addr;
+    dxa_desc_t desc_read_data;
+    wire [31:0] desc_w22, desc_w23;
+    wire                        tm_fill_valid, tm_fill_ready;
+    wire [DXA_TMAP_IDX_W-1:0]   tm_fill_entry;
+    wire [TM_STRIDE-1:0]        tm_fill_wren;
+    wire [TM_STRIDE*32-1:0]     tm_fill_wdata;
+
+    VX_dxa_desc_table desc_table (
+        .clk        (clk),
+        .reset      (reset),
+        .dcr_bus_if (dcr_bus_if),
+        .read_addr  (desc_read_addr),
+        .fill_valid (tm_fill_valid),
+        .fill_entry (tm_fill_entry),
+        .fill_wren  (tm_fill_wren),
+        .fill_wdata (tm_fill_wdata),
+        .fill_ready (tm_fill_ready),
+        .read_w22   (desc_w22),
+        .read_w23   (desc_w23),
+        .read_desc  (desc_read_data)
+    );
+`else
     wire [DXA_DESC_SLOT_W-1:0] desc_read_addr;
     dxa_desc_t desc_read_data;
 
@@ -57,6 +82,7 @@ module VX_dxa_core import VX_gpu_pkg::*, VX_dxa_pkg::*; #(
         .read_addr  (desc_read_addr),
         .read_desc  (desc_read_data)
     );
+`endif
 
     // ================================================================
     // Request path: sockets → arb(N:1) → queue → dispatch(1:N) → workers
@@ -97,6 +123,256 @@ module VX_dxa_core import VX_gpu_pkg::*, VX_dxa_pkg::*; #(
         .data_out  (queue_out_bus_if[0].req_data)
     );
 
+`ifdef DXA_MBAR_ENABLE
+    // The queue head reads its descriptor from a DCR slot or a cached tensor
+    // map. A slot request and a map hit read the RAM in the IDLE cycle and are
+    // presented the next (PRESENT). A map miss (MAP) reads the map's lines on
+    // the GMEM port, writes each line's words into its victim entry as it
+    // returns, then looks the head up again as a hit. A tensormap prefetch pops
+    // on a hit, an invalidate in its IDLE cycle; neither reaches dispatch.
+    localparam FETCH_IDLE = 2'd0, FETCH_PRESENT = 2'd1, FETCH_MAP = 2'd2;
+    reg [1:0] fetch_state_r;
+
+    VX_dxa_worker_req_if dispatch_in_if[1]();
+
+    dxa_tm_req_t q_tm;
+    assign q_tm = queue_out_bus_if[0].req_data.tm;
+    wire q_valid = queue_out_bus_if[0].req_valid;
+    wire q_map   = q_tm.en;
+    wire q_pf    = (q_tm.op == DXA_TM_PREFETCH);
+    wire q_inv   = (q_tm.op == DXA_TM_INVAL);
+
+    reg [DXA_TMAP_ENTRIES-1:0]                      tm_valid_r;
+    reg [DXA_TMAP_ENTRIES-1:0][DXA_TMAP_TAG_W-1:0]  tm_tag_r;
+    reg [DXA_TMAP_IDX_W-1:0] tm_rr_r, tm_vict_r, tm_cur_r;
+
+    wire [DXA_TMAP_ENTRIES-1:0] tm_match;
+    for (genvar e = 0; e < DXA_TMAP_ENTRIES; ++e) begin : g_tm_match
+        assign tm_match[e] = tm_valid_r[e] && (tm_tag_r[e] == q_tm.addr);
+    end
+    wire                      tm_hit = (| tm_match);
+    wire [DXA_TMAP_IDX_W-1:0] tm_hit_idx, tm_free_idx;
+    wire                      tm_has_free;
+
+    VX_priority_encoder #(
+        .N (DXA_TMAP_ENTRIES)
+    ) tm_hit_enc (
+        .data_in    (tm_match),
+        .index_out  (tm_hit_idx),
+        `UNUSED_PIN (onehot_out),
+        `UNUSED_PIN (valid_out)
+    );
+
+    // The victim: the lowest invalid entry, else the round-robin pointer.
+    VX_priority_encoder #(
+        .N (DXA_TMAP_ENTRIES)
+    ) tm_free_enc (
+        .data_in    (~tm_valid_r),
+        .index_out  (tm_free_idx),
+        `UNUSED_PIN (onehot_out),
+        .valid_out  (tm_has_free)
+    );
+    wire [DXA_TMAP_IDX_W-1:0] tm_victim = tm_has_free ? tm_free_idx : tm_rr_r;
+
+    // Every launch writes the KMU state: maps are reread per launch and the
+    // victim order restarts.
+    wire tm_launch = dcr_bus_if.req_valid && dcr_bus_if.req_data.rw
+                  && (dcr_bus_if.req_data.addr >= VX_DCR_ADDR_WIDTH'(`VX_DCR_KMU_STATE_BEGIN))
+                  && (dcr_bus_if.req_data.addr < VX_DCR_ADDR_WIDTH'(`VX_DCR_KMU_STATE_END));
+    // DXA work can outlive its kernel (its busy is not in the socket's), so a
+    // fetch may straddle the next launch. A launch from the miss cycle through
+    // the last response kills the fetch: the entry stays invalid, the head
+    // misses again in the next IDLE cycle, and a tensormap prefetch pops there.
+    reg tm_kill_r;
+
+    wire idle_q     = (fetch_state_r == FETCH_IDLE) && q_valid;
+    wire tm_inv_pop = idle_q && q_map && q_inv;
+    wire tm_pf_pop  = idle_q && q_map && q_pf && (tm_hit || tm_kill_r);
+    wire tm_miss    = idle_q && q_map && ~q_inv && ~tm_hit && ~(q_pf && tm_kill_r);
+    wire tm_present = idle_q && (~q_map || (~q_inv && ~q_pf && tm_hit));
+
+    // A map that fails its decode checks is held one PRESENT cycle, so its
+    // assert fires before any check downstream sees the request.
+    wire tm_hold;
+    wire head_go = (fetch_state_r == FETCH_PRESENT) && ~tm_hold && dispatch_in_if[0].ready;
+
+    assign queue_out_bus_if[0].req_ready = head_go || tm_inv_pop || tm_pf_pop;
+
+    wire [DXA_TMAP_IDX_W-1:0] tm_rd_idx = (fetch_state_r == FETCH_IDLE) ? tm_hit_idx : tm_cur_r;
+    assign desc_read_addr = q_map ? DXA_DESC_ADDR_W'(`VX_DCR_DXA_DESC_COUNT + 32'(tm_rd_idx))
+                                  : DXA_DESC_ADDR_W'(queue_out_bus_if[0].req_data.meta[DXA_DESC_SLOT_W-1:0]);
+
+    // ---- Map line reads: the map's 128 bytes from its first line on ----
+    localparam TM_CL       = `VX_CFG_L1_LINE_SIZE;
+    localparam TM_LG_CL    = `CLOG2(TM_CL);
+    localparam TM_LINES    = (TM_CL > 64) ? 2 : (DXA_TMAP_BYTES / TM_CL);
+    localparam TM_LINE_W   = `UP(`CLOG2(TM_LINES));
+    localparam TM_CNT_W    = `CLOG2(TM_LINES + 1);
+    localparam TM_LADDR_W  = `VX_CFG_MEM_ADDR_WIDTH - TM_LG_CL;
+    localparam TM_PORT_TAG_W = SOCKET_MEM_TAG_WIDTH;
+    localparam TM_VAL_W    = TM_PORT_TAG_W - UUID_WIDTH;
+    localparam TM_ARB_SEL_BITS = `ARB_SEL_BITS(`VX_CFG_NUM_DXA_CORES, GMEM_OUT_PORTS);
+    // A fetch tag sets the top value bit, which no worker tag reaches (a
+    // worker's value is a line slot below DXA_MAX_INFLIGHT, or 0).
+    `STATIC_ASSERT ((SOCKET_MEM_TAG_WIDTH - TM_ARB_SEL_BITS - UUID_WIDTH) > `CLOG2(`VX_CFG_DXA_MAX_INFLIGHT),
+        ("DXA GMEM tag has no room for the tensor-map fetch"))
+    `STATIC_ASSERT (TM_VAL_W > TM_LINE_W, ("DXA GMEM tag has no room for the tensor-map fetch"))
+
+    wire [`VX_CFG_MEM_ADDR_WIDTH-1:0] tm_byte = {q_tm.addr, DXA_TMAP_ALIGN'(0)};
+    wire [TM_LG_CL-1:0] tm_off;   // the map's byte offset in its first line
+    if (TM_CL > 64) begin : g_tm_off
+        assign tm_off = tm_byte[TM_LG_CL-1:0];
+    end else begin : g_tm_off0
+        assign tm_off = '0;
+    end
+    wire [TM_LADDR_W-1:0] tm_first  = tm_byte[`VX_CFG_MEM_ADDR_WIDTH-1:TM_LG_CL];
+    wire [TM_CNT_W-1:0]   tm_nlines = TM_CNT_W'(((32'(tm_off) + DXA_TMAP_BYTES - 1) >> TM_LG_CL) + 1);
+
+    reg [TM_CNT_W-1:0] tm_req_cnt_r, tm_rsp_cnt_r;
+    wire tm_req_valid = (fetch_state_r == FETCH_MAP) && (tm_req_cnt_r < tm_nlines);
+    wire tm_req_ready;
+    wire tm_req_fire  = tm_req_valid && tm_req_ready;
+
+    wire                     tm_rsp_valid;
+    wire [TM_CL*8-1:0]       tm_rsp_data;
+    wire [TM_LINE_W-1:0]     tm_rsp_line;
+    wire tm_rsp_fire = tm_rsp_valid && tm_fill_ready;
+    wire tm_rsp_last = tm_rsp_fire && ((tm_rsp_cnt_r + TM_CNT_W'(1)) == tm_nlines);
+
+    // Word j of the map sits in line (off + 4j) / CL of the fetch.
+    assign tm_fill_valid = tm_rsp_valid;
+    assign tm_fill_entry = tm_vict_r;
+    for (genvar j = 0; j < TM_STRIDE; ++j) begin : g_tm_fill
+        wire [31:0] pos = 32'(tm_off) + 32'(j * 4);
+        assign tm_fill_wren[j] = tm_rsp_valid && (TM_LINE_W'(pos >> TM_LG_CL) == tm_rsp_line);
+        assign tm_fill_wdata[j*32 +: 32] = tm_rsp_data[((pos % TM_CL) / 4) * 32 +: 32];
+    end
+
+    always @(posedge clk) begin
+        if (reset) begin
+            fetch_state_r <= FETCH_IDLE;
+            tm_valid_r    <= '0;
+            tm_rr_r       <= '0;
+            tm_kill_r     <= 1'b0;
+        end else begin
+            case (fetch_state_r)
+                FETCH_IDLE: begin
+                    if (tm_present) fetch_state_r <= FETCH_PRESENT;
+                    if (tm_miss)    fetch_state_r <= FETCH_MAP;
+                end
+                FETCH_PRESENT: if (head_go) fetch_state_r <= FETCH_IDLE;
+                default: if (tm_rsp_last) fetch_state_r <= FETCH_IDLE;
+            endcase
+            if (tm_miss) begin
+                tm_valid_r[tm_victim] <= 1'b0;
+                if (~tm_has_free)
+                    tm_rr_r <= tm_rr_r + DXA_TMAP_IDX_W'(1);
+            end
+            if (tm_inv_pop)
+                tm_valid_r <= tm_valid_r & ~tm_match;
+            if (tm_rsp_last && ~tm_kill_r)
+                tm_valid_r[tm_vict_r] <= 1'b1;
+            if (tm_launch) begin
+                tm_valid_r <= '0;
+                tm_rr_r    <= '0;
+            end
+            if (tm_launch && (tm_miss || (fetch_state_r == FETCH_MAP)))
+                tm_kill_r <= 1'b1;
+            else if (fetch_state_r == FETCH_IDLE)
+                tm_kill_r <= 1'b0;
+        end
+        if (tm_present)
+            tm_cur_r <= tm_hit_idx;
+        if (tm_miss) begin
+            tm_vict_r    <= tm_victim;
+            tm_req_cnt_r <= '0;
+            tm_rsp_cnt_r <= '0;
+        end
+        if (tm_req_fire)
+            tm_req_cnt_r <= tm_req_cnt_r + TM_CNT_W'(1);
+        if (tm_rsp_fire)
+            tm_rsp_cnt_r <= tm_rsp_cnt_r + TM_CNT_W'(1);
+        if (tm_rsp_last)
+            tm_tag_r[tm_vict_r] <= q_tm.addr;
+    end
+
+    // ---- Map decode at the head ----
+    // A map's rank, its 40-bit strides and, for a map-typed reduction, its
+    // element type. Invalid maps are undefined; they still run, clamped.
+    wire [2:0] tm_rank     = desc_read_data.meta[DXA_DESC_META_DIM_LSB +: DXA_DESC_META_DIM_BITS];
+    wire       tm_rank_bad = (tm_rank == 3'd0) || (tm_rank > 3'd5);
+    wire       tm_wide     = (desc_w22 != '0);
+    wire [3:0] tm_rtyp     = dxa_tmap_red_type(desc_w23[3:0]);
+    wire       tm_rt_ok    = (tm_rtyp != DXA_RT_FROM_MAP) && dxa_red_ok_g(q_tm.rop, tm_rtyp);
+    wire       tm_rt_nofp  = tm_rt_ok && dxa_red_fp(q_tm.rop, tm_rtyp) && (`VX_CFG_EXT_FPAMO_ENABLED == 0);
+    wire       tm_rt_use   = tm_rt_ok && ~tm_rt_nofp;
+    `UNUSED_VAR (desc_w23)
+    `UNUSED_VAR (tm_st)
+
+    dxa_desc_t tm_desc;
+    dxa_st_t   tm_st;
+    dxa_req_data_t head_req;
+    always @(*) begin
+        tm_desc = desc_read_data;
+        if (tm_rank == 3'd0)
+            tm_desc.meta[DXA_DESC_META_DIM_LSB +: DXA_DESC_META_DIM_BITS] = 3'd1;
+        else if (tm_rank > 3'd5)
+            tm_desc.meta[DXA_DESC_META_DIM_LSB +: DXA_DESC_META_DIM_BITS] = 3'd5;
+        tm_st = dxa_red_st(tm_rt_use ? q_tm.rop : 4'd0, tm_rt_use ? tm_rtyp : 4'd0);
+        head_req = queue_out_bus_if[0].req_data;
+        if (q_map && q_tm.rt) begin
+            head_req.st.amo_op  = tm_st.amo_op;
+            head_req.st.amo_uns = tm_st.amo_uns;
+            head_req.st.w8      = tm_st.w8;
+            head_req.st.tsize   = tm_st.tsize;
+        end
+    end
+
+    wire tm_fault = q_map && (tm_wide || tm_rank_bad || (q_tm.rt && ~tm_rt_use));
+    reg  tm_held_r;
+    always @(posedge clk) begin
+        if (reset || (fetch_state_r != FETCH_PRESENT))
+            tm_held_r <= 1'b0;
+        else if (tm_fault)
+            tm_held_r <= 1'b1;
+    end
+    assign tm_hold = tm_fault && ~tm_held_r;
+    wire tm_dsp = (fetch_state_r == FETCH_PRESENT) && tm_hold;
+    `RUNTIME_ASSERT(~(tm_dsp && tm_wide),
+        ("%t: *** %s DXA tensor stride needs 32 bits: map=0x%0h stride_hi=0x%0h",
+         $time, INSTANCE_ID, tm_byte, desc_w22))
+    `RUNTIME_ASSERT(~(tm_dsp && ~tm_wide && tm_rank_bad),
+        ("%t: *** %s DXA tensor map rank must be 1-5: map=0x%0h rank=%0d", $time, INSTANCE_ID, tm_byte, tm_rank))
+    `RUNTIME_ASSERT(~(tm_dsp && ~tm_wide && ~tm_rank_bad && q_tm.rt && ~tm_rt_ok),
+        ("%t: *** %s DXA tensor reduction type not supported by the map: map=0x%0h op=%0d type=%0d",
+         $time, INSTANCE_ID, tm_byte, q_tm.rop, desc_w23[3:0]))
+    `RUNTIME_ASSERT(~(tm_dsp && ~tm_wide && ~tm_rank_bad && q_tm.rt && tm_rt_nofp),
+        ("%t: *** %s DXA reduction needs FPAMO: map=0x%0h op=%0d type=%0d",
+         $time, INSTANCE_ID, tm_byte, q_tm.rop, desc_w23[3:0]))
+
+    assign dispatch_in_if[0].valid     = (fetch_state_r == FETCH_PRESENT) && ~tm_hold;
+    assign dispatch_in_if[0].req_data  = head_req;
+    // A bulk copy reads no descriptor: it runs as a rank-1 box of size / 8
+    // doublewords at its source, the issuer core's local-memory byte address,
+    // or a global address (bload and its prefetch).
+    wire is_gbulk = queue_out_bus_if[0].req_data.bload
+                 || (queue_out_bus_if[0].req_data.prefetch && ~queue_out_bus_if[0].req_data.tload);
+    // A bulk store or reduction walks its destination, gsrc, from the source.
+    wire       q_st_en   = queue_out_bus_if[0].req_data.st.en;
+    wire [2:0] q_st_kind = queue_out_bus_if[0].req_data.st.kind;
+    wire is_sbulk = q_st_en && ((q_st_kind == DXA_ST_BULK) || (q_st_kind == DXA_ST_RED_G) || (q_st_kind == DXA_ST_RED_C));
+    dxa_desc_t bulk_desc;
+    always @(*) begin
+        bulk_desc           = '0;
+        bulk_desc.base_addr = (is_gbulk || is_sbulk) ? queue_out_bus_if[0].req_data.gsrc
+                                       : `VX_CFG_MEM_ADDR_WIDTH'(queue_out_bus_if[0].req_data.src_addr);
+        bulk_desc.meta      = (32'd1 << DXA_DESC_META_DIM_LSB) | (32'd3 << DXA_DESC_META_ELEMSZ_LSB);
+        bulk_desc.tile01    = 32'(queue_out_bus_if[0].req_data.size >> 3);
+        bulk_desc.size0     = 32'(queue_out_bus_if[0].req_data.size >> 3);
+    end
+    assign dispatch_in_if[0].desc_data = (queue_out_bus_if[0].req_data.bulk || is_gbulk || is_sbulk) ? bulk_desc
+                                       : (q_map ? tm_desc : desc_read_data);
+`else
     // Read desc_table using the queued request's desc_slot. desc_store is now
     // a registered-read BRAM (OUT_REG=1), so desc_read_data lands one cycle
     // after desc_read_addr. A 1-deep fetch register absorbs that latency: the
@@ -137,27 +413,6 @@ module VX_dxa_core import VX_gpu_pkg::*, VX_dxa_pkg::*; #(
 
     assign dispatch_in_if[0].valid     = (fetch_state_r == FETCH_PRESENT);
     assign dispatch_in_if[0].req_data  = queue_out_bus_if[0].req_data;
-`ifdef DXA_MBAR_ENABLE
-    // A bulk copy reads no descriptor: it runs as a rank-1 box of size / 8
-    // doublewords at its source, the issuer core's local-memory byte address,
-    // or a global address (bload and its prefetch).
-    wire is_gbulk = queue_out_bus_if[0].req_data.bload
-                 || (queue_out_bus_if[0].req_data.prefetch && ~queue_out_bus_if[0].req_data.tload);
-    // A bulk store or reduction walks its destination, gsrc, from the source.
-    wire       q_st_en   = queue_out_bus_if[0].req_data.st.en;
-    wire [2:0] q_st_kind = queue_out_bus_if[0].req_data.st.kind;
-    wire is_sbulk = q_st_en && ((q_st_kind == DXA_ST_BULK) || (q_st_kind == DXA_ST_RED_G) || (q_st_kind == DXA_ST_RED_C));
-    dxa_desc_t bulk_desc;
-    always @(*) begin
-        bulk_desc           = '0;
-        bulk_desc.base_addr = (is_gbulk || is_sbulk) ? queue_out_bus_if[0].req_data.gsrc
-                                       : `VX_CFG_MEM_ADDR_WIDTH'(queue_out_bus_if[0].req_data.src_addr);
-        bulk_desc.meta      = (32'd1 << DXA_DESC_META_DIM_LSB) | (32'd3 << DXA_DESC_META_ELEMSZ_LSB);
-        bulk_desc.tile01    = 32'(queue_out_bus_if[0].req_data.size >> 3);
-        bulk_desc.size0     = 32'(queue_out_bus_if[0].req_data.size >> 3);
-    end
-    assign dispatch_in_if[0].desc_data = (queue_out_bus_if[0].req_data.bulk || is_gbulk || is_sbulk) ? bulk_desc : desc_read_data;
-`else
     assign dispatch_in_if[0].desc_data = desc_read_data;
 `endif
 
@@ -328,6 +583,13 @@ module VX_dxa_core import VX_gpu_pkg::*, VX_dxa_pkg::*; #(
     // ================================================================
     // Output arbitration
     // ================================================================
+`ifdef DXA_MBAR_ENABLE
+    VX_mem_bus_if #(
+        .DATA_SIZE (`VX_CFG_L1_LINE_SIZE),
+        .TAG_WIDTH (TM_PORT_TAG_W)
+    ) gmem_arb_out_if[GMEM_OUT_PORTS]();
+`endif
+
     VX_mem_bus_arb #(
         .NUM_INPUTS  (`VX_CFG_NUM_DXA_CORES),
         .NUM_OUTPUTS (GMEM_OUT_PORTS),
@@ -339,8 +601,58 @@ module VX_dxa_core import VX_gpu_pkg::*, VX_dxa_pkg::*; #(
         .clk        (clk),
         .reset      (reset),
         .bus_in_if  (worker_gmem_bus_if),
+    `ifdef DXA_MBAR_ENABLE
+        .bus_out_if (gmem_arb_out_if)
+    `else
         .bus_out_if (gmem_bus_if)
+    `endif
     );
+
+`ifdef DXA_MBAR_ENABLE
+    // Map line reads share port 0: the fetch wins while it has a request,
+    // and its responses come back under the fetch tag bit.
+    VX_mem_bus_if #(
+        .DATA_SIZE (`VX_CFG_L1_LINE_SIZE),
+        .TAG_WIDTH (TM_PORT_TAG_W)
+    ) tm_bus_if();
+
+    assign tm_bus_if.req_valid            = tm_req_valid;
+    assign tm_bus_if.req_data.rw          = 1'b0;
+    assign tm_bus_if.req_data.addr        = tm_first + TM_LADDR_W'(tm_req_cnt_r);
+    assign tm_bus_if.req_data.data        = '0;
+    assign tm_bus_if.req_data.byteen      = {`VX_CFG_L1_LINE_SIZE{1'b1}};
+    assign tm_bus_if.req_data.attr        = '0;
+    assign tm_bus_if.req_data.tag.uuid    = '0;
+    assign tm_bus_if.req_data.tag.value   = {1'b1, (TM_VAL_W-1)'(tm_req_cnt_r)};
+
+    wire gmem_rsp_tm = gmem_bus_if[0].rsp_data.tag.value[TM_VAL_W-1];
+
+    assign gmem_bus_if[0].req_valid = tm_req_valid || gmem_arb_out_if[0].req_valid;
+    assign gmem_bus_if[0].req_data  = tm_req_valid ? tm_bus_if.req_data : gmem_arb_out_if[0].req_data;
+    assign gmem_arb_out_if[0].req_ready = gmem_bus_if[0].req_ready && ~tm_req_valid;
+    assign tm_bus_if.req_ready = gmem_bus_if[0].req_ready;
+    assign gmem_arb_out_if[0].rsp_valid = gmem_bus_if[0].rsp_valid && ~gmem_rsp_tm;
+    assign gmem_arb_out_if[0].rsp_data  = gmem_bus_if[0].rsp_data;
+    assign tm_bus_if.rsp_valid = gmem_bus_if[0].rsp_valid && gmem_rsp_tm;
+    assign tm_bus_if.rsp_data  = gmem_bus_if[0].rsp_data;
+    assign tm_bus_if.rsp_ready = tm_fill_ready;
+    assign gmem_bus_if[0].rsp_ready = gmem_rsp_tm ? tm_bus_if.rsp_ready : gmem_arb_out_if[0].rsp_ready;
+
+    assign tm_req_ready = tm_bus_if.req_ready;
+    assign tm_rsp_valid = tm_bus_if.rsp_valid;
+    assign tm_rsp_data  = tm_bus_if.rsp_data.data;
+    assign tm_rsp_line  = TM_LINE_W'(tm_bus_if.rsp_data.tag.value);
+    `UNUSED_VAR (tm_bus_if.rsp_data.tag)
+
+    for (genvar i = 1; i < GMEM_OUT_PORTS; ++i) begin : g_gmem_pass
+        assign gmem_bus_if[i].req_valid     = gmem_arb_out_if[i].req_valid;
+        assign gmem_bus_if[i].req_data      = gmem_arb_out_if[i].req_data;
+        assign gmem_arb_out_if[i].req_ready = gmem_bus_if[i].req_ready;
+        assign gmem_arb_out_if[i].rsp_valid = gmem_bus_if[i].rsp_valid;
+        assign gmem_arb_out_if[i].rsp_data  = gmem_bus_if[i].rsp_data;
+        assign gmem_bus_if[i].rsp_ready     = gmem_arb_out_if[i].rsp_ready;
+    end
+`endif
 
 `ifdef DXA_MBAR_ENABLE
     VX_mem_bus_if #(
@@ -431,9 +743,34 @@ module VX_dxa_core import VX_gpu_pkg::*, VX_dxa_pkg::*; #(
         else
             dxa_busy_r <= dcr_bus_if.req_valid | (|req_bus_valid) | ~(&worker_idle);
     end
+`ifdef DXA_MBAR_ENABLE
+    assign busy = dxa_busy_r | dcr_bus_if.req_valid | (|req_bus_valid) | (fetch_state_r == FETCH_MAP);
+`else
     assign busy = dxa_busy_r | dcr_bus_if.req_valid | (|req_bus_valid);
+`endif
 
 `ifdef PERF_ENABLE
+`ifdef DXA_MBAR_ENABLE
+    // A lookup counts once: the hit after a fill is the miss's own.
+    reg [PERF_CTR_BITS-1:0] perf_tm_hits_r, perf_tm_misses_r;
+    reg tm_refill_r;
+    always @(posedge clk) begin
+        if (reset) begin
+            perf_tm_hits_r   <= '0;
+            perf_tm_misses_r <= '0;
+            tm_refill_r      <= 1'b0;
+        end else begin
+            if (idle_q)
+                tm_refill_r <= 1'b0;
+            if (tm_rsp_last)
+                tm_refill_r <= 1'b1;
+            if ((tm_pf_pop || (tm_present && q_map)) && ~tm_refill_r)
+                perf_tm_hits_r <= perf_tm_hits_r + PERF_CTR_BITS'(1);
+            if (tm_miss)
+                perf_tm_misses_r <= perf_tm_misses_r + PERF_CTR_BITS'(1);
+        end
+    end
+`endif
     always_comb begin
         dxa_perf = '0;
         for (int w = 0; w < `VX_CFG_NUM_DXA_CORES; ++w) begin
@@ -444,6 +781,10 @@ module VX_dxa_core import VX_gpu_pkg::*, VX_dxa_pkg::*; #(
             dxa_perf.gmem_latency += worker_dxa_perf[w].gmem_latency;
             dxa_perf.noslot_stalls += worker_dxa_perf[w].noslot_stalls;
         end
+    `ifdef DXA_MBAR_ENABLE
+        dxa_perf.tmap_hits   = perf_tm_hits_r;
+        dxa_perf.tmap_misses = perf_tm_misses_r;
+    `endif
     end
 `endif
 

@@ -197,6 +197,8 @@ CPA_UNIT_TEST_OBJ  := $(OBJ_DIR)/tests/cpa_unit_test.o
 CPA_UNIT_TEST      := $(DESTDIR)/cpa_unit_test
 BG_UNIT_TEST_OBJ   := $(OBJ_DIR)/tests/bg_unit_test.o
 BG_UNIT_TEST       := $(DESTDIR)/bg_unit_test
+DXA_TMAP_CORE_TEST_OBJ := $(OBJ_DIR)/tests/dxa_tmap_core_test.o
+DXA_TMAP_CORE_TEST     := $(DESTDIR)/dxa_tmap_core_test
 
 DEPS := $(OBJS:.o=.d) $(MAIN_OBJ:.o=.d) $(DXA_OOO_TEST_OBJ:.o=.d) $(RVC_TEST_OBJ:.o=.d)
 DEPS += $(DLMEM_NOC_OBJS:.o=.d) $(DLMEM_NOC_TEST_OBJ:.o=.d)
@@ -209,6 +211,7 @@ DEPS += $(DXA_COMPL_TEST_OBJ:.o=.d)
 DEPS += $(DXA_BULK_TEST_OBJ:.o=.d)
 DEPS += $(CPA_UNIT_TEST_OBJ:.o=.d)
 DEPS += $(BG_UNIT_TEST_OBJ:.o=.d)
+DEPS += $(DXA_TMAP_CORE_TEST_OBJ:.o=.d)
 
 # generate .d files alongside .o files
 CXXFLAGS += -MMD -MP -MF $(@:.o=.d)
@@ -231,7 +234,7 @@ PROJECT := simx
 VORTEX_LIB := libvortex.so
 VORTEX_GEM5_LIB := libvortex-gem5.so
 
-.PHONY: all force test-dxa-ooo test-rvc-decompress test-dlmem-noc test-cta-gang test-dlmem-xlate test-dlmem-ep test-lmem-switch test-mbar-waiters test-dxa-compl test-dxa-bulk test-cpa-unit test-bg-unit clean clean-lib clean-exe clean-obj libvortex clean-libvortex libvortex-gem5 clean-libvortex-gem5
+.PHONY: all force test-dxa-ooo test-rvc-decompress test-dlmem-noc test-cta-gang test-dlmem-xlate test-dlmem-ep test-lmem-switch test-mbar-waiters test-dxa-compl test-dxa-bulk test-cpa-unit test-bg-unit test-dxa-tmap-core clean clean-lib clean-exe clean-obj libvortex clean-libvortex libvortex-gem5 clean-libvortex-gem5
 
 ifeq ($(USE_SST), 1)
 all: $(DESTDIR)/$(PROJECT) $(DESTDIR)/$(VORTEX_LIB)
@@ -314,6 +317,10 @@ $(BG_UNIT_TEST_OBJ): $(VORTEX_HOME)/tests/unittest/bg_unit/main.cpp $(CONFIG_FIL
 	@mkdir -p $(@D)
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
+$(DXA_TMAP_CORE_TEST_OBJ): $(VORTEX_HOME)/tests/unittest/dxa_tmap_core/main.cpp $(CONFIG_FILE)
+	@mkdir -p $(@D)
+	$(CXX) $(CXXFLAGS) -c $< -o $@
+
 # Main executable
 $(DESTDIR)/$(PROJECT): $(OBJS) $(MAIN_OBJ)
 	$(CXX) $(CXXFLAGS) $^ $(LDFLAGS) -o $@
@@ -388,6 +395,12 @@ test-bg-unit: $(BG_UNIT_TEST)
 	$(BG_UNIT_TEST) $(BG_UNIT_OPTS)
 
 $(BG_UNIT_TEST): $(OBJS) $(BG_UNIT_TEST_OBJ)
+	$(CXX) $(CXXFLAGS) $^ $(LDFLAGS) -o $@
+
+test-dxa-tmap-core: $(DXA_TMAP_CORE_TEST)
+	$(DXA_TMAP_CORE_TEST) $(DXA_TMAP_CORE_OPTS)
+
+$(DXA_TMAP_CORE_TEST): $(OBJS) $(DXA_TMAP_CORE_TEST_OBJ)
 	$(CXX) $(CXXFLAGS) $^ $(LDFLAGS) -o $@
 
 # Shared library
