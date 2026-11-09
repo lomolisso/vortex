@@ -2284,3 +2284,179 @@ tests:
     touches: *dxa_tmap_touches
     env: {DRIVER: rtlsim, APP: dxa_tmap, ARGS: "-x redtype", EXPECT: "DXA tensor reduction type not supported by the map"}
     run: *expect_fail_run
+
+  # The CUDA porting layer at the ports' shape (XLEN 64, 2 cores of 4 warps x 32
+  # threads, DLMEM, A, Zacas, mbarriers, DXA, FPAMO, an L2): cuda_api calls
+  # vx_cuda.h, vx_cuda_fp.h and vx_cuda_runtime.h by their CUDA names, launches
+  # through vx::cuda::launch_kernel_ex and checks every result against a host
+  # reference written from the CUDA and PTX semantics.
+  # Cooperative-groups identity (grid, block, cluster, tile ranks and sizes, map_shared_rank,
+  # invoke_one) for a 1D and a 2D cluster of 2 and a launch without a cluster.
+  - id: cuda_api-cg
+    app: cuda_api
+    drivers: [simx, rtlsim]
+    configs+: "-DVX_CFG_EXT_DXA_ENABLE -DVX_CFG_EXT_ZACAS_ENABLE -DVX_CFG_EXT_FPAMO_ENABLE"
+    shape: {cores: 2, threads: 32, l2cache: true}
+    touches: &cuda_api_touches [sw/kernel/include/vx_cuda.h, sw/runtime/include/vx_cuda_runtime.h,
+              sw/common/vx_cuda_fp.h, tests/regression/cuda_api, sw/kernel/include/vx_intrinsics.h,
+              sw/kernel/include/vx_spawn2.h, sw/kernel/include/vx_atomic.h, sw/kernel/include/vx_cp_async.h,
+              sw/kernel/include/vx_dxa.h, sw/kernel/include/vx_mbar.h, sw/kernel/include/vx_dlmem.h,
+              sw/kernel/include/vx_print.h, sw/runtime/include/vortex2.h, sw/runtime/include/dxa.h,
+              sw/runtime/common, sw/common/dxa_tmap.h, sw/common/dxa_meta.h, sw/common/dlmem_ref.h,
+              hw/rtl/dxa, sim/simx/dxa, hw/rtl/core/VX_alu_int.sv, sim/simx/alu_unit.cpp,
+              hw/rtl/core/VX_mem_unit.sv, hw/rtl/mem/VX_local_mem.sv, hw/rtl/core/VX_cta_dispatch.sv,
+              hw/rtl/core/VX_core.sv, hw/rtl/core/VX_execute.sv, hw/rtl/core/VX_sfu_unit.sv,
+              hw/rtl/core/VX_wctl_unit.sv, hw/rtl/core/VX_bar_unit.sv, hw/rtl/VX_socket.sv,
+              hw/rtl/VX_gpu_pkg.sv, hw/rtl/VX_define.vh, hw/rtl/cache, hw/rtl/dlmem,
+              hw/rtl/mem/VX_lmem_switch.sv, hw/rtl/VX_kmu.sv, hw/rtl/VX_cluster.sv, hw/rtl/interfaces,
+              hw/rtl/core/VX_scheduler.sv, hw/rtl/core/VX_decode.sv, hw/rtl/core/VX_lsu_slice.sv,
+              hw/rtl/core/VX_lsu_unit.sv, hw/rtl/core/VX_bg_unit.sv, hw/rtl/core/VX_cpa_unit.sv,
+              hw/rtl/core/VX_csr_unit.sv, hw/rtl/core/VX_csr_data.sv, hw/rtl/mem/VX_gbar_unit.sv,
+              sim/simx/mem, sim/simx/core, sim/simx/socket, sim/simx/cta_dispatcher, sim/simx/types.h,
+              sim/simx/instr.h, sim/simx/decode.cpp, sim/simx/mbar_waiters, sim/simx/amo,
+              sim/simx/scheduler, sim/simx/barrier_unit, sim/simx/sfu_unit, sim/simx/lsu_unit,
+              sim/simx/bg_unit, sim/simx/cpa_unit, sim/simx/csr_unit.cpp, sim/simx/Makefile,
+              sim/simx/dlmem, sim/simx/kmu, sim/simx/cluster, VX_config.toml, VX_types.toml]
+    args: "-m cg"
+  # The same identity for a 3D cluster shape (1, 1, 2) on a 3D grid.
+  - id: cuda_api-cg3d
+    app: cuda_api
+    drivers: [simx, rtlsim]
+    configs+: "-DVX_CFG_EXT_DXA_ENABLE -DVX_CFG_EXT_ZACAS_ENABLE -DVX_CFG_EXT_FPAMO_ENABLE"
+    shape: {cores: 2, threads: 32, l2cache: true}
+    touches: *cuda_api_touches
+    args: "-m cg -c 1,1,2"
+  # Every shuffle x width x lane/delta x type, votes in divergent branches, elect_sync,
+  # __reduce_*_sync, __match_*_sync, the lane masks and the thread_block_tile<32> members.
+  - id: cuda_api-warp
+    app: cuda_api
+    drivers: [simx, rtlsim]
+    configs+: "-DVX_CFG_EXT_DXA_ENABLE -DVX_CFG_EXT_ZACAS_ENABLE -DVX_CFG_EXT_FPAMO_ENABLE"
+    shape: {cores: 2, threads: 32, l2cache: true}
+    touches: *cuda_api_touches
+    args: "-m warp"
+  # Every atomicX op and type on global memory, the block's own local memory and the peer's
+  # through the cluster window, from every thread; final values and old values (a serialization must
+  # exist); the _block and _system forms once each.
+  - id: cuda_api-atomic
+    app: cuda_api
+    drivers: [simx, rtlsim]
+    configs+: "-DVX_CFG_EXT_DXA_ENABLE -DVX_CFG_EXT_ZACAS_ENABLE -DVX_CFG_EXT_FPAMO_ENABLE"
+    shape: {cores: 2, threads: 32, l2cache: true}
+    touches: *cuda_api_touches
+    args: "-m atomic"
+  # cuda::barrier over 8 phases with an arrive_and_drop, barrier_arrive_tx / barrier_expect_tx
+  # with memcpy_async_tx at 3 sizes, cuda::memcpy_async aligned and unaligned.
+  - id: cuda_api-barrier
+    app: cuda_api
+    drivers: [simx, rtlsim]
+    configs+: "-DVX_CFG_EXT_DXA_ENABLE -DVX_CFG_EXT_ZACAS_ENABLE -DVX_CFG_EXT_FPAMO_ENABLE"
+    shape: {cores: 2, threads: 32, l2cache: true}
+    touches: *cuda_api_touches
+    args: "-m barrier"
+  # Every cuda::ptx name with its effect: mbarriers, fences, bulk and tensor copies, stores and
+  # reductions, prefetches, the cluster ops and tensormap.replace.
+  - id: cuda_api-ptx
+    app: cuda_api
+    drivers: [simx, rtlsim]
+    configs+: "-DVX_CFG_EXT_DXA_ENABLE -DVX_CFG_EXT_ZACAS_ENABLE -DVX_CFG_EXT_FPAMO_ENABLE"
+    shape: {cores: 2, threads: 32, l2cache: true}
+    touches: *cuda_api_touches
+    args: "-m ptx"
+  # __syncthreads_count/and/or over 4 predicates, 3 times back to back; __syncwarp ordering in
+  # global and local memory.
+  - id: cuda_api-sync
+    app: cuda_api
+    drivers: [simx, rtlsim]
+    configs+: "-DVX_CFG_EXT_DXA_ENABLE -DVX_CFG_EXT_ZACAS_ENABLE -DVX_CFG_EXT_FPAMO_ENABLE"
+    shape: {cores: 2, threads: 32, l2cache: true}
+    touches: *cuda_api_touches
+    args: "-m sync"
+  # The number types (vx_cuda_fp.h) on the device equal the host, bit for bit, on 512 inputs.
+  - id: cuda_api-types
+    app: cuda_api
+    drivers: [simx, rtlsim]
+    configs+: "-DVX_CFG_EXT_DXA_ENABLE -DVX_CFG_EXT_ZACAS_ENABLE -DVX_CFG_EXT_FPAMO_ENABLE"
+    shape: {cores: 2, threads: 32, l2cache: true}
+    touches: *cuda_api_touches
+    args: "-m types"
+  # launch_kernel_ex with __cluster_dims__, func_set_attribute and a launch at the limit, the
+  # occupancy and tensor-map wrappers.
+  - id: cuda_api-launch
+    app: cuda_api
+    drivers: [simx, rtlsim]
+    configs+: "-DVX_CFG_EXT_DXA_ENABLE -DVX_CFG_EXT_ZACAS_ENABLE -DVX_CFG_EXT_FPAMO_ENABLE"
+    shape: {cores: 2, threads: 32, l2cache: true}
+    touches: *cuda_api_touches
+    args: "-m launch"
+  # A launch whose cluster is not the kernel's __cluster_dims__ traps at the
+  # kernel entry (x1). The kernel's vx_printf text is lost when the simulator
+  # stops, so the run must print the host marker and then the trap line, in
+  # that order. The shape goes in CONFIGS, so the run reuses the prebuilt driver.
+  - id: cuda_api-x1
+    via: script
+    driver: simx
+    configs+: "-DVX_CFG_EXT_DXA_ENABLE -DVX_CFG_EXT_ZACAS_ENABLE -DVX_CFG_EXT_FPAMO_ENABLE -DVX_CFG_NUM_CORES=2 -DVX_CFG_NUM_THREADS=32 -DVX_CFG_L2_ENABLE"
+    touches: *cuda_api_touches
+    env: {DRIVER: simx, APP: cuda_api, ARGS: "-x 1", MARKER: "cuda_api: x1 marker:", EXPECT: "invalid CSR read addr=0xc00"}
+    run: &cuda_expect_trap_run |
+      set -u
+      tmp=$(mktemp -d)
+      if ! make -C sw/runtime/"$DRIVER" > "$tmp/build.log" 2>&1 \
+         || ! make -C tests/regression/"$APP" >> "$tmp/build.log" 2>&1; then
+        echo "FAIL: the build failed with CONFIGS=${CONFIGS:-}"; tail -n 20 "$tmp/build.log"
+        rm -rf "$tmp"; exit 1
+      fi
+      timeout 120 ./ci/blackbox.sh --driver="$DRIVER" --app="$APP" --args="$ARGS" > "$tmp/run.log" 2>&1
+      rc=$?
+      m=$(grep -nF -m1 "$MARKER" "$tmp/run.log" | cut -d: -f1)
+      e=$(grep -nF -m1 "$EXPECT" "$tmp/run.log" | cut -d: -f1)
+      fail=0
+      if [ $rc -eq 0 ]; then
+        echo "FAIL: '$ARGS' ran to completion on $DRIVER"; fail=1
+      elif [ $rc -eq 124 ]; then
+        echo "FAIL: '$ARGS' timed out on $DRIVER"; fail=1
+      elif [ -z "$m" ] || [ -z "$e" ] || [ "$m" -ge "$e" ]; then
+        echo "FAIL: '$ARGS' failed on $DRIVER (exit $rc) without '$MARKER' then '$EXPECT'"; fail=1
+      else
+        echo "OK: '$ARGS' stops $DRIVER (exit $rc) after the marker: $(grep -F -m1 "$EXPECT" "$tmp/run.log")"
+      fi
+      [ $fail -eq 0 ] || tail -n 20 "$tmp/run.log"
+      rm -rf "$tmp"
+      exit $fail
+  - id: cuda_api-x1
+    via: script
+    driver: rtlsim
+    configs+: "-DVX_CFG_EXT_DXA_ENABLE -DVX_CFG_EXT_ZACAS_ENABLE -DVX_CFG_EXT_FPAMO_ENABLE -DVX_CFG_NUM_CORES=2 -DVX_CFG_NUM_THREADS=32 -DVX_CFG_L2_ENABLE"
+    touches: *cuda_api_touches
+    env: {DRIVER: rtlsim, APP: cuda_api, ARGS: "-x 1", MARKER: "cuda_api: x1 marker:", EXPECT: "invalid CSR write address: c00"}
+    run: *cuda_expect_trap_run
+  # launch_kernel_ex refuses, with VX_ERR_INVALID_VALUE and before any launch,
+  # dynamic shared memory past the recorded attribute (x2) and an explicit
+  # cluster other than __cluster_dims__ (x3); each first launches its compliant
+  # twin. Host-only refusals: simx only.
+  - id: cuda_api-x2
+    via: script
+    driver: simx
+    configs+: "-DVX_CFG_EXT_DXA_ENABLE -DVX_CFG_EXT_ZACAS_ENABLE -DVX_CFG_EXT_FPAMO_ENABLE -DVX_CFG_NUM_CORES=2 -DVX_CFG_NUM_THREADS=32 -DVX_CFG_L2_ENABLE"
+    touches: *cuda_api_touches
+    env: {DRIVER: simx, APP: cuda_api, ARGS: "-x 2", EXPECT: "dynamic shared memory 8192 over the kernel's limit 4096: VX_ERR_INVALID_VALUE"}
+    run: *expect_fail_run
+  - id: cuda_api-x3
+    via: script
+    driver: simx
+    configs+: "-DVX_CFG_EXT_DXA_ENABLE -DVX_CFG_EXT_ZACAS_ENABLE -DVX_CFG_EXT_FPAMO_ENABLE -DVX_CFG_NUM_CORES=2 -DVX_CFG_NUM_THREADS=32 -DVX_CFG_L2_ENABLE"
+    touches: *cuda_api_touches
+    env: {DRIVER: simx, APP: cuda_api, ARGS: "-x 3", EXPECT: "differs from __cluster_dims__ (2, 1, 1): VX_ERR_INVALID_VALUE"}
+    run: *expect_fail_run
+  # Parity at the ports' shape: warp shuffles and reductions and integer atomics
+  # (single AMOs, no CAS loop, no spin-wait), so the instruction count does not
+  # depend on timing.
+  - id: parity-cuda-warp
+    check: model_parity
+    app: cuda_api
+    xlen: [64]
+    configs+: "-DVX_CFG_EXT_DXA_ENABLE -DVX_CFG_EXT_ZACAS_ENABLE -DVX_CFG_EXT_FPAMO_ENABLE"
+    shape: {cores: 2, threads: 32, l2cache: true}
+    touches: *cuda_api_touches
+    args: "-p"

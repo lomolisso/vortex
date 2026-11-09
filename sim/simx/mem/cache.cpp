@@ -634,16 +634,12 @@ public:
   // commits it, not one.
   static constexpr uint32_t MEM_REQ_DELAY = 2;
 
-  // Non-LLC AMO passthrough table capacity. Also partitions the memory-side
-  // tag namespace and counts toward the response-sink credit on mem_rsp_in.
-  static constexpr uint32_t AMO_PASSTHRU_CAP = 8;
-
   SimChannel<MemReq> core_req_in;
   SimChannel<MemRsp> core_rsp_out;
 
   SimChannel<MemReq> mem_req_out;
   // Sized to sink every response this bank can solicit (one per MSHR fill
-  // plus one per AMO passthrough probe). A memory response must never
+  // plus one per AMO passthrough table entry). A memory response must never
   // back-pressure its sender: if it can, the request and response channels
   // deadlock through each other across cache levels — this bank's pipe head
   // stalls on a full mem_req_out while the downstream cache's pipe head
@@ -655,7 +651,7 @@ public:
             const Cache::Config &config,
             const params_t &params,
             uint32_t bank_id)
-      : SimObject<CacheBank>(ctx, name), core_req_in(this), core_rsp_out(this), mem_req_out(this), mem_rsp_in(this, config.mshr_size + AMO_PASSTHRU_CAP), config_(config), params_(params), bank_id_(bank_id), sets_(params.sets_per_bank, set_t(params.lines_per_set, params.sectors_per_line)), mshr_(config.mshr_size), pipe_req_(TFifo<bank_req_t>::Create("", config.latency)), rand_ctr_(0), adm_seq_ctr_(0)
+      : SimObject<CacheBank>(ctx, name), core_req_in(this), core_rsp_out(this), mem_req_out(this), mem_rsp_in(this, 2 * config.mshr_size), config_(config), params_(params), bank_id_(bank_id), sets_(params.sets_per_bank, set_t(params.lines_per_set, params.sectors_per_line)), mshr_(config.mshr_size), pipe_req_(TFifo<bank_req_t>::Create("", config.latency)), rand_ctr_(0), adm_seq_ctr_(0)
 #if VX_CFG_EXT_A_ENABLED
       , amo_unit_(__MAX(2u, (uint32_t)VX_CFG_AMO_RS_SIZE))
 #endif
@@ -799,6 +795,7 @@ protected:
     for (auto &e : amo_passthru_) {
       e = amo_passthru_entry_t{};
     }
+    amo_passthru_live_ = 0;
 #endif
   }
 
@@ -936,7 +933,7 @@ private:
       // the AmoProbe handler — that namespace partition survives
       // arbiter tag mangling.
       if (mem_rsp.tag >= amo_passthru_tag_base()
-       && mem_rsp.tag <  amo_passthru_tag_base() + AMO_PASSTHRU_CAP) {
+       && mem_rsp.tag <  amo_passthru_tag_base() + amo_passthru_.size()) {
         uint32_t pid = mem_rsp.tag - amo_passthru_tag_base();
         auto &e = amo_passthru_.at(pid);
         assert(e.valid && "AMO passthru response without entry");
@@ -948,6 +945,7 @@ private:
         this->core_rsp_out.send(core_rsp);
         DT(3, this->name() << " amo-passthru-rsp: " << core_rsp);
         e.valid = false;
+        --amo_passthru_live_;
         this->mem_rsp_in.pop();
         --pending_fill_reqs_;
         return;
@@ -986,26 +984,17 @@ private:
 #else
 #line 922
 #endif
-      // Conservative MSHR occupancy check: any request that may miss must
-      // reserve a slot. Counts both currently-allocated entries and
-      // in-flight pipe requests that haven't reached MSHR allocation yet.
-      // AMO requests always need a return; at the LLC they reserve like
-      // a load; at non-LLC they don't fill so no MSHR slot is needed
-      // but a passthru side-table slot is.
+      // Conservative MSHR occupancy check: every request reserves a slot at
+      // admission. Counts the allocated entries, the in-flight pipe requests
+      // that haven't reached MSHR allocation yet, and the forwarded non-LLC
+      // atomics: the hardware forwards those through MSHR entries, so they
+      // share one limit with the misses.
       const bool is_amo = memop_is_amo(core_req.op);
+      uint32_t mshr_occupancy = mshr_.size() + pending_mshr_size_;
 #if VX_CFG_EXT_A_ENABLED
+      mshr_occupancy += amo_passthru_live_ + pending_amo_probes_;
       const bool is_amo_passthru = is_amo && !config_.is_llc;
       if (is_amo_passthru) {
-        // Reserve a passthru-table slot at admission, counting probes still
-        // in the pipe. A probe that reaches the pipe head with no free slot
-        // cannot retire, and a full pipe blocks the response processing that
-        // frees slots — a deadlock the input gate must make unreachable.
-        uint32_t free_slots = 0;
-        for (const auto &e : amo_passthru_) { if (!e.valid) ++free_slots; }
-        if (free_slots <= pending_amo_probes_) {
-          ++perf_stats_.mshr_stalls;
-          return;
-        }
         // Age-ordering: if a fill is in flight for this AMO's line, an
         // older load/store missed on it and is awaiting its replay. Defer
         // the AMO until that access completes — otherwise the AMO's
@@ -1033,13 +1022,16 @@ private:
 #else
       const bool is_amo_passthru = false;
 #endif
-      // Gate ALL non-AMO-passthru requests on MSHR occupancy because a
-      // write-through store can need a wt-merge MSHR slot if a fill is
-      // pending on the same line. Letting writes in past a full MSHR
-      // causes them to stall on the wt-merge enqueue, blocking fill
-      // responses from draining — a deadlock. Reserve at admission.
-      bool needs_mshr = !is_amo_passthru;
-      if (needs_mshr && (mshr_.size() + pending_mshr_size_) >= mshr_.capacity()) {
+      // Gate ALL requests on MSHR occupancy because a write-through store
+      // can need a wt-merge MSHR slot if a fill is pending on the same line.
+      // Letting writes in past a full MSHR causes them to stall on the
+      // wt-merge enqueue, blocking fill responses from draining — a
+      // deadlock. Reserve at admission. The same gate reserves a
+      // passthru-table slot (one per MSHR entry) for each probe still in
+      // the pipe: a probe that reaches the pipe head with no free slot
+      // cannot retire, and a full pipe blocks the response processing that
+      // frees slots — a deadlock the input gate must make unreachable.
+      if (mshr_occupancy >= mshr_.capacity()) {
         ++perf_stats_.mshr_stalls;
         return;
       }
@@ -1147,8 +1139,8 @@ private:
       DT(3, this->name() << " core-req: " << core_req);
       // pending_mshr_size_ tracks Core-typed in-flight requests so the
       // MSHR pre-reservation in processInputs is conservative. AmoProbe
-      // doesn't allocate an MSHR slot (no fill on the response), so it
-      // stays out of this counter.
+      // takes a passthru-table slot instead (no fill on the response) and
+      // is counted by pending_amo_probes_.
       if (!is_amo_passthru) {
         ++pending_mshr_size_;
         pipe_core_lines_.emplace_back(params_.addr_set_id(core_req.addr),
@@ -1537,11 +1529,11 @@ private:
         return; // stall
       }
       // Pre-allocate a passthru-table slot before mutating state.
-      uint32_t pid = AMO_PASSTHRU_CAP;
-      for (uint32_t i = 0; i < AMO_PASSTHRU_CAP; ++i) {
+      uint32_t pid = amo_passthru_.size();
+      for (uint32_t i = 0; i < amo_passthru_.size(); ++i) {
         if (!amo_passthru_.at(i).valid) { pid = i; break; }
       }
-      if (pid == AMO_PASSTHRU_CAP) {
+      if (pid == amo_passthru_.size()) {
         // Unreachable: admission reserves a slot per in-pipe probe. Kept as
         // a defensive stall.
         return;
@@ -1571,6 +1563,7 @@ private:
       e.req_tag = bank_req.req_tag;
       e.cid     = bank_req.hart_id;
       e.uuid    = bank_req.uuid;
+      ++amo_passthru_live_;
       MemReq amo_fwd;
       amo_fwd.addr   = bank_req.addr;
       // op already set below; default-construct sets MemOp::LD which we override.
@@ -2290,8 +2283,11 @@ private:
   // Non-LLC AMO passthrough table. When config_.is_llc==false, AMOs
   // probe-and-invalidate the local line, forward the MemReq downstream,
   // and route the response straight to core_rsp_out without a fill.
+  // One slot per MSHR entry: the hardware forwards each atomic through an
+  // MSHR entry, and the admission gate counts the live slots against the
+  // MSHR capacity.
   // Tag namespace is partitioned: fill responses use [0, mshr_capacity),
-  // passthru responses use [mshr_capacity, mshr_capacity + AMO_PASSTHRU_CAP).
+  // passthru responses use [mshr_capacity, 2 * mshr_capacity).
   // Arbiters add bits at the LSB, preserving the partition across the round-trip.
   struct amo_passthru_entry_t {
     bool     valid   = false;
@@ -2299,7 +2295,8 @@ private:
     uint32_t cid     = 0;
     uint64_t uuid    = 0;
   };
-  std::array<amo_passthru_entry_t, AMO_PASSTHRU_CAP> amo_passthru_;
+  std::vector<amo_passthru_entry_t> amo_passthru_ = std::vector<amo_passthru_entry_t>(config_.mshr_size);
+  uint32_t amo_passthru_live_ = 0;
   uint32_t amo_passthru_tag_base() const { return mshr_.capacity(); }
 #endif
 

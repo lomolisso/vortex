@@ -58,9 +58,11 @@ extern "C" {
 // 1D and 2D: all rs2 lanes are zero, so rs2 = x0 (no second vx_wgather).
 // 3D–5D: rs2 carries coord2..coord4, requiring a second vx_wgather.
 //
-// The issue may come from the whole warp or from one elected thread, as long
-// as thread 0 of the warp is active: it is the wgather source lane, and the
-// gather fills lanes 1-3 even when they are inactive.
+// Issue from a converged warp (thread 0, the wgather source lane, active):
+// the gather writes its destination in lanes 1-3 even when they are inactive,
+// so inside a divergent branch it can overwrite a value that a parked lane
+// still holds in that register. A partial warp issues through vx_cuda.h,
+// which packs the operands in registers the build reserves.
 
 inline uint32_t vx_dxa_pack_meta(uint32_t desc_slot, uint32_t barrier_id) {
   return (barrier_id << 4) | desc_slot;

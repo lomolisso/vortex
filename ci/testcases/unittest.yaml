@@ -180,6 +180,16 @@ tests:
     run: "make -C tests/unittest/dxa_tmap run"
     touches: [sw/common/dxa_tmap.h, sw/common/dxa_meta.h, sw/common/dxa_ref.h, sw/common/amo_ref.h,
               sw/runtime/include/dxa.h, tests/unittest/dxa_tmap]
+  # CUDA's f16/bf16/e4m3 types and f32 intrinsics (vx_cuda_fp.h): every f16
+  # and bf16 pattern widened and back, f32/f64/int narrowing around every
+  # midpoint, the arithmetic on specials and random operands against softfloat
+  # (bf16 through f128 round-to-odd), fma with far-apart addends, the e4m3
+  # table, __frsqrt_rn exhaustive on [1, 4), the approx forms within bounds.
+  - id: sw-cuda-fp
+    via: script
+    xlen: [64]
+    run: "make -C tests/unittest/cuda_fp run"
+    touches: [sw/common/vx_cuda_fp.h, tests/unittest/cuda_fp]
   # The SimX twin of the bulk async-group unit, with the same cycle rules.
   - id: sw-bg-unit
     via: script
