@@ -89,12 +89,6 @@ protected:
 		return !main.peek().flags.dma && !cpa_last_[i];
 	}
 
-	// The request the bank would start this cycle, if any.
-	const MemReq* bank_head(uint32_t i, bool held) const {
-		const auto& q = this->cpa_turn(i, held) ? cpa_xbar_->ReqOut.at(i) : mem_xbar_->ReqOut.at(i);
-		return q.empty() ? nullptr : &q.peek();
-	}
-
 	// The bank's request this cycle; only a grant of the two-input round-robin
 	// moves it, not a DMA request.
 	SimChannel<MemReq>& bank_queue(uint32_t i, bool held) {
@@ -363,11 +357,7 @@ private:
 				if (is_dxa_write(req) && req.flags.dxa_notify_done) {
 					++dxa_fwd_finals_;
 				}
-#ifdef DXA_MBAR_ENABLE
-				if (req.flags.dma && req.dxa.remote) {
-					++row_words_;
-				}
-#else
+#ifndef DXA_MBAR_ENABLE
 #line 201
 #endif
 			});
@@ -384,7 +374,6 @@ private:
 		row_words_       = 0;
 		bulk_port_.clear();
 		bulk_fwd_finals_ = 0;
-		bulk_hold_       = 0;
 #else
 #line 211
 #endif
@@ -447,10 +436,14 @@ private:
 
 	bool dxa_gate_admit(uint32_t input, const MemReq& req) const {
 #ifdef DXA_MBAR_ENABLE
-		// The row port is a DMA port; a unit without one leaves it at 0.
-		if (input >= config_.dma_begin && input == config_.dxa_row_port
-		 && (this->dxa_row_wait() || this->dxa_row_amo_wait(req)))
+		// The row port is a DMA port; a unit without one leaves it at 0. A
+		// peer's word takes the DMA port, not the crossbar.
+		if (input >= config_.dma_begin && input == config_.dxa_row_port) {
+			if (!this->dxa_row_wait()) {
+				const_cast<Impl*>(this)->bulk_take(input, req);
+			}
 			return false;
+		}
 		// A copy's completion follows its words into the banks.
 		if (row_words_ != 0 && req.dxa.remote && req.op == MemOp::MBAR_COMPLETE_TX)
 			return false;
@@ -486,20 +479,8 @@ private:
 		return false;
 	}
 
-	// The RTL's DMA port refuses a write while the bank has an atomic in flight,
-	// which keeps a peer's word at the ingress and the flits behind it waiting.
-	// A word forwarded now meets its bank next cycle: the in-flight atomic must
-	// have written back by then, and none may start this cycle.
-	bool dxa_row_amo_wait(const MemReq& req) const {
-		const uint32_t bank = uint32_t(req.addr >> log2ceil(config_.line_size)) & ((1u << config_.B) - 1);
-		if (amo_busy_[bank] != 0)
-			return amo_busy_[bank] > 1;
-		const MemReq* head = this->bank_head(bank, (bulk_hold_ >> bank) & 1);
-		return head && (memop_is_atomic(head->op) || memop_is_mbar(head->op));
-	}
-
 	std::vector<SimChannel<MemReq>>* dxa_inputs_ = nullptr;
-	uint32_t row_words_ = 0;    // a peer's words forwarded to a bank and not yet committed
+	uint32_t row_words_ = 0;    // a peer's words the DMA port took and has not yet committed
 
 	// A bulk copy's DMA access, the RTL's DMA port at once on every bank it
 	// touches: a read every bank, a write those its bytes do.
@@ -522,12 +503,13 @@ private:
 		return banks;
 	}
 
-	// The RTL's DMA port: one bulk access at a time, straight at the banks and
-	// ahead of the requests the crossbar has buffered for them. While it waits
-	// for an atomic in flight on one of its banks to write back, it holds LSU
-	// requests off all of them, so the wait is at most the atomic's. An access
-	// the crossbar would grant now reaches the port next cycle, as a grant
-	// reaches its bank; the one behind it waits in the engine's buffer.
+	// The RTL's DMA port: one access at a time, a bulk access or a peer's word,
+	// straight at the banks and ahead of the requests the crossbar has buffered
+	// for them. While it waits for an atomic in flight on one of its banks to
+	// write back, it holds LSU requests off all of them, so no atomic starts
+	// under it and the wait is at most the atomic's. An access the crossbar
+	// would grant now reaches the port next cycle, as a grant reaches its bank;
+	// the one behind it waits in the engine's buffer.
 	void bulk_take(uint32_t input, const MemReq& req) {
 		// A row wider than a block comes as one access per block, side by side.
 		const uint32_t row_blocks = std::max<uint32_t>(1, (config_.line_size << config_.B) / VX_CFG_MEM_BLOCK_SIZE);
@@ -546,13 +528,16 @@ private:
 		if (is_dxa_write(e.req) && e.req.flags.dxa_notify_done) {
 			++bulk_fwd_finals_;
 		}
+		if (e.req.dxa.remote) {
+			++row_words_;
+		}
 		bulk_port_.push_back(e);
 		dxa_inputs_->at(input).pop();
 	}
 
-	// Whether the port presents an access next cycle, when a word forwarded
-	// now meets its bank: one taken this cycle, one behind the head, or a head
-	// an atomic still holds off then.
+	// Whether the port presents an access next cycle, when a peer's word taken
+	// now reaches it: one taken this cycle, one behind the head, or a head an
+	// atomic still holds off then.
 	bool bulk_port_next() const {
 		if (bulk_port_.empty())
 			return false;
@@ -620,7 +605,7 @@ private:
 			out.send(rsp, 1);
 		}
 		DT(4, simobject_->name() << "-bank" << (uint32_t(req.addr >> log2ceil(config_.line_size)) & ((1u << config_.B) - 1))
-		   << " bulk : " << req);
+		   << (req.dxa.remote ? " row : " : " bulk : ") << req);
 		perf_stats_.reads  += !req.is_write();
 		perf_stats_.writes += req.is_write();
 		return true;
@@ -633,8 +618,6 @@ private:
 	};
 	std::deque<BulkAccess> bulk_port_;
 	uint32_t bulk_fwd_finals_ = 0;   // final writes taken by the port, counted from the next cycle
-	// The banks the port holds next cycle, as far as this one knows.
-	uint64_t bulk_hold_ = 0;
 #else
 #line 271
 #endif
@@ -650,7 +633,6 @@ public:
 		uint32_t num_banks = (1 << config_.B);
 #ifdef DXA_MBAR_ENABLE
 		const uint64_t bulk_banks = this->bulk_port_tick();
-		bulk_hold_ = bulk_port_.empty() ? 0 : bulk_port_.front().banks;
 #elif defined(VX_CFG_EXT_DXA_ENABLE)
 #line 281
 #elif defined(VX_CFG_EXT_MBAR_ENABLE)

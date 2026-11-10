@@ -79,9 +79,9 @@ void DlmemIngress::check_slot(const DlmemReqPkt& pkt) const {
 // The RTL ingress hands a DATA word straight to the local memory's DMA port,
 // whose acceptance is the bank commit, and takes nothing behind it until then.
 // Here the word leaves in the cycle it is taken, and the next flit waits until
-// the local memory's crossbar has moved it into its bank's queue, ahead of
-// any later access to that bank; the crossbar holds it while an atomic owns
-// the bank, and holds the COMPL's complete_tx until the words are written.
+// the local memory's DMA port has taken it; the port holds the word's bank
+// ahead of every queued access, waits there only for an atomic in flight,
+// and the crossbar holds the COMPL's complete_tx until the words are written.
 bool DlmemIngress::accept_dxa(const DlmemReqPkt& pkt) {
   const bool compl_flit = pkt.flags.amo_unsigned;
   if (LmemDmaOut.size() != 0)

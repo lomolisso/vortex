@@ -2460,3 +2460,914 @@ tests:
     shape: {cores: 2, threads: 32, l2cache: true}
     touches: *cuda_api_touches
     args: "-p"
+
+  # The 29 DSMEM collectives of the H100 study (h100-dsmem-collectives/collectives, commit
+  # 2b9a97e), one app at the ports' shape: N cores of one cluster (one block of 8 warps x 32
+  # threads per core), an L2, DLMEM, A, Zacas, mbarriers, DXA, FPAMO and 256 KB of local memory.
+  # N, M and the element type are compile-time, as on the H100: COLL_N, COLL_M and COLL_T reach
+  # the app build through env (the app rebuilds when they change; they stay out of CONFIGS, the
+  # simulator build key). Each run checks every rep against a host reference: pattern A (small
+  # integers) is bit-exact for every op, pattern B (-p B, random floats) is within a log2(N)
+  # tolerance for the reduce ops. Smoke: every algorithm at N=4, M=1024 (the N=2-only pairwise
+  # exchange at N=2).
+  - id: dsmem_coll-allgather__bruck
+    app: dsmem_collectives
+    drivers: [simx]
+    configs+: &dsmem_coll_cfg "-DVX_CFG_EXT_ZACAS_ENABLE -DVX_CFG_EXT_DXA_ENABLE -DVX_CFG_EXT_FPAMO_ENABLE -DVX_CFG_LMEM_LOG_SIZE=18"
+    shape: &dsmem_coll_n4 {cores: 4, warps: 8, threads: 32, l2cache: true}
+    env: &dsmem_coll_n4_m1024 {COLL_N: "4", COLL_M: "1024", COLL_T: f32}
+    touches: &dsmem_coll_touches [tests/regression/dsmem_collectives, sw/kernel/include/vx_cuda.h,
+              sw/kernel/include/vx_dlmem.h, sw/kernel/include/vx_mbar.h, sw/kernel/include/vx_dxa.h,
+              sw/runtime/include/vx_cuda_runtime.h, sw/common/vx_cuda_fp.h,
+              hw/rtl/mem/VX_local_mem.sv, hw/rtl/core/VX_decode.sv, hw/rtl/VX_gpu_pkg.sv,
+              hw/rtl/VX_define.vh, hw/rtl/dlmem, hw/rtl/core/VX_lsu_slice.sv,
+              hw/rtl/core/VX_mem_unit.sv, hw/rtl/core/VX_core.sv, sim/simx/types.h,
+              sim/simx/decode.cpp, sim/simx/amo, sim/simx/lsu_unit, sim/simx/dlmem, sim/simx/core,
+              sim/simx/processor.cpp, sw/common/mbar_ref.h, tests/regression/mbar_local,
+              VX_config.toml, hw/rtl/core/VX_wctl_unit.sv,
+              sw/common/dxa_tmap.h, hw/rtl/mem/VX_lmem_switch.sv, hw/rtl/core/VX_lsu_unit.sv,
+              hw/rtl/core/VX_scheduler.sv, sw/common/dlmem_ref.h, hw/rtl/dxa, hw/rtl/VX_kmu.sv,
+              hw/rtl/Vortex.sv, hw/rtl/VX_cluster.sv, hw/rtl/core/VX_cta_dispatch.sv,
+              hw/rtl/core/VX_csr_data.sv, hw/rtl/core/VX_kmu_bus_arb.sv, hw/rtl/core/VX_bar_unit.sv,
+              hw/rtl/mem/VX_gbar_unit.sv, hw/rtl/core/VX_execute.sv,
+              hw/rtl/cp/VX_cp_axil_regfile.sv, hw/rtl/VX_socket.sv, sim/simx/kmu,
+              sim/simx/cta_dispatcher, sim/simx/scheduler, sim/simx/csr_unit.cpp, sim/simx/cluster,
+              sim/simx/barrier_unit, sim/common/cmd_processor.cpp, sim/simx/wctl_unit.cpp,
+              sim/simx/socket, sw/kernel/include/vx_spawn2.h, tests/regression/cluster_rank,
+              tests/regression/cta_gang, tests/regression/cluster_sync,
+              tests/regression/dlmem_local, tests/regression/dlmem_store,
+              tests/regression/dlmem_load, tests/regression/dlmem_atomic,
+              tests/regression/dlmem_stress, tests/regression/lmem_bar_order,
+              tests/regression/dlmem_amo_order, VX_types.toml, hw/rtl/core/VX_uop_sequencer.sv,
+              sim/simx/sequencer, hw/rtl/core/VX_cpa_unit.sv, sim/simx/cpa_unit,
+              hw/rtl/VX_trace_pkg.sv, sim/simx/instr.h, hw/rtl/cache, hw/rtl/tcu, sim/simx/tcu,
+              sw/kernel/include/vx_tensor.h, tests/regression/sgemm_tcu_wg_mbar,
+              tests/regression/sgemm_tcu_mx_mbar, sim/simx/mbar_waiters, sim/simx/Makefile,
+              tests/regression/mbar_wait, tests/regression/mbar_remote, sw/common/dxa_ref.h,
+              sw/common/dxa_meta.h, hw/rtl/core/VX_bg_unit.sv, hw/rtl/core/VX_sfu_unit.sv,
+              sim/simx/bg_unit, sim/simx/sfu_unit, tests/regression/cuda_api,
+              sw/kernel/include/vx_intrinsics.h, sw/kernel/include/vx_atomic.h,
+              sw/kernel/include/vx_cp_async.h, sw/kernel/include/vx_print.h,
+              sw/runtime/include/vortex2.h, sw/runtime/include/dxa.h, sw/runtime/common,
+              sim/simx/dxa, hw/rtl/core/VX_alu_int.sv, sim/simx/alu_unit.cpp, hw/rtl/interfaces,
+              hw/rtl/core/VX_csr_unit.sv, sim/simx/mem, sw/kernel/include/vx_barrier.h,
+              sw/runtime/include/vortex.h]
+    args: "-a allgather__bruck"
+  - id: dsmem_coll-allgather__direct_pull
+    app: dsmem_collectives
+    drivers: [simx]
+    configs+: *dsmem_coll_cfg
+    shape: *dsmem_coll_n4
+    env: *dsmem_coll_n4_m1024
+    touches: *dsmem_coll_touches
+    args: "-a allgather__direct_pull"
+  - id: dsmem_coll-allgather__direct_replicated_push
+    app: dsmem_collectives
+    drivers: [simx]
+    configs+: *dsmem_coll_cfg
+    shape: *dsmem_coll_n4
+    env: *dsmem_coll_n4_m1024
+    touches: *dsmem_coll_touches
+    args: "-a allgather__direct_replicated_push"
+  - id: dsmem_coll-allgather__direct_shift
+    app: dsmem_collectives
+    drivers: [simx]
+    configs+: *dsmem_coll_cfg
+    shape: *dsmem_coll_n4
+    env: *dsmem_coll_n4_m1024
+    touches: *dsmem_coll_touches
+    args: "-a allgather__direct_shift"
+  - id: dsmem_coll-allgather__gather_bcast_binomial
+    app: dsmem_collectives
+    drivers: [simx]
+    configs+: *dsmem_coll_cfg
+    shape: *dsmem_coll_n4
+    env: *dsmem_coll_n4_m1024
+    touches: *dsmem_coll_touches
+    args: "-a allgather__gather_bcast_binomial"
+  - id: dsmem_coll-allgather__recursive_doubling
+    app: dsmem_collectives
+    drivers: [simx]
+    configs+: *dsmem_coll_cfg
+    shape: *dsmem_coll_n4
+    env: *dsmem_coll_n4_m1024
+    touches: *dsmem_coll_touches
+    args: "-a allgather__recursive_doubling"
+  - id: dsmem_coll-allgather__ring
+    app: dsmem_collectives
+    drivers: [simx]
+    configs+: *dsmem_coll_cfg
+    shape: *dsmem_coll_n4
+    env: *dsmem_coll_n4_m1024
+    touches: *dsmem_coll_touches
+    args: "-a allgather__ring"
+  - id: dsmem_coll-allreduce__2d_mesh
+    app: dsmem_collectives
+    drivers: [simx]
+    configs+: *dsmem_coll_cfg
+    shape: *dsmem_coll_n4
+    env: *dsmem_coll_n4_m1024
+    touches: *dsmem_coll_touches
+    args: "-a allreduce__2d_mesh"
+  - id: dsmem_coll-allreduce__atomic_all_push
+    app: dsmem_collectives
+    drivers: [simx]
+    configs+: *dsmem_coll_cfg
+    shape: *dsmem_coll_n4
+    env: *dsmem_coll_n4_m1024
+    touches: *dsmem_coll_touches
+    args: "-a allreduce__atomic_all_push"
+  - id: dsmem_coll-allreduce__direct_replicated_push
+    app: dsmem_collectives
+    drivers: [simx]
+    configs+: *dsmem_coll_cfg
+    shape: *dsmem_coll_n4
+    env: *dsmem_coll_n4_m1024
+    touches: *dsmem_coll_touches
+    args: "-a allreduce__direct_replicated_push"
+  - id: dsmem_coll-allreduce__one_shot_pull
+    app: dsmem_collectives
+    drivers: [simx]
+    configs+: *dsmem_coll_cfg
+    shape: *dsmem_coll_n4
+    env: *dsmem_coll_n4_m1024
+    touches: *dsmem_coll_touches
+    args: "-a allreduce__one_shot_pull"
+  - id: dsmem_coll-allreduce__pull_reduce_scatter_push_allgather
+    app: dsmem_collectives
+    drivers: [simx]
+    configs+: *dsmem_coll_cfg
+    shape: *dsmem_coll_n4
+    env: *dsmem_coll_n4_m1024
+    touches: *dsmem_coll_touches
+    args: "-a allreduce__pull_reduce_scatter_push_allgather"
+  - id: dsmem_coll-allreduce__rabenseifner
+    app: dsmem_collectives
+    drivers: [simx]
+    configs+: *dsmem_coll_cfg
+    shape: *dsmem_coll_n4
+    env: *dsmem_coll_n4_m1024
+    touches: *dsmem_coll_touches
+    args: "-a allreduce__rabenseifner"
+  - id: dsmem_coll-allreduce__recursive_doubling
+    app: dsmem_collectives
+    drivers: [simx]
+    configs+: *dsmem_coll_cfg
+    shape: *dsmem_coll_n4
+    env: *dsmem_coll_n4_m1024
+    touches: *dsmem_coll_touches
+    args: "-a allreduce__recursive_doubling"
+  - id: dsmem_coll-allreduce__reduce_bcast_binomial
+    app: dsmem_collectives
+    drivers: [simx]
+    configs+: *dsmem_coll_cfg
+    shape: *dsmem_coll_n4
+    env: *dsmem_coll_n4_m1024
+    touches: *dsmem_coll_touches
+    args: "-a allreduce__reduce_bcast_binomial"
+  - id: dsmem_coll-allreduce__ring
+    app: dsmem_collectives
+    drivers: [simx]
+    configs+: *dsmem_coll_cfg
+    shape: *dsmem_coll_n4
+    env: *dsmem_coll_n4_m1024
+    touches: *dsmem_coll_touches
+    args: "-a allreduce__ring"
+  - id: dsmem_coll-allreduce__shift_accumulate_atomic
+    app: dsmem_collectives
+    drivers: [simx]
+    configs+: *dsmem_coll_cfg
+    shape: *dsmem_coll_n4
+    env: *dsmem_coll_n4_m1024
+    touches: *dsmem_coll_touches
+    args: "-a allreduce__shift_accumulate_atomic"
+  - id: dsmem_coll-allreduce__shift_accumulate_bulk
+    app: dsmem_collectives
+    drivers: [simx]
+    configs+: *dsmem_coll_cfg
+    shape: *dsmem_coll_n4
+    env: *dsmem_coll_n4_m1024
+    touches: *dsmem_coll_touches
+    args: "-a allreduce__shift_accumulate_bulk"
+  - id: dsmem_coll-allreduce__two_shot_push
+    app: dsmem_collectives
+    drivers: [simx]
+    configs+: *dsmem_coll_cfg
+    shape: *dsmem_coll_n4
+    env: *dsmem_coll_n4_m1024
+    touches: *dsmem_coll_touches
+    args: "-a allreduce__two_shot_push"
+  - id: dsmem_coll-reducescatter__direct_pull
+    app: dsmem_collectives
+    drivers: [simx]
+    configs+: *dsmem_coll_cfg
+    shape: *dsmem_coll_n4
+    env: *dsmem_coll_n4_m1024
+    touches: *dsmem_coll_touches
+    args: "-a reducescatter__direct_pull"
+  - id: dsmem_coll-reducescatter__direct_push
+    app: dsmem_collectives
+    drivers: [simx]
+    configs+: *dsmem_coll_cfg
+    shape: *dsmem_coll_n4
+    env: *dsmem_coll_n4_m1024
+    touches: *dsmem_coll_touches
+    args: "-a reducescatter__direct_push"
+  - id: dsmem_coll-reducescatter__recursive_halving
+    app: dsmem_collectives
+    drivers: [simx]
+    configs+: *dsmem_coll_cfg
+    shape: *dsmem_coll_n4
+    env: *dsmem_coll_n4_m1024
+    touches: *dsmem_coll_touches
+    args: "-a reducescatter__recursive_halving"
+  - id: dsmem_coll-reducescatter__ring
+    app: dsmem_collectives
+    drivers: [simx]
+    configs+: *dsmem_coll_cfg
+    shape: *dsmem_coll_n4
+    env: *dsmem_coll_n4_m1024
+    touches: *dsmem_coll_touches
+    args: "-a reducescatter__ring"
+  - id: dsmem_coll-alltoall__bruck
+    app: dsmem_collectives
+    drivers: [simx]
+    configs+: *dsmem_coll_cfg
+    shape: *dsmem_coll_n4
+    env: *dsmem_coll_n4_m1024
+    touches: *dsmem_coll_touches
+    args: "-a alltoall__bruck"
+  - id: dsmem_coll-alltoall__direct_pull
+    app: dsmem_collectives
+    drivers: [simx]
+    configs+: *dsmem_coll_cfg
+    shape: *dsmem_coll_n4
+    env: *dsmem_coll_n4_m1024
+    touches: *dsmem_coll_touches
+    args: "-a alltoall__direct_pull"
+  - id: dsmem_coll-alltoall__direct_push
+    app: dsmem_collectives
+    drivers: [simx]
+    configs+: *dsmem_coll_cfg
+    shape: *dsmem_coll_n4
+    env: *dsmem_coll_n4_m1024
+    touches: *dsmem_coll_touches
+    args: "-a alltoall__direct_push"
+  - id: dsmem_coll-alltoall__pairwise_exchange
+    app: dsmem_collectives
+    drivers: [simx]
+    configs+: *dsmem_coll_cfg
+    shape: &dsmem_coll_n2 {cores: 2, warps: 8, threads: 32, l2cache: true}
+    env: &dsmem_coll_n2_m1024 {COLL_N: "2", COLL_M: "1024", COLL_T: f32}
+    touches: *dsmem_coll_touches
+    args: "-a alltoall__pairwise_exchange"
+  - id: dsmem_coll-alltoall__pairwise_xor
+    app: dsmem_collectives
+    drivers: [simx]
+    configs+: *dsmem_coll_cfg
+    shape: *dsmem_coll_n4
+    env: *dsmem_coll_n4_m1024
+    touches: *dsmem_coll_touches
+    args: "-a alltoall__pairwise_xor"
+  - id: dsmem_coll-alltoall__shift
+    app: dsmem_collectives
+    drivers: [simx]
+    configs+: *dsmem_coll_cfg
+    shape: *dsmem_coll_n4
+    env: *dsmem_coll_n4_m1024
+    touches: *dsmem_coll_touches
+    args: "-a alltoall__shift"
+  # The RTL leg at the same points, one rep each: the ring, the two pushes into peers (bulk
+  # copies and float atomics), the pull, and the remote-armed mbarrier of the pairwise exchange.
+  - id: dsmem_coll-allreduce__ring
+    app: dsmem_collectives
+    drivers: [rtlsim]
+    configs+: *dsmem_coll_cfg
+    shape: *dsmem_coll_n4
+    env: *dsmem_coll_n4_m1024
+    touches: *dsmem_coll_touches
+    args: "-a allreduce__ring -r 1"
+  - id: dsmem_coll-allreduce__two_shot_push
+    app: dsmem_collectives
+    drivers: [rtlsim]
+    configs+: *dsmem_coll_cfg
+    shape: *dsmem_coll_n4
+    env: *dsmem_coll_n4_m1024
+    touches: *dsmem_coll_touches
+    args: "-a allreduce__two_shot_push -r 1"
+  - id: dsmem_coll-allreduce__atomic_all_push
+    app: dsmem_collectives
+    drivers: [rtlsim]
+    configs+: *dsmem_coll_cfg
+    shape: *dsmem_coll_n4
+    env: *dsmem_coll_n4_m1024
+    touches: *dsmem_coll_touches
+    args: "-a allreduce__atomic_all_push -r 1"
+  - id: dsmem_coll-allreduce__one_shot_pull
+    app: dsmem_collectives
+    drivers: [rtlsim]
+    configs+: *dsmem_coll_cfg
+    shape: *dsmem_coll_n4
+    env: *dsmem_coll_n4_m1024
+    touches: *dsmem_coll_touches
+    args: "-a allreduce__one_shot_pull -r 1"
+  - id: dsmem_coll-alltoall__pairwise_exchange
+    app: dsmem_collectives
+    drivers: [rtlsim]
+    configs+: *dsmem_coll_cfg
+    shape: *dsmem_coll_n2
+    env: *dsmem_coll_n2_m1024
+    touches: *dsmem_coll_touches
+    args: "-a alltoall__pairwise_exchange -r 1"
+  # The host refuses a point the original build rejects: a static_assert of the file exits 2
+  # with SKIP:static_assert, a CollectiveSmem past the local memory exits 3 with SKIP:smem
+  # (2 x 16 x 4096 floats = 512 KB here). The run must fail with that exit code and line. The
+  # shape goes in CONFIGS, so the run reuses the prebuilt driver.
+  - id: dsmem_coll-x-static
+    via: script
+    driver: simx
+    configs+: "-DVX_CFG_EXT_ZACAS_ENABLE -DVX_CFG_EXT_DXA_ENABLE -DVX_CFG_EXT_FPAMO_ENABLE -DVX_CFG_LMEM_LOG_SIZE=18 -DVX_CFG_NUM_CORES=2 -DVX_CFG_NUM_WARPS=8 -DVX_CFG_NUM_THREADS=32 -DVX_CFG_L2_ENABLE"
+    touches: *dsmem_coll_touches
+    env: {DRIVER: simx, APP: dsmem_collectives, ARGS: "-a allreduce__shift_accumulate_bulk", COLL_N: "2", COLL_M: "1024", COLL_T: f32,
+          EXPECT: "SKIP:static_assert allreduce__shift_accumulate_bulk N=2 M=1024", EXPECT_RC: "2"}
+    run: &expect_exit_run |
+      set -u
+      tmp=$(mktemp -d)
+      if ! make -C sw/runtime/"$DRIVER" > "$tmp/build.log" 2>&1 \
+         || ! make -C tests/regression/"$APP" >> "$tmp/build.log" 2>&1; then
+        echo "FAIL: the build failed with CONFIGS=${CONFIGS:-}"; tail -n 20 "$tmp/build.log"
+        rm -rf "$tmp"; exit 1
+      fi
+      timeout 120 ./ci/blackbox.sh --driver="$DRIVER" --app="$APP" --args="$ARGS" > "$tmp/run.log" 2>&1
+      rc=$?
+      fail=0
+      if [ $rc -eq 0 ]; then
+        echo "FAIL: '$ARGS' ran to completion on $DRIVER"; fail=1
+      elif [ $rc -eq 124 ]; then
+        echo "FAIL: '$ARGS' timed out on $DRIVER"; fail=1
+      elif ! grep -qF "$EXPECT" "$tmp/run.log"; then
+        echo "FAIL: '$ARGS' failed on $DRIVER (exit $rc) without '$EXPECT'"; fail=1
+      elif ! grep -qE "run-$DRIVER\] Error $EXPECT_RC\$" "$tmp/run.log"; then
+        echo "FAIL: '$ARGS' printed '$EXPECT' but the app did not exit $EXPECT_RC on $DRIVER"; fail=1
+      else
+        echo "OK: '$ARGS' stops $DRIVER (app exit $EXPECT_RC): $(grep -F -m1 "$EXPECT" "$tmp/run.log")"
+      fi
+      [ $fail -eq 0 ] || tail -n 20 "$tmp/run.log"
+      rm -rf "$tmp"
+      exit $fail
+  - id: dsmem_coll-x-smem
+    via: script
+    driver: simx
+    configs+: "-DVX_CFG_EXT_ZACAS_ENABLE -DVX_CFG_EXT_DXA_ENABLE -DVX_CFG_EXT_FPAMO_ENABLE -DVX_CFG_LMEM_LOG_SIZE=18 -DVX_CFG_NUM_CORES=16 -DVX_CFG_NUM_WARPS=8 -DVX_CFG_NUM_THREADS=32 -DVX_CFG_L2_ENABLE"
+    touches: *dsmem_coll_touches
+    env: {DRIVER: simx, APP: dsmem_collectives, ARGS: "-a alltoall__direct_push", COLL_N: "16", COLL_M: "4096", COLL_T: f32,
+          EXPECT: "SKIP:smem alltoall__direct_push N=16 M=4096:", EXPECT_RC: "3"}
+    run: *expect_exit_run
+  # Nightly: every algorithm at every N in {2, 8, 16} x M in {16, 1024} where its original build
+  # is legal (static_asserts: N == 4 for shift_accumulate_bulk, N in {2, 4} for
+  # shift_accumulate_atomic, N == 2 for pairwise_exchange, 16-byte chunks of M/N elements for
+  # ring, two_shot_push and rabenseifner); every point fits 256 KB. Then the reduce ops at N=4,
+  # M=1024 in int32 (-i32) and with pattern B (-pb).
+  # N=2
+  - {id: dsmem_coll-allgather__bruck-n2-m16, app: dsmem_collectives, drivers: [simx], tier: nightly, configs+: *dsmem_coll_cfg,
+     shape: {cores: 2, warps: 8, threads: 32, l2cache: true}, env: {COLL_N: "2", COLL_M: "16", COLL_T: f32},
+     touches: *dsmem_coll_touches, args: "-a allgather__bruck"}
+  - {id: dsmem_coll-allgather__direct_pull-n2-m16, app: dsmem_collectives, drivers: [simx], tier: nightly, configs+: *dsmem_coll_cfg,
+     shape: {cores: 2, warps: 8, threads: 32, l2cache: true}, env: {COLL_N: "2", COLL_M: "16", COLL_T: f32},
+     touches: *dsmem_coll_touches, args: "-a allgather__direct_pull"}
+  - {id: dsmem_coll-allgather__direct_replicated_push-n2-m16, app: dsmem_collectives, drivers: [simx], tier: nightly, configs+: *dsmem_coll_cfg,
+     shape: {cores: 2, warps: 8, threads: 32, l2cache: true}, env: {COLL_N: "2", COLL_M: "16", COLL_T: f32},
+     touches: *dsmem_coll_touches, args: "-a allgather__direct_replicated_push"}
+  - {id: dsmem_coll-allgather__direct_shift-n2-m16, app: dsmem_collectives, drivers: [simx], tier: nightly, configs+: *dsmem_coll_cfg,
+     shape: {cores: 2, warps: 8, threads: 32, l2cache: true}, env: {COLL_N: "2", COLL_M: "16", COLL_T: f32},
+     touches: *dsmem_coll_touches, args: "-a allgather__direct_shift"}
+  - {id: dsmem_coll-allgather__gather_bcast_binomial-n2-m16, app: dsmem_collectives, drivers: [simx], tier: nightly, configs+: *dsmem_coll_cfg,
+     shape: {cores: 2, warps: 8, threads: 32, l2cache: true}, env: {COLL_N: "2", COLL_M: "16", COLL_T: f32},
+     touches: *dsmem_coll_touches, args: "-a allgather__gather_bcast_binomial"}
+  - {id: dsmem_coll-allgather__recursive_doubling-n2-m16, app: dsmem_collectives, drivers: [simx], tier: nightly, configs+: *dsmem_coll_cfg,
+     shape: {cores: 2, warps: 8, threads: 32, l2cache: true}, env: {COLL_N: "2", COLL_M: "16", COLL_T: f32},
+     touches: *dsmem_coll_touches, args: "-a allgather__recursive_doubling"}
+  - {id: dsmem_coll-allgather__ring-n2-m16, app: dsmem_collectives, drivers: [simx], tier: nightly, configs+: *dsmem_coll_cfg,
+     shape: {cores: 2, warps: 8, threads: 32, l2cache: true}, env: {COLL_N: "2", COLL_M: "16", COLL_T: f32},
+     touches: *dsmem_coll_touches, args: "-a allgather__ring"}
+  - {id: dsmem_coll-allreduce__2d_mesh-n2-m16, app: dsmem_collectives, drivers: [simx], tier: nightly, configs+: *dsmem_coll_cfg,
+     shape: {cores: 2, warps: 8, threads: 32, l2cache: true}, env: {COLL_N: "2", COLL_M: "16", COLL_T: f32},
+     touches: *dsmem_coll_touches, args: "-a allreduce__2d_mesh"}
+  - {id: dsmem_coll-allreduce__atomic_all_push-n2-m16, app: dsmem_collectives, drivers: [simx], tier: nightly, configs+: *dsmem_coll_cfg,
+     shape: {cores: 2, warps: 8, threads: 32, l2cache: true}, env: {COLL_N: "2", COLL_M: "16", COLL_T: f32},
+     touches: *dsmem_coll_touches, args: "-a allreduce__atomic_all_push"}
+  - {id: dsmem_coll-allreduce__direct_replicated_push-n2-m16, app: dsmem_collectives, drivers: [simx], tier: nightly, configs+: *dsmem_coll_cfg,
+     shape: {cores: 2, warps: 8, threads: 32, l2cache: true}, env: {COLL_N: "2", COLL_M: "16", COLL_T: f32},
+     touches: *dsmem_coll_touches, args: "-a allreduce__direct_replicated_push"}
+  - {id: dsmem_coll-allreduce__one_shot_pull-n2-m16, app: dsmem_collectives, drivers: [simx], tier: nightly, configs+: *dsmem_coll_cfg,
+     shape: {cores: 2, warps: 8, threads: 32, l2cache: true}, env: {COLL_N: "2", COLL_M: "16", COLL_T: f32},
+     touches: *dsmem_coll_touches, args: "-a allreduce__one_shot_pull"}
+  - {id: dsmem_coll-allreduce__pull_reduce_scatter_push_allgather-n2-m16, app: dsmem_collectives, drivers: [simx], tier: nightly, configs+: *dsmem_coll_cfg,
+     shape: {cores: 2, warps: 8, threads: 32, l2cache: true}, env: {COLL_N: "2", COLL_M: "16", COLL_T: f32},
+     touches: *dsmem_coll_touches, args: "-a allreduce__pull_reduce_scatter_push_allgather"}
+  - {id: dsmem_coll-allreduce__rabenseifner-n2-m16, app: dsmem_collectives, drivers: [simx], tier: nightly, configs+: *dsmem_coll_cfg,
+     shape: {cores: 2, warps: 8, threads: 32, l2cache: true}, env: {COLL_N: "2", COLL_M: "16", COLL_T: f32},
+     touches: *dsmem_coll_touches, args: "-a allreduce__rabenseifner"}
+  - {id: dsmem_coll-allreduce__recursive_doubling-n2-m16, app: dsmem_collectives, drivers: [simx], tier: nightly, configs+: *dsmem_coll_cfg,
+     shape: {cores: 2, warps: 8, threads: 32, l2cache: true}, env: {COLL_N: "2", COLL_M: "16", COLL_T: f32},
+     touches: *dsmem_coll_touches, args: "-a allreduce__recursive_doubling"}
+  - {id: dsmem_coll-allreduce__reduce_bcast_binomial-n2-m16, app: dsmem_collectives, drivers: [simx], tier: nightly, configs+: *dsmem_coll_cfg,
+     shape: {cores: 2, warps: 8, threads: 32, l2cache: true}, env: {COLL_N: "2", COLL_M: "16", COLL_T: f32},
+     touches: *dsmem_coll_touches, args: "-a allreduce__reduce_bcast_binomial"}
+  - {id: dsmem_coll-allreduce__ring-n2-m16, app: dsmem_collectives, drivers: [simx], tier: nightly, configs+: *dsmem_coll_cfg,
+     shape: {cores: 2, warps: 8, threads: 32, l2cache: true}, env: {COLL_N: "2", COLL_M: "16", COLL_T: f32},
+     touches: *dsmem_coll_touches, args: "-a allreduce__ring"}
+  - {id: dsmem_coll-allreduce__shift_accumulate_atomic-n2-m16, app: dsmem_collectives, drivers: [simx], tier: nightly, configs+: *dsmem_coll_cfg,
+     shape: {cores: 2, warps: 8, threads: 32, l2cache: true}, env: {COLL_N: "2", COLL_M: "16", COLL_T: f32},
+     touches: *dsmem_coll_touches, args: "-a allreduce__shift_accumulate_atomic"}
+  - {id: dsmem_coll-allreduce__two_shot_push-n2-m16, app: dsmem_collectives, drivers: [simx], tier: nightly, configs+: *dsmem_coll_cfg,
+     shape: {cores: 2, warps: 8, threads: 32, l2cache: true}, env: {COLL_N: "2", COLL_M: "16", COLL_T: f32},
+     touches: *dsmem_coll_touches, args: "-a allreduce__two_shot_push"}
+  - {id: dsmem_coll-reducescatter__direct_pull-n2-m16, app: dsmem_collectives, drivers: [simx], tier: nightly, configs+: *dsmem_coll_cfg,
+     shape: {cores: 2, warps: 8, threads: 32, l2cache: true}, env: {COLL_N: "2", COLL_M: "16", COLL_T: f32},
+     touches: *dsmem_coll_touches, args: "-a reducescatter__direct_pull"}
+  - {id: dsmem_coll-reducescatter__direct_push-n2-m16, app: dsmem_collectives, drivers: [simx], tier: nightly, configs+: *dsmem_coll_cfg,
+     shape: {cores: 2, warps: 8, threads: 32, l2cache: true}, env: {COLL_N: "2", COLL_M: "16", COLL_T: f32},
+     touches: *dsmem_coll_touches, args: "-a reducescatter__direct_push"}
+  - {id: dsmem_coll-reducescatter__recursive_halving-n2-m16, app: dsmem_collectives, drivers: [simx], tier: nightly, configs+: *dsmem_coll_cfg,
+     shape: {cores: 2, warps: 8, threads: 32, l2cache: true}, env: {COLL_N: "2", COLL_M: "16", COLL_T: f32},
+     touches: *dsmem_coll_touches, args: "-a reducescatter__recursive_halving"}
+  - {id: dsmem_coll-reducescatter__ring-n2-m16, app: dsmem_collectives, drivers: [simx], tier: nightly, configs+: *dsmem_coll_cfg,
+     shape: {cores: 2, warps: 8, threads: 32, l2cache: true}, env: {COLL_N: "2", COLL_M: "16", COLL_T: f32},
+     touches: *dsmem_coll_touches, args: "-a reducescatter__ring"}
+  - {id: dsmem_coll-alltoall__bruck-n2-m16, app: dsmem_collectives, drivers: [simx], tier: nightly, configs+: *dsmem_coll_cfg,
+     shape: {cores: 2, warps: 8, threads: 32, l2cache: true}, env: {COLL_N: "2", COLL_M: "16", COLL_T: f32},
+     touches: *dsmem_coll_touches, args: "-a alltoall__bruck"}
+  - {id: dsmem_coll-alltoall__direct_pull-n2-m16, app: dsmem_collectives, drivers: [simx], tier: nightly, configs+: *dsmem_coll_cfg,
+     shape: {cores: 2, warps: 8, threads: 32, l2cache: true}, env: {COLL_N: "2", COLL_M: "16", COLL_T: f32},
+     touches: *dsmem_coll_touches, args: "-a alltoall__direct_pull"}
+  - {id: dsmem_coll-alltoall__direct_push-n2-m16, app: dsmem_collectives, drivers: [simx], tier: nightly, configs+: *dsmem_coll_cfg,
+     shape: {cores: 2, warps: 8, threads: 32, l2cache: true}, env: {COLL_N: "2", COLL_M: "16", COLL_T: f32},
+     touches: *dsmem_coll_touches, args: "-a alltoall__direct_push"}
+  - {id: dsmem_coll-alltoall__pairwise_exchange-n2-m16, app: dsmem_collectives, drivers: [simx], tier: nightly, configs+: *dsmem_coll_cfg,
+     shape: {cores: 2, warps: 8, threads: 32, l2cache: true}, env: {COLL_N: "2", COLL_M: "16", COLL_T: f32},
+     touches: *dsmem_coll_touches, args: "-a alltoall__pairwise_exchange"}
+  - {id: dsmem_coll-alltoall__pairwise_xor-n2-m16, app: dsmem_collectives, drivers: [simx], tier: nightly, configs+: *dsmem_coll_cfg,
+     shape: {cores: 2, warps: 8, threads: 32, l2cache: true}, env: {COLL_N: "2", COLL_M: "16", COLL_T: f32},
+     touches: *dsmem_coll_touches, args: "-a alltoall__pairwise_xor"}
+  - {id: dsmem_coll-alltoall__shift-n2-m16, app: dsmem_collectives, drivers: [simx], tier: nightly, configs+: *dsmem_coll_cfg,
+     shape: {cores: 2, warps: 8, threads: 32, l2cache: true}, env: {COLL_N: "2", COLL_M: "16", COLL_T: f32},
+     touches: *dsmem_coll_touches, args: "-a alltoall__shift"}
+  - {id: dsmem_coll-allgather__bruck-n2-m1024, app: dsmem_collectives, drivers: [simx], tier: nightly, configs+: *dsmem_coll_cfg,
+     shape: {cores: 2, warps: 8, threads: 32, l2cache: true}, env: {COLL_N: "2", COLL_M: "1024", COLL_T: f32},
+     touches: *dsmem_coll_touches, args: "-a allgather__bruck"}
+  - {id: dsmem_coll-allgather__direct_pull-n2-m1024, app: dsmem_collectives, drivers: [simx], tier: nightly, configs+: *dsmem_coll_cfg,
+     shape: {cores: 2, warps: 8, threads: 32, l2cache: true}, env: {COLL_N: "2", COLL_M: "1024", COLL_T: f32},
+     touches: *dsmem_coll_touches, args: "-a allgather__direct_pull"}
+  - {id: dsmem_coll-allgather__direct_replicated_push-n2-m1024, app: dsmem_collectives, drivers: [simx], tier: nightly, configs+: *dsmem_coll_cfg,
+     shape: {cores: 2, warps: 8, threads: 32, l2cache: true}, env: {COLL_N: "2", COLL_M: "1024", COLL_T: f32},
+     touches: *dsmem_coll_touches, args: "-a allgather__direct_replicated_push"}
+  - {id: dsmem_coll-allgather__direct_shift-n2-m1024, app: dsmem_collectives, drivers: [simx], tier: nightly, configs+: *dsmem_coll_cfg,
+     shape: {cores: 2, warps: 8, threads: 32, l2cache: true}, env: {COLL_N: "2", COLL_M: "1024", COLL_T: f32},
+     touches: *dsmem_coll_touches, args: "-a allgather__direct_shift"}
+  - {id: dsmem_coll-allgather__gather_bcast_binomial-n2-m1024, app: dsmem_collectives, drivers: [simx], tier: nightly, configs+: *dsmem_coll_cfg,
+     shape: {cores: 2, warps: 8, threads: 32, l2cache: true}, env: {COLL_N: "2", COLL_M: "1024", COLL_T: f32},
+     touches: *dsmem_coll_touches, args: "-a allgather__gather_bcast_binomial"}
+  - {id: dsmem_coll-allgather__recursive_doubling-n2-m1024, app: dsmem_collectives, drivers: [simx], tier: nightly, configs+: *dsmem_coll_cfg,
+     shape: {cores: 2, warps: 8, threads: 32, l2cache: true}, env: {COLL_N: "2", COLL_M: "1024", COLL_T: f32},
+     touches: *dsmem_coll_touches, args: "-a allgather__recursive_doubling"}
+  - {id: dsmem_coll-allgather__ring-n2-m1024, app: dsmem_collectives, drivers: [simx], tier: nightly, configs+: *dsmem_coll_cfg,
+     shape: {cores: 2, warps: 8, threads: 32, l2cache: true}, env: {COLL_N: "2", COLL_M: "1024", COLL_T: f32},
+     touches: *dsmem_coll_touches, args: "-a allgather__ring"}
+  - {id: dsmem_coll-allreduce__2d_mesh-n2-m1024, app: dsmem_collectives, drivers: [simx], tier: nightly, configs+: *dsmem_coll_cfg,
+     shape: {cores: 2, warps: 8, threads: 32, l2cache: true}, env: {COLL_N: "2", COLL_M: "1024", COLL_T: f32},
+     touches: *dsmem_coll_touches, args: "-a allreduce__2d_mesh"}
+  - {id: dsmem_coll-allreduce__atomic_all_push-n2-m1024, app: dsmem_collectives, drivers: [simx], tier: nightly, configs+: *dsmem_coll_cfg,
+     shape: {cores: 2, warps: 8, threads: 32, l2cache: true}, env: {COLL_N: "2", COLL_M: "1024", COLL_T: f32},
+     touches: *dsmem_coll_touches, args: "-a allreduce__atomic_all_push"}
+  - {id: dsmem_coll-allreduce__direct_replicated_push-n2-m1024, app: dsmem_collectives, drivers: [simx], tier: nightly, configs+: *dsmem_coll_cfg,
+     shape: {cores: 2, warps: 8, threads: 32, l2cache: true}, env: {COLL_N: "2", COLL_M: "1024", COLL_T: f32},
+     touches: *dsmem_coll_touches, args: "-a allreduce__direct_replicated_push"}
+  - {id: dsmem_coll-allreduce__one_shot_pull-n2-m1024, app: dsmem_collectives, drivers: [simx], tier: nightly, configs+: *dsmem_coll_cfg,
+     shape: {cores: 2, warps: 8, threads: 32, l2cache: true}, env: {COLL_N: "2", COLL_M: "1024", COLL_T: f32},
+     touches: *dsmem_coll_touches, args: "-a allreduce__one_shot_pull"}
+  - {id: dsmem_coll-allreduce__pull_reduce_scatter_push_allgather-n2-m1024, app: dsmem_collectives, drivers: [simx], tier: nightly, configs+: *dsmem_coll_cfg,
+     shape: {cores: 2, warps: 8, threads: 32, l2cache: true}, env: {COLL_N: "2", COLL_M: "1024", COLL_T: f32},
+     touches: *dsmem_coll_touches, args: "-a allreduce__pull_reduce_scatter_push_allgather"}
+  - {id: dsmem_coll-allreduce__rabenseifner-n2-m1024, app: dsmem_collectives, drivers: [simx], tier: nightly, configs+: *dsmem_coll_cfg,
+     shape: {cores: 2, warps: 8, threads: 32, l2cache: true}, env: {COLL_N: "2", COLL_M: "1024", COLL_T: f32},
+     touches: *dsmem_coll_touches, args: "-a allreduce__rabenseifner"}
+  - {id: dsmem_coll-allreduce__recursive_doubling-n2-m1024, app: dsmem_collectives, drivers: [simx], tier: nightly, configs+: *dsmem_coll_cfg,
+     shape: {cores: 2, warps: 8, threads: 32, l2cache: true}, env: {COLL_N: "2", COLL_M: "1024", COLL_T: f32},
+     touches: *dsmem_coll_touches, args: "-a allreduce__recursive_doubling"}
+  - {id: dsmem_coll-allreduce__reduce_bcast_binomial-n2-m1024, app: dsmem_collectives, drivers: [simx], tier: nightly, configs+: *dsmem_coll_cfg,
+     shape: {cores: 2, warps: 8, threads: 32, l2cache: true}, env: {COLL_N: "2", COLL_M: "1024", COLL_T: f32},
+     touches: *dsmem_coll_touches, args: "-a allreduce__reduce_bcast_binomial"}
+  - {id: dsmem_coll-allreduce__ring-n2-m1024, app: dsmem_collectives, drivers: [simx], tier: nightly, configs+: *dsmem_coll_cfg,
+     shape: {cores: 2, warps: 8, threads: 32, l2cache: true}, env: {COLL_N: "2", COLL_M: "1024", COLL_T: f32},
+     touches: *dsmem_coll_touches, args: "-a allreduce__ring"}
+  - {id: dsmem_coll-allreduce__shift_accumulate_atomic-n2-m1024, app: dsmem_collectives, drivers: [simx], tier: nightly, configs+: *dsmem_coll_cfg,
+     shape: {cores: 2, warps: 8, threads: 32, l2cache: true}, env: {COLL_N: "2", COLL_M: "1024", COLL_T: f32},
+     touches: *dsmem_coll_touches, args: "-a allreduce__shift_accumulate_atomic"}
+  - {id: dsmem_coll-allreduce__two_shot_push-n2-m1024, app: dsmem_collectives, drivers: [simx], tier: nightly, configs+: *dsmem_coll_cfg,
+     shape: {cores: 2, warps: 8, threads: 32, l2cache: true}, env: {COLL_N: "2", COLL_M: "1024", COLL_T: f32},
+     touches: *dsmem_coll_touches, args: "-a allreduce__two_shot_push"}
+  - {id: dsmem_coll-reducescatter__direct_pull-n2-m1024, app: dsmem_collectives, drivers: [simx], tier: nightly, configs+: *dsmem_coll_cfg,
+     shape: {cores: 2, warps: 8, threads: 32, l2cache: true}, env: {COLL_N: "2", COLL_M: "1024", COLL_T: f32},
+     touches: *dsmem_coll_touches, args: "-a reducescatter__direct_pull"}
+  - {id: dsmem_coll-reducescatter__direct_push-n2-m1024, app: dsmem_collectives, drivers: [simx], tier: nightly, configs+: *dsmem_coll_cfg,
+     shape: {cores: 2, warps: 8, threads: 32, l2cache: true}, env: {COLL_N: "2", COLL_M: "1024", COLL_T: f32},
+     touches: *dsmem_coll_touches, args: "-a reducescatter__direct_push"}
+  - {id: dsmem_coll-reducescatter__recursive_halving-n2-m1024, app: dsmem_collectives, drivers: [simx], tier: nightly, configs+: *dsmem_coll_cfg,
+     shape: {cores: 2, warps: 8, threads: 32, l2cache: true}, env: {COLL_N: "2", COLL_M: "1024", COLL_T: f32},
+     touches: *dsmem_coll_touches, args: "-a reducescatter__recursive_halving"}
+  - {id: dsmem_coll-reducescatter__ring-n2-m1024, app: dsmem_collectives, drivers: [simx], tier: nightly, configs+: *dsmem_coll_cfg,
+     shape: {cores: 2, warps: 8, threads: 32, l2cache: true}, env: {COLL_N: "2", COLL_M: "1024", COLL_T: f32},
+     touches: *dsmem_coll_touches, args: "-a reducescatter__ring"}
+  - {id: dsmem_coll-alltoall__bruck-n2-m1024, app: dsmem_collectives, drivers: [simx], tier: nightly, configs+: *dsmem_coll_cfg,
+     shape: {cores: 2, warps: 8, threads: 32, l2cache: true}, env: {COLL_N: "2", COLL_M: "1024", COLL_T: f32},
+     touches: *dsmem_coll_touches, args: "-a alltoall__bruck"}
+  - {id: dsmem_coll-alltoall__direct_pull-n2-m1024, app: dsmem_collectives, drivers: [simx], tier: nightly, configs+: *dsmem_coll_cfg,
+     shape: {cores: 2, warps: 8, threads: 32, l2cache: true}, env: {COLL_N: "2", COLL_M: "1024", COLL_T: f32},
+     touches: *dsmem_coll_touches, args: "-a alltoall__direct_pull"}
+  - {id: dsmem_coll-alltoall__direct_push-n2-m1024, app: dsmem_collectives, drivers: [simx], tier: nightly, configs+: *dsmem_coll_cfg,
+     shape: {cores: 2, warps: 8, threads: 32, l2cache: true}, env: {COLL_N: "2", COLL_M: "1024", COLL_T: f32},
+     touches: *dsmem_coll_touches, args: "-a alltoall__direct_push"}
+  - {id: dsmem_coll-alltoall__pairwise_xor-n2-m1024, app: dsmem_collectives, drivers: [simx], tier: nightly, configs+: *dsmem_coll_cfg,
+     shape: {cores: 2, warps: 8, threads: 32, l2cache: true}, env: {COLL_N: "2", COLL_M: "1024", COLL_T: f32},
+     touches: *dsmem_coll_touches, args: "-a alltoall__pairwise_xor"}
+  - {id: dsmem_coll-alltoall__shift-n2-m1024, app: dsmem_collectives, drivers: [simx], tier: nightly, configs+: *dsmem_coll_cfg,
+     shape: {cores: 2, warps: 8, threads: 32, l2cache: true}, env: {COLL_N: "2", COLL_M: "1024", COLL_T: f32},
+     touches: *dsmem_coll_touches, args: "-a alltoall__shift"}
+  # N=8
+  - {id: dsmem_coll-allgather__bruck-n8-m16, app: dsmem_collectives, drivers: [simx], tier: nightly, configs+: *dsmem_coll_cfg,
+     shape: {cores: 8, warps: 8, threads: 32, l2cache: true}, env: {COLL_N: "8", COLL_M: "16", COLL_T: f32},
+     touches: *dsmem_coll_touches, args: "-a allgather__bruck"}
+  - {id: dsmem_coll-allgather__direct_pull-n8-m16, app: dsmem_collectives, drivers: [simx], tier: nightly, configs+: *dsmem_coll_cfg,
+     shape: {cores: 8, warps: 8, threads: 32, l2cache: true}, env: {COLL_N: "8", COLL_M: "16", COLL_T: f32},
+     touches: *dsmem_coll_touches, args: "-a allgather__direct_pull"}
+  - {id: dsmem_coll-allgather__direct_replicated_push-n8-m16, app: dsmem_collectives, drivers: [simx], tier: nightly, configs+: *dsmem_coll_cfg,
+     shape: {cores: 8, warps: 8, threads: 32, l2cache: true}, env: {COLL_N: "8", COLL_M: "16", COLL_T: f32},
+     touches: *dsmem_coll_touches, args: "-a allgather__direct_replicated_push"}
+  - {id: dsmem_coll-allgather__direct_shift-n8-m16, app: dsmem_collectives, drivers: [simx], tier: nightly, configs+: *dsmem_coll_cfg,
+     shape: {cores: 8, warps: 8, threads: 32, l2cache: true}, env: {COLL_N: "8", COLL_M: "16", COLL_T: f32},
+     touches: *dsmem_coll_touches, args: "-a allgather__direct_shift"}
+  - {id: dsmem_coll-allgather__gather_bcast_binomial-n8-m16, app: dsmem_collectives, drivers: [simx], tier: nightly, configs+: *dsmem_coll_cfg,
+     shape: {cores: 8, warps: 8, threads: 32, l2cache: true}, env: {COLL_N: "8", COLL_M: "16", COLL_T: f32},
+     touches: *dsmem_coll_touches, args: "-a allgather__gather_bcast_binomial"}
+  - {id: dsmem_coll-allgather__recursive_doubling-n8-m16, app: dsmem_collectives, drivers: [simx], tier: nightly, configs+: *dsmem_coll_cfg,
+     shape: {cores: 8, warps: 8, threads: 32, l2cache: true}, env: {COLL_N: "8", COLL_M: "16", COLL_T: f32},
+     touches: *dsmem_coll_touches, args: "-a allgather__recursive_doubling"}
+  - {id: dsmem_coll-allgather__ring-n8-m16, app: dsmem_collectives, drivers: [simx], tier: nightly, configs+: *dsmem_coll_cfg,
+     shape: {cores: 8, warps: 8, threads: 32, l2cache: true}, env: {COLL_N: "8", COLL_M: "16", COLL_T: f32},
+     touches: *dsmem_coll_touches, args: "-a allgather__ring"}
+  - {id: dsmem_coll-allreduce__2d_mesh-n8-m16, app: dsmem_collectives, drivers: [simx], tier: nightly, configs+: *dsmem_coll_cfg,
+     shape: {cores: 8, warps: 8, threads: 32, l2cache: true}, env: {COLL_N: "8", COLL_M: "16", COLL_T: f32},
+     touches: *dsmem_coll_touches, args: "-a allreduce__2d_mesh"}
+  - {id: dsmem_coll-allreduce__atomic_all_push-n8-m16, app: dsmem_collectives, drivers: [simx], tier: nightly, configs+: *dsmem_coll_cfg,
+     shape: {cores: 8, warps: 8, threads: 32, l2cache: true}, env: {COLL_N: "8", COLL_M: "16", COLL_T: f32},
+     touches: *dsmem_coll_touches, args: "-a allreduce__atomic_all_push"}
+  - {id: dsmem_coll-allreduce__direct_replicated_push-n8-m16, app: dsmem_collectives, drivers: [simx], tier: nightly, configs+: *dsmem_coll_cfg,
+     shape: {cores: 8, warps: 8, threads: 32, l2cache: true}, env: {COLL_N: "8", COLL_M: "16", COLL_T: f32},
+     touches: *dsmem_coll_touches, args: "-a allreduce__direct_replicated_push"}
+  - {id: dsmem_coll-allreduce__one_shot_pull-n8-m16, app: dsmem_collectives, drivers: [simx], tier: nightly, configs+: *dsmem_coll_cfg,
+     shape: {cores: 8, warps: 8, threads: 32, l2cache: true}, env: {COLL_N: "8", COLL_M: "16", COLL_T: f32},
+     touches: *dsmem_coll_touches, args: "-a allreduce__one_shot_pull"}
+  - {id: dsmem_coll-allreduce__pull_reduce_scatter_push_allgather-n8-m16, app: dsmem_collectives, drivers: [simx], tier: nightly, configs+: *dsmem_coll_cfg,
+     shape: {cores: 8, warps: 8, threads: 32, l2cache: true}, env: {COLL_N: "8", COLL_M: "16", COLL_T: f32},
+     touches: *dsmem_coll_touches, args: "-a allreduce__pull_reduce_scatter_push_allgather"}
+  - {id: dsmem_coll-allreduce__recursive_doubling-n8-m16, app: dsmem_collectives, drivers: [simx], tier: nightly, configs+: *dsmem_coll_cfg,
+     shape: {cores: 8, warps: 8, threads: 32, l2cache: true}, env: {COLL_N: "8", COLL_M: "16", COLL_T: f32},
+     touches: *dsmem_coll_touches, args: "-a allreduce__recursive_doubling"}
+  - {id: dsmem_coll-allreduce__reduce_bcast_binomial-n8-m16, app: dsmem_collectives, drivers: [simx], tier: nightly, configs+: *dsmem_coll_cfg,
+     shape: {cores: 8, warps: 8, threads: 32, l2cache: true}, env: {COLL_N: "8", COLL_M: "16", COLL_T: f32},
+     touches: *dsmem_coll_touches, args: "-a allreduce__reduce_bcast_binomial"}
+  - {id: dsmem_coll-reducescatter__direct_pull-n8-m16, app: dsmem_collectives, drivers: [simx], tier: nightly, configs+: *dsmem_coll_cfg,
+     shape: {cores: 8, warps: 8, threads: 32, l2cache: true}, env: {COLL_N: "8", COLL_M: "16", COLL_T: f32},
+     touches: *dsmem_coll_touches, args: "-a reducescatter__direct_pull"}
+  - {id: dsmem_coll-reducescatter__direct_push-n8-m16, app: dsmem_collectives, drivers: [simx], tier: nightly, configs+: *dsmem_coll_cfg,
+     shape: {cores: 8, warps: 8, threads: 32, l2cache: true}, env: {COLL_N: "8", COLL_M: "16", COLL_T: f32},
+     touches: *dsmem_coll_touches, args: "-a reducescatter__direct_push"}
+  - {id: dsmem_coll-reducescatter__recursive_halving-n8-m16, app: dsmem_collectives, drivers: [simx], tier: nightly, configs+: *dsmem_coll_cfg,
+     shape: {cores: 8, warps: 8, threads: 32, l2cache: true}, env: {COLL_N: "8", COLL_M: "16", COLL_T: f32},
+     touches: *dsmem_coll_touches, args: "-a reducescatter__recursive_halving"}
+  - {id: dsmem_coll-reducescatter__ring-n8-m16, app: dsmem_collectives, drivers: [simx], tier: nightly, configs+: *dsmem_coll_cfg,
+     shape: {cores: 8, warps: 8, threads: 32, l2cache: true}, env: {COLL_N: "8", COLL_M: "16", COLL_T: f32},
+     touches: *dsmem_coll_touches, args: "-a reducescatter__ring"}
+  - {id: dsmem_coll-alltoall__bruck-n8-m16, app: dsmem_collectives, drivers: [simx], tier: nightly, configs+: *dsmem_coll_cfg,
+     shape: {cores: 8, warps: 8, threads: 32, l2cache: true}, env: {COLL_N: "8", COLL_M: "16", COLL_T: f32},
+     touches: *dsmem_coll_touches, args: "-a alltoall__bruck"}
+  - {id: dsmem_coll-alltoall__direct_pull-n8-m16, app: dsmem_collectives, drivers: [simx], tier: nightly, configs+: *dsmem_coll_cfg,
+     shape: {cores: 8, warps: 8, threads: 32, l2cache: true}, env: {COLL_N: "8", COLL_M: "16", COLL_T: f32},
+     touches: *dsmem_coll_touches, args: "-a alltoall__direct_pull"}
+  - {id: dsmem_coll-alltoall__direct_push-n8-m16, app: dsmem_collectives, drivers: [simx], tier: nightly, configs+: *dsmem_coll_cfg,
+     shape: {cores: 8, warps: 8, threads: 32, l2cache: true}, env: {COLL_N: "8", COLL_M: "16", COLL_T: f32},
+     touches: *dsmem_coll_touches, args: "-a alltoall__direct_push"}
+  - {id: dsmem_coll-alltoall__pairwise_xor-n8-m16, app: dsmem_collectives, drivers: [simx], tier: nightly, configs+: *dsmem_coll_cfg,
+     shape: {cores: 8, warps: 8, threads: 32, l2cache: true}, env: {COLL_N: "8", COLL_M: "16", COLL_T: f32},
+     touches: *dsmem_coll_touches, args: "-a alltoall__pairwise_xor"}
+  - {id: dsmem_coll-alltoall__shift-n8-m16, app: dsmem_collectives, drivers: [simx], tier: nightly, configs+: *dsmem_coll_cfg,
+     shape: {cores: 8, warps: 8, threads: 32, l2cache: true}, env: {COLL_N: "8", COLL_M: "16", COLL_T: f32},
+     touches: *dsmem_coll_touches, args: "-a alltoall__shift"}
+  - {id: dsmem_coll-allgather__bruck-n8-m1024, app: dsmem_collectives, drivers: [simx], tier: nightly, configs+: *dsmem_coll_cfg,
+     shape: {cores: 8, warps: 8, threads: 32, l2cache: true}, env: {COLL_N: "8", COLL_M: "1024", COLL_T: f32},
+     touches: *dsmem_coll_touches, args: "-a allgather__bruck"}
+  - {id: dsmem_coll-allgather__direct_pull-n8-m1024, app: dsmem_collectives, drivers: [simx], tier: nightly, configs+: *dsmem_coll_cfg,
+     shape: {cores: 8, warps: 8, threads: 32, l2cache: true}, env: {COLL_N: "8", COLL_M: "1024", COLL_T: f32},
+     touches: *dsmem_coll_touches, args: "-a allgather__direct_pull"}
+  - {id: dsmem_coll-allgather__direct_replicated_push-n8-m1024, app: dsmem_collectives, drivers: [simx], tier: nightly, configs+: *dsmem_coll_cfg,
+     shape: {cores: 8, warps: 8, threads: 32, l2cache: true}, env: {COLL_N: "8", COLL_M: "1024", COLL_T: f32},
+     touches: *dsmem_coll_touches, args: "-a allgather__direct_replicated_push"}
+  - {id: dsmem_coll-allgather__direct_shift-n8-m1024, app: dsmem_collectives, drivers: [simx], tier: nightly, configs+: *dsmem_coll_cfg,
+     shape: {cores: 8, warps: 8, threads: 32, l2cache: true}, env: {COLL_N: "8", COLL_M: "1024", COLL_T: f32},
+     touches: *dsmem_coll_touches, args: "-a allgather__direct_shift"}
+  - {id: dsmem_coll-allgather__gather_bcast_binomial-n8-m1024, app: dsmem_collectives, drivers: [simx], tier: nightly, configs+: *dsmem_coll_cfg,
+     shape: {cores: 8, warps: 8, threads: 32, l2cache: true}, env: {COLL_N: "8", COLL_M: "1024", COLL_T: f32},
+     touches: *dsmem_coll_touches, args: "-a allgather__gather_bcast_binomial"}
+  - {id: dsmem_coll-allgather__recursive_doubling-n8-m1024, app: dsmem_collectives, drivers: [simx], tier: nightly, configs+: *dsmem_coll_cfg,
+     shape: {cores: 8, warps: 8, threads: 32, l2cache: true}, env: {COLL_N: "8", COLL_M: "1024", COLL_T: f32},
+     touches: *dsmem_coll_touches, args: "-a allgather__recursive_doubling"}
+  - {id: dsmem_coll-allgather__ring-n8-m1024, app: dsmem_collectives, drivers: [simx], tier: nightly, configs+: *dsmem_coll_cfg,
+     shape: {cores: 8, warps: 8, threads: 32, l2cache: true}, env: {COLL_N: "8", COLL_M: "1024", COLL_T: f32},
+     touches: *dsmem_coll_touches, args: "-a allgather__ring"}
+  - {id: dsmem_coll-allreduce__2d_mesh-n8-m1024, app: dsmem_collectives, drivers: [simx], tier: nightly, configs+: *dsmem_coll_cfg,
+     shape: {cores: 8, warps: 8, threads: 32, l2cache: true}, env: {COLL_N: "8", COLL_M: "1024", COLL_T: f32},
+     touches: *dsmem_coll_touches, args: "-a allreduce__2d_mesh"}
+  - {id: dsmem_coll-allreduce__atomic_all_push-n8-m1024, app: dsmem_collectives, drivers: [simx], tier: nightly, configs+: *dsmem_coll_cfg,
+     shape: {cores: 8, warps: 8, threads: 32, l2cache: true}, env: {COLL_N: "8", COLL_M: "1024", COLL_T: f32},
+     touches: *dsmem_coll_touches, args: "-a allreduce__atomic_all_push"}
+  - {id: dsmem_coll-allreduce__direct_replicated_push-n8-m1024, app: dsmem_collectives, drivers: [simx], tier: nightly, configs+: *dsmem_coll_cfg,
+     shape: {cores: 8, warps: 8, threads: 32, l2cache: true}, env: {COLL_N: "8", COLL_M: "1024", COLL_T: f32},
+     touches: *dsmem_coll_touches, args: "-a allreduce__direct_replicated_push"}
+  - {id: dsmem_coll-allreduce__one_shot_pull-n8-m1024, app: dsmem_collectives, drivers: [simx], tier: nightly, configs+: *dsmem_coll_cfg,
+     shape: {cores: 8, warps: 8, threads: 32, l2cache: true}, env: {COLL_N: "8", COLL_M: "1024", COLL_T: f32},
+     touches: *dsmem_coll_touches, args: "-a allreduce__one_shot_pull"}
+  - {id: dsmem_coll-allreduce__pull_reduce_scatter_push_allgather-n8-m1024, app: dsmem_collectives, drivers: [simx], tier: nightly, configs+: *dsmem_coll_cfg,
+     shape: {cores: 8, warps: 8, threads: 32, l2cache: true}, env: {COLL_N: "8", COLL_M: "1024", COLL_T: f32},
+     touches: *dsmem_coll_touches, args: "-a allreduce__pull_reduce_scatter_push_allgather"}
+  - {id: dsmem_coll-allreduce__rabenseifner-n8-m1024, app: dsmem_collectives, drivers: [simx], tier: nightly, configs+: *dsmem_coll_cfg,
+     shape: {cores: 8, warps: 8, threads: 32, l2cache: true}, env: {COLL_N: "8", COLL_M: "1024", COLL_T: f32},
+     touches: *dsmem_coll_touches, args: "-a allreduce__rabenseifner"}
+  - {id: dsmem_coll-allreduce__recursive_doubling-n8-m1024, app: dsmem_collectives, drivers: [simx], tier: nightly, configs+: *dsmem_coll_cfg,
+     shape: {cores: 8, warps: 8, threads: 32, l2cache: true}, env: {COLL_N: "8", COLL_M: "1024", COLL_T: f32},
+     touches: *dsmem_coll_touches, args: "-a allreduce__recursive_doubling"}
+  - {id: dsmem_coll-allreduce__reduce_bcast_binomial-n8-m1024, app: dsmem_collectives, drivers: [simx], tier: nightly, configs+: *dsmem_coll_cfg,
+     shape: {cores: 8, warps: 8, threads: 32, l2cache: true}, env: {COLL_N: "8", COLL_M: "1024", COLL_T: f32},
+     touches: *dsmem_coll_touches, args: "-a allreduce__reduce_bcast_binomial"}
+  - {id: dsmem_coll-allreduce__ring-n8-m1024, app: dsmem_collectives, drivers: [simx], tier: nightly, configs+: *dsmem_coll_cfg,
+     shape: {cores: 8, warps: 8, threads: 32, l2cache: true}, env: {COLL_N: "8", COLL_M: "1024", COLL_T: f32},
+     touches: *dsmem_coll_touches, args: "-a allreduce__ring"}
+  - {id: dsmem_coll-allreduce__two_shot_push-n8-m1024, app: dsmem_collectives, drivers: [simx], tier: nightly, configs+: *dsmem_coll_cfg,
+     shape: {cores: 8, warps: 8, threads: 32, l2cache: true}, env: {COLL_N: "8", COLL_M: "1024", COLL_T: f32},
+     touches: *dsmem_coll_touches, args: "-a allreduce__two_shot_push"}
+  - {id: dsmem_coll-reducescatter__direct_pull-n8-m1024, app: dsmem_collectives, drivers: [simx], tier: nightly, configs+: *dsmem_coll_cfg,
+     shape: {cores: 8, warps: 8, threads: 32, l2cache: true}, env: {COLL_N: "8", COLL_M: "1024", COLL_T: f32},
+     touches: *dsmem_coll_touches, args: "-a reducescatter__direct_pull"}
+  - {id: dsmem_coll-reducescatter__direct_push-n8-m1024, app: dsmem_collectives, drivers: [simx], tier: nightly, configs+: *dsmem_coll_cfg,
+     shape: {cores: 8, warps: 8, threads: 32, l2cache: true}, env: {COLL_N: "8", COLL_M: "1024", COLL_T: f32},
+     touches: *dsmem_coll_touches, args: "-a reducescatter__direct_push"}
+  - {id: dsmem_coll-reducescatter__recursive_halving-n8-m1024, app: dsmem_collectives, drivers: [simx], tier: nightly, configs+: *dsmem_coll_cfg,
+     shape: {cores: 8, warps: 8, threads: 32, l2cache: true}, env: {COLL_N: "8", COLL_M: "1024", COLL_T: f32},
+     touches: *dsmem_coll_touches, args: "-a reducescatter__recursive_halving"}
+  - {id: dsmem_coll-reducescatter__ring-n8-m1024, app: dsmem_collectives, drivers: [simx], tier: nightly, configs+: *dsmem_coll_cfg,
+     shape: {cores: 8, warps: 8, threads: 32, l2cache: true}, env: {COLL_N: "8", COLL_M: "1024", COLL_T: f32},
+     touches: *dsmem_coll_touches, args: "-a reducescatter__ring"}
+  - {id: dsmem_coll-alltoall__bruck-n8-m1024, app: dsmem_collectives, drivers: [simx], tier: nightly, configs+: *dsmem_coll_cfg,
+     shape: {cores: 8, warps: 8, threads: 32, l2cache: true}, env: {COLL_N: "8", COLL_M: "1024", COLL_T: f32},
+     touches: *dsmem_coll_touches, args: "-a alltoall__bruck"}
+  - {id: dsmem_coll-alltoall__direct_pull-n8-m1024, app: dsmem_collectives, drivers: [simx], tier: nightly, configs+: *dsmem_coll_cfg,
+     shape: {cores: 8, warps: 8, threads: 32, l2cache: true}, env: {COLL_N: "8", COLL_M: "1024", COLL_T: f32},
+     touches: *dsmem_coll_touches, args: "-a alltoall__direct_pull"}
+  - {id: dsmem_coll-alltoall__direct_push-n8-m1024, app: dsmem_collectives, drivers: [simx], tier: nightly, configs+: *dsmem_coll_cfg,
+     shape: {cores: 8, warps: 8, threads: 32, l2cache: true}, env: {COLL_N: "8", COLL_M: "1024", COLL_T: f32},
+     touches: *dsmem_coll_touches, args: "-a alltoall__direct_push"}
+  - {id: dsmem_coll-alltoall__pairwise_xor-n8-m1024, app: dsmem_collectives, drivers: [simx], tier: nightly, configs+: *dsmem_coll_cfg,
+     shape: {cores: 8, warps: 8, threads: 32, l2cache: true}, env: {COLL_N: "8", COLL_M: "1024", COLL_T: f32},
+     touches: *dsmem_coll_touches, args: "-a alltoall__pairwise_xor"}
+  - {id: dsmem_coll-alltoall__shift-n8-m1024, app: dsmem_collectives, drivers: [simx], tier: nightly, configs+: *dsmem_coll_cfg,
+     shape: {cores: 8, warps: 8, threads: 32, l2cache: true}, env: {COLL_N: "8", COLL_M: "1024", COLL_T: f32},
+     touches: *dsmem_coll_touches, args: "-a alltoall__shift"}
+  # N=16
+  - {id: dsmem_coll-allgather__bruck-n16-m16, app: dsmem_collectives, drivers: [simx], tier: nightly, configs+: *dsmem_coll_cfg,
+     shape: {cores: 16, warps: 8, threads: 32, l2cache: true}, env: {COLL_N: "16", COLL_M: "16", COLL_T: f32},
+     touches: *dsmem_coll_touches, args: "-a allgather__bruck"}
+  - {id: dsmem_coll-allgather__direct_pull-n16-m16, app: dsmem_collectives, drivers: [simx], tier: nightly, configs+: *dsmem_coll_cfg,
+     shape: {cores: 16, warps: 8, threads: 32, l2cache: true}, env: {COLL_N: "16", COLL_M: "16", COLL_T: f32},
+     touches: *dsmem_coll_touches, args: "-a allgather__direct_pull"}
+  - {id: dsmem_coll-allgather__direct_replicated_push-n16-m16, app: dsmem_collectives, drivers: [simx], tier: nightly, configs+: *dsmem_coll_cfg,
+     shape: {cores: 16, warps: 8, threads: 32, l2cache: true}, env: {COLL_N: "16", COLL_M: "16", COLL_T: f32},
+     touches: *dsmem_coll_touches, args: "-a allgather__direct_replicated_push"}
+  - {id: dsmem_coll-allgather__direct_shift-n16-m16, app: dsmem_collectives, drivers: [simx], tier: nightly, configs+: *dsmem_coll_cfg,
+     shape: {cores: 16, warps: 8, threads: 32, l2cache: true}, env: {COLL_N: "16", COLL_M: "16", COLL_T: f32},
+     touches: *dsmem_coll_touches, args: "-a allgather__direct_shift"}
+  - {id: dsmem_coll-allgather__gather_bcast_binomial-n16-m16, app: dsmem_collectives, drivers: [simx], tier: nightly, configs+: *dsmem_coll_cfg,
+     shape: {cores: 16, warps: 8, threads: 32, l2cache: true}, env: {COLL_N: "16", COLL_M: "16", COLL_T: f32},
+     touches: *dsmem_coll_touches, args: "-a allgather__gather_bcast_binomial"}
+  - {id: dsmem_coll-allgather__recursive_doubling-n16-m16, app: dsmem_collectives, drivers: [simx], tier: nightly, configs+: *dsmem_coll_cfg,
+     shape: {cores: 16, warps: 8, threads: 32, l2cache: true}, env: {COLL_N: "16", COLL_M: "16", COLL_T: f32},
+     touches: *dsmem_coll_touches, args: "-a allgather__recursive_doubling"}
+  - {id: dsmem_coll-allgather__ring-n16-m16, app: dsmem_collectives, drivers: [simx], tier: nightly, configs+: *dsmem_coll_cfg,
+     shape: {cores: 16, warps: 8, threads: 32, l2cache: true}, env: {COLL_N: "16", COLL_M: "16", COLL_T: f32},
+     touches: *dsmem_coll_touches, args: "-a allgather__ring"}
+  - {id: dsmem_coll-allreduce__2d_mesh-n16-m16, app: dsmem_collectives, drivers: [simx], tier: nightly, configs+: *dsmem_coll_cfg,
+     shape: {cores: 16, warps: 8, threads: 32, l2cache: true}, env: {COLL_N: "16", COLL_M: "16", COLL_T: f32},
+     touches: *dsmem_coll_touches, args: "-a allreduce__2d_mesh"}
+  - {id: dsmem_coll-allreduce__atomic_all_push-n16-m16, app: dsmem_collectives, drivers: [simx], tier: nightly, configs+: *dsmem_coll_cfg,
+     shape: {cores: 16, warps: 8, threads: 32, l2cache: true}, env: {COLL_N: "16", COLL_M: "16", COLL_T: f32},
+     touches: *dsmem_coll_touches, args: "-a allreduce__atomic_all_push"}
+  - {id: dsmem_coll-allreduce__direct_replicated_push-n16-m16, app: dsmem_collectives, drivers: [simx], tier: nightly, configs+: *dsmem_coll_cfg,
+     shape: {cores: 16, warps: 8, threads: 32, l2cache: true}, env: {COLL_N: "16", COLL_M: "16", COLL_T: f32},
+     touches: *dsmem_coll_touches, args: "-a allreduce__direct_replicated_push"}
+  - {id: dsmem_coll-allreduce__one_shot_pull-n16-m16, app: dsmem_collectives, drivers: [simx], tier: nightly, configs+: *dsmem_coll_cfg,
+     shape: {cores: 16, warps: 8, threads: 32, l2cache: true}, env: {COLL_N: "16", COLL_M: "16", COLL_T: f32},
+     touches: *dsmem_coll_touches, args: "-a allreduce__one_shot_pull"}
+  - {id: dsmem_coll-allreduce__pull_reduce_scatter_push_allgather-n16-m16, app: dsmem_collectives, drivers: [simx], tier: nightly, configs+: *dsmem_coll_cfg,
+     shape: {cores: 16, warps: 8, threads: 32, l2cache: true}, env: {COLL_N: "16", COLL_M: "16", COLL_T: f32},
+     touches: *dsmem_coll_touches, args: "-a allreduce__pull_reduce_scatter_push_allgather"}
+  - {id: dsmem_coll-allreduce__recursive_doubling-n16-m16, app: dsmem_collectives, drivers: [simx], tier: nightly, configs+: *dsmem_coll_cfg,
+     shape: {cores: 16, warps: 8, threads: 32, l2cache: true}, env: {COLL_N: "16", COLL_M: "16", COLL_T: f32},
+     touches: *dsmem_coll_touches, args: "-a allreduce__recursive_doubling"}
+  - {id: dsmem_coll-allreduce__reduce_bcast_binomial-n16-m16, app: dsmem_collectives, drivers: [simx], tier: nightly, configs+: *dsmem_coll_cfg,
+     shape: {cores: 16, warps: 8, threads: 32, l2cache: true}, env: {COLL_N: "16", COLL_M: "16", COLL_T: f32},
+     touches: *dsmem_coll_touches, args: "-a allreduce__reduce_bcast_binomial"}
+  - {id: dsmem_coll-reducescatter__direct_pull-n16-m16, app: dsmem_collectives, drivers: [simx], tier: nightly, configs+: *dsmem_coll_cfg,
+     shape: {cores: 16, warps: 8, threads: 32, l2cache: true}, env: {COLL_N: "16", COLL_M: "16", COLL_T: f32},
+     touches: *dsmem_coll_touches, args: "-a reducescatter__direct_pull"}
+  - {id: dsmem_coll-reducescatter__direct_push-n16-m16, app: dsmem_collectives, drivers: [simx], tier: nightly, configs+: *dsmem_coll_cfg,
+     shape: {cores: 16, warps: 8, threads: 32, l2cache: true}, env: {COLL_N: "16", COLL_M: "16", COLL_T: f32},
+     touches: *dsmem_coll_touches, args: "-a reducescatter__direct_push"}
+  - {id: dsmem_coll-reducescatter__recursive_halving-n16-m16, app: dsmem_collectives, drivers: [simx], tier: nightly, configs+: *dsmem_coll_cfg,
+     shape: {cores: 16, warps: 8, threads: 32, l2cache: true}, env: {COLL_N: "16", COLL_M: "16", COLL_T: f32},
+     touches: *dsmem_coll_touches, args: "-a reducescatter__recursive_halving"}
+  - {id: dsmem_coll-reducescatter__ring-n16-m16, app: dsmem_collectives, drivers: [simx], tier: nightly, configs+: *dsmem_coll_cfg,
+     shape: {cores: 16, warps: 8, threads: 32, l2cache: true}, env: {COLL_N: "16", COLL_M: "16", COLL_T: f32},
+     touches: *dsmem_coll_touches, args: "-a reducescatter__ring"}
+  - {id: dsmem_coll-alltoall__bruck-n16-m16, app: dsmem_collectives, drivers: [simx], tier: nightly, configs+: *dsmem_coll_cfg,
+     shape: {cores: 16, warps: 8, threads: 32, l2cache: true}, env: {COLL_N: "16", COLL_M: "16", COLL_T: f32},
+     touches: *dsmem_coll_touches, args: "-a alltoall__bruck"}
+  - {id: dsmem_coll-alltoall__direct_pull-n16-m16, app: dsmem_collectives, drivers: [simx], tier: nightly, configs+: *dsmem_coll_cfg,
+     shape: {cores: 16, warps: 8, threads: 32, l2cache: true}, env: {COLL_N: "16", COLL_M: "16", COLL_T: f32},
+     touches: *dsmem_coll_touches, args: "-a alltoall__direct_pull"}
+  - {id: dsmem_coll-alltoall__direct_push-n16-m16, app: dsmem_collectives, drivers: [simx], tier: nightly, configs+: *dsmem_coll_cfg,
+     shape: {cores: 16, warps: 8, threads: 32, l2cache: true}, env: {COLL_N: "16", COLL_M: "16", COLL_T: f32},
+     touches: *dsmem_coll_touches, args: "-a alltoall__direct_push"}
+  - {id: dsmem_coll-alltoall__pairwise_xor-n16-m16, app: dsmem_collectives, drivers: [simx], tier: nightly, configs+: *dsmem_coll_cfg,
+     shape: {cores: 16, warps: 8, threads: 32, l2cache: true}, env: {COLL_N: "16", COLL_M: "16", COLL_T: f32},
+     touches: *dsmem_coll_touches, args: "-a alltoall__pairwise_xor"}
+  - {id: dsmem_coll-alltoall__shift-n16-m16, app: dsmem_collectives, drivers: [simx], tier: nightly, configs+: *dsmem_coll_cfg,
+     shape: {cores: 16, warps: 8, threads: 32, l2cache: true}, env: {COLL_N: "16", COLL_M: "16", COLL_T: f32},
+     touches: *dsmem_coll_touches, args: "-a alltoall__shift"}
+  - {id: dsmem_coll-allgather__bruck-n16-m1024, app: dsmem_collectives, drivers: [simx], tier: nightly, configs+: *dsmem_coll_cfg,
+     shape: {cores: 16, warps: 8, threads: 32, l2cache: true}, env: {COLL_N: "16", COLL_M: "1024", COLL_T: f32},
+     touches: *dsmem_coll_touches, args: "-a allgather__bruck"}
+  - {id: dsmem_coll-allgather__direct_pull-n16-m1024, app: dsmem_collectives, drivers: [simx], tier: nightly, configs+: *dsmem_coll_cfg,
+     shape: {cores: 16, warps: 8, threads: 32, l2cache: true}, env: {COLL_N: "16", COLL_M: "1024", COLL_T: f32},
+     touches: *dsmem_coll_touches, args: "-a allgather__direct_pull"}
+  - {id: dsmem_coll-allgather__direct_replicated_push-n16-m1024, app: dsmem_collectives, drivers: [simx], tier: nightly, configs+: *dsmem_coll_cfg,
+     shape: {cores: 16, warps: 8, threads: 32, l2cache: true}, env: {COLL_N: "16", COLL_M: "1024", COLL_T: f32},
+     touches: *dsmem_coll_touches, args: "-a allgather__direct_replicated_push"}
+  - {id: dsmem_coll-allgather__direct_shift-n16-m1024, app: dsmem_collectives, drivers: [simx], tier: nightly, configs+: *dsmem_coll_cfg,
+     shape: {cores: 16, warps: 8, threads: 32, l2cache: true}, env: {COLL_N: "16", COLL_M: "1024", COLL_T: f32},
+     touches: *dsmem_coll_touches, args: "-a allgather__direct_shift"}
+  - {id: dsmem_coll-allgather__gather_bcast_binomial-n16-m1024, app: dsmem_collectives, drivers: [simx], tier: nightly, configs+: *dsmem_coll_cfg,
+     shape: {cores: 16, warps: 8, threads: 32, l2cache: true}, env: {COLL_N: "16", COLL_M: "1024", COLL_T: f32},
+     touches: *dsmem_coll_touches, args: "-a allgather__gather_bcast_binomial"}
+  - {id: dsmem_coll-allgather__recursive_doubling-n16-m1024, app: dsmem_collectives, drivers: [simx], tier: nightly, configs+: *dsmem_coll_cfg,
+     shape: {cores: 16, warps: 8, threads: 32, l2cache: true}, env: {COLL_N: "16", COLL_M: "1024", COLL_T: f32},
+     touches: *dsmem_coll_touches, args: "-a allgather__recursive_doubling"}
+  - {id: dsmem_coll-allgather__ring-n16-m1024, app: dsmem_collectives, drivers: [simx], tier: nightly, configs+: *dsmem_coll_cfg,
+     shape: {cores: 16, warps: 8, threads: 32, l2cache: true}, env: {COLL_N: "16", COLL_M: "1024", COLL_T: f32},
+     touches: *dsmem_coll_touches, args: "-a allgather__ring"}
+  - {id: dsmem_coll-allreduce__2d_mesh-n16-m1024, app: dsmem_collectives, drivers: [simx], tier: nightly, configs+: *dsmem_coll_cfg,
+     shape: {cores: 16, warps: 8, threads: 32, l2cache: true}, env: {COLL_N: "16", COLL_M: "1024", COLL_T: f32},
+     touches: *dsmem_coll_touches, args: "-a allreduce__2d_mesh"}
+  - {id: dsmem_coll-allreduce__atomic_all_push-n16-m1024, app: dsmem_collectives, drivers: [simx], tier: nightly, configs+: *dsmem_coll_cfg,
+     shape: {cores: 16, warps: 8, threads: 32, l2cache: true}, env: {COLL_N: "16", COLL_M: "1024", COLL_T: f32},
+     touches: *dsmem_coll_touches, args: "-a allreduce__atomic_all_push"}
+  - {id: dsmem_coll-allreduce__direct_replicated_push-n16-m1024, app: dsmem_collectives, drivers: [simx], tier: nightly, configs+: *dsmem_coll_cfg,
+     shape: {cores: 16, warps: 8, threads: 32, l2cache: true}, env: {COLL_N: "16", COLL_M: "1024", COLL_T: f32},
+     touches: *dsmem_coll_touches, args: "-a allreduce__direct_replicated_push"}
+  - {id: dsmem_coll-allreduce__one_shot_pull-n16-m1024, app: dsmem_collectives, drivers: [simx], tier: nightly, configs+: *dsmem_coll_cfg,
+     shape: {cores: 16, warps: 8, threads: 32, l2cache: true}, env: {COLL_N: "16", COLL_M: "1024", COLL_T: f32},
+     touches: *dsmem_coll_touches, args: "-a allreduce__one_shot_pull"}
+  - {id: dsmem_coll-allreduce__pull_reduce_scatter_push_allgather-n16-m1024, app: dsmem_collectives, drivers: [simx], tier: nightly, configs+: *dsmem_coll_cfg,
+     shape: {cores: 16, warps: 8, threads: 32, l2cache: true}, env: {COLL_N: "16", COLL_M: "1024", COLL_T: f32},
+     touches: *dsmem_coll_touches, args: "-a allreduce__pull_reduce_scatter_push_allgather"}
+  - {id: dsmem_coll-allreduce__rabenseifner-n16-m1024, app: dsmem_collectives, drivers: [simx], tier: nightly, configs+: *dsmem_coll_cfg,
+     shape: {cores: 16, warps: 8, threads: 32, l2cache: true}, env: {COLL_N: "16", COLL_M: "1024", COLL_T: f32},
+     touches: *dsmem_coll_touches, args: "-a allreduce__rabenseifner"}
+  - {id: dsmem_coll-allreduce__recursive_doubling-n16-m1024, app: dsmem_collectives, drivers: [simx], tier: nightly, configs+: *dsmem_coll_cfg,
+     shape: {cores: 16, warps: 8, threads: 32, l2cache: true}, env: {COLL_N: "16", COLL_M: "1024", COLL_T: f32},
+     touches: *dsmem_coll_touches, args: "-a allreduce__recursive_doubling"}
+  - {id: dsmem_coll-allreduce__reduce_bcast_binomial-n16-m1024, app: dsmem_collectives, drivers: [simx], tier: nightly, configs+: *dsmem_coll_cfg,
+     shape: {cores: 16, warps: 8, threads: 32, l2cache: true}, env: {COLL_N: "16", COLL_M: "1024", COLL_T: f32},
+     touches: *dsmem_coll_touches, args: "-a allreduce__reduce_bcast_binomial"}
+  - {id: dsmem_coll-allreduce__ring-n16-m1024, app: dsmem_collectives, drivers: [simx], tier: nightly, configs+: *dsmem_coll_cfg,
+     shape: {cores: 16, warps: 8, threads: 32, l2cache: true}, env: {COLL_N: "16", COLL_M: "1024", COLL_T: f32},
+     touches: *dsmem_coll_touches, args: "-a allreduce__ring"}
+  - {id: dsmem_coll-allreduce__two_shot_push-n16-m1024, app: dsmem_collectives, drivers: [simx], tier: nightly, configs+: *dsmem_coll_cfg,
+     shape: {cores: 16, warps: 8, threads: 32, l2cache: true}, env: {COLL_N: "16", COLL_M: "1024", COLL_T: f32},
+     touches: *dsmem_coll_touches, args: "-a allreduce__two_shot_push"}
+  - {id: dsmem_coll-reducescatter__direct_pull-n16-m1024, app: dsmem_collectives, drivers: [simx], tier: nightly, configs+: *dsmem_coll_cfg,
+     shape: {cores: 16, warps: 8, threads: 32, l2cache: true}, env: {COLL_N: "16", COLL_M: "1024", COLL_T: f32},
+     touches: *dsmem_coll_touches, args: "-a reducescatter__direct_pull"}
+  - {id: dsmem_coll-reducescatter__direct_push-n16-m1024, app: dsmem_collectives, drivers: [simx], tier: nightly, configs+: *dsmem_coll_cfg,
+     shape: {cores: 16, warps: 8, threads: 32, l2cache: true}, env: {COLL_N: "16", COLL_M: "1024", COLL_T: f32},
+     touches: *dsmem_coll_touches, args: "-a reducescatter__direct_push"}
+  - {id: dsmem_coll-reducescatter__recursive_halving-n16-m1024, app: dsmem_collectives, drivers: [simx], tier: nightly, configs+: *dsmem_coll_cfg,
+     shape: {cores: 16, warps: 8, threads: 32, l2cache: true}, env: {COLL_N: "16", COLL_M: "1024", COLL_T: f32},
+     touches: *dsmem_coll_touches, args: "-a reducescatter__recursive_halving"}
+  - {id: dsmem_coll-reducescatter__ring-n16-m1024, app: dsmem_collectives, drivers: [simx], tier: nightly, configs+: *dsmem_coll_cfg,
+     shape: {cores: 16, warps: 8, threads: 32, l2cache: true}, env: {COLL_N: "16", COLL_M: "1024", COLL_T: f32},
+     touches: *dsmem_coll_touches, args: "-a reducescatter__ring"}
+  - {id: dsmem_coll-alltoall__bruck-n16-m1024, app: dsmem_collectives, drivers: [simx], tier: nightly, configs+: *dsmem_coll_cfg,
+     shape: {cores: 16, warps: 8, threads: 32, l2cache: true}, env: {COLL_N: "16", COLL_M: "1024", COLL_T: f32},
+     touches: *dsmem_coll_touches, args: "-a alltoall__bruck"}
+  - {id: dsmem_coll-alltoall__direct_pull-n16-m1024, app: dsmem_collectives, drivers: [simx], tier: nightly, configs+: *dsmem_coll_cfg,
+     shape: {cores: 16, warps: 8, threads: 32, l2cache: true}, env: {COLL_N: "16", COLL_M: "1024", COLL_T: f32},
+     touches: *dsmem_coll_touches, args: "-a alltoall__direct_pull"}
+  - {id: dsmem_coll-alltoall__direct_push-n16-m1024, app: dsmem_collectives, drivers: [simx], tier: nightly, configs+: *dsmem_coll_cfg,
+     shape: {cores: 16, warps: 8, threads: 32, l2cache: true}, env: {COLL_N: "16", COLL_M: "1024", COLL_T: f32},
+     touches: *dsmem_coll_touches, args: "-a alltoall__direct_push"}
+  - {id: dsmem_coll-alltoall__pairwise_xor-n16-m1024, app: dsmem_collectives, drivers: [simx], tier: nightly, configs+: *dsmem_coll_cfg,
+     shape: {cores: 16, warps: 8, threads: 32, l2cache: true}, env: {COLL_N: "16", COLL_M: "1024", COLL_T: f32},
+     touches: *dsmem_coll_touches, args: "-a alltoall__pairwise_xor"}
+  - {id: dsmem_coll-alltoall__shift-n16-m1024, app: dsmem_collectives, drivers: [simx], tier: nightly, configs+: *dsmem_coll_cfg,
+     shape: {cores: 16, warps: 8, threads: 32, l2cache: true}, env: {COLL_N: "16", COLL_M: "1024", COLL_T: f32},
+     touches: *dsmem_coll_touches, args: "-a alltoall__shift"}
+  # N=4, M=1024, int32 and pattern B
+  - {id: dsmem_coll-allreduce__2d_mesh-i32, app: dsmem_collectives, drivers: [simx], tier: nightly, configs+: *dsmem_coll_cfg,
+     shape: *dsmem_coll_n4, env: {COLL_N: "4", COLL_M: "1024", COLL_T: i32}, touches: *dsmem_coll_touches,
+     args: "-a allreduce__2d_mesh"}
+  - {id: dsmem_coll-allreduce__2d_mesh-pb, app: dsmem_collectives, drivers: [simx], tier: nightly, configs+: *dsmem_coll_cfg,
+     shape: *dsmem_coll_n4, env: *dsmem_coll_n4_m1024, touches: *dsmem_coll_touches, args: "-a allreduce__2d_mesh -p B"}
+  - {id: dsmem_coll-allreduce__atomic_all_push-i32, app: dsmem_collectives, drivers: [simx], tier: nightly, configs+: *dsmem_coll_cfg,
+     shape: *dsmem_coll_n4, env: {COLL_N: "4", COLL_M: "1024", COLL_T: i32}, touches: *dsmem_coll_touches,
+     args: "-a allreduce__atomic_all_push"}
+  - {id: dsmem_coll-allreduce__atomic_all_push-pb, app: dsmem_collectives, drivers: [simx], tier: nightly, configs+: *dsmem_coll_cfg,
+     shape: *dsmem_coll_n4, env: *dsmem_coll_n4_m1024, touches: *dsmem_coll_touches, args: "-a allreduce__atomic_all_push -p B"}
+  - {id: dsmem_coll-allreduce__direct_replicated_push-i32, app: dsmem_collectives, drivers: [simx], tier: nightly, configs+: *dsmem_coll_cfg,
+     shape: *dsmem_coll_n4, env: {COLL_N: "4", COLL_M: "1024", COLL_T: i32}, touches: *dsmem_coll_touches,
+     args: "-a allreduce__direct_replicated_push"}
+  - {id: dsmem_coll-allreduce__direct_replicated_push-pb, app: dsmem_collectives, drivers: [simx], tier: nightly, configs+: *dsmem_coll_cfg,
+     shape: *dsmem_coll_n4, env: *dsmem_coll_n4_m1024, touches: *dsmem_coll_touches, args: "-a allreduce__direct_replicated_push -p B"}
+  - {id: dsmem_coll-allreduce__one_shot_pull-i32, app: dsmem_collectives, drivers: [simx], tier: nightly, configs+: *dsmem_coll_cfg,
+     shape: *dsmem_coll_n4, env: {COLL_N: "4", COLL_M: "1024", COLL_T: i32}, touches: *dsmem_coll_touches,
+     args: "-a allreduce__one_shot_pull"}
+  - {id: dsmem_coll-allreduce__one_shot_pull-pb, app: dsmem_collectives, drivers: [simx], tier: nightly, configs+: *dsmem_coll_cfg,
+     shape: *dsmem_coll_n4, env: *dsmem_coll_n4_m1024, touches: *dsmem_coll_touches, args: "-a allreduce__one_shot_pull -p B"}
+  - {id: dsmem_coll-allreduce__pull_reduce_scatter_push_allgather-i32, app: dsmem_collectives, drivers: [simx], tier: nightly, configs+: *dsmem_coll_cfg,
+     shape: *dsmem_coll_n4, env: {COLL_N: "4", COLL_M: "1024", COLL_T: i32}, touches: *dsmem_coll_touches,
+     args: "-a allreduce__pull_reduce_scatter_push_allgather"}
+  - {id: dsmem_coll-allreduce__pull_reduce_scatter_push_allgather-pb, app: dsmem_collectives, drivers: [simx], tier: nightly, configs+: *dsmem_coll_cfg,
+     shape: *dsmem_coll_n4, env: *dsmem_coll_n4_m1024, touches: *dsmem_coll_touches, args: "-a allreduce__pull_reduce_scatter_push_allgather -p B"}
+  - {id: dsmem_coll-allreduce__rabenseifner-i32, app: dsmem_collectives, drivers: [simx], tier: nightly, configs+: *dsmem_coll_cfg,
+     shape: *dsmem_coll_n4, env: {COLL_N: "4", COLL_M: "1024", COLL_T: i32}, touches: *dsmem_coll_touches,
+     args: "-a allreduce__rabenseifner"}
+  - {id: dsmem_coll-allreduce__rabenseifner-pb, app: dsmem_collectives, drivers: [simx], tier: nightly, configs+: *dsmem_coll_cfg,
+     shape: *dsmem_coll_n4, env: *dsmem_coll_n4_m1024, touches: *dsmem_coll_touches, args: "-a allreduce__rabenseifner -p B"}
+  - {id: dsmem_coll-allreduce__recursive_doubling-i32, app: dsmem_collectives, drivers: [simx], tier: nightly, configs+: *dsmem_coll_cfg,
+     shape: *dsmem_coll_n4, env: {COLL_N: "4", COLL_M: "1024", COLL_T: i32}, touches: *dsmem_coll_touches,
+     args: "-a allreduce__recursive_doubling"}
+  - {id: dsmem_coll-allreduce__recursive_doubling-pb, app: dsmem_collectives, drivers: [simx], tier: nightly, configs+: *dsmem_coll_cfg,
+     shape: *dsmem_coll_n4, env: *dsmem_coll_n4_m1024, touches: *dsmem_coll_touches, args: "-a allreduce__recursive_doubling -p B"}
+  - {id: dsmem_coll-allreduce__reduce_bcast_binomial-i32, app: dsmem_collectives, drivers: [simx], tier: nightly, configs+: *dsmem_coll_cfg,
+     shape: *dsmem_coll_n4, env: {COLL_N: "4", COLL_M: "1024", COLL_T: i32}, touches: *dsmem_coll_touches,
+     args: "-a allreduce__reduce_bcast_binomial"}
+  - {id: dsmem_coll-allreduce__reduce_bcast_binomial-pb, app: dsmem_collectives, drivers: [simx], tier: nightly, configs+: *dsmem_coll_cfg,
+     shape: *dsmem_coll_n4, env: *dsmem_coll_n4_m1024, touches: *dsmem_coll_touches, args: "-a allreduce__reduce_bcast_binomial -p B"}
+  - {id: dsmem_coll-allreduce__ring-i32, app: dsmem_collectives, drivers: [simx], tier: nightly, configs+: *dsmem_coll_cfg,
+     shape: *dsmem_coll_n4, env: {COLL_N: "4", COLL_M: "1024", COLL_T: i32}, touches: *dsmem_coll_touches,
+     args: "-a allreduce__ring"}
+  - {id: dsmem_coll-allreduce__ring-pb, app: dsmem_collectives, drivers: [simx], tier: nightly, configs+: *dsmem_coll_cfg,
+     shape: *dsmem_coll_n4, env: *dsmem_coll_n4_m1024, touches: *dsmem_coll_touches, args: "-a allreduce__ring -p B"}
+  - {id: dsmem_coll-allreduce__shift_accumulate_atomic-i32, app: dsmem_collectives, drivers: [simx], tier: nightly, configs+: *dsmem_coll_cfg,
+     shape: *dsmem_coll_n4, env: {COLL_N: "4", COLL_M: "1024", COLL_T: i32}, touches: *dsmem_coll_touches,
+     args: "-a allreduce__shift_accumulate_atomic"}
+  - {id: dsmem_coll-allreduce__shift_accumulate_atomic-pb, app: dsmem_collectives, drivers: [simx], tier: nightly, configs+: *dsmem_coll_cfg,
+     shape: *dsmem_coll_n4, env: *dsmem_coll_n4_m1024, touches: *dsmem_coll_touches, args: "-a allreduce__shift_accumulate_atomic -p B"}
+  - {id: dsmem_coll-allreduce__shift_accumulate_bulk-i32, app: dsmem_collectives, drivers: [simx], tier: nightly, configs+: *dsmem_coll_cfg,
+     shape: *dsmem_coll_n4, env: {COLL_N: "4", COLL_M: "1024", COLL_T: i32}, touches: *dsmem_coll_touches,
+     args: "-a allreduce__shift_accumulate_bulk"}
+  - {id: dsmem_coll-allreduce__shift_accumulate_bulk-pb, app: dsmem_collectives, drivers: [simx], tier: nightly, configs+: *dsmem_coll_cfg,
+     shape: *dsmem_coll_n4, env: *dsmem_coll_n4_m1024, touches: *dsmem_coll_touches, args: "-a allreduce__shift_accumulate_bulk -p B"}
+  - {id: dsmem_coll-allreduce__two_shot_push-i32, app: dsmem_collectives, drivers: [simx], tier: nightly, configs+: *dsmem_coll_cfg,
+     shape: *dsmem_coll_n4, env: {COLL_N: "4", COLL_M: "1024", COLL_T: i32}, touches: *dsmem_coll_touches,
+     args: "-a allreduce__two_shot_push"}
+  - {id: dsmem_coll-allreduce__two_shot_push-pb, app: dsmem_collectives, drivers: [simx], tier: nightly, configs+: *dsmem_coll_cfg,
+     shape: *dsmem_coll_n4, env: *dsmem_coll_n4_m1024, touches: *dsmem_coll_touches, args: "-a allreduce__two_shot_push -p B"}
+  - {id: dsmem_coll-reducescatter__direct_pull-i32, app: dsmem_collectives, drivers: [simx], tier: nightly, configs+: *dsmem_coll_cfg,
+     shape: *dsmem_coll_n4, env: {COLL_N: "4", COLL_M: "1024", COLL_T: i32}, touches: *dsmem_coll_touches,
+     args: "-a reducescatter__direct_pull"}
+  - {id: dsmem_coll-reducescatter__direct_pull-pb, app: dsmem_collectives, drivers: [simx], tier: nightly, configs+: *dsmem_coll_cfg,
+     shape: *dsmem_coll_n4, env: *dsmem_coll_n4_m1024, touches: *dsmem_coll_touches, args: "-a reducescatter__direct_pull -p B"}
+  - {id: dsmem_coll-reducescatter__direct_push-i32, app: dsmem_collectives, drivers: [simx], tier: nightly, configs+: *dsmem_coll_cfg,
+     shape: *dsmem_coll_n4, env: {COLL_N: "4", COLL_M: "1024", COLL_T: i32}, touches: *dsmem_coll_touches,
+     args: "-a reducescatter__direct_push"}
+  - {id: dsmem_coll-reducescatter__direct_push-pb, app: dsmem_collectives, drivers: [simx], tier: nightly, configs+: *dsmem_coll_cfg,
+     shape: *dsmem_coll_n4, env: *dsmem_coll_n4_m1024, touches: *dsmem_coll_touches, args: "-a reducescatter__direct_push -p B"}
+  - {id: dsmem_coll-reducescatter__recursive_halving-i32, app: dsmem_collectives, drivers: [simx], tier: nightly, configs+: *dsmem_coll_cfg,
+     shape: *dsmem_coll_n4, env: {COLL_N: "4", COLL_M: "1024", COLL_T: i32}, touches: *dsmem_coll_touches,
+     args: "-a reducescatter__recursive_halving"}
+  - {id: dsmem_coll-reducescatter__recursive_halving-pb, app: dsmem_collectives, drivers: [simx], tier: nightly, configs+: *dsmem_coll_cfg,
+     shape: *dsmem_coll_n4, env: *dsmem_coll_n4_m1024, touches: *dsmem_coll_touches, args: "-a reducescatter__recursive_halving -p B"}
+  - {id: dsmem_coll-reducescatter__ring-i32, app: dsmem_collectives, drivers: [simx], tier: nightly, configs+: *dsmem_coll_cfg,
+     shape: *dsmem_coll_n4, env: {COLL_N: "4", COLL_M: "1024", COLL_T: i32}, touches: *dsmem_coll_touches,
+     args: "-a reducescatter__ring"}
+  - {id: dsmem_coll-reducescatter__ring-pb, app: dsmem_collectives, drivers: [simx], tier: nightly, configs+: *dsmem_coll_cfg,
+     shape: *dsmem_coll_n4, env: *dsmem_coll_n4_m1024, touches: *dsmem_coll_touches, args: "-a reducescatter__ring -p B"}
