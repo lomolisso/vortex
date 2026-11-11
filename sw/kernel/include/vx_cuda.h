@@ -155,6 +155,52 @@ __VX_CUDA_INL void __setmaxnreg(unsigned) {}
 template <typename T>
 __VX_CUDA_INL T __ldg(const T* p) { return *p; }
 
+// ld.global.cg: Vortex has no cache-global hint, so __ldcg is a plain load.
+#define __VX_LDCG(T) __VX_CUDA_INL T __ldcg(const T* p) { return *p; }
+__VX_LDCG(char)
+__VX_LDCG(signed char)
+__VX_LDCG(short)
+__VX_LDCG(int)
+__VX_LDCG(long)
+__VX_LDCG(long long)
+__VX_LDCG(unsigned char)
+__VX_LDCG(unsigned short)
+__VX_LDCG(unsigned int)
+__VX_LDCG(unsigned long)
+__VX_LDCG(unsigned long long)
+__VX_LDCG(float)
+__VX_LDCG(double)
+__VX_LDCG(char2)
+__VX_LDCG(char4)
+__VX_LDCG(short2)
+__VX_LDCG(short4)
+__VX_LDCG(int2)
+__VX_LDCG(int4)
+__VX_LDCG(longlong2)
+__VX_LDCG(uchar2)
+__VX_LDCG(uchar4)
+__VX_LDCG(ushort2)
+__VX_LDCG(ushort4)
+__VX_LDCG(uint2)
+__VX_LDCG(uint4)
+__VX_LDCG(ulonglong2)
+__VX_LDCG(float2)
+__VX_LDCG(float4)
+__VX_LDCG(double2)
+__VX_LDCG(__half)
+__VX_LDCG(__half2)
+__VX_LDCG(__nv_bfloat16)
+__VX_LDCG(__nv_bfloat162)
+#undef __VX_LDCG
+
+// cuda_fp16.h's alternative names.
+typedef __half __nv_half;
+typedef __half2 __nv_half2;
+
+// math_constants.h, as constant expressions.
+#define CUDART_INF_F __builtin_bit_cast(float, 0x7f800000U)
+#define CUDART_NAN_F __builtin_bit_cast(float, 0x7fffffffU)
+
 __VX_CUDA_INL void __prefetch_global_l2(const void*) {}
 
 ///////////////////////////////////////////////////////////////////////////////

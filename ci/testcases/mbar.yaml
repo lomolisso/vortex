@@ -3371,3 +3371,412 @@ tests:
      args: "-a reducescatter__ring"}
   - {id: dsmem_coll-reducescatter__ring-pb, app: dsmem_collectives, drivers: [simx], tier: nightly, configs+: *dsmem_coll_cfg,
      shape: *dsmem_coll_n4, env: *dsmem_coll_n4_m1024, touches: *dsmem_coll_touches, args: "-a reducescatter__ring -p B"}
+
+  # Part 2a of the H100 workload set, the kernels without tensor cores, each a re-implementation
+  # of the kernel the H100 ran, at the ports' shape: one cluster of C cores (one block per core,
+  # blocks of 32-thread warps), an L2, DLMEM, A, Zacas, mbarriers, DXA, FPAMO and 256 KB of local
+  # memory. Every run checks every element of every launch against a host reference with the
+  # H100 harness's tolerance, plus a tight gate a broken cluster reduction fails where the outputs
+  # are far below that tolerance, a guard tail after each output and the smid buffer, and the
+  # blocks' distinct cores; each launch draws a new input.
+  # credit_reduction: the six CREDIT cluster kernels (cluster_*_staged_kernel<256, 8>), one row
+  # per cluster of P blocks of 256 threads, -c cols -n rows -p P. Smoke: the H100 shape n4k (4096
+  # columns) at the profiled P = 8, 3 rows.
+  - id: credit_reduction-layernorm
+    app: credit_reduction
+    drivers: [simx]
+    configs+: &e9b_a_cfg "-DVX_CFG_EXT_ZACAS_ENABLE -DVX_CFG_EXT_DXA_ENABLE -DVX_CFG_EXT_FPAMO_ENABLE -DVX_CFG_LMEM_LOG_SIZE=18"
+    shape: &credit_p8 {cores: 8, warps: 8, threads: 32, l2cache: true}
+    touches: &credit_touches [tests/regression/credit_reduction, tests/regression/dsmem_collectives,
+              sw/kernel/include/vx_cuda.h, sw/kernel/include/vx_dlmem.h, sw/kernel/include/vx_mbar.h,
+              sw/kernel/include/vx_dxa.h, sw/runtime/include/vx_cuda_runtime.h, sw/common/vx_cuda_fp.h,
+              hw/rtl/mem/VX_local_mem.sv, hw/rtl/core/VX_decode.sv, hw/rtl/VX_gpu_pkg.sv,
+              hw/rtl/VX_define.vh, hw/rtl/dlmem, hw/rtl/core/VX_lsu_slice.sv,
+              hw/rtl/core/VX_mem_unit.sv, hw/rtl/core/VX_core.sv, sim/simx/types.h,
+              sim/simx/decode.cpp, sim/simx/amo, sim/simx/lsu_unit, sim/simx/dlmem, sim/simx/core,
+              sim/simx/processor.cpp, sw/common/mbar_ref.h, tests/regression/mbar_local,
+              VX_config.toml, hw/rtl/core/VX_wctl_unit.sv, sw/common/dxa_tmap.h,
+              hw/rtl/mem/VX_lmem_switch.sv, hw/rtl/core/VX_lsu_unit.sv, hw/rtl/core/VX_scheduler.sv,
+              sw/common/dlmem_ref.h, hw/rtl/dxa, hw/rtl/VX_kmu.sv, hw/rtl/Vortex.sv,
+              hw/rtl/VX_cluster.sv, hw/rtl/core/VX_cta_dispatch.sv, hw/rtl/core/VX_csr_data.sv,
+              hw/rtl/core/VX_kmu_bus_arb.sv, hw/rtl/core/VX_bar_unit.sv, hw/rtl/mem/VX_gbar_unit.sv,
+              hw/rtl/core/VX_execute.sv, hw/rtl/cp/VX_cp_axil_regfile.sv, hw/rtl/VX_socket.sv,
+              sim/simx/kmu, sim/simx/cta_dispatcher, sim/simx/scheduler, sim/simx/csr_unit.cpp,
+              sim/simx/cluster, sim/simx/barrier_unit, sim/common/cmd_processor.cpp,
+              sim/simx/wctl_unit.cpp, sim/simx/socket, sw/kernel/include/vx_spawn2.h,
+              tests/regression/cluster_rank, tests/regression/cta_gang, tests/regression/cluster_sync,
+              tests/regression/dlmem_local, tests/regression/dlmem_store, tests/regression/dlmem_load,
+              tests/regression/dlmem_atomic, tests/regression/dlmem_stress,
+              tests/regression/lmem_bar_order, tests/regression/dlmem_amo_order, VX_types.toml,
+              hw/rtl/core/VX_uop_sequencer.sv, sim/simx/sequencer, hw/rtl/core/VX_cpa_unit.sv,
+              sim/simx/cpa_unit, hw/rtl/VX_trace_pkg.sv, sim/simx/instr.h, hw/rtl/cache, hw/rtl/tcu,
+              sim/simx/tcu, sw/kernel/include/vx_tensor.h, tests/regression/sgemm_tcu_wg_mbar,
+              tests/regression/sgemm_tcu_mx_mbar, sim/simx/mbar_waiters, sim/simx/Makefile,
+              tests/regression/mbar_wait, tests/regression/mbar_remote, sw/common/dxa_ref.h,
+              sw/common/dxa_meta.h, hw/rtl/core/VX_bg_unit.sv, hw/rtl/core/VX_sfu_unit.sv,
+              sim/simx/bg_unit, sim/simx/sfu_unit, tests/regression/cuda_api,
+              sw/kernel/include/vx_intrinsics.h, sw/kernel/include/vx_atomic.h,
+              sw/kernel/include/vx_cp_async.h, sw/kernel/include/vx_print.h,
+              sw/runtime/include/vortex2.h, sw/runtime/include/dxa.h, sw/runtime/common, sim/simx/dxa,
+              hw/rtl/core/VX_alu_int.sv, sim/simx/alu_unit.cpp, hw/rtl/interfaces,
+              hw/rtl/core/VX_csr_unit.sv, sim/simx/mem, sw/kernel/include/vx_barrier.h,
+              sw/runtime/include/vortex.h, hw/rtl/fpu, sim/simx/fpu_unit.cpp, third_party/cvfpu,
+              third_party/hardfloat, sw/kernel/src, tests/regression/common.mk,
+              sw/kernel/scripts/vxbin.py]
+    args: "-k layernorm -c 4096 -n 3 -p 8"
+  - id: credit_reduction-weighted_var
+    app: credit_reduction
+    drivers: [simx]
+    configs+: *e9b_a_cfg
+    shape: *credit_p8
+    touches: *credit_touches
+    args: "-k weighted_var -c 4096 -n 3 -p 8"
+  - id: credit_reduction-pearson
+    app: credit_reduction
+    drivers: [simx]
+    configs+: *e9b_a_cfg
+    shape: *credit_p8
+    touches: *credit_touches
+    args: "-k pearson -c 4096 -n 3 -p 8"
+  - id: credit_reduction-softmax
+    app: credit_reduction
+    drivers: [simx]
+    configs+: *e9b_a_cfg
+    shape: *credit_p8
+    touches: *credit_touches
+    args: "-k softmax -c 4096 -n 3 -p 8"
+  - id: credit_reduction-lars
+    app: credit_reduction
+    drivers: [simx]
+    configs+: *e9b_a_cfg
+    shape: *credit_p8
+    touches: *credit_touches
+    args: "-k lars -c 4096 -n 3 -p 8"
+  - id: credit_reduction-rowwise
+    app: credit_reduction
+    drivers: [simx]
+    configs+: *e9b_a_cfg
+    shape: *credit_p8
+    touches: *credit_touches
+    args: "-k rowwise -c 4096 -n 3 -p 8"
+  # cf_rmsnorm: ClusterFusion's RMSNormKernel (variant cluster2), a cluster of 2 blocks of 512
+  # threads per fp16 row of 8192, -b rows (the H100 ran 64); simx and one launch on rtlsim.
+  - id: cf_rmsnorm
+    app: cf_rmsnorm
+    drivers: [simx]
+    configs+: *e9b_a_cfg
+    shape: &cf_rmsnorm_shape {cores: 2, warps: 16, threads: 32, l2cache: true}
+    touches: &cf_rmsnorm_touches [tests/regression/cf_rmsnorm, tests/regression/dsmem_collectives,
+              sw/kernel/include/vx_cuda.h, sw/kernel/include/vx_dlmem.h, sw/kernel/include/vx_mbar.h,
+              sw/kernel/include/vx_dxa.h, sw/runtime/include/vx_cuda_runtime.h, sw/common/vx_cuda_fp.h,
+              hw/rtl/mem/VX_local_mem.sv, hw/rtl/core/VX_decode.sv, hw/rtl/VX_gpu_pkg.sv,
+              hw/rtl/VX_define.vh, hw/rtl/dlmem, hw/rtl/core/VX_lsu_slice.sv,
+              hw/rtl/core/VX_mem_unit.sv, hw/rtl/core/VX_core.sv, sim/simx/types.h,
+              sim/simx/decode.cpp, sim/simx/amo, sim/simx/lsu_unit, sim/simx/dlmem, sim/simx/core,
+              sim/simx/processor.cpp, sw/common/mbar_ref.h, tests/regression/mbar_local,
+              VX_config.toml, hw/rtl/core/VX_wctl_unit.sv, sw/common/dxa_tmap.h,
+              hw/rtl/mem/VX_lmem_switch.sv, hw/rtl/core/VX_lsu_unit.sv, hw/rtl/core/VX_scheduler.sv,
+              sw/common/dlmem_ref.h, hw/rtl/dxa, hw/rtl/VX_kmu.sv, hw/rtl/Vortex.sv,
+              hw/rtl/VX_cluster.sv, hw/rtl/core/VX_cta_dispatch.sv, hw/rtl/core/VX_csr_data.sv,
+              hw/rtl/core/VX_kmu_bus_arb.sv, hw/rtl/core/VX_bar_unit.sv, hw/rtl/mem/VX_gbar_unit.sv,
+              hw/rtl/core/VX_execute.sv, hw/rtl/cp/VX_cp_axil_regfile.sv, hw/rtl/VX_socket.sv,
+              sim/simx/kmu, sim/simx/cta_dispatcher, sim/simx/scheduler, sim/simx/csr_unit.cpp,
+              sim/simx/cluster, sim/simx/barrier_unit, sim/common/cmd_processor.cpp,
+              sim/simx/wctl_unit.cpp, sim/simx/socket, sw/kernel/include/vx_spawn2.h,
+              tests/regression/cluster_rank, tests/regression/cta_gang, tests/regression/cluster_sync,
+              tests/regression/dlmem_local, tests/regression/dlmem_store, tests/regression/dlmem_load,
+              tests/regression/dlmem_atomic, tests/regression/dlmem_stress,
+              tests/regression/lmem_bar_order, tests/regression/dlmem_amo_order, VX_types.toml,
+              hw/rtl/core/VX_uop_sequencer.sv, sim/simx/sequencer, hw/rtl/core/VX_cpa_unit.sv,
+              sim/simx/cpa_unit, hw/rtl/VX_trace_pkg.sv, sim/simx/instr.h, hw/rtl/cache, hw/rtl/tcu,
+              sim/simx/tcu, sw/kernel/include/vx_tensor.h, tests/regression/sgemm_tcu_wg_mbar,
+              tests/regression/sgemm_tcu_mx_mbar, sim/simx/mbar_waiters, sim/simx/Makefile,
+              tests/regression/mbar_wait, tests/regression/mbar_remote, sw/common/dxa_ref.h,
+              sw/common/dxa_meta.h, hw/rtl/core/VX_bg_unit.sv, hw/rtl/core/VX_sfu_unit.sv,
+              sim/simx/bg_unit, sim/simx/sfu_unit, tests/regression/cuda_api,
+              sw/kernel/include/vx_intrinsics.h, sw/kernel/include/vx_atomic.h,
+              sw/kernel/include/vx_cp_async.h, sw/kernel/include/vx_print.h,
+              sw/runtime/include/vortex2.h, sw/runtime/include/dxa.h, sw/runtime/common, sim/simx/dxa,
+              hw/rtl/core/VX_alu_int.sv, sim/simx/alu_unit.cpp, hw/rtl/interfaces,
+              hw/rtl/core/VX_csr_unit.sv, sim/simx/mem, sw/kernel/include/vx_barrier.h,
+              sw/runtime/include/vortex.h, hw/rtl/fpu, sim/simx/fpu_unit.cpp, third_party/cvfpu,
+              third_party/hardfloat, sw/kernel/src, tests/regression/common.mk,
+              sw/kernel/scripts/vxbin.py]
+    args: "-b 1"
+  - id: cf_rmsnorm
+    app: cf_rmsnorm
+    drivers: [rtlsim]
+    configs+: *e9b_a_cfg
+    shape: *cf_rmsnorm_shape
+    touches: *cf_rmsnorm_touches
+    args: "-b 1 -r 1"
+  # hpcops_rmsnorm_lamport: the cluster RMSNorm of hpc-ops' fused all-reduce + RMSNorm
+  # (rmsNormLamport<bf16, bf16, 1>, multi-GPU parts stubbed; not run on the H100) at the host's
+  # adjustGridConfig shape for one token of H = 8192: a cluster (1, 8, 1) of 128-thread blocks.
+  - id: hpcops_rmsnorm_lamport
+    app: hpcops_rmsnorm_lamport
+    drivers: [simx]
+    configs+: *e9b_a_cfg
+    shape: {cores: 8, warps: 4, threads: 32, l2cache: true}
+    touches: &lamport_touches [tests/regression/hpcops_rmsnorm_lamport,
+              tests/regression/dsmem_collectives, sw/kernel/include/vx_cuda.h,
+              sw/kernel/include/vx_dlmem.h, sw/kernel/include/vx_mbar.h, sw/kernel/include/vx_dxa.h,
+              sw/runtime/include/vx_cuda_runtime.h, sw/common/vx_cuda_fp.h, hw/rtl/mem/VX_local_mem.sv,
+              hw/rtl/core/VX_decode.sv, hw/rtl/VX_gpu_pkg.sv, hw/rtl/VX_define.vh, hw/rtl/dlmem,
+              hw/rtl/core/VX_lsu_slice.sv, hw/rtl/core/VX_mem_unit.sv, hw/rtl/core/VX_core.sv,
+              sim/simx/types.h, sim/simx/decode.cpp, sim/simx/amo, sim/simx/lsu_unit, sim/simx/dlmem,
+              sim/simx/core, sim/simx/processor.cpp, sw/common/mbar_ref.h, tests/regression/mbar_local,
+              VX_config.toml, hw/rtl/core/VX_wctl_unit.sv, sw/common/dxa_tmap.h,
+              hw/rtl/mem/VX_lmem_switch.sv, hw/rtl/core/VX_lsu_unit.sv, hw/rtl/core/VX_scheduler.sv,
+              sw/common/dlmem_ref.h, hw/rtl/dxa, hw/rtl/VX_kmu.sv, hw/rtl/Vortex.sv,
+              hw/rtl/VX_cluster.sv, hw/rtl/core/VX_cta_dispatch.sv, hw/rtl/core/VX_csr_data.sv,
+              hw/rtl/core/VX_kmu_bus_arb.sv, hw/rtl/core/VX_bar_unit.sv, hw/rtl/mem/VX_gbar_unit.sv,
+              hw/rtl/core/VX_execute.sv, hw/rtl/cp/VX_cp_axil_regfile.sv, hw/rtl/VX_socket.sv,
+              sim/simx/kmu, sim/simx/cta_dispatcher, sim/simx/scheduler, sim/simx/csr_unit.cpp,
+              sim/simx/cluster, sim/simx/barrier_unit, sim/common/cmd_processor.cpp,
+              sim/simx/wctl_unit.cpp, sim/simx/socket, sw/kernel/include/vx_spawn2.h,
+              tests/regression/cluster_rank, tests/regression/cta_gang, tests/regression/cluster_sync,
+              tests/regression/dlmem_local, tests/regression/dlmem_store, tests/regression/dlmem_load,
+              tests/regression/dlmem_atomic, tests/regression/dlmem_stress,
+              tests/regression/lmem_bar_order, tests/regression/dlmem_amo_order, VX_types.toml,
+              hw/rtl/core/VX_uop_sequencer.sv, sim/simx/sequencer, hw/rtl/core/VX_cpa_unit.sv,
+              sim/simx/cpa_unit, hw/rtl/VX_trace_pkg.sv, sim/simx/instr.h, hw/rtl/cache, hw/rtl/tcu,
+              sim/simx/tcu, sw/kernel/include/vx_tensor.h, tests/regression/sgemm_tcu_wg_mbar,
+              tests/regression/sgemm_tcu_mx_mbar, sim/simx/mbar_waiters, sim/simx/Makefile,
+              tests/regression/mbar_wait, tests/regression/mbar_remote, sw/common/dxa_ref.h,
+              sw/common/dxa_meta.h, hw/rtl/core/VX_bg_unit.sv, hw/rtl/core/VX_sfu_unit.sv,
+              sim/simx/bg_unit, sim/simx/sfu_unit, tests/regression/cuda_api,
+              sw/kernel/include/vx_intrinsics.h, sw/kernel/include/vx_atomic.h,
+              sw/kernel/include/vx_cp_async.h, sw/kernel/include/vx_print.h,
+              sw/runtime/include/vortex2.h, sw/runtime/include/dxa.h, sw/runtime/common, sim/simx/dxa,
+              hw/rtl/core/VX_alu_int.sv, sim/simx/alu_unit.cpp, hw/rtl/interfaces,
+              hw/rtl/core/VX_csr_unit.sv, sim/simx/mem, sw/kernel/include/vx_barrier.h,
+              sw/runtime/include/vortex.h, hw/rtl/fpu, sim/simx/fpu_unit.cpp, third_party/cvfpu,
+              third_party/hardfloat, sw/kernel/src, tests/regression/common.mk,
+              sw/kernel/scripts/vxbin.py]
+    args: "-t 1 -d 8192"
+  # Nightly: every CREDIT kernel at the yaml's other cluster sizes P = 2 and 4 (4096 columns, 3
+  # rows) and at the profiled slice of 8192 columns per block (65536 columns, P = 8, 1 row; up to
+  # 96 KB of tile per block); cf_rmsnorm with 2 rows.
+  - {id: credit_reduction-layernorm-p2, app: credit_reduction, drivers: [simx], tier: nightly, configs+: *e9b_a_cfg,
+     shape: {cores: 2, warps: 8, threads: 32, l2cache: true}, touches: *credit_touches,
+     args: "-k layernorm -c 4096 -n 3 -p 2"}
+  - {id: credit_reduction-layernorm-p4, app: credit_reduction, drivers: [simx], tier: nightly, configs+: *e9b_a_cfg,
+     shape: {cores: 4, warps: 8, threads: 32, l2cache: true}, touches: *credit_touches,
+     args: "-k layernorm -c 4096 -n 3 -p 4"}
+  - {id: credit_reduction-layernorm-c65536, app: credit_reduction, drivers: [simx], tier: nightly, configs+: *e9b_a_cfg,
+     shape: {cores: 8, warps: 8, threads: 32, l2cache: true}, touches: *credit_touches,
+     args: "-k layernorm -c 65536 -n 1 -p 8"}
+  - {id: credit_reduction-weighted_var-p2, app: credit_reduction, drivers: [simx], tier: nightly, configs+: *e9b_a_cfg,
+     shape: {cores: 2, warps: 8, threads: 32, l2cache: true}, touches: *credit_touches,
+     args: "-k weighted_var -c 4096 -n 3 -p 2"}
+  - {id: credit_reduction-weighted_var-p4, app: credit_reduction, drivers: [simx], tier: nightly, configs+: *e9b_a_cfg,
+     shape: {cores: 4, warps: 8, threads: 32, l2cache: true}, touches: *credit_touches,
+     args: "-k weighted_var -c 4096 -n 3 -p 4"}
+  - {id: credit_reduction-weighted_var-c65536, app: credit_reduction, drivers: [simx], tier: nightly, configs+: *e9b_a_cfg,
+     shape: {cores: 8, warps: 8, threads: 32, l2cache: true}, touches: *credit_touches,
+     args: "-k weighted_var -c 65536 -n 1 -p 8"}
+  - {id: credit_reduction-pearson-p2, app: credit_reduction, drivers: [simx], tier: nightly, configs+: *e9b_a_cfg,
+     shape: {cores: 2, warps: 8, threads: 32, l2cache: true}, touches: *credit_touches,
+     args: "-k pearson -c 4096 -n 3 -p 2"}
+  - {id: credit_reduction-pearson-p4, app: credit_reduction, drivers: [simx], tier: nightly, configs+: *e9b_a_cfg,
+     shape: {cores: 4, warps: 8, threads: 32, l2cache: true}, touches: *credit_touches,
+     args: "-k pearson -c 4096 -n 3 -p 4"}
+  - {id: credit_reduction-pearson-c65536, app: credit_reduction, drivers: [simx], tier: nightly, configs+: *e9b_a_cfg,
+     shape: {cores: 8, warps: 8, threads: 32, l2cache: true}, touches: *credit_touches,
+     args: "-k pearson -c 65536 -n 1 -p 8"}
+  - {id: credit_reduction-softmax-p2, app: credit_reduction, drivers: [simx], tier: nightly, configs+: *e9b_a_cfg,
+     shape: {cores: 2, warps: 8, threads: 32, l2cache: true}, touches: *credit_touches,
+     args: "-k softmax -c 4096 -n 3 -p 2"}
+  - {id: credit_reduction-softmax-p4, app: credit_reduction, drivers: [simx], tier: nightly, configs+: *e9b_a_cfg,
+     shape: {cores: 4, warps: 8, threads: 32, l2cache: true}, touches: *credit_touches,
+     args: "-k softmax -c 4096 -n 3 -p 4"}
+  - {id: credit_reduction-softmax-c65536, app: credit_reduction, drivers: [simx], tier: nightly, configs+: *e9b_a_cfg,
+     shape: {cores: 8, warps: 8, threads: 32, l2cache: true}, touches: *credit_touches,
+     args: "-k softmax -c 65536 -n 1 -p 8"}
+  - {id: credit_reduction-lars-p2, app: credit_reduction, drivers: [simx], tier: nightly, configs+: *e9b_a_cfg,
+     shape: {cores: 2, warps: 8, threads: 32, l2cache: true}, touches: *credit_touches,
+     args: "-k lars -c 4096 -n 3 -p 2"}
+  - {id: credit_reduction-lars-p4, app: credit_reduction, drivers: [simx], tier: nightly, configs+: *e9b_a_cfg,
+     shape: {cores: 4, warps: 8, threads: 32, l2cache: true}, touches: *credit_touches,
+     args: "-k lars -c 4096 -n 3 -p 4"}
+  - {id: credit_reduction-lars-c65536, app: credit_reduction, drivers: [simx], tier: nightly, configs+: *e9b_a_cfg,
+     shape: {cores: 8, warps: 8, threads: 32, l2cache: true}, touches: *credit_touches,
+     args: "-k lars -c 65536 -n 1 -p 8"}
+  - {id: credit_reduction-rowwise-p2, app: credit_reduction, drivers: [simx], tier: nightly, configs+: *e9b_a_cfg,
+     shape: {cores: 2, warps: 8, threads: 32, l2cache: true}, touches: *credit_touches,
+     args: "-k rowwise -c 4096 -n 3 -p 2"}
+  - {id: credit_reduction-rowwise-p4, app: credit_reduction, drivers: [simx], tier: nightly, configs+: *e9b_a_cfg,
+     shape: {cores: 4, warps: 8, threads: 32, l2cache: true}, touches: *credit_touches,
+     args: "-k rowwise -c 4096 -n 3 -p 4"}
+  - {id: credit_reduction-rowwise-c65536, app: credit_reduction, drivers: [simx], tier: nightly, configs+: *e9b_a_cfg,
+     shape: {cores: 8, warps: 8, threads: 32, l2cache: true}, touches: *credit_touches,
+     args: "-k rowwise -c 65536 -n 1 -p 8"}
+  - {id: cf_rmsnorm-b2, app: cf_rmsnorm, drivers: [simx], tier: nightly, configs+: *e9b_a_cfg,
+     shape: *cf_rmsnorm_shape, touches: *cf_rmsnorm_touches, args: "-b 2"}
+  # ClusterFusion's fused decode-step kernels as the H100 ran them (ClusterFusion 8755446 with
+  # the patch clusterfusion__residual_out_c4_fix): the Llama-2 attention block
+  # (include/H100/llama/kernel_sglang.cuh, variant fused_c4) and DeepSeek-V2-Lite weight-absorbed
+  # MLA (include/H100/deepseek/kernel.cuh). One cluster of four 128-thread blocks per head, one
+  # block per core (4 cores x 4 warps x 32 threads): TMA weight and KV tiles through tensor maps
+  # (zero fill past the sequence), bulk-push cluster reduces and an all-gather on mbarriers,
+  # remote f32 atomics and a remote max, f16 global atomics over the heads. Head counts, the MLA
+  # hidden size and sequence length are compile-time, through env (the app rebuilds when they
+  # change). Each rep draws new inputs and checks the wrappers' tolerances against the unfused
+  # sequence computed on the host. Smoke: llama 4 heads (hidden 512, 250 cached tokens), mla 2
+  # heads (hidden 1024, 128 tokens); nightly: 2 heads and 1 head.
+  - id: cf_decoder-llama
+    app: cf_decoder
+    drivers: [simx]
+    configs+: *dsmem_coll_cfg
+    shape: &cf_decoder_shape {cores: 4, warps: 4, threads: 32, l2cache: true}
+    env: &cf_decoder_env {CF_LLAMA_HEADS: "4", CF_MLA_HEADS: "2", CF_MLA_HIDDEN: "1024", CF_MLA_SEQ: "128"}
+    touches: &cf_decoder_touches [tests/regression/cf_decoder, tests/regression/dsmem_collectives,
+              sw/kernel/include/vx_cuda.h, sw/kernel/include/vx_dlmem.h, sw/kernel/include/vx_mbar.h,
+              sw/kernel/include/vx_dxa.h, sw/runtime/include/vx_cuda_runtime.h, sw/common/vx_cuda_fp.h,
+              hw/rtl/mem/VX_local_mem.sv, hw/rtl/core/VX_decode.sv, hw/rtl/VX_gpu_pkg.sv, hw/rtl/VX_define.vh,
+              hw/rtl/dlmem, hw/rtl/core/VX_lsu_slice.sv, hw/rtl/core/VX_mem_unit.sv, hw/rtl/core/VX_core.sv,
+              sim/simx/types.h, sim/simx/decode.cpp, sim/simx/amo, sim/simx/lsu_unit, sim/simx/dlmem,
+              sim/simx/core, sim/simx/processor.cpp, sw/common/mbar_ref.h, tests/regression/mbar_local,
+              VX_config.toml, hw/rtl/core/VX_wctl_unit.sv, sw/common/dxa_tmap.h, hw/rtl/mem/VX_lmem_switch.sv,
+              hw/rtl/core/VX_lsu_unit.sv, hw/rtl/core/VX_scheduler.sv, sw/common/dlmem_ref.h, hw/rtl/dxa,
+              hw/rtl/VX_kmu.sv, hw/rtl/Vortex.sv, hw/rtl/VX_cluster.sv, hw/rtl/core/VX_cta_dispatch.sv,
+              hw/rtl/core/VX_csr_data.sv, hw/rtl/core/VX_kmu_bus_arb.sv, hw/rtl/core/VX_bar_unit.sv,
+              hw/rtl/mem/VX_gbar_unit.sv, hw/rtl/core/VX_execute.sv, hw/rtl/cp/VX_cp_axil_regfile.sv,
+              hw/rtl/VX_socket.sv, sim/simx/kmu, sim/simx/cta_dispatcher, sim/simx/scheduler,
+              sim/simx/csr_unit.cpp, sim/simx/cluster, sim/simx/barrier_unit, sim/common/cmd_processor.cpp,
+              sim/simx/wctl_unit.cpp, sim/simx/socket, sw/kernel/include/vx_spawn2.h,
+              tests/regression/cluster_rank, tests/regression/cta_gang, tests/regression/cluster_sync,
+              tests/regression/dlmem_local, tests/regression/dlmem_store, tests/regression/dlmem_load,
+              tests/regression/dlmem_atomic, tests/regression/dlmem_stress, tests/regression/lmem_bar_order,
+              tests/regression/dlmem_amo_order, VX_types.toml, hw/rtl/core/VX_uop_sequencer.sv,
+              sim/simx/sequencer, hw/rtl/core/VX_cpa_unit.sv, sim/simx/cpa_unit, hw/rtl/VX_trace_pkg.sv,
+              sim/simx/instr.h, hw/rtl/cache, hw/rtl/tcu, sim/simx/tcu, sw/kernel/include/vx_tensor.h,
+              tests/regression/sgemm_tcu_wg_mbar, tests/regression/sgemm_tcu_mx_mbar, sim/simx/mbar_waiters,
+              sim/simx/Makefile, tests/regression/mbar_wait, tests/regression/mbar_remote,
+              sw/common/dxa_ref.h, sw/common/dxa_meta.h, hw/rtl/core/VX_bg_unit.sv,
+              hw/rtl/core/VX_sfu_unit.sv, sim/simx/bg_unit, sim/simx/sfu_unit, tests/regression/cuda_api,
+              sw/kernel/include/vx_intrinsics.h, sw/kernel/include/vx_atomic.h,
+              sw/kernel/include/vx_cp_async.h, sw/kernel/include/vx_print.h, sw/runtime/include/vortex2.h,
+              sw/runtime/include/dxa.h, sw/runtime/common, sim/simx/dxa, hw/rtl/core/VX_alu_int.sv,
+              sim/simx/alu_unit.cpp, hw/rtl/interfaces, hw/rtl/core/VX_csr_unit.sv, sim/simx/mem,
+              sw/kernel/include/vx_barrier.h, sw/runtime/include/vortex.h, hw/rtl/fpu, sim/simx/fpu_unit.cpp,
+              third_party/cvfpu, third_party/hardfloat, sw/kernel/src, tests/regression/common.mk,
+              sw/kernel/scripts/vxbin.py]
+    args: "-k llama -s 250"
+  - {id: cf_decoder-mla, app: cf_decoder, drivers: [simx], configs+: *dsmem_coll_cfg, shape: *cf_decoder_shape,
+     env: *cf_decoder_env, touches: *cf_decoder_touches, args: "-k mla"}
+  # The RTL leg, one rep each.
+  - {id: cf_decoder-llama, app: cf_decoder, drivers: [rtlsim], configs+: *dsmem_coll_cfg, shape: *cf_decoder_shape,
+     env: *cf_decoder_env, touches: *cf_decoder_touches, args: "-k llama -s 250 -r 1"}
+  # MLA's RTL leg runs one head (one cluster): two heads took 3 h 42 min of rtlsim.
+  - {id: cf_decoder-mla-h1, app: cf_decoder, drivers: [rtlsim], configs+: *dsmem_coll_cfg, shape: *cf_decoder_shape,
+     env: {CF_LLAMA_HEADS: "4", CF_MLA_HEADS: "1", CF_MLA_HIDDEN: "1024", CF_MLA_SEQ: "128"},
+     touches: *cf_decoder_touches, args: "-k mla -r 1"}
+  - {id: cf_decoder-llama-h2, app: cf_decoder, drivers: [simx], tier: nightly, configs+: *dsmem_coll_cfg,
+     shape: *cf_decoder_shape, env: {CF_LLAMA_HEADS: "2", CF_MLA_HEADS: "2", CF_MLA_HIDDEN: "1024", CF_MLA_SEQ: "128"},
+     touches: *cf_decoder_touches, args: "-k llama -s 250"}
+  - {id: cf_decoder-mla-h1, app: cf_decoder, drivers: [simx], tier: nightly, configs+: *dsmem_coll_cfg,
+     shape: *cf_decoder_shape, env: {CF_LLAMA_HEADS: "4", CF_MLA_HEADS: "1", CF_MLA_HIDDEN: "1024", CF_MLA_SEQ: "128"},
+     touches: *cf_decoder_touches, args: "-k mla"}
+  # The hpc-ops cluster-8 exact top-k (hpc-ops 2a2e265 src/topk/topk_filtered.cu,
+  # topk_filtered_cluster8_exact_kernel<VEC, 2048, 8, 1024>): one row per 8-CTA cluster of
+  # 1024-thread blocks (32 warps x 32 threads per core, 8 cores), DSMEM histogram all-reduce and
+  # gather to rank 0. VEC follows n: n = 8194 is the VEC 2 route the H100 profiled, n = 8192 the
+  # VEC 4 route. Each rep draws a new row and checks the wrapper's rule (k unique in-range
+  # indices equal to the CPU top-k, or the same sorted values under ties) and the route the kernel
+  # recorded against the one the coarse histogram implies; on VEC 2 each rank's recorded spill
+  # count must match its segment. The ties case forces the VEC 2 overflow continuation (4500
+  # boundary candidates; rank 5's segment alone exceeds its 2048-entry buffer, and the harness
+  # requires a spill) and asserts the route with -e.
+  - id: hpcops_topk
+    app: hpcops_topk
+    drivers: [simx]
+    configs+: *dsmem_coll_cfg
+    shape: &hpcops_topk_shape {cores: 8, warps: 32, threads: 32, l2cache: true}
+    touches: &hpcops_topk_touches [tests/regression/hpcops_topk, tests/regression/dsmem_collectives, sw/kernel/include/vx_cuda.h,
+              sw/kernel/include/vx_dlmem.h, sw/kernel/include/vx_mbar.h, sw/kernel/include/vx_dxa.h,
+              sw/runtime/include/vx_cuda_runtime.h, sw/common/vx_cuda_fp.h, hw/rtl/mem/VX_local_mem.sv,
+              hw/rtl/core/VX_decode.sv, hw/rtl/VX_gpu_pkg.sv, hw/rtl/VX_define.vh, hw/rtl/dlmem,
+              hw/rtl/core/VX_lsu_slice.sv, hw/rtl/core/VX_mem_unit.sv, hw/rtl/core/VX_core.sv,
+              sim/simx/types.h, sim/simx/decode.cpp, sim/simx/amo, sim/simx/lsu_unit, sim/simx/dlmem,
+              sim/simx/core, sim/simx/processor.cpp, sw/common/mbar_ref.h, tests/regression/mbar_local,
+              VX_config.toml, hw/rtl/core/VX_wctl_unit.sv, sw/common/dxa_tmap.h, hw/rtl/mem/VX_lmem_switch.sv,
+              hw/rtl/core/VX_lsu_unit.sv, hw/rtl/core/VX_scheduler.sv, sw/common/dlmem_ref.h, hw/rtl/dxa,
+              hw/rtl/VX_kmu.sv, hw/rtl/Vortex.sv, hw/rtl/VX_cluster.sv, hw/rtl/core/VX_cta_dispatch.sv,
+              hw/rtl/core/VX_csr_data.sv, hw/rtl/core/VX_kmu_bus_arb.sv, hw/rtl/core/VX_bar_unit.sv,
+              hw/rtl/mem/VX_gbar_unit.sv, hw/rtl/core/VX_execute.sv, hw/rtl/cp/VX_cp_axil_regfile.sv,
+              hw/rtl/VX_socket.sv, sim/simx/kmu, sim/simx/cta_dispatcher, sim/simx/scheduler,
+              sim/simx/csr_unit.cpp, sim/simx/cluster, sim/simx/barrier_unit, sim/common/cmd_processor.cpp,
+              sim/simx/wctl_unit.cpp, sim/simx/socket, sw/kernel/include/vx_spawn2.h,
+              tests/regression/cluster_rank, tests/regression/cta_gang, tests/regression/cluster_sync,
+              tests/regression/dlmem_local, tests/regression/dlmem_store, tests/regression/dlmem_load,
+              tests/regression/dlmem_atomic, tests/regression/dlmem_stress, tests/regression/lmem_bar_order,
+              tests/regression/dlmem_amo_order, VX_types.toml, hw/rtl/core/VX_uop_sequencer.sv,
+              sim/simx/sequencer, hw/rtl/core/VX_cpa_unit.sv, sim/simx/cpa_unit, hw/rtl/VX_trace_pkg.sv,
+              sim/simx/instr.h, hw/rtl/cache, hw/rtl/tcu, sim/simx/tcu, sw/kernel/include/vx_tensor.h,
+              tests/regression/sgemm_tcu_wg_mbar, tests/regression/sgemm_tcu_mx_mbar, sim/simx/mbar_waiters,
+              sim/simx/Makefile, tests/regression/mbar_wait, tests/regression/mbar_remote,
+              sw/common/dxa_ref.h, sw/common/dxa_meta.h, hw/rtl/core/VX_bg_unit.sv,
+              hw/rtl/core/VX_sfu_unit.sv, sim/simx/bg_unit, sim/simx/sfu_unit, tests/regression/cuda_api,
+              sw/kernel/include/vx_intrinsics.h, sw/kernel/include/vx_atomic.h,
+              sw/kernel/include/vx_cp_async.h, sw/kernel/include/vx_print.h, sw/runtime/include/vortex2.h,
+              sw/runtime/include/dxa.h, sw/runtime/common, sim/simx/dxa, hw/rtl/core/VX_alu_int.sv,
+              sim/simx/alu_unit.cpp, hw/rtl/interfaces, hw/rtl/core/VX_csr_unit.sv, sim/simx/mem,
+              sw/kernel/include/vx_barrier.h, sw/runtime/include/vortex.h,
+              hw/rtl/fpu, sim/simx/fpu_unit.cpp, third_party/cvfpu, third_party/hardfloat,
+              sw/kernel/src, tests/regression/common.mk, sw/kernel/scripts/vxbin.py]
+    args: "-n 8194 -e resident"
+  - {id: hpcops_topk-vec4, app: hpcops_topk, drivers: [simx], tier: nightly, configs+: *dsmem_coll_cfg,
+     shape: *hpcops_topk_shape, touches: *hpcops_topk_touches, args: "-n 8192 -e register"}
+  - {id: hpcops_topk-ties, app: hpcops_topk, drivers: [simx], tier: nightly, configs+: *dsmem_coll_cfg,
+     shape: *hpcops_topk_shape, touches: *hpcops_topk_touches, args: "-n 32770 -p ties -e overflow"}
+  # The FlashAttention-4 two-CTA dS exchange (h100-dsmem-collectives/kernels/
+  # flash_bwd_2cta_ds_exchange__fa4.cu, rank-1 K operand fixed): remote expect_tx + 16 KB bulk
+  # push, relay arrive on the leader, three cluster barriers, f32 global atomics for dQ. One
+  # cluster of two 256-thread blocks on 2 cores; dQ checked in double within the f32
+  # accumulation bound.
+  - id: fa4_ds_exchange
+    app: fa4_ds_exchange
+    drivers: [simx]
+    configs+: *dsmem_coll_cfg
+    shape: &fa4_ds_exchange_shape {cores: 2, warps: 8, threads: 32, l2cache: true}
+    touches: &fa4_ds_exchange_touches [tests/regression/fa4_ds_exchange, tests/regression/dsmem_collectives,
+              sw/kernel/include/vx_cuda.h, sw/kernel/include/vx_dlmem.h, sw/kernel/include/vx_mbar.h,
+              sw/kernel/include/vx_dxa.h, sw/runtime/include/vx_cuda_runtime.h, sw/common/vx_cuda_fp.h,
+              hw/rtl/mem/VX_local_mem.sv, hw/rtl/core/VX_decode.sv, hw/rtl/VX_gpu_pkg.sv, hw/rtl/VX_define.vh,
+              hw/rtl/dlmem, hw/rtl/core/VX_lsu_slice.sv, hw/rtl/core/VX_mem_unit.sv, hw/rtl/core/VX_core.sv,
+              sim/simx/types.h, sim/simx/decode.cpp, sim/simx/amo, sim/simx/lsu_unit, sim/simx/dlmem,
+              sim/simx/core, sim/simx/processor.cpp, sw/common/mbar_ref.h, tests/regression/mbar_local,
+              VX_config.toml, hw/rtl/core/VX_wctl_unit.sv, sw/common/dxa_tmap.h, hw/rtl/mem/VX_lmem_switch.sv,
+              hw/rtl/core/VX_lsu_unit.sv, hw/rtl/core/VX_scheduler.sv, sw/common/dlmem_ref.h, hw/rtl/dxa,
+              hw/rtl/VX_kmu.sv, hw/rtl/Vortex.sv, hw/rtl/VX_cluster.sv, hw/rtl/core/VX_cta_dispatch.sv,
+              hw/rtl/core/VX_csr_data.sv, hw/rtl/core/VX_kmu_bus_arb.sv, hw/rtl/core/VX_bar_unit.sv,
+              hw/rtl/mem/VX_gbar_unit.sv, hw/rtl/core/VX_execute.sv, hw/rtl/cp/VX_cp_axil_regfile.sv,
+              hw/rtl/VX_socket.sv, sim/simx/kmu, sim/simx/cta_dispatcher, sim/simx/scheduler,
+              sim/simx/csr_unit.cpp, sim/simx/cluster, sim/simx/barrier_unit, sim/common/cmd_processor.cpp,
+              sim/simx/wctl_unit.cpp, sim/simx/socket, sw/kernel/include/vx_spawn2.h,
+              tests/regression/cluster_rank, tests/regression/cta_gang, tests/regression/cluster_sync,
+              tests/regression/dlmem_local, tests/regression/dlmem_store, tests/regression/dlmem_load,
+              tests/regression/dlmem_atomic, tests/regression/dlmem_stress, tests/regression/lmem_bar_order,
+              tests/regression/dlmem_amo_order, VX_types.toml, hw/rtl/core/VX_uop_sequencer.sv,
+              sim/simx/sequencer, hw/rtl/core/VX_cpa_unit.sv, sim/simx/cpa_unit, hw/rtl/VX_trace_pkg.sv,
+              sim/simx/instr.h, hw/rtl/cache, hw/rtl/tcu, sim/simx/tcu, sw/kernel/include/vx_tensor.h,
+              tests/regression/sgemm_tcu_wg_mbar, tests/regression/sgemm_tcu_mx_mbar, sim/simx/mbar_waiters,
+              sim/simx/Makefile, tests/regression/mbar_wait, tests/regression/mbar_remote,
+              sw/common/dxa_ref.h, sw/common/dxa_meta.h, hw/rtl/core/VX_bg_unit.sv,
+              hw/rtl/core/VX_sfu_unit.sv, sim/simx/bg_unit, sim/simx/sfu_unit, tests/regression/cuda_api,
+              sw/kernel/include/vx_intrinsics.h, sw/kernel/include/vx_atomic.h,
+              sw/kernel/include/vx_cp_async.h, sw/kernel/include/vx_print.h, sw/runtime/include/vortex2.h,
+              sw/runtime/include/dxa.h, sw/runtime/common, sim/simx/dxa, hw/rtl/core/VX_alu_int.sv,
+              sim/simx/alu_unit.cpp, hw/rtl/interfaces, hw/rtl/core/VX_csr_unit.sv, sim/simx/mem,
+              sw/kernel/include/vx_barrier.h, sw/runtime/include/vortex.h,
+              hw/rtl/fpu, sim/simx/fpu_unit.cpp, third_party/cvfpu, third_party/hardfloat,
+              sw/kernel/src, tests/regression/common.mk, sw/kernel/scripts/vxbin.py]
+  - id: fa4_ds_exchange
+    app: fa4_ds_exchange
+    drivers: [rtlsim]
+    configs+: *dsmem_coll_cfg
+    shape: *fa4_ds_exchange_shape
+    touches: *fa4_ds_exchange_touches
+    args: "-r 1"
