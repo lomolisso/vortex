@@ -107,13 +107,39 @@ __global__ void cg_k(cuda_arg_t* __UNIFORM__ arg) {
   // Each block publishes its grid rank; every thread reads its successor's
   // through the window after the cluster barrier.
   auto lm = reinterpret_cast<uint32_t*>(__local_mem());
-  if (tb.thread_rank() == 0)
+  if (tb.thread_rank() == 0) {
     lm[0] = 0x1000 + grid.block_rank();
+    lm[1] = 0;
+  }
   cl.sync();
   const uint32_t peer = (cl.block_rank() + 1) % cl.num_blocks();
   uint32_t* pw = cl.map_shared_rank(lm, peer);
   o[k++] = *pw;
   o[k++] = cl.query_shared_rank(pw);
+  // Thread t reads rank t % size, so every rank, the caller's own included, is read.
+  uint32_t* aw = cl.map_shared_rank(lm, tb.thread_rank() % cl.num_blocks());
+  o[k++] = *aw;
+  o[k++] = cl.query_shared_rank(aw);
+  o[k++] = cuda::ptx::get_sreg_cluster_ctaid_x();
+  o[k++] = cuda::ptx::get_sreg_cluster_ctaid_y();
+  o[k++] = cuda::ptx::get_sreg_cluster_ctaid_z();
+  o[k++] = cuda::ptx::get_sreg_cluster_nctaid_x();
+  o[k++] = cuda::ptx::get_sreg_cluster_nctaid_y();
+  o[k++] = cuda::ptx::get_sreg_cluster_nctaid_z();
+  o[k++] = cuda::ptx::get_sreg_cluster_ctarank();
+  o[k++] = cuda::ptx::get_sreg_cluster_nctarank();
+  o[k++] = cuda::ptx::get_sreg_clusterid_x();
+  o[k++] = cuda::ptx::get_sreg_clusterid_y();
+  o[k++] = cuda::ptx::get_sreg_clusterid_z();
+  // Every block adds one to rank 0's counter, the last rank late, so a
+  // barrier that lets a block through early leaves the count short.
+  if (tb.thread_rank() == 0) {
+    if (cl.block_rank() == cl.num_blocks() - 1)
+      __nanosleep(2000);
+    atomicAdd(cl.map_shared_rank(&lm[1], 0), 1u);
+  }
+  cl.sync();
+  o[k++] = *reinterpret_cast<volatile uint32_t*>(cl.map_shared_rank(&lm[1], 0));
   o[k++] = tile.thread_rank();
   o[k++] = tile.size();
   o[k++] = tile.meta_group_rank();
@@ -868,6 +894,53 @@ __global__ void types_k(cuda_arg_t* __UNIFORM__ arg) {
   auto o = reinterpret_cast<uint32_t*>(arg->aux);
   for (uint32_t i = t; i < T_INPUTS; i += nt)
     types_ops::eval_input(i, o + i * T_OPS);
+}
+
+// ── dfp: the f64 _rn intrinsics, with frm at RNE and then at RTZ ─────────
+__global__ void dfp_k(cuda_arg_t* __UNIFORM__ arg) {
+  const uint32_t nt = blockDim.x * gridDim.x;
+  const uint32_t t = threadIdx.x + blockDim.x * blockIdx.x;
+  auto in = reinterpret_cast<const uint64_t*>(arg->in);
+  auto o = reinterpret_cast<uint64_t*>(arg->out);
+  for (uint32_t pass = 0; pass < 2; ++pass) {
+    __asm__ volatile("fsrm %0" ::"r"(pass) : "memory");
+    for (uint32_t i = t; i < D_INPUTS; i += nt) {
+      const uint64_t* x = in + i * D_IN;
+      const double a = __longlong_as_double((long long)x[0]), b = __longlong_as_double((long long)x[1]);
+      const double c = __longlong_as_double((long long)x[2]);
+      uint64_t* w = o + ((uint64_t)pass * D_INPUTS + i) * D_OPS;
+      w[0] = (uint64_t)__double_as_longlong(__dadd_rn(a, b));
+      w[1] = (uint64_t)__double_as_longlong(__dsub_rn(a, b));
+      w[2] = (uint64_t)__double_as_longlong(__dmul_rn(a, b));
+      w[3] = (uint64_t)__double_as_longlong(__fma_rn(a, b, c));
+      w[4] = (uint64_t)__double_as_longlong(__ll2double_rn((long long)x[3]));
+      w[5] = (uint64_t)__double_as_longlong(__int2double_rn((int)(uint32_t)x[3]));
+      w[6] = __double2uint_rn(a);
+      w[7] = (uint64_t)__double_as_longlong(__dadd_rn(__dmul_rn(a, b), c));
+      w[8] = (uint64_t)__double_as_longlong(__drcp_rn(a));
+    }
+  }
+  __asm__ volatile("fsrm %0" ::"r"(0u) : "memory");
+}
+
+// ── flog: __logf and the lg2.approx forms, with frm at RNE and then at RTZ ─
+__global__ void flog_k(cuda_arg_t* __UNIFORM__ arg) {
+  const uint32_t nt = blockDim.x * gridDim.x;
+  const uint32_t t = threadIdx.x + blockDim.x * blockIdx.x;
+  auto in = reinterpret_cast<const uint32_t*>(arg->in);
+  auto o = reinterpret_cast<uint32_t*>(arg->out);
+  for (uint32_t pass = 0; pass < 2; ++pass) {
+    __asm__ volatile("fsrm %0" ::"r"(pass) : "memory");
+    for (uint32_t i = t; i < L_INPUTS; i += nt) {
+      const uint32_t x = in[i];
+      uint32_t* w = o + (pass * L_INPUTS + i) * L_OPS;
+      w[0] = vx_cuda_fp::lg2_approx_ftz(x);
+      w[1] = vx_cuda_fp::lg2_approx(x);
+      w[2] = __float_as_uint(__logf(__int_as_float((int)x)));
+      w[3] = vx_cuda_fp::lg2_mul_ln2(vx_cuda_fp::lg2_approx_ftz(x));
+    }
+  }
+  __asm__ volatile("fsrm %0" ::"r"(0u) : "memory");
 }
 
 // ── launch: a kernel with __cluster_dims__ ───────────────────────────────

@@ -225,7 +225,9 @@ tests:
   # and bf16 pattern widened and back, f32/f64/int narrowing around every
   # midpoint, the arithmetic on specials and random operands against softfloat
   # (bf16 through f128 round-to-odd), fma with far-apart addends, the e4m3
-  # table, __frsqrt_rn exhaustive on [1, 4), the approx forms within bounds.
+  # table, __frsqrt_rn exhaustive on [1, 4), the approx forms within bounds,
+  # the f64 _rn intrinsics against softfloat with the library's NaN and the
+  # PTX u32 saturation rule, and __logf / lg2.approx on 4096 H100 samples.
   - id: sw-cuda-fp
     via: script
     xlen: [64]

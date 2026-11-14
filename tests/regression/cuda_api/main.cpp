@@ -5,8 +5,9 @@
 // against a host reference written from the CUDA / PTX semantics.
 //
 //   -m cg       cooperative-groups identity: grid, block, cluster, tile ranks
-//               and sizes, map_shared_rank, invoke_one, for a 1D and a 2D
-//               cluster and a launch without one (-c x,y,z: that shape only)
+//               and sizes, the cluster special registers, map_shared_rank to
+//               every rank, cluster.sync arrivals, invoke_one, for a 1D and a
+//               2D cluster and a launch without one (-c x,y,z: that shape only)
 //   -m warp     shuffles (4 kinds x 6 widths x 6 lanes x 5 types), votes in
 //               divergent branches, elect_sync, __reduce_*_sync,
 //               __match_*_sync, lane masks, thread_block_tile<32> members
@@ -21,7 +22,11 @@
 //   -m sync     __syncthreads_count/and/or, __syncwarp ordering
 //   -m types    the number types on the device equal the host's, bit for bit
 //   -m launch   launch_kernel_ex with __cluster_dims__, func_set_attribute,
-//               occupancy and tensor-map wrappers
+//               func_set_cache_config, occupancy and tensor-map wrappers
+//   -m dfp      the f64 _rn intrinsics on the device, with frm at RNE and at
+//               RTZ, against the host reference
+//   -m flog     __logf and lg2.approx(.ftz) on the device, with frm at RNE and
+//               at RTZ, equal to the host's bits
 //   -p          the parity run: warp reductions, shuffles, integer atomics
 //   -r <n>      rounds of -p (default P_ROUNDS)
 //   -x 1|2|3    runs that must fail: the kernel entry check traps a launch
@@ -38,6 +43,8 @@
 #include "types_ops.h"
 
 #include <algorithm>
+#include <cfenv>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -61,8 +68,8 @@ namespace vc = vx::cuda;
     }                                                                 \
   } while (0)
 
-enum Mode { M_CG, M_WARP, M_ATOMIC, M_BARRIER, M_PTX, M_SYNC, M_TYPES, M_LAUNCH, NUM_MODES };
-const char* const kModeNames[] = {"cg", "warp", "atomic", "barrier", "ptx", "sync", "types", "launch"};
+enum Mode { M_CG, M_WARP, M_ATOMIC, M_BARRIER, M_PTX, M_SYNC, M_TYPES, M_LAUNCH, M_DFP, M_FLOG, NUM_MODES };
+const char* const kModeNames[] = {"cg", "warp", "atomic", "barrier", "ptx", "sync", "types", "launch", "dfp", "flog"};
 
 uint32_t mode = M_CG;
 int neg = 0;
@@ -80,7 +87,7 @@ uint64_t num_cores = 0, nw = 0, nt = 0, lmem_cap = 0, max_cluster = 0, isa = 0;
 int failures = 0;
 
 void usage() {
-  std::printf("Usage: [-m cg|warp|atomic|barrier|ptx|sync|types|launch] [-c x,y,z] [-s parts] [-p] [-r rounds] "
+  std::printf("Usage: [-m cg|warp|atomic|barrier|ptx|sync|types|launch|dfp|flog] [-c x,y,z] [-s parts] [-p] [-r rounds] "
               "[-x 1|2|3] [-v] [-h]\n");
 }
 
@@ -247,6 +254,10 @@ void cg_launch(vx_kernel_h k, vc::dim3 cluster, vc::dim3 grid, const char* tag) 
     const uint32_t peer_rank = (crank + 1) % vol(c);
     const vc::dim3 pi(peer_rank % c.x, (peer_rank / c.x) % c.y, peer_rank / (c.x * c.y));
     const uint32_t peer_br = (cid.x * c.x + pi.x) + grid.x * ((cid.y * c.y + pi.y) + grid.y * (cid.z * c.z + pi.z));
+    auto rank_br = [&](uint32_t r) {
+      const vc::dim3 ri(r % c.x, (r / c.x) % c.y, r / (c.x * c.y));
+      return (cid.x * c.x + ri.x) + grid.x * ((cid.y * c.y + ri.y) + grid.y * (cid.z * c.z + ri.z));
+    };
     for (uint32_t tz = 0; tz < block.z; ++tz)
     for (uint32_t ty = 0; ty < block.y; ++ty)
     for (uint32_t tx = 0; tx < block.x; ++tx) {
@@ -257,6 +268,8 @@ void cg_launch(vx_kernel_h k, vc::dim3 cluster, vc::dim3 grid, const char* tag) 
         crank, vol(c), c.x, c.y, c.z, ci.x, ci.y, ci.z, crank * bt + tr, bt * vol(c),
         block.x * c.x, block.y * c.y, block.z * c.z, 1,
         0x1000u + peer_br, peer_rank,
+        0x1000u + rank_br(tr % vol(c)), tr % vol(c), ci.x, ci.y, ci.z, c.x, c.y, c.z, crank, vol(c),
+        cid.x, cid.y, cid.z, vol(c),
         tr % 32, 32, tr / 32, (bt + 31) / 32, threads, 0xC0DE};
       static const char* const names[] = {
         "grid.thread_rank", "grid.num_threads", "grid.block_rank", "grid.num_blocks", "grid.dim_blocks.x",
@@ -270,7 +283,10 @@ void cg_launch(vx_kernel_h k, vc::dim3 cluster, vc::dim3 grid, const char* tag) 
         "cluster.dim_blocks.y", "cluster.dim_blocks.z", "cluster.block_index.x", "cluster.block_index.y",
         "cluster.block_index.z", "cluster.thread_rank", "cluster.num_threads", "cluster.dim_threads.x",
         "cluster.dim_threads.y", "cluster.dim_threads.z", "cluster.is_valid", "map_shared_rank(peer)",
-        "query_shared_rank", "tile.thread_rank", "tile.size", "tile.meta_group_rank", "tile.meta_group_size",
+        "query_shared_rank", "map_shared_rank(t % size)", "query_shared_rank(t % size)", "%cluster_ctaid.x",
+        "%cluster_ctaid.y", "%cluster_ctaid.z", "%cluster_nctaid.x", "%cluster_nctaid.y", "%cluster_nctaid.z",
+        "%cluster_ctarank", "%cluster_nctarank", "%clusterid.x", "%clusterid.y", "%clusterid.z",
+        "arrivals before cluster.sync", "tile.thread_rank", "tile.size", "tile.meta_group_rank", "tile.meta_group_size",
         "grid.size", "done"};
       static_assert(sizeof(want) / sizeof(want[0]) == sizeof(names) / sizeof(names[0]), "one name a word");
       for (uint32_t w = 0; w < sizeof(want) / sizeof(want[0]); ++w)
@@ -852,6 +868,188 @@ void mode_types() {
   }
 }
 
+// ── dfp ──────────────────────────────────────────────────────────────
+// PTX: add/sub/mul/fma/rcp.rn.f64 and cvt.rn.f64.s64 round once to nearest
+// even (the host's mode), cvt.rn.f64.s32 is exact, cvt.rni.u32.f64 clamps to
+// [0, 2^32 - 1] and converts NaN to 0. NaN results are vx_cuda_fp.h's
+// 0xfff8000000000000, a library rule: the H100 returns a NaN input quieted.
+uint64_t dbits(double d) { uint64_t u; std::memcpy(&u, &d, 8); return u; }
+double bitsd(uint64_t u) { double d; std::memcpy(&d, &u, 8); return d; }
+uint64_t dnan(double r) { return r != r ? 0xfff8000000000000ull : dbits(r); }
+
+void dfp_ref(const uint64_t* x, uint64_t* w) {
+  const double a = bitsd(x[0]), b = bitsd(x[1]), c = bitsd(x[2]);
+  volatile double p = a * b;  // rounded before the add of w[7]
+  w[0] = dnan(a + b);
+  w[1] = dnan(a - b);
+  w[2] = dnan(p);
+  w[3] = dnan(std::fma(a, b, c));
+  w[4] = dbits((double)(int64_t)x[3]);
+  w[5] = dbits((double)(int32_t)(uint32_t)x[3]);
+  const double r = std::nearbyint(a);
+  w[6] = (a != a || !(r > 0.0)) ? 0 : r >= 4294967295.0 ? 0xffffffffu : (uint64_t)r;
+  w[7] = dnan(p + c);
+  w[8] = dnan(1.0 / a);
+}
+
+// Every pair of 32 specials (NaNs, +-0, +-inf, subnormals, ties, the u32
+// bounds), then random inputs: close exponents, an addend that cancels the
+// rounded product, and u32 conversions with x.5 ties.
+void dfp_inputs(std::vector<uint64_t>& in) {
+  const uint64_t sp[32] = {
+    0, 0x8000000000000000ull, 0x7ff0000000000000ull, 0xfff0000000000000ull, 0x7ff8000000000000ull,
+    0xfff8000000000123ull, 0x7ff0000000000001ull, 1, 3, 0x800fffffffffffffull, 0x0010000000000000ull,
+    0x7fefffffffffffffull, 0xffefffffffffffffull, dbits(1.0), dbits(-1.0), dbits(0.5), dbits(1.5), dbits(2.5),
+    dbits(3.5), dbits(-0.5), dbits(-1.5), dbits(-0.4), dbits(0x1p-53), dbits(1.0 + 0x1p-52),
+    dbits(0.49999999999999994), dbits(4503599627370497.0), dbits(4294967295.0), dbits(4294967295.5),
+    dbits(4294967296.0), dbits(2147483648.5), dbits(1e300), dbits(1.0 / 3.0)};
+  const uint64_t ll[16] = {
+    0, 1, ~0ull, 1ull << 63, ~0ull >> 1, (1ull << 53) + 1, (1ull << 53) + 3, 0 - ((1ull << 53) + 1),
+    (1ull << 54) + 2, (1ull << 54) + 6, (~0ull >> 1) - 511, (~0ull >> 1) - 512, 0xffffffff80000000ull,
+    0x7fffffffull, 0x80000000ull, 0xffffffffull};
+  auto with_exp = [](uint64_t v, uint32_t e) { return (v & 0x800fffffffffffffull) | ((uint64_t)e << 52); };
+  for (uint32_t i = 0; i < D_INPUTS; ++i) {
+    uint64_t* x = &in[(uint64_t)i * D_IN];
+    if (i < 32 * 32) {
+      x[0] = sp[i % 32];
+      x[1] = sp[i / 32];
+      x[2] = sp[(7 * i + i / 32) % 32];
+      x[3] = ll[i % 16];
+      continue;
+    }
+    x[0] = mix64(i, 1);
+    x[1] = mix64(i, 2);
+    x[2] = mix64(i, 3);
+    x[3] = mix64(i, 4) >> (mix32(i, 5) % 64);
+    if (i & 1)
+      x[3] = 0 - x[3];
+    switch (i % 4) {
+    case 1: {
+      const int32_t ea = std::min<int32_t>(2046, (int32_t)((x[0] >> 52) & 0x7ff));
+      x[0] = with_exp(x[0], (uint32_t)ea);
+      x[1] = with_exp(x[1], (uint32_t)std::min(2046, std::max(0, ea + (int32_t)(mix32(i, 6) % 121) - 60)));
+      break;
+    }
+    case 2:
+      x[0] = with_exp(x[0], 900 + mix32(i, 7) % 246);
+      x[1] = with_exp(x[1], 900 + mix32(i, 8) % 246);
+      x[2] = dbits(-(bitsd(x[0]) * bitsd(x[1])));
+      break;
+    case 3:
+      x[0] = dbits((double)(mix64(i, 9) % (1ull << 34)) * 0.5 - 4.0);
+      break;
+    default:
+      break;
+    }
+  }
+}
+
+void mode_dfp() {
+  vx_kernel_h k = kernel("dfp_k");
+  std::vector<uint64_t> x((uint64_t)D_INPUTS * D_IN);
+  dfp_inputs(x);
+  Buf in(x.size() * 8), out((uint64_t)2 * D_INPUTS * D_OPS * 8), dump(64);
+  in.write(x.data(), x.size() * 8);
+  const std::vector<uint64_t> fill(out.size / 8, 0xBADC0FFEE0DDF00Dull);
+  out.write(fill.data(), out.size);
+  cuda_arg_t arg = new_arg();
+  arg.in = in.addr;
+  arg.out = out.addr;
+  arg.dump = dump.addr;
+  CHECK(run(k, config(vc::dim3(2), vc::dim3(D_WARPS * WARP), vc::dim3(0, 0, 0), 0), arg));
+  const std::vector<uint64_t> o = out.read<uint64_t>();
+  static const char* const names[D_OPS] = {"dadd_rn", "dsub_rn", "dmul_rn", "fma_rn", "ll2double_rn",
+                                           "int2double_rn", "double2uint_rn", "dadd_rn(dmul_rn)", "drcp_rn"};
+  uint64_t want[D_OPS];
+  for (uint32_t pass = 0; pass < 2; ++pass) {
+    Check ck(pass ? "frm-rtz" : "frm-rne");
+    for (uint32_t i = 0; i < D_INPUTS; ++i) {
+      dfp_ref(&x[(uint64_t)i * D_IN], want);
+      for (uint32_t j = 0; j < D_OPS; ++j)
+        ck.eq(o[((uint64_t)pass * D_INPUTS + i) * D_OPS + j], want[j], names[j], i, j);
+    }
+  }
+  // The RTZ pass tells a static rne from the dynamic mode only if some
+  // results differ under RTZ.
+  {
+    Check ck("rtz-discriminates");
+    uint64_t rtz[D_OPS], differ = 0;
+    for (uint32_t i = 0; i < D_INPUTS; ++i) {
+      dfp_ref(&x[(uint64_t)i * D_IN], want);
+      std::fesetround(FE_TOWARDZERO);
+      dfp_ref(&x[(uint64_t)i * D_IN], rtz);
+      std::fesetround(FE_TONEAREST);
+      for (uint32_t j = 0; j < D_OPS; ++j)
+        differ += want[j] != rtz[j];
+    }
+    ck.eq(differ > 0, 1, "results that differ under RTZ", 0);
+    std::printf("cuda_api: dfp: %llu of %u results differ under RTZ\n", (unsigned long long)differ,
+                D_INPUTS * D_OPS);
+  }
+  vx_kernel_release(k);
+}
+
+// ── flog ─────────────────────────────────────────────────────────────
+// The host runs the same integer model, so the device must match it bit for
+// bit; the host model itself is checked against the H100 in the cuda_fp unit
+// test. Inputs: specials, both ends of every exponent, every table segment's
+// ends in [0.5, 2), 1 +- k ulp, then random subnormals, near-one and any bits.
+void flog_inputs(std::vector<uint32_t>& in) {
+  std::vector<uint32_t> v = {0, 0x80000000u, 0x7f800000u, 0xff800000u, 0x7fc00000u, 0xffc00000u, 0x7f800001u,
+                             0xff800001u, 0x7fffffffu, 0x3f800000u, 0xbf800000u, 0x40000000u, 0x3f000000u,
+                             0x402df854u, 0x3f317218u, 0x7f7fffffu, 0xff7fffffu, 0x00800000u, 0x80800000u,
+                             0x007fffffu, 0x807fffffu, 0x00000001u, 0x80000001u, 0x00400000u};
+  for (uint32_t e = 1; e < 255; ++e) {
+    v.push_back(e << 23);
+    v.push_back((e << 23) | 0x7fffffu);
+  }
+  for (uint32_t e = 126; e < 128; ++e)
+    for (uint32_t s = 0; s < 64; ++s) {
+      v.push_back((e << 23) | (s << 17));
+      v.push_back((e << 23) | (s << 17) | 0x1ffffu);
+    }
+  for (uint32_t k = 1; k <= 64; ++k) {
+    v.push_back(0x3f800000u + k);
+    v.push_back(0x3f800000u - k);
+  }
+  for (uint32_t i = (uint32_t)v.size(); i < L_INPUTS; ++i) {
+    const uint32_t r = mix32(i, 0x10f);
+    switch (i % 4) {
+    case 0: v.push_back(r & 0x807fffffu); break;
+    case 1: v.push_back(0x3f800000u + (r % 0x20000u) - 0x10000u); break;
+    default: v.push_back(r); break;
+    }
+  }
+  in.assign(v.begin(), v.begin() + L_INPUTS);
+}
+
+void mode_flog() {
+  vx_kernel_h k = kernel("flog_k");
+  std::vector<uint32_t> x;
+  flog_inputs(x);
+  Buf in(x.size() * 4), out((uint64_t)2 * L_INPUTS * L_OPS * 4);
+  in.write(x.data(), x.size() * 4);
+  const std::vector<uint32_t> fill(out.size / 4, 0xBADC0FFEu);
+  out.write(fill.data(), out.size);
+  cuda_arg_t arg = new_arg();
+  arg.in = in.addr;
+  arg.out = out.addr;
+  CHECK(run(k, config(vc::dim3(2), vc::dim3(L_WARPS * WARP), vc::dim3(0, 0, 0), 0), arg));
+  const std::vector<uint32_t> o = out.read<uint32_t>();
+  static const char* const names[L_OPS] = {"lg2.approx.ftz", "lg2.approx", "__logf", "__logf -ftz"};
+  for (uint32_t pass = 0; pass < 2; ++pass) {
+    Check ck(pass ? "frm-rtz" : "frm-rne");
+    for (uint32_t i = 0; i < L_INPUTS; ++i) {
+      const uint32_t want[L_OPS] = {vx_cuda_fp::lg2_approx_ftz(x[i]), vx_cuda_fp::lg2_approx(x[i]),
+                                    __float_as_uint(__logf(__int_as_float((int)x[i]))),
+                                    vx_cuda_fp::lg2_mul_ln2(vx_cuda_fp::lg2_approx_ftz(x[i]))};
+      for (uint32_t j = 0; j < L_OPS; ++j)
+        ck.eq(o[((uint64_t)pass * L_INPUTS + i) * L_OPS + j], want[j], names[j], i, j);
+    }
+  }
+  vx_kernel_release(k);
+}
+
 // ── launch ───────────────────────────────────────────────────────────
 void check_launch(Check& ck, const Buf& aux, uint32_t blocks, uint32_t bt, uint32_t dyn, const char* what) {
   std::vector<uint32_t> w = aux.read<uint32_t>();
@@ -910,6 +1108,7 @@ void mode_launch() {
     ck.eq(vc::func_set_attribute(dev, k, vc::func_attribute::max_dynamic_shared_memory_size, (int)lmem_cap),
           VX_SUCCESS, "the local memory", 0);
     ck.eq(vc::func_max_dynamic_shared_memory_size(k), lmem_cap, "recorded limit", 0);
+    ck.eq(vc::func_set_cache_config(k, vc::func_cache::prefer_shared), VX_SUCCESS, "func_set_cache_config", 0);
     aux.zero();
     cfg.dyn_smem = (uint32_t)lmem_cap;
     ck.eq(run<launch_k_cluster_dims>(k, cfg, arg), VX_SUCCESS, "at the limit", 0);
@@ -1441,6 +1640,8 @@ int main(int argc, char** argv) {
     case M_PTX:     mode_ptx(); break;
     case M_SYNC:    mode_sync(); break;
     case M_TYPES:   mode_types(); break;
+    case M_DFP:     mode_dfp(); break;
+    case M_FLOG:    mode_flog(); break;
     default:        mode_launch(); break;
     }
   }

@@ -35,7 +35,7 @@ static inline uint64_t mix64(uint32_t a, uint32_t b) {
 }
 
 // ── cg ────────────────────────────────────────────────────────────────
-#define CG_WORDS 64
+#define CG_WORDS 72
 #define CG_BLOCK_X 32
 #define CG_BLOCK_Y 2
 #define CG_BLOCK_Z 2
@@ -366,6 +366,21 @@ static inline uint32_t s_sw_value(uint32_t r, uint32_t t, uint32_t space) { retu
 // ── types ─────────────────────────────────────────────────────────────
 #define T_INPUTS 512
 #define T_WARPS  4
+
+// ── dfp ───────────────────────────────────────────────────────────────
+// Per input: a, b, c (f64 bits) and l (an int64, whose low half is the int).
+// Per input and pass: dadd, dsub, dmul, fma, ll2double, int2double,
+// double2uint, dadd(dmul(a, b), c), drcp(a).
+#define D_INPUTS 2048
+#define D_IN     4
+#define D_OPS    9
+#define D_WARPS  4
+
+// ── flog ──────────────────────────────────────────────────────────────
+// Per input and pass: lg2.approx.ftz, lg2.approx, __logf, __logf with -ftz.
+#define L_INPUTS 4096
+#define L_OPS    4
+#define L_WARPS  4
 
 // ── launch ────────────────────────────────────────────────────────────
 VX_CUDA_CLUSTER_DIMS(launch_k, 2, 1, 1);

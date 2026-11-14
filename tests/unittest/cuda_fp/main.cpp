@@ -1,10 +1,13 @@
-// vx_cuda_fp.h against independent references: softfloat for f16 and the f32
-// intrinsics; for bf16, softfloat f128 with round-to-odd, then f32 with
+// vx_cuda_fp.h against independent references: softfloat for f16, the f32
+// intrinsics and the f64 _rn intrinsics; for bf16, softfloat f128 with round-to-odd, then f32 with
 // round-to-odd, then round-to-nearest-even on the bits; for e4m3, the 256
 // values built from the format definition; for rsqrt, exact integer
-// comparisons of the rounding midpoints with 1/sqrt(x).
+// comparisons of the rounding midpoints with 1/sqrt(x); for __logf and
+// lg2.approx, the H100's own outputs.
 
 #include <vx_cuda_fp.h>
+
+#include "lg2_h100_samples.h"
 
 #include <algorithm>
 #include <chrono>
@@ -928,6 +931,162 @@ void test_approx() {
   finish(g);
 }
 
+// __logf and the lg2.approx forms against the H100's values for 4096 inputs
+// covering every input class. The model has no known mismatch, so every value
+// must be equal.
+void test_logf() {
+  Group g("logf-h100");
+  constexpr int NC = sizeof(kLg2SampleClass) / sizeof(kLg2SampleClass[0]);
+  uint64_t bad[NC] = {};
+  for (const Lg2Sample& s : kLg2Samples) {
+#ifdef __FAST_MATH__
+    const uint32_t want_logf = s.logf_ftz;
+#else
+    const uint32_t want_logf = s.logf;
+#endif
+    const uint32_t got[4] = {vx_cuda_fp::lg2_approx_ftz(s.x), vx_cuda_fp::lg2_approx(s.x), fb(__logf(bf(s.x))),
+                             vx_cuda_fp::lg2_mul_ln2(vx_cuda_fp::lg2_approx_ftz(s.x))};
+    const uint32_t want[4] = {s.lg2_ftz, s.lg2, want_logf, s.logf_ftz};
+    static const char* const name[4] = {"lg2.approx.ftz", "lg2.approx", "__logf", "__logf -ftz"};
+    for (int j = 0; j < 4; ++j) {
+      check(g, got[j] == want[j], "%s(%08x) [%s] = %08x, H100 %08x", name[j], s.x, kLg2SampleClass[s.cls], got[j],
+            want[j]);
+      bad[s.cls] += got[j] != want[j];
+    }
+  }
+  for (int c = 0; c < NC; ++c)
+    if (bad[c])
+      std::printf("  logf-h100: %" PRIu64 " mismatches in class %s\n", bad[c], kLg2SampleClass[c]);
+  finish(g);
+}
+
+// The f64 _rn intrinsics against softfloat in round-to-nearest-even, with the
+// library's NaN rule on top (every NaN result is 0xfff8000000000000, where the
+// H100 returns a NaN input quieted) and the PTX one for cvt.rni.u32.f64: it
+// clamps to [0, 2^32 - 1] and converts NaN to 0.
+constexpr uint64_t F64_QNAN = 0xfff8000000000000ull;
+bool nan64(uint64_t u) { return (u & 0x7fffffffffffffffull) > 0x7ff0000000000000ull; }
+float64_t f64v(uint64_t u) { float64_t r; r.v = u; return r; }
+uint64_t canon64(float64_t r) { return nan64(r.v) ? F64_QNAN : r.v; }
+
+uint32_t ref_d2u(uint64_t u) {
+  if (nan64(u)) return 0;
+  if (u >> 63) return 0;  // rounds to -0, or below 0
+  if (u >= db(4294967295.5)) return 0xffffffffu;  // positive doubles order as their bits; +inf included
+  return (uint32_t)f64_to_ui32(f64v(u), softfloat_round_near_even, false);
+}
+
+// Exponent field e (0..2046) with a random sign and fraction.
+uint64_t rnd_exp(int e) { return (rnd64() & 0x800fffffffffffffull) | ((uint64_t)e << 52); }
+
+void test_rn64() {
+  Group g("rn64-intrinsics");
+  softfloat_roundingMode = softfloat_round_near_even;
+  const double dmax = bd(0x7fefffffffffffffull);
+  auto run = [&](uint64_t a, uint64_t b, uint64_t c) {
+    const double A = bd(a), B = bd(b), C = bd(c);
+    const float64_t xa = f64v(a), xb = f64v(b), xc = f64v(c);
+    const uint64_t got[6] = {db(__dadd_rn(A, B)), db(__dsub_rn(A, B)), db(__dmul_rn(A, B)), db(__fma_rn(A, B, C)),
+                             db(__dadd_rn(__dmul_rn(A, B), C)), db(__drcp_rn(A))};
+    const uint64_t want[6] = {canon64(f64_add(xa, xb)), canon64(f64_sub(xa, xb)), canon64(f64_mul(xa, xb)),
+                              canon64(f64_mulAdd(xa, xb, xc)), canon64(f64_add(f64_mul(xa, xb), xc)),
+                              canon64(f64_div(f64v(db(1.0)), xa))};
+    static const char* const name[6] = {"dadd_rn", "dsub_rn", "dmul_rn", "fma_rn", "dadd_rn(dmul_rn)", "drcp_rn"};
+    for (int k = 0; k < 6; ++k)
+      check(g, got[k] == want[k], "%s(%016" PRIx64 ", %016" PRIx64 ", %016" PRIx64 "): got %016" PRIx64
+            " want %016" PRIx64, name[k], a, b, c, got[k], want[k]);
+    const uint32_t d = __double2uint_rn(A), wd = ref_d2u(a);
+    check(g, d == wd, "double2uint_rn(%016" PRIx64 "): got %u want %u", a, d, wd);
+  };
+  auto run_int = [&](int64_t l) {
+    const uint64_t got = db(__ll2double_rn(l)), want = i64_to_f64(l).v;
+    check(g, got == want, "ll2double_rn(%" PRId64 "): got %016" PRIx64 " want %016" PRIx64, l, got, want);
+    const int32_t i = (int32_t)(uint32_t)l;
+    const uint64_t got32 = db(__int2double_rn(i)), want32 = i32_to_f64(i).v;
+    check(g, got32 == want32, "int2double_rn(%d): got %016" PRIx64 " want %016" PRIx64, i, got32, want32);
+  };
+  const uint64_t sp[] = {
+    0, 0x8000000000000000ull, 0x7ff0000000000000ull, 0xfff0000000000000ull,  // +-0, +-inf
+    0x7ff8000000000000ull, 0xfff8000000000123ull, 0x7ff0000000000001ull,      // qNaN, -qNaN with payload, sNaN
+    1, 3, 0x800fffffffffffffull, 0x0010000000000000ull,                       // subnormals, min normal
+    0x7fefffffffffffffull, 0xffefffffffffffffull,                             // +-max
+    db(1.0), db(-1.0), db(0.5), db(1.5), db(2.5), db(3.5), db(-0.5), db(-1.5), db(-0.4),
+    db(0x1p-53), db(1.0 + 0x1p-52), db(0.49999999999999994), db(4503599627370497.0),  // 2^52 + 1
+    db(4294967295.0), db(4294967295.5), db(4294967296.0), db(2147483648.5), db(1e300), db(1.0 / 3.0)};
+  for (uint64_t a : sp)
+    for (uint64_t b : sp)
+      for (uint64_t c : sp) run(a, b, c);
+  for (int i = 0; i < 2000000; ++i) {
+    uint64_t a = rnd64(), b = rnd64(), c = rnd64();
+    const int ea = (int)(rnd64() % 2047);
+    switch (i % 5) {
+    case 1:  // close exponents: the add and sub round
+      a = rnd_exp(ea);
+      b = rnd_exp(std::min(2046, std::max(0, ea + (int)(rnd64() % 121) - 60)));
+      break;
+    case 2:  // c cancels the rounded product: fma returns its rounding error
+      a = rnd_exp(900 + (int)(rnd64() % 246));
+      b = rnd_exp(900 + (int)(rnd64() % 246));
+      c = f64_mul(f64v(a), f64v(b)).v ^ 0x8000000000000000ull;
+      break;
+    case 3: {  // products near and below the smallest normal
+      const int e1 = 1 + (int)(rnd64() % 1000), e2 = 1029 - (int)(rnd64() % 66) - e1;
+      a = rnd_exp(e1);
+      b = rnd_exp(std::min(2046, std::max(1, e2)));
+      c = rnd_exp((int)(rnd64() % 60));
+      break;
+    }
+    case 4:  // conversion to u32: ties at x.5 inside and around the range
+      a = db((double)(rnd64() % (1ull << 34)) * 0.5 - 4.0);
+      break;
+    default:
+      break;
+    }
+    run(a, b, c);
+  }
+  const int64_t ll[] = {0, 1, -1, INT64_MIN, INT64_MAX, (1ll << 53) + 1, (1ll << 53) + 3, -((1ll << 53) + 1),
+                        (1ll << 54) + 2, (1ll << 54) + 6, INT64_MAX - 511, INT64_MAX - 512, INT32_MIN, INT32_MAX,
+                        0x80000000ll, 0xffffffffll};
+  for (int64_t l : ll) run_int(l);
+  for (int i = 0; i < 1000000; ++i) {
+    const uint64_t m = rnd64() >> (rnd64() % 64);
+    run_int((int64_t)((i & 1) ? 0 - m : m));
+  }
+  // The PTX rules and the library's NaN, spelled out.
+  check(g, __double2uint_rn(bd(0x7ff8000000000000ull)) == 0 && __double2uint_rn(bd(0xfff8000000000001ull)) == 0,
+        "double2uint_rn(NaN) = 0");
+  check(g, __double2uint_rn(INFINITY) == 0xffffffffu && __double2uint_rn(-INFINITY) == 0, "double2uint_rn(+-inf)");
+  check(g, __double2uint_rn(4294967295.5) == 0xffffffffu && __double2uint_rn(1e20) == 0xffffffffu,
+        "double2uint_rn saturates high");
+  check(g, __double2uint_rn(-1.5) == 0 && __double2uint_rn(-0.5) == 0 && __double2uint_rn(-0.0) == 0,
+        "double2uint_rn saturates low");
+  check(g, __double2uint_rn(0.5) == 0 && __double2uint_rn(1.5) == 2 && __double2uint_rn(2.5) == 2 &&
+        __double2uint_rn(4294967294.5) == 4294967294u, "double2uint_rn ties to even");
+  check(g, __dadd_rn(1.0, 0x1p-53) == 1.0 && __dadd_rn(1.0 + 0x1p-52, 0x1p-53) == 1.0 + 0x1p-51,
+        "dadd_rn ties to even");
+  check(g, __ll2double_rn((1ll << 53) + 1) == 0x1p53 && __ll2double_rn((1ll << 53) + 3) == 0x1p53 + 4.0 &&
+        __ll2double_rn(INT64_MAX) == 0x1p63, "ll2double_rn ties to even");
+  check(g, __fma_rn(1.0 + 0x1p-52, 1.0 - 0x1p-53, -1.0) == 0x1p-53 - 0x1p-105 &&
+        __dadd_rn(__dmul_rn(1.0 + 0x1p-52, 1.0 - 0x1p-53), -1.0) == 0.0, "fma_rn rounds once, dmul_rn + dadd_rn twice");
+  check(g, db(__dadd_rn(INFINITY, -INFINITY)) == F64_QNAN && db(__dmul_rn(0.0, INFINITY)) == F64_QNAN &&
+        db(__dsub_rn(bd(0x7ff0000000000001ull), 1.0)) == F64_QNAN && db(__fma_rn(1.0, 1.0, NAN)) == F64_QNAN,
+        "NaN results are 0xfff8000000000000");
+  check(g, db(__drcp_rn(0.0)) == db(INFINITY) && db(__drcp_rn(-0.0)) == db(-INFINITY) && db(__drcp_rn(INFINITY)) == 0 &&
+        db(__drcp_rn(-INFINITY)) == 0x8000000000000000ull && db(__drcp_rn(NAN)) == F64_QNAN &&
+        db(__drcp_rn(bd(0x7ff0000000000001ull))) == F64_QNAN, "drcp_rn specials");
+  check(g, __drcp_rn(3.0) == 1.0 / 3.0 && __drcp_rn(-0.5) == -2.0 && db(__drcp_rn(0x1p1023)) == 0x0008000000000000ull &&
+        db(__drcp_rn(dmax)) == 0x0004000000000000ull && db(__drcp_rn(0x1p-1023)) == 0x7fe0000000000000ull &&
+        db(__drcp_rn(0x1p-1024)) == db(INFINITY) && db(__drcp_rn(bd(1))) == db(INFINITY),
+        "drcp_rn rounding, subnormal results and inputs, overflow");
+  check(g, db(__dadd_rn(-0.0, -0.0)) == 0x8000000000000000ull && db(__dadd_rn(-0.0, 0.0)) == 0 &&
+        db(__dsub_rn(0.0, 0.0)) == 0 && db(__dmul_rn(-1.0, 0.0)) == 0x8000000000000000ull &&
+        db(__fma_rn(1.0, -0.0, 0.0)) == 0 && db(__fma_rn(-0.0, 1.0, -0.0)) == 0x8000000000000000ull, "signed zeros");
+  check(g, db(__dmul_rn(bd(3), 0.5)) == 2 && db(__dmul_rn(0x1p-1022, 0.5)) == 0x0008000000000000ull,
+        "subnormal products");
+  check(g, __dadd_rn(dmax, dmax) == INFINITY && __dmul_rn(-dmax, 2.0) == -INFINITY, "overflow");
+  finish(g);
+}
+
 // Every f32 pattern (about 3 min): run with -x.
 void test_exhaustive() {
   Group g("f32-exhaustive");
@@ -967,7 +1126,9 @@ int main(int argc, char** argv) {
   test_operators<BF16>();
   test_rsqrt();
   test_rn();
+  test_rn64();
   test_approx();
+  test_logf();
   if (argc > 1 && std::strcmp(argv[1], "-x") == 0) test_exhaustive();
   const double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
   std::printf("PERF: cuda_fp %" PRIu64 " checks in %.1f s\n", g_checks, s);

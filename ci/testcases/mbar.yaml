@@ -2290,7 +2290,8 @@ tests:
   # vx_cuda.h, vx_cuda_fp.h and vx_cuda_runtime.h by their CUDA names, launches
   # through vx::cuda::launch_kernel_ex and checks every result against a host
   # reference written from the CUDA and PTX semantics.
-  # Cooperative-groups identity (grid, block, cluster, tile ranks and sizes, map_shared_rank,
+  # Cooperative-groups identity (grid, block, cluster, tile ranks and sizes, the cluster
+  # special registers, map_shared_rank to every rank, the cluster.sync arrival count,
   # invoke_one) for a 1D and a 2D cluster of 2 and a launch without a cluster.
   - id: cuda_api-cg
     app: cuda_api
@@ -2326,6 +2327,14 @@ tests:
     shape: {cores: 2, threads: 32, l2cache: true}
     touches: *cuda_api_touches
     args: "-m cg -c 1,1,2"
+  # Four blocks in a (1, 2, 2) cluster, the TFHE shape, on four cores.
+  - id: cuda_api-cg3d-c122
+    app: cuda_api
+    drivers: [simx]
+    configs+: "-DVX_CFG_EXT_DXA_ENABLE -DVX_CFG_EXT_ZACAS_ENABLE -DVX_CFG_EXT_FPAMO_ENABLE"
+    shape: {cores: 4, threads: 32, l2cache: true}
+    touches: *cuda_api_touches
+    args: "-m cg -c 1,2,2"
   # Every shuffle x width x lane/delta x type, votes in divergent branches, elect_sync,
   # __reduce_*_sync, __match_*_sync, the lane masks and the thread_block_tile<32> members.
   - id: cuda_api-warp
@@ -2460,6 +2469,24 @@ tests:
     shape: {cores: 2, threads: 32, l2cache: true}
     touches: *cuda_api_touches
     args: "-p"
+  # The f64 _rn intrinsics on the device against the host reference (NaN, +-0, +-inf,
+  # subnormals, ties to even, the u32 saturation), with frm at RNE and at RTZ.
+  - id: cuda_api-dfp
+    app: cuda_api
+    drivers: [simx]
+    configs+: "-DVX_CFG_EXT_DXA_ENABLE -DVX_CFG_EXT_ZACAS_ENABLE -DVX_CFG_EXT_FPAMO_ENABLE"
+    shape: {cores: 2, threads: 32, l2cache: true}
+    touches: *cuda_api_touches
+    args: "-m dfp"
+  # __logf, lg2.approx and lg2.approx.ftz on the device against the H100 model (specials,
+  # both ends of every exponent and table segment, 1 +- k ulp), with frm at RNE and at RTZ.
+  - id: cuda_api-flog
+    app: cuda_api
+    drivers: [simx]
+    configs+: "-DVX_CFG_EXT_DXA_ENABLE -DVX_CFG_EXT_ZACAS_ENABLE -DVX_CFG_EXT_FPAMO_ENABLE"
+    shape: {cores: 2, threads: 32, l2cache: true}
+    touches: *cuda_api_touches
+    args: "-m flog"
 
   # The 29 DSMEM collectives of the H100 study (h100-dsmem-collectives/collectives, commit
   # 2b9a97e), one app at the ports' shape: N cores of one cluster (one block of 8 warps x 32

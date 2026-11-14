@@ -12,10 +12,11 @@
 // limitations under the License.
 
 // Host side of the CUDA porting layer, over vortex2.h and dxa.h: a
-// cudaLaunchKernelEx-shaped launch, cudaFuncSetAttribute, the cluster
-// occupancy queries and the cuTensorMapEncode* calls, with CUDA's parameter
-// order and enum names. A Vortex kernel takes one argument block, so the
-// kernel's parameters are one trivially copyable struct.
+// cudaLaunchKernelEx-shaped launch, cudaFuncSetAttribute,
+// cudaFuncSetCacheConfig, the cluster occupancy queries and the
+// cuTensorMapEncode* calls, with CUDA's parameter order and enum names. A
+// Vortex kernel takes one argument block, so the kernel's parameters are one
+// trivially copyable struct.
 //
 // Every call returns a vx_result_t: VX_ERR_INVALID_VALUE where CUDA returns
 // cudaErrorInvalidValue / CUDA_ERROR_INVALID_VALUE, VX_ERR_INVALID_HANDLE for
@@ -212,6 +213,21 @@ inline vx_result_t func_set_attribute(vx_device_h dev, vx_kernel_h kernel, func_
   }
   }
   return VX_ERR_INVALID_VALUE;
+}
+
+// cudaFuncCache, with CUDA's values.
+enum class func_cache : int {
+  prefer_none   = 0,
+  prefer_shared = 1,
+  prefer_l1     = 2,
+  prefer_equal  = 3,
+};
+
+// cudaFuncSetCacheConfig: accepted and ignored, because the split of the L1
+// between cache and shared memory is not modelled.
+inline vx_result_t func_set_cache_config(vx_kernel_h kernel, func_cache config) {
+  (void)config;
+  return kernel ? VX_SUCCESS : VX_ERR_INVALID_HANDLE;
 }
 
 // cudaFuncGetAttributes' maxDynamicSharedMemorySize, as recorded.

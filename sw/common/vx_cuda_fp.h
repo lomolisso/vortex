@@ -75,6 +75,16 @@ constexpr uint32_t F32_NAN = 0x7fffffff;
 
 __VX_CUDA_FP_HD float canon_f32(float r) { return (r != r) ? u2f(F32_NAN) : r; }
 
+// f64 NaN results, on every target: the NaN the H100 generates for inf - inf.
+// For a NaN input the H100 returns that NaN quieted; its payload is not kept
+// here, an accepted difference.
+constexpr uint64_t F64_NAN = 0xfff8000000000000ull;
+
+// A bit test: -ffast-math folds x != x to false.
+__VX_CUDA_FP_HD bool is_nan_f64(double d) { return (d2u(d) << 1) > 0xffe0000000000000ull; }
+
+__VX_CUDA_FP_HD double canon_f64(double r) { return is_nan_f64(r) ? u2d(F64_NAN) : r; }
+
 struct fmt_f16  { static constexpr int MB = 10, BIAS = 15;  static constexpr uint32_t SIGN = 0x8000, MAXFIN = 0x7bff, INF = 0x7c00, NAN_ = 0x7fff; };
 struct fmt_bf16 { static constexpr int MB = 7,  BIAS = 127; static constexpr uint32_t SIGN = 0x8000, MAXFIN = 0x7f7f, INF = 0x7f80, NAN_ = 0x7fff; };
 // e4m3 has no infinity: an overflow without saturation is NaN.
@@ -593,4 +603,235 @@ __VX_CUDA_FP_HD float __fdividef(const float x, const float y) {
   return __fdiv_rn(x, y);
 }
 
+// The H100's MUFU.LG2 bit for bit, measured over all 2^32 inputs. For a normal
+// x = 2^E (1 + m 2^-23), each of 64 segments of m holds a quadratic whose
+// squarer drops each partial-product row below bit 19, giving a fraction F in
+// 2^-36 units; T = E 2^36 + F is negated as ~T when negative and truncated to
+// 24 bits. Integer arithmetic only, so no target's FTZ, DAZ or rounding mode
+// can change a bit.
+namespace vx_cuda_fp {
+
+__VX_CUDA_FP_HD uint64_t lg2_sq19(uint32_t xl) {
+  uint64_t s = 0;
+  for (int i = 0; i < 17; ++i) {
+    if ((xl >> i) & 1u) {
+      const uint64_t hi = (uint64_t)((xl >> (i + 1)) << (i + 1));
+      s += (((uint64_t)1 << (2 * i)) + (hi << (i + 1))) >> 19;
+    }
+  }
+  return s;
+}
+
+__VX_CUDA_FP_HD uint64_t lg2_frac36(uint32_t m) {
+  static const uint64_t K0[64] = {
+    29508ull, 6148432709ull, 12203000644ull, 18166489924ull,
+    24041640772ull, 29831013189ull, 35537077061ull, 41162191684ull,
+    46708667204ull, 52178604868ull, 57574130500ull, 62897230661ull,
+    68149822277ull, 73333732164ull, 78450783044ull, 83502646085ull,
+    88490939204ull, 93417288517ull, 98283180868ull, 103090078533ull,
+    107839419204ull, 112532534084ull, 117170770756ull, 121755394880ull,
+    126287618884ull, 130768622404ull, 135199564608ull, 139581543237ull,
+    143915623236ull, 148202869572ull, 152444248900ull, 156640731973ull,
+    160793285444ull, 164902798149ull, 168970179396ull, 172996260677ull,
+    176981869381ull, 180927816517ull, 184834904900ull, 188703847236ull,
+    192535413573ull, 196330328900ull, 200089273156ull, 203812897604ull,
+    207501906756ull, 211156931397ull, 214778549061ull, 218367394629ull,
+    221924049733ull, 225449096004ull, 228943086404ull, 232406541125ull,
+    235840037700ull, 239244047173ull, 242619102016ull, 245965656900ull,
+    249284195141ull, 252575208260ull, 255839150917ull, 259076424516ull,
+    262287512389ull, 265472783172ull, 268632675140ull, 271767585605ull,
+  };
+  static const uint16_t C1[64] = {
+    47272, 46545, 45840, 45156, 44492, 43847, 43221, 42612,
+    42020, 41444, 40884, 40339, 39809, 39292, 38788, 38297,
+    37818, 37351, 36896, 36451, 36018, 35594, 35180, 34776,
+    34380, 33994, 33616, 33247, 32886, 32532, 32186, 31847,
+    31516, 31191, 30872, 30561, 30255, 29955, 29662, 29374,
+    29091, 28814, 28542, 28276, 28014, 27757, 27505, 27257,
+    27013, 26774, 26540, 26309, 26082, 25859, 25640, 25424,
+    25213, 25004, 24799, 24598, 24399, 24204, 24012, 23823,
+  };
+  static const uint16_t C2[64] = {
+    1454, 1410, 1370, 1330, 1292, 1254, 1220, 1184,
+    1152, 1118, 1088, 1060, 1036, 1008, 982, 958,
+    932, 910, 890, 866, 850, 828, 808, 792,
+    770, 754, 736, 722, 708, 692, 678, 662,
+    652, 638, 622, 614, 600, 586, 578, 566,
+    552, 542, 532, 524, 514, 506, 498, 488,
+    476, 468, 464, 454, 446, 438, 432, 422,
+    418, 408, 402, 398, 390, 384, 378, 372,
+  };
+  const uint32_t s = m >> 17, xl = m & 0x1ffff;
+  return (K0[s] + (uint64_t)C1[s] * xl - (uint64_t)C2[s] * lg2_sq19(xl)) >> 2;
+}
+
+// lg2.approx.ftz.f32: x = 1 gives +0 (the table alone would not); zero and
+// subnormal inputs give -inf; negative inputs and NaN give F32_NAN.
+__VX_CUDA_FP_HD uint32_t lg2_approx_ftz(uint32_t x) {
+  if ((x & 0x7fffffff) > 0x7f800000) return F32_NAN;
+  if ((x & 0x7f800000) == 0) return 0xff800000;
+  if (x >> 31) return F32_NAN;
+  if (x == 0x7f800000) return x;
+  if (x == 0x3f800000) return 0;
+  const int64_t T = (int64_t)((int)(x >> 23) - 127) * ((int64_t)1 << 36) + (int64_t)lg2_frac36(x & 0x7fffff);
+  const uint32_t sign = T < 0 ? 0x80000000u : 0u;
+  const uint64_t mag = T < 0 ? ~(uint64_t)T : (uint64_t)T;
+  if (mag == 0) return sign;
+  const int p = 63 - __builtin_clzll(mag);
+  const uint64_t man = p > 23 ? mag >> (p - 23) : mag << (23 - p);
+  return sign | ((uint32_t)(p - 36 + 127) << 23) | ((uint32_t)man & 0x7fffff);
+}
+
+// sign | mag 2^-frac rounded to nearest even; every caller's result is normal.
+__VX_CUDA_FP_HD uint32_t lg2_fix_to_f32(uint32_t sign, uint64_t mag, int frac) {
+  if (mag == 0) return sign;
+  int p = 63 - __builtin_clzll(mag);
+  uint64_t man;
+  if (p > 23) {
+    const int sh = p - 23;
+    man = mag >> sh;
+    const uint64_t rem = mag & (((uint64_t)1 << sh) - 1), half = (uint64_t)1 << (sh - 1);
+    if (rem > half || (rem == half && (man & 1)))
+      ++man;
+    if (man >> 24) {
+      man >>= 1;
+      ++p;
+    }
+  } else {
+    man = mag << (23 - p);
+  }
+  return sign | ((uint32_t)(p - frac + 127) << 23) | ((uint32_t)man & 0x7fffff);
+}
+
+// lg2.approx.f32: nvcc wraps MUFU.LG2 for a subnormal input in a multiply by
+// 2^24 and an add of -24.
+__VX_CUDA_FP_HD uint32_t lg2_approx(uint32_t x) {
+  const uint32_t ax = x & 0x7fffffff;
+  if (ax >= 0x00800000) return lg2_approx_ftz(x);
+  if (ax == 0) return 0xff800000;
+  if (x >> 31) return F32_NAN;
+  const int p = 31 - __builtin_clz(ax);
+  const uint32_t r = lg2_approx_ftz(((uint32_t)(p + 2) << 23) | ((ax << (23 - p)) & 0x7fffff));
+  const uint64_t man = (r & 0x7fffff) | 0x800000;
+  const int lsb = (int)((r >> 23) & 0xff) - 150, frac = 40;
+  return lg2_fix_to_f32(0x80000000u, (man << (lsb + frac)) + ((uint64_t)24 << frac), frac);
+}
+
+// mul.f32 by 0x3f317218 (ln 2 as a float), rounded to nearest even; no
+// finite nonzero lg2 result is small enough to flush.
+__VX_CUDA_FP_HD uint32_t lg2_mul_ln2(uint32_t r) {
+  const uint32_t ar = r & 0x7fffffff;
+  if (ar > 0x7f800000) return F32_NAN;
+  if (ar == 0x7f800000 || ar == 0) return r;
+  const uint64_t man = (r & 0x7fffff) | 0x800000;
+  const int lsb = (int)((r >> 23) & 0xff) - 150;
+  return lg2_fix_to_f32(r & 0x80000000u, man * 0xb17218u, 24 - lsb);
+}
+
+} // namespace vx_cuda_fp
+
+// nvcc's __logf is lg2.approx.f32 times ln 2; -ftz=true and -use_fast_math
+// drop the subnormal wrapper, which only -ffast-math can signal here.
+__VX_CUDA_FP_HD float __logf(const float x) {
+#ifdef __FAST_MATH__
+  return vx_cuda_fp::u2f(vx_cuda_fp::lg2_mul_ln2(vx_cuda_fp::lg2_approx_ftz(vx_cuda_fp::f2u(x))));
+#else
+  return vx_cuda_fp::u2f(vx_cuda_fp::lg2_mul_ln2(vx_cuda_fp::lg2_approx(vx_cuda_fp::f2u(x))));
+#endif
+}
+
+// Double-precision _rn intrinsics. On RV64D each is one instruction with a
+// static round-to-nearest-even mode, so frm cannot change it; the host
+// computes the same value in its default rounding mode. NaN results are
+// F64_NAN.
+
+#if defined(__riscv) && __riscv_xlen == 64 && defined(__riscv_flen) && __riscv_flen >= 64
+#define __VX_CUDA_FP_RV64D
+#else
+namespace vx_cuda_fp {
+// The value is rounded on its own: a compiler that contracts across
+// statements (GCC's -ffp-contract=fast) cannot fuse it into a later add.
+__VX_CUDA_FP_HD double rn_alone(double r) { volatile double v = r; return v; }
+} // namespace vx_cuda_fp
+#endif
+
+__VX_CUDA_FP_HD double __dadd_rn(const double x, const double y) {
+#ifdef __VX_CUDA_FP_RV64D
+  double r;
+  __asm__("fadd.d %0, %1, %2, rne" : "=f"(r) : "f"(x), "f"(y));
+  return vx_cuda_fp::canon_f64(r);
+#else
+  return vx_cuda_fp::canon_f64(vx_cuda_fp::rn_alone(x + y));
+#endif
+}
+
+__VX_CUDA_FP_HD double __dsub_rn(const double x, const double y) {
+#ifdef __VX_CUDA_FP_RV64D
+  double r;
+  __asm__("fsub.d %0, %1, %2, rne" : "=f"(r) : "f"(x), "f"(y));
+  return vx_cuda_fp::canon_f64(r);
+#else
+  return vx_cuda_fp::canon_f64(vx_cuda_fp::rn_alone(x - y));
+#endif
+}
+
+__VX_CUDA_FP_HD double __dmul_rn(const double x, const double y) {
+#ifdef __VX_CUDA_FP_RV64D
+  double r;
+  __asm__("fmul.d %0, %1, %2, rne" : "=f"(r) : "f"(x), "f"(y));
+  return vx_cuda_fp::canon_f64(r);
+#else
+  return vx_cuda_fp::canon_f64(vx_cuda_fp::rn_alone(x * y));
+#endif
+}
+
+__VX_CUDA_FP_HD double __fma_rn(const double x, const double y, const double z) {
+#ifdef __VX_CUDA_FP_RV64D
+  double r;
+  __asm__("fmadd.d %0, %1, %2, %3, rne" : "=f"(r) : "f"(x), "f"(y), "f"(z));
+  return vx_cuda_fp::canon_f64(r);
+#else
+  return vx_cuda_fp::canon_f64(__builtin_fma(x, y, z));
+#endif
+}
+
+// rcp.rn.f64: the correctly rounded 1/x, subnormal results included.
+__VX_CUDA_FP_HD double __drcp_rn(const double x) {
+#ifdef __VX_CUDA_FP_RV64D
+  double r;
+  __asm__("fdiv.d %0, %1, %2, rne" : "=f"(r) : "f"(1.0), "f"(x));
+  return vx_cuda_fp::canon_f64(r);
+#else
+  return vx_cuda_fp::canon_f64(vx_cuda_fp::rn_alone(1.0 / x));
+#endif
+}
+
+__VX_CUDA_FP_HD double __ll2double_rn(const long long int x) {
+#ifdef __VX_CUDA_FP_RV64D
+  double r;
+  __asm__("fcvt.d.l %0, %1, rne" : "=f"(r) : "r"(x));
+  return r;
+#else
+  return (double)x;
+#endif
+}
+
+__VX_CUDA_FP_HD double __int2double_rn(const int x) { return (double)x; }
+
+// cvt.rni.u32.f64 saturates to [0, 2^32 - 1] and converts NaN to 0, where
+// fcvt.wu.d gives 2^32 - 1.
+__VX_CUDA_FP_HD unsigned int __double2uint_rn(const double x) {
+  if (vx_cuda_fp::is_nan_f64(x)) return 0;
+#ifdef __VX_CUDA_FP_RV64D
+  unsigned long r;
+  __asm__("fcvt.wu.d %0, %1, rne" : "=r"(r) : "f"(x));
+  return (unsigned int)r;
+#else
+  const double r = __builtin_rint(x);
+  if (!(r > 0.0)) return 0;
+  return r >= 4294967295.0 ? 0xffffffffu : (unsigned int)r;
+#endif
+}
+
+#undef __VX_CUDA_FP_RV64D
 #undef __VX_CUDA_FP_HD
