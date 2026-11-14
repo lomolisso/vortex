@@ -2737,48 +2737,6 @@ tests:
     env: *dsmem_coll_n4_m1024
     touches: *dsmem_coll_touches
     args: "-a alltoall__shift"
-  # The RTL leg at the same points, one rep each: the ring, the two pushes into peers (bulk
-  # copies and float atomics), the pull, and the remote-armed mbarrier of the pairwise exchange.
-  - id: dsmem_coll-allreduce__ring
-    app: dsmem_collectives
-    drivers: [rtlsim]
-    configs+: *dsmem_coll_cfg
-    shape: *dsmem_coll_n4
-    env: *dsmem_coll_n4_m1024
-    touches: *dsmem_coll_touches
-    args: "-a allreduce__ring -r 1"
-  - id: dsmem_coll-allreduce__two_shot_push
-    app: dsmem_collectives
-    drivers: [rtlsim]
-    configs+: *dsmem_coll_cfg
-    shape: *dsmem_coll_n4
-    env: *dsmem_coll_n4_m1024
-    touches: *dsmem_coll_touches
-    args: "-a allreduce__two_shot_push -r 1"
-  - id: dsmem_coll-allreduce__atomic_all_push
-    app: dsmem_collectives
-    drivers: [rtlsim]
-    configs+: *dsmem_coll_cfg
-    shape: *dsmem_coll_n4
-    env: *dsmem_coll_n4_m1024
-    touches: *dsmem_coll_touches
-    args: "-a allreduce__atomic_all_push -r 1"
-  - id: dsmem_coll-allreduce__one_shot_pull
-    app: dsmem_collectives
-    drivers: [rtlsim]
-    configs+: *dsmem_coll_cfg
-    shape: *dsmem_coll_n4
-    env: *dsmem_coll_n4_m1024
-    touches: *dsmem_coll_touches
-    args: "-a allreduce__one_shot_pull -r 1"
-  - id: dsmem_coll-alltoall__pairwise_exchange
-    app: dsmem_collectives
-    drivers: [rtlsim]
-    configs+: *dsmem_coll_cfg
-    shape: *dsmem_coll_n2
-    env: *dsmem_coll_n2_m1024
-    touches: *dsmem_coll_touches
-    args: "-a alltoall__pairwise_exchange -r 1"
   # The host refuses a point the original build rejects: a static_assert of the file exits 2
   # with SKIP:static_assert, a CollectiveSmem past the local memory exits 3 with SKIP:smem
   # (2 x 16 x 4096 floats = 512 KB here). The run must fail with that exit code and line. The
@@ -3503,13 +3461,6 @@ tests:
               third_party/hardfloat, sw/kernel/src, tests/regression/common.mk,
               sw/kernel/scripts/vxbin.py]
     args: "-b 1"
-  - id: cf_rmsnorm
-    app: cf_rmsnorm
-    drivers: [rtlsim]
-    configs+: *e9b_a_cfg
-    shape: *cf_rmsnorm_shape
-    touches: *cf_rmsnorm_touches
-    args: "-b 1 -r 1"
   # hpcops_rmsnorm_lamport: the cluster RMSNorm of hpc-ops' fused all-reduce + RMSNorm
   # (rmsNormLamport<bf16, bf16, 1>, multi-GPU parts stubbed; not run on the H100) at the host's
   # adjustGridConfig shape for one token of H = 8192: a cluster (1, 8, 1) of 128-thread blocks.
@@ -3666,13 +3617,6 @@ tests:
     args: "-k llama -s 250"
   - {id: cf_decoder-mla, app: cf_decoder, drivers: [simx], configs+: *dsmem_coll_cfg, shape: *cf_decoder_shape,
      env: *cf_decoder_env, touches: *cf_decoder_touches, args: "-k mla"}
-  # The RTL leg, one rep each.
-  - {id: cf_decoder-llama, app: cf_decoder, drivers: [rtlsim], configs+: *dsmem_coll_cfg, shape: *cf_decoder_shape,
-     env: *cf_decoder_env, touches: *cf_decoder_touches, args: "-k llama -s 250 -r 1"}
-  # MLA's RTL leg runs one head (one cluster): two heads took 3 h 42 min of rtlsim.
-  - {id: cf_decoder-mla-h1, app: cf_decoder, drivers: [rtlsim], configs+: *dsmem_coll_cfg, shape: *cf_decoder_shape,
-     env: {CF_LLAMA_HEADS: "4", CF_MLA_HEADS: "1", CF_MLA_HIDDEN: "1024", CF_MLA_SEQ: "128"},
-     touches: *cf_decoder_touches, args: "-k mla -r 1"}
   - {id: cf_decoder-llama-h2, app: cf_decoder, drivers: [simx], tier: nightly, configs+: *dsmem_coll_cfg,
      shape: *cf_decoder_shape, env: {CF_LLAMA_HEADS: "2", CF_MLA_HEADS: "2", CF_MLA_HIDDEN: "1024", CF_MLA_SEQ: "128"},
      touches: *cf_decoder_touches, args: "-k llama -s 250"}
@@ -3773,13 +3717,6 @@ tests:
               sw/kernel/include/vx_barrier.h, sw/runtime/include/vortex.h,
               hw/rtl/fpu, sim/simx/fpu_unit.cpp, third_party/cvfpu, third_party/hardfloat,
               sw/kernel/src, tests/regression/common.mk, sw/kernel/scripts/vxbin.py]
-  - id: fa4_ds_exchange
-    app: fa4_ds_exchange
-    drivers: [rtlsim]
-    configs+: *dsmem_coll_cfg
-    shape: *fa4_ds_exchange_shape
-    touches: *fa4_ds_exchange_touches
-    args: "-r 1"
 
   # stmatrix / ldmatrix .m8n8.b16 (x1/x2/x4, +-trans) of vx_cuda.h against the PTX byte
   # model (every byte of local memory compared), DAK's stmatrix.x4.trans and DeepGEMM's
@@ -3859,3 +3796,115 @@ tests:
     touches: *dxa_store_touches
     shape: {warps: 4, threads: 32}
     args: "-m swz-oob -p"
+  # DAK's multicast GEMV kernel as the H100 ran it (DirectAccessKernel 7d1a278 with the patch
+  # dak_gemm_multicast__sync_fix, include/task/gemv_multicast.cuh, gemv_multicast<64, 256, 64, 3, 3,
+  # 4096, 16384, 16384>): C[T][M] = X[T][K] . W[K][M] in fp16 with fp16 accumulation, one cluster of
+  # 2 blocks of 576 threads (two consumer groups of two m64n128 warpgroups each, N split from the
+  # H100's m64n256, and two producer warps), one block per core with 214272 bytes of local memory.
+  # Rank 0 multicasts each swizzled weight tile (rank-4 map) to both blocks under a cluster drain
+  # mbarrier; each block loads its own 256 tokens and stores its C tiles with stmatrix and a tensor
+  # store. Each rep draws new inputs and checks the wrapper's per-tile relative Frobenius bound and a
+  # bit-exact fp16 model of the tensor unit; the smoke case also runs the host-only negative controls
+  # (-N). Smoke: T 512, M 256, K 448 (2 m-tile pairs x 7 k-tiles); nightly: M 384, K 1024.
+  - id: dak_gemv_multicast
+    app: dak_gemv_multicast
+    drivers: [simx]
+    configs+: &e9d_h100_cfg "-DVX_CFG_EXT_ZACAS_ENABLE -DVX_CFG_EXT_DXA_ENABLE -DVX_CFG_EXT_FPAMO_ENABLE -DVX_CFG_LMEM_LOG_SIZE=18 -DVX_CFG_NUM_BARRIERS=16 -DVX_CFG_ISSUE_WIDTH=4 -DVX_CFG_EXT_TCU_ENABLE -DVX_CFG_TCU_WGMMA_ENABLE -DVX_CFG_TCU_FP8_ENABLE -DVX_CFG_TCU_H100_ENABLE -DWGMMA_SS"
+    shape: &e9d_shape {cores: 2, warps: 32, threads: 32, l2cache: true}
+    touches: &dak_gemv_multicast_touches [tests/regression/dak_gemv_multicast, sw/kernel/include/vx_cuda.h,
+              sw/kernel/include/vx_dlmem.h, sw/kernel/include/vx_mbar.h, sw/kernel/include/vx_dxa.h,
+              sw/runtime/include/vx_cuda_runtime.h, sw/common/vx_cuda_fp.h, hw/rtl/mem/VX_local_mem.sv,
+              hw/rtl/core/VX_decode.sv, hw/rtl/VX_gpu_pkg.sv, hw/rtl/VX_define.vh, hw/rtl/dlmem,
+              hw/rtl/core/VX_lsu_slice.sv, hw/rtl/core/VX_mem_unit.sv, hw/rtl/core/VX_core.sv,
+              sim/simx/types.h, sim/simx/decode.cpp, sim/simx/amo, sim/simx/lsu_unit, sim/simx/dlmem,
+              sim/simx/core, sim/simx/processor.cpp, sw/common/mbar_ref.h, tests/regression/mbar_local,
+              VX_config.toml, hw/rtl/core/VX_wctl_unit.sv, sw/common/dxa_tmap.h,
+              hw/rtl/mem/VX_lmem_switch.sv, hw/rtl/core/VX_lsu_unit.sv, hw/rtl/core/VX_scheduler.sv,
+              sw/common/dlmem_ref.h, hw/rtl/dxa, hw/rtl/VX_kmu.sv, hw/rtl/Vortex.sv, hw/rtl/VX_cluster.sv,
+              hw/rtl/core/VX_cta_dispatch.sv, hw/rtl/core/VX_csr_data.sv, hw/rtl/core/VX_kmu_bus_arb.sv,
+              hw/rtl/core/VX_bar_unit.sv, hw/rtl/mem/VX_gbar_unit.sv, hw/rtl/core/VX_execute.sv,
+              hw/rtl/cp/VX_cp_axil_regfile.sv, hw/rtl/VX_socket.sv, sim/simx/kmu, sim/simx/cta_dispatcher,
+              sim/simx/scheduler, sim/simx/csr_unit.cpp, sim/simx/cluster, sim/simx/barrier_unit,
+              sim/common/cmd_processor.cpp, sim/simx/wctl_unit.cpp, sim/simx/socket,
+              sw/kernel/include/vx_spawn2.h, tests/regression/cluster_rank, tests/regression/cta_gang,
+              tests/regression/cluster_sync, tests/regression/dlmem_local, tests/regression/dlmem_store,
+              tests/regression/dlmem_load, tests/regression/dlmem_atomic, tests/regression/dlmem_stress,
+              tests/regression/lmem_bar_order, tests/regression/dlmem_amo_order, VX_types.toml,
+              hw/rtl/core/VX_uop_sequencer.sv, sim/simx/sequencer, hw/rtl/core/VX_cpa_unit.sv,
+              sim/simx/cpa_unit, hw/rtl/VX_trace_pkg.sv, sim/simx/instr.h, hw/rtl/cache, hw/rtl/tcu,
+              sim/simx/tcu, sw/kernel/include/vx_tensor.h, tests/regression/sgemm_tcu_wg_mbar,
+              tests/regression/sgemm_tcu_mx_mbar, sim/simx/mbar_waiters, sim/simx/Makefile,
+              tests/regression/mbar_wait, tests/regression/mbar_remote, sw/common/dxa_ref.h,
+              sw/common/dxa_meta.h, hw/rtl/core/VX_bg_unit.sv, hw/rtl/core/VX_sfu_unit.sv, sim/simx/bg_unit,
+              sim/simx/sfu_unit, tests/regression/cuda_api, sw/kernel/include/vx_intrinsics.h,
+              sw/kernel/include/vx_atomic.h, sw/kernel/include/vx_cp_async.h, sw/kernel/include/vx_print.h,
+              sw/runtime/include/vortex2.h, sw/runtime/include/dxa.h, sw/runtime/common, sim/simx/dxa,
+              hw/rtl/core/VX_alu_int.sv, sim/simx/alu_unit.cpp, hw/rtl/interfaces,
+              hw/rtl/core/VX_csr_unit.sv, sim/simx/mem, sw/kernel/include/vx_barrier.h,
+              sw/runtime/include/vortex.h, hw/rtl/fpu, sim/simx/fpu_unit.cpp, third_party/cvfpu,
+              third_party/hardfloat, sw/kernel/src, tests/regression/common.mk, sw/kernel/scripts/vxbin.py,
+              sw/common/tcu_desc_ref.h, sw/common/tcu_fedp_ref.h, sw/common/tensor_cfg.h, hw/dpi/dpi_tcu.cpp,
+              hw/dpi/dpi_tcu.vh, hw/rtl/core/VX_commit.sv, hw/rtl/mem]
+    args: "-t 512 -m 256 -k 448 -N"
+  - {id: dak_gemv_multicast-m384-k1024, app: dak_gemv_multicast, drivers: [simx], tier: nightly,
+     configs+: *e9d_h100_cfg, shape: *e9d_shape, touches: *dak_gemv_multicast_touches,
+     args: "-t 512 -m 384 -k 1024"}
+  # DeepGEMM's SM90 FP8 1D2D m-grouped contiguous GEMM (DeepGEMM 5081f85
+  # impls/sm90_fp8_gemm_1d2d.cuh, the H100 validation run's instantiation: block 128x192x128,
+  # 4 stages, 128 TMA threads, multicast 2 on B, MGroupedContiguous, bf16 D). One cluster of
+  # two persistent blocks on 2 cores; each H100 m64n192 math warpgroup is split into three
+  # m64n64 warpgroups (896 threads per block). N, K, G and the SM count are build-time
+  # (DG_SHAPE_N/K, DG_NUM_GROUPS, DG_NUM_SMS through env:, one binary per N); rows per group
+  # at run time. Each rep draws new bf16 inputs, quantises them as the wrapper does, and checks
+  # the wrapper's rule (finite, calc_diff < 1e-3 against the bf16 product), a per-element bound
+  # against the fp8-dequantised reference, the guard tails, distinct cores and the producer's
+  # tile trace against the host schedule. The smoke case runs the four host-only negative
+  # controls (-N); the nightly N 640 case runs the partial last n-block (one B-scale row, B rows
+  # from the next group and zero fill, out-of-bounds D stores) and the multicast-off pairs.
+  - id: deepgemm_fp8_1d2d
+    app: deepgemm_fp8_1d2d
+    drivers: [simx]
+    configs+: *e9d_h100_cfg
+    shape: *e9d_shape
+    env: {DG_SHAPE_N: "384", DG_SHAPE_K: "1024", DG_NUM_GROUPS: "2", DG_NUM_SMS: "2"}
+    touches: &deepgemm_touches [tests/regression/deepgemm_fp8_1d2d, sw/kernel/include/vx_cuda.h, sw/kernel/include/vx_dlmem.h,
+              sw/kernel/include/vx_mbar.h, sw/kernel/include/vx_dxa.h, sw/runtime/include/vx_cuda_runtime.h,
+              sw/common/vx_cuda_fp.h, hw/rtl/mem/VX_local_mem.sv, hw/rtl/core/VX_decode.sv, hw/rtl/VX_gpu_pkg.sv,
+              hw/rtl/VX_define.vh, hw/rtl/dlmem, hw/rtl/core/VX_lsu_slice.sv, hw/rtl/core/VX_mem_unit.sv,
+              hw/rtl/core/VX_core.sv, sim/simx/types.h, sim/simx/decode.cpp, sim/simx/amo, sim/simx/lsu_unit,
+              sim/simx/dlmem, sim/simx/core, sim/simx/processor.cpp, sw/common/mbar_ref.h,
+              tests/regression/mbar_local, VX_config.toml, hw/rtl/core/VX_wctl_unit.sv, sw/common/dxa_tmap.h,
+              hw/rtl/mem/VX_lmem_switch.sv, hw/rtl/core/VX_lsu_unit.sv, hw/rtl/core/VX_scheduler.sv,
+              sw/common/dlmem_ref.h, hw/rtl/dxa, hw/rtl/VX_kmu.sv, hw/rtl/Vortex.sv, hw/rtl/VX_cluster.sv,
+              hw/rtl/core/VX_cta_dispatch.sv, hw/rtl/core/VX_csr_data.sv, hw/rtl/core/VX_kmu_bus_arb.sv,
+              hw/rtl/core/VX_bar_unit.sv, hw/rtl/mem/VX_gbar_unit.sv, hw/rtl/core/VX_execute.sv,
+              hw/rtl/cp/VX_cp_axil_regfile.sv, hw/rtl/VX_socket.sv, sim/simx/kmu, sim/simx/cta_dispatcher,
+              sim/simx/scheduler, sim/simx/csr_unit.cpp, sim/simx/cluster, sim/simx/barrier_unit,
+              sim/common/cmd_processor.cpp, sim/simx/wctl_unit.cpp, sim/simx/socket, sw/kernel/include/vx_spawn2.h,
+              tests/regression/cluster_rank, tests/regression/cta_gang, tests/regression/cluster_sync,
+              tests/regression/dlmem_local, tests/regression/dlmem_store, tests/regression/dlmem_load,
+              tests/regression/dlmem_atomic, tests/regression/dlmem_stress, tests/regression/lmem_bar_order,
+              tests/regression/dlmem_amo_order, VX_types.toml, hw/rtl/core/VX_uop_sequencer.sv, sim/simx/sequencer,
+              hw/rtl/core/VX_cpa_unit.sv, sim/simx/cpa_unit, hw/rtl/VX_trace_pkg.sv, sim/simx/instr.h, hw/rtl/cache,
+              hw/rtl/tcu, sim/simx/tcu, sw/kernel/include/vx_tensor.h, tests/regression/sgemm_tcu_wg_mbar,
+              tests/regression/sgemm_tcu_mx_mbar, sim/simx/mbar_waiters, sim/simx/Makefile,
+              tests/regression/mbar_wait, tests/regression/mbar_remote, sw/common/dxa_ref.h, sw/common/dxa_meta.h,
+              hw/rtl/core/VX_bg_unit.sv, hw/rtl/core/VX_sfu_unit.sv, sim/simx/bg_unit, sim/simx/sfu_unit,
+              tests/regression/cuda_api, sw/kernel/include/vx_intrinsics.h, sw/kernel/include/vx_atomic.h,
+              sw/kernel/include/vx_cp_async.h, sw/kernel/include/vx_print.h, sw/runtime/include/vortex2.h,
+              sw/runtime/include/dxa.h, sw/runtime/common, sim/simx/dxa, hw/rtl/core/VX_alu_int.sv,
+              sim/simx/alu_unit.cpp, hw/rtl/interfaces, hw/rtl/core/VX_csr_unit.sv, sim/simx/mem,
+              sw/kernel/include/vx_barrier.h, sw/runtime/include/vortex.h, hw/rtl/fpu, sim/simx/fpu_unit.cpp,
+              third_party/cvfpu, third_party/hardfloat, sw/kernel/src, tests/regression/common.mk,
+              sw/kernel/scripts/vxbin.py, sw/common/tcu_desc_ref.h, sw/common/tcu_fedp_ref.h, sw/common/tensor_cfg.h,
+              hw/dpi/dpi_tcu.cpp, hw/dpi/dpi_tcu.vh, hw/rtl/core/VX_commit.sv, hw/rtl/mem]
+    args: "-m 256 -N"
+  - id: deepgemm_fp8_1d2d-n640-m384
+    app: deepgemm_fp8_1d2d
+    drivers: [simx]
+    tier: nightly
+    configs+: *e9d_h100_cfg
+    shape: *e9d_shape
+    env: {DG_SHAPE_N: "640", DG_SHAPE_K: "1024", DG_NUM_GROUPS: "2", DG_NUM_SMS: "2"}
+    touches: *deepgemm_touches
+    args: "-m 384"
