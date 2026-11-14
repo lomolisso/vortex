@@ -700,6 +700,9 @@ template <uint32_t NT,
           bool is_sparse = false,
           uint32_t NRC_ = 8>
 struct wgmma_context {
+#if VX_CFG_TCU_H100_ENABLED
+  static_assert(sizeof(It) == 0, "wgmma_context is not available with VX_CFG_TCU_H100_ENABLE: use vortex::h100::wgmma");
+#endif
 private:
   static constexpr uint32_t NRA = 4;
 
@@ -1208,3 +1211,216 @@ public:
 
 } // namespace tensor
 } // namespace vortex
+
+#if VX_CFG_TCU_H100_ENABLED
+
+// WGMMA as on the H100 (wgmma.mma_async.sp-free, A and B from shared
+// memory): 64-bit PTX matrix descriptors, the PTX accumulator fragment of a
+// warpgroup, f16 accumulators packed two per register. The four warps of a
+// warpgroup (warp % 4 = 0..3, warp w computing rows 16w..16w+15 of m64) issue
+// the same instruction with the same descriptors.
+
+#if !defined(__riscv_xlen) || __riscv_xlen != 64
+#error "H100 WGMMA requires XLEN 64"
+#endif
+#if !VX_CFG_EXT_TCU_ENABLED || !VX_CFG_TCU_WGMMA_ENABLED
+#error "H100 WGMMA requires the TCU with WGMMA"
+#endif
+#if VX_CFG_NUM_THREADS != 32
+#error "H100 WGMMA requires 32 threads"
+#endif
+#if VX_CFG_ISSUE_WIDTH != 4
+#error "H100 WGMMA requires ISSUE_WIDTH 4 (one warpgroup)"
+#endif
+#if !defined(VX_CFG_TCU_TYPE_TFR) && !defined(VX_CFG_TCU_TYPE_DPI)
+#error "H100 WGMMA needs the TFR or DPI backend"
+#endif
+#if !VX_CFG_EXT_DXA_ENABLED || !VX_CFG_EXT_MBAR_ENABLED
+#error "H100 WGMMA requires DXA and mbarriers"
+#endif
+#if VX_CFG_TCU_SPARSE_ENABLED
+#error "H100 WGMMA does not support sparse WGMMA"
+#endif
+#if VX_CFG_TCU_MX_ENABLED || VX_CFG_TCU_MXFP4_ENABLED || VX_CFG_TCU_NVFP4_ENABLED
+#error "H100 WGMMA does not support MX formats"
+#endif
+#ifdef VX_CFG_TCU_FEDP2K
+#error "H100 WGMMA does not support FEDP2K"
+#endif
+#if VX_CFG_TCU_DSM_ENABLED
+#error "H100 WGMMA does not support DSM"
+#endif
+
+namespace vortex {
+namespace h100 {
+
+// Descriptor layout field [63:62].
+enum class swz : uint32_t { none = 0, b128 = 1, b64 = 2, b32 = 3 };
+
+// Bit 52 carries the instruction's transpose (MN-major) flag to the tensor unit.
+constexpr uint64_t desc_mn_major_bit = 1ull << 52;
+
+// The CTA-relative byte address of a pointer into the block's local memory.
+inline __attribute__((always_inline)) uint32_t cta_addr(const void* smem) {
+  return (uint32_t)((uintptr_t)smem - (uintptr_t)csr_read_nv(VX_CSR_CTA_LMEM_ADDR));
+}
+
+// A descriptor from a CTA-relative byte address; base offset 0. Each field
+// keeps bits 17:4 of its byte value.
+inline __attribute__((always_inline)) uint64_t make_desc(uint32_t cta_rel, swz mode, uint32_t lbo_bytes,
+                                                         uint32_t sbo_bytes) {
+  return (uint64_t)((cta_rel & 0x3FFFFu) >> 4)
+       | ((uint64_t)((lbo_bytes & 0x3FFFFu) >> 4) << 16)
+       | ((uint64_t)((sbo_bytes & 0x3FFFFu) >> 4) << 32)
+       | ((uint64_t)mode << 62);
+}
+
+inline __attribute__((always_inline)) uint64_t make_desc(const void* smem, swz mode, uint32_t lbo_bytes,
+                                                         uint32_t sbo_bytes) {
+  return make_desc(cta_addr(smem), mode, lbo_bytes, sbo_bytes);
+}
+
+inline __attribute__((always_inline)) uint64_t desc_mn_major(uint64_t d) {
+  return d | desc_mn_major_bit;
+}
+
+// Moves the start address by a byte count (a k-step or a pipeline stage),
+// as kernels add bytes/16 to the descriptor's low word.
+inline __attribute__((always_inline)) uint64_t desc_advance(uint64_t d, uint32_t bytes) {
+  return d + (bytes >> 4);
+}
+
+namespace detail {
+  template <typename Dt, typename At>
+  struct pair_ok : std::bool_constant<
+      (std::is_same_v<Dt, tensor::fp16> && std::is_same_v<At, tensor::fp16>)
+   || (std::is_same_v<Dt, tensor::fp32> && (std::is_same_v<At, tensor::fp16> || std::is_same_v<At, tensor::bf16>
+                                         || std::is_same_v<At, tensor::fp8> || std::is_same_v<At, tensor::bf8>))> {};
+} // namespace detail
+
+// The accumulator fragment of one thread: NRC registers tied to f0..f(NRC-1)
+// by wgmma. fp32 D: N/2 registers, register 4j + 2h + e = D(16w + L/4 + 8h,
+// 8j + 2(L%4) + e). Packed f16 D: N/4 registers, register 2j + h holds
+// D(16w + L/4 + 8h, 8j + 2(L%4)) in bits 15:0 and the next column in 31:16.
+// (t = 32w + L is the thread of the warpgroup.)
+template <int N, typename Dt>
+struct acc {
+  static constexpr bool packed = std::is_same_v<Dt, tensor::fp16>;
+  static_assert(packed || std::is_same_v<Dt, tensor::fp32>, "H100 WGMMA accumulates in fp32 or packed f16");
+  static constexpr uint32_t NRC = packed ? N / 4 : N / 2;
+  static_assert(NRC == 8 || NRC == 16 || NRC == 32,
+                "H100 WGMMA N is 16, 32 or 64 for an fp32 D and 32, 64 or 128 for an f16 D");
+
+  float data[NRC];
+
+  // Every register set to a 32-bit pattern (NaN-boxed, as fmv.w.x writes it).
+  static inline __attribute__((always_inline)) float fmv_w_x(uint32_t v) {
+    float f;
+    __asm__ ("fmv.w.x %0, %1" : "=f"(f) : "r"(v));
+    return f;
+  }
+
+  inline __attribute__((always_inline)) void fill_bits(uint32_t v) {
+    tensor::detail::unroll_for<NRC>([&](auto i) __attribute__((always_inline)) { data[i] = fmv_w_x(v); });
+  }
+
+  inline __attribute__((always_inline)) void zero() { fill_bits(0); }
+
+  inline __attribute__((always_inline)) uint32_t bits(uint32_t r) const {
+    return __builtin_bit_cast(uint32_t, data[r]);
+  }
+
+  // The whole 64-bit register (fmv.x.d): bits 63:32 are the NaN box.
+  inline __attribute__((always_inline)) uint64_t bits64(uint32_t r) const {
+    uint64_t x;
+    __asm__ ("fmv.x.d %0, %1" : "=r"(x) : "f"(data[r]));
+    return x;
+  }
+
+  static constexpr uint32_t row(uint32_t t, uint32_t r) {
+    return 16 * (t / 32) + (t % 32) / 4 + 8 * (packed ? (r & 1u) : ((r >> 1) & 1u));
+  }
+
+  // half: 0 = bits 15:0, 1 = bits 31:16 of a packed register (ignored for fp32).
+  static constexpr uint32_t col(uint32_t t, uint32_t r, uint32_t half = 0) {
+    return packed ? 8 * (r / 2) + 2 * (t % 4) + (half & 1u) : 8 * (r / 4) + 2 * (t % 4) + (r & 1u);
+  }
+};
+
+template <typename Dt>
+constexpr uint32_t acc_row(uint32_t t, uint32_t r) {
+  return acc<std::is_same_v<Dt, tensor::fp16> ? 32 : 16, Dt>::row(t, r);
+}
+
+template <typename Dt>
+constexpr uint32_t acc_col(uint32_t t, uint32_t r, uint32_t half = 0) {
+  return acc<std::is_same_v<Dt, tensor::fp16> ? 32 : 16, Dt>::col(t, r, half);
+}
+
+#define __VX_H100_DECL(i) register float __vx_f##i __asm__("f" #i) = d.data[i];
+#define __VX_H100_BACK(i) d.data[i] = __vx_f##i;
+#define __VX_H100_O8(a, b, c, e, f, g, h, k)                                    \
+  "+f"(__vx_f##a), "+f"(__vx_f##b), "+f"(__vx_f##c), "+f"(__vx_f##e),           \
+  "+f"(__vx_f##f), "+f"(__vx_f##g), "+f"(__vx_f##h), "+f"(__vx_f##k)
+#define __VX_H100_L8(M)  M(0) M(1) M(2) M(3) M(4) M(5) M(6) M(7)
+#define __VX_H100_L16(M) __VX_H100_L8(M) M(8) M(9) M(10) M(11) M(12) M(13) M(14) M(15)
+#define __VX_H100_L32(M) __VX_H100_L16(M) M(16) M(17) M(18) M(19) M(20) M(21) M(22) M(23) \
+                         M(24) M(25) M(26) M(27) M(28) M(29) M(30) M(31)
+
+// d = A * B + d (scale_d = false: d = A * B), m64 x N x K with K = 16 for
+// 16-bit inputs and 32 for 8-bit inputs. da/db: the A (m64 x K) and B
+// (N x K) descriptors; tnspA/tnspB select MN-major (16-bit types only) and
+// are ORed into bit 52. Ordering: wgmma_fence before, commit_group and
+// wait_group after (vx_wgmma_*).
+template <int N, typename Dt, typename At, typename Bt, bool tnspA = false, bool tnspB = false>
+inline __attribute__((always_inline)) void wgmma(uint64_t da, uint64_t db, acc<N, Dt>& d, bool scale_d = true) {
+  static_assert(std::is_same_v<At, Bt>, "H100 WGMMA takes one input type for A and B");
+  static_assert(detail::pair_ok<Dt, At>::value,
+                "H100 WGMMA does not support this type pair");
+  static_assert(!(tnspA || tnspB) || At::bits == 16, "wgmma MN-major needs a 16-bit type");
+  static_assert(!(std::is_same_v<At, tensor::fp8> || std::is_same_v<At, tensor::bf8>) || VX_CFG_TCU_FP8_ENABLED,
+                "e4m3 and e5m2 inputs need VX_CFG_TCU_FP8_ENABLE");
+  constexpr uint32_t NRC = acc<N, Dt>::NRC;
+  // rs2 field: bit 0 sparse (0), bits 2:1 cd_nregs (8/16/32), bit 3 A from shared memory.
+  constexpr int flags = (((NRC == 8) ? 0 : (NRC == 16) ? 1 : 2) << 1) | (1 << 3);
+
+  if (!scale_d)
+    d.zero();
+  register uint64_t ra __asm__("a0") = da | (tnspA ? desc_mn_major_bit : 0);
+  register uint64_t rb __asm__("a1") = db | (tnspB ? desc_mn_major_bit : 0);
+  if constexpr (NRC == 8) {
+    __VX_H100_L8(__VX_H100_DECL)
+    __asm__ volatile (".insn r %[insn], 1, 2, x%[fmd], x%[fms], x%[flags]"
+      : __VX_H100_O8(0, 1, 2, 3, 4, 5, 6, 7)
+      : [insn]"i"(RISCV_CUSTOM0), [fmd]"i"(Dt::id), [fms]"i"(At::id), [flags]"i"(flags), "r"(ra), "r"(rb)
+      : "memory");
+    __VX_H100_L8(__VX_H100_BACK)
+  } else if constexpr (NRC == 16) {
+    __VX_H100_L16(__VX_H100_DECL)
+    __asm__ volatile (".insn r %[insn], 1, 2, x%[fmd], x%[fms], x%[flags]"
+      : __VX_H100_O8(0, 1, 2, 3, 4, 5, 6, 7), __VX_H100_O8(8, 9, 10, 11, 12, 13, 14, 15)
+      : [insn]"i"(RISCV_CUSTOM0), [fmd]"i"(Dt::id), [fms]"i"(At::id), [flags]"i"(flags), "r"(ra), "r"(rb)
+      : "memory");
+    __VX_H100_L16(__VX_H100_BACK)
+  } else {
+    __VX_H100_L32(__VX_H100_DECL)
+    __asm__ volatile (".insn r %[insn], 1, 2, x%[fmd], x%[fms], x%[flags]"
+      : __VX_H100_O8(0, 1, 2, 3, 4, 5, 6, 7), __VX_H100_O8(8, 9, 10, 11, 12, 13, 14, 15),
+        __VX_H100_O8(16, 17, 18, 19, 20, 21, 22, 23), __VX_H100_O8(24, 25, 26, 27, 28, 29, 30, 31)
+      : [insn]"i"(RISCV_CUSTOM0), [fmd]"i"(Dt::id), [fms]"i"(At::id), [flags]"i"(flags), "r"(ra), "r"(rb)
+      : "memory");
+    __VX_H100_L32(__VX_H100_BACK)
+  }
+}
+
+#undef __VX_H100_L32
+#undef __VX_H100_L16
+#undef __VX_H100_L8
+#undef __VX_H100_O8
+#undef __VX_H100_BACK
+#undef __VX_H100_DECL
+
+} // namespace h100
+} // namespace vortex
+
+#endif // VX_CFG_TCU_H100_ENABLED

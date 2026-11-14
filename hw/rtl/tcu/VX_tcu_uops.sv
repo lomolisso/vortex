@@ -61,6 +61,9 @@ module VX_tcu_uops import VX_tcu_pkg::*, VX_gpu_pkg::*; (
   `else
   `ifdef VX_CFG_TCU_FEDP2K
     localparam MAX_WG_UOPS_DENSE = TCU_WG_UOPS + 1;
+  `elsif VX_CFG_TCU_H100_ENABLE
+    // packed f16 accumulators: two micro-ops per register and k-step
+    localparam MAX_WG_UOPS_DENSE = 2 * TCU_WG_UOPS;
   `else
     localparam MAX_WG_UOPS_DENSE = TCU_WG_UOPS;
   `endif
@@ -127,6 +130,36 @@ module VX_tcu_uops import VX_tcu_pkg::*, VX_gpu_pkg::*; (
     localparam WG_UOPS_SP_NR32 = WG_MN_NR32 * TCU_WG_K_STEPS_SP;
 `endif
 
+`ifdef VX_CFG_TCU_H100_ENABLE
+    `STATIC_ASSERT (`VX_CFG_NUM_THREADS == 32, ("H100 WGMMA requires 32 threads"))
+    `STATIC_ASSERT (`VX_CFG_ISSUE_WIDTH == 4 && `VX_CFG_NUM_TCU_BLOCKS == 4,
+        ("H100 WGMMA requires ISSUE_WIDTH 4 (one warpgroup)"))
+
+    // H100 accumulator fragment order. r = ctr mod NRC is the accumulator
+    // register, so every register is touched every NRC micro-ops; for a
+    // packed f16 D the two halves of a register are NRC micro-ops apart.
+    //   f32 D: e = r[0], h = r[1], j = r >> 2, k = ctr / NRC
+    //   f16 D: h = r[0], j = r >> 1, e = (ctr / NRC) % 2, k = ctr / (2 NRC)
+    // The micro-op computes rows 8h + L/4 and columns 8j + 2(L%4) + e of the
+    // warp's 16-row slice, i.e. step_n = 2j + e.
+    wire h100_f16d = (ibuf_in.op_args.tcu.fmt_d == TCU_FMT_WIDTH'(TCU_FP16_ID));
+    wire [6:0] h100_ctr = 7'(uop_idx);
+    reg [4:0] h100_r;
+    reg [1:0] h100_hi;
+    always_comb begin
+        case (ibuf_in.op_args.tcu.cd_nregs)
+            2'd0: begin h100_r = {2'b0, h100_ctr[2:0]}; h100_hi = h100_ctr[4:3]; end
+            2'd1: begin h100_r = {1'b0, h100_ctr[3:0]}; h100_hi = h100_ctr[5:4]; end
+            default: begin h100_r = h100_ctr[4:0]; h100_hi = h100_ctr[6:5]; end
+        endcase
+    end
+    wire       h100_e = h100_f16d ? h100_hi[0] : h100_r[0];
+    wire       h100_h = h100_f16d ? h100_r[0] : h100_r[1];
+    wire       h100_k = h100_f16d ? h100_hi[1] : h100_hi[0];
+    wire [3:0] h100_j = h100_f16d ? h100_r[4:1] : {1'b0, h100_r[4:2]};
+    wire [4:0] h100_n = {h100_j, h100_e};
+`endif
+
     // Mux uop count based on cd_nregs: 0→8, 1→16, 2→32
     reg [UOP_CTR_W-1:0] wg_uop_cnt;
     reg [UOP_CTR_W-1:0] wg_compute_uop_cnt;
@@ -136,6 +169,11 @@ module VX_tcu_uops import VX_tcu_pkg::*, VX_gpu_pkg::*; (
             2'd1: wg_compute_uop_cnt = UOP_CTR_W'(WG_UOPS_NR16);
             default: wg_compute_uop_cnt = UOP_CTR_W'(WG_UOPS_NR32);
         endcase
+    `ifdef VX_CFG_TCU_H100_ENABLE
+        if (h100_f16d) begin
+            wg_compute_uop_cnt = wg_compute_uop_cnt << 1;
+        end
+    `endif
     `ifdef VX_CFG_TCU_SPARSE_ENABLE
         if (wg_is_sparse) begin
             case (ibuf_in.op_args.tcu.cd_nregs)
@@ -192,6 +230,9 @@ module VX_tcu_uops import VX_tcu_pkg::*, VX_gpu_pkg::*; (
 
     // Accumulator register index: n * m_steps + m  (n-major layout)
     wire [4:0] wg_rs3_off = (5'(wg_n_index) << LG_M_WG) | 5'(wg_m_index);
+`ifdef VX_CFG_TCU_H100_ENABLE
+    `UNUSED_VAR ({wg_rs3_off, wg_k_index})
+`endif
     // Fixed A register base for RS mode: f24..f27
     localparam [4:0] wg_ra_base = TCU_WG_RA;
 
@@ -349,12 +390,25 @@ module VX_tcu_uops import VX_tcu_pkg::*, VX_gpu_pkg::*; (
     `endif
     `ifdef VX_CFG_TCU_WGMMA_ENABLE
         if (is_wgmma) begin
+        `ifdef VX_CFG_TCU_H100_ENABLE
+            ibuf_r.op_args.tcu.step_m = 4'(h100_h);
+            ibuf_r.op_args.tcu.step_n = h100_n;
+            ibuf_r.op_args.tcu.step_k = 4'(h100_k);
+            ibuf_r.wb  = !is_wg_setup_uop;
+            ibuf_r.rd  = make_reg_num(REG_TYPE_F, TCU_WG_RC + h100_r);
+            ibuf_r.rs3 = make_reg_num(REG_TYPE_F, TCU_WG_RC + h100_r);
+            // a packed f16 result writes only its half of the register
+            if (h100_f16d) begin
+                ibuf_r.bytesel = {XLENB_W'(1), XLENB_W'({h100_e, 1'b0})};
+            end
+        `else
             ibuf_r.op_args.tcu.step_m = is_wg_setup_uop ? 4'd0 : 4'(wg_m_index);
             ibuf_r.op_args.tcu.step_n = is_wg_setup_uop ? 4'd0 : 4'(wg_n_index);
             ibuf_r.op_args.tcu.step_k = is_wg_setup_uop ? 4'd0 : 4'(wg_k_index);
             ibuf_r.wb  = !is_wg_setup_uop;
             ibuf_r.rd  = make_reg_num(REG_TYPE_F, TCU_WG_RC + wg_rs3_off);
             ibuf_r.rs3 = make_reg_num(REG_TYPE_F, TCU_WG_RC + wg_rs3_off);
+        `endif
             ibuf_r.used_rs[2] = !is_wg_setup_uop;
             if (is_wg_setup_uop) begin
                 ibuf_r.used_rs[0] = 1'b0;
@@ -404,7 +458,11 @@ module VX_tcu_uops import VX_tcu_pkg::*, VX_gpu_pkg::*; (
         ibuf_r.used_rs[2] = 1'b1;
     `else
         ibuf_r.op_args.tcu.step_m = 4'(m_index);
+    `ifdef VX_CFG_TCU_H100_ENABLE
+        ibuf_r.op_args.tcu.step_n = 5'(n_index);
+    `else
         ibuf_r.op_args.tcu.step_n = 4'(n_index);
+    `endif
         ibuf_r.op_args.tcu.step_k = 4'(k_index);
         ibuf_r.wb  = 1'b1;
         ibuf_r.rd  = make_reg_num(REG_TYPE_F, rs3);

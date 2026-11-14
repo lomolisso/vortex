@@ -47,6 +47,10 @@ XCONFIGS := $(shell python3 $(ROOT_DIR)/ci/gen_config.py --config=$(VORTEX_HOME)
 
 SRCS = $(SW_COMMON_DIR)/util.cpp $(SIM_COMMON_DIR)/mem.cpp $(SW_COMMON_DIR)/softfloat_ext.cpp $(SW_COMMON_DIR)/rvfloats.cpp $(SIM_COMMON_DIR)/dram_sim.cpp
 SRCS += $(DPI_DIR)/dpi_util.cpp $(DPI_DIR)/dpi_float.cpp
+# The H100 FEDP model behind the DPI tensor backend (knob on, from CONFIGS or the toml).
+ifneq (,$(filter -DVX_CFG_TCU_H100_ENABLE,$(XCONFIGS)))
+SRCS += $(DPI_DIR)/dpi_tcu.cpp
+endif
 SRCS += $(SRC_DIR)/fpga.cpp $(SRC_DIR)/opae_sim.cpp
 
 RTL_PKGS = $(AFU_DIR)/local_mem_cfg_pkg.sv $(AFU_DIR)/ccip/ccip_if_pkg.sv

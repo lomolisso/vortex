@@ -107,6 +107,9 @@ module VX_dxa_st import VX_gpu_pkg::*, VX_dxa_pkg::*, VX_dlmem_pkg::*; #(
     localparam CNT_W      = 20;
     localparam SWZ_TOP    = (WORD_LOG < 7) ? WORD_LOG : 7;
     localparam SWZ_STAGES = (SWZ_TOP > 4) ? (SWZ_TOP - 4) : 0;
+`ifdef VX_CFG_TCU_H100_ENABLE
+    localparam SWZ_ROWS   = (WORD_LOG > 7) ? (1 << (WORD_LOG - 7)) : 1;
+`endif
 
     `STATIC_ASSERT (`IS_POW2(CL_SIZE) && `IS_POW2(WORD_SIZE), ("invalid parameter"))
     `STATIC_ASSERT (CL_SIZE >= 8, ("invalid parameter"))
@@ -140,6 +143,25 @@ module VX_dxa_st import VX_gpu_pkg::*, VX_dxa_pkg::*, VX_dlmem_pkg::*; #(
                                : ((32'(word_room) < 32'(rem_cur)) ? (CL_OFF_BITS+1)'(word_room) : rem_cur);
     wire rd_last = (n_cur >= rem_cur);
 
+`ifdef VX_CFG_TCU_H100_ENABLE
+    // Swizzle on the block-relative word, as the writer does it: one XOR
+    // per 128-byte row of the word.
+    wire [ADDR_W-1:0] word_l   = ADDR_W'(a_cur >> WORD_LOG);
+    wire [ADDR_W-1:0] swz_bw   = ADDR_W'(tma.blk_base >> WORD_LOG);
+    wire [ADDR_W-1:0] swz_rel  = word_l - swz_bw;
+    wire [2:0] swz_m  = (tma.swizzle == 2'd1) ? 3'b001 : (tma.swizzle == 2'd2) ? 3'b011 : (tma.swizzle == 2'd3) ? 3'b111 : 3'b000;
+    wire [SWZ_ROWS-1:0][2:0] swz_xv;
+    if (WORD_LOG > 7) begin : g_swz_rows
+        wire [2:0] base_row = 3'(tma.blk_base >> 7);
+        for (genvar r = 0; r < SWZ_ROWS; ++r) begin : g_row
+            assign swz_xv[r] = (3'({word_l, (WORD_LOG-7)'(r)}) - base_row) & swz_m;
+        end
+    end else begin : g_swz_word
+        wire [ADDR_W+WORD_LOG-1:0] swz_rel_b = {swz_rel, WORD_LOG'(0)};
+        assign swz_xv[0] = 3'(swz_rel_b >> 7) & swz_m;
+    end
+    wire [6:0] swz_x  = {swz_xv[0], 4'b0000};
+`else
     // Swizzle on the block-relative word, as the writer does it.
     wire [ADDR_W-1:0] word_l   = ADDR_W'(a_cur >> WORD_LOG);
     wire [ADDR_W-1:0] swz_bw   = ADDR_W'(tma.blk_base >> WORD_LOG);
@@ -148,6 +170,7 @@ module VX_dxa_st import VX_gpu_pkg::*, VX_dxa_pkg::*, VX_dlmem_pkg::*; #(
     wire [2:0] swz_m  = (tma.swizzle == 2'd1) ? 3'b001 : (tma.swizzle == 2'd2) ? 3'b011 : (tma.swizzle == 2'd3) ? 3'b111 : 3'b000;
     wire [2:0] swz_xv = 3'(swz_rel_b >> 7) & swz_m;
     wire [6:0] swz_x  = {swz_xv, 4'b0000};
+`endif
     wire [ADDR_W-1:0] word_p = swz_bw + (swz_rel ^ ADDR_W'(swz_x >> WORD_LOG));
 
     // What the assembly needs per read.
@@ -155,7 +178,11 @@ module VX_dxa_st import VX_gpu_pkg::*, VX_dxa_pkg::*, VX_dlmem_pkg::*; #(
         logic [WORD_LOG-1:0]      rot;      // source byte address - line offset, mod WORD_SIZE
         logic [CL_OFF_BITS:0]     p0;       // first line offset
         logic [CL_OFF_BITS:0]     n;        // bytes
+`ifdef VX_CFG_TCU_H100_ENABLE
+        logic [SWZ_ROWS-1:0][2:0] swz;      // chunk swap bits 4..6, per 128-byte row
+`else
         logic [2:0]               swz;      // chunk swap bits 4..6
+`endif
         logic                     tok_last;
         logic [LINE_ADDR_W-1:0]   cl_addr;
     } rd_info_t;
@@ -249,11 +276,19 @@ module VX_dxa_st import VX_gpu_pkg::*, VX_dxa_pkg::*, VX_dlmem_pkg::*; #(
     for (genvar t = 0; t < SWZ_STAGES; ++t) begin : g_uswz
         for (genvar i = 0; i < WORD_SIZE; ++i) begin : g_bytes
             localparam J = i ^ (1 << (4 + t));
+`ifdef VX_CFG_TCU_H100_ENABLE
+            assign uswz_d[t+1][i*8 +: 8] = asm_info.swz[i / 128][t] ? uswz_d[t][J*8 +: 8] : uswz_d[t][i*8 +: 8];
+`else
             assign uswz_d[t+1][i*8 +: 8] = asm_info.swz[t] ? uswz_d[t][J*8 +: 8] : uswz_d[t][i*8 +: 8];
+`endif
         end
     end
     if (SWZ_STAGES < 3) begin : g_uswz_x
+`ifdef VX_CFG_TCU_H100_ENABLE
+        `UNUSED_VAR (asm_info.swz[0][2:SWZ_STAGES])
+`else
         `UNUSED_VAR (asm_info.swz[2:SWZ_STAGES])
+`endif
     end
 
     // rot_d[q] = word[(q + rot) mod WORD_SIZE]; line byte p takes rot_d[p mod WORD_SIZE].

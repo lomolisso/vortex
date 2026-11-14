@@ -14,6 +14,11 @@
 #pragma once
 
 #include "types.h"
+#ifdef VX_CFG_TCU_H100_ENABLE
+#include "tcu_h100.h"
+#else
+#line 16
+#endif
 
 namespace vortex {
 
@@ -59,6 +64,14 @@ public:
 
   // Total LMEM port-cycles issued since last reset (perf counter).
   uint64_t reads() const;
+#ifdef VX_CFG_TCU_H100_ENABLE
+
+  // The descriptor-addressed buffers that replace the line caches.
+  TcuH100Bufs& h100() { return h100_; }
+  const TcuH100Bufs& h100() const { return h100_; }
+#else
+#line 61
+#endif
 
 protected:
   void on_reset();
@@ -67,6 +80,11 @@ protected:
 private:
   class Impl;
   Impl* impl_;
+#ifdef VX_CFG_TCU_H100_ENABLE
+  TcuH100Bufs h100_;
+#else
+#line 69
+#endif
 
   friend class SimObject<TcuTbuf>;
 };

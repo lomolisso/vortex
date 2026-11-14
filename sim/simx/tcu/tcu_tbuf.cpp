@@ -175,8 +175,15 @@ TcuTbuf::TcuTbuf(const SimContext& ctx, const char* name)
 
 TcuTbuf::~TcuTbuf() { delete impl_; }
 
+#ifdef VX_CFG_TCU_H100_ENABLE
+void TcuTbuf::on_reset() { impl_->reset(); h100_.reset(); }
+void TcuTbuf::on_tick()  { h100_.tick(lmem_req_out, lmem_rsp_in, SimPlatform::instance().cycles()); }
+#else
+#line 178
 void TcuTbuf::on_reset() { impl_->reset(); }
 void TcuTbuf::on_tick()  { impl_->tick(); }
+#line 179
+#endif
 
 void TcuTbuf::plan_a(uint32_t b, const std::vector<uint64_t>& line_addrs) {
   impl_->plan(kAOffset + b, line_addrs);
@@ -198,4 +205,9 @@ std::shared_ptr<mem_block_t> TcuTbuf::read_b(uint64_t line_addr) const {
 void TcuTbuf::invalidate_a(uint32_t b) { impl_->invalidate(kAOffset + b); }
 void TcuTbuf::invalidate_b()           { impl_->invalidate(kBOffset); }
 
+#ifdef VX_CFG_TCU_H100_ENABLE
+uint64_t TcuTbuf::reads() const { return h100_.reads(); }
+#else
+#line 201
 uint64_t TcuTbuf::reads() const { return impl_->reads(); }
+#endif

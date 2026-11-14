@@ -50,6 +50,9 @@ module VX_tcu_abuf import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
     parameter `STRING INSTANCE_ID     = "",
     parameter         NUM_BANKS       = 4,
     parameter         BANK_ADDR_WIDTH = 12
+`ifdef VX_CFG_TCU_H100_ENABLE
+  , parameter         BLOCK_IDX       = 0
+`endif
 ) (
     input  wire clk,
     input  wire reset,
@@ -64,12 +67,21 @@ module VX_tcu_abuf import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
     input  wire                     req_valid,
     input  wire                     req_setup,
     input  wire [3:0]               req_step_m,
+`ifdef VX_CFG_TCU_H100_ENABLE
+    input  wire [4:0]               req_step_n,
+`else
     input  wire [3:0]               req_step_n,
+`endif
     input  wire [3:0]               req_step_k,
     input  wire [`VX_CFG_XLEN-1:0]  req_desc_a,
     input  wire                     req_a_is_smem,
     input  wire                     req_is_sparse,
     input  wire [UUID_WIDTH-1:0]    req_uuid,
+`ifdef VX_CFG_TCU_H100_ENABLE
+    input  wire                     req_is_first_uop,
+    input  wire [`VX_CFG_LMEM_LOG_SIZE-1:0] req_slot_base,
+    input  wire                     req_esize16,
+`endif
 
     // LMEM bank-parallel read port
     VX_mem_bus_if.master            tcu_lmem_if,
@@ -80,6 +92,254 @@ module VX_tcu_abuf import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
 );
     `UNUSED_SPARAM (INSTANCE_ID)
     `UNUSED_VAR (req_wid)
+
+`ifdef VX_CFG_TCU_H100_ENABLE
+    // -----------------------------------------------------------------------
+    // Operands read through wgmma shared-memory descriptors.
+    //
+    // The buffer holds one k-stripe of this block's 16 rows of the m64 tile:
+    // rows 16 * BLOCK_IDX + r, r in [0, 16), one 16-byte chunk of K each,
+    // stored as storage[r * FEDP_K + word]. A fill is 16 single-outstanding
+    // reads of one 16-byte chunk:
+    //   K-major:  read i is row i at the stripe's K chunk;
+    //   MN-major: read i is k-row (i >> 1) of the stripe and MN chunk (i & 1),
+    //             whose eight 16-bit elements go to eight rows, one half-word
+    //             each.
+    // -----------------------------------------------------------------------
+
+    localparam LMEM_LOG       = `VX_CFG_LMEM_LOG_SIZE;
+    localparam BANK_SEL_BITS  = $clog2(NUM_BANKS);
+    localparam WORD_SIZE_LOG2 = $clog2(`VX_CFG_XLEN / 8);
+    localparam ROW_BYTES_LOG  = BANK_SEL_BITS + WORD_SIZE_LOG2;
+    localparam ROW_HWORDS     = NUM_BANKS * (`VX_CFG_XLEN / 16);
+    localparam LANE_W         = ROW_BYTES_LOG - 2;
+    localparam A_ROWS         = TCU_WG_M_STEPS * TCU_TC_M;
+    localparam A_WORDS        = A_ROWS * TCU_WG_FEDP_K;
+    localparam NUM_READS      = A_ROWS;
+    localparam CTR_W          = `CLOG2(NUM_READS + 1);
+    localparam K_STEPS_W      = `CLOG2(TCU_WG_K_STEPS);
+
+    `STATIC_ASSERT (TCU_WG_FEDP_K == 4, ("wgmma descriptors need one 16-byte chunk per row and step"))
+    `STATIC_ASSERT (TCU_TC_M == 8 && A_ROWS == 16, ("wgmma descriptors need 16 rows of 8 per block"))
+    `STATIC_ASSERT (ROW_BYTES_LOG >= 4, ("a local-memory row must hold a 16-byte chunk"))
+    `STATIC_ASSERT (LMEM_LOG == BANK_ADDR_WIDTH + ROW_BYTES_LOG, ("local-memory address width mismatch"))
+
+    `UNUSED_VAR (req_setup)
+    `UNUSED_VAR (req_step_n)
+    `UNUSED_VAR (req_is_sparse)
+
+    wire [`UP(K_STEPS_W)-1:0] req_step_k_trunc = `UP(K_STEPS_W)'(req_step_k);
+    if (4 > K_STEPS_W) begin : g_step_k_upper_unused
+        `UNUSED_VAR (req_step_k[3:`UP(K_STEPS_W)])
+    end
+
+    logic                      slot_valid_r;
+    logic [`UP(K_STEPS_W)-1:0] slot_step_k_r;
+    logic                      fetching_r;
+    logic                      refetched_r;
+    logic [63:0]               f_desc_r;
+    logic [LMEM_LOG-1:0]       f_base_r;
+    logic                      f_esize16_r;
+    logic [CTR_W-1:0]          req_ctr_r;
+    logic [CTR_W-1:0]          rsp_ctr_r;
+    logic                      req_inflight_r;
+    logic [LANE_W-1:0]         rsp_lane_r;
+
+    // A WGMMA's first micro-op always refills: a K-tile loop rewrites the
+    // slab in place and reissues the same descriptors.
+    wire stripe_resident = slot_valid_r
+                        && (slot_step_k_r == req_step_k_trunc)
+                        && (!req_is_first_uop || refetched_r);
+
+    wire need_smem = req_valid && req_a_is_smem;
+    wire alloc_en  = need_smem && !stripe_resident && !fetching_r;
+
+    assign abuf_ready = !req_valid || !req_a_is_smem || stripe_resident;
+    wire fire = req_valid && abuf_ready;
+
+    wire f_mn_major = f_desc_r[52];
+    wire all_requested = (req_ctr_r == CTR_W'(NUM_READS));
+    wire can_issue = fetching_r && !all_requested
+                  && (!req_inflight_r || tcu_lmem_if.rsp_valid);
+    wire last_rsp  = fetching_r && tcu_lmem_if.rsp_valid
+                  && (rsp_ctr_r == CTR_W'(NUM_READS - 1));
+
+    wire [3:0] rd_idx = req_ctr_r[3:0];
+    wire [7:0] rd_mn  = 8'(BLOCK_IDX * A_ROWS)
+                      + (f_mn_major ? {4'b0, rd_idx[0], 3'b0} : {4'b0, rd_idx});
+    wire [5:0] rd_k   = f_mn_major ? 6'({slot_step_k_r, rd_idx[3:1]})
+                                   : (f_esize16_r ? 6'({slot_step_k_r, 3'b0})
+                                                  : 6'({slot_step_k_r, 4'b0}));
+
+    wire [LMEM_LOG-1:0] rd_addr;
+    VX_tcu_smem_addr #(
+        .LMEM_LOG (LMEM_LOG)
+    ) smem_addr (
+        .clk       (clk),
+        .reset     (reset),
+        .check     (can_issue),
+        .desc      (f_desc_r),
+        .slot_base (f_base_r),
+        .esize16   (f_esize16_r),
+        .mn        (rd_mn),
+        .k         (rd_k),
+        .addr      (rd_addr)
+    );
+
+    assign tcu_lmem_if.req_valid       = can_issue;
+    assign tcu_lmem_if.req_data.rw     = 1'b0;
+    assign tcu_lmem_if.req_data.addr   = rd_addr[LMEM_LOG-1:ROW_BYTES_LOG];
+    assign tcu_lmem_if.req_data.data   = '0;
+    assign tcu_lmem_if.req_data.byteen = '0;
+    assign tcu_lmem_if.req_data.attr   = '0;
+    assign tcu_lmem_if.req_data.tag.uuid  = req_uuid;
+    assign tcu_lmem_if.req_data.tag.value = '0;
+    assign tcu_lmem_if.rsp_ready       = 1'b1;
+    `UNUSED_VAR (tcu_lmem_if.rsp_data.tag)
+    `UNUSED_VAR (rd_addr[1:0])
+
+    always_ff @(posedge clk) begin
+        if (reset) begin
+            slot_valid_r   <= 1'b0;
+            slot_step_k_r  <= '0;
+            fetching_r     <= 1'b0;
+            refetched_r    <= 1'b0;
+            f_desc_r       <= '0;
+            f_base_r       <= '0;
+            f_esize16_r    <= 1'b0;
+            req_ctr_r      <= '0;
+            rsp_ctr_r      <= '0;
+            req_inflight_r <= 1'b0;
+            rsp_lane_r     <= '0;
+        end else begin
+            if (tcu_lmem_if.rsp_valid)
+                req_inflight_r <= 1'b0;
+            if (tcu_lmem_if.req_valid && tcu_lmem_if.req_ready) begin
+                req_inflight_r <= 1'b1;
+                req_ctr_r      <= req_ctr_r + CTR_W'(1);
+                rsp_lane_r     <= rd_addr[ROW_BYTES_LOG-1:2];
+            end
+            if (fetching_r && tcu_lmem_if.rsp_valid)
+                rsp_ctr_r <= rsp_ctr_r + CTR_W'(1);
+
+            if (last_rsp && req_valid && req_is_first_uop)
+                refetched_r <= 1'b1;
+            else if (fire && !req_is_first_uop)
+                refetched_r <= 1'b0;
+
+            if (alloc_en) begin
+                fetching_r     <= 1'b1;
+                slot_valid_r   <= 1'b0;
+                slot_step_k_r  <= req_step_k_trunc;
+                f_desc_r       <= 64'(req_desc_a);
+                f_base_r       <= req_slot_base;
+                f_esize16_r    <= req_esize16;
+                req_ctr_r      <= '0;
+                rsp_ctr_r      <= '0;
+                req_inflight_r <= 1'b0;
+            end else if (last_rsp) begin
+                fetching_r   <= 1'b0;
+                slot_valid_r <= 1'b1;
+            end
+        end
+    end
+
+    // Storage in half-words, so a MN-major chunk can scatter its elements.
+    logic [A_WORDS*32-1:0] storage_wdata;
+    logic [A_WORDS*2-1:0]  storage_wren;
+
+    always_comb begin
+        storage_wdata = '0;
+        storage_wren  = '0;
+        if (fetching_r && tcu_lmem_if.rsp_valid) begin
+            for (int h = 0; h < 8; ++h) begin
+                automatic int src = int'(rsp_lane_r) * 2 + h;
+                automatic int dst;
+                if (f_mn_major) begin
+                    // k-row kk of MN chunk c: element h is row 8c + h, half kk.
+                    automatic int kk = int'(rsp_ctr_r[3:1]);
+                    automatic int c  = int'(rsp_ctr_r[0]);
+                    dst = ((8 * c + h) * TCU_WG_FEDP_K + kk / 2) * 2 + (kk % 2);
+                end else begin
+                    dst = int'(rsp_ctr_r[3:0]) * TCU_WG_FEDP_K * 2 + h;
+                end
+                if (src < ROW_HWORDS && dst < A_WORDS * 2) begin
+                    storage_wren[dst] = 1'b1;
+                    storage_wdata[dst * 16 +: 16] = tcu_lmem_if.rsp_data.data[src * 16 +: 16];
+                end
+            end
+        end
+    end
+
+    wire [A_WORDS-1:0][31:0] storage_rdata;
+
+    VX_dp_ram #(
+        .DATAW   (A_WORDS * 32),
+        .SIZE    (1),
+        .WRENW   (A_WORDS * 2),
+        .LUTRAM  (1),
+        .OUT_REG (0),
+        .RDW_MODE("W")
+    ) storage_ram (
+        .clk   (clk),
+        .reset (reset),
+        .read  (1'b1),
+        .write (fetching_r && tcu_lmem_if.rsp_valid),
+        .wren  (storage_wren),
+        .waddr (1'b0),
+        .wdata (storage_wdata),
+        .raddr (1'b0),
+        .rdata (storage_rdata)
+    );
+
+    localparam A_BLOCK_WORDS = TCU_TC_M * TCU_WG_FEDP_K;
+
+    logic [TCU_WG_A_DATA_SIZE-1:0][`VX_CFG_XLEN-1:0] rs1_mux;
+    always_comb begin
+        rs1_mux = '0;
+        for (int lane = 0; lane < TCU_WG_A_DATA_SIZE; ++lane) begin
+            automatic int src_idx = int'(req_step_m) * A_BLOCK_WORDS + lane;
+            if (lane < A_BLOCK_WORDS && src_idx < A_WORDS)
+                rs1_mux[lane] = `VX_CFG_XLEN'(storage_rdata[src_idx]);
+        end
+    end
+    assign abuf_rs1_data = rs1_mux;
+
+`ifdef PERF_ENABLE
+    reg [PERF_CTR_BITS-1:0] stall_ctr_r;
+    reg [PERF_CTR_BITS-1:0] reads_ctr_r;
+    always_ff @(posedge clk) begin
+        if (reset) begin
+            stall_ctr_r <= '0;
+            reads_ctr_r <= '0;
+        end else begin
+            if (req_valid && !abuf_ready)
+                stall_ctr_r <= stall_ctr_r + PERF_CTR_BITS'(1);
+            if (tcu_lmem_if.req_valid && tcu_lmem_if.req_ready)
+                reads_ctr_r <= reads_ctr_r + PERF_CTR_BITS'(1);
+        end
+    end
+    assign abuf_stalls = stall_ctr_r;
+    assign lmem_reads  = reads_ctr_r;
+`endif
+
+`ifdef DBG_TRACE_TCU
+    // One line per event, fields as the SimX tile-buffer trace, for trace diffs.
+    always @(posedge clk) begin
+        if (!reset) begin
+            if (alloc_en)
+                `TRACE(1, ("%t: tcutr a_alloc b=%0d k=%0d desc=0x%0h base=0x%0h\n",
+                    $time, BLOCK_IDX, req_step_k, req_desc_a, req_slot_base))
+            if (tcu_lmem_if.req_valid && tcu_lmem_if.req_ready)
+                `TRACE(1, ("%t: tcutr a_req b=%0d i=%0d addr=0x%0h\n",
+                    $time, BLOCK_IDX, req_ctr_r, rd_addr))
+            if (fetching_r && tcu_lmem_if.rsp_valid)
+                `TRACE(1, ("%t: tcutr a_rsp b=%0d i=%0d\n", $time, BLOCK_IDX, rsp_ctr_r))
+        end
+    end
+`endif
+
+`else
 
     // -----------------------------------------------------------------------
     // Constants
@@ -491,6 +751,8 @@ module VX_tcu_abuf import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
         end
     end
 `endif
+
+`endif // VX_CFG_TCU_H100_ENABLE
 
 endmodule
 

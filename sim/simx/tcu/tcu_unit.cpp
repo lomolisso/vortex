@@ -30,6 +30,12 @@
 #if defined(VX_CFG_EXT_MBAR_ENABLE) && defined(VX_CFG_TCU_WGMMA_ENABLE)
 #include <bitset>
 #include <deque>
+#ifdef VX_CFG_TCU_H100_ENABLE
+#include "tcu_desc_ref.h"
+#include "tcu_fedp_ref.h"
+#else
+#line 32
+#endif
 #else
 #line 29
 #endif
@@ -388,6 +394,11 @@ public:
     cur_block_ = 0;
   #if defined(VX_CFG_EXT_MBAR_ENABLE) && defined(VX_CFG_TCU_WGMMA_ENABLE)
     this->wg_reset();
+  #ifdef VX_CFG_TCU_H100_ENABLE
+    this->h100_reset();
+  #else
+  #line 390
+  #endif
   #else
   #line 382
   #endif
@@ -545,6 +556,12 @@ public:
     this->agu_step();
   #endif
   #if defined(VX_CFG_EXT_MBAR_ENABLE) && defined(VX_CFG_TCU_WGMMA_ENABLE)
+  #ifdef VX_CFG_TCU_H100_ENABLE
+    this->h100_tick();
+    return;
+  #else
+  #line 547
+  #endif
     this->wg_unlock_step();
     std::array<bool, VX_CFG_NUM_TCU_BLOCKS> grp_taken{};
     for (uint32_t b = 0; b < VX_CFG_NUM_TCU_BLOCKS; ++b) {
@@ -1523,6 +1540,12 @@ public:
     order.pop_front();
     if (wid < 0)
       return;
+  #ifdef VX_CFG_TCU_H100_ENABLE
+    this->h100_wg_retired(uint32_t(wid));
+    return;
+  #else
+  #line 1525
+  #endif
     auto& g = wg_.at(wid);
     __assert(g.done != g.issued, "wgmma retire without an issue: wid=" << wid);
     ++g.done;
@@ -1540,6 +1563,11 @@ private:
   std::array<std::bitset<VX_CFG_NUM_WARPS>, VX_CFG_NUM_TCU_BLOCKS> wg_ready_;
   // Per block, per result in Outputs: the warp of a WGMMA's last result, else -1.
   std::array<std::deque<int32_t>, VX_CFG_NUM_TCU_BLOCKS> wg_out_last_;
+#ifdef VX_CFG_TCU_H100_ENABLE
+#include "tcu_h100_impl.h"
+#else
+#line 1542
+#endif
 #else
 #line 1371
 #endif
@@ -1593,6 +1621,14 @@ uint32_t TcuUopGen::uop_count(const Instr& instr) {
     return mma_steps;
   }
 
+#ifdef VX_CFG_TCU_H100_ENABLE
+  if (tcu_is_wgmma(tcu_type))
+    return tcu_h100::uop_count(args);
+#elif defined(VX_CFG_EXT_MBAR_ENABLE) && defined(VX_CFG_TCU_WGMMA_ENABLE)
+#line 1593
+#else
+#line 1421
+#endif
 #ifdef VX_CFG_TCU_WGMMA_ENABLE
   if (tcu_is_wgmma(tcu_type)) {
     bool is_sparse = tcu_is_sparse(tcu_type);
@@ -1624,6 +1660,16 @@ Instr::Ptr TcuUopGen::get(const Instr& macro_instr, uint32_t uop_index) {
   auto uop_instr = std::allocate_shared<Instr>(pool_, uop_uuid, FUType::TCU);
   uop_instr->set_parent_uuid(parent_uuid);
 
+#ifdef VX_CFG_TCU_H100_ENABLE
+  if (tcu_is_wgmma(tcu_type)) {
+    tcu_h100::uop_fill(*uop_instr, args, uop_index, total);
+    return uop_instr;
+  }
+#elif defined(VX_CFG_EXT_MBAR_ENABLE) && defined(VX_CFG_TCU_WGMMA_ENABLE)
+#line 1624
+#else
+#line 1452
+#endif
   if (tcu_is_wmma(tcu_type)) {
     using wmma = vt::wmma_config_t<VX_CFG_NUM_THREADS>;
     constexpr uint32_t rc_base = 0, ra_base = 10;
@@ -1800,6 +1846,11 @@ TcuUnit::TcuUnit(const SimContext &ctx, const char* name, Core* core)
 	, agu_rsp_in(this)
 #endif
 #if defined(VX_CFG_EXT_MBAR_ENABLE) && defined(VX_CFG_TCU_WGMMA_ENABLE)
+#ifdef VX_CFG_TCU_H100_ENABLE
+	, SlotIn(this, 4 * VX_CFG_NUM_WARPS + 8)
+#else
+#line 1802
+#endif
 	, UnlockOut(VX_CFG_NUM_TCU_BLOCKS, SimChannel<uint32_t>(this))
 #else
 #line 1627

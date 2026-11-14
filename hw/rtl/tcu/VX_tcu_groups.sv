@@ -52,6 +52,13 @@ module VX_tcu_groups import VX_gpu_pkg::*; #(
     input wire [NW_WIDTH-1:0]   req_wid,
     input wire [2:0]            req_n,
 
+`ifdef VX_CFG_TCU_H100_ENABLE
+    // The retire counts of this block's warps, and those of every block: a
+    // warpgroup is the warps of one slice index across the blocks.
+    output wire [PER_ISSUE_WARPS-1:0][5:0] done_cnt,
+    input  wire [`VX_CFG_ISSUE_WIDTH-1:0][PER_ISSUE_WARPS-1:0][5:0] done_cnt_all,
+`endif
+
     VX_sched_unlock_if.master   unlock_if
 );
     `UNUSED_SPARAM (INSTANCE_ID)
@@ -95,6 +102,61 @@ module VX_tcu_groups import VX_gpu_pkg::*; #(
         end
     endfunction
 
+`ifdef VX_CFG_TCU_H100_ENABLE
+    // A wgmma is one operation of the whole warpgroup, so a group is complete
+    // once every warp of the warpgroup has retired past its boundary: the
+    // boundaries are compared against the smallest retire count of the
+    // warpgroup, read from the registers (a retire counts from the next
+    // cycle). A waiting warp is re-checked every cycle; boundaries are dropped
+    // only by the warp's own commit and wait requests.
+    `STATIC_ASSERT (CNT_W == 6, ("wgmma group counts are 6 bits wide"))
+    `STATIC_ASSERT (`VX_CFG_ISSUE_WIDTH == 4, ("a warpgroup spans four blocks"))
+
+    for (genvar w = 0; w < PW; ++w) begin : g_done_cnt
+        assign done_cnt[w] = done_r[w];
+    end
+
+    logic [CNT_W-1:0] wg_done [PW];
+    always @(*) begin
+        for (integer w = 0; w < PW; ++w) begin
+            logic [CNT_W-1:0] m, diff;
+            m = done_r[w];
+            for (integer b = 0; b < `VX_CFG_ISSUE_WIDTH; ++b) begin
+                diff = done_cnt_all[b][w] - m;
+                if (diff[CNT_W-1]) m = done_cnt_all[b][w];
+            end
+            wg_done[w] = m;
+        end
+    end
+
+    wire [CNT_W-1:0] done_inc = done_r[done_wis] + CNT_W'(1);
+
+    wire [SIZE_W-1:0] req_pending = pending(req_wis, wg_done[req_wis]);
+    wire [SIZE_W-1:0] req_live    = req_pending;
+
+    wire req_wait = req_valid && req_is_wait;
+    wire req_commit = req_valid && ~req_is_wait;
+    wire sat_req  = req_wait && (req_pending <= SIZE_W'(req_n));
+
+    reg [PW-1:0] sat_wait;
+    always @(*) begin
+        for (integer w = 0; w < PW; ++w) begin
+            sat_wait[w] = waiting_r[w]
+                       && (pending(ISSUE_WIS_W'(w), wg_done[w]) <= SIZE_W'(wait_n_r[w]));
+        end
+    end
+
+    reg [PW-1:0] ready_n;
+    reg [PW-1:0] pick;
+    always @(*) begin
+        ready_n = ready_r | sat_wait;
+        if (sat_req)  ready_n[req_wis]  = 1'b1;
+        pick = '0;
+        for (integer w = PW-1; w >= 0; --w) begin
+            if (ready_n[w]) pick = PW'(1) << w;
+        end
+    end
+`else
     wire [CNT_W-1:0] done_inc = done_r[done_wis] + CNT_W'(1);
     wire [CNT_W-1:0] req_done_n = done_r[req_wis] + CNT_W'(done_valid && (done_wis == req_wis));
 
@@ -121,6 +183,8 @@ module VX_tcu_groups import VX_gpu_pkg::*; #(
         end
     end
 
+`endif
+
     wire [ISSUE_WIS_W-1:0] pick_wis;
     VX_onehot_encoder #(
         .N (PW)
@@ -145,22 +209,34 @@ module VX_tcu_groups import VX_gpu_pkg::*; #(
             if (issue_valid) begin
                 issued_r[issue_wis] <= issued_r[issue_wis] + CNT_W'(1);
             end
+        `ifdef VX_CFG_TCU_H100_ENABLE
+            if (done_valid) begin
+                done_r[done_wis] <= done_inc;
+            end
+        `else
             if (done_valid) begin
                 done_r[done_wis] <= done_inc;
                 head_r[done_wis] <= head_r[done_wis] + PTR_W'(size_r[done_wis] - done_pending);
                 size_r[done_wis] <= done_pending;
             end
+        `endif
             if (req_valid) begin
                 // drop the retired boundaries; a commit then pushes
                 head_r[req_wis] <= head_r[req_wis] + PTR_W'(size_r[req_wis] - req_live);
                 size_r[req_wis] <= req_live + SIZE_W'(req_commit);
             end
+        `ifndef VX_CFG_TCU_H100_ENABLE
             if (req_wait && ~sat_req) begin
                 waiting_r[req_wis] <= 1'b1;
             end
+        `endif
+        `ifdef VX_CFG_TCU_H100_ENABLE
+            waiting_r <= (waiting_r | (PW'(req_wait && ~sat_req) << req_wis)) & ~sat_wait;
+        `else
             if (sat_done) begin
                 waiting_r[done_wis] <= 1'b0;
             end
+        `endif
             ready_r        <= ready_n & ~pick;
             unlock_valid_r <= (pick != '0);
         end

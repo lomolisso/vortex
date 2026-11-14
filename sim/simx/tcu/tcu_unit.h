@@ -27,6 +27,37 @@
 #if defined(VX_CFG_TCU_MX_ENABLE) || defined(VX_CFG_TCU_SPARSE_ENABLE)
 #define TCU_META_ENABLE
 #endif
+#ifdef VX_CFG_TCU_H100_ENABLE
+// WGMMA as on the H100: one warpgroup of four 32-thread warps over shared
+// memory addressed relative to the block's local-memory slot.
+static_assert(VX_CFG_XLEN == 64, "H100 WGMMA requires XLEN 64");
+#if !defined(VX_CFG_EXT_TCU_ENABLE) || !defined(VX_CFG_TCU_WGMMA_ENABLE)
+#error "H100 WGMMA requires the TCU with WGMMA"
+#endif
+#if !defined(VX_CFG_EXT_DXA_ENABLE) || !defined(VX_CFG_EXT_MBAR_ENABLE)
+#error "H100 WGMMA requires DXA and mbarriers"
+#endif
+#ifdef VX_CFG_TCU_SPARSE_ENABLE
+#error "H100 WGMMA does not support sparse WGMMA"
+#endif
+#if defined(VX_CFG_TCU_MX_ENABLE) || defined(VX_CFG_TCU_MXFP4_ENABLE) || defined(VX_CFG_TCU_NVFP4_ENABLE)
+#error "H100 WGMMA does not support MX formats"
+#endif
+#ifdef VX_CFG_TCU_FEDP2K
+#error "H100 WGMMA does not support FEDP2K"
+#endif
+#ifdef VX_CFG_TCU_DSM_ENABLE
+#error "H100 WGMMA does not support DSM"
+#endif
+#if !defined(VX_CFG_TCU_TYPE_TFR) && !defined(VX_CFG_TCU_TYPE_DPI)
+#error "H100 WGMMA needs the TFR or DPI backend"
+#endif
+static_assert(VX_CFG_NUM_THREADS == 32, "H100 WGMMA requires 32 threads");
+static_assert(VX_CFG_ISSUE_WIDTH == 4 && VX_CFG_NUM_TCU_BLOCKS == 4,
+              "H100 WGMMA requires ISSUE_WIDTH 4 (one warpgroup)");
+#else
+#line 29
+#endif
 
 namespace vortex {
 
@@ -82,6 +113,13 @@ public:
   // metadata SRAM.
   SimChannel<LsuReq> agu_req_out;
   SimChannel<LsuRsp> agu_rsp_in;
+#endif
+#ifdef VX_CFG_TCU_H100_ENABLE
+  // The dispatcher's block-slot events: each warp's slot and the slot pitch.
+  // Operand addresses are relative to the issuing block's slot, as TMA's are.
+  SimChannel<CtaSlotEvt> SlotIn;
+#else
+#line 85
 #endif
 
 #if defined(VX_CFG_EXT_MBAR_ENABLE) && defined(VX_CFG_TCU_WGMMA_ENABLE)

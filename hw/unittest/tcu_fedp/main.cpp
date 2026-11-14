@@ -56,7 +56,8 @@
 #include "softfloat_ext.h"
 
 #ifdef USE_FEDP
-#include "fedp.h"
+#include "tcu_fedp_ref.h"
+using vortex::tcu_fedp_ref::FEDP;
 #endif
 
 bool sim_trace_enabled() {
@@ -862,8 +863,134 @@ public:
     return true;
   }
 
+#ifdef USE_FEDP
+  static uint16_t make_f16(uint32_t s, uint32_t e, uint32_t f) {
+    return (uint16_t)(((s & 1u) << 15) | ((e & 0x1fu) << 10) | (f & 0x3ffu));
+  }
+
+  static double f16_value(uint16_t h) {
+    uint32_t u = vortex::tcu_fedp_ref::FEDP::f16_to_f32_bits(h);
+    float f;
+    std::memcpy(&f, &u, 4);
+    return f;
+  }
+
+  // One f16 operand of the given scenario.
+  uint16_t gen_f16(int scenario) {
+    std::uniform_int_distribution<uint32_t> d(0, 0xffffffffu);
+    uint32_t r = d(rng_), s = r & 1u, f = (r >> 1) & 0x3ffu, x = r >> 11;
+    switch (scenario) {
+    case 0: return make_f16(s, 11 + x % 8, f);           // around 1
+    case 1: return make_f16(s, 1 + x % 5, f);            // tiny: subnormal sums
+    case 6: return make_f16(s, (x % 4) ? 0 : 1, f);      // subnormal or smallest-normal C
+    case 2: return make_f16(s, 20 + x % 9, f);           // huge: overflow
+    case 4: {                                            // specials mixed in
+      switch (x % 8) {
+      case 0: return make_f16(s, 0, 0);
+      case 1: return make_f16(s, 0, f ? f : 1);
+      case 2: return make_f16(s, 31, 0);
+      case 3: return make_f16(s, 31, f | 0x200);
+      case 4: return make_f16(s, 30, 0x3ff);
+      default: return make_f16(s, 8 + x % 14, f);
+      }
+    }
+    default: {                                           // any finite pattern, few overflows
+      uint32_t e = x % 23;
+      return make_f16(s, e, f);
+    }
+    }
+  }
+
+  // f16 destination: C and the result are f16, rounded once per call. The
+  // result must equal the model bit for bit.
+  bool test_f16_dest() {
+    const int total_elements = NUM_REGS * 2;
+    std::cout << "Testing f16 destination, " << total_elements << " products per call" << std::endl;
+    const char* names[] = {"moderate", "subnormal", "overflow", "cancel", "specials", "random"};
+    uint32_t counts[6] = {0}, subs = 0, infs = 0, nans = 0, zeros = 0;
+    for (uint32_t test_id = 0; test_id < config_.num_tests; test_id++) {
+      const int scenario = test_id % 6;
+      std::vector<uint32_t> a_hex(total_elements), b_hex(total_elements);
+      double sum = 0;
+      for (int i = 0; i < total_elements; i++) {
+        int sa = (scenario == 3) ? 0 : scenario;
+        a_hex[i] = gen_f16(sa);
+        b_hex[i] = gen_f16(sa);
+        sum += f16_value(a_hex[i]) * f16_value(b_hex[i]);
+      }
+      uint16_t c_hex = gen_f16(scenario == 3 ? 0 : (scenario == 1 ? 6 : scenario));
+      if (scenario == 3) {
+        // C close to minus the products: the sum cancels to a few bits
+        float neg = (float)(-sum);
+        uint32_t u;
+        std::memcpy(&u, &neg, 4);
+        uint32_t e32 = (u >> 23) & 0xff;
+        int e16 = (int)e32 - 112;
+        if (e16 >= 1 && e16 <= 30) {
+          c_hex = make_f16(u >> 31, e16, ((u >> 13) & 0x3ff) ^ (test_id & 3));
+        }
+      }
+      if (config_.test_id >= 0 && (int)test_id != config_.test_id)
+        continue;
+
+      std::vector<uint32_t> a_packed(NUM_REGS), b_packed(NUM_REGS);
+      pack_elements(a_hex, 16, NUM_REGS, a_packed.data());
+      pack_elements(b_hex, 16, NUM_REGS, b_packed.data());
+      for (int i = 0; i < NUM_REGS; i++) {
+        WRITE_WDATA(dut_->a_row, i, a_packed[i]);
+        WRITE_WDATA(dut_->b_col, i, b_packed[i]);
+      }
+      dut_->c_val = c_hex;
+      dut_->fmt_s = config_.fmt_s;
+      dut_->fmt_d = config_.fmt_d;
+      dut_->enable = 1;
+    #ifdef VX_CFG_TCU_TYPE_TFR
+      dut_->vld_mask = (uint32_t)((1ull << (total_elements * 4)) - 1);
+    #endif
+      for (int i = 0; i < LATENCY; i++) {
+        tick();
+      #ifdef VX_CFG_TCU_TYPE_TFR
+        dut_->vld_mask = 0;
+      #endif
+      }
+      dut_->enable = 0;
+      tick();
+
+      uint32_t actual = dut_->d_val;
+      uint32_t expected = vortex::tcu_fedp_ref::fedp(config_.fmt_s, config_.fmt_d,
+                                                     a_packed.data(), b_packed.data(), c_hex, NUM_REGS);
+      ++counts[scenario];
+      uint32_t h = expected & 0x7fff;
+      if (h == 0) ++zeros; else if (h < 0x400) ++subs; else if (h == 0x7c00) ++infs; else if (h > 0x7c00) ++nans;
+      if (actual != expected) {
+        std::cout << "Test #" << test_id << " (" << names[scenario] << ") failed:" << std::endl;
+        print_format("  a_values=", a_hex, true);
+        print_format("  b_values=", b_hex, true);
+        print_format("  c_value=", (uint32_t)c_hex, true);
+        print_format("  expected=", expected, true);
+        print_format("  actual=", actual, true);
+        return false;
+      }
+    }
+    std::cout << "  results: " << zeros << " zero, " << subs << " subnormal, " << infs
+              << " infinite, " << nans << " NaN" << std::endl;
+    return true;
+  }
+#endif
+
   bool run_tests() {
     this->reset();
+
+  #ifdef USE_FEDP
+    if (config_.fmt_d == 2) {
+      if (!test_f16_dest()) {
+        return false;
+      }
+      std::cout << config_.num_tests << " test(s) PASSED!" << std::endl;
+      std::cout << "Simulation completed in " << cycle_count_ << " cycles" << std::endl;
+      return true;
+    }
+  #endif
 
     if (config_.fmt_s >= 16) {
       if (!test_integers()) {
@@ -909,6 +1036,8 @@ TestConfig parse_args(int argc, char **argv) {
       }
     } else if (arg.substr(0, 6) == "--fmt=") {
       config_.fmt_s = std::stoi(arg.substr(6));
+    } else if (arg.substr(0, 8) == "--fmt-d=") {
+      config_.fmt_d = std::stoi(arg.substr(8));
     } else if (arg.substr(0, 6) == "--ext=") {
       config_.exp_bits = std::stoi(arg.substr(6));
     } else if (arg.substr(0, 6) == "--sig=") {
@@ -936,6 +1065,7 @@ TestConfig parse_args(int argc, char **argv) {
       std::cout << "  --no-trace       Disable VCD tracing" << std::endl;
       std::cout << "  --features=LIST  Semicolon-separated list of features to test (default: infinities;nans;subnormals;normals;zeros)" << std::endl;
       std::cout << "  --fmt=<id>       Set source format code" << std::endl;
+      std::cout << "  --fmt-d=<id>     Destination format code (2 = f16, compared bit-exactly)" << std::endl;
       std::cout << "  --ext=BITS       Exponent bits for custom format" << std::endl;
       std::cout << "  --sig=BITS       Significand bits for custom format" << std::endl;
       std::cout << "  --frm=MODE       Rounding mode (RNE, RZ, RU, RD, RM)" << std::endl;

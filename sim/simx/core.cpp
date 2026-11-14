@@ -438,6 +438,13 @@ public:
       auto cta = scheduler_->cta_dispatcher();
       cta->DxaSlotOut.at(0).bind(&dxa_compl_->SlotIn);
       cta->DxaSlotOut.at(1).bind(&sfu->dxa_slot_in);
+    #ifdef VX_CFG_TCU_H100_ENABLE
+      cta->DxaSlotOut.at(3).bind(&tcu_unit_->SlotIn);
+    #elif defined(VX_CFG_EXT_DLMEM_ENABLE)
+    #line 438
+    #else
+    #line 352
+    #endif
       // Created after the SFU, so it takes the DXA unit's group events in
       // their cycle.
       snprintf(sname, 100, "%s-bg_unit", name.c_str());

@@ -55,6 +55,11 @@ module VX_tcu_tbuf import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
 
     // Per-block uop observation (sized BLOCK_SIZE; req.valid pre-gated to WGMMA)
     input  tcu_tbuf_req_t [BLOCK_SIZE-1:0]                              req,
+`ifdef VX_CFG_TCU_H100_ENABLE
+    // Each block's CTA local-memory slot base and operand element size
+    input  wire [BLOCK_SIZE-1:0][`VX_CFG_LMEM_LOG_SIZE-1:0]             req_slot_base,
+    input  wire [BLOCK_SIZE-1:0]                                        req_esize16,
+`endif
 
     // Single LMEM master out (post-arb)
     VX_mem_bus_if.master                                                tcu_lmem_if,
@@ -96,6 +101,9 @@ module VX_tcu_tbuf import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
         VX_tcu_abuf #(
             .INSTANCE_ID    (`SFORMATF(("%s-abuf%0d", INSTANCE_ID, b))),
             .NUM_BANKS      (NUM_BANKS),
+        `ifdef VX_CFG_TCU_H100_ENABLE
+            .BLOCK_IDX      (b),
+        `endif
             .BANK_ADDR_WIDTH(BANK_ADDR_WIDTH)
         ) abuf (
             .clk            (clk),
@@ -118,6 +126,11 @@ module VX_tcu_tbuf import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
             .req_is_sparse  (1'b0),
         `endif
             .req_uuid       (req[b].uuid),
+        `ifdef VX_CFG_TCU_H100_ENABLE
+            .req_is_first_uop (req[b].is_first_uop),
+            .req_slot_base  (req_slot_base[b]),
+            .req_esize16    (req_esize16[b]),
+        `endif
             .tcu_lmem_if    (lmem_masters[b]),
             .abuf_ready     (abuf_ready_w[b]),
             .abuf_rs1_data  (abuf_rs1_data_w[b])
@@ -147,7 +160,13 @@ module VX_tcu_tbuf import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
     wire                          bbuf_req_is_sparse;
     wire [3:0]                    bbuf_req_step_m;
     wire [3:0]                    bbuf_req_step_k;
+`ifdef VX_CFG_TCU_H100_ENABLE
+    wire [4:0]                    bbuf_req_step_n;
+    wire [`VX_CFG_LMEM_LOG_SIZE-1:0] bbuf_req_slot_base;
+    wire                          bbuf_req_esize16;
+`else
     wire [3:0]                    bbuf_req_step_n;
+`endif
     wire [1:0]                    bbuf_req_cd_nregs;
     wire [NCTA_WIDTH-1:0]         bbuf_req_cta_id;
     wire [`VX_CFG_XLEN-1:0]       bbuf_req_desc_b;
@@ -169,6 +188,10 @@ module VX_tcu_tbuf import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
         assign bbuf_req_cd_nregs     = req[0].cd_nregs;
         assign bbuf_req_cta_id       = req[0].cta_id;
         assign bbuf_req_desc_b       = req[0].desc_b;
+    `ifdef VX_CFG_TCU_H100_ENABLE
+        assign bbuf_req_slot_base    = req_slot_base[0];
+        assign bbuf_req_esize16      = req_esize16[0];
+    `endif
     end else begin : g_bbuf_inputs_pe
         wire [BLOCK_SIZE-1:0] req_valid_v;
         wire [BLOCK_SIZE-1:0] req_setup_v;
@@ -194,7 +217,13 @@ module VX_tcu_tbuf import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
         logic              sel_is_sparse;
         logic [3:0]        sel_step_m;
         logic [3:0]        sel_step_k;
+    `ifdef VX_CFG_TCU_H100_ENABLE
+        logic [4:0]        sel_step_n;
+        logic [`VX_CFG_LMEM_LOG_SIZE-1:0] sel_slot_base;
+        logic              sel_esize16;
+    `else
         logic [3:0]        sel_step_n;
+    `endif
         logic [1:0]        sel_cd_nregs;
         logic [NCTA_WIDTH-1:0] sel_cta_id;
         logic [`VX_CFG_XLEN-1:0]  sel_desc_b;
@@ -209,6 +238,10 @@ module VX_tcu_tbuf import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
             sel_cta_id       = '0;
             sel_desc_b       = '0;
             sel_uuid         = '0;
+        `ifdef VX_CFG_TCU_H100_ENABLE
+            sel_slot_base    = '0;
+            sel_esize16      = 1'b0;
+        `endif
             for (int b = 0; b < BLOCK_SIZE; ++b) begin
                 if (bbuf_sel_oh[b]) begin
                     sel_is_first_uop = req[b].is_first_uop;
@@ -222,6 +255,10 @@ module VX_tcu_tbuf import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
                     sel_cta_id   = req[b].cta_id;
                     sel_desc_b   = req[b].desc_b;
                     sel_uuid     = req[b].uuid;
+                `ifdef VX_CFG_TCU_H100_ENABLE
+                    sel_slot_base = req_slot_base[b];
+                    sel_esize16   = req_esize16[b];
+                `endif
                 end
             end
         end
@@ -237,6 +274,10 @@ module VX_tcu_tbuf import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
         assign bbuf_req_cd_nregs     = sel_cd_nregs;
         assign bbuf_req_cta_id       = sel_cta_id;
         assign bbuf_req_desc_b       = sel_desc_b;
+    `ifdef VX_CFG_TCU_H100_ENABLE
+        assign bbuf_req_slot_base    = sel_slot_base;
+        assign bbuf_req_esize16      = sel_esize16;
+    `endif
     end
 
     VX_tcu_bbuf #(
@@ -262,6 +303,10 @@ module VX_tcu_tbuf import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
         .req_cta_id       (bbuf_req_cta_id),
         .req_desc_b       (bbuf_req_desc_b),
         .req_uuid         (bbuf_req_uuid),
+    `ifdef VX_CFG_TCU_H100_ENABLE
+        .req_slot_base    (bbuf_req_slot_base),
+        .req_esize16      (bbuf_req_esize16),
+    `endif
         .tcu_lmem_if      (lmem_masters[BBUF_IDX]),
         .bbuf_ready       (bbuf_ready_w),
         .bbuf_rs2_data    (bbuf_rs2_data_w)
@@ -306,9 +351,20 @@ module VX_tcu_tbuf import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
 
     wire [BLOCK_SIZE-1:0] block_key_match;
     for (genvar b = 0; b < BLOCK_SIZE; ++b) begin : g_block_match
+    `ifdef VX_CFG_TCU_H100_ENABLE
+        // The whole descriptor: layout, offsets and the major flag all
+        // change which bytes the shared buffer holds.
+        wire same_desc_b = (req[b].desc_b == bbuf_req_desc_b);
+    `else
         wire same_desc_b = (req[b].desc_b[15:0] == bbuf_req_desc_b[15:0]);
+    `endif
         wire same_step_k = (req[b].step_k       == bbuf_req_step_k);
+    `ifdef VX_CFG_TCU_H100_ENABLE
+        // The shared buffer holds both column parities of a group.
+        wire same_step_n = (req[b].step_n[4:1]  == bbuf_req_step_n[4:1]);
+    `else
         wire same_step_n = (req[b].step_n       == bbuf_req_step_n);
+    `endif
         wire same_cd_n   = (req[b].cd_nregs     == bbuf_req_cd_nregs);
         // Inactive blocks always "match" (they don't consume bbuf data).
         // Active blocks must match the representative's key.

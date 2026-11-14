@@ -731,6 +731,35 @@ define tcu_tfr_suite
 	$(call tcu_int_pair,TFR,INT8,17,18)
 	$(call tcu_int_pair,TFR,INT4,19,20)
 endef
+# H100 WGMMA (VX_CFG_TCU_H100_ENABLE): f16 destination (f16 C in, one RNE
+# rounding per call) and the f32 destination of every WGMMA source type, all
+# compared bit-exactly with sw/common/tcu_fedp_ref.h at the WGMMA FEDP width
+# (4 words: k8 for 16-bit, k16 for 8-bit inputs). The knob needs the WGMMA
+# shape (RV64, 32 threads, ISSUE_WIDTH 4, DXA + MBAR) in CONFIGS.
+TCU_H100 := -DVX_CFG_TCU_H100_ENABLE -DVX_CFG_TCU_WGMMA_ENABLE -DVX_CFG_TCU_FP8_ENABLE \
+            -DVX_CFG_EXT_DLMEM_ENABLE -DVX_CFG_EXT_A_ENABLE -DVX_CFG_EXT_DXA_ENABLE \
+            -DVX_CFG_EXT_MBAR_ENABLE -DVX_CFG_NUM_THREADS=32 -DVX_CFG_ISSUE_WIDTH=4
+TCU_H100_RUNS := "--fmt=2 --fmt-d=2 --tests=120000" "--fmt=2 --W=25 --ulp=0" \
+                 "--fmt=3 --W=25 --ulp=0" "--fmt=4 --W=25 --ulp=0" "--fmt=5 --W=25 --ulp=0"
+# $(1)=TCU type $(2)=extra CONFIGS; one build, every run of TCU_H100_RUNS
+define tcu_h100_case
+	$(MAKE) -C tcu_fedp clean
+	$(MAKE) -C tcu_fedp NUM_REGS=4 USE_DSP=$(USE_DSP) CONFIGS="$(TCU_BASE) -DVX_CFG_TCU_TYPE_$(1) -DUSE_FEDP $(TCU_H100) $(2)"
+	for o in $(TCU_H100_RUNS); do \
+	  $(MAKE) -C tcu_fedp run NUM_REGS=4 USE_DSP=$(USE_DSP) CONFIGS="$(TCU_BASE) -DVX_CFG_TCU_TYPE_$(1) -DUSE_FEDP $(TCU_H100) $(2)" OPTS="$$o" || exit 1; \
+	done
+endef
+# $(1) = TFR or DPI; TFR also runs the 2-stage multiply latency (5)
+ifeq ($(XLEN),64)
+define tcu_h100_suite
+	$(call tcu_h100_case,$(1),)
+	$(call tcu_h100_case,$(1),$(if $(filter TFR,$(1)),-DVX_CFG_TCU_LATENCY=5))
+endef
+else
+define tcu_h100_suite
+	@echo "H100 WGMMA FEDP cases are RV64 only; nothing to run at XLEN $(XLEN)"
+endef
+endif
 run-tcu:
 	# native TFR — LUT/Wallace multipliers (USE_DSP=0)
 	$(call tcu_tfr_suite)
@@ -743,6 +772,8 @@ run-tcu:
 	# DPI reference — integer
 	$(call tcu_int_pair,DPI,INT8,17,18)
 	$(call tcu_int_pair,DPI,INT4,19,20)
+	$(call tcu_h100_suite,TFR)
+	$(call tcu_h100_suite,DPI)
 
 # Same native-TFR formats as run-tcu, but with the multipliers mapped onto DSP48
 # (USE_DSP=1). USE_DSP is bit-identical to the LUT path by contract, so the same
@@ -750,6 +781,35 @@ run-tcu:
 run-tcu-dsp: USE_DSP := 1
 run-tcu-dsp:
 	$(call tcu_tfr_suite)
+	$(call tcu_h100_suite,TFR)
+
+# Tile buffers through H100 wgmma descriptors: the bench's own Makefile sets
+# the knob's shape. Three seeds of 80 phases each; the final clean keeps a
+# plain build from reusing the H100 objects.
+run-tcu-tbuf:
+ifeq ($(XLEN),64)
+	$(MAKE) -C tcu_tbuf clean
+	$(MAKE) -C tcu_tbuf
+	$(MAKE) -C tcu_tbuf run OPTS="--seed=1 --phases=80"
+	$(MAKE) -C tcu_tbuf run OPTS="--seed=2 --phases=80"
+	$(MAKE) -C tcu_tbuf run OPTS="--seed=3 --phases=80"
+	$(MAKE) -C tcu_tbuf clean
+else
+	@echo "run-tcu-tbuf: H100 wgmma descriptors are RV64 only; nothing to run at XLEN $(XLEN)"
+endif
+
+# The WGMMA CTA gate: directed same-cycle starts and random runs, knob off and,
+# at XLEN 64, with the H100 knob.
+run-tcu-lockstep:
+	$(MAKE) -C tcu_lockstep clean
+	$(MAKE) -C tcu_lockstep
+	$(MAKE) -C tcu_lockstep run OPTS="--seed=1"
+	$(MAKE) -C tcu_lockstep clean
+ifeq ($(XLEN),64)
+	$(MAKE) -C tcu_lockstep H100=1
+	$(MAKE) -C tcu_lockstep run H100=1 OPTS="--seed=2"
+	$(MAKE) -C tcu_lockstep clean
+endif
 
 clean:
 	$(MAKE) -C generic_queue clean
@@ -767,6 +827,8 @@ clean:
 	$(MAKE) -C kmu clean
 	$(MAKE) -C dxa_core clean
 	$(MAKE) -C tcu_unit clean
+	$(MAKE) -C tcu_tbuf clean
+	$(MAKE) -C tcu_lockstep clean
 	$(MAKE) -C cp_arbiter clean
 	$(MAKE) -C cp_engine clean
 	$(MAKE) -C cp_launch clean

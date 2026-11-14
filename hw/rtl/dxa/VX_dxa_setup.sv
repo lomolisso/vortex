@@ -292,8 +292,10 @@ module VX_dxa_setup import VX_gpu_pkg::*, VX_dxa_pkg::*; (
         ("DXA swizzle span smaller than the inner box: inner=%0d span=%0d", dec_inner, dec_span))
     `RUNTIME_ASSERT(!launch_accept || !a_align,
         ("DXA swizzle needs a 128-byte aligned destination: offset=0x%0h", dec_blk_off))
+`ifndef VX_CFG_TCU_H100_ENABLE
     `RUNTIME_ASSERT(!launch_accept || (dec_swz == 2'd0) || (DXA_LMEM_WORD_SIZE <= 128),
         ("DXA swizzle needs a local-memory word of at most 128 bytes: word=%0d", DXA_LMEM_WORD_SIZE))
+`endif
     wire [4:0] c_neg = {req_data.coords[4][31], req_data.coords[3][31], req_data.coords[2][31],
                         req_data.coords[1][31], req_data.coords[0][31]};
     wire [4:0] c_in_rank = {rank_ge5, rank_ge4, rank_ge3, rank_ge2, 1'b1};

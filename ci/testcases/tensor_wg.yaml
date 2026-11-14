@@ -237,3 +237,815 @@ tests:
 
   # Not warp-width swept: the tensor-core fragment layout is defined over a fixed
   # lane count, which the configs pin.
+
+# WGMMA as on the H100 (VX_CFG_TCU_H100_ENABLE, RV64 only): wgmma_h100 checks every
+# accumulator register of every thread bit for bit against the TFR model
+# (sw/common/tcu_fedp_ref.h) through the PTX fragment layout, with operands placed by
+# the descriptor golden (sw/common/tcu_desc_ref.h) or by DXA tensor loads.
+# 1 core, 4 warps (8 with -w 2), 32 threads, ISSUE_WIDTH 4, 256 KB of local memory.
+- id: wgmma_h100-sw128-f16f32
+  via: blackbox
+  drivers: [simx]
+  xlen: [64]
+  app: wgmma_h100
+  configs: &h100_cfg -DVX_CFG_ISSUE_WIDTH=4 -DVX_CFG_LMEM_LOG_SIZE=18 -DVX_CFG_EXT_DLMEM_ENABLE -DVX_CFG_EXT_A_ENABLE -DVX_CFG_EXT_ZACAS_ENABLE -DVX_CFG_EXT_MBAR_ENABLE -DVX_CFG_EXT_DXA_ENABLE -DVX_CFG_EXT_FPAMO_ENABLE -DVX_CFG_EXT_TCU_ENABLE -DVX_CFG_TCU_WGMMA_ENABLE -DVX_CFG_TCU_FP8_ENABLE -DVX_CFG_TCU_H100_ENABLE -DWGMMA_SS
+  shape: &h100_w4 {cores: 1, warps: 4, threads: 32}
+  touches: &h100_touches [hw/rtl/tcu, sim/simx/tcu, sw/kernel/include/vx_tensor.h, sw/kernel/include/vx_cuda.h,
+            sw/common/tcu_desc_ref.h, sw/common/tcu_fedp_ref.h, sw/common/dxa_ref.h, hw/dpi/dpi_tcu.cpp,
+            hw/dpi/dpi_tcu.vh, hw/rtl/VX_gpu_pkg.sv, hw/rtl/VX_define.vh, VX_config.toml, sim/simx/types.h,
+            sim/simx/decode.cpp, hw/rtl/core/VX_execute.sv, hw/rtl/core/VX_core.sv, hw/rtl/core/VX_commit.sv,
+            hw/rtl/dxa, sim/simx/dxa, tests/regression/wgmma_h100, sim/simx/mem/local_mem,
+            sim/simx/core, sim/simx/cta_dispatcher, hw/rtl/core/VX_mem_unit.sv, hw/rtl/mem,
+            hw/rtl/core/VX_cta_dispatch.sv, hw/rtl/core/VX_scheduler.sv]
+  args: "-l 128 -t f16f32 -n 64 -c 2 -r 2"
+- id: wgmma_h100-sw64-f16f32
+  via: blackbox
+  drivers: [simx]
+  xlen: [64]
+  app: wgmma_h100
+  configs: *h100_cfg
+  shape: *h100_w4
+  touches: *h100_touches
+  args: "-l 64 -t f16f32 -n 64 -c 2 -r 2"
+- id: wgmma_h100-sw32-bf16f32
+  via: blackbox
+  drivers: [simx]
+  xlen: [64]
+  app: wgmma_h100
+  configs: *h100_cfg
+  shape: *h100_w4
+  touches: *h100_touches
+  args: "-l 32 -t bf16f32 -n 32 -c 2 -r 2"
+- id: wgmma_h100-none-f16f32
+  via: blackbox
+  drivers: [simx]
+  xlen: [64]
+  app: wgmma_h100
+  configs: *h100_cfg
+  shape: *h100_w4
+  touches: *h100_touches
+  args: "-l none -t f16f32 -n 64 -c 2 -r 2"
+- id: wgmma_h100-mn-f16f16-n128
+  via: blackbox
+  drivers: [simx]
+  xlen: [64]
+  app: wgmma_h100
+  configs: *h100_cfg
+  shape: *h100_w4
+  touches: *h100_touches
+  args: "-l 128 -a mn -t f16f16 -n 128 -c 2 -r 2"
+- id: wgmma_h100-e4m3f32
+  via: blackbox
+  drivers: [simx]
+  xlen: [64]
+  app: wgmma_h100
+  configs: *h100_cfg
+  shape: *h100_w4
+  touches: *h100_touches
+  args: "-l 128 -t e4m3f32 -n 64 -c 2 -r 2"
+- id: wgmma_h100-hi64k-sw64
+  via: blackbox
+  drivers: [simx]
+  xlen: [64]
+  app: wgmma_h100
+  configs: *h100_cfg
+  shape: *h100_w4
+  touches: *h100_touches
+  args: "-l 64 -o -a mn -b mn -t f16f32 -n 64 -c 2 -r 2"
+- id: wgmma_h100-w2
+  via: blackbox
+  drivers: [simx]
+  xlen: [64]
+  app: wgmma_h100
+  configs: *h100_cfg
+  shape: {cores: 1, warps: 8, threads: 32}
+  touches: *h100_touches
+  args: "-l 128 -w 2 -t f16f32 -n 32 -c 2 -r 2"
+- id: wgmma_h100-tma-mn-f16f16
+  via: blackbox
+  drivers: [simx]
+  xlen: [64]
+  app: wgmma_h100
+  configs: *h100_cfg
+  shape: *h100_w4
+  touches: *h100_touches
+  args: "-g tma -l 128 -a mn -t f16f16 -n 128 -c 4 -r 2"
+- id: wgmma_h100-chain-z
+  via: blackbox
+  drivers: [simx]
+  xlen: [64]
+  app: wgmma_h100
+  configs: *h100_cfg
+  shape: *h100_w4
+  touches: *h100_touches
+  args: "-l 128 -t f16f32 -n 16 -c 8 -z -r 2"
+- id: wgmma_h100-pad-mn
+  via: blackbox
+  drivers: [simx]
+  xlen: [64]
+  app: wgmma_h100
+  configs: *h100_cfg
+  shape: *h100_w4
+  touches: *h100_touches
+  args: "-l 32 -a mn -b mn -L 256 -S 128 -t f16f16 -n 64 -c 2 -r 2"
+# Nightly: every swizzle mode x A/B major for f16 -> f32 and f16 -> f16, every mode
+# for bf16, e4m3 and e5m2 (K-major only, as on the H100), and TMA fills.
+- id: wgmma_h100-n-128-kk-f16f32
+  via: blackbox
+  drivers: [simx]
+  xlen: [64]
+  tier: nightly
+  app: wgmma_h100
+  configs: *h100_cfg
+  shape: *h100_w4
+  touches: *h100_touches
+  args: "-l 128 -a k -b k -t f16f32 -n 64 -c 2 -r 2"
+- id: wgmma_h100-n-128-kmn-f16f32
+  via: blackbox
+  drivers: [simx]
+  xlen: [64]
+  tier: nightly
+  app: wgmma_h100
+  configs: *h100_cfg
+  shape: *h100_w4
+  touches: *h100_touches
+  args: "-l 128 -a k -b mn -t f16f32 -n 64 -c 2 -r 2"
+- id: wgmma_h100-n-128-mnk-f16f32
+  via: blackbox
+  drivers: [simx]
+  xlen: [64]
+  tier: nightly
+  app: wgmma_h100
+  configs: *h100_cfg
+  shape: *h100_w4
+  touches: *h100_touches
+  args: "-l 128 -a mn -b k -t f16f32 -n 64 -c 2 -r 2"
+- id: wgmma_h100-n-128-mnmn-f16f32
+  via: blackbox
+  drivers: [simx]
+  xlen: [64]
+  tier: nightly
+  app: wgmma_h100
+  configs: *h100_cfg
+  shape: *h100_w4
+  touches: *h100_touches
+  args: "-l 128 -a mn -b mn -t f16f32 -n 64 -c 2 -r 2"
+- id: wgmma_h100-n-128-mnk-f16f16
+  via: blackbox
+  drivers: [simx]
+  xlen: [64]
+  tier: nightly
+  app: wgmma_h100
+  configs: *h100_cfg
+  shape: *h100_w4
+  touches: *h100_touches
+  args: "-l 128 -a mn -b k -t f16f16 -n 128 -c 2 -r 2"
+- id: wgmma_h100-n-128-kmn-f16f16
+  via: blackbox
+  drivers: [simx]
+  xlen: [64]
+  tier: nightly
+  app: wgmma_h100
+  configs: *h100_cfg
+  shape: *h100_w4
+  touches: *h100_touches
+  args: "-l 128 -a k -b mn -t f16f16 -n 128 -c 2 -r 2"
+- id: wgmma_h100-n-128-bf16f32
+  via: blackbox
+  drivers: [simx]
+  xlen: [64]
+  tier: nightly
+  app: wgmma_h100
+  configs: *h100_cfg
+  shape: *h100_w4
+  touches: *h100_touches
+  args: "-l 128 -a mn -t bf16f32 -n 32 -c 2 -r 2"
+- id: wgmma_h100-n-128-e4m3f32
+  via: blackbox
+  drivers: [simx]
+  xlen: [64]
+  tier: nightly
+  app: wgmma_h100
+  configs: *h100_cfg
+  shape: *h100_w4
+  touches: *h100_touches
+  args: "-l 128 -t e4m3f32 -n 64 -c 2 -r 2"
+- id: wgmma_h100-n-128-e5m2f32
+  via: blackbox
+  drivers: [simx]
+  xlen: [64]
+  tier: nightly
+  app: wgmma_h100
+  configs: *h100_cfg
+  shape: *h100_w4
+  touches: *h100_touches
+  args: "-l 128 -t e5m2f32 -n 16 -c 2 -r 2"
+- id: wgmma_h100-n-128-tma
+  via: blackbox
+  drivers: [simx]
+  xlen: [64]
+  tier: nightly
+  app: wgmma_h100
+  configs: *h100_cfg
+  shape: *h100_w4
+  touches: *h100_touches
+  args: "-g tma -l 128 -a mn -b mn -t f16f32 -n 64 -c 2 -r 2"
+- id: wgmma_h100-n-64-kk-f16f32
+  via: blackbox
+  drivers: [simx]
+  xlen: [64]
+  tier: nightly
+  app: wgmma_h100
+  configs: *h100_cfg
+  shape: *h100_w4
+  touches: *h100_touches
+  args: "-l 64 -a k -b k -t f16f32 -n 64 -c 2 -r 2"
+- id: wgmma_h100-n-64-kmn-f16f32
+  via: blackbox
+  drivers: [simx]
+  xlen: [64]
+  tier: nightly
+  app: wgmma_h100
+  configs: *h100_cfg
+  shape: *h100_w4
+  touches: *h100_touches
+  args: "-l 64 -a k -b mn -t f16f32 -n 64 -c 2 -r 2"
+- id: wgmma_h100-n-64-mnk-f16f32
+  via: blackbox
+  drivers: [simx]
+  xlen: [64]
+  tier: nightly
+  app: wgmma_h100
+  configs: *h100_cfg
+  shape: *h100_w4
+  touches: *h100_touches
+  args: "-l 64 -a mn -b k -t f16f32 -n 64 -c 2 -r 2"
+- id: wgmma_h100-n-64-mnmn-f16f32
+  via: blackbox
+  drivers: [simx]
+  xlen: [64]
+  tier: nightly
+  app: wgmma_h100
+  configs: *h100_cfg
+  shape: *h100_w4
+  touches: *h100_touches
+  args: "-l 64 -a mn -b mn -t f16f32 -n 64 -c 2 -r 2"
+- id: wgmma_h100-n-64-mnk-f16f16
+  via: blackbox
+  drivers: [simx]
+  xlen: [64]
+  tier: nightly
+  app: wgmma_h100
+  configs: *h100_cfg
+  shape: *h100_w4
+  touches: *h100_touches
+  args: "-l 64 -a mn -b k -t f16f16 -n 128 -c 2 -r 2"
+- id: wgmma_h100-n-64-kmn-f16f16
+  via: blackbox
+  drivers: [simx]
+  xlen: [64]
+  tier: nightly
+  app: wgmma_h100
+  configs: *h100_cfg
+  shape: *h100_w4
+  touches: *h100_touches
+  args: "-l 64 -a k -b mn -t f16f16 -n 128 -c 2 -r 2"
+- id: wgmma_h100-n-64-bf16f32
+  via: blackbox
+  drivers: [simx]
+  xlen: [64]
+  tier: nightly
+  app: wgmma_h100
+  configs: *h100_cfg
+  shape: *h100_w4
+  touches: *h100_touches
+  args: "-l 64 -a mn -t bf16f32 -n 32 -c 2 -r 2"
+- id: wgmma_h100-n-64-e4m3f32
+  via: blackbox
+  drivers: [simx]
+  xlen: [64]
+  tier: nightly
+  app: wgmma_h100
+  configs: *h100_cfg
+  shape: *h100_w4
+  touches: *h100_touches
+  args: "-l 64 -t e4m3f32 -n 64 -c 2 -r 2"
+- id: wgmma_h100-n-64-e5m2f32
+  via: blackbox
+  drivers: [simx]
+  xlen: [64]
+  tier: nightly
+  app: wgmma_h100
+  configs: *h100_cfg
+  shape: *h100_w4
+  touches: *h100_touches
+  args: "-l 64 -t e5m2f32 -n 16 -c 2 -r 2"
+- id: wgmma_h100-n-64-tma
+  via: blackbox
+  drivers: [simx]
+  xlen: [64]
+  tier: nightly
+  app: wgmma_h100
+  configs: *h100_cfg
+  shape: *h100_w4
+  touches: *h100_touches
+  args: "-g tma -l 64 -a mn -b mn -t f16f32 -n 64 -c 2 -r 2"
+- id: wgmma_h100-n-32-kk-f16f32
+  via: blackbox
+  drivers: [simx]
+  xlen: [64]
+  tier: nightly
+  app: wgmma_h100
+  configs: *h100_cfg
+  shape: *h100_w4
+  touches: *h100_touches
+  args: "-l 32 -a k -b k -t f16f32 -n 64 -c 2 -r 2"
+- id: wgmma_h100-n-32-kmn-f16f32
+  via: blackbox
+  drivers: [simx]
+  xlen: [64]
+  tier: nightly
+  app: wgmma_h100
+  configs: *h100_cfg
+  shape: *h100_w4
+  touches: *h100_touches
+  args: "-l 32 -a k -b mn -t f16f32 -n 64 -c 2 -r 2"
+- id: wgmma_h100-n-32-mnk-f16f32
+  via: blackbox
+  drivers: [simx]
+  xlen: [64]
+  tier: nightly
+  app: wgmma_h100
+  configs: *h100_cfg
+  shape: *h100_w4
+  touches: *h100_touches
+  args: "-l 32 -a mn -b k -t f16f32 -n 64 -c 2 -r 2"
+- id: wgmma_h100-n-32-mnmn-f16f32
+  via: blackbox
+  drivers: [simx]
+  xlen: [64]
+  tier: nightly
+  app: wgmma_h100
+  configs: *h100_cfg
+  shape: *h100_w4
+  touches: *h100_touches
+  args: "-l 32 -a mn -b mn -t f16f32 -n 64 -c 2 -r 2"
+- id: wgmma_h100-n-32-mnk-f16f16
+  via: blackbox
+  drivers: [simx]
+  xlen: [64]
+  tier: nightly
+  app: wgmma_h100
+  configs: *h100_cfg
+  shape: *h100_w4
+  touches: *h100_touches
+  args: "-l 32 -a mn -b k -t f16f16 -n 128 -c 2 -r 2"
+- id: wgmma_h100-n-32-kmn-f16f16
+  via: blackbox
+  drivers: [simx]
+  xlen: [64]
+  tier: nightly
+  app: wgmma_h100
+  configs: *h100_cfg
+  shape: *h100_w4
+  touches: *h100_touches
+  args: "-l 32 -a k -b mn -t f16f16 -n 128 -c 2 -r 2"
+- id: wgmma_h100-n-32-bf16f32
+  via: blackbox
+  drivers: [simx]
+  xlen: [64]
+  tier: nightly
+  app: wgmma_h100
+  configs: *h100_cfg
+  shape: *h100_w4
+  touches: *h100_touches
+  args: "-l 32 -a mn -t bf16f32 -n 32 -c 2 -r 2"
+- id: wgmma_h100-n-32-e4m3f32
+  via: blackbox
+  drivers: [simx]
+  xlen: [64]
+  tier: nightly
+  app: wgmma_h100
+  configs: *h100_cfg
+  shape: *h100_w4
+  touches: *h100_touches
+  args: "-l 32 -t e4m3f32 -n 64 -c 2 -r 2"
+- id: wgmma_h100-n-32-e5m2f32
+  via: blackbox
+  drivers: [simx]
+  xlen: [64]
+  tier: nightly
+  app: wgmma_h100
+  configs: *h100_cfg
+  shape: *h100_w4
+  touches: *h100_touches
+  args: "-l 32 -t e5m2f32 -n 16 -c 2 -r 2"
+- id: wgmma_h100-n-32-tma
+  via: blackbox
+  drivers: [simx]
+  xlen: [64]
+  tier: nightly
+  app: wgmma_h100
+  configs: *h100_cfg
+  shape: *h100_w4
+  touches: *h100_touches
+  args: "-g tma -l 32 -a mn -b mn -t f16f32 -n 64 -c 2 -r 2"
+- id: wgmma_h100-n-none-kk-f16f32
+  via: blackbox
+  drivers: [simx]
+  xlen: [64]
+  tier: nightly
+  app: wgmma_h100
+  configs: *h100_cfg
+  shape: *h100_w4
+  touches: *h100_touches
+  args: "-l none -a k -b k -t f16f32 -n 64 -c 2 -r 2"
+- id: wgmma_h100-n-none-kmn-f16f32
+  via: blackbox
+  drivers: [simx]
+  xlen: [64]
+  tier: nightly
+  app: wgmma_h100
+  configs: *h100_cfg
+  shape: *h100_w4
+  touches: *h100_touches
+  args: "-l none -a k -b mn -t f16f32 -n 64 -c 2 -r 2"
+- id: wgmma_h100-n-none-mnk-f16f32
+  via: blackbox
+  drivers: [simx]
+  xlen: [64]
+  tier: nightly
+  app: wgmma_h100
+  configs: *h100_cfg
+  shape: *h100_w4
+  touches: *h100_touches
+  args: "-l none -a mn -b k -t f16f32 -n 64 -c 2 -r 2"
+- id: wgmma_h100-n-none-mnmn-f16f32
+  via: blackbox
+  drivers: [simx]
+  xlen: [64]
+  tier: nightly
+  app: wgmma_h100
+  configs: *h100_cfg
+  shape: *h100_w4
+  touches: *h100_touches
+  args: "-l none -a mn -b mn -t f16f32 -n 64 -c 2 -r 2"
+- id: wgmma_h100-n-none-mnk-f16f16
+  via: blackbox
+  drivers: [simx]
+  xlen: [64]
+  tier: nightly
+  app: wgmma_h100
+  configs: *h100_cfg
+  shape: *h100_w4
+  touches: *h100_touches
+  args: "-l none -a mn -b k -t f16f16 -n 128 -c 2 -r 2"
+- id: wgmma_h100-n-none-kmn-f16f16
+  via: blackbox
+  drivers: [simx]
+  xlen: [64]
+  tier: nightly
+  app: wgmma_h100
+  configs: *h100_cfg
+  shape: *h100_w4
+  touches: *h100_touches
+  args: "-l none -a k -b mn -t f16f16 -n 128 -c 2 -r 2"
+- id: wgmma_h100-n-none-bf16f32
+  via: blackbox
+  drivers: [simx]
+  xlen: [64]
+  tier: nightly
+  app: wgmma_h100
+  configs: *h100_cfg
+  shape: *h100_w4
+  touches: *h100_touches
+  args: "-l none -a mn -t bf16f32 -n 32 -c 2 -r 2"
+- id: wgmma_h100-n-none-e4m3f32
+  via: blackbox
+  drivers: [simx]
+  xlen: [64]
+  tier: nightly
+  app: wgmma_h100
+  configs: *h100_cfg
+  shape: *h100_w4
+  touches: *h100_touches
+  args: "-l none -t e4m3f32 -n 64 -c 2 -r 2"
+- id: wgmma_h100-n-none-e5m2f32
+  via: blackbox
+  drivers: [simx]
+  xlen: [64]
+  tier: nightly
+  app: wgmma_h100
+  configs: *h100_cfg
+  shape: *h100_w4
+  touches: *h100_touches
+  args: "-l none -t e5m2f32 -n 16 -c 2 -r 2"
+- id: wgmma_h100-n-none-tma
+  via: blackbox
+  drivers: [simx]
+  xlen: [64]
+  tier: nightly
+  app: wgmma_h100
+  configs: *h100_cfg
+  shape: *h100_w4
+  touches: *h100_touches
+  args: "-g tma -l none -a mn -b mn -t f16f32 -n 64 -c 2 -r 2"
+- id: wgmma_h100-n-tma-e4m3-w2
+  via: blackbox
+  drivers: [simx]
+  xlen: [64]
+  tier: nightly
+  app: wgmma_h100
+  configs: *h100_cfg
+  shape: {cores: 1, warps: 8, threads: 32}
+  touches: *h100_touches
+  args: "-g tma -l 128 -w 2 -t e4m3f32 -n 64 -c 4 -r 2"
+# rtlsim: the end-to-end TMA fill and operands beyond the first 64 KB.
+- id: wgmma_h100-rtl-tma-mn-f16f16
+  via: blackbox
+  drivers: [rtlsim]
+  xlen: [64]
+  app: wgmma_h100
+  configs: *h100_cfg
+  shape: *h100_w4
+  touches: *h100_touches
+  args: "-g tma -l 128 -a mn -t f16f16 -n 128 -c 2 -r 1"
+- id: wgmma_h100-rtl-hi64k-sw64
+  via: blackbox
+  drivers: [rtlsim]
+  xlen: [64]
+  app: wgmma_h100
+  configs: *h100_cfg
+  shape: *h100_w4
+  touches: *h100_touches
+  args: "-l 64 -o -a mn -b mn -t f16f32 -n 64 -c 2 -r 1"
+# SimX <-> rtlsim cycle parity of the H100 paths: software fill, an unrolled chain of 6 wgmmas
+# with no accumulator spills, so the tensor path dominates the fixed non-TCU load/store gap.
+- id: model_parity-wgmma-h100-sw128-f16f32
+  check: model_parity
+  via: blackbox
+  xlen: [64]
+  app: wgmma_h100
+  configs: *h100_cfg
+  shape: *h100_w4
+  touches: *h100_touches
+  args: "-l 128 -t f16f32 -n 64 -c 6 -r 1"
+- id: model_parity-wgmma-h100-mn-f16f16
+  check: model_parity
+  via: blackbox
+  xlen: [64]
+  app: wgmma_h100
+  configs: *h100_cfg
+  shape: *h100_w4
+  touches: *h100_touches
+  args: "-l 128 -a mn -t f16f16 -n 128 -c 6 -r 1"
+- id: model_parity-wgmma-h100-e4m3
+  check: model_parity
+  via: blackbox
+  xlen: [64]
+  app: wgmma_h100
+  configs: *h100_cfg
+  shape: *h100_w4
+  touches: *h100_touches
+  args: "-l 128 -t e4m3f32 -n 64 -c 6 -r 1"
+- id: model_parity-wgmma-h100-hi64k-sw64
+  check: model_parity
+  via: blackbox
+  xlen: [64]
+  app: wgmma_h100
+  configs: *h100_cfg
+  shape: *h100_w4
+  touches: *h100_touches
+  args: "-l 64 -o -a mn -b mn -t f16f32 -n 64 -c 6 -r 1"
+# Review fix loop: lbo 0, distinct A per warpgroup, resident multi-block (nonzero slot base),
+# clusters, the warpgroup-wide wait_group ring, 4 and 6 warpgroups per block, more RTL legs.
+- id: wgmma_h100-lbo0-e4m3
+  via: blackbox
+  drivers: [simx]
+  xlen: [64]
+  app: wgmma_h100
+  configs: *h100_cfg
+  shape: *h100_w4
+  touches: *h100_touches
+  args: "-K -l 128 -t e4m3f32 -n 64 -c 2 -r 2"
+- id: wgmma_h100-w2-distinct-a
+  via: blackbox
+  drivers: [simx]
+  xlen: [64]
+  app: wgmma_h100
+  configs: *h100_cfg
+  shape: &h100_w8 {cores: 1, warps: 8, threads: 32}
+  touches: *h100_touches
+  args: "-l 128 -w 2 -A -t e4m3f32 -n 64 -c 2 -r 2"
+# Two and four blocks resident on one core (4-warp blocks, at most 128 KB each):
+# each block has its own operands and outputs; a block must run at a nonzero
+# local-memory slot.
+- id: wgmma_h100-m2
+  via: blackbox
+  drivers: [simx]
+  xlen: [64]
+  app: wgmma_h100
+  configs: *h100_cfg
+  shape: *h100_w8
+  touches: *h100_touches
+  args: "-m 2 -o -l 128 -t f16f32 -n 64 -c 2 -r 2"
+- id: wgmma_h100-m2-tma-mn
+  via: blackbox
+  drivers: [simx]
+  xlen: [64]
+  app: wgmma_h100
+  configs: *h100_cfg
+  shape: *h100_w8
+  touches: *h100_touches
+  args: "-m 2 -g tma -l 128 -a mn -t f16f16 -n 128 -c 2 -r 2"
+# Three blocks with operands above 64 KB (73 KB each) and four with small ones,
+# all resident at once on a 1-core, 16-warp device (one wave). They need S's and
+# R1's CTA-gate fix (2026-11-12). The app refuses an -m that cannot be resident.
+- id: wgmma_h100-m3-hi64k
+  via: blackbox
+  drivers: [simx]
+  xlen: [64]
+  app: wgmma_h100
+  configs: *h100_cfg
+  shape: &h100_w16 {cores: 1, warps: 16, threads: 32}
+  touches: *h100_touches
+  args: "-m 3 -o -l 64 -t bf16f32 -n 32 -c 2 -r 2"
+- id: wgmma_h100-m4
+  via: blackbox
+  drivers: [simx]
+  xlen: [64]
+  app: wgmma_h100
+  configs: *h100_cfg
+  shape: *h100_w16
+  touches: *h100_touches
+  args: "-m 4 -l 64 -t bf16f32 -n 32 -c 2 -r 2"
+# Two clusters of 2 on 2 cores, 2 blocks per core.
+- id: wgmma_h100-cluster2
+  via: blackbox
+  drivers: [simx]
+  xlen: [64]
+  app: wgmma_h100
+  configs: *h100_cfg
+  shape: {cores: 2, warps: 8, threads: 32, l2cache: true}
+  touches: *h100_touches
+  args: "-m 4 -C -l 64 -t e4m3f32 -n 64 -c 2 -r 2"
+# wait_group covers the whole warpgroup: a 2-stage TMA ring where only thread 0
+# frees a stage after wait_group 0 and warps 1-3 issue late.
+- id: wgmma_h100-ring
+  via: blackbox
+  drivers: [simx]
+  xlen: [64]
+  app: wgmma_h100
+  configs: *h100_cfg
+  shape: *h100_w8
+  touches: *h100_touches
+  args: "-R -k 20000 -l 128 -t f16f32 -n 64 -c 6 -r 2"
+# rtlsim legs: an 8-warp model for m2-tma-mn, w2-distinct-a and ring, a 16-warp model
+# for m4 (needs R1's CTA-gate fix), the 4-warp model of the existing rtl cases
+# for the last two.
+- id: wgmma_h100-rtl-m2-tma-mn
+  via: blackbox
+  drivers: [rtlsim]
+  xlen: [64]
+  app: wgmma_h100
+  configs: *h100_cfg
+  shape: *h100_w8
+  touches: *h100_touches
+  args: "-m 2 -g tma -l 128 -a mn -t f16f16 -n 128 -c 2 -r 1"
+- id: wgmma_h100-rtl-m4
+  via: blackbox
+  drivers: [rtlsim]
+  xlen: [64]
+  app: wgmma_h100
+  configs: *h100_cfg
+  shape: *h100_w16
+  touches: *h100_touches
+  args: "-m 4 -l 64 -t bf16f32 -n 32 -c 2 -r 1"
+- id: wgmma_h100-rtl-w2-distinct-a
+  via: blackbox
+  drivers: [rtlsim]
+  xlen: [64]
+  app: wgmma_h100
+  configs: *h100_cfg
+  shape: *h100_w8
+  touches: *h100_touches
+  args: "-l 128 -w 2 -A -t e4m3f32 -n 64 -c 2 -r 1"
+- id: wgmma_h100-rtl-ring
+  via: blackbox
+  drivers: [rtlsim]
+  xlen: [64]
+  app: wgmma_h100
+  configs: *h100_cfg
+  shape: *h100_w8
+  touches: *h100_touches
+  args: "-R -k 20000 -l 128 -t f16f32 -n 64 -c 6 -r 1"
+- id: wgmma_h100-rtl-sw32-bf16f32
+  via: blackbox
+  drivers: [rtlsim]
+  xlen: [64]
+  app: wgmma_h100
+  configs: *h100_cfg
+  shape: *h100_w4
+  touches: *h100_touches
+  args: "-l 32 -t bf16f32 -n 32 -c 2 -r 1"
+- id: wgmma_h100-rtl-e5m2f32
+  via: blackbox
+  drivers: [rtlsim]
+  xlen: [64]
+  app: wgmma_h100
+  configs: *h100_cfg
+  shape: *h100_w4
+  touches: *h100_touches
+  args: "-l 128 -t e5m2f32 -n 64 -c 2 -r 1"
+# Several warpgroups of one block sharing the tensor unit, as the ports run:
+# 4 (DAK) with a B each, and 6 (DeepGEMM) with an A and a B each.
+- id: wgmma_h100-w4
+  via: blackbox
+  drivers: [simx]
+  xlen: [64]
+  app: wgmma_h100
+  configs: *h100_cfg
+  shape: *h100_w16
+  touches: *h100_touches
+  args: "-l 128 -w 4 -t f16f32 -n 64 -c 2 -r 2"
+- id: wgmma_h100-w6-distinct-a
+  via: blackbox
+  drivers: [simx]
+  xlen: [64]
+  app: wgmma_h100
+  configs: *h100_cfg
+  shape: {cores: 1, warps: 32, threads: 32}
+  touches: *h100_touches
+  args: "-l 128 -w 6 -A -t e4m3f32 -n 64 -c 2 -r 2"
+- id: wgmma_h100-rtl-w4
+  via: blackbox
+  drivers: [rtlsim]
+  xlen: [64]
+  app: wgmma_h100
+  configs: *h100_cfg
+  shape: *h100_w16
+  touches: *h100_touches
+  args: "-l 128 -w 4 -t f16f32 -n 64 -c 2 -r 1"
+# Illegal knob combinations stop the build with the RTL's and SimX's texts (SimX processor object and
+# the RTL lint, as dlmem.yaml's reject cases; the kernel library #errors with the same
+# texts). The run script is dlmem.yaml's `reject_run`, copied (anchors do not cross files), compiling
+# the SimX TCU unit, where the SimX rules live, instead of the processor object; the
+# 32-thread rule is an RTL STATIC_ASSERT that fires at simulation start, so that case
+# checks the SimX build only (SIDES).
+- id: reject-h100-rv32
+  via: script
+  driver: simx
+  xlen: [32]
+  configs: -DVX_CFG_ISSUE_WIDTH=4 -DVX_CFG_LMEM_LOG_SIZE=18 -DVX_CFG_EXT_DLMEM_ENABLE -DVX_CFG_EXT_A_ENABLE -DVX_CFG_EXT_ZACAS_ENABLE -DVX_CFG_EXT_MBAR_ENABLE -DVX_CFG_EXT_DXA_ENABLE -DVX_CFG_EXT_TCU_ENABLE -DVX_CFG_TCU_WGMMA_ENABLE -DVX_CFG_TCU_FP8_ENABLE -DVX_CFG_TCU_H100_ENABLE -DVX_CFG_NUM_THREADS=32
+  env: {EXPECT: "H100 WGMMA requires XLEN 64"}
+  touches: *h100_touches
+  run: &h100_reject_run |
+    set -u
+    read -r vh vl xl <<< "$(printf 'include config.mk\nall:\n\t@echo $(VORTEX_HOME) $(VERILATOR_PATH) $(XLEN)\n' | make -s -f -)"
+    tmp=$(mktemp -d)
+    make -C sim/simx DESTDIR="$tmp" "$tmp/obj/tcu/tcu_unit.o" > "$tmp/simx.log" 2>&1; simx_rc=$?
+    r=$vh/hw/rtl
+    "$vl/bin/verilator" --lint-only -Wno-lint -Wno-style -Wno-REDEFMACRO \
+      -DVX_CFG_XLEN="$xl" -DVX_CFG_XLEN_"$xl" -DSIMULATION ${CONFIGS:-} \
+      -Isw -Ihw -I"$r" -I"$r/libs" -I"$r/interfaces" -I"$r/core" -I"$r/mem" \
+      -I"$r/vm" -I"$r/cache" -I"$r/fpu" -I"$r/dlmem" \
+      "$r/VX_gpu_pkg.sv" "$r/fpu/VX_fpu_pkg.sv" "$r/dlmem/VX_dlmem_pkg.sv" \
+      "$r/VX_trace_pkg.sv" "$r/Vortex.sv" \
+      --top-module Vortex > "$tmp/rtl.log" 2>&1; rtl_rc=$?
+    fail=0
+    for side in ${SIDES:-simx rtl}; do
+      rc=simx_rc; [ $side = rtl ] && rc=rtl_rc
+      if [ "${!rc}" -eq 0 ]; then
+        echo "FAIL: the $side build accepted CONFIGS=${CONFIGS:-}"; fail=1
+      elif ! grep -qF "$EXPECT" "$tmp/$side.log"; then
+        echo "FAIL: the $side build failed without '$EXPECT':"; tail -n 20 "$tmp/$side.log"; fail=1
+      else
+        echo "OK: the $side build rejects it: $(grep -F -m1 "$EXPECT" "$tmp/$side.log")"
+      fi
+    done
+    rm -rf "$tmp"
+    exit $fail
+- id: reject-h100-sparse
+  via: script
+  driver: simx
+  xlen: [64]
+  configs: -DVX_CFG_ISSUE_WIDTH=4 -DVX_CFG_LMEM_LOG_SIZE=18 -DVX_CFG_EXT_DLMEM_ENABLE -DVX_CFG_EXT_A_ENABLE -DVX_CFG_EXT_ZACAS_ENABLE -DVX_CFG_EXT_MBAR_ENABLE -DVX_CFG_EXT_DXA_ENABLE -DVX_CFG_EXT_FPAMO_ENABLE -DVX_CFG_EXT_TCU_ENABLE -DVX_CFG_TCU_WGMMA_ENABLE -DVX_CFG_TCU_FP8_ENABLE -DVX_CFG_TCU_H100_ENABLE -DVX_CFG_TCU_SPARSE_ENABLE -DVX_CFG_NUM_THREADS=32
+  env: {EXPECT: "H100 WGMMA does not support sparse WGMMA"}
+  touches: *h100_touches
+  run: *h100_reject_run
+- id: reject-h100-bhf
+  via: script
+  driver: simx
+  xlen: [64]
+  configs: -DVX_CFG_ISSUE_WIDTH=4 -DVX_CFG_LMEM_LOG_SIZE=18 -DVX_CFG_EXT_DLMEM_ENABLE -DVX_CFG_EXT_A_ENABLE -DVX_CFG_EXT_ZACAS_ENABLE -DVX_CFG_EXT_MBAR_ENABLE -DVX_CFG_EXT_DXA_ENABLE -DVX_CFG_EXT_FPAMO_ENABLE -DVX_CFG_EXT_TCU_ENABLE -DVX_CFG_TCU_WGMMA_ENABLE -DVX_CFG_TCU_FP8_ENABLE -DVX_CFG_TCU_H100_ENABLE -DVX_CFG_TCU_TYPE=BHF -DVX_CFG_NUM_THREADS=32
+  env: {EXPECT: "H100 WGMMA needs the TFR or DPI backend"}
+  touches: *h100_touches
+  run: *h100_reject_run
+- id: reject-h100-8threads
+  via: script
+  driver: simx
+  xlen: [64]
+  configs: -DVX_CFG_ISSUE_WIDTH=4 -DVX_CFG_LMEM_LOG_SIZE=18 -DVX_CFG_EXT_DLMEM_ENABLE -DVX_CFG_EXT_A_ENABLE -DVX_CFG_EXT_ZACAS_ENABLE -DVX_CFG_EXT_MBAR_ENABLE -DVX_CFG_EXT_DXA_ENABLE -DVX_CFG_EXT_FPAMO_ENABLE -DVX_CFG_EXT_TCU_ENABLE -DVX_CFG_TCU_WGMMA_ENABLE -DVX_CFG_TCU_FP8_ENABLE -DVX_CFG_TCU_H100_ENABLE -DVX_CFG_NUM_THREADS=8
+  env: {EXPECT: "H100 WGMMA requires 32 threads", SIDES: simx}
+  touches: *h100_touches
+  run: *h100_reject_run

@@ -436,6 +436,21 @@ private:
 
 	bool dxa_gate_admit(uint32_t input, const MemReq& req) const {
 #ifdef DXA_MBAR_ENABLE
+#ifdef VX_CFG_TCU_H100_ENABLE
+		// A tensor-unit tile-buffer read takes the DMA port, as in the RTL: the
+		// bank row is read in the cycle the request arrives, ahead of the LSU at
+		// every bank, and the data is back in the next cycle.
+		if (input + 1 == config_.dxa_row_port && !req.is_write()) {
+			if (!this->tcu_wait()) {
+				const_cast<Impl*>(this)->tcu_read(input, req);
+			}
+			return false;
+		}
+#elif defined(VX_CFG_EXT_DLMEM_ENABLE) && !defined(VX_CFG_EXT_FPAMO_ENABLE)
+#line 349
+#else
+#line 438
+#endif
 		// The row port is a DMA port; a unit without one leaves it at 0. A
 		// peer's word takes the DMA port, not the crossbar.
 		if (input >= config_.dma_begin && input == config_.dxa_row_port) {
@@ -469,6 +484,15 @@ private:
 	// The RTL's DMA port takes one request a cycle, a peer's DXA word only when
 	// no other DMA input presents one: the arbiter's last, priority input.
 	bool dxa_row_wait() const {
+#ifdef VX_CFG_TCU_H100_ENABLE
+		// A tensor-unit read outranks a peer's word at the DMA port.
+		if (!dxa_inputs_->at(config_.dxa_row_port - 1).empty())
+			return true;
+#elif defined(VX_CFG_EXT_DLMEM_ENABLE) && !defined(VX_CFG_EXT_FPAMO_ENABLE)
+#line 382
+#else
+#line 471
+#endif
 		if (this->bulk_port_next())
 			return true;
 		for (uint32_t i = config_.dma_begin; i < config_.dxa_row_port; ++i) {
@@ -481,6 +505,55 @@ private:
 
 	std::vector<SimChannel<MemReq>>* dxa_inputs_ = nullptr;
 	uint32_t row_words_ = 0;    // a peer's words the DMA port took and has not yet committed
+#ifdef VX_CFG_TCU_H100_ENABLE
+
+	// The banks a tensor-unit read holds this cycle (the whole row).
+	uint64_t tcu_banks_ = 0;
+	uint64_t tcu_cycle_ = ~uint64_t(0);
+
+	// The RTL's DMA port arbitrates by priority, the DXA's writes first, then
+	// the tensor unit, then a peer's word: a tile-buffer read waits while the
+	// port serves a DXA access this cycle, a DXA input presents one, or an
+	// atomic holds a bank it reads.
+	bool tcu_wait() const {
+		const uint64_t now = SimPlatform::instance().cycles();
+		if (!bulk_port_.empty() && bulk_port_.front().at <= now)
+			return true;
+		for (uint32_t b = 0; b < (1u << config_.B); ++b) {
+			if (amo_busy_[b] != 0)
+				return true;
+		}
+		for (uint32_t i = config_.dma_begin; i + 1 < config_.dxa_row_port; ++i) {
+			const auto& ch = dxa_inputs_->at(i);
+			if (!ch.empty() && (is_bulk_dma(ch.peek()) || this->dxa_gate_admit(i, ch.peek())))
+				return true;
+		}
+		return false;
+	}
+
+	uint64_t tcu_banks() const {
+		return (tcu_cycle_ == SimPlatform::instance().cycles()) ? tcu_banks_ : 0;
+	}
+
+	// The tile buffer ticks after the local memory, so a response sent now
+	// with no delay reaches it in this cycle: one cycle after its request.
+	void tcu_read(uint32_t input, const MemReq& req) {
+		const uint64_t block = to_local_addr(req.addr) & ~uint64_t(VX_CFG_MEM_BLOCK_SIZE - 1);
+		MemRsp rsp{req.tag, req.hart_id, req.uuid};
+		rsp.data = make_mem_block();
+		ram_.read(rsp.data->data(), block, VX_CFG_MEM_BLOCK_SIZE);
+		simobject_->Outputs.at(input).send(rsp, 0);
+		dxa_inputs_->at(input).pop();
+		tcu_banks_ = ~uint64_t(0) >> (64 - (1u << config_.B));
+		tcu_cycle_ = SimPlatform::instance().cycles();
+		perf_stats_.reads += 1;
+		DT(4, simobject_->name() << " tcu read : " << req);
+	}
+#elif defined(VX_CFG_EXT_DLMEM_ENABLE) && !defined(VX_CFG_EXT_FPAMO_ENABLE)
+#line 394
+#else
+#line 483
+#endif
 
 	// A bulk copy's DMA access, the RTL's DMA port at once on every bank it
 	// touches: a read every bank, a write those its bytes do.
@@ -631,7 +704,14 @@ public:
 	void tick() {
 		// process bank requets from xbar
 		uint32_t num_banks = (1 << config_.B);
-#ifdef DXA_MBAR_ENABLE
+#ifdef VX_CFG_TCU_H100_ENABLE
+		const uint64_t bulk_banks = this->bulk_port_tick() | this->tcu_banks();
+#elif defined(DXA_MBAR_ENABLE) && defined(VX_CFG_EXT_DLMEM_ENABLE) && !defined(VX_CFG_EXT_FPAMO_ENABLE)
+#line 548
+		const uint64_t bulk_banks = this->bulk_port_tick();
+#line 546
+#elif defined(DXA_MBAR_ENABLE)
+#line 635
 		const uint64_t bulk_banks = this->bulk_port_tick();
 #elif defined(VX_CFG_EXT_DXA_ENABLE)
 #line 281

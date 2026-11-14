@@ -296,6 +296,9 @@ module VX_core import VX_gpu_pkg::*, VX_tlb_pkg::*; #(
     wire [`VX_CFG_NUM_WARPS-1:0]                    cta_slot_valid;
     wire [`VX_CFG_NUM_WARPS-1:0][DXA_CTA_GEN_W-1:0] cta_slot_gen;
     wire [`VX_CFG_NUM_WARPS-1:0][NW_WIDTH-1:0]      cta_warp_slot;
+`ifdef VX_CFG_TCU_H100_ENABLE
+    wire [`VX_CFG_NUM_WARPS-1:0]                    tcu_wg_rank_ok;
+`endif
     // The peer table's DXA read port
     wire [NW_WIDTH-1:0]                             dxa_peer_rd_slot;
     dlmem_row_t                                     dxa_peer_row;
@@ -351,6 +354,9 @@ module VX_core import VX_gpu_pkg::*, VX_tlb_pkg::*; #(
         .cta_slot_valid (cta_slot_valid),
         .cta_slot_gen   (cta_slot_gen),
         .cta_warp_slot  (cta_warp_slot),
+    `endif
+    `ifdef VX_CFG_TCU_H100_ENABLE
+        .wg_rank_ok     (tcu_wg_rank_ok),
     `endif
 
         .busy           (sched_busy)
@@ -477,6 +483,9 @@ module VX_core import VX_gpu_pkg::*, VX_tlb_pkg::*; #(
         .dxa_peer_row   (dxa_peer_row),
         .dxa_peer_slot_base (dxa_peer_slot_base),
         .dxa_peer_stride (dxa_peer_stride),
+    `endif
+    `ifdef VX_CFG_TCU_H100_ENABLE
+        .tcu_wg_rank_ok (tcu_wg_rank_ok),
     `endif
     `ifdef VX_CFG_EXT_TEX_ENABLE
         .tex_bus_if     (tex_bus_if),

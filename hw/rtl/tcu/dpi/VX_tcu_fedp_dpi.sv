@@ -13,6 +13,9 @@
 
 `include "VX_define.vh"
 `include "dpi_float.vh"
+`ifdef VX_CFG_TCU_H100_ENABLE
+`include "dpi_tcu.vh"
+`endif
 
 module VX_tcu_fedp_dpi import VX_tcu_pkg::*; #(
     parameter `STRING INSTANCE_ID = "",
@@ -47,7 +50,9 @@ module VX_tcu_fedp_dpi import VX_tcu_pkg::*; #(
     `UNUSED_PARAM (SF)
 `endif
 
+`ifndef VX_CFG_TCU_H100_ENABLE
     `UNUSED_VAR (fmt_d);
+`endif
 
 `ifdef VX_CFG_TCU_MX_ENABLE
     function automatic [7:0] mx_scale_exp_sum(
@@ -269,6 +274,10 @@ module VX_tcu_fedp_dpi import VX_tcu_pkg::*; #(
         .data_out({delayed_is_int, delayed_c})
     );
 
+`ifdef VX_CFG_TCU_H100_ENABLE
+    wire [31:0] d_val_chain;
+`endif
+
     //floating point accumulator
     reg [63:0] acc_f;
     reg [4:0] fflags;
@@ -304,7 +313,37 @@ module VX_tcu_fedp_dpi import VX_tcu_pkg::*; #(
         .reset   (reset),
         .enable  (enable),
         .data_in (delayed_is_int ? acc_i : acc_f[31:0]),
+    `ifdef VX_CFG_TCU_H100_ENABLE
+        .data_out(d_val_chain)
+    `else
         .data_out(d_val)
+    `endif
     );
+
+`ifdef VX_CFG_TCU_H100_ENABLE
+    // Float formats go through the bit-accurate model of the TFR datapath, so
+    // DPI and TFR results agree bit for bit (f16 or f32 destination).
+    `STATIC_ASSERT (N <= 8, ("invalid parameter"))
+    wire use_model = (fmt_s == 5'(TCU_FP16_ID)) || (fmt_s == 5'(TCU_BF16_ID))
+                  || (fmt_s == 5'(TCU_FP8_ID))  || (fmt_s == 5'(TCU_BF8_ID))
+                  || (fmt_s == 5'(TCU_TF32_ID));
+    reg [31:0] model_d;
+    always_comb begin
+        model_d = dpi_tcu_fedp(int'(fmt_s), int'(fmt_d), N, 256'(a_row), 256'(b_col), c_val);
+    end
+    wire [31:0] model_d_r;
+    wire use_model_r;
+    VX_pipe_register #(
+        .DATAW (1 + 32),
+        .DEPTH (TOTAL_LATENCY)
+    ) pipe_model (
+        .clk     (clk),
+        .reset   (reset),
+        .enable  (enable),
+        .data_in ({use_model,   model_d}),
+        .data_out({use_model_r, model_d_r})
+    );
+    assign d_val = use_model_r ? model_d_r : d_val_chain;
+`endif
 
 endmodule

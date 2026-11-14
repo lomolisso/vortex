@@ -75,6 +75,9 @@
 #include <vx_dxa.h>
 #include <vx_atomic.h>
 #include <vx_cuda_fp.h>
+#if VX_CFG_TCU_H100_ENABLED
+#include <vx_tensor.h>
+#endif
 #include <stddef.h>
 #include <stdint.h>
 
@@ -1947,6 +1950,204 @@ __VX_CUDA_INL uint32_t get_sreg_aggr_smem_size() { return vx_aggr_smem_size(); }
 
 } // namespace ptx
 } // namespace cuda
+
+///////////////////////////////////////////////////////////////////////////////
+// stmatrix / ldmatrix .m8n8 .b16 (x1, x2, x4, with and without .trans).
+// Lanes 8q..8q+7 give the 16-byte row addresses of matrix q; lane L's
+// register q holds matrix q's halves e = 0 (bits 15:0) and 1 (bits 31:16) at
+//   non-trans: row L/4, column 2(L%4) + e   -> addr[8q + L/4] + 2(2(L%4) + e)
+//   trans:     row 2(L%4) + e, column L/4   -> addr[8q + 2(L%4) + e] + 2(L/4)
+// Each lane fetches the row addresses it needs with a shuffle and stores or
+// loads its own halves, so exactly the bytes of the PTX operation move.
+// All 32 lanes take part, as with the .sync.aligned instruction.
+
+template <int X, bool Trans>
+__VX_CUDA_INL void __vx_stmatrix(void* row_addr, const uint32_t* r) {
+  static_assert(X == 1 || X == 2 || X == 4, "stmatrix takes 1, 2 or 4 matrices");
+  const unsigned L = __laneid();
+  const unsigned long a = (unsigned long)row_addr;
+  __VX_CUDA_ASSERT(L >= 8u * X || (a & 15u) == 0);
+  for (int q = 0; q < X; ++q) {
+    if constexpr (!Trans) {
+      char* p = (char*)__shfl_sync(0xffffffffu, a, 8 * q + L / 4);
+      *(uint32_t*)(p + 4 * (L % 4)) = r[q];
+    } else {
+      char* p0 = (char*)__shfl_sync(0xffffffffu, a, 8 * q + 2 * (L % 4));
+      char* p1 = (char*)__shfl_sync(0xffffffffu, a, 8 * q + 2 * (L % 4) + 1);
+      *(uint16_t*)(p0 + 2 * (L / 4)) = (uint16_t)r[q];
+      *(uint16_t*)(p1 + 2 * (L / 4)) = (uint16_t)(r[q] >> 16);
+    }
+  }
+}
+
+template <int X, bool Trans>
+__VX_CUDA_INL void __vx_ldmatrix(const void* row_addr, uint32_t* r) {
+  static_assert(X == 1 || X == 2 || X == 4, "ldmatrix takes 1, 2 or 4 matrices");
+  const unsigned L = __laneid();
+  const unsigned long a = (unsigned long)row_addr;
+  __VX_CUDA_ASSERT(L >= 8u * X || (a & 15u) == 0);
+  for (int q = 0; q < X; ++q) {
+    if constexpr (!Trans) {
+      const char* p = (const char*)__shfl_sync(0xffffffffu, a, 8 * q + L / 4);
+      r[q] = *(const uint32_t*)(p + 4 * (L % 4));
+    } else {
+      const char* p0 = (const char*)__shfl_sync(0xffffffffu, a, 8 * q + 2 * (L % 4));
+      const char* p1 = (const char*)__shfl_sync(0xffffffffu, a, 8 * q + 2 * (L % 4) + 1);
+      r[q] = (uint32_t)*(const uint16_t*)(p0 + 2 * (L / 4))
+           | ((uint32_t)*(const uint16_t*)(p1 + 2 * (L / 4)) << 16);
+    }
+  }
+}
+
+__VX_WARP void stmatrix_x1(void* row_addr, uint32_t r0) {
+  __VX_WARP_ASSERT();
+  const uint32_t r[1] = {r0};
+  __vx_stmatrix<1, false>(row_addr, r);
+}
+__VX_WARP void stmatrix_x2(void* row_addr, uint32_t r0, uint32_t r1) {
+  __VX_WARP_ASSERT();
+  const uint32_t r[2] = {r0, r1};
+  __vx_stmatrix<2, false>(row_addr, r);
+}
+__VX_WARP void stmatrix_x4(void* row_addr, uint32_t r0, uint32_t r1, uint32_t r2, uint32_t r3) {
+  __VX_WARP_ASSERT();
+  const uint32_t r[4] = {r0, r1, r2, r3};
+  __vx_stmatrix<4, false>(row_addr, r);
+}
+__VX_WARP void stmatrix_x1_trans(void* row_addr, uint32_t r0) {
+  __VX_WARP_ASSERT();
+  const uint32_t r[1] = {r0};
+  __vx_stmatrix<1, true>(row_addr, r);
+}
+__VX_WARP void stmatrix_x2_trans(void* row_addr, uint32_t r0, uint32_t r1) {
+  __VX_WARP_ASSERT();
+  const uint32_t r[2] = {r0, r1};
+  __vx_stmatrix<2, true>(row_addr, r);
+}
+__VX_WARP void stmatrix_x4_trans(void* row_addr, uint32_t r0, uint32_t r1, uint32_t r2, uint32_t r3) {
+  __VX_WARP_ASSERT();
+  const uint32_t r[4] = {r0, r1, r2, r3};
+  __vx_stmatrix<4, true>(row_addr, r);
+}
+
+__VX_WARP void ldmatrix_x1(const void* row_addr, uint32_t& r0) {
+  __VX_WARP_ASSERT();
+  uint32_t r[1];
+  __vx_ldmatrix<1, false>(row_addr, r);
+  r0 = r[0];
+}
+__VX_WARP void ldmatrix_x2(const void* row_addr, uint32_t& r0, uint32_t& r1) {
+  __VX_WARP_ASSERT();
+  uint32_t r[2];
+  __vx_ldmatrix<2, false>(row_addr, r);
+  r0 = r[0];
+  r1 = r[1];
+}
+__VX_WARP void ldmatrix_x4(const void* row_addr, uint32_t& r0, uint32_t& r1, uint32_t& r2, uint32_t& r3) {
+  __VX_WARP_ASSERT();
+  uint32_t r[4];
+  __vx_ldmatrix<4, false>(row_addr, r);
+  r0 = r[0];
+  r1 = r[1];
+  r2 = r[2];
+  r3 = r[3];
+}
+__VX_WARP void ldmatrix_x1_trans(const void* row_addr, uint32_t& r0) {
+  __VX_WARP_ASSERT();
+  uint32_t r[1];
+  __vx_ldmatrix<1, true>(row_addr, r);
+  r0 = r[0];
+}
+__VX_WARP void ldmatrix_x2_trans(const void* row_addr, uint32_t& r0, uint32_t& r1) {
+  __VX_WARP_ASSERT();
+  uint32_t r[2];
+  __vx_ldmatrix<2, true>(row_addr, r);
+  r0 = r[0];
+  r1 = r[1];
+}
+__VX_WARP void ldmatrix_x4_trans(const void* row_addr, uint32_t& r0, uint32_t& r1, uint32_t& r2, uint32_t& r3) {
+  __VX_WARP_ASSERT();
+  uint32_t r[4];
+  __vx_ldmatrix<4, true>(row_addr, r);
+  r0 = r[0];
+  r1 = r[1];
+  r2 = r[2];
+  r3 = r[3];
+}
+
+///////////////////////////////////////////////////////////////////////////////
+// Named barriers (bar.sync / bar.arrive id, nthreads): barrier number id of the block
+// (the hardware handle is the number above the block's slot, as
+// vortex::barrier forms it), counted in warps; bar.sync 0 is the barrier
+// __syncthreads uses.
+
+__VX_CUDA_INL void bar_sync(uint32_t id, uint32_t nthreads) {
+  __VX_CUDA_ASSERT(nthreads != 0 && nthreads % 32 == 0 && id < VX_CFG_NUM_BARRIERS);
+  vx_barrier((int)((id << 8) + get_local_group_id()), (int)(nthreads / 32));
+}
+
+template <uint32_t Id, uint32_t NThreads>
+__VX_CUDA_INL void bar_sync() {
+  static_assert(NThreads != 0 && NThreads % 32 == 0, "bar.sync counts whole warps");
+  static_assert(Id < VX_CFG_NUM_BARRIERS, "bar.sync id must be below VX_CFG_NUM_BARRIERS");
+  vx_barrier((int)((Id << 8) + get_local_group_id()), (int)(NThreads / 32));
+}
+
+// bar.arrive id, nthreads: the warp counts toward the same barrier without
+// waiting; nthreads covers the arriving and the waiting warps.
+__VX_CUDA_INL void bar_arrive(uint32_t id, uint32_t nthreads) {
+  __VX_CUDA_ASSERT(nthreads != 0 && nthreads % 32 == 0 && id < VX_CFG_NUM_BARRIERS);
+  (void)vx_barrier_arrive((int)((id << 8) + get_local_group_id()), (int)(nthreads / 32));
+}
+
+template <uint32_t Id, uint32_t NThreads>
+__VX_CUDA_INL void bar_arrive() {
+  static_assert(NThreads != 0 && NThreads % 32 == 0, "bar.arrive counts whole warps");
+  static_assert(Id < VX_CFG_NUM_BARRIERS, "bar.arrive id must be below VX_CFG_NUM_BARRIERS");
+  (void)vx_barrier_arrive((int)((Id << 8) + get_local_group_id()), (int)(NThreads / 32));
+}
+
+#if VX_CFG_TCU_H100_ENABLED
+///////////////////////////////////////////////////////////////////////////////
+// wgmma ordering (wgmma.fence / commit_group / wait_group) and the CuTe
+// warpgroup names over them.
+
+__VX_CUDA_INL void wgmma_fence() { vx_wgmma_fence(); }
+__VX_CUDA_INL void wgmma_commit_group() { vx_wgmma_commit_group(); }
+
+template <int N>
+__VX_CUDA_INL void wgmma_wait_group() {
+  vx_wgmma_wait_group(N);
+}
+
+namespace cute {
+
+__VX_CUDA_INL void warpgroup_arrive() { vx_wgmma_fence(); }
+__VX_CUDA_INL void warpgroup_commit_batch() { vx_wgmma_commit_group(); }
+
+template <int N>
+__VX_CUDA_INL void warpgroup_wait() {
+  vx_wgmma_wait_group(N);
+}
+
+// Keeps the compiler from moving accesses of an accumulator across a wgmma.
+__VX_CUDA_INL void warpgroup_fence_operand(float& x) { __asm__ volatile ("" : "+f"(x) :: "memory"); }
+__VX_CUDA_INL void warpgroup_fence_operand(uint32_t& x) { __asm__ volatile ("" : "+r"(x) :: "memory"); }
+
+template <int N, typename Dt>
+__VX_CUDA_INL void warpgroup_fence_operand(vortex::h100::acc<N, Dt>& d) {
+  for (uint32_t i = 0; i < vortex::h100::acc<N, Dt>::NRC; ++i)
+    __asm__ volatile ("" : "+f"(d.data[i]) :: "memory");
+}
+
+template <typename T, size_t M>
+__VX_CUDA_INL void warpgroup_fence_operand(T (&a)[M]) {
+  for (size_t i = 0; i < M; ++i)
+    warpgroup_fence_operand(a[i]);
+}
+
+} // namespace cute
+#endif
 
 ///////////////////////////////////////////////////////////////////////////////
 // invoke_one (CUDA allows any thread; this one is deterministic), cute

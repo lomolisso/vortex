@@ -3780,3 +3780,82 @@ tests:
     shape: *fa4_ds_exchange_shape
     touches: *fa4_ds_exchange_touches
     args: "-r 1"
+
+  # stmatrix / ldmatrix .m8n8.b16 (x1/x2/x4, +-trans) of vx_cuda.h against the PTX byte
+  # model (every byte of local memory compared), DAK's stmatrix.x4.trans and DeepGEMM's
+  # stmatrix.x2 epilogues at their swizzled positions, and bar.sync on ids 1-15 (64, 128
+  # and 256 threads, runtime and template forms) with 16 named barriers. No tensor unit.
+  - id: cuda_matrix
+    via: blackbox
+    drivers: [simx]
+    app: cuda_matrix
+    configs+: &cuda_matrix_cfg "-DVX_CFG_EXT_ZACAS_ENABLE -DVX_CFG_EXT_DXA_ENABLE -DVX_CFG_EXT_FPAMO_ENABLE -DVX_CFG_LMEM_LOG_SIZE=18 -DVX_CFG_NUM_BARRIERS=16"
+    shape: &cuda_matrix_shape {cores: 1, warps: 8, threads: 32}
+    touches: &cuda_matrix_touches [sw/kernel/include/vx_cuda.h, sw/kernel/include/vx_intrinsics.h, sw/kernel/include/vx_spawn2.h,
+              hw/rtl/core/VX_bar_unit.sv, hw/rtl/core/VX_wctl_unit.sv, sim/simx/barrier_unit.cpp,
+              sim/simx/wctl_unit.cpp, tests/regression/cuda_matrix]
+    args: "-r 2"
+  - id: cuda_matrix-rtl
+    via: blackbox
+    drivers: [rtlsim]
+    app: cuda_matrix
+    configs+: *cuda_matrix_cfg
+    shape: *cuda_matrix_shape
+    touches: *cuda_matrix_touches
+    args: "-r 1"
+
+  # Swizzle at 32 lanes (a 256-byte local-memory word, two 128-byte swizzle
+  # rows per word): loads and stores of every span, im2col and multicast.
+  - id: dxa_load-swz128-h100
+    app: dxa_load
+    drivers: [simx, rtlsim]
+    configs+: &dxa_h100_cfg "-DVX_CFG_EXT_DXA_ENABLE -DVX_CFG_EXT_ZACAS_ENABLE -DVX_CFG_EXT_FPAMO_ENABLE -DVX_CFG_ISSUE_WIDTH=4 -DVX_CFG_LMEM_LOG_SIZE=18 -DVX_CFG_EXT_TCU_ENABLE -DVX_CFG_TCU_WGMMA_ENABLE -DVX_CFG_TCU_FP8_ENABLE -DVX_CFG_TCU_H100_ENABLE -DWGMMA_RS -DVX_CFG_MBAR_SUSPEND_CYCLES=4096"
+    touches: *dxa_load_touches
+    shape: {warps: 4, threads: 32}
+    args: "-m swz -s 128"
+  - id: dxa_load-swz32-h100
+    app: dxa_load
+    drivers: [simx, rtlsim]
+    configs+: *dxa_h100_cfg
+    touches: *dxa_load_touches
+    shape: {warps: 4, threads: 32}
+    args: "-m swz -s 32"
+  - id: dxa_load-i2c4-h100
+    app: dxa_load
+    drivers: [simx, rtlsim]
+    configs+: *dxa_h100_cfg
+    touches: *dxa_load_touches
+    shape: {warps: 4, threads: 32}
+    args: "-m i2c4"
+  - id: dxa_load-mc-h100
+    app: dxa_load
+    drivers: [simx, rtlsim]
+    configs+: *dxa_h100_cfg
+    touches: *dxa_load_touches
+    shape: {cores: 2, l2cache: true, warps: 4, threads: 32}
+    args: "-m mc"
+  - id: dxa_store-swz128-h100
+    app: dxa_store
+    drivers: [simx, rtlsim]
+    configs+: *dxa_h100_cfg
+    touches: *dxa_store_touches
+    shape: {warps: 4, threads: 32}
+    args: "-m swz -s 128"
+  # Parity of the 256-byte-word swizzle path (measured 21292 / 21921 and
+  # 55724 / 56485 cycles, simx / rtlsim, instructions equal).
+  - id: parity-dxa-load-swz-h100
+    check: model_parity
+    app: dxa_load
+    xlen: [64]
+    configs+: *dxa_h100_cfg
+    touches: *dxa_load_touches
+    shape: {warps: 4, threads: 32}
+    args: "-m swz-oob -p"
+  - id: parity-dxa-store-swz-h100
+    check: model_parity
+    app: dxa_store
+    xlen: [64]
+    configs+: *dxa_h100_cfg
+    touches: *dxa_store_touches
+    shape: {warps: 4, threads: 32}
+    args: "-m swz-oob -p"

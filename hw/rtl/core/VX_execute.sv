@@ -79,6 +79,10 @@ module VX_execute import VX_gpu_pkg::*; #(
     input  dlmem_row_t                               dxa_peer_row,
     input wire [`VX_CFG_NUM_WARPS-1:0][`VX_CFG_LMEM_LOG_SIZE-1:0] dxa_peer_slot_base,
     input wire [`VX_CFG_LMEM_LOG_SIZE:0]             dxa_peer_stride,
+`ifdef VX_CFG_TCU_H100_ENABLE
+    // each warp's CTA rank agrees with its warp id mod 4
+    input wire [`VX_CFG_NUM_WARPS-1:0]               tcu_wg_rank_ok,
+`endif
     // bulk_group operation progress from the socket DXA, and the waits' releases
     input wire                                       dxa_bg_compl_valid,
     input VX_dxa_pkg::dxa_bg_compl_t                 dxa_bg_compl,
@@ -169,6 +173,12 @@ module VX_execute import VX_gpu_pkg::*; #(
 `endif
 
 `ifdef VX_CFG_EXT_TCU_ENABLE
+`ifdef VX_CFG_TCU_H100_ENABLE
+    wire [`VX_CFG_NUM_WARPS-1:0][`VX_CFG_LMEM_LOG_SIZE-1:0] tcu_slot_base;
+    for (genvar w = 0; w < `VX_CFG_NUM_WARPS; ++w) begin : g_tcu_slot_base
+        assign tcu_slot_base[w] = dxa_peer_slot_base[cta_warp_slot[w]];
+    end
+`endif
     VX_tcu_unit #(
         .INSTANCE_ID (`SFORMATF(("%s-tcu", INSTANCE_ID)))
     ) tcu_unit (
@@ -179,6 +189,10 @@ module VX_execute import VX_gpu_pkg::*; #(
     `endif
     `ifdef VX_CFG_TCU_WGMMA_ENABLE
         .tcu_lmem_if    (tcu_lmem_if),
+    `endif
+    `ifdef VX_CFG_TCU_H100_ENABLE
+        .tcu_slot_base  (tcu_slot_base),
+        .tcu_wg_rank_ok (tcu_wg_rank_ok),
     `endif
     `ifdef TCU_META_ENABLE
         .tcu_mem_if        (tcu_mem_if),

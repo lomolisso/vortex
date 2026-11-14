@@ -82,6 +82,12 @@ module VX_cta_dispatch import VX_gpu_pkg::*; #(
     output wire [`VX_CFG_NUM_WARPS-1:0][NW_WIDTH-1:0] warp_slot,
 `endif
 
+`ifdef VX_CFG_TCU_H100_ENABLE
+    // Per warp: its rank in the CTA and its warp id agree mod 4, so its
+    // warpgroup is the warps of one slice index across the four TCU blocks.
+    output wire [`VX_CFG_NUM_WARPS-1:0] wg_rank_ok,
+`endif
+
     output wire                     busy
 );
     `UNUSED_SPARAM (INSTANCE_ID)
@@ -1155,6 +1161,18 @@ module VX_cta_dispatch import VX_gpu_pkg::*; #(
                 $time, INSTANCE_ID, admit_ok, base_slot, stride, usable_slots_r))
         end
     end
+`endif
+
+`ifdef VX_CFG_TCU_H100_ENABLE
+    reg [`VX_CFG_NUM_WARPS-1:0] wg_rank_ok_r;
+    always @(posedge clk) begin
+        if (reset) begin
+            wg_rank_ok_r <= '1;
+        end else if (cta_fire) begin
+            wg_rank_ok_r[cta_wid] <= (cta_csrs.cta_rank[1:0] == cta_wid[1:0]);
+        end
+    end
+    assign wg_rank_ok = wg_rank_ok_r;
 `endif
 
 endmodule

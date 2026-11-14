@@ -25,22 +25,32 @@
 #include <utility>
 
 #ifdef FEDP_TRACE
-#define LOG(...) std::fprintf(stderr, __VA_ARGS__);
+#define TCU_FEDP_LOG(...) std::fprintf(stderr, __VA_ARGS__);
 #else
-#define LOG(...)
+#define TCU_FEDP_LOG(...)
 #endif
 
 #ifdef FEDP_RTL_WATCH
-#define RTL_WATCH(...) std::fprintf(stderr, __VA_ARGS__)
+#define TCU_FEDP_RTL_WATCH(...) std::fprintf(stderr, __VA_ARGS__)
 #else
-#define RTL_WATCH(...)
+#define TCU_FEDP_RTL_WATCH(...)
 #endif
 
+// The trace hooks take their arguments even when tracing is compiled out.
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wunused-parameter"
+
+namespace vortex {
+namespace tcu_fedp_ref {
+
+// Bit-accurate model of one TFR FEDP call (VX_tcu_fedp_tfr): the products of
+// n words of packed a and b elements plus c, aligned to a W-bit window, summed
+// exactly and rounded once (RNE).
 class FEDP {
 public:
   explicit FEDP(int exp_bits = 5, int sig_bits = 10, int frm = 0, int W = 25, bool renorm = false, bool no_window = false)
       : exp_bits_(exp_bits), sig_bits_(sig_bits), frm_(frm), W_(W), renorm_(renorm), no_window_(no_window) {
-    LOG("[ctor] fmt=e%dm%d, frm=%d, W=%d, renorm_=%s, no_window_=%s\n",
+    TCU_FEDP_LOG("[ctor] fmt=e%dm%d, frm=%d, W=%d, renorm_=%s, no_window_=%s\n",
         exp_bits_, sig_bits_, frm_, W_, (renorm_ ? "true" : "false"), (no_window_ ? "true" : "false"));
     assert(exp_bits_ > 0 && exp_bits_ <= 8);
     assert(sig_bits_ > 0 && sig_bits_ <= 10);
@@ -79,6 +89,42 @@ public:
     ++req_id_;
 
     return f32FromBits(out);
+  }
+
+  // f16 accumulate: c is an f16, widened exactly to f32 (as the RTL does), and
+  // the windowed sum is rounded once to f16 (RNE, subnormals kept, overflow to
+  // infinity). Returns the f16 bits.
+  uint16_t f16(const uint32_t *a, const uint32_t *b, uint16_t c, uint32_t n) {
+    const auto c_enc = f16_to_f32_bits(c);
+    rtl_watch_s0(a, b, c_enc, n);
+
+    const auto terms = decode_inputs(a, b, n);
+    const auto c_dec = decode_input(c_enc, 8, 23);
+    const auto c_term = decodeC_to_common(c_dec);
+
+    const auto mul_res = multiply_to_common(terms, c_term);
+
+    HR_ = 32 - lzcN(mul_res.terms.size() - 1, 32);
+
+    const auto aln = alignment(mul_res);
+    const auto acc = accumulate(aln);
+    const auto out = rounding_f16(acc);
+
+    ++req_id_;
+
+    return out;
+  }
+
+  // The exact f16 -> f32 widening the datapath applies to an f16 C input.
+  static uint32_t f16_to_f32_bits(uint16_t h) {
+    const uint32_t s = (h >> 15) & 1u, e = (h >> 10) & 0x1fu, f = h & 0x3ffu;
+    if (e == 31) return (s << 31) | 0x7f800000u | (f << 13);
+    if (e == 0) {
+      if (f == 0) return s << 31;
+      const int p = 31 - __builtin_clz(f);
+      return (s << 31) | ((uint32_t)(p + 103) << 23) | ((f << (23 - p)) & 0x7fffffu);
+    }
+    return (s << 31) | ((e + 112) << 23) | (f << 13);
   }
 
 private:
@@ -159,72 +205,72 @@ private:
   // -------- [RTL-WATCH] helpers --------
   inline void rtl_watch_s0(const uint32_t* a, const uint32_t* b, uint32_t c_enc, uint32_t n) {
 #ifdef FEDP_RTL_WATCH
-    RTL_WATCH("[RTL_WATCH] FEDP-S0(%lu): a_row=", req_id_);
-    RTL_WATCH("{");
+    TCU_FEDP_RTL_WATCH("[RTL_WATCH] FEDP-S0(%lu): a_row=", req_id_);
+    TCU_FEDP_RTL_WATCH("{");
     for (int i = (int)n - 1; i >= 0; --i) {
-      RTL_WATCH("0x%x", a[i]);
-      if (i > 0) RTL_WATCH(", ");
+      TCU_FEDP_RTL_WATCH("0x%x", a[i]);
+      if (i > 0) TCU_FEDP_RTL_WATCH(", ");
     }
-    RTL_WATCH("}, b_col={");
+    TCU_FEDP_RTL_WATCH("}, b_col={");
     for (int i = (int)n - 1; i >= 0; --i) {
-      RTL_WATCH("0x%x", b[i]);
-      if (i > 0) RTL_WATCH(", ");
+      TCU_FEDP_RTL_WATCH("0x%x", b[i]);
+      if (i > 0) TCU_FEDP_RTL_WATCH(", ");
     }
-    RTL_WATCH("}, c_val=0x%x\n", c_enc);
+    TCU_FEDP_RTL_WATCH("}, c_val=0x%x\n", c_enc);
 #endif
   }
 
   inline void rtl_watch_s1(const mul_res_t& res, const cterm_t& c_term, uint32_t c_enc) {
 #ifdef FEDP_RTL_WATCH
-    RTL_WATCH("[RTL_WATCH] FEDP-S1(%lu): max_exp=0x%x, shift_amt=", req_id_, res.L);
-    RTL_WATCH("{");
+    TCU_FEDP_RTL_WATCH("[RTL_WATCH] FEDP-S1(%lu): max_exp=0x%x, shift_amt=", req_id_, res.L);
+    TCU_FEDP_RTL_WATCH("{");
     if (!res.shifts.empty()) {
-      RTL_WATCH("0x%x", res.shifts.back());
-      if (res.shifts.size() > 1) RTL_WATCH(", ");
+      TCU_FEDP_RTL_WATCH("0x%x", res.shifts.back());
+      if (res.shifts.size() > 1) TCU_FEDP_RTL_WATCH(", ");
       for (int i = (int)res.shifts.size() - 2; i >= 0; --i) {
-        RTL_WATCH("0x%x", res.shifts[i]);
-        if (i > 0) RTL_WATCH(", ");
+        TCU_FEDP_RTL_WATCH("0x%x", res.shifts[i]);
+        if (i > 0) TCU_FEDP_RTL_WATCH(", ");
       }
     }
-    RTL_WATCH("}, raw_sig={");
+    TCU_FEDP_RTL_WATCH("}, raw_sig={");
     uint32_t c_raw = c_term.Mc;
     if (c_term.sign) c_raw |= (1u << 24);
     if (c_term.cls == 2 || c_term.cls == 1) c_raw |= (1u << 23);
-    RTL_WATCH("0x%x", c_raw);
-    if (res.terms.size() > 1) RTL_WATCH(", ");
+    TCU_FEDP_RTL_WATCH("0x%x", c_raw);
+    if (res.terms.size() > 1) TCU_FEDP_RTL_WATCH(", ");
     for (int i = (int)res.terms.size() - 2; i >= 0; --i) {
       uint32_t raw_val = res.terms[i].Mp;
       if (res.terms[i].sign) raw_val |= (1u << 24);
-      RTL_WATCH("0x%x", raw_val);
-      if (i > 0) RTL_WATCH(", ");
+      TCU_FEDP_RTL_WATCH("0x%x", raw_val);
+      if (i > 0) TCU_FEDP_RTL_WATCH(", ");
     }
-    RTL_WATCH("}\n");
+    TCU_FEDP_RTL_WATCH("}\n");
 #endif
   }
 
   inline void rtl_watch_s2(const align_t& aln, const mul_res_t& res, const cterm_t& c_term, uint32_t c_enc) {
 #ifdef FEDP_RTL_WATCH
-    RTL_WATCH("[RTL_WATCH] FEDP-S2(%lu): max_exp=0x%x, aln_sig=", req_id_, res.L);
-    RTL_WATCH("{");
+    TCU_FEDP_RTL_WATCH("[RTL_WATCH] FEDP-S2(%lu): max_exp=0x%x, aln_sig=", req_id_, res.L);
+    TCU_FEDP_RTL_WATCH("{");
     if (!aln.dbg_aln_sigs.empty()) {
       uint32_t c_sig = aln.dbg_aln_sigs.back();
-      RTL_WATCH("0x%x", c_sig);
-      if (aln.dbg_aln_sigs.size() > 1) RTL_WATCH(", ");
+      TCU_FEDP_RTL_WATCH("0x%x", c_sig);
+      if (aln.dbg_aln_sigs.size() > 1) TCU_FEDP_RTL_WATCH(", ");
       for (int i = (int)aln.dbg_aln_sigs.size() - 2; i >= 0; --i) {
-        RTL_WATCH("0x%x", aln.dbg_aln_sigs[i]);
-        if (i > 0) RTL_WATCH(", ");
+        TCU_FEDP_RTL_WATCH("0x%x", aln.dbg_aln_sigs[i]);
+        if (i > 0) TCU_FEDP_RTL_WATCH(", ");
       }
     }
-    RTL_WATCH("}, sticky_bits={");
+    TCU_FEDP_RTL_WATCH("}, sticky_bits={");
     if (!aln.dbg_sticky_bits.empty()) {
-      RTL_WATCH("0x%x", aln.dbg_sticky_bits.back());
-      if (aln.dbg_sticky_bits.size() > 1) RTL_WATCH(", ");
+      TCU_FEDP_RTL_WATCH("0x%x", aln.dbg_sticky_bits.back());
+      if (aln.dbg_sticky_bits.size() > 1) TCU_FEDP_RTL_WATCH(", ");
       for (int i = (int)aln.dbg_sticky_bits.size() - 2; i >= 0; --i) {
-        RTL_WATCH("0x%x", aln.dbg_sticky_bits[i]);
-        if (i > 0) RTL_WATCH(", ");
+        TCU_FEDP_RTL_WATCH("0x%x", aln.dbg_sticky_bits[i]);
+        if (i > 0) TCU_FEDP_RTL_WATCH(", ");
       }
     }
-    RTL_WATCH("}\n");
+    TCU_FEDP_RTL_WATCH("}\n");
 #endif
   }
 
@@ -234,7 +280,7 @@ private:
     for (size_t i = 0; i < res.terms.size() - 1; ++i) {
       if (res.terms[i].sign) sigs_sign |= (1 << i);
     }
-    RTL_WATCH("[RTL_WATCH] FEDP-S3(%lu): acc_sig=0x%x, max_exp=0x%x, sigs_sign=0x%x, sticky=%d\n",
+    TCU_FEDP_RTL_WATCH("[RTL_WATCH] FEDP-S3(%lu): acc_sig=0x%x, max_exp=0x%x, sigs_sign=0x%x, sticky=%d\n",
         req_id_, acc.V, res.L, sigs_sign, acc.sticky ? 1 : 0);
 #endif
   }
@@ -242,7 +288,7 @@ private:
   inline void rtl_watch_norm(const nrm_t& nrm, int flags, int max_exp) {
 #ifdef FEDP_RTL_WATCH
     int lsb = nrm.kept & 1;
-    RTL_WATCH("[RTL_WATCH] FEDP-NORM(%lu): abs_sum=0x%x, L=%d, G=%d, R=%d, S=%d, Rup=%d\n",
+    TCU_FEDP_RTL_WATCH("[RTL_WATCH] FEDP-NORM(%lu): abs_sum=0x%x, L=%d, G=%d, R=%d, S=%d, Rup=%d\n",
         req_id_, nrm.abs_sum, lsb, nrm.g, 0, nrm.st, nrm.round_up
     );
 #endif
@@ -250,7 +296,7 @@ private:
 
   inline void rtl_watch_s4(uint32_t result) {
 #ifdef FEDP_RTL_WATCH
-    RTL_WATCH("[RTL_WATCH] FEDP-S4(%lu): result=0x%08x\n", req_id_, result);
+    TCU_FEDP_RTL_WATCH("[RTL_WATCH] FEDP-S4(%lu): result=0x%08x\n", req_id_, result);
 #endif
   }
 
@@ -446,7 +492,7 @@ private:
     P >>= 1;
     E += 1;
 
-    LOG("[reduce_f8 (%ld)] t1=(%d, %d, %d), t2=(%d, %d, %d) | diff=%d max_P=0x%lx min_P=0x%lx aligned=0x%lx val=0x%lx -> s=%d P=0x%lx E=%d\n",
+    TCU_FEDP_LOG("[reduce_f8 (%ld)] t1=(%d, %d, %d), t2=(%d, %d, %d) | diff=%d max_P=0x%lx min_P=0x%lx aligned=0x%lx val=0x%lx -> s=%d P=0x%lx E=%d\n",
         req_id_, t1.sign, t1.Mp, e1, t2.sign, t2.Mp, e2, diff, max_P, min_P, aligned, val, s, P, E);
 
     return {{s, (int)P}, E};
@@ -574,8 +620,102 @@ private:
     return s_bit | ((be & 0xff) << 23) | (kept_rounded & 0x7FFFFFu);
   }
 
+  // Rounds the accumulator straight to f16: the 11 leading bits (fewer for a
+  // subnormal result) with guard and sticky from everything below, so there
+  // is no intermediate f32 rounding.
+  uint16_t rounding_f16(const acc_t &x) const {
+    if (x.flags & FL_NAN) return 0x7e00;
+    if ((x.flags & FL_PINF) && (x.flags & FL_NINF)) return 0x7e00;
+    if (x.flags & FL_PINF) return 0x7c00;
+    if (x.flags & FL_NINF) return 0xfc00;
+
+    const int Ww = (W_ + 2) + HR_;
+    const uint64_t mask = (1ULL << Ww) - 1;
+    if (x.V == 0) return 0;
+
+    const int s = (int)((x.V >> (Ww - 1)) & 1);
+    const uint64_t X = s ? ((-(uint64_t)x.V) & mask) : (uint64_t)x.V;
+    const int msb = 63 - __builtin_clzll(X);
+    const int e32 = x.L + msb - EXP_POS_BIAS;  // biased f32 exponent of the leading bit
+    const int e16 = e32 - 112;
+
+    // Significand bits kept: 11 for a normal, 10 + e16 for a subnormal.
+    const int dsh = (e16 < 1) ? std::min(1 - e16, 12) : 0;
+    const int p = 11 - dsh;
+    const int nb = msb + 1;
+    uint32_t kept = 0;
+    int g = 0, st = x.sticky;
+    if (p >= nb) {
+      kept = (uint32_t)(X << (p - nb));
+    } else if (p >= 0) {
+      const int sh = nb - p;
+      kept = (uint32_t)(X >> sh);
+      g = (int)((X >> (sh - 1)) & 1);
+      st = ((X & ((1ULL << (sh - 1)) - 1)) != 0 || st) ? 1 : 0;
+    } else {
+      st = 1;
+    }
+    const uint32_t round_up = (g && (st || (kept & 1))) ? 1u : 0u;
+
+    uint32_t enc;
+    if (e16 >= 31) {
+      enc = 0x7c00;
+    } else if (e16 >= 1) {
+      enc = (((uint32_t)e16 - 1) << 10) + kept + round_up;
+    } else {
+      enc = kept + round_up;
+    }
+    if (enc > 0x7c00) enc = 0x7c00;
+    return (uint16_t)(((uint32_t)s << 15) | enc);
+  }
+
   // members --------
   int exp_bits_, sig_bits_, frm_, W_, HR_;
   bool renorm_, no_window_;
   uint64_t req_id_ = 0;
 };
+
+// Format ids of the tensor unit (VX_tcu_pkg TCU_*_ID).
+enum : uint32_t {
+  FMT_FP32 = 0, FMT_TF32 = 1, FMT_FP16 = 2, FMT_BF16 = 3, FMT_FP8 = 4, FMT_BF8 = 5
+};
+
+// The window the TFR datapath accumulates in (VX_tcu_fedp_tfr W).
+constexpr int TFR_WINDOW = 25;
+
+inline bool fmt_bits(uint32_t fmt, int *eb, int *sb) {
+  switch (fmt) {
+  case FMT_TF32: *eb = 8; *sb = 10; return true;
+  case FMT_FP16: *eb = 5; *sb = 10; return true;
+  case FMT_BF16: *eb = 8; *sb = 7;  return true;
+  case FMT_FP8:  *eb = 4; *sb = 3;  return true;
+  case FMT_BF8:  *eb = 5; *sb = 2;  return true;
+  default: return false;
+  }
+}
+
+// One FEDP call exactly as the TFR datapath computes it: n 32-bit words of a
+// and b (elements packed lowest k first), c in the destination format.
+// fmt_d == FMT_FP16: c is an f16 in bits 15:0 and the f16 result is returned
+// in bits 15:0. Any other fmt_d: c and the result are f32 bits.
+inline uint32_t fedp(uint32_t fmt_s, uint32_t fmt_d, const uint32_t *a, const uint32_t *b,
+                     uint32_t c, uint32_t n) {
+  int eb = 0, sb = 0;
+  const bool ok = fmt_bits(fmt_s, &eb, &sb);
+  assert(ok && "tcu_fedp_ref: unsupported source format");
+  (void)ok;
+  FEDP unit(eb, sb, 0, TFR_WINDOW, false);
+  if (fmt_d == FMT_FP16)
+    return unit.f16(a, b, (uint16_t)(c & 0xffffu), n);
+  float cf;
+  std::memcpy(&cf, &c, 4);
+  const float d = unit(a, b, cf, n);
+  uint32_t u;
+  std::memcpy(&u, &d, 4);
+  return u;
+}
+
+} // namespace tcu_fedp_ref
+} // namespace vortex
+
+#pragma GCC diagnostic pop

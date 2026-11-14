@@ -131,6 +131,58 @@
     `endif
 `endif
 
+// WGMMA as on the H100: one warpgroup of 4 warps x 32 threads reads both
+// operands through smem descriptors in the CTA's local memory window (the DXA
+// slot base) and keeps the H100 accumulator fragment layout.
+`ifdef VX_CFG_TCU_H100_ENABLE
+    `ifndef VX_CFG_XLEN_64
+        `error "H100 WGMMA requires XLEN 64"
+    `endif
+    `ifndef VX_CFG_EXT_TCU_ENABLE
+        `error "H100 WGMMA requires the TCU with WGMMA"
+    `endif
+    `ifndef VX_CFG_TCU_WGMMA_ENABLE
+        `error "H100 WGMMA requires the TCU with WGMMA"
+    `endif
+    `ifndef VX_CFG_EXT_DXA_ENABLE
+        `error "H100 WGMMA requires DXA and mbarriers"
+    `endif
+    `ifndef VX_CFG_EXT_MBAR_ENABLE
+        `error "H100 WGMMA requires DXA and mbarriers"
+    `endif
+    `ifdef VX_CFG_TCU_SPARSE_ENABLE
+        `error "H100 WGMMA does not support sparse WGMMA"
+    `endif
+    `ifdef VX_CFG_TCU_MX_ENABLE
+        `error "H100 WGMMA does not support MX formats"
+    `endif
+    `ifdef VX_CFG_TCU_MXFP4_ENABLE
+        `error "H100 WGMMA does not support MX formats"
+    `endif
+    `ifdef VX_CFG_TCU_NVFP4_ENABLE
+        `error "H100 WGMMA does not support MX formats"
+    `endif
+    `ifdef VX_CFG_TCU_FEDP2K
+        `error "H100 WGMMA does not support FEDP2K"
+    `endif
+    `ifdef VX_CFG_TCU_DSM_ENABLE
+        `error "H100 WGMMA does not support DSM"
+    `endif
+    `ifndef VX_CFG_TCU_TYPE_TFR
+    `ifndef VX_CFG_TCU_TYPE_DPI
+        `error "H100 WGMMA needs the TFR or DPI backend"
+    `endif
+    `endif
+`endif
+
+// One more op-argument bit: the 5-bit amo_op of FPAMO or the 5-bit tcu step_n
+// of H100 WGMMA. Internal derived macro, not a VX_CFG_* knob.
+`ifdef VX_CFG_EXT_FPAMO_ENABLE
+    `define INST_ARGS_WIDE
+`elsif VX_CFG_TCU_H100_ENABLE
+    `define INST_ARGS_WIDE
+`endif
+
 // Convenience flag: the TCU metadata SRAM is present when any metadata-consuming
 // mode (MX or sparse) is enabled. Internal derived macro — not a VX_CFG_* knob.
 `ifdef VX_CFG_TCU_MX_ENABLE

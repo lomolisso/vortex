@@ -446,7 +446,11 @@ package VX_tcu_pkg;
         logic [NW_WIDTH-1:0]        wid;
         logic [NCTA_WIDTH-1:0]      cta_id;
         logic [3:0]                 step_m;
+    `ifdef VX_CFG_TCU_H100_ENABLE
+        logic [4:0]                 step_n;
+    `else
         logic [3:0]                 step_n;
+    `endif
         logic [3:0]                 step_k;
         logic [1:0]                 cd_nregs;
         logic [`VX_CFG_XLEN-1:0]    desc_a;

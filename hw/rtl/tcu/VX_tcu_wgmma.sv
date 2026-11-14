@@ -41,6 +41,14 @@ module VX_tcu_wgmma import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
     input  wire [BLOCK_SIZE-1:0]                                         exec_valid,
     input  wire [BLOCK_SIZE-1:0]                                         exec_ready,
     input  tcu_execute_t                                                 exec_data [BLOCK_SIZE],
+`ifdef VX_CFG_TCU_H100_ENABLE
+    // Each warp's CTA local-memory slot base; descriptor addresses are
+    // relative to it.
+    input  wire [`VX_CFG_NUM_WARPS-1:0][`VX_CFG_LMEM_LOG_SIZE-1:0]       slot_base,
+    // Each warp's CTA rank agrees with its warp id mod 4: the A rows come
+    // from the TCU block index.
+    input  wire [`VX_CFG_NUM_WARPS-1:0]                                  wg_rank_ok,
+`endif
 
     // Bank-parallel LMEM read port.
     VX_mem_bus_if.master                                                 tcu_lmem_if,
@@ -161,6 +169,17 @@ module VX_tcu_wgmma import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
 
     wire [BLOCK_SIZE-1:0] tbuf_ready;
 
+`ifdef VX_CFG_TCU_H100_ENABLE
+    wire [BLOCK_SIZE-1:0][`VX_CFG_LMEM_LOG_SIZE-1:0] req_slot_base;
+    wire [BLOCK_SIZE-1:0]                            req_esize16;
+    for (genvar bi = 0; bi < BLOCK_SIZE; ++bi) begin : g_h100_inputs
+        wire [TCU_FMT_WIDTH-1:0] fmt_s = exec_data[bi].op_args.tcu.fmt_s;
+        assign req_slot_base[bi] = slot_base[exec_data[bi].header.wid];
+        assign req_esize16[bi]   = (fmt_s == TCU_FMT_WIDTH'(TCU_FP16_ID))
+                                || (fmt_s == TCU_FMT_WIDTH'(TCU_BF16_ID));
+    end
+`endif
+
 `ifdef PERF_ENABLE
     wire [PERF_CTR_BITS-1:0] tbuf_stalls_w;
     wire [PERF_CTR_BITS-1:0] tbuf_cache_hits_w;
@@ -181,11 +200,47 @@ module VX_tcu_wgmma import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
         .lmem_reads     (lmem_reads_w),
     `endif
         .req            (req),
+    `ifdef VX_CFG_TCU_H100_ENABLE
+        .req_slot_base  (req_slot_base),
+        .req_esize16    (req_esize16),
+    `endif
         .tcu_lmem_if    (tcu_lmem_if),
         .tbuf_rs1_data  (tbuf_rs1_data),
         .tbuf_rs2_data  (tbuf_rs2_data),
         .tbuf_ready     (tbuf_ready)
     );
+
+`ifdef VX_CFG_TCU_H100_ENABLE
+    for (genvar bi = 0; bi < BLOCK_SIZE; ++bi) begin : g_rank_check
+        `RUNTIME_ASSERT(!(exec_valid[bi] && exec_ready[bi] && is_first_uop_b_w[bi])
+                     || wg_rank_ok[exec_data[bi].header.wid],
+            ("%t: H100 WGMMA needs each CTA's warps 4-aligned (wid=%0d)", $time, exec_data[bi].header.wid))
+    end
+`ifndef SIMULATION
+    `UNUSED_VAR (wg_rank_ok)
+`endif
+`ifdef DBG_TRACE_TCU
+    reg [BLOCK_SIZE-1:0] cta_conflict_trace_r;
+    always @(posedge clk) begin
+        cta_conflict_trace_r <= reset ? '0 : cta_conflict;
+    end
+    // Each fired WGMMA micro-op and each change of a block's CTA wait, for
+    // trace diffs against SimX.
+    always @(posedge clk) begin
+        if (!reset) begin
+            for (int bi = 0; bi < BLOCK_SIZE; ++bi) begin
+                if (exec_valid[bi] && exec_ready[bi] && is_wgmma_b_w[bi])
+                    `TRACE(1, ("%t: tcutr uop b=%0d wid=%0d m=%0d n=%0d k=%0d\n", $time, bi,
+                        exec_data[bi].header.wid, exec_data[bi].op_args.tcu.step_m,
+                        exec_data[bi].op_args.tcu.step_n, exec_data[bi].op_args.tcu.step_k))
+                if (cta_conflict[bi] != cta_conflict_trace_r[bi])
+                    `TRACE(1, ("%t: tcutr cta b=%0d wid=%0d %s\n", $time, bi,
+                        exec_data[bi].header.wid, cta_conflict[bi] ? "wait" : "ok"))
+            end
+        end
+    end
+`endif
+`endif
 
     for (genvar bi = 0; bi < BLOCK_SIZE; ++bi) begin : g_tbuf_eff
         assign tbuf_ready_eff[bi] = is_setup_uop_b_w[bi] ? 1'b1

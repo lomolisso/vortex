@@ -25,8 +25,8 @@
 //
 // Per-block ownership matches the SimX model: a block records its CTA when
 // its first compute uop enters WGMMA, and releases on its last compute uop.
-// A block is deferred only while another block is mid-WGMMA for a different
-// CTA.
+// A block is deferred while another block is mid-WGMMA for a different CTA,
+// or while a lower block starts a WGMMA of a different CTA in the same cycle.
 //
 // Contract: the consumer must AND `cta_conflict` into the request
 // validity presented to bbuf and into any downstream ready that gates
@@ -95,20 +95,35 @@ module VX_tcu_lockstep import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
     end
 
     // -----------------------------------------------------------------------
-    // Per-block conflict — flat combinational, no propagation chain.
+    // Per-block conflict.
+    //
+    // The registered test defers a block while another block is mid-WGMMA
+    // for a different CTA. On its own it would let two blocks start WGMMAs of
+    // different CTAs in the same cycle, after which each blocks the other
+    // forever. So a block that starts this cycle (a leader) also defers the
+    // higher blocks of other CTAs; the leaders are resolved lowest block
+    // first, so a deferred block is not itself a leader.
     // -----------------------------------------------------------------------
-    for (genvar bi = 0; bi < BLOCK_SIZE; ++bi) begin : g_conflict
-        logic cta_conflict_r;
-        always_comb begin
-            cta_conflict_r = 1'b0;
+    logic [BLOCK_SIZE-1:0] conflict_w;
+    always_comb begin : p_gate
+        logic [BLOCK_SIZE-1:0] lead_v;
+        lead_v = '0;
+        for (int bi = 0; bi < BLOCK_SIZE; ++bi) begin
+            conflict_w[bi] = 1'b0;
             for (int k = 0; k < BLOCK_SIZE; ++k) begin
                 if (k != bi && in_expansion_r[k] && (cta_owner_r[k] != new_cta_b[bi])) begin
-                    cta_conflict_r = 1'b1;
+                    conflict_w[bi] = 1'b1;
                 end
             end
+            for (int k = 0; k < bi; ++k) begin
+                if (lead_v[k] && (new_cta_b[k] != new_cta_b[bi])) begin
+                    conflict_w[bi] = 1'b1;
+                end
+            end
+            lead_v[bi] = is_wgmma_b[bi] && is_first_uop_b[bi] && !in_expansion_r[bi] && !conflict_w[bi];
         end
-        assign cta_conflict[bi] = is_wgmma_b[bi] && cta_conflict_r;
     end
+    assign cta_conflict = is_wgmma_b & conflict_w;
 
     // -----------------------------------------------------------------------
     // Sim-only contract assertion: a fired WGMMA uop must have its
@@ -122,6 +137,18 @@ module VX_tcu_lockstep import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
     `RUNTIME_ASSERT (~|lockstep_violation,
         ("%s lockstep violation: a WGMMA uop fired with a cta_id that conflicts with another block's resident CTA",
          INSTANCE_ID))
+`ifdef SIMULATION
+    always @(posedge clk) begin
+        if (!reset) begin
+            for (int i = 0; i < BLOCK_SIZE; ++i) begin
+                for (int j = i + 1; j < BLOCK_SIZE; ++j) begin
+                    `ASSERT(!(in_expansion_r[i] && in_expansion_r[j] && (cta_owner_r[i] != cta_owner_r[j])),
+                        ("%t: %s TCU blocks %0d and %0d inside WGMMAs of different CTAs", $time, INSTANCE_ID, i, j));
+                end
+            end
+        end
+    end
+`endif
 
 endmodule
 

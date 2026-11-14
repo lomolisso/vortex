@@ -70,6 +70,10 @@ module VX_scheduler import VX_gpu_pkg::*; #(
     output wire [`VX_CFG_NUM_WARPS-1:0][DXA_CTA_GEN_W-1:0] cta_slot_gen,
     output wire [`VX_CFG_NUM_WARPS-1:0][NW_WIDTH-1:0] cta_warp_slot,
 `endif
+`ifdef VX_CFG_TCU_H100_ENABLE
+    // each warp's CTA rank agrees with its warp id mod 4
+    output wire [`VX_CFG_NUM_WARPS-1:0] wg_rank_ok,
+`endif
 
     // status
     output wire             busy
@@ -169,6 +173,9 @@ module VX_scheduler import VX_gpu_pkg::*; #(
         .slot_valid     (cta_slot_valid),
         .slot_gen       (cta_slot_gen),
         .warp_slot      (cta_warp_slot),
+    `endif
+    `ifdef VX_CFG_TCU_H100_ENABLE
+        .wg_rank_ok     (wg_rank_ok),
     `endif
         .busy       (cta_dispatcher_busy)
     );

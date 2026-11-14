@@ -20,6 +20,10 @@ XCONFIGS := $(shell python3 $(ROOT_DIR)/ci/gen_config.py --config=$(VORTEX_HOME)
 
 SRCS += $(DPI_DIR)/dpi_util.cpp
 SRCS += $(DPI_DIR)/dpi_float.cpp
+# The H100 FEDP model behind the DPI tensor backend (knob on, from CONFIGS or the toml).
+ifneq (,$(filter -DVX_CFG_TCU_H100_ENABLE,$(XCONFIGS)))
+SRCS += $(DPI_DIR)/dpi_tcu.cpp
+endif
 SRCS += $(SW_COMMON_DIR)/softfloat_ext.cpp
 SRCS += $(SW_COMMON_DIR)/rvfloats.cpp
 SRCS += $(SRC_DIR)/main.cpp

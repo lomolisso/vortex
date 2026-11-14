@@ -1448,8 +1448,8 @@ private:
     const uint32_t t_bkK     = tiled ? desc_geo_bkk(w.desc) : 1u;
     const uint32_t t_nsteps  = tiled ? std::max<uint32_t>(1u, uint32_t(w.desc.tile_sizes[0]) / t_tcN) : 1u;
     // The element's dense destination, before the swizzle and the receiver's
-    // offset. A swizzle moves 16-byte chunks inside a word of at most 128
-    // bytes, so a beat's dense word is one destination word.
+    // offset. A swizzle moves 16-byte chunks inside their 128-byte row, so a
+    // beat's dense word is one destination word.
     auto dense_of = [&](uint32_t idx) -> uint64_t {
       if (tiled) {
         uint32_t de = tiled_dest_elem(DestLayout(lw.dest_layout), lw.tile_k_row,
@@ -1669,7 +1669,15 @@ private:
   }
 
   // ── The PTX traversal ───────────────────────────────────────────────
+#ifdef VX_CFG_TCU_H100_ENABLE
+  // A word wider than 128 bytes holds whole swizzle rows, so a swizzled beat
+  // is a whole word, as an unswizzled one.
+  static constexpr uint32_t kSwzWord = DxaCore::LMEM_ROW_SIZE;
+#else
+#line 1351
   static constexpr uint32_t kSwzWord = std::min<uint32_t>(DxaCore::LMEM_ROW_SIZE, 128u);
+#endif
+#line 1352
 
   // The descriptor's words, as the golden model decodes them.
   static dxa_ref::Desc ref_desc(const Descriptor& d) {

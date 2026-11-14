@@ -38,7 +38,19 @@ module VX_tcu_fedp_tfr import VX_tcu_pkg::*; #(
     output wire [31:0]        d_val
 );
     `UNUSED_SPARAM (INSTANCE_ID)
+`ifdef VX_CFG_TCU_H100_ENABLE
+    // An f16 destination: C arrives as an f16 in c_val[15:0] and is widened
+    // exactly to f32, and the sum is rounded once to f16 (d_val[15:0]).
+    wire is_f16d = (fmt_d == 5'(TCU_FP16_ID));
+    wire [31:0] c_val_f32;
+    VX_tcu_tfr_f16_to_f32 c_widen (
+        .h (c_val[15:0]),
+        .f (c_val_f32)
+    );
+    wire [31:0] c_val_eff = is_f16d ? c_val_f32 : c_val;
+`else
     `UNUSED_VAR (fmt_d)
+`endif
 
 `ifndef VX_CFG_TCU_MX_ENABLE
     `UNUSED_PARAM (SF)
@@ -119,7 +131,11 @@ module VX_tcu_fedp_tfr import VX_tcu_pkg::*; #(
 
     wire is_int = tcu_fmt_is_int(fmt_s);
 
+`ifdef VX_CFG_TCU_H100_ENABLE
+    wire [7:0] cval_top = c_val_eff[31:24];
+`else
     wire [7:0] cval_top = c_val[31:24];
+`endif
     wire [6:0] cval_hi = cval_top[7:1] + 7'(cval_top[0]);
 
     VX_tcu_tfr_shared_mul #(
@@ -139,7 +155,11 @@ module VX_tcu_fedp_tfr import VX_tcu_pkg::*; #(
         .fmt_s(fmt_s),
         .a_row(a_row),
         .b_col(b_col),
+    `ifdef VX_CFG_TCU_H100_ENABLE
+        .c_val(c_val_eff),
+    `else
         .c_val(c_val),
+    `endif
     `ifdef VX_CFG_TCU_MX_ENABLE
         .sf_a(sf_a),
         .sf_b(sf_b),
@@ -299,6 +319,20 @@ module VX_tcu_fedp_tfr import VX_tcu_pkg::*; #(
 
     wire [31:0] final_result;
 
+`ifdef VX_CFG_TCU_H100_ENABLE
+    wire s3_is_f16d;
+    VX_pipe_register #(
+        .DATAW (1),
+        .DEPTH (S3_IDX)
+    ) pipe_f16d (
+        .clk      (clk),
+        .reset    (reset),
+        .enable   (enable),
+        .data_in  (is_f16d),
+        .data_out (s3_is_f16d)
+    );
+`endif
+
     VX_tcu_tfr_norm_round #(
         .EXP_W (EXP_W),
         .C_HI_W(C_HI_W),
@@ -314,6 +348,9 @@ module VX_tcu_fedp_tfr import VX_tcu_pkg::*; #(
         .exceptions(s3_exceptions),
         .cval_hi(s3_cval_hi),
         .is_int(s3_is_int),
+    `ifdef VX_CFG_TCU_H100_ENABLE
+        .is_f16d(s3_is_f16d),
+    `endif
         .result(final_result)
     );
 

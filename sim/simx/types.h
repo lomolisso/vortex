@@ -965,7 +965,29 @@ struct IntrTcuArgs {
   uint32_t fmt_s        : 5;
   uint32_t fmt_d        : 5;
   uint32_t step_m       : 4;
+#if defined(VX_CFG_TCU_H100_ENABLE)
+  uint32_t step_n       : 5; // packed f16 n128 has 32 column groups
+#elif !defined(VX_CFG_EXT_MBAR_ENABLE) || !defined(VX_CFG_TCU_WGMMA_ENABLE)
+#line 775
   uint32_t step_n       : 4;
+#line 759
+#elif !defined(VX_CFG_EXT_DXA_ENABLE)
+#line 863
+  uint32_t step_n       : 4;
+#line 851
+#elif !defined(VX_CFG_EXT_DLMEM_ENABLE)
+#line 846
+  uint32_t step_n       : 4;
+#line 838
+#elif !defined(VX_CFG_EXT_FPAMO_ENABLE)
+#line 944
+  uint32_t step_n       : 4;
+#line 940
+#else
+#line 968
+  uint32_t step_n       : 4;
+#line 968
+#endif
   uint32_t step_k       : 4;
   uint32_t is_first_uop : 1; // set per-uop by tcu_uops expansion (C4)
   uint32_t is_last_uop  : 1;

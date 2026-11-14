@@ -85,10 +85,15 @@ module VX_mem_unit import VX_gpu_pkg::*; #(
 
 `ifdef VX_CFG_TCU_WGMMA_ENABLE
     `STATIC_ASSERT(`VX_CFG_LMEM_ENABLED, ("TCU_WGMMA_ENABLE requires LMEM_ENABLE"))
+`ifdef VX_CFG_TCU_H100_ENABLE
+    // H100 descriptors carry 14-bit fields of 16-byte units: 256 KB.
+    `STATIC_ASSERT(`VX_CFG_LMEM_LOG_SIZE <= 18, ("LMEM exceeds the 256 KB reach of the wgmma descriptor"))
+`else
     // The WGMMA shared-memory descriptor carries the LMEM byte offset in a 16-bit
     // field, so a WGMMA-visible LMEM cannot exceed 64KB; beyond that the offset
     // wraps into the adjacent stride field.
     `STATIC_ASSERT(`VX_CFG_LMEM_LOG_SIZE <= 16, ("LMEM exceeds the 16-bit smem descriptor offset field"))
+`endif
 `endif
 
 `ifdef VX_CFG_EXT_DLMEM_ENABLE

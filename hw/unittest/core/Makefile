@@ -41,6 +41,38 @@ RTL_PKGS += $(RTL_DIR)/dxa/VX_dxa_pkg.sv
 RTL_INCLUDE += -I$(RTL_DIR)/dxa
 endif
 
+# TCU builds import the tensor package and the selected FEDP backend.
+ifneq (,$(filter -DVX_CFG_EXT_TCU_ENABLE,$(CONFIGS)))
+XCONFIGS := $(shell python3 $(ROOT_DIR)/ci/gen_config.py --config=$(VORTEX_HOME)/VX_config.toml --cflags='$(CONFIGS) -DVX_CFG_XLEN=$(XLEN)')
+RTL_PKGS += $(RTL_DIR)/tcu/VX_tcu_pkg.sv
+RTL_INCLUDE += -I$(RTL_DIR)/tcu
+ifneq (,$(filter -DVX_CFG_TCU_H100_ENABLE,$(XCONFIGS)))
+SRCS += $(DPI_DIR)/dpi_tcu.cpp
+endif
+ifneq (,$(filter -DVX_CFG_TCU_TYPE_DPI,$(XCONFIGS)))
+RTL_INCLUDE += -I$(RTL_DIR)/tcu/dpi
+else ifneq (,$(filter -DVX_CFG_TCU_TYPE_DSP,$(XCONFIGS)))
+RTL_INCLUDE += -I$(RTL_DIR)/tcu/dsp
+else ifneq (,$(filter -DVX_CFG_TCU_TYPE_BHF,$(XCONFIGS)))
+RTL_INCLUDE += -I$(RTL_DIR)/tcu/bhf
+RTL_PKGS += $(THIRD_PARTY_DIR)/hardfloat/source/fNToRecFN.v
+RTL_PKGS += $(THIRD_PARTY_DIR)/hardfloat/source/addRecFN.v
+RTL_PKGS += $(THIRD_PARTY_DIR)/hardfloat/source/bsg_hardfloat_pkg.sv
+RTL_PKGS += $(THIRD_PARTY_DIR)/hardfloat/source/HardFloat_primitives.v
+RTL_PKGS += $(THIRD_PARTY_DIR)/hardfloat/source/HardFloat_rawFN.v
+RTL_PKGS += $(THIRD_PARTY_DIR)/hardfloat/source/isSigNaNRecFN.v
+RTL_PKGS += $(THIRD_PARTY_DIR)/hardfloat/source/mulRecFN.v
+RTL_PKGS += $(THIRD_PARTY_DIR)/hardfloat/source/recFNToFN.v
+RTL_PKGS += $(THIRD_PARTY_DIR)/hardfloat/source/recFNToRecFN.v
+RTL_INCLUDE += -I$(THIRD_PARTY_DIR)/hardfloat/source/RISCV -I$(THIRD_PARTY_DIR)/hardfloat/source
+else ifneq (,$(filter -DVX_CFG_TCU_TYPE_FPNEW,$(XCONFIGS)))
+RTL_INCLUDE += -I$(RTL_DIR)/tcu/fpnew
+RTL_INCLUDE += -I$(THIRD_PARTY_DIR)/cvfpu/src/common_cells/include -I$(THIRD_PARTY_DIR)/cvfpu/src/common_cells/src -I$(THIRD_PARTY_DIR)/cvfpu/src
+else
+RTL_INCLUDE += -I$(RTL_DIR)/tcu/tfr
+endif
+endif
+
 TOP := VX_core_top
 
 include ../common.mk

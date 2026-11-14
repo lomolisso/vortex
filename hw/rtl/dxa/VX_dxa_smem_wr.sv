@@ -828,6 +828,45 @@ module VX_dxa_smem_wr import VX_gpu_pkg::*, VX_dxa_pkg::*; #(
     // receiver's offset.
     wire [SMEM_ADDR_WIDTH-1:0] base_word_addr = scatter ? km_word_addr : fb_word_addr_r;
 `ifdef DXA_MBAR_ENABLE
+`ifdef VX_CFG_TCU_H100_ENABLE
+    // Swizzle on the block-relative word: the XOR's bits above the word
+    // move the word, those inside it swap its 16-byte chunks. A word wider
+    // than 128 bytes holds whole 128-byte rows, each with its own XOR, and
+    // is never moved. The replay adds the receivers' offsets after.
+    localparam SWZ_TOP    = (SMEM_OFF_W < 7) ? SMEM_OFF_W : 7;
+    localparam SWZ_STAGES = (SWZ_TOP > 4) ? (SWZ_TOP - 4) : 0;
+    localparam SWZ_ROWS   = (SMEM_OFF_W > 7) ? (1 << (SMEM_OFF_W - 7)) : 1;
+    wire [SMEM_ADDR_WIDTH-1:0] swz_rel = base_word_addr - swz_base_w_q;
+    wire [2:0] swz_m  = (swz_q == 2'd1) ? 3'b001 : (swz_q == 2'd2) ? 3'b011 : (swz_q == 2'd3) ? 3'b111 : 3'b000;
+    wire [SWZ_ROWS-1:0][2:0] swz_rv;
+    if (SMEM_OFF_W > 7) begin : g_swz_rows
+        // Each row's index from its byte offset, so a block base need only
+        // be 128-byte aligned.
+        reg [2:0] base_row_q;
+        always @(posedge clk) begin
+            base_row_q <= 3'(tma.blk_base >> 7);
+        end
+        for (genvar r = 0; r < SWZ_ROWS; ++r) begin : g_row
+            assign swz_rv[r] = (3'({base_word_addr, (SMEM_OFF_W-7)'(r)}) - base_row_q) & swz_m;
+        end
+    end else begin : g_swz_word
+        wire [SMEM_ADDR_WIDTH+SMEM_OFF_W-1:0] swz_rel_b = {swz_rel, SMEM_OFF_W'(0)};
+        assign swz_rv[0] = 3'(swz_rel_b >> 7) & swz_m;
+    end
+    wire [6:0] swz_x  = {swz_rv[0], 4'b0000};
+    wire [SMEM_ADDR_WIDTH-1:0] swz_word = swz_base_w_q + (swz_rel ^ SMEM_ADDR_WIDTH'(swz_x >> SMEM_OFF_W));
+    wire [SWZ_STAGES:0][SMEM_DATAW-1:0]     swz_d;
+    wire [SWZ_STAGES:0][SMEM_WORD_SIZE-1:0] swz_e;
+    assign swz_d[0] = fb_word_data;
+    assign swz_e[0] = fb_word_byteen;
+    for (genvar t = 0; t < SWZ_STAGES; ++t) begin : g_swz
+        for (genvar i = 0; i < SMEM_WORD_SIZE; ++i) begin : g_bytes
+            localparam J = i ^ (1 << (4 + t));
+            assign swz_d[t+1][i*8 +: 8] = swz_rv[i / 128][t] ? swz_d[t][J*8 +: 8] : swz_d[t][i*8 +: 8];
+            assign swz_e[t+1][i]        = swz_rv[i / 128][t] ? swz_e[t][J] : swz_e[t][i];
+        end
+    end
+`else
     // Swizzle on the block-relative word: the XOR's bits above the word
     // move the word, those inside it swap its 16-byte chunks. The replay
     // adds the receivers' offsets after.
@@ -850,6 +889,7 @@ module VX_dxa_smem_wr import VX_gpu_pkg::*, VX_dxa_pkg::*; #(
             assign swz_e[t+1][i]        = swz_x[4 + t] ? swz_e[t][J] : swz_e[t][i];
         end
     end
+`endif
     wire [SMEM_ADDR_WIDTH-1:0] replay_addr  = swz_word + beat_offset_r;
 `else
     wire [SMEM_ADDR_WIDTH-1:0] replay_addr  = base_word_addr + beat_offset_r;

@@ -30,6 +30,13 @@ module VX_tcu_unit import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
     VX_mem_bus_if.master     tcu_lmem_if,
 `endif
 
+`ifdef VX_CFG_TCU_H100_ENABLE
+    // Each warp's CTA local-memory slot base
+    input wire [`VX_CFG_NUM_WARPS-1:0][`VX_CFG_LMEM_LOG_SIZE-1:0] tcu_slot_base,
+    // each warp's CTA rank agrees with its warp id mod 4
+    input wire [`VX_CFG_NUM_WARPS-1:0] tcu_wg_rank_ok,
+`endif
+
 `ifdef TCU_META_ENABLE
     // TCU_LD memory client connection to VX_lsu_scheduler at VX_core.
     VX_lsu_sched_if.master  tcu_mem_if,
@@ -202,6 +209,10 @@ module VX_tcu_unit import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
         .exec_valid     (exec_valid_w),
         .exec_ready     (exec_ready_w),
         .exec_data      (exec_data_w),
+    `ifdef VX_CFG_TCU_H100_ENABLE
+        .slot_base      (tcu_slot_base),
+        .wg_rank_ok     (tcu_wg_rank_ok),
+    `endif
         .tcu_lmem_if    (tcu_lmem_if),
         .tbuf_rs1_data  (tbuf_rs1_data),
         .tbuf_rs2_data  (tbuf_rs2_data),
@@ -301,6 +312,10 @@ module VX_tcu_unit import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
         .data_t (tcu_result_t)
     ) gather_result_if[BLOCK_SIZE]();
 
+`ifdef VX_CFG_TCU_H100_ENABLE
+    wire [BLOCK_SIZE-1:0][PER_ISSUE_WARPS-1:0][5:0] grp_done_cnt;
+`endif
+
     for (genvar bi = 0; bi < BLOCK_SIZE; ++bi) begin : g_groups
         wire is_wgmma_op = (core_execute_if[bi].data.op_type == INST_TCU_WGMMA)
         `ifdef VX_CFG_TCU_SPARSE_ENABLE
@@ -324,6 +339,10 @@ module VX_tcu_unit import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
             .req_is_wait (lane_execute_if[bi].data.op_type == INST_TCU_WAIT),
             .req_wid     (lane_execute_if[bi].data.header.wid),
             .req_n       (lane_execute_if[bi].data.op_args.tcu.step_m[2:0]),
+        `ifdef VX_CFG_TCU_H100_ENABLE
+            .done_cnt    (grp_done_cnt[bi]),
+            .done_cnt_all(grp_done_cnt),
+        `endif
             .unlock_if   (unlock_if[bi])
         );
 

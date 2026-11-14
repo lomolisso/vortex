@@ -1057,16 +1057,17 @@ package VX_gpu_pkg;
 
     //////////////////////// instruction arguments ////////////////////////////
 
-    // tcu_args_t at 27 bits = 1+1+1+2+5+5+4+4+4. Sparse variants are distinct opcodes.
-`ifdef VX_CFG_EXT_FPAMO_ENABLE
-    // One more bit for the 5-bit amo_op of lsu_args_t.
+    // tcu_args_t at 27 bits = 1+1+1+2+5+5+4+4+4 (step_n is 5 bits with H100 WGMMA).
+    // Sparse variants are distinct opcodes.
+`ifdef INST_ARGS_WIDE
+    // One more bit for the 5-bit amo_op of lsu_args_t or the 5-bit tcu step_n.
     localparam INST_ARGS_BITS = 3 + ALU_TYPE_BITS + 20 + 3;
 `else
     localparam INST_ARGS_BITS = 3 + ALU_TYPE_BITS + 20 + 2;
 `endif
 
     typedef struct packed {
-    `ifdef VX_CFG_EXT_FPAMO_ENABLE
+    `ifdef INST_ARGS_WIDE
         logic [2:0] __padding;
     `else
         logic [1:0] __padding;
@@ -1081,7 +1082,7 @@ package VX_gpu_pkg;
 
     // Branch instructions (JAL/JALR/B/SYS) execute on the ALU pipeline.
     typedef struct packed {
-    `ifdef VX_CFG_EXT_FPAMO_ENABLE
+    `ifdef INST_ARGS_WIDE
         logic [2:0] __padding;
     `else
         logic [1:0] __padding;
@@ -1119,6 +1120,12 @@ package VX_gpu_pkg;
     // unchanged (the PACKAGE_ASSERT below proves it).
     typedef struct packed {
     `ifdef VX_CFG_EXT_MBAR_ENABLE
+    `ifdef VX_CFG_TCU_H100_ENABLE
+    `ifndef VX_CFG_EXT_FPAMO_ENABLE
+        // the 4-bit amo_op leaves one bit of the wider argument field free
+        logic                       __padding;
+    `endif
+    `endif
         // st.async/red.async: a posted store (or add) to a cluster peer that
         // completes on the mbarrier named by rs3 in the destination block.
         logic                       is_async;
@@ -1178,7 +1185,8 @@ package VX_gpu_pkg;
 
 `ifdef VX_CFG_EXT_TCU_ENABLE
     typedef struct packed {
-    `ifdef VX_CFG_EXT_FPAMO_ENABLE
+    `ifdef VX_CFG_TCU_H100_ENABLE
+    `elsif VX_CFG_EXT_FPAMO_ENABLE
         logic __padding;
     `endif
         logic is_last_uop;    // WGMMA: set on last sub-uop of an expansion
@@ -1188,7 +1196,11 @@ package VX_gpu_pkg;
         logic [4:0] fmt_d;
         logic [4:0] fmt_s;
         logic [3:0] step_k;
+    `ifdef VX_CFG_TCU_H100_ENABLE
+        logic [4:0] step_n;   // packed f16 n128 has 32 column groups
+    `else
         logic [3:0] step_n;
+    `endif
         logic [3:0] step_m;
     } tcu_args_t;
     `PACKAGE_ASSERT($bits(tcu_args_t) == INST_ARGS_BITS)

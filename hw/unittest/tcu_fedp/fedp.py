@@ -944,7 +944,7 @@ def _ensure_cpp_ext(source_path):
         int n, int eb, int sb, int frm,
         int W, bool renorm, bool no_window) {{
 
-        FEDP fedp(eb, sb,frm, W, renorm, no_window);
+        vortex::tcu_fedp_ref::FEDP fedp(eb, sb,frm, W, renorm, no_window);
 
         float c_float;
         uint32_t c_u32 = Cbits;
@@ -1296,7 +1296,8 @@ if __name__ == "__main__":
                   help="Reference: 'numpy', 'cuda', 'cpp', 'emul'")
   ap.add_argument("--arch", type=str, default="sm_89",
                   help="CUDA arch for --ref=cuda (e.g., sm_80, sm_89, sm_90)")
-  ap.add_argument("--cpp-source", type=str, default="fedp.h",
+  ap.add_argument("--cpp-source", type=str,
+                  default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "../../../sw/common/tcu_fedp_ref.h"),
                   help="Path to external C++ source containing FEDP class")
   ap.add_argument("--max-errors", type=int, default=0,
                   help="Stop after N errors (0 = do not stop)")

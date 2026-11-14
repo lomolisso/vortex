@@ -29,7 +29,10 @@ CtaDispatcher::CtaDispatcher(const SimContext& ctx, const char* name, Core* core
 #ifdef VX_CFG_EXT_DLMEM_ENABLE
   , PeerWrOut(this)
 #endif
-#ifdef DXA_MBAR_ENABLE
+#ifdef VX_CFG_TCU_H100_ENABLE
+  , DxaSlotOut(4, SimChannel<CtaSlotEvt>(this, 4 * VX_CFG_NUM_WARPS + 8))
+#elif defined(DXA_MBAR_ENABLE)
+#line 33
   , DxaSlotOut(3, SimChannel<CtaSlotEvt>(this, 4 * VX_CFG_NUM_WARPS + 8))
 #else
 #line 31
@@ -480,5 +483,8 @@ void CtaDispatcher::dxa_slot_evt(const CtaSlotEvt& e, uint64_t delay, bool to_co
     DxaSlotOut.at(2).send(e, delay);
   }
   DxaSlotOut.at(1).send(e, delay);
+#ifdef VX_CFG_TCU_H100_ENABLE
+  DxaSlotOut.at(3).send(e, delay);
+#endif
 }
 #endif

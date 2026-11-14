@@ -113,6 +113,9 @@ module VX_tcu_fedp_dsp import VX_tcu_pkg::*; #(
     output wire [31:0] d_val
 );
     `UNUSED_SPARAM (INSTANCE_ID)
+`ifdef VX_CFG_TCU_H100_ENABLE
+    `STATIC_ASSERT (0, ("H100 WGMMA needs the TFR or DPI backend"))
+`endif
     localparam TCK = 2 * N;
     localparam LEVELS = $clog2(TCK);
 

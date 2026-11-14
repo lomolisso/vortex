@@ -7,3 +7,9 @@ lint_off -file "@VORTEX_HOME@/third_party/cvfpu/*"
 lint_off -rule BLKANDNBLK -file "@VORTEX_HOME@/third_party/hardfloat/*"
 lint_off -rule UNOPTFLAT -file "@VORTEX_HOME@/third_party/hardfloat/*"
 lint_off -file "@VORTEX_HOME@/third_party/hardfloat/*"
+
+// Replicated leaf modules stay one shared C++ class each: inlined, every
+// instance of the 32-lane local-memory crossbars and the FEDP array becomes its
+// own copy of code, and gcc then takes over 10 hours on a 2-core TCU model.
+no_inline -module "VX_tcu_fedp_tfr"
+no_inline -module "VX_stream_arb"

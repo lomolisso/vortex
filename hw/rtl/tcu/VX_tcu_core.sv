@@ -137,11 +137,23 @@ module VX_tcu_core import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
 `endif
 
     wire [3:0] step_m = execute_if.data.op_args.tcu.step_m;
+`ifdef VX_CFG_TCU_H100_ENABLE
+    wire [4:0] step_n = execute_if.data.op_args.tcu.step_n;
+`else
     wire [3:0] step_n = execute_if.data.op_args.tcu.step_n;
+`endif
     wire [3:0] step_k = execute_if.data.op_args.tcu.step_k;
 
     wire [4:0] fmt_s = execute_if.data.op_args.tcu.fmt_s;
+`ifdef VX_CFG_TCU_H100_ENABLE
+    // Only WGMMA accumulates in f16 (packed, one half per micro-op, the half
+    // being step_n[0]); WMMA keeps its f32 result.
+    wire [4:0] fmt_d_in = execute_if.data.op_args.tcu.fmt_d;
+    wire h100_f16d = is_wgmma && (fmt_d_in == 5'(TCU_FP16_ID));
+    wire [4:0] fmt_d = h100_f16d ? 5'(TCU_FP16_ID) : 5'(TCU_FP32_ID);
+`else
     wire [4:0] fmt_d = execute_if.data.op_args.tcu.fmt_d;
+`endif
 
     wire execute_fire = execute_if.valid && execute_if.ready;
 `ifdef VX_CFG_TCU_WGMMA_ENABLE
@@ -178,6 +190,46 @@ module VX_tcu_core import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
             $write("META_RD,%0d,%0d,%0d,%0d,0x%08h\n",
                 execute_if.data.header.wid, step_m, step_k, trc_wg_bank,
                 vld_meta_block[31:0]);
+        end
+    end
+`endif
+`endif
+
+`ifdef VX_CFG_TCU_H100_ENABLE
+    `STATIC_ASSERT (`VX_CFG_NUM_THREADS == 32, ("H100 WGMMA requires 32 threads"))
+    `STATIC_ASSERT (`VX_CFG_ISSUE_WIDTH == 4 && `VX_CFG_NUM_TCU_BLOCKS == 4,
+        ("H100 WGMMA requires ISSUE_WIDTH 4 (one warpgroup)"))
+
+    // The first micro-op carries both descriptors (x10, x11), uniform over the
+    // warpgroup, so lane 0 is checked.
+    localparam [63:0] H100_DESC_DEFINED = (64'h3FFF << 0) | (64'h3FFF << 16) | (64'h3FFF << 32)
+                                        | (64'h7 << 49) | (64'h1 << 52) | (64'h3 << 62);
+    wire [63:0] h100_desc_a = 64'(execute_if.data.rs1_data[0]);
+    wire [63:0] h100_desc_b = 64'(execute_if.data.rs2_data[0]);
+    wire h100_fmt_s_8bit = (fmt_s == 5'(TCU_FP8_ID)) || (fmt_s == 5'(TCU_BF8_ID));
+    wire h100_pair_ok = (fmt_d_in == 5'(TCU_FP16_ID)) ? (fmt_s == 5'(TCU_FP16_ID))
+                      : ((fmt_d_in == 5'(TCU_FP32_ID))
+                      && ((fmt_s == 5'(TCU_FP16_ID)) || (fmt_s == 5'(TCU_BF16_ID)) || h100_fmt_s_8bit));
+    wire h100_check = execute_fire && is_wgmma && execute_if.data.op_args.tcu.is_first_uop;
+    `UNUSED_VAR ({h100_desc_a, h100_desc_b, h100_pair_ok, h100_check})
+`ifndef SYNTHESIS
+    always @(posedge clk) begin
+        if (h100_check) begin
+            `ASSERT(wg_a_smem, ("%t: %s H100 WGMMA needs A in shared memory", $time, INSTANCE_ID));
+            `ASSERT(h100_pair_ok, ("%t: %s H100 WGMMA does not support this type pair (fmt_s=%0d, fmt_d=%0d)",
+                $time, INSTANCE_ID, fmt_s, fmt_d_in));
+            `ASSERT((h100_desc_a & ~H100_DESC_DEFINED) == 0,
+                ("%t: %s wgmma descriptor reserved bits must be 0 (A=0x%0h)", $time, INSTANCE_ID, h100_desc_a));
+            `ASSERT(h100_desc_a[51:49] == 3'b0,
+                ("%t: %s wgmma descriptor base offset must be 0 (A=0x%0h)", $time, INSTANCE_ID, h100_desc_a));
+            `ASSERT(!(h100_desc_a[52] && h100_fmt_s_8bit),
+                ("%t: %s wgmma MN-major needs a 16-bit type (A=0x%0h)", $time, INSTANCE_ID, h100_desc_a));
+            `ASSERT((h100_desc_b & ~H100_DESC_DEFINED) == 0,
+                ("%t: %s wgmma descriptor reserved bits must be 0 (B=0x%0h)", $time, INSTANCE_ID, h100_desc_b));
+            `ASSERT(h100_desc_b[51:49] == 3'b0,
+                ("%t: %s wgmma descriptor base offset must be 0 (B=0x%0h)", $time, INSTANCE_ID, h100_desc_b));
+            `ASSERT(!(h100_desc_b[52] && h100_fmt_s_8bit),
+                ("%t: %s wgmma MN-major needs a 16-bit type (B=0x%0h)", $time, INSTANCE_ID, h100_desc_b));
         end
     end
 `endif
@@ -527,7 +579,12 @@ module VX_tcu_core import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
             end
         `endif
 
+        `ifdef VX_CFG_TCU_H100_ENABLE
+            wire [31:0] c_reg = 32'(execute_if.data.rs3_data[i * TCU_TC_N + j]);
+            wire [31:0] c_val = h100_f16d ? {16'b0, (step_n[0] ? c_reg[31:16] : c_reg[15:0])} : c_reg;
+        `else
             wire [31:0] c_val = 32'(execute_if.data.rs3_data[i * TCU_TC_N + j]);
+        `endif
 
         `ifdef VX_CFG_TCU_SPARSE_ENABLE
             VX_tcu_sp_mux #(

@@ -312,6 +312,11 @@ VX_CFG_TCU_SPARSE_ENABLE = false
 VX_CFG_TCU_DSM_ENABLE = false
 VX_CFG_TCU_WGMMA_ENABLE = false
 VX_CFG_TCU_FEDP2K = false
+# WGMMA as on the H100: smem descriptors into the CTA's local memory, the
+# H100 accumulator fragment layout, f16 accumulators packed two per register.
+# Needs XLEN 64, 32 threads, ISSUE_WIDTH 4, TCU + WGMMA, DXA + MBAR and the
+# TFR or DPI backend; refuses sparse, MX, FEDP2K and DSM.
+VX_CFG_TCU_H100_ENABLE = false
 
 [dxa]
 # Cluster-level DXA engine count, decoupled from cores/socket size.

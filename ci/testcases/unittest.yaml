@@ -92,14 +92,47 @@ tests:
   - id: hw-tcu
     via: script
     run: "make -C hw/unittest run-tcu"
-    touches: [hw/rtl/tcu, hw/unittest/tcu_fedp]
+    touches: [hw/rtl/tcu, hw/unittest/tcu_fedp, sw/common/tcu_fedp_ref.h, hw/dpi/dpi_tcu.cpp,
+              hw/dpi/dpi_tcu.vh, hw/rtl/VX_define.vh, hw/rtl/VX_gpu_pkg.sv, VX_config.toml]
   # Same native-TFR formats with the multipliers mapped onto DSP48 (USE_DSP=1) —
   # the FPGA-synthesis path, off by default in sim. Bit-identical to LUT by
   # contract, so a mismatch is a DSP-packing bug.
   - id: hw-tcu-dsp
     via: script
     run: "make -C hw/unittest run-tcu-dsp"
-    touches: [hw/rtl/tcu, hw/unittest/tcu_fedp]
+    touches: [hw/rtl/tcu, hw/unittest/tcu_fedp, sw/common/tcu_fedp_ref.h, hw/rtl/VX_define.vh,
+              hw/rtl/VX_gpu_pkg.sv, VX_config.toml]
+  # Tile buffers reading operands through H100 wgmma descriptors (RV64): four
+  # blocks replay WGMMA micro-op sequences against a random local memory behind
+  # a random-latency, back-pressured read port, with random descriptors (every
+  # swizzle mode, K- and MN-major A and B, 16- and 8-bit elements, multi-atom
+  # LBO/SBO, starts across 256 KB), random nonzero slot bases, warpgroups
+  # drifting apart, pairs of blocks on different descriptors and memory
+  # rewritten under unchanged descriptors; every operand word checked against
+  # sw/common/tcu_desc_ref.h, with a coverage check per mode, major and size.
+  - id: hw-tcu-tbuf
+    via: script
+    xlen: [64]
+    run: "make -C hw/unittest run-tcu-tbuf"
+    touches: [hw/rtl/tcu/VX_tcu_tbuf.sv, hw/rtl/tcu/VX_tcu_abuf.sv, hw/rtl/tcu/VX_tcu_bbuf.sv,
+              hw/rtl/tcu/VX_tcu_smem_addr.sv, hw/rtl/tcu/VX_tcu_pkg.sv, hw/rtl/VX_gpu_pkg.sv,
+              hw/rtl/VX_define.vh, hw/rtl/libs/VX_mem_bus_arb.sv, hw/rtl/libs/VX_dp_ram.sv,
+              hw/unittest/tcu_tbuf, hw/unittest/common.mk, hw/unittest/Makefile,
+              sw/common/tcu_desc_ref.h, sw/common/dxa_ref.h]
+  # The WGMMA CTA gate of the shared tile buffers (VX_tcu_lockstep): four
+  # blocks present WGMMAs of different CTAs; directed cases pin the fire
+  # cycles of same-cycle starts (A,B), (A,B,A), (B,A,A,B), (A,A,A,A), a block
+  # mid-expansion against a lower block that starts, a lower block that is
+  # itself deferred and alternating CTAs, then 300 random runs with
+  # downstream stalls; every run must make progress and never hold two
+  # blocks inside WGMMAs of different CTAs. Without and, at XLEN 64, with the
+  # H100 knob.
+  - id: hw-tcu-lockstep
+    via: script
+    run: "make -C hw/unittest run-tcu-lockstep"
+    touches: [hw/rtl/tcu/VX_tcu_lockstep.sv, hw/rtl/tcu/VX_tcu_pkg.sv, hw/rtl/VX_gpu_pkg.sv,
+              hw/rtl/VX_define.vh, hw/unittest/tcu_lockstep, hw/unittest/common.mk,
+              hw/unittest/Makefile]
   # DXA core: legacy multicast copies through VX_dxa_core with dense and
   # sparse cta masks; the receiver of bit r gets the tile at issuer + r x the
   # stride and its barrier release at barrier + r. The `hw` lane above only
@@ -133,6 +166,14 @@ tests:
   # three latencies, the last-level cache bank and the local-memory banks with
   # the new ops (a float op at a bank aborts at the site assert), the DLMEM
   # endpoints and translation with the 5-bit op, then core and memory-unit lint.
+  # The DXA bench at 32 lanes with the H100 knob: a 256-byte local-memory
+  # word, every swizzle as two 128-byte rows per word, with a block base 128
+  # bytes off a word.
+  - id: hw-dxa-bulk-h100
+    via: script
+    xlen: [64]
+    run: "make -C hw/unittest/dxa_core clean && make -C hw/unittest/dxa_core CONFIGS='-DVX_CFG_EXT_DLMEM_ENABLE -DVX_CFG_EXT_A_ENABLE -DVX_CFG_EXT_MBAR_ENABLE -DVX_CFG_EXT_DXA_ENABLE -DVX_CFG_NUM_CORES=4 -DVX_CFG_NUM_THREADS=32 -DVX_CFG_ISSUE_WIDTH=4 -DVX_CFG_EXT_TCU_ENABLE -DVX_CFG_TCU_WGMMA_ENABLE -DVX_CFG_TCU_H100_ENABLE' && make -C hw/unittest/dxa_core run CONFIGS='-DVX_CFG_EXT_DLMEM_ENABLE -DVX_CFG_EXT_A_ENABLE -DVX_CFG_EXT_MBAR_ENABLE -DVX_CFG_EXT_DXA_ENABLE -DVX_CFG_NUM_CORES=4 -DVX_CFG_NUM_THREADS=32 -DVX_CFG_ISSUE_WIDTH=4 -DVX_CFG_EXT_TCU_ENABLE -DVX_CFG_TCU_WGMMA_ENABLE -DVX_CFG_TCU_H100_ENABLE' && make -C hw/unittest/dxa_core clean"
+    touches: *dxa_bulk_bench_touches
   - id: hw-fpamo
     via: script
     xlen: [64]
@@ -190,6 +231,14 @@ tests:
     xlen: [64]
     run: "make -C tests/unittest/cuda_fp run"
     touches: [sw/common/vx_cuda_fp.h, tests/unittest/cuda_fp]
+# The wgmma descriptor golden: the PTX descriptor fields and asserts, the descriptors
+# and operand layouts of the DAK and DeepGEMM kernels, the accumulator fragment rows,
+# and tiles written by the DXA tensor-load model for every swizzle mode, both majors
+# and 1/2/4-byte elements read back through operand_addr (bases up to 256 KB).
+  - id: sw-tcu-desc
+    via: script
+    run: "make -C tests/unittest/tcu_desc run"
+    touches: [sw/common/tcu_desc_ref.h, sw/common/dxa_ref.h, tests/unittest/tcu_desc, tests/unittest/Makefile]
   # The SimX twin of the bulk async-group unit, with the same cycle rules.
   - id: sw-bg-unit
     via: script

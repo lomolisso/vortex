@@ -29,6 +29,9 @@ module VX_tcu_tfr_norm_round import VX_tcu_pkg::*; #(
     input wire          is_int,
     input wire          sticky_in,
     input fedp_excep_t  exceptions,
+`ifdef VX_CFG_TCU_H100_ENABLE
+    input wire          is_f16d,   // round to f16 into result[15:0]
+`endif
     output wire [31:0]  result
 );
     `UNUSED_SPARAM (INSTANCE_ID)
@@ -143,6 +146,40 @@ module VX_tcu_tfr_norm_round import VX_tcu_pkg::*; #(
         end
     end
 
+`ifdef VX_CFG_TCU_H100_ENABLE
+    // Round the exact normalized sum straight to f16 (no f32 step): keep the
+    // 11 leading bits, fewer for a subnormal result, with guard and sticky
+    // from every bit below. EXP_W >= 10 here (FP16 is enabled).
+    wire signed [EXP_W-1:0] h_exp = norm_exp_base - EXP_W'(112);
+    wire h_sub = (h_exp < 1);
+    wire signed [EXP_W-1:0] h_dsh_full = EXP_W'(1) - h_exp;
+    wire [3:0] h_dsh = h_sub ? ((h_dsh_full > 12) ? 4'd12 : 4'(h_dsh_full)) : 4'd0;
+    wire h_dsh_sticky = |(shifted_sum & ((WA'(1) << h_dsh) - WA'(1)));
+    wire [WA-1:0] h_shifted = shifted_sum >> h_dsh;
+    wire [10:0] h_kept   = h_shifted[WA-1 -: 11];
+    wire        h_guard  = h_shifted[WA-12];
+    wire        h_sticky = (|h_shifted[WA-13:0]) | h_dsh_sticky | sticky_in;
+    wire        h_round  = h_guard && (h_sticky || h_kept[0]);
+    wire [15:0] h_base   = h_sub ? 16'd0 : {1'b0, 5'(h_exp - EXP_W'(1)), 10'd0};
+    wire [15:0] h_sum    = h_base + 16'(h_kept) + 16'(h_round);
+    wire        h_ovf    = (h_exp >= 31) || (h_sum >= 16'h7C00);
+    logic [15:0] h_result;
+    always_comb begin
+        if (exceptions.is_nan) begin
+            h_result = 16'h7E00;
+        end else if (exceptions.is_inf) begin
+            h_result = {exceptions.sign, 15'h7C00};
+        end else if (zero_sum) begin
+            h_result = {sum_sign, 15'd0};
+        end else if (h_ovf) begin
+            h_result = {sum_sign, 15'h7C00};
+        end else begin
+            h_result = {sum_sign, h_sum[14:0]};
+        end
+    end
+    wire [31:0] fp_result_d = is_f16d ? {16'd0, h_result} : fp_result;
+`endif
+
 `ifdef TCU_TFR_INT_ENABLE
     // Integer handling: reconstruct the two's-complement sum
     wire [WA-1:0] acc_tc = sum_sign ? (-abs_sum) : abs_sum;
@@ -162,9 +199,17 @@ module VX_tcu_tfr_norm_round import VX_tcu_pkg::*; #(
 
     wire [31:0] int_result = {int_hi, acc_tc[24:0]};
 
+`ifdef VX_CFG_TCU_H100_ENABLE
+    assign result = is_int ? int_result : fp_result_d;
+`else
     assign result = is_int ? int_result : fp_result;
+`endif
+`else
+`ifdef VX_CFG_TCU_H100_ENABLE
+    assign result = fp_result_d;
 `else
     assign result = fp_result;
+`endif
 `endif
 
 `ifndef SYNTHESIS
