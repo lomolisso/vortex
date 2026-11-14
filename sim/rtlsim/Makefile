@@ -178,6 +178,8 @@ RTL_SRCS := $(shell find $(RTL_DIRS) -type d -name syn -prune -o -type f \( -nam
 # Enable Verilator multithreaded simulation
 THREADS ?= $(shell python3 -c 'import multiprocessing as mp; print(mp.cpu_count())')
 VL_FLAGS += -j $(THREADS)
+# No grouping: grouped by -j, a few huge files serialize the g++ compile.
+VL_FLAGS += --output-groups 0
 #VL_FLAGS += --threads $(THREADS)
 
 # Debugging
