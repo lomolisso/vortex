@@ -16,6 +16,49 @@ VX_CFG_LMEM_ENABLE = true
 VX_CFG_L2_ENABLE = false
 VX_CFG_L3_ENABLE = false
 
+[hierarchy]
+# H100 organization: levels, SM memory path, HBM3; presets turn it on.
+VX_CFG_H100_ORG_ENABLE = false
+
+# Compute tree: partition > GPC > CPC > TPC > SM.
+VX_CFG_NUM_PARTITIONS = 1
+VX_CFG_GPCS_PER_PARTITION = 1
+VX_CFG_CPCS_PER_GPC = 1
+VX_CFG_TPCS_PER_CPC = 1
+VX_CFG_SMS_PER_TPC = 1
+
+# Memory tree: partition > MP > LTC > L2 slice (one DRAM channel per slice).
+VX_CFG_MPS_PER_PARTITION = 1
+VX_CFG_LTCS_PER_MP = 1
+VX_CFG_SLICES_PER_LTC = 1
+
+VX_CFG_NUM_GPCS = "expr: $VX_CFG_NUM_PARTITIONS * $VX_CFG_GPCS_PER_PARTITION"
+VX_CFG_SMS_PER_GPC = "expr: $VX_CFG_CPCS_PER_GPC * $VX_CFG_TPCS_PER_CPC * $VX_CFG_SMS_PER_TPC"
+VX_CFG_NUM_SLICES = "expr: $VX_CFG_NUM_PARTITIONS * $VX_CFG_MPS_PER_PARTITION * $VX_CFG_LTCS_PER_MP * $VX_CFG_SLICES_PER_LTC"
+
+[[check]]
+NUM_PARTITIONS_POW2 = ["expr: is_pow2($VX_CFG_NUM_PARTITIONS)", "VX_CFG_NUM_PARTITIONS must be a power of two >= 1"]
+GPCS_PER_PARTITION_POW2 = ["expr: is_pow2($VX_CFG_GPCS_PER_PARTITION)", "VX_CFG_GPCS_PER_PARTITION must be a power of two >= 1"]
+CPCS_PER_GPC_POW2 = ["expr: is_pow2($VX_CFG_CPCS_PER_GPC)", "VX_CFG_CPCS_PER_GPC must be a power of two >= 1"]
+TPCS_PER_CPC_POW2 = ["expr: is_pow2($VX_CFG_TPCS_PER_CPC)", "VX_CFG_TPCS_PER_CPC must be a power of two >= 1"]
+SMS_PER_TPC_POW2 = ["expr: is_pow2($VX_CFG_SMS_PER_TPC)", "VX_CFG_SMS_PER_TPC must be a power of two >= 1"]
+MPS_PER_PARTITION_POW2 = ["expr: is_pow2($VX_CFG_MPS_PER_PARTITION)", "VX_CFG_MPS_PER_PARTITION must be a power of two >= 1"]
+LTCS_PER_MP_POW2 = ["expr: is_pow2($VX_CFG_LTCS_PER_MP)", "VX_CFG_LTCS_PER_MP must be a power of two >= 1"]
+SLICES_PER_LTC_POW2 = ["expr: is_pow2($VX_CFG_SLICES_PER_LTC)", "VX_CFG_SLICES_PER_LTC must be a power of two >= 1"]
+
+[h100_ref]
+# H100 NVL (GPU 3) constants for scaling formulas, not knobs; integers only (no floats in expr or #if).
+VX_CFG_H100_NUM_SMS = 132                            # 01/spec.md §2 (chip.sms_enabled)
+VX_CFG_H100_NUM_SLICES = 94                          # 01/spec.md §2 (L2 slices)
+VX_CFG_H100_FB_USABLE_BYTES = 0x1745770000           # 07/spec.md §1 (org.framebuffer_usable, 93.09 GiB)
+VX_CFG_H100_DRAM_CHANNEL_BITS = 64                   # 07/spec.md §1 (org.bus_bits_per_slice)
+VX_CFG_H100_SLICE_RD_MILLIBYTES_PER_DRAMCLK = 15500  # 18/spec.md §9.3 (noc.hbm.slice_read_bytes_per_dram_cycle, 15.5 B)
+VX_CFG_H100_SLICE_PEAK_BYTES_PER_DRAMCLK = 16        # 18/spec.md §9.3 (noc.hbm.slice_peak_bytes_per_dram_cycle)
+VX_CFG_H100_SLICE_RD_MBPS = 40600                    # 18/spec.md §9.3 (per-slice DRAM read, 40.6 GB/s)
+VX_CFG_H100_SLICE_WR_MBPS = 40800                    # 18/spec.md §9.3 (per-slice DRAM write, 40.8 GB/s)
+VX_CFG_H100_DRAM_QD = 64                             # 18/spec.md §0.6 D3 (noc.sim.c4.qd)
+VX_CFG_H100_PEAK_MEM_BW_MBPS = 3938000               # 07/spec.md §1 (peak bandwidth, 3938 GB/s)
+
 
 [isa]
 
@@ -76,6 +119,7 @@ VX_CFG_NUM_VGPR_BANKS = 2
 [memory]
 VX_CFG_MEM_BLOCK_SIZE = 64
 VX_CFG_MEM_ADDR_WIDTH = "expr: 48 if $VX_CFG_XLEN_64 else 32"
+VX_CFG_GLOBAL_MEM_SIZE = "expr: 0x200000000 if $VX_CFG_XLEN_64 else 0x100000000"
 
 # L1 block = memory bus (MEM_BLOCK), shared by icache/dcache/gfx + L2 input word.
 # L2/L3 are sectored: a doubled line halves tags while the sector (= MEM_BLOCK)

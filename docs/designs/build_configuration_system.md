@@ -175,6 +175,31 @@ a **misspelled or un-prefixed knob is silently ignored**: `-DL2_ENABLE` or
 `-DICACHE_DISABLE` changes nothing, because the keys are `VX_CFG_L2_ENABLE`
 and `VX_CFG_ICACHE_ENABLE`. Always spell the full prefix.
 
+### 4.5 Configuration checks — `[[check]]`
+
+A `[[check]]` table holds constraints, one per key:
+
+```toml
+[[check]]
+NUM_PARTITIONS_POW2 = ["expr: is_pow2($VX_CFG_NUM_PARTITIONS)", "VX_CFG_NUM_PARTITIONS must be a power of two >= 1"]
+MEM_FITS = "expr: $VX_CFG_GLOBAL_MEM_SIZE >= $VX_CFG_NUM_SLICES * 0x1000"
+```
+
+- **Every run evaluates every check**, resolved, with the `-D` overrides (and
+  `XLEN` from the environment in header mode). A false check exits non-zero
+  with its name, message (default: the expression) and the values it read:
+  `configure` stops; a Makefile's `$(shell ... --cflags)` prints it (make
+  itself does not stop on a failed `$(shell)`; the compile then stops at the
+  header's `#error`).
+- **The C header repeats each check** as `#if !(<expr>)` / `#error`, so a `-D`
+  given only to the compiler is checked too. Booleans are tested as
+  `defined(NAME)`. A check cannot read a knob whose C form uses `pow()` or
+  `clog2()` (constexpr functions), a string or a `[[param]]`; the generator
+  rejects it.
+- **The Verilog header gets no checks.** RTL modules assert the constraints
+  they rely on with `` `STATIC_ASSERT ``, and SimX in its constructors.
+- Messages may not contain `#` (the TOML reader strips comments at `#`).
+
 ---
 
 ## 5. The header pass — `configure`

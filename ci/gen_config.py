@@ -28,6 +28,17 @@ Key features:
   - Supports [[builtin]] blocks in TOML to declare environment-sourced variables used only in expr evaluation.
   - Supports [[param]] blocks in TOML to declare parameter variables used only in expr evaluation / unresolved RHS.
   - builtin/param variables are NOT emitted to outputs.
+  - Supports [[check]] blocks in TOML: configuration constraints, one per key,
+    `NAME = "expr: <boolean>"` or `NAME = ["expr: <boolean>", "message"]`.
+    Every check is evaluated in resolved mode on each run (all formats, with the
+    -D overrides; XLEN comes from the environment when not overridden) and a
+    failure exits with the check's name, message and the values it read. The C
+    header also gets `#if !(<expr>) / #error` per check, so a compile-time -D
+    override is checked too. The Verilog header gets nothing: RTL modules assert
+    their constraints with `STATIC_ASSERT`. A check may reference integer knobs,
+    booleans (tested as `defined(NAME)` in C) and helpers other than pow/clog2
+    (e.g. `is_pow2(x)`), since its C form must be a preprocessor expression.
+    Messages may not contain '#' (comments are stripped at '#').
   - Supports "expr:" values in TOML, with $NAME references.
   - supports local/private variables as lowercase definitions to use with expressions.
   - Auto-generates an integer `X_ENABLED` (1/0) mirror for every boolean
@@ -199,6 +210,7 @@ def _scan_hex_literals(toml_path: str) -> Dict[str, HexMeta]:
   in_enum = False
   in_builtin = False
   in_param = False
+  in_check = False
   with open(toml_path, "r", encoding="utf-8") as f:
     for raw_line in f:
       line = raw_line.rstrip("\n")
@@ -209,13 +221,15 @@ def _scan_hex_literals(toml_path: str) -> Dict[str, HexMeta]:
         in_enum = (s == "[[enum]]")
         in_builtin = (s == "[[builtin]]")
         in_param = (s == "[[param]]")
+        in_check = (s == "[[check]]")
         continue
       if s.startswith("[") and s.endswith("]"):
         in_enum = False
         in_builtin = False
         in_param = False
+        in_check = False
         continue
-      if in_enum or in_builtin or in_param:
+      if in_enum or in_builtin or in_param or in_check:
         continue
       if "=" in line:
         rhs = line.split("=", 1)[1].lstrip()
@@ -278,7 +292,7 @@ def _flatten_with_layout(toml_data: Dict[str, Any]) -> Tuple[Dict[str, Any], Lay
 
   root_keys: List[str] = []
   for top_k, top_v in toml_data.items():
-    if top_k in ("enum", "builtin", "param"):
+    if top_k in ("enum", "builtin", "param", "check"):
       continue
     if isinstance(top_v, dict):
       sec_keys: List[str] = []
@@ -647,6 +661,18 @@ class Clog2Helper(HelperSpec):
       return "0"
     return f"{d.ref(self.macro)}({args[0]})"
 
+class IsPow2Helper(HelperSpec):
+  fn = "is_pow2"
+  macro = "__IS_POW2"
+
+  def emit(self, d: Dialect) -> List[str]:
+    return _guarded_macro(d, self.macro, "(x) (((x) >= 1) && (((x) & ((x) - 1)) == 0))")
+
+  def translate_call(self, d: Dialect, args: List[str]) -> str:
+    if len(args) != 1:
+      return "0"
+    return f"{d.ref(self.macro)}({args[0]})"
+
 HELPERS: Dict[str, HelperSpec] = {
   "min": MinHelper(),
   "max": MaxHelper(),
@@ -654,6 +680,7 @@ HELPERS: Dict[str, HelperSpec] = {
   "clamp": ClampHelper(),
   "pow": PowHelper(),
   "clog2": Clog2Helper(),
+  "is_pow2": IsPow2Helper(),
 }
 
 
@@ -1167,14 +1194,7 @@ def _emit_enabled_companion_unresolved(lines: List[str], d: Dialect, key: str) -
   lines.append("")
 
 
-def emit_unresolved_header(toml_defs: Dict[str, Any], layout: Layout, enums: Dict[str, EnumSpec],
-                           fmt: str, output_path: Optional[str], hex_meta: Dict[str, HexMeta],
-                           params: Set[str]) -> str:
-  d = Dialect("c" if fmt == "cpp" else "sv")
-  tool = os.path.basename(sys.argv[0])
-
-  locals_ast = _build_local_asts(toml_defs)
-
+def _key_helpers_used(toml_defs: Dict[str, Any], layout: Layout) -> Set[str]:
   # Helpers used by lowercase locals must still be emitted, since locals are
   # inlined into public-key expressions.
   used: Set[str] = set()
@@ -1184,6 +1204,17 @@ def emit_unresolved_header(toml_defs: Dict[str, Any], layout: Layout, enums: Dic
       continue
     expr = _extract_expr(str(raw)) or ""
     used |= _helpers_used(expr)
+  return used
+
+
+def emit_unresolved_header(toml_defs: Dict[str, Any], layout: Layout, enums: Dict[str, EnumSpec],
+                           fmt: str, output_path: Optional[str], hex_meta: Dict[str, HexMeta],
+                           params: Set[str], check_lines: List[str]) -> str:
+  d = Dialect("c" if fmt == "cpp" else "sv")
+  tool = os.path.basename(sys.argv[0])
+
+  locals_ast = _build_local_asts(toml_defs)
+  used = _key_helpers_used(toml_defs, layout)
 
   guard = _make_guard_macro(output_path, "GEN_CONFIG")
   lines: List[str] = []
@@ -1219,6 +1250,7 @@ def emit_unresolved_header(toml_defs: Dict[str, Any], layout: Layout, enums: Dic
       lines.append(f"// --- {sec} ---")
     lines.extend(sec_lines)
 
+  lines.extend(check_lines)
   lines.append("")
   lines.append(f"{d.endif()}  // {guard}")
   return "\n".join(lines).rstrip() + "\n"
@@ -1265,6 +1297,11 @@ def _py_clog2(x: Any) -> Any:
   if xi <= 1:
     return 0
   return (xi - 1).bit_length()
+
+
+def _py_is_pow2(x: Any) -> bool:
+  xi = int(x)
+  return xi >= 1 and (xi & (xi - 1)) == 0
 
 
 class Resolver:
@@ -1378,6 +1415,8 @@ class EvalScope(dict):
       return _py_pow
     if k == "clog2":
       return _py_clog2
+    if k == "is_pow2":
+      return _py_is_pow2
     if k == "int":
       return int
     if k == "bool":
@@ -1392,7 +1431,8 @@ class EvalScope(dict):
 
 
 def emit_resolved_header(cfg: Dict[str, Any], layout: Layout, enums: Dict[str, EnumSpec],
-                         fmt: str, output_path: Optional[str], hex_meta: Dict[str, HexMeta]) -> str:
+                         fmt: str, output_path: Optional[str], hex_meta: Dict[str, HexMeta],
+                         check_lines: List[str]) -> str:
   d = Dialect("c" if fmt == "cpp" else "sv")
   tool = os.path.basename(sys.argv[0])
   guard = _make_guard_macro(output_path, "GEN_CONFIG")
@@ -1441,6 +1481,7 @@ def emit_resolved_header(cfg: Dict[str, Any], layout: Layout, enums: Dict[str, E
       lines.append(f"// --- {sec} ---")
     lines.extend(sec_lines)
 
+  lines.extend(check_lines)
   lines.append("")
   lines.append(f"{d.endif()}  // {guard}")
   return "\n".join(lines).rstrip() + "\n"
@@ -1478,6 +1519,173 @@ def emit_cflags(cfg: Dict[str, Any], layout: Layout, enums: Dict[str, EnumSpec],
 
 
 # -----------------------------
+# Configuration checks (declared in TOML with [[check]])
+# -----------------------------
+
+class ConfigCheckError(ValueError):
+  pass
+
+
+@dataclass(frozen=True)
+class CheckSpec:
+  name: str
+  expr: str
+  message: str
+
+
+_EXPR_FUNCS = set(HELPERS.keys()) | {"int", "bool", "True", "False", "true", "false", "None"}
+
+
+def _load_checks(toml_data: Dict[str, Any]) -> List[CheckSpec]:
+  arr = toml_data.get("check", None)
+  if arr is None:
+    return []
+  if not isinstance(arr, list):
+    raise ValueError("TOML 'check' must be an array of tables (use [[check]])")
+
+  out: List[CheckSpec] = []
+  seen: Set[str] = set()
+  for i, item in enumerate(arr):
+    if not isinstance(item, dict) or len(item) == 0:
+      raise ValueError(f"check[{i}] must be a non-empty table like: [[check]] NAME = \"expr: ...\"")
+    for name, val in item.items():
+      if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name):
+        raise ValueError(f"Invalid check name: {name!r}")
+      if name in seen:
+        raise ValueError(f"Duplicate check name: {name}")
+      seen.add(name)
+      message: Optional[str] = None
+      if isinstance(val, list):
+        if len(val) != 2 or not all(isinstance(x, str) for x in val):
+          raise ValueError(f"check {name} must be \"expr: ...\" or [\"expr: ...\", \"message\"]")
+        val, message = val
+      if not _is_expr_string(val):
+        raise ValueError(f"check {name} must be an \"expr: <boolean>\" string, got {val!r}")
+      expr = _extract_expr(str(val)) or ""
+      out.append(CheckSpec(name=name, expr=expr, message=message or _preprocess_expr(expr)))
+  return out
+
+
+def _expr_names(expr: str) -> List[str]:
+  tree = ast.parse(_preprocess_expr(expr), mode="eval")
+  names: List[str] = []
+  for n in ast.walk(tree):
+    if isinstance(n, ast.Name) and n.id not in _EXPR_FUNCS and n.id not in names:
+      names.append(n.id)
+  return names
+
+
+def _fmt_check_value(v: Any) -> str:
+  if isinstance(v, bool):
+    return "true" if v else "false"
+  return str(v)
+
+
+def _seed_enums_from_env(overrides: Dict[str, Any], toml_defs: Dict[str, Any],
+                         enums: Dict[str, EnumSpec]) -> Dict[str, Any]:
+  # Enums without a TOML default (XLEN) are build axes: configure exports them
+  # to the environment, so header-mode checks resolve with the build's value.
+  out = dict(overrides)
+  for name, spec in enums.items():
+    if name in out or name in toml_defs or not name.startswith("VX_CFG_"):
+      continue
+    env = os.environ.get(name[len("VX_CFG_"):])
+    if env is None:
+      continue
+    v = _scalar(env)
+    if v in spec.values:
+      out[name] = v
+  return out
+
+
+def _run_checks(checks: List[CheckSpec], r: "Resolver") -> None:
+  failures: List[str] = []
+  for c in checks:
+    try:
+      ok = _truthy(r._eval(c.expr))
+      if ok:
+        continue
+      vals = ", ".join(f"{n}={_fmt_check_value(r.resolve(n))}" for n in _expr_names(c.expr))
+    except ValueError as e:
+      raise ConfigCheckError(f"configuration check {c.name} could not be evaluated: {e}") from e
+    failures.append(f"  {c.name}: {c.message} ({vals})")
+  if failures:
+    raise ConfigCheckError("configuration check failed:\n" + "\n".join(failures))
+
+
+def _check_c_blocker(node: ast.AST, toml_defs: Dict[str, Any], ro: Set[str],
+                     locals_ast: Dict[str, ast.AST], seen: Set[str]) -> Optional[str]:
+  """Why `node` (or a knob it reads, transitively) has no preprocessor form."""
+  for n in ast.walk(node):
+    if isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id in ("pow", "clog2"):
+      return f"uses {n.func.id}(), a constexpr function in C"
+    if isinstance(n, ast.Constant) and isinstance(n.value, str):
+      return f"uses the string {n.value!r}"
+    if not isinstance(n, ast.Name) or n.id in _EXPR_FUNCS or n.id in seen:
+      continue
+    seen.add(n.id)
+    if n.id in ro:
+      return f"reads {n.id}, a [[param]]/[[builtin]] the C header does not define"
+    raw = toml_defs.get(n.id)
+    if raw is None:
+      continue
+    if _is_expr_string(raw):
+      sub = ast.parse(_preprocess_expr(_extract_expr(str(raw)) or ""), mode="eval").body
+      why = _check_c_blocker(_inline_locals_into(sub, locals_ast), toml_defs, ro, locals_ast, seen)
+      if why:
+        return f"reads {n.id}, which {why}"
+    elif isinstance(raw, str) and isinstance(_scalar(raw), str):
+      return f"reads {n.id}, a string"
+  return None
+
+
+class _CheckExprTranslator(MacroExprTranslator):
+  def __init__(self, d: Dialect, params: Set[str], expr_src: str, r: "Resolver") -> None:
+    super().__init__(d, params=params, expr_src=expr_src)
+    self.r = r
+
+  def _name_ref(self, name: str) -> str:
+    # Booleans are emitted as present/absent macros, so #if must test presence.
+    if isinstance(self.r.resolve(name), bool):
+      return f"defined({name})"
+    return super()._name_ref(name)
+
+
+def emit_checks_c(checks: List[CheckSpec], toml_defs: Dict[str, Any], enums: Dict[str, EnumSpec],
+                  params: Set[str], ro: Set[str], r: "Resolver", emitted_helpers: Set[str]) -> List[str]:
+  if not checks:
+    return []
+  d = Dialect("c")
+  locals_ast = _build_local_asts(toml_defs)
+  used: Set[str] = set()
+  body: List[str] = []
+  for c in checks:
+    expr2 = _preprocess_expr(c.expr)
+    tree = ast.parse(expr2, mode="eval")
+    tree.body = _inline_locals_into(tree.body, locals_ast)
+    why = _check_c_blocker(tree.body, toml_defs, ro, locals_ast, set())
+    if why:
+      raise ValueError(f"check {c.name} has no C preprocessor form: it {why}")
+    used |= _helpers_used(expr2)
+    try:
+      cond = _CheckExprTranslator(d, params=params, expr_src=expr2, r=r)._emit(tree.body, current_key=None, enums=enums)
+    except ValueError as e:
+      raise ValueError(f"check {c.name}: {e} (use and/or/not, comparisons and helpers)") from e
+    body.append(f"#if !({cond})")
+    body.append(f"#error {_cpp_quote(c.name + ': ' + c.message)}")
+    body.append("#endif")
+    body.append("")
+
+  lines: List[str] = ["", "// --- checks ---"]
+  for fn in sorted(used - emitted_helpers):
+    lines.extend(HELPERS[fn].emit(d))
+  lines.extend(body)
+  while lines and lines[-1] == "":
+    lines.pop()
+  return lines
+
+
+# -----------------------------
 # Main
 # -----------------------------
 
@@ -1498,6 +1706,7 @@ def main(argv: List[str]) -> int:
   builtins = _load_var_table(toml_data, "builtin")
   params_tbl = _load_var_table(toml_data, "param")
   params_set = set(params_tbl.keys())
+  checks = _load_checks(toml_data)
 
   toml_defs, layout = _flatten_with_layout(toml_data)
 
@@ -1523,7 +1732,16 @@ def main(argv: List[str]) -> int:
       "Remove these -D flags; [[param]]/[[builtin]] values are read-only."
     )
 
+  check_r = Resolver(base=toml_defs, overrides=_seed_enums_from_env(overrides, toml_defs, enums),
+                     enums=enums, builtins=builtins, params=params_tbl)
+  _run_checks(checks, check_r)
+
   resolved = True if args.format == "cflags" else args.resolved
+
+  check_lines: List[str] = []
+  if args.format == "cpp":
+    emitted = set() if resolved else _key_helpers_used(toml_defs, layout)
+    check_lines = emit_checks_c(checks, toml_defs, enums, params_set, ro, check_r, emitted)
 
   if resolved:
     r = Resolver(base=toml_defs, overrides=overrides, enums=enums, builtins=builtins, params=params_tbl)
@@ -1537,13 +1755,14 @@ def main(argv: List[str]) -> int:
     if args.format == "cflags":
       out = emit_cflags(cfg, layout, enums, hex_meta)
     elif args.format == "cpp":
-      out = emit_resolved_header(cfg, layout, enums, "cpp", args.output, hex_meta)
+      out = emit_resolved_header(cfg, layout, enums, "cpp", args.output, hex_meta, check_lines)
     else:
-      out = emit_resolved_header(cfg, layout, enums, "verilog", args.output, hex_meta)
+      out = emit_resolved_header(cfg, layout, enums, "verilog", args.output, hex_meta, [])
   else:
     if args.format == "cflags":
       raise ValueError("Internal: cflags output is always resolved")
-    out = emit_unresolved_header(toml_defs, layout, enums, args.format, args.output, hex_meta, params_set)
+    out = emit_unresolved_header(toml_defs, layout, enums, args.format, args.output, hex_meta, params_set,
+                                 check_lines)
 
   if args.output:
     with open(args.output, "w", encoding="utf-8") as f:
@@ -1554,4 +1773,8 @@ def main(argv: List[str]) -> int:
 
 
 if __name__ == "__main__":
-  raise SystemExit(main(sys.argv[1:]))
+  try:
+    raise SystemExit(main(sys.argv[1:]))
+  except ConfigCheckError as e:
+    sys.stderr.write(f"{os.path.basename(sys.argv[0])}: {e}\n")
+    raise SystemExit(1)
