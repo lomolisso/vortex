@@ -43,8 +43,9 @@ constexpr unsigned vm_clog2(uint64_t n) {
 constexpr unsigned VM_VPN_BITS = vm_clog2(VX_VM_PT_SIZE / VX_VM_PTE_SIZE);
 } // namespace
 
-VMManager::VMManager(DeviceMemIO* dev_io)
+VMManager::VMManager(DeviceMemIO* dev_io, uint64_t global_mem_size)
     : dev_io_(dev_io),
+      global_mem_size_(global_mem_size),
       satp_(nullptr),
       page_table_mem_(nullptr),
       virtual_mem_(nullptr) {
@@ -81,7 +82,7 @@ int VMManager::init() {
   if (page_table_mem_ == nullptr)
     return 1;
 
-  uint64_t virtual_mem_size = (GLOBAL_MEM_SIZE - ALLOC_BASE_ADDR);
+  uint64_t virtual_mem_size = (global_mem_size_ - ALLOC_BASE_ADDR);
 #if VX_VM_ADDR_MODE == SV32
   // Keep VAs within the 32-bit address space.
   uint64_t max_va_end = 0x100000000ULL;
@@ -111,7 +112,7 @@ int VMManager::init() {
     // via mem_reserve() once the loader knows its extents.
     CHECK_ERR(install_identity_map(0, VX_MEM_USER_BASE_ADDR), { return err; });
     CHECK_ERR(install_identity_map(VX_MEM_PAGE_TABLE_BASE_ADDR,
-                                   GLOBAL_MEM_SIZE - VX_MEM_PAGE_TABLE_BASE_ADDR), {
+                                   global_mem_size_ - VX_MEM_PAGE_TABLE_BASE_ADDR), {
       return err;
     });
   }

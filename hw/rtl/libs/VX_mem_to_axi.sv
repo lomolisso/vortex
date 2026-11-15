@@ -31,6 +31,7 @@ module VX_mem_to_axi #(
     parameter NUM_PORTS_IN      = 1,
     parameter NUM_BANKS_OUT     = 1,
     parameter INTERLEAVE        = 0,
+    parameter BANK_SEL_SHIFT    = 0, // interleave: low block-address bits kept below the bank select
     parameter TAG_BUFFER_SIZE   = 16,
     parameter WRITE_TRACK_DEPTH = 8, // outstanding writes tracked per bank
     parameter ARBITER           = "R",
@@ -124,6 +125,7 @@ module VX_mem_to_axi #(
 
     `STATIC_ASSERT ((DST_ADDR_WDITH >= ADDR_WIDTH_IN), ("invalid address width: current=%0d, expected=%0d", DST_ADDR_WDITH, ADDR_WIDTH_IN))
     `STATIC_ASSERT ((TAG_WIDTH_OUT >= DST_TAG_WIDTH), ("invalid output tag width: current=%0d, expected=%0d", TAG_WIDTH_OUT, DST_TAG_WIDTH))
+    `STATIC_ASSERT ((BANK_SEL_SHIFT < BANK_ADDR_WIDTH), ("invalid bank select shift: current=%0d", BANK_SEL_SHIFT))
     `STATIC_ASSERT ((WRITE_TRACK_DEPTH >= 2) && `IS_POW2(WRITE_TRACK_DEPTH), ("WRITE_TRACK_DEPTH must be a power of 2 >= 2: current=%0d", WRITE_TRACK_DEPTH))
 
     // Bank selection
@@ -134,7 +136,11 @@ module VX_mem_to_axi #(
     if (NUM_BANKS_OUT > 1) begin : g_bank_sel
         for (genvar i = 0; i < NUM_PORTS_IN; ++i) begin : g_i
             wire [DST_ADDR_WDITH-1:0] mem_req_addr_dst = DST_ADDR_WDITH'(mem_req_addr[i]);
-            if (INTERLEAVE) begin : g_interleave
+            if (INTERLEAVE && BANK_SEL_SHIFT != 0) begin : g_interleave_shift
+                assign req_bank_sel[i]  = mem_req_addr_dst[BANK_SEL_SHIFT +: BANK_SEL_BITS];
+                assign req_bank_addr[i] = {mem_req_addr_dst[BANK_SEL_SHIFT + BANK_SEL_BITS +: BANK_ADDR_WIDTH - BANK_SEL_SHIFT],
+                                           mem_req_addr_dst[BANK_SEL_SHIFT-1:0]};
+            end else if (INTERLEAVE) begin : g_interleave
                 assign req_bank_sel[i]  = mem_req_addr_dst[BANK_SEL_BITS-1:0];
                 assign req_bank_addr[i] = mem_req_addr_dst[BANK_SEL_BITS +: BANK_ADDR_WIDTH];
             end else begin : g_no_interleave
@@ -317,7 +323,11 @@ module VX_mem_to_axi #(
 
         assign m_axi_awvalid[i] = req_xbar_valid_out[i] && xbar_rw_out && ~m_axi_aw_ack && wr_start_allowed;
 
-    if (INTERLEAVE) begin : g_m_axi_awaddr_i
+    if (INTERLEAVE && BANK_SEL_SHIFT != 0) begin : g_m_axi_awaddr_s
+        assign m_axi_awaddr[i]  = ((ADDR_WIDTH_OUT'(xbar_addr_out) >> BANK_SEL_SHIFT) << (BANK_SEL_SHIFT + BANK_SEL_BITS + LOG2_DATA_SIZE))
+                                 | (ADDR_WIDTH_OUT'(i) << (BANK_SEL_SHIFT + LOG2_DATA_SIZE))
+                                 | ((ADDR_WIDTH_OUT'(xbar_addr_out) & ((ADDR_WIDTH_OUT'(1) << BANK_SEL_SHIFT) - 1)) << LOG2_DATA_SIZE);
+    end else if (INTERLEAVE) begin : g_m_axi_awaddr_i
         assign m_axi_awaddr[i]  = (ADDR_WIDTH_OUT'(xbar_addr_out) << (BANK_SEL_BITS + LOG2_DATA_SIZE)) | (ADDR_WIDTH_OUT'(i) << LOG2_DATA_SIZE);
     end else begin : g_m_axi_awaddr_ni
         assign m_axi_awaddr[i]  = (ADDR_WIDTH_OUT'(xbar_addr_out) << LOG2_DATA_SIZE) | (ADDR_WIDTH_OUT'(i) << (BANK_ADDR_WIDTH + LOG2_DATA_SIZE));
@@ -353,7 +363,11 @@ module VX_mem_to_axi #(
         assign m_axi_arvalid[i] = req_xbar_valid_out[i] && ~xbar_rw_out && ~rd_hazard;
 
         // convert address to byte-addressable space
-    if (INTERLEAVE) begin : g_m_axi_araddr_i
+    if (INTERLEAVE && BANK_SEL_SHIFT != 0) begin : g_m_axi_araddr_s
+        assign m_axi_araddr[i]  = ((ADDR_WIDTH_OUT'(xbar_addr_out) >> BANK_SEL_SHIFT) << (BANK_SEL_SHIFT + BANK_SEL_BITS + LOG2_DATA_SIZE))
+                                 | (ADDR_WIDTH_OUT'(i) << (BANK_SEL_SHIFT + LOG2_DATA_SIZE))
+                                 | ((ADDR_WIDTH_OUT'(xbar_addr_out) & ((ADDR_WIDTH_OUT'(1) << BANK_SEL_SHIFT) - 1)) << LOG2_DATA_SIZE);
+    end else if (INTERLEAVE) begin : g_m_axi_araddr_i
         assign m_axi_araddr[i]  = (ADDR_WIDTH_OUT'(xbar_addr_out) << (BANK_SEL_BITS + LOG2_DATA_SIZE)) | (ADDR_WIDTH_OUT'(i) << LOG2_DATA_SIZE);
     end else begin : g_m_axi_araddr_ni
         assign m_axi_araddr[i]  = (ADDR_WIDTH_OUT'(xbar_addr_out) << LOG2_DATA_SIZE) | (ADDR_WIDTH_OUT'(i) << (BANK_ADDR_WIDTH + LOG2_DATA_SIZE));

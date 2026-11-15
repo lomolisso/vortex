@@ -26,8 +26,12 @@ constexpr unsigned cp_clog2(uint64_t n) {
 }
 uint64_t gpu_dev_caps() {
     const unsigned cluster_size = VX_CFG_NUM_CORES / VX_CFG_SOCKET_SIZE;
-    const unsigned bank_addr_w  = VX_CFG_PLATFORM_MEMORY_ADDR_WIDTH
-                                - cp_clog2(VX_CFG_PLATFORM_MEMORY_NUM_BANKS);
+    // A channel's capacity; the runtime sizes its allocator from channels x this.
+    const unsigned lg_bank_size = cp_clog2(VX_CFG_GLOBAL_MEM_SIZE)
+                                - cp_clog2(VX_CFG_DRAM_CHANNELS);
+    static_assert(cp_clog2(VX_CFG_GLOBAL_MEM_SIZE) - cp_clog2(VX_CFG_DRAM_CHANNELS) >= 20
+               && cp_clog2(VX_CFG_GLOBAL_MEM_SIZE) - cp_clog2(VX_CFG_DRAM_CHANNELS) <= 51,
+                  "a DRAM channel must hold 1 MiB to 2^51 bytes (caps field)");
     uint64_t caps = (uint64_t(VX_ISA_IMPL_ID) & 0xFF)
          | ((uint64_t(cp_clog2(VX_CFG_NUM_THREADS))  & 0x7)  << 8)
          | ((uint64_t(cp_clog2(VX_CFG_NUM_WARPS))    & 0x7)  << 11)
@@ -36,8 +40,8 @@ uint64_t gpu_dev_caps() {
          | ((uint64_t(cp_clog2(VX_CFG_NUM_CLUSTERS)) & 0x7)  << 20)
          | ((uint64_t(cp_clog2(VX_CFG_ISSUE_WIDTH))  & 0x7)  << 23)
          | ((uint64_t(VX_CFG_LMEM_ENABLED ? VX_CFG_LMEM_LOG_SIZE : 0) & 0xFF) << 26)
-         | ((uint64_t(cp_clog2(VX_CFG_PLATFORM_MEMORY_NUM_BANKS)) & 0x7) << 34)
-         | ((uint64_t(bank_addr_w - 20) & 0x1F) << 37);
+         | ((uint64_t(cp_clog2(VX_CFG_DRAM_CHANNELS)) & 0x7) << 34)
+         | ((uint64_t(lg_bank_size - 20) & 0x1F) << 37);
 #ifdef VX_CFG_EXT_DLMEM_ENABLE
     caps |= (uint64_t(VX_CFG_DLMEM_MAX_CLUSTER) & 0x7F) << 42;
 #endif

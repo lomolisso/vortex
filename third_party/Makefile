@@ -6,7 +6,7 @@ softfloat:
 	SPECIALIZE_TYPE=RISCV SOFTFLOAT_OPTS="-fPIC -DSOFTFLOAT_ROUND_ODD -DINLINE_LEVEL=5 -DSOFTFLOAT_FAST_DIV32TO16 -DSOFTFLOAT_FAST_DIV64TO32 -DTHREAD_LOCAL=_Thread_local" $(MAKE) -C softfloat/build/Linux-x86_64-GCC
 
 ramulator/libramulator.so:
-	cd ramulator && mkdir -p build && cd build && cmake .. && make -j4
+	cd ramulator && mkdir -p build && cd build && cmake .. -DRAMULATOR_PYTHON_BINDINGS=OFF $(RAMULATOR_CMAKE_FLAGS) && make -j4
 ramulator: ramulator/libramulator.so
 
 cocogfx/libcocogfx.a:

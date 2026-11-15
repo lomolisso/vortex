@@ -80,8 +80,8 @@ KNOBS = [
     ("l2_banks",         "VX_CFG_L2_NUM_BANKS",               "--l2-banks",         True,  False),
     ("l2_mshr",          "VX_CFG_L2_MSHR_SIZE",               "--l2-mshr",          False, False),
     ("l2_writeback",     "VX_CFG_L2_WRITEBACK",               "--l2-writeback",     False, False),
-    ("mem_banks",        "VX_CFG_PLATFORM_MEMORY_NUM_BANKS",  "--mem-banks",        True,  False),
-    ("mem_data_size",    "VX_CFG_PLATFORM_MEMORY_DATA_SIZE",  "--mem-data-size",    True,  False),
+    ("mem_banks",        "VX_CFG_DRAM_CHANNELS",  "--mem-banks",        True,  False),
+    ("mem_data_size",    "VX_CFG_DRAM_PORT_DATA_SIZE",  "--mem-data-size",    True,  False),
 ]
 
 KNOB_BY_NAME = {k[0]: k for k in KNOBS}
@@ -589,7 +589,7 @@ def plot_roofline(args, cfg, ipc, instrs, cycles, total_bytes, outfile):
     mem_bytes  = cfg.get("mem_data_size", 64) or 64
     mem_banks  = cfg.get("mem_banks", 2)    or 2
 
-    # VX_CFG_PLATFORM_MEMORY_PEAK_BW (VX_config.toml), in GB/s
+    # VX_CFG_PEAK_MEM_BW (VX_config.toml), in GB/s
     PLATFORM_PEAK_BW_GBS = 460.0
 
     peak_flops_per_cycle = (args.peak_flops if args.peak_flops is not None

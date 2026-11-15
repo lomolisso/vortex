@@ -79,6 +79,8 @@ module vortex_afu import ccip_if_pkg::*; import local_mem_cfg_pkg::*; import VX_
 
     localparam CLUSTER_SIZE = `VX_CFG_NUM_CORES / `VX_CFG_SOCKET_SIZE;
     `STATIC_ASSERT((CLUSTER_SIZE * `VX_CFG_SOCKET_SIZE) == `VX_CFG_NUM_CORES, ("NUM_CORES must be a multiple of SOCKET_SIZE"));
+    // VX_mem_to_avs selects the bank from the lowest block-address bits only.
+    `STATIC_ASSERT(`VX_CFG_DRAM_INTERLEAVE_SHIFT == 0, ("the OPAE memory path has no DRAM-line channel select"));
 
     // Vortex memory ports ////////////////////////////////////////////////////
 
@@ -668,7 +670,7 @@ module vortex_afu import ccip_if_pkg::*; import local_mem_cfg_pkg::*; import VX_
         .NUM_BANKS_OUT (NUM_LOCAL_MEM_BANKS),
         .TAG_WIDTH     (AVS_TAG_WIDTH),
         .RD_QUEUE_SIZE (AVS_RD_QUEUE_SIZE),
-        .INTERLEAVE    (`VX_CFG_PLATFORM_MEMORY_INTERLEAVE),
+        .INTERLEAVE    (`VX_CFG_DRAM_INTERLEAVE),
         .REQ_OUT_BUF   (2),
         .RSP_OUT_BUF   ((VX_MEM_PORTS > 1 || NUM_LOCAL_MEM_BANKS > 1) ? 2 : 0)
     ) avs_adapter (

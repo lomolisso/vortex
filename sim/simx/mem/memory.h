@@ -22,10 +22,9 @@ namespace vortex {
 class Memory : public SimObject<Memory>{
 public:
 	struct Config {
-		uint32_t num_banks;
+		uint32_t num_channels;
 		uint32_t num_ports;
 		uint32_t block_size;
-		float clock_ratio;
 	};
 
 	struct PerfStats {

@@ -125,8 +125,10 @@ module VX_cp_axil_regfile
   // Exposed RO so the host runtime reads device/ISA caps from a single
   // platform-neutral source. sw/runtime/common/vx_caps.h is the decoder.
   localparam int GPU_CLUSTER_SIZE = `VX_CFG_NUM_CORES / `VX_CFG_SOCKET_SIZE;
-  localparam int GPU_BANK_ADDR_W  = `VX_CFG_PLATFORM_MEMORY_ADDR_WIDTH
-                                  - `CLOG2(`VX_CFG_PLATFORM_MEMORY_NUM_BANKS);
+  // A channel's capacity; the runtime sizes its allocator from channels x this.
+  localparam int GPU_LG_BANK_SIZE = $clog2(`VX_CFG_GLOBAL_MEM_SIZE)
+                                  - `CLOG2(`VX_CFG_DRAM_CHANNELS);
+  `STATIC_ASSERT ((GPU_LG_BANK_SIZE >= 20) && (GPU_LG_BANK_SIZE <= 51), ("a DRAM channel must hold 1 MiB to 2^51 bytes (caps field)"))
 
   wire [63:0] gpu_dev_caps = {
 `ifdef VX_CFG_EXT_DLMEM_ENABLE
@@ -135,8 +137,8 @@ module VX_cp_axil_regfile
 `else
     22'b0,
 `endif
-    5'(GPU_BANK_ADDR_W - 20),
-    3'($clog2(`VX_CFG_PLATFORM_MEMORY_NUM_BANKS)),
+    5'(GPU_LG_BANK_SIZE - 20),
+    3'($clog2(`VX_CFG_DRAM_CHANNELS)),
     8'(`VX_CFG_LMEM_ENABLED ? `VX_CFG_LMEM_LOG_SIZE : 0),
     3'($clog2(`VX_CFG_ISSUE_WIDTH)),
     3'($clog2(`VX_CFG_NUM_CLUSTERS)),

@@ -169,6 +169,16 @@ struct line_t {
   }
 };
 
+// Byte enables are positioned within the MEM_BLOCK_SIZE block, as the sector's data is.
+static inline uint64_t writeback_byteen(const Cache::Config& config, const sector_t& sec, uint64_t addr) {
+  if (config.dirty_bytes)
+    return sec.dirty_mask;
+  uint32_t size = 1u << config.S;
+  if (size >= 64)
+    return ~uint64_t(0);
+  return ((uint64_t(1) << size) - 1) << (addr & (VX_CFG_MEM_BLOCK_SIZE - 1));
+}
+
 static inline void sector_merge(sector_t& sec, const std::shared_ptr<mem_block_t>& src, uint64_t byteen) {
   // Copy-on-write only when shared. sec.data may be aliased with in-flight
   // responses, fill payloads, or writeback messages; mutating in place would
@@ -1246,7 +1256,7 @@ private:
         wb.hart_id = bank_req.hart_id;
         wb.uuid   = bank_req.uuid;
         wb.data   = sec.data;
-        wb.byteen = sec.dirty_mask;
+        wb.byteen = writeback_byteen(config_, sec, wb.addr);
         this->memReqSend(wb);
         DT(3, this->name() << " writeback: " << wb);
         ++perf_stats_.evictions;
@@ -1547,7 +1557,7 @@ private:
         wb.hart_id    = bank_req.hart_id;
         wb.uuid   = bank_req.uuid;
         wb.data   = sec.data;
-        wb.byteen = sec.dirty_mask;
+        wb.byteen = writeback_byteen(config_, sec, wb.addr);
         this->memReqSend(wb);
         DT(3, this->name() << " amo-probe-wb: " << wb);
         ++perf_stats_.evictions;
@@ -1928,7 +1938,7 @@ private:
             mem_req.addr = params_.mem_addr_sector(bank_id_, flush_set_idx_, line.tag, flush_sector_idx_);
             mem_req.op   = MemOp::ST;
             mem_req.data = sec.data;
-            mem_req.byteen = sec.dirty_mask;
+            mem_req.byteen = writeback_byteen(config_, sec, mem_req.addr);
             this->memReqSend(mem_req);
             DT(3, this->name() << " flush-wb: " << mem_req);
             ++perf_stats_.evictions;
@@ -1999,7 +2009,7 @@ private:
           wb.addr   = params_.mem_addr_sector(bank_id_, set_id, line.tag, i);
           wb.op     = MemOp::ST;
           wb.data   = sec.data;
-          wb.byteen = sec.dirty_mask;
+          wb.byteen = writeback_byteen(config_, sec, wb.addr);
           this->memReqSend(wb);
           DT(3, this->name() << " fence-wb: " << wb);
           ++perf_stats_.evictions;

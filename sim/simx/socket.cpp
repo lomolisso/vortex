@@ -80,6 +80,7 @@ public:
       1,                      // number of inputs
       VX_CFG_ICACHE_MEM_PORTS,       // memory ports
       false,                  // write-back
+      false,                  // dirty bytes
       false,                  // write response
       VX_CFG_ICACHE_MSHR_SIZE,       // mshr size
       VX_CFG_ICACHE_LATENCY,         // pipeline latency (capacity-scaled, matches hardware)
@@ -101,6 +102,7 @@ public:
       VX_CFG_DCACHE_NUM_REQS,        // number of inputs
       VX_CFG_L1_MEM_PORTS,           // memory ports
       VX_CFG_DCACHE_WRITEBACK,       // write-back
+      VX_CFG_DCACHE_DIRTYBYTES,      // dirty bytes
       false,                  // write response
       VX_CFG_DCACHE_MSHR_SIZE,       // mshr size
       VX_CFG_DCACHE_LATENCY,         // pipeline latency (capacity-scaled, matches hardware)
@@ -134,6 +136,7 @@ public:
       kTcacheNumReqs,              // request size
       kTcacheMemPorts,             // memory ports
       false,                       // write-back (read-only cache)
+      false,                       // dirty bytes
       false,                       // write response
       VX_CFG_TCACHE_MSHR_SIZE,            // mshr size
       2,                           // pipeline latency
@@ -174,6 +177,7 @@ public:
       kRtcacheNumInputs,                  // num_inputs (1 per RTU port)
       kRtcacheMemPorts,                   // memory ports
       false,                              // write-back (read-only)
+      false,                              // dirty bytes
       false,                              // write response
       VX_CFG_RTCACHE_MSHR_SIZE,           // mshr size
       2,                                  // pipeline latency

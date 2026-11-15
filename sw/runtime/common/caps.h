@@ -20,7 +20,7 @@
 // The two 64-bit capability words (GPU_DEV_CAPS / GPU_ISA_CAPS) are read
 // from the Command Processor regfile at the CP-internal offsets below.
 //
-// CACHE_LINE_SIZE / GLOBAL_MEM_SIZE / CLOCK_RATE / PEAK_MEM_BW are NOT
+// CACHE_LINE_SIZE / CLOCK_RATE / PEAK_MEM_BW are NOT
 // encoded in the caps words (they are platform/runtime-specific); for
 // those ids decode_caps() returns false and the backend resolves them.
 // ============================================================================
@@ -39,8 +39,8 @@ static constexpr uint32_t CP_REG_GPU_ISA_CAPS_HI = 0x024;
 
 // Decode a VX_CAPS_* id from the two CP capability words. Returns true
 // and writes *out when the id is encoded in the words; returns false
-// for ids the caller must resolve itself (CACHE_LINE_SIZE,
-// GLOBAL_MEM_SIZE, CLOCK_RATE, PEAK_MEM_BW).
+// for ids the caller must resolve itself (CACHE_LINE_SIZE, CLOCK_RATE,
+// PEAK_MEM_BW).
 inline bool decode_caps(uint64_t dev_caps, uint64_t isa_caps,
                         uint32_t caps_id, uint64_t* out) {
   switch (caps_id) {
@@ -80,6 +80,9 @@ inline bool decode_caps(uint64_t dev_caps, uint64_t isa_caps,
     return true;
   case VX_CAPS_MEM_BANK_SIZE:
     *out = 1ull << (20 + ((dev_caps >> 37) & 0x1f));
+    return true;
+  case VX_CAPS_GLOBAL_MEM_SIZE:
+    *out = 1ull << (((dev_caps >> 34) & 0x7) + 20 + ((dev_caps >> 37) & 0x1f));
     return true;
   case VX_CAPS_DLMEM_MAX_CLUSTER:
     // A plain count, not a log2: the knob need not be a power of two.

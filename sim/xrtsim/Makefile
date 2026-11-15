@@ -15,14 +15,11 @@ CXXFLAGS += -fPIC -Wno-maybe-uninitialized
 CXXFLAGS += -fno-tree-loop-distribute-patterns
 CXXFLAGS += -I$(SRC_DIR) -I$(ROOT_DIR)/sw -I$(ROOT_DIR)/hw -I$(SIM_COMMON_DIR) -I$(SW_COMMON_DIR) -I$(DESTDIR)
 CXXFLAGS += -I/$(THIRD_PARTY_DIR)/softfloat/source/include
-CXXFLAGS += -I$(THIRD_PARTY_DIR)/ramulator/ext/spdlog/include
-CXXFLAGS += -I$(THIRD_PARTY_DIR)/ramulator/ext/yaml-cpp/include
-CXXFLAGS += -I$(THIRD_PARTY_DIR)/ramulator/src
 CXXFLAGS += -DVX_CFG_XLEN=$(XLEN) -DVX_CFG_XLEN_$(XLEN)
 CXXFLAGS += $(CONFIGS)
 
 LDFLAGS += -shared $(THIRD_PARTY_DIR)/softfloat/build/Linux-x86_64-GCC/softfloat.a
-LDFLAGS += -Wl,-rpath,$(THIRD_PARTY_DIR)/ramulator -L$(THIRD_PARTY_DIR)/ramulator -lramulator -pthread
+LDFLAGS += -pthread
 
 # control RTL debug tracing states
 DBG_TRACE_FLAGS += -DDBG_TRACE_PIPELINE
@@ -45,8 +42,14 @@ DBG_FLAGS += -DVX_DBG_DEBUG_LEVEL=$(DEBUG) $(DBG_TRACE_FLAGS)
 override CONFIGS += -DSIMULATION -DSV_DPI
 
 XCONFIGS := $(shell python3 $(ROOT_DIR)/ci/gen_config.py --config=$(VORTEX_HOME)/VX_config.toml --cflags='$(CONFIGS) -DVX_CFG_XLEN=$(XLEN)')
+DRAM_ENUMS := $(filter -DVX_CFG_DRAM_MODEL_% -DVX_CFG_DRAM_PAGE_POLICY_% -DVX_CFG_DRAM_RW_POLICY_% -DVX_CFG_DRAM_SCHED_% -DVX_CFG_DRAM_REFRESH_%,$(XCONFIGS))
+CXXFLAGS += $(DRAM_ENUMS)
+# The AXI memory ports (RTL shim and C++ model) are generated with MP_REPEAT, which pastes
+# the channel count into a macro name: it needs the resolved number, not the knob's formula.
+DRAM_CHANNELS_DEF := $(filter -DVX_CFG_DRAM_CHANNELS=%,$(XCONFIGS))
+CXXFLAGS += $(DRAM_CHANNELS_DEF)
 
-SRCS = $(SW_COMMON_DIR)/util.cpp $(SIM_COMMON_DIR)/mem.cpp $(SW_COMMON_DIR)/softfloat_ext.cpp $(SW_COMMON_DIR)/rvfloats.cpp $(SIM_COMMON_DIR)/dram_sim.cpp
+SRCS = $(SW_COMMON_DIR)/util.cpp $(SIM_COMMON_DIR)/mem.cpp $(SW_COMMON_DIR)/softfloat_ext.cpp $(SW_COMMON_DIR)/rvfloats.cpp
 SRCS += $(DPI_DIR)/dpi_util.cpp $(DPI_DIR)/dpi_float.cpp
 # The H100 FEDP model behind the DPI tensor backend (knob on, from CONFIGS or the toml).
 ifneq (,$(filter -DVX_CFG_TCU_H100_ENABLE,$(XCONFIGS)))
@@ -168,7 +171,8 @@ VL_FLAGS += -DVX_CFG_XLEN=$(XLEN) -DVX_CFG_XLEN_$(XLEN)
 # leaves the RTL `ifdef selectors (which key off the *companion*
 # VX_CFG_TCU_TYPE_DPI) unmatched. Add just the enum companions gen_config
 # resolves, so a CONFIGS enum override actually selects its RTL implementation.
-VL_FLAGS += $(CONFIGS) $(filter -DVX_CFG_TCU_TYPE_% -DVX_CFG_FPU_TYPE_%,$(XCONFIGS))
+VL_FLAGS += $(CONFIGS) $(filter -DVX_CFG_TCU_TYPE_% -DVX_CFG_FPU_TYPE_%,$(XCONFIGS)) $(DRAM_ENUMS)
+VL_FLAGS += $(DRAM_CHANNELS_DEF)
 VL_FLAGS += $(RTL_INCLUDE)
 VL_FLAGS += $(RTL_PKGS)
 ifneq (,$(RTL_PRE_SRCS))
@@ -232,13 +236,16 @@ PROJECT := libxrtsim.so
 
 all: $(DESTDIR)/$(PROJECT)
 
+include $(SIM_COMMON_DIR)/dram/ramulator.mk
+LDFLAGS += $(VXDRAM_LDFLAGS)
+
 $(DESTDIR)/vortex.json: $(CONFIG_FILE)
 	$(VERILATOR_PATH)/bin/verilator --json-only -O0 $(VL_FLAGS) $(TOP) --json-only-output $@
 
 $(DESTDIR)/scope.json: $(DESTDIR)/vortex.json
 	$(SCRIPT_DIR)/scope.py $^ -o $@
 
-$(DESTDIR)/$(PROJECT): $(SRCS) $(SCOPE_JSON) $(CONFIG_FILE) $(RTL_SRCS)
+$(DESTDIR)/$(PROJECT): $(SRCS) $(SCOPE_JSON) $(CONFIG_FILE) $(RTL_SRCS) $(VXDRAM_LIB)
 	$(VERILATOR_PATH)/bin/verilator --build --exe $(VL_FLAGS) --cc $(TOP) --top-module $(TOP) $(SRCS) -CFLAGS '$(CXXFLAGS)' -LDFLAGS '$(LDFLAGS)' --Mdir $@.obj_dir -o $@
 
 # updates the timestamp when flags changed.
@@ -252,6 +259,6 @@ $(CONFIG_FILE): force
 	  rm $@.tmp; \
 	fi
 
-clean:
+clean: clean-vxdram
 	rm -rf $(DESTDIR)/$(PROJECT).obj_dir
 	rm -f $(DESTDIR)/vortex.json $(DESTDIR)/scope.json $(DESTDIR)/$(PROJECT)

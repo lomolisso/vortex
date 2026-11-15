@@ -30,13 +30,7 @@
 
 using namespace vortex;
 
-// Matches GLOBAL_MEM_SIZE from the host runtime for vram_{read,write} bounds checks.
-// Inlined to avoid pulling in the full runtime ABI.
-#if (VX_CFG_XLEN == 64)
-static constexpr uint64_t GEM5_GLOBAL_MEM_SIZE = 0x200000000ull;  // 8 GB
-#else
-static constexpr uint64_t GEM5_GLOBAL_MEM_SIZE = 0x100000000ull;  // 4 GB
-#endif
+static constexpr uint64_t GEM5_GLOBAL_MEM_SIZE = VX_CFG_GLOBAL_MEM_SIZE;
 
 namespace {
 

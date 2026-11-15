@@ -26,7 +26,7 @@
 // through an AXI4-Lite control block.
 module VX_firesim_wrap import VX_gpu_pkg::*; #(
     parameter C_M_AXI_MEM_ID_WIDTH   = `PLATFORM_MEMORY_ID_WIDTH,
-    parameter C_M_AXI_MEM_DATA_WIDTH = `VX_CFG_PLATFORM_MEMORY_DATA_SIZE * 8,
+    parameter C_M_AXI_MEM_DATA_WIDTH = `VX_CFG_DRAM_PORT_DATA_SIZE * 8,
     parameter C_M_AXI_MEM_ADDR_WIDTH = 64,
     parameter C_M_AXI_MEM_NUM_BANKS  = 1
 ) (

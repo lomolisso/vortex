@@ -134,6 +134,7 @@ public:
       VX_CFG_L2_NUM_REQS,            // request size
       VX_CFG_L2_MEM_PORTS,           // memory ports
       VX_CFG_L2_WRITEBACK,           // write-back
+      VX_CFG_L2_DIRTYBYTES,          // dirty bytes
       false,                  // write response
       VX_CFG_L2_MSHR_SIZE,           // mshr size
       VX_CFG_L2_LATENCY,             // pipeline latency
@@ -229,6 +230,7 @@ public:
       kOcacheNumReqs,               // request size
       kOcacheMemPorts,              // memory ports
       false,                        // write-back (write-through)
+      false,                        // dirty bytes
       true,                         // write response (OM holds its same-pixel
                                     // R-M-W interlock until writes COMMIT)
       VX_CFG_OCACHE_MSHR_SIZE,             // mshr size
@@ -294,6 +296,7 @@ public:
       kRcacheNumReqs,               // request size
       kRcacheMemPorts,              // memory ports
       false,                        // write-back (read-only)
+      false,                        // dirty bytes
       false,                        // write response
       VX_CFG_RCACHE_MSHR_SIZE,             // mshr size
       2,                            // pipeline latency

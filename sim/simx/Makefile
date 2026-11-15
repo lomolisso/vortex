@@ -20,19 +20,18 @@ CXXFLAGS += -std=c++17 -Wall -Wextra -Wfatal-errors -Werror
 CXXFLAGS += -fPIC -Wno-maybe-uninitialized
 CXXFLAGS += -I$(SRC_DIR) -I$(SRC_DIR)/dxa -I$(SRC_DIR)/tex -I$(SRC_DIR)/om -I$(SRC_DIR)/raster -I$(SRC_DIR)/rtu -I$(SRC_DIR)/kmu -I$(SRC_DIR)/mem -I$(SRC_DIR)/dtm -I$(SW_COMMON_DIR) -I$(SIM_COMMON_DIR) -I$(ROOT_DIR)/sw -I$(ROOT_DIR)/hw -I$(THIRD_PARTY_DIR)
 CXXFLAGS += -I$(THIRD_PARTY_DIR)/softfloat/source/include
-CXXFLAGS += -I$(THIRD_PARTY_DIR)/ramulator/ext/spdlog/include
-CXXFLAGS += -I$(THIRD_PARTY_DIR)/ramulator/ext/yaml-cpp/include
-CXXFLAGS += -I$(THIRD_PARTY_DIR)/ramulator/src
 CXXFLAGS += -DVX_CFG_XLEN=$(XLEN) -DVX_CFG_XLEN_$(XLEN)
 CXXFLAGS += $(CONFIGS)
 
 LDFLAGS += $(THIRD_PARTY_DIR)/softfloat/build/Linux-x86_64-GCC/softfloat.a
-LDFLAGS += -Wl,-rpath,$(THIRD_PARTY_DIR)/ramulator -L$(THIRD_PARTY_DIR)/ramulator -lramulator
 
 XCONFIGS := $(shell python3 $(ROOT_DIR)/ci/gen_config.py --config=$(VORTEX_HOME)/VX_config.toml --cflags='$(CONFIGS) -DVX_CFG_XLEN=$(XLEN)')
 
+# VX_config.h selects on enum companions, which raw CONFIGS lacks for a value override.
+CXXFLAGS += $(filter -DVX_CFG_DRAM_MODEL_% -DVX_CFG_DRAM_PAGE_POLICY_% -DVX_CFG_DRAM_RW_POLICY_% -DVX_CFG_DRAM_SCHED_% -DVX_CFG_DRAM_REFRESH_%,$(XCONFIGS))
+
 # Source files definition
-SRCS = $(SW_COMMON_DIR)/util.cpp $(SIM_COMMON_DIR)/mem.cpp $(SW_COMMON_DIR)/softfloat_ext.cpp $(SW_COMMON_DIR)/rvfloats.cpp $(SIM_COMMON_DIR)/dram_sim.cpp $(SIM_COMMON_DIR)/cmd_processor.cpp $(SIM_COMMON_DIR)/elf_loader.cpp $(SIM_COMMON_DIR)/host_monitor.cpp $(SIM_COMMON_DIR)/cout_drainer.cpp
+SRCS = $(SW_COMMON_DIR)/util.cpp $(SIM_COMMON_DIR)/mem.cpp $(SW_COMMON_DIR)/softfloat_ext.cpp $(SW_COMMON_DIR)/rvfloats.cpp $(SIM_COMMON_DIR)/cmd_processor.cpp $(SIM_COMMON_DIR)/elf_loader.cpp $(SIM_COMMON_DIR)/host_monitor.cpp $(SIM_COMMON_DIR)/cout_drainer.cpp
 SRCS += $(SRC_DIR)/processor.cpp $(SRC_DIR)/cluster.cpp $(SRC_DIR)/socket.cpp $(SRC_DIR)/core.cpp $(SRC_DIR)/scheduler.cpp $(SRC_DIR)/cta_dispatcher.cpp $(SRC_DIR)/barrier_unit.cpp
 SRCS += $(SRC_DIR)/kmu/kmu.cpp
 SRCS += $(SRC_DIR)/decode.cpp $(SRC_DIR)/decompressor.cpp $(SRC_DIR)/scoreboard.cpp $(SRC_DIR)/sequencer.cpp $(SRC_DIR)/opc_unit.cpp $(SRC_DIR)/dispatcher.cpp
@@ -244,6 +243,13 @@ else
 all: $(DESTDIR)/$(PROJECT)
 endif
 
+include $(SIM_COMMON_DIR)/dram/ramulator.mk
+LDFLAGS += $(VXDRAM_LDFLAGS)
+
+$(DESTDIR)/$(PROJECT) $(DESTDIR)/lib$(PROJECT).so $(DESTDIR)/$(VORTEX_LIB) $(DESTDIR)/$(VORTEX_GEM5_LIB): $(VXDRAM_LIB)
+$(DXA_OOO_TEST) $(RVC_TEST) $(DLMEM_NOC_TEST) $(CTA_GANG_TEST) $(DLMEM_XLATE_TEST) $(DLMEM_EP_TEST): $(VXDRAM_LIB)
+$(LMEM_SWITCH_TEST) $(MBAR_WAITERS_TEST) $(DXA_COMPL_TEST) $(DXA_BULK_TEST) $(CPA_UNIT_TEST) $(BG_UNIT_TEST) $(DXA_TMAP_CORE_TEST): $(VXDRAM_LIB)
+
 # build common object files
 $(OBJ_DIR)/common/%.o: $(SW_COMMON_DIR)/%.cpp $(CONFIG_FILE)
 	@mkdir -p $(@D)
@@ -323,89 +329,89 @@ $(DXA_TMAP_CORE_TEST_OBJ): $(VORTEX_HOME)/tests/unittest/dxa_tmap_core/main.cpp 
 
 # Main executable
 $(DESTDIR)/$(PROJECT): $(OBJS) $(MAIN_OBJ)
-	$(CXX) $(CXXFLAGS) $^ $(LDFLAGS) -o $@
+	$(CXX) $(CXXFLAGS) $(filter-out $(VXDRAM_LIB),$^) $(LDFLAGS) -o $@
 
 test-dxa-ooo: $(DXA_OOO_TEST)
 	$(DXA_OOO_TEST)
 
 $(DXA_OOO_TEST): $(OBJS) $(DXA_OOO_TEST_OBJ)
-	$(CXX) $(CXXFLAGS) $^ $(LDFLAGS) -o $@
+	$(CXX) $(CXXFLAGS) $(filter-out $(VXDRAM_LIB),$^) $(LDFLAGS) -o $@
 
 test-rvc-decompress: $(RVC_TEST)
 	$(RVC_TEST)
 
 $(RVC_TEST): $(OBJS) $(RVC_TEST_OBJ)
-	$(CXX) $(CXXFLAGS) $^ $(LDFLAGS) -o $@
+	$(CXX) $(CXXFLAGS) $(filter-out $(VXDRAM_LIB),$^) $(LDFLAGS) -o $@
 
 test-dlmem-noc: $(DLMEM_NOC_TEST)
 	$(DLMEM_NOC_TEST) $(DLMEM_NOC_OPTS)
 
 $(DLMEM_NOC_TEST): $(DLMEM_NOC_OBJS) $(DLMEM_NOC_TEST_OBJ)
-	$(CXX) $(CXXFLAGS) $^ $(LDFLAGS) -o $@
+	$(CXX) $(CXXFLAGS) $(filter-out $(VXDRAM_LIB),$^) $(LDFLAGS) -o $@
 
 test-cta-gang: $(CTA_GANG_TEST)
 	$(CTA_GANG_TEST) $(CTA_GANG_OPTS)
 
 $(CTA_GANG_TEST): $(OBJS) $(CTA_GANG_TEST_OBJ)
-	$(CXX) $(CXXFLAGS) $^ $(LDFLAGS) -o $@
+	$(CXX) $(CXXFLAGS) $(filter-out $(VXDRAM_LIB),$^) $(LDFLAGS) -o $@
 
 test-dlmem-xlate: $(DLMEM_XLATE_TEST)
 	$(DLMEM_XLATE_TEST) $(DLMEM_XLATE_OPTS)
 
 $(DLMEM_XLATE_TEST): $(DLMEM_XLATE_OBJS) $(DLMEM_XLATE_TEST_OBJ)
-	$(CXX) $(CXXFLAGS) $^ $(LDFLAGS) -o $@
+	$(CXX) $(CXXFLAGS) $(filter-out $(VXDRAM_LIB),$^) $(LDFLAGS) -o $@
 
 test-dlmem-ep: $(DLMEM_EP_TEST)
 	$(DLMEM_EP_TEST) $(DLMEM_EP_OPTS)
 
 $(DLMEM_EP_TEST): $(DLMEM_EP_OBJS) $(DLMEM_EP_TEST_OBJ)
-	$(CXX) $(CXXFLAGS) $^ $(LDFLAGS) -o $@
+	$(CXX) $(CXXFLAGS) $(filter-out $(VXDRAM_LIB),$^) $(LDFLAGS) -o $@
 
 test-lmem-switch: $(LMEM_SWITCH_TEST)
 	$(LMEM_SWITCH_TEST) $(LMEM_SWITCH_OPTS)
 
 $(LMEM_SWITCH_TEST): $(OBJS) $(LMEM_SWITCH_TEST_OBJ)
-	$(CXX) $(CXXFLAGS) $^ $(LDFLAGS) -o $@
+	$(CXX) $(CXXFLAGS) $(filter-out $(VXDRAM_LIB),$^) $(LDFLAGS) -o $@
 
 test-mbar-waiters: $(MBAR_WAITERS_TEST)
 	$(MBAR_WAITERS_TEST) $(MBAR_WAITERS_OPTS)
 
 $(MBAR_WAITERS_TEST): $(OBJS) $(MBAR_WAITERS_TEST_OBJ)
-	$(CXX) $(CXXFLAGS) $^ $(LDFLAGS) -o $@
+	$(CXX) $(CXXFLAGS) $(filter-out $(VXDRAM_LIB),$^) $(LDFLAGS) -o $@
 
 test-dxa-compl: $(DXA_COMPL_TEST)
 	$(DXA_COMPL_TEST) $(DXA_COMPL_OPTS)
 
 $(DXA_COMPL_TEST): $(OBJS) $(DXA_COMPL_TEST_OBJ)
-	$(CXX) $(CXXFLAGS) $^ $(LDFLAGS) -o $@
+	$(CXX) $(CXXFLAGS) $(filter-out $(VXDRAM_LIB),$^) $(LDFLAGS) -o $@
 
 test-dxa-bulk: $(DXA_BULK_TEST)
 	$(DXA_BULK_TEST) $(DXA_BULK_OPTS)
 
 $(DXA_BULK_TEST): $(OBJS) $(DXA_BULK_TEST_OBJ)
-	$(CXX) $(CXXFLAGS) $^ $(LDFLAGS) -o $@
+	$(CXX) $(CXXFLAGS) $(filter-out $(VXDRAM_LIB),$^) $(LDFLAGS) -o $@
 
 test-cpa-unit: $(CPA_UNIT_TEST)
 	$(CPA_UNIT_TEST) $(CPA_UNIT_OPTS)
 
 $(CPA_UNIT_TEST): $(OBJS) $(CPA_UNIT_TEST_OBJ)
-	$(CXX) $(CXXFLAGS) $^ $(LDFLAGS) -o $@
+	$(CXX) $(CXXFLAGS) $(filter-out $(VXDRAM_LIB),$^) $(LDFLAGS) -o $@
 
 test-bg-unit: $(BG_UNIT_TEST)
 	$(BG_UNIT_TEST) $(BG_UNIT_OPTS)
 
 $(BG_UNIT_TEST): $(OBJS) $(BG_UNIT_TEST_OBJ)
-	$(CXX) $(CXXFLAGS) $^ $(LDFLAGS) -o $@
+	$(CXX) $(CXXFLAGS) $(filter-out $(VXDRAM_LIB),$^) $(LDFLAGS) -o $@
 
 test-dxa-tmap-core: $(DXA_TMAP_CORE_TEST)
 	$(DXA_TMAP_CORE_TEST) $(DXA_TMAP_CORE_OPTS)
 
 $(DXA_TMAP_CORE_TEST): $(OBJS) $(DXA_TMAP_CORE_TEST_OBJ)
-	$(CXX) $(CXXFLAGS) $^ $(LDFLAGS) -o $@
+	$(CXX) $(CXXFLAGS) $(filter-out $(VXDRAM_LIB),$^) $(LDFLAGS) -o $@
 
 # Shared library
 $(DESTDIR)/lib$(PROJECT).so: $(OBJS)
-	$(CXX) $(CXXFLAGS) $^ -shared $(LDFLAGS) -o $@
+	$(CXX) $(CXXFLAGS) $(filter-out $(VXDRAM_LIB),$^) -shared $(LDFLAGS) -o $@
 
 # Vortex SST simulator component shared library
 libvortex: $(DESTDIR)/$(VORTEX_LIB)
@@ -422,7 +428,7 @@ $(DESTDIR)/$(VORTEX_LIB): $(OBJS) $(VORTEX_SST_OBJS)
 libvortex-gem5: $(DESTDIR)/$(VORTEX_GEM5_LIB)
 
 $(DESTDIR)/$(VORTEX_GEM5_LIB): $(OBJS) $(VORTEX_GEM5_OBJS)
-	$(CXX) $(CXXFLAGS) $^ -shared $(LDFLAGS) -Wl,-soname,$(VORTEX_GEM5_LIB) -o $@
+	$(CXX) $(CXXFLAGS) $(filter-out $(VXDRAM_LIB),$^) -shared $(LDFLAGS) -Wl,-soname,$(VORTEX_GEM5_LIB) -o $@
 
 # updates the timestamp when flags changed.
 # `-MF $@` names the stamp itself, and callers spell DESTDIR differently
@@ -455,4 +461,4 @@ clean-exe:
 clean-obj:
 	rm -rf $(OBJ_DIR)
 
-clean: clean-lib clean-libvortex clean-libvortex-gem5 clean-exe clean-obj
+clean: clean-lib clean-libvortex clean-libvortex-gem5 clean-exe clean-obj clean-vxdram

@@ -354,7 +354,7 @@ public:
 
 private:
     friend class RefCounted<Device>;
-    explicit Device(std::unique_ptr<Platform> plat);
+    Device(std::unique_ptr<Platform> plat, uint64_t dev_caps, uint64_t isa_caps);
     ~Device();
 
     // Allocate ring/head/cmpl buffers and program the CP regfile.
@@ -412,6 +412,7 @@ private:
 
     std::unique_ptr<Platform>      platform_;
     uint64_t                       cycle_freq_hz_;
+    uint64_t                       global_mem_size_;
 
     // Device-memory allocator (the CP DMAs to these addresses). Pure
     // host-side bookkeeping — constructed in the Device ctor.
@@ -421,7 +422,7 @@ private:
     //   [USER_BASE, USER_BASE + pinned_size_)        → pinned_mem_
     //                                                   (VX_MEM_PHYS buffers,
     //                                                    identity-mapped)
-    //   [USER_BASE + pinned_size_, GLOBAL_MEM_SIZE)  → global_mem_
+    //   [USER_BASE + pinned_size_, global_mem_size_) → global_mem_
     //                                                   (kernel-only buffers,
     //                                                    minted VA != PA)
     //

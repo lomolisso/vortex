@@ -84,13 +84,13 @@ tests:
   drivers:
   - xrt
   app: mstress
-  configs: -DVX_CFG_PLATFORM_MEMORY_NUM_BANKS=1
+  configs: -DVX_CFG_DRAM_CHANNELS=1
 - id: mstress-7
   via: blackbox
   drivers:
   - xrt
   app: mstress
-  configs: -DVX_CFG_PLATFORM_MEMORY_ADDR_WIDTH=49
+  configs: -DVX_CFG_DRAM_ADDR_WIDTH=49
 # Larger platform memory address. The width must cover the core's
 # MEM_ADDR_WIDTH (XLEN-derived), or the platform memory adapter asserts on rv64
 # (48-bit MEM_ADDR_WIDTH won't fit in a 33-bit platform space): 33 for
@@ -101,38 +101,38 @@ tests:
   - xrt
   app: mstress
   xlen: [32]
-  configs: -DVX_CFG_PLATFORM_MEMORY_ADDR_WIDTH=33
+  configs: -DVX_CFG_DRAM_ADDR_WIDTH=33
 - id: mstress-8b
   via: blackbox
   drivers:
   - xrt
   app: mstress
   xlen: [64]
-  configs: -DVX_CFG_PLATFORM_MEMORY_ADDR_WIDTH=49
+  configs: -DVX_CFG_DRAM_ADDR_WIDTH=49
 - id: mstress-9
   via: blackbox
   drivers:
   - xrt
   app: mstress
-  configs: -DVX_CFG_PLATFORM_MEMORY_INTERLEAVE=1
+  configs: -DVX_CFG_DRAM_INTERLEAVE=1
 - id: mstress-10
   via: blackbox
   drivers:
   - xrt
   app: mstress
-  configs: -DVX_CFG_PLATFORM_MEMORY_INTERLEAVE=0
+  configs: -DVX_CFG_DRAM_INTERLEAVE=0
 - id: mstress-11
   via: blackbox
   drivers:
   - simx
   app: mstress
-  configs: -DVX_CFG_MEM_BLOCK_SIZE=8 -DVX_CFG_PLATFORM_MEMORY_NUM_BANKS=2
+  configs: -DVX_CFG_MEM_BLOCK_SIZE=8 -DVX_CFG_DRAM_CHANNELS=2
 - id: mstress-12
   via: blackbox
   drivers:
   - simx
   app: mstress
-  configs: -DVX_CFG_MEM_BLOCK_SIZE=8 -DVX_CFG_PLATFORM_MEMORY_NUM_BANKS=2
+  configs: -DVX_CFG_MEM_BLOCK_SIZE=8 -DVX_CFG_DRAM_CHANNELS=2
   shape:
     threads: 8
 - id: mstress-13
@@ -140,13 +140,13 @@ tests:
   drivers:
   - rtlsim
   app: mstress
-  configs: -DVX_CFG_MEM_BLOCK_SIZE=8 -DVX_CFG_PLATFORM_MEMORY_NUM_BANKS=2
+  configs: -DVX_CFG_MEM_BLOCK_SIZE=8 -DVX_CFG_DRAM_CHANNELS=2
 - id: mstress-14
   via: blackbox
   drivers:
   - rtlsim
   app: mstress
-  configs: -DVX_CFG_MEM_BLOCK_SIZE=8 -DVX_CFG_PLATFORM_MEMORY_NUM_BANKS=2
+  configs: -DVX_CFG_MEM_BLOCK_SIZE=8 -DVX_CFG_DRAM_CHANNELS=2
   shape:
     threads: 8
 - id: mstress-15

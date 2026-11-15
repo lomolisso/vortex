@@ -39,18 +39,13 @@
 
 #include <VX_config.h>
 #include <ostream>
-#include <list>
-#include <queue>
+#include <memory>
 #include <vector>
 #include <sstream>
 #include <unordered_map>
 
 #include <dram_sim.h>
 #include <util.h>
-
-#ifndef MEM_CLOCK_RATIO
-#define MEM_CLOCK_RATIO 1
-#endif
 
 #ifndef TRACE_START_TIME
 #define TRACE_START_TIME 0ull
@@ -77,8 +72,6 @@ typedef uint64_t Word;
 
 using namespace vortex;
 
-static uint32_t g_mem_bank_addr_width = (VX_CFG_PLATFORM_MEMORY_ADDR_WIDTH - log2ceil(VX_CFG_PLATFORM_MEMORY_NUM_BANKS));
-
 static uint64_t timestamp = 0;
 
 double sc_time_stamp() {
@@ -101,7 +94,12 @@ bool sim_trace_enabled() {
 
 class Processor::Impl {
 public:
-  Impl() : dram_sim_(VX_CFG_PLATFORM_MEMORY_NUM_BANKS, VX_CFG_PLATFORM_MEMORY_DATA_SIZE, MEM_CLOCK_RATIO) {
+  Impl() {
+    for (uint32_t s = 0; s < DramSim::num_systems(); ++s) {
+      dram_sims_.emplace_back(new DramSim(DramSim::Config{
+        DramSim::channels_per_system(), s * DramSim::channels_per_system(), false}));
+    }
+
     // restart sim time so a re-created model registers at time zero
     timestamp = 0;
 
@@ -152,6 +150,12 @@ public:
 
   ~Impl() {
     this->cout_flush();
+
+    std::vector<const DramSim*> systems;
+    for (auto& d : dram_sims_) {
+      systems.push_back(d.get());
+    }
+    DramSim::print_perf(systems.data(), systems.size());
 
   #ifdef VCD_OUTPUT
     tfp_->close();
@@ -257,13 +261,9 @@ private:
 
     print_bufs_.clear();
 
-    for (auto& reqs : pending_mem_reqs_) {
-      reqs.clear();
-    }
-
-    for (int b = 0; b < VX_CFG_PLATFORM_MEMORY_NUM_BANKS; ++b) {
-      std::queue<mem_req_t*> empty;
-      std::swap(dram_queue_[b], empty);
+    pending_reads_.clear();
+    for (auto& d : dram_sims_) {
+      d->reset();
     }
 
     device_->start = 0;
@@ -287,7 +287,7 @@ private:
       this->eval();
     }
 
-    for (int b = 0; b < VX_CFG_PLATFORM_MEMORY_NUM_BANKS; ++b) {
+    for (int b = 0; b < VX_CFG_DRAM_CHANNELS; ++b) {
       device_->mem_req_ready[b] = 1;
     }
   }
@@ -303,19 +303,8 @@ private:
 
     this->mem_bus_eval(1);
 
-    dram_sim_.tick();
-
-    for (int b = 0; b < VX_CFG_PLATFORM_MEMORY_NUM_BANKS; ++b) {
-      if (!dram_queue_[b].empty()) {
-        auto mem_req = dram_queue_[b].front();
-        dram_sim_.send_request(mem_req->addr, mem_req->write, [](void* arg)->bool {
-          // mark completed request as ready
-          auto orig_req = reinterpret_cast<mem_req_t*>(arg);
-          orig_req->ready = true;
-          return true;
-        }, mem_req);
-        dram_queue_[b].pop();
-      }
+    for (auto& d : dram_sims_) {
+      d->tick();
     }
 
   #ifndef NDEBUG
@@ -339,7 +328,7 @@ private:
   }
 
   void mem_bus_reset() {
-    for (int b = 0; b < VX_CFG_PLATFORM_MEMORY_NUM_BANKS; ++b) {
+    for (int b = 0; b < VX_CFG_DRAM_CHANNELS; ++b) {
       device_->mem_req_ready[b] = 0;
       device_->mem_rsp_valid[b] = 0;
     }
@@ -347,84 +336,58 @@ private:
 
   void mem_bus_eval(bool clk) {
     if (!clk) {
-      for (int b = 0; b < VX_CFG_PLATFORM_MEMORY_NUM_BANKS; ++b) {
+      for (int b = 0; b < VX_CFG_DRAM_CHANNELS; ++b) {
         mem_rd_rsp_ready_[b] = device_->mem_rsp_ready[b];
       }
       return;
     }
 
-    for (int b = 0; b < VX_CFG_PLATFORM_MEMORY_NUM_BANKS; ++b) {
-      // process memory responses
+    for (int b = 0; b < VX_CFG_DRAM_CHANNELS; ++b) {
+      auto& dram = this->dram_of(b);
+      uint32_t ch = b % DramSim::channels_per_system();
+
+      // Responses in completion order.
       if (device_->mem_rsp_valid[b] && mem_rd_rsp_ready_[b]) {
         device_->mem_rsp_valid[b] = 0;
       }
-      if (device_->mem_rsp_valid[b] == 0) {
-        if (!pending_mem_reqs_[b].empty()) {
-          auto mem_rsp_it = pending_mem_reqs_[b].begin();
-          auto mem_rsp = *mem_rsp_it;
-          if (mem_rsp->ready) {
-            if (!mem_rsp->write) {
-              // return read responses
-              device_->mem_rsp_valid[b] = 1;
-              memcpy(VDataCast<void*, VX_CFG_PLATFORM_MEMORY_DATA_SIZE>::get(device_->mem_rsp_data[b]), mem_rsp->data.data(), VX_CFG_PLATFORM_MEMORY_DATA_SIZE);
-              device_->mem_rsp_tag[b] = mem_rsp->tag;
-            }
-            // delete the request
-            pending_mem_reqs_[b].erase(mem_rsp_it);
-            delete mem_rsp;
+      if (device_->mem_rsp_valid[b] == 0 && dram.rsp_valid(ch)) {
+        auto it = pending_reads_.find(dram.rsp_peek(ch).tag);
+        device_->mem_rsp_valid[b] = 1;
+        memcpy(VDataCast<void*, VX_CFG_DRAM_PORT_DATA_SIZE>::get(device_->mem_rsp_data[b]), it->second.data.data(), VX_CFG_DRAM_PORT_DATA_SIZE);
+        device_->mem_rsp_tag[b] = it->second.tag;
+        pending_reads_.erase(it);
+        dram.rsp_pop(ch);
+      }
+
+      // The request visible now fires at the next edge when the channel takes it.
+      bool rw = device_->mem_req_rw[b];
+      bool ready = !device_->mem_req_valid[b] || dram.can_accept(ch, rw);
+      device_->mem_req_ready[b] = ready;
+      if (!(device_->mem_req_valid[b] && ready))
+        continue;
+
+      uint64_t local_addr = uint64_t(device_->mem_req_addr[b]) * VX_CFG_DRAM_PORT_DATA_SIZE;
+      uint64_t byte_addr = DramSim::global_addr(b, local_addr);
+      uint64_t byteen = ~uint64_t(0);
+      if (rw) {
+        byteen = device_->mem_req_byteen[b];
+        auto data = VDataCast<uint8_t*, VX_CFG_DRAM_PORT_DATA_SIZE>::get(device_->mem_req_data[b]);
+        for (int i = 0; i < VX_CFG_DRAM_PORT_DATA_SIZE; i++) {
+          if ((byteen >> i) & 0x1) {
+            (*ram_)[byte_addr + i] = data[i];
           }
         }
       }
-
-      // process memory requests
-      if (device_->mem_req_valid[b] && device_->mem_req_ready[b]) {
-      #if VX_CFG_PLATFORM_MEMORY_INTERLEAVE == 1
-        uint64_t byte_addr = (uint64_t(device_->mem_req_addr[b]) * VX_CFG_PLATFORM_MEMORY_NUM_BANKS + b) * VX_CFG_PLATFORM_MEMORY_DATA_SIZE;
-      #else
-        uint64_t byte_addr = (uint64_t(device_->mem_req_addr[b]) + (b << g_mem_bank_addr_width)) * VX_CFG_PLATFORM_MEMORY_DATA_SIZE;
-      #endif
-        // check read/write
-        if (device_->mem_req_rw[b]) {
-          auto byteen = device_->mem_req_byteen[b];
-          auto data = VDataCast<uint8_t*, VX_CFG_PLATFORM_MEMORY_DATA_SIZE>::get(device_->mem_req_data[b]);
-          // Console output (VX_MEM_IO_COUT range) is now ordinary device
-          // memory — Option C: the host runtime drains it. No tap here.
-          {
-            // process memory writes
-            for (int i = 0; i < VX_CFG_PLATFORM_MEMORY_DATA_SIZE; i++) {
-              if ((byteen >> i) & 0x1) {
-                (*ram_)[byte_addr + i] = data[i];
-              }
-            }
-
-            auto mem_req = new mem_req_t();
-            mem_req->tag   = device_->mem_req_tag[b];
-            mem_req->addr  = byte_addr;
-            mem_req->write = true;
-            mem_req->ready = false;
-
-            // enqueue dram request
-            dram_queue_[b].push(mem_req);
-
-            // add to pending list
-            pending_mem_reqs_[b].emplace_back(mem_req);
-          }
-        } else {
-          // process memory reads
-          auto mem_req = new mem_req_t();
-          mem_req->tag   = device_->mem_req_tag[b];
-          mem_req->addr  = byte_addr;
-          mem_req->write = false;
-          mem_req->ready = false;
-          ram_->read(mem_req->data.data(), byte_addr, VX_CFG_PLATFORM_MEMORY_DATA_SIZE);
-
-          // enqueue dram request
-          dram_queue_[b].push(mem_req);
-
-          // add to pending list
-          pending_mem_reqs_[b].emplace_back(mem_req);
-        }
+      uint32_t sectors = DramSim::sector_mask(local_addr, VX_CFG_DRAM_PORT_DATA_SIZE, byteen);
+      if (sectors == 0)
+        continue;
+      uint64_t id = next_id_++;
+      if (!rw) {
+        auto& p = pending_reads_[id];
+        p.tag = device_->mem_req_tag[b];
+        ram_->read(p.data.data(), byte_addr, VX_CFG_DRAM_PORT_DATA_SIZE);
       }
+      dram.send(DramSim::Req{ch, local_addr, sectors, rw, id});
     }
   }
 
@@ -441,24 +404,23 @@ private:
 
 private:
 
-  typedef struct {
-    Vrtlsim_shim* device;
-    std::array<uint8_t, VX_CFG_PLATFORM_MEMORY_DATA_SIZE> data;
-    uint64_t addr;
+  struct pending_read_t {
+    std::array<uint8_t, VX_CFG_DRAM_PORT_DATA_SIZE> data;
     uint64_t tag;
-    bool write;
-    bool ready;
-  } mem_req_t;
+  };
+
+  DramSim& dram_of(uint32_t channel) {
+    return *dram_sims_.at(channel / DramSim::channels_per_system());
+  }
 
   std::unordered_map<int, std::stringstream> print_bufs_;
 
-  std::list<mem_req_t*> pending_mem_reqs_[VX_CFG_PLATFORM_MEMORY_NUM_BANKS];
+  std::unordered_map<uint64_t, pending_read_t> pending_reads_;
+  uint64_t next_id_ = 0;
 
-  std::queue<mem_req_t*> dram_queue_[VX_CFG_PLATFORM_MEMORY_NUM_BANKS];
+  std::array<bool, VX_CFG_DRAM_CHANNELS> mem_rd_rsp_ready_;
 
-  std::array<bool, VX_CFG_PLATFORM_MEMORY_NUM_BANKS> mem_rd_rsp_ready_;
-
-  DramSim dram_sim_;
+  std::vector<std::unique_ptr<DramSim>> dram_sims_;
 
   VerilatedContext* context_;
   Vrtlsim_shim* device_;

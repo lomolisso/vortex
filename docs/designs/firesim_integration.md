@@ -134,7 +134,7 @@ A thin AFU presenting Vortex as:
 - a DCR request/response pair for configuration,
 - `start` / `busy` for launch and completion.
 
-`VX_CFG_PLATFORM_MEMORY_NUM_BANKS=1` is set for this wrapper. Left at the
+`VX_CFG_DRAM_CHANNELS=1` is set for this wrapper. Left at the
 default of 2, Vortex builds two internal memory ports and `VX_mem_to_axi`
 arbitrates them onto the one bank, recovering the originating port from the
 *returned* AXI id (`rsp_xbar_sel_in = m_axi_rid[0 +: NUM_PORTS_IN_BITS]`).

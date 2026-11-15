@@ -201,7 +201,7 @@ class VortexDUT(nastiParams: NastiParameters)(implicit val p: Parameters) extend
 /** Memory-port shape for a 32-bit Vortex build.
   *
   * Address width follows XLEN (32 for a 32-bit build, 48 for 64-bit) and data width is
-  * VX_CFG_PLATFORM_MEMORY_DATA_SIZE bytes, both mirroring the generated VX_config.vh and regenerated alongside
+  * VX_CFG_DRAM_PORT_DATA_SIZE bytes, both mirroring the generated VX_config.vh and regenerated alongside
   * the RTL config rather than edited independently.
   *
   * idBits does NOT mirror the RTL default, and must not. FASED sizes its read-response egress with

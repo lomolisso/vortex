@@ -40,12 +40,12 @@ module VX_afu_wrap import VX_gpu_pkg::*; #(
     parameter C_S_AXI_CTRL_ADDR_WIDTH = 16,
     parameter C_S_AXI_CTRL_DATA_WIDTH = 32,
     parameter C_M_AXI_MEM_ID_WIDTH    = `PLATFORM_MEMORY_ID_WIDTH,
-    parameter C_M_AXI_MEM_DATA_WIDTH  = `VX_CFG_PLATFORM_MEMORY_DATA_SIZE * 8,
+    parameter C_M_AXI_MEM_DATA_WIDTH  = `VX_CFG_DRAM_PORT_DATA_SIZE * 8,
     parameter C_M_AXI_MEM_ADDR_WIDTH  = 64,
 `ifdef PLATFORM_MERGED_MEMORY_INTERFACE
     parameter C_M_AXI_MEM_NUM_BANKS   = 1
 `else
-    parameter C_M_AXI_MEM_NUM_BANKS   = `VX_CFG_PLATFORM_MEMORY_NUM_BANKS
+    parameter C_M_AXI_MEM_NUM_BANKS   = `VX_CFG_DRAM_CHANNELS
 `endif
 ) (
     // System signals
@@ -56,7 +56,7 @@ module VX_afu_wrap import VX_gpu_pkg::*; #(
 `ifdef PLATFORM_MERGED_MEMORY_INTERFACE
     `MP_REPEAT (1, GEN_AXI_MEM, MP_COMMA),
 `else
-    `MP_REPEAT (`VX_CFG_PLATFORM_MEMORY_NUM_BANKS, GEN_AXI_MEM, MP_COMMA),
+    `MP_REPEAT (`VX_CFG_DRAM_CHANNELS, GEN_AXI_MEM, MP_COMMA),
 `endif
     // AXI4 host-memory master interface (CP command ring + host side of DMA)
     `GEN_AXI_HOST,
@@ -85,7 +85,7 @@ module VX_afu_wrap import VX_gpu_pkg::*; #(
 
     output wire                                 interrupt
 );
-    localparam M_AXI_MEM_ADDR_WIDTH = `VX_CFG_PLATFORM_MEMORY_ADDR_WIDTH;
+    localparam M_AXI_MEM_ADDR_WIDTH = `VX_CFG_DRAM_ADDR_WIDTH;
 
     wire                                 m_axi_mem_awvalid_a [C_M_AXI_MEM_NUM_BANKS];
     wire                                 m_axi_mem_awready_a [C_M_AXI_MEM_NUM_BANKS];
@@ -121,7 +121,7 @@ module VX_afu_wrap import VX_gpu_pkg::*; #(
 `ifdef PLATFORM_MERGED_MEMORY_INTERFACE
     `MP_REPEAT (1, AXI_MEM_TO_ARRAY, MP_SEMI);
 `else
-    `MP_REPEAT (`VX_CFG_PLATFORM_MEMORY_NUM_BANKS, AXI_MEM_TO_ARRAY, MP_SEMI);
+    `MP_REPEAT (`VX_CFG_DRAM_CHANNELS, AXI_MEM_TO_ARRAY, MP_SEMI);
 `endif
 
     reg [`VX_CFG_RESET_DELAY-1:0] vx_reset_shift_r;

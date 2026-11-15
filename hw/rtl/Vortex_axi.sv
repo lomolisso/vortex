@@ -94,6 +94,12 @@ module Vortex_axi import VX_gpu_pkg::*; #(
     localparam VX_MEM_TAG_A_WIDTH  = VX_MEM_TAG_WIDTH + `MAX(SUB_LDATAW, 0);
     localparam VX_MEM_ADDR_A_WIDTH = VX_MEM_ADDR_WIDTH - SUB_LDATAW;
 
+    `STATIC_ASSERT (`IS_POW2(`VX_CFG_DRAM_CHANNELS), ("invalid parameter"))
+    `STATIC_ASSERT (`VX_MEM_STACK_BASE_ADDR < `VX_CFG_GLOBAL_MEM_SIZE, ("the stack must lie in global memory"))
+`ifdef VX_CFG_XLEN_64
+    `STATIC_ASSERT (`VX_CFG_GLOBAL_MEM_SIZE <= `VX_MEM_DLMEM_BASE_ADDR, ("the DLMEM window must lie above global memory"))
+`endif
+
     wire                            mem_req_valid [VX_MEM_PORTS];
     wire                            mem_req_rw [VX_MEM_PORTS];
     wire [VX_MEM_BYTEEN_WIDTH-1:0]  mem_req_byteen [VX_MEM_PORTS];
@@ -204,7 +210,8 @@ module Vortex_axi import VX_gpu_pkg::*; #(
         .TAG_WIDTH_OUT  (AXI_TID_WIDTH),
         .NUM_PORTS_IN   (VX_MEM_PORTS),
         .NUM_BANKS_OUT  (AXI_NUM_BANKS),
-        .INTERLEAVE     (`VX_CFG_PLATFORM_MEMORY_INTERLEAVE),
+        .INTERLEAVE     (`VX_CFG_DRAM_INTERLEAVE),
+        .BANK_SEL_SHIFT (`VX_CFG_DRAM_INTERLEAVE_SHIFT),
         .REQ_OUT_BUF    ((VX_MEM_PORTS > 1) ? 2 : 0),
         .RSP_OUT_BUF    ((VX_MEM_PORTS > 1 || AXI_NUM_BANKS > 1) ? 2 : 0)
     ) axi_adapter (

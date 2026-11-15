@@ -8,7 +8,7 @@
 #include "vortex2_internal.h"
 #include "dispatcher.h"  // dispatcher_get_callbacks — load the backend selected by $VORTEX_DRIVER
 #include <VX_types.h>  // VX_MEM_IO_COUT_* (console buffer layout)
-#include "common.h"    // ALLOC_BASE_ADDR / GLOBAL_MEM_SIZE / *_SIZE constants
+#include "common.h"    // ALLOC_BASE_ADDR / *_SIZE constants
 #include "caps.h"      // vortex::load_caps / decode_caps
 #ifdef SCOPE
 #include "scope.h"   // vx_scope_drain — lossless SCOPE tap-ring drainer
@@ -25,12 +25,18 @@
 
 namespace vx {
 
+static uint64_t caps_global_mem_size(uint64_t dev_caps, uint64_t isa_caps) {
+    uint64_t size = 0;
+    vortex::decode_caps(dev_caps, isa_caps, VX_CAPS_GLOBAL_MEM_SIZE, &size);
+    return size;
+}
+
 // Resolve the pinned-region size: compile-time default
 // VX_CFG_VM_PINNED_REGION_SIZE, optionally overridden by the
 // VORTEX_VM_PINNED_SIZE env var (decimal bytes). Returns 0 when VM is
 // disabled at build time (the pinned-region carve-out is a no-op then —
 // VX_MEM_PHYS has no effect without VM).
-static uint64_t resolve_pinned_size() {
+static uint64_t resolve_pinned_size(uint64_t global_mem_size) {
 #if VX_CFG_VM_ENABLED
     uint64_t size = (uint64_t)VX_CFG_VM_PINNED_REGION_SIZE;
     if (const char* s = std::getenv("VORTEX_VM_PINNED_SIZE")) {
@@ -38,14 +44,15 @@ static uint64_t resolve_pinned_size() {
         unsigned long long v = std::strtoull(s, &end, 0);
         if (end != s) size = (uint64_t)v;
     }
-    // Bound at GLOBAL_MEM_SIZE/2 so the paged pool always has room.
-    const uint64_t user_size = GLOBAL_MEM_SIZE - ALLOC_BASE_ADDR;
+    // Bound at half the user region so the paged pool always has room.
+    const uint64_t user_size = global_mem_size - ALLOC_BASE_ADDR;
     if (size > user_size / 2) size = user_size / 2;
     // Round down to a page so the slab boundary is page-aligned (the
     // VM page-table walker installs leaf PTEs at page granularity).
     size &= ~uint64_t(RAM_PAGE_SIZE - 1);
     return size;
 #else
+    (void)global_mem_size;
     return 0;
 #endif
 }
@@ -114,10 +121,12 @@ thread_local const Device* tls_batch_owner = nullptr;
 
 } // namespace
 
-Device::Device(std::unique_ptr<Platform> plat)
+Device::Device(std::unique_ptr<Platform> plat, uint64_t dev_caps, uint64_t isa_caps)
     : platform_(std::move(plat)), cycle_freq_hz_(0),
-      global_mem_(ALLOC_BASE_ADDR, GLOBAL_MEM_SIZE - ALLOC_BASE_ADDR,
-                  RAM_PAGE_SIZE, CACHE_BLOCK_SIZE) {
+      global_mem_size_(caps_global_mem_size(dev_caps, isa_caps)),
+      global_mem_(ALLOC_BASE_ADDR, global_mem_size_ - ALLOC_BASE_ADDR,
+                  RAM_PAGE_SIZE, CACHE_BLOCK_SIZE),
+      dev_caps_(dev_caps), isa_caps_(isa_caps), caps_loaded_(true) {
     // cycle_freq_hz_=0 tells the ns conversion path to use the wall clock.
     // global_mem_ is the device-memory allocator — pure host-side address
     // bookkeeping; the CP DMAs to whatever addresses it hands out.
@@ -126,7 +135,7 @@ Device::Device(std::unique_ptr<Platform> plat)
     // VX_MEM_PHYS allocations. Reserved out of global_mem_ so the
     // paged-pool side never hands out an address that collides with
     // an identity-mapped pinned buffer.
-    pinned_size_ = resolve_pinned_size();
+    pinned_size_ = resolve_pinned_size(global_mem_size_);
     if (pinned_size_ > 0) {
         pinned_base_ = ALLOC_BASE_ADDR;
         // Reserve the slab from global_mem_; the slab is owned by pinned_mem_.
@@ -217,7 +226,15 @@ vx_result_t Device::open(uint32_t index, Device** out) {
         return VX_ERR_DEVICE_LOST;
 
     std::unique_ptr<Platform> plat(new CallbacksAdapter(*cb, dev_ctx));
-    Device* d = new Device(std::move(plat));
+    // The memory size is a property of the device, as CUDA's totalGlobalMem:
+    // the allocator is sized from the caps word before anything is allocated.
+    uint64_t dev_caps = 0, isa_caps = 0;
+    auto rd = [&plat](uint32_t off, uint32_t* v) -> int {
+        return plat->cp_reg_read(off, v) == VX_SUCCESS ? 0 : -1;
+    };
+    if (vortex::load_caps(rd, &dev_caps, &isa_caps) != 0)
+        return VX_ERR_DEVICE_LOST;
+    Device* d = new Device(std::move(plat), dev_caps, isa_caps);
     auto cr = d->cp_init();
     if (cr != VX_SUCCESS) {
         d->release();
@@ -382,7 +399,7 @@ vx_result_t Device::cp_init() {
         }
         vm_io_  = std::unique_ptr<CpMemIO>(new CpMemIO(this));
         vm_mgr_ = std::unique_ptr<vortex::VMManager>(
-                      new vortex::VMManager(vm_io_.get()));
+                      new vortex::VMManager(vm_io_.get(), global_mem_size_));
         if (vm_mgr_->init() != 0)
             return VX_ERR_DEVICE_LOST;
         const uint64_t satp = vm_mgr_->satp();
@@ -428,11 +445,11 @@ vx_result_t Device::cp_init() {
             printf("[VXDRV] memory self-test\n"
                    "[VXDRV]   device reports : %llu bank(s) x %llu bytes"
                    " = %llu total\n"
-                   "[VXDRV]   host built for : %llu bytes (GLOBAL_MEM_SIZE),"
+                   "[VXDRV]   allocator      : %llu bytes,"
                    " user base 0x%llx\n",
                    (unsigned long long)banks, (unsigned long long)bank_size,
                    (unsigned long long)(banks * bank_size),
-                   (unsigned long long)GLOBAL_MEM_SIZE,
+                   (unsigned long long)global_mem_size_,
                    (unsigned long long)ALLOC_BASE_ADDR);
             // Sweep the advertised space by octave rather than by bank. The
             // question this answers is which addresses are actually backed:
@@ -444,7 +461,7 @@ vx_result_t Device::cp_init() {
                 0x1000000ull, 0x10000000ull, 0x80000000ull,
             };
             for (uint64_t addr : probes) {
-                if (addr >= GLOBAL_MEM_SIZE) {
+                if (addr >= global_mem_size_) {
                     continue;
                 }
                 uint32_t out[16], back[16];
@@ -1189,9 +1206,8 @@ vx_result_t Device::query_caps(uint32_t caps_id, uint64_t* out_value) {
     // Caps not encoded in the CP words — platform/runtime constants.
     switch (caps_id) {
     case VX_CAPS_CACHE_LINE_SIZE: *out_value = CACHE_BLOCK_SIZE;             break;
-    case VX_CAPS_GLOBAL_MEM_SIZE: *out_value = GLOBAL_MEM_SIZE;              break;
-    case VX_CAPS_CLOCK_RATE:      *out_value = VX_CFG_PLATFORM_CLOCK_RATE;   break;
-    case VX_CAPS_PEAK_MEM_BW:     *out_value = VX_CFG_PLATFORM_MEMORY_PEAK_BW; break;
+    case VX_CAPS_CLOCK_RATE:      *out_value = VX_CFG_SM_CLOCK_MHZ;   break;
+    case VX_CAPS_PEAK_MEM_BW:     *out_value = VX_CFG_PEAK_MEM_BW; break;
     case VX_CAPS_VM_SUPPORT:      *out_value = vm_enabled_ ? 1 : 0;          break;
     case VX_CAPS_VM_PINNED_SIZE:  *out_value = pinned_size_;                 break;
     case VX_CAPS_VM_PINNED_FREE: {

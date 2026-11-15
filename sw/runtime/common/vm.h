@@ -72,7 +72,7 @@ public:
 // csrw at boot (no push from host needed).
 class VMManager {
 public:
-  explicit VMManager(DeviceMemIO* dev_io);
+  VMManager(DeviceMemIO* dev_io, uint64_t global_mem_size);
   ~VMManager();
 
   int init();
@@ -112,6 +112,7 @@ private:
   uint8_t  get_mode()     const { return satp_ ? satp_->get_mode() : 0; }
 
   DeviceMemIO* dev_io_;
+  uint64_t global_mem_size_;
   std::unique_ptr<SATP_t> satp_;
 
   MemoryAllocator* page_table_mem_;

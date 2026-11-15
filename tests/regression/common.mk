@@ -45,12 +45,12 @@ else
 	ZACAS_EXT :=
 endif
 
+STARTUP_ADDR ?= $(patsubst -DVX_MEM_STARTUP_ADDR=%,%,$(filter -DVX_MEM_STARTUP_ADDR=%,$(XCONFIGS)))
+
 ifeq ($(XLEN),64)
 	VX_CFLAGS += -march=rv64imafd$(C_EXT)$(ZACAS_EXT) -mabi=lp64d
-	STARTUP_ADDR ?= 0x180000000
 else
 	VX_CFLAGS += -march=rv32imaf$(C_EXT)$(ZACAS_EXT) -mabi=ilp32f
-	STARTUP_ADDR ?= 0x80000000
 endif
 
 LLVM_CFLAGS += --target=riscv$(XLEN)-unknown-elf

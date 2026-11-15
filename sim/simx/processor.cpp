@@ -41,8 +41,6 @@ ProcessorImpl::ProcessorImpl()
   SimPlatform::instance().initialize();
   SimPlatform::instance().set_num_workers(SIMX_NUM_WORKERS);
 
-	assert(VX_CFG_PLATFORM_MEMORY_DATA_SIZE == VX_CFG_MEM_BLOCK_SIZE);
-
   // create kernel management unit (SimObject)
 #ifdef VX_CFG_EXT_DLMEM_ENABLE
   // One launch lane per hardware cluster, into its gang unit.
@@ -54,10 +52,9 @@ ProcessorImpl::ProcessorImpl()
 
   // create memory simulator
   memsim_ = Memory::Create("dram", Memory::Config{
-    VX_CFG_PLATFORM_MEMORY_NUM_BANKS,
+    VX_CFG_DRAM_CHANNELS,
     VX_CFG_L3_MEM_PORTS,
-    VX_CFG_MEM_BLOCK_SIZE,
-    MEM_CLOCK_RATIO
+    VX_CFG_MEM_BLOCK_SIZE
   });
 
   char sname[100];
@@ -116,6 +113,7 @@ ProcessorImpl::ProcessorImpl()
     VX_CFG_L3_NUM_REQS,              // request size
     VX_CFG_L3_MEM_PORTS,             // memory ports
     VX_CFG_L3_WRITEBACK,             // write-back
+    VX_CFG_L3_DIRTYBYTES,            // dirty bytes
     false,                    // write response
     VX_CFG_L3_MSHR_SIZE,             // mshr size
     VX_CFG_L3_LATENCY,               // pipeline latency

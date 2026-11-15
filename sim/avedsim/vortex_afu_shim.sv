@@ -18,16 +18,16 @@ module vortex_afu_shim #(
 
     parameter C_S_AXI_CTRL_DATA_WIDTH = 32,
     parameter C_M_AXI_MEM_ID_WIDTH    = `PLATFORM_MEMORY_ID_WIDTH,
-    parameter C_M_AXI_MEM_DATA_WIDTH  = (`VX_CFG_PLATFORM_MEMORY_DATA_SIZE * 8),
+    parameter C_M_AXI_MEM_DATA_WIDTH  = (`VX_CFG_DRAM_PORT_DATA_SIZE * 8),
     parameter C_M_AXI_MEM_ADDR_WIDTH  = 64,
-    parameter C_M_AXI_MEM_NUM_BANKS   = `VX_CFG_PLATFORM_MEMORY_NUM_BANKS
+    parameter C_M_AXI_MEM_NUM_BANKS   = `VX_CFG_DRAM_CHANNELS
 ) (
     // System signals
     input wire                                  ap_clk,
     input wire                                  ap_rst_n,
 
     // AXI4 master interface
-    `MP_REPEAT (`VX_CFG_PLATFORM_MEMORY_NUM_BANKS, GEN_AXI_MEM, MP_COMMA),
+    `MP_REPEAT (`VX_CFG_DRAM_CHANNELS, GEN_AXI_MEM, MP_COMMA),
 
     // AXI4 host-memory master interface (CP command ring + host side of DMA)
     `GEN_AXI_HOST,
@@ -65,7 +65,7 @@ module vortex_afu_shim #(
         .ap_clk   (ap_clk),
         .ap_rst_n (ap_rst_n),
 
-        `MP_REPEAT (`VX_CFG_PLATFORM_MEMORY_NUM_BANKS, AXI_MEM_ARGS, MP_COMMA),
+        `MP_REPEAT (`VX_CFG_DRAM_CHANNELS, AXI_MEM_ARGS, MP_COMMA),
 
         `AXI_HOST_ARGS,
 

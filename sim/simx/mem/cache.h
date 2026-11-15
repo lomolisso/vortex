@@ -38,6 +38,7 @@ public:
 		uint8_t num_inputs;     // number of inputs
 		uint8_t mem_ports;      // memory ports
 		bool    write_back;     // is write-back
+		bool    dirty_bytes;    // a writeback carries only the dirty bytes, else its whole sector
 		bool    write_reponse;  // enable write response
 		uint16_t mshr_size;     // MSHR buffer size
 		uint8_t latency;        // pipeline latency

@@ -9,8 +9,8 @@ override CONFIGS += -DPLATFORM_MEMORY_DATA_WIDTH=512
 # A single wide master fanned across the channels avoids the per-bank base
 # address problem: the linker assigns each memory range independently, and
 # those bases are not known at synthesis time.
-override CONFIGS += -DVX_CFG_PLATFORM_MEMORY_NUM_BANKS=1
-override CONFIGS += -DVX_CFG_PLATFORM_MEMORY_ADDR_WIDTH=34
+override CONFIGS += -DVX_CFG_DRAM_CHANNELS=1
+override CONFIGS += -DVX_CFG_DRAM_ADDR_WIDTH=34
 override CONFIGS += -DPLATFORM_MERGED_MEMORY_INTERFACE
 
 # Device-memory aperture base. The V80 maps the AFU's m_axi_mem_0 port at

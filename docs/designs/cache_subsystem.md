@@ -527,7 +527,7 @@ routing.
 
 **Memory ports.** `MEM_PORTS ≤ NUM_BANKS` (static assert). Ports below the bank
 count serialize the miss drain, which is fine when the hit rate is high.
-`PLATFORM_MEMORY_NUM_BANKS` is the real ceiling: every level's `MEM_PORTS`
+`VX_CFG_DRAM_CHANNELS` is the real ceiling: every level's `MEM_PORTS`
 expression mins against it.
 
 **Cache units.** `VX_cache_cluster` puts `NUM_UNITS` independent caches behind a
@@ -1142,10 +1142,10 @@ is fixed in `VX_gpu_pkg.sv` and at its instantiation (`NUM_BANKS=1`, `NUM_REQS=1
 | `VX_CFG_DCACHE_WORD_SIZE` | `min(L1_LINE_SIZE, min(MEM_BLOCK_SIZE, (XLEN/8) × pow(2, (clog2(NUM_LSU_LANES)+1)/2)))` | Coalescer output granule. Sets `NUM_REQS` and therefore the bank count. Smaller words → more banks (more MLP, more crossbar area); larger words → wider single-bank access. The `pow(2, (clog2(lanes)+1)/2)` term is a power-of-two rounding of a square root — there is no `sqrt` helper in the generator. |
 | `VX_CFG_DCACHE_NUM_BANKS` | `pow(2, clog2(min(DCACHE_NUM_REQS, 16)))` | Bank count. |
 | `VX_CFG_L2_NUM_BANKS` / `VX_CFG_L3_NUM_BANKS` | `pow(2, clog2(min(<L>_NUM_REQS, 16)))` | Identical form; `NUM_REQS` counts upstream sockets/clusters. |
-| `VX_CFG_L1_MEM_PORTS` | `min(DCACHE_NUM_BANKS, PLATFORM_MEMORY_NUM_BANKS)` when either L1 is enabled | Concurrent transactions presented downstream. |
-| `VX_CFG_L2_MEM_PORTS` / `VX_CFG_L3_MEM_PORTS` | `min(<L>_NUM_BANKS, PLATFORM_MEMORY_NUM_BANKS)` when enabled | Same. |
+| `VX_CFG_L1_MEM_PORTS` | `min(DCACHE_NUM_BANKS, DRAM_CHANNELS)` when either L1 is enabled | Concurrent transactions presented downstream. |
+| `VX_CFG_L2_MEM_PORTS` / `VX_CFG_L3_MEM_PORTS` | `min(<L>_NUM_BANKS, DRAM_CHANNELS)` when enabled | Same. |
 | `VX_CFG_NUM_ICACHES` / `VX_CFG_NUM_DCACHES` | `up(SOCKET_SIZE / 4)` if enabled, else `0` | L1 instances per socket. `up()` clamps to 1, so `SOCKET_SIZE < 4` still yields one cache — the `0` branch is reserved for the disable case. |
-| `VX_CFG_PLATFORM_MEMORY_NUM_BANKS` | `2` | Platform memory channels; caps every level's `MEM_PORTS`. |
+| `VX_CFG_DRAM_CHANNELS` | `2` | Platform memory channels; caps every level's `MEM_PORTS`. |
 
 The `min(…, 16)` in the bank expressions **is** the bank cap, and it applies
 identically at all three levels — the dcache is not special.

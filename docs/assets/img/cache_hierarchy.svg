@@ -114,7 +114,7 @@
 
   <rect x="66" y="466" width="368" height="58" rx="6" class="l1"/>
   <text x="78" y="486" class="th">socket mem egress</text>
-  <text x="78" y="504" class="ts">L1_MEM_PORTS = min(NUM_BANKS, PLATFORM_MEMORY_NUM_BANKS)</text>
+  <text x="78" y="504" class="ts">L1_MEM_PORTS = min(NUM_BANKS, DRAM_CHANNELS)</text>
   <text x="78" y="518" class="tt">icache + dcache merged onto the socket trunk</text>
 
   <!-- ============ CLUSTER SCOPE ============ -->
@@ -164,7 +164,7 @@
 
   <rect x="496" y="900" width="200" height="66" rx="6" class="mem"/>
   <text x="508" y="926" class="th" fill="#ffffff">platform memory</text>
-  <text x="508" y="946" class="cmw">PLATFORM_MEMORY_NUM_BANKS</text>
+  <text x="508" y="946" class="cmw">DRAM_CHANNELS</text>
   <text x="508" y="960" class="cmw">caps every level's MEM_PORTS</text>
 
   <!-- ============ RIGHT PANEL: the bus contract ============ -->

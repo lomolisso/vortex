@@ -23,6 +23,7 @@ module VX_mem_bank_adapter #(
     parameter NUM_PORTS_IN   = 1,
     parameter NUM_BANKS_OUT  = 1,
     parameter INTERLEAVE     = 0,
+    parameter BANK_SEL_SHIFT = 0, // interleave: low block-address bits kept below the bank select
     parameter TAG_BUFFER_SIZE= 32,
     parameter ARBITER        = "R",
     parameter REQ_OUT_BUF    = 1,
@@ -79,6 +80,7 @@ module VX_mem_bank_adapter #(
 
     `STATIC_ASSERT ((DST_ADDR_WDITH >= ADDR_WIDTH_IN), ("invalid address width: current=%0d, expected=%0d", DST_ADDR_WDITH, ADDR_WIDTH_IN))
     `STATIC_ASSERT ((TAG_WIDTH_OUT >= DST_TAG_WIDTH), ("invalid output tag width: current=%0d, expected=%0d", TAG_WIDTH_OUT, DST_TAG_WIDTH))
+    `STATIC_ASSERT ((BANK_SEL_SHIFT < BANK_ADDR_WIDTH), ("invalid bank select shift: current=%0d", BANK_SEL_SHIFT))
 
     // Bank selection
 
@@ -88,7 +90,11 @@ module VX_mem_bank_adapter #(
     if (NUM_BANKS_OUT > 1) begin : g_bank_sel
         for (genvar i = 0; i < NUM_PORTS_IN; ++i) begin : g_i
             wire [DST_ADDR_WDITH-1:0] mem_req_addr_dst = DST_ADDR_WDITH'(mem_req_addr_in[i]);
-            if (INTERLEAVE) begin : g_interleave
+            if (INTERLEAVE && BANK_SEL_SHIFT != 0) begin : g_interleave_shift
+                assign req_bank_sel[i]  = mem_req_addr_dst[BANK_SEL_SHIFT +: BANK_SEL_BITS];
+                assign req_bank_addr[i] = {mem_req_addr_dst[BANK_SEL_SHIFT + BANK_SEL_BITS +: BANK_ADDR_WIDTH - BANK_SEL_SHIFT],
+                                           mem_req_addr_dst[BANK_SEL_SHIFT-1:0]};
+            end else if (INTERLEAVE) begin : g_interleave
                 assign req_bank_sel[i]  = mem_req_addr_dst[BANK_SEL_BITS-1:0];
                 assign req_bank_addr[i] = mem_req_addr_dst[BANK_SEL_BITS +: BANK_ADDR_WIDTH];
             end else begin : g_no_interleave

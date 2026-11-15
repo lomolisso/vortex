@@ -14,9 +14,9 @@
 `include "VX_define.vh"
 
 module rtlsim_shim import VX_gpu_pkg::*; #(
-    parameter MEM_DATA_WIDTH = (`VX_CFG_PLATFORM_MEMORY_DATA_SIZE * 8),
-    parameter VX_CFG_MEM_ADDR_WIDTH = `VX_CFG_PLATFORM_MEMORY_ADDR_WIDTH - $clog2(`VX_CFG_PLATFORM_MEMORY_NUM_BANKS),
-    parameter MEM_NUM_BANKS  = `VX_CFG_PLATFORM_MEMORY_NUM_BANKS,
+    parameter MEM_DATA_WIDTH = (`VX_CFG_DRAM_PORT_DATA_SIZE * 8),
+    parameter VX_CFG_MEM_ADDR_WIDTH = `VX_CFG_DRAM_ADDR_WIDTH - $clog2(`VX_CFG_DRAM_CHANNELS),
+    parameter MEM_NUM_BANKS  = `VX_CFG_DRAM_CHANNELS,
     parameter MEM_TAG_WIDTH  = 64
 ) (
     `SCOPE_IO_DECL
@@ -59,6 +59,12 @@ module rtlsim_shim import VX_gpu_pkg::*; #(
     localparam SUB_LDATAW = DST_LDATAW - SRC_LDATAW;
     localparam VX_MEM_TAG_A_WIDTH  = VX_MEM_TAG_WIDTH + `MAX(SUB_LDATAW, 0);
     localparam VX_MEM_ADDR_A_WIDTH = VX_MEM_ADDR_WIDTH - SUB_LDATAW;
+
+    `STATIC_ASSERT (`IS_POW2(`VX_CFG_DRAM_CHANNELS), ("invalid parameter"))
+    `STATIC_ASSERT (`VX_MEM_STACK_BASE_ADDR < `VX_CFG_GLOBAL_MEM_SIZE, ("the stack must lie in global memory"))
+`ifdef VX_CFG_XLEN_64
+    `STATIC_ASSERT (`VX_CFG_GLOBAL_MEM_SIZE <= `VX_MEM_DLMEM_BASE_ADDR, ("the DLMEM window must lie above global memory"))
+`endif
 
     wire                            vx_mem_req_valid [VX_MEM_PORTS];
     wire                            vx_mem_req_rw [VX_MEM_PORTS];
@@ -170,7 +176,8 @@ module rtlsim_shim import VX_gpu_pkg::*; #(
         .TAG_WIDTH_OUT  (MEM_TAG_WIDTH),
         .NUM_PORTS_IN   (VX_MEM_PORTS),
         .NUM_BANKS_OUT  (MEM_NUM_BANKS),
-        .INTERLEAVE     (`VX_CFG_PLATFORM_MEMORY_INTERLEAVE),
+        .INTERLEAVE     (`VX_CFG_DRAM_INTERLEAVE),
+        .BANK_SEL_SHIFT (`VX_CFG_DRAM_INTERLEAVE_SHIFT),
         .REQ_OUT_BUF    ((VX_MEM_PORTS > 1) ? 2 : 0),
         .RSP_OUT_BUF    ((VX_MEM_PORTS > 1 || MEM_NUM_BANKS > 1) ? 2 : 0)
     ) mem_bank_adapter (

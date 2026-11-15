@@ -8,6 +8,24 @@ tests:
   - id: sw
     via: script
     run: "make -C tests/unittest run"
+  # The golden DRAM map: the 5000 lines measured on the H100, the golden presets'
+  # lines, the interim channel select and the Ramulator field packing.
+  - id: sw-dram-map
+    via: script
+    run: "make -C tests/unittest/dram_map run"
+    touches: [sw/common/vx_dram_map.h, tests/unittest/dram_map]
+  # DramSim alone, one binary per memory shape (legacy HBM2, micro, nano, pocket
+  # memory on the H100 model, h100 for wall time): zero-load read and write, row
+  # conflict and same-row pairs, per-channel rates and visit intervals, the age
+  # switch, queue bounds, completion order, the clock ratio and the golden map of
+  # every issued column command; the read/write mixes and loaded latency are printed
+  # for the configuration sweep.
+  - id: sw-dram-sim
+    via: script
+    xlen: [64]
+    run: "make -C tests/unittest/dram_sim run"
+    touches: [sim/common/dram_sim.h, sim/common/dram_sim.cpp, sim/common/dram, sw/common/vx_dram_map.h,
+              third_party/ramulator, tests/unittest/dram_sim, VX_config.toml]
   - id: hw
     via: script
     run: "make -C hw/unittest"

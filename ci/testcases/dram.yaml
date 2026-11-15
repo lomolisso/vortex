@@ -1,0 +1,167 @@
+# Global memory: DramSim (Ramulator 2.1 HBM3 as on the H100, or the HBM2 model of
+# the single-cluster shapes), its per-channel ports in every simulator, and the
+# dram_bench microbenchmarks. The H100 model is selected with DRAM_MODEL=H100 and
+# the memory-side counts below; compute stays one core. Every shape enables the
+# L2, so the chase's L2-hit pass is a real L2 hit.
+#   h8:  2 partitions x 2 LTCs x 2 slices = 8 channels, 4 SMs (micro memory)
+#   h16: 2 x 2 x 4 = 16 channels, 16 SMs (nano)
+#   h4:  1 x 2 x 2 = 4 channels, 4 SMs
+category: dram
+defaults:
+  xlen: [64]
+  tier: smoke
+  touches: [sim/common/dram_sim.h, sim/common/dram_sim.cpp, sim/common/dram, sw/common/vx_dram_map.h,
+            third_party/ramulator, hw/rtl/libs/VX_mem_bank_adapter.sv, sim/rtlsim, sim/xrtsim, sim/simx/mem,
+            tests/regression/dram_bench, VX_config.toml]
+tests:
+  # Dependent chase over cold lines, then the same chain again from the L2:
+  # median, p10 and p90 of both and the miss-over-hit offset.
+  - id: chase-h8
+    app: dram_bench
+    drivers: [simx, rtlsim]
+    configs: &h8 "-DVX_CFG_DRAM_MODEL=H100 -DVX_CFG_NUM_PARTITIONS=2 -DVX_CFG_SMS_PER_TPC=2 -DVX_CFG_LTCS_PER_MP=2 -DVX_CFG_SLICES_PER_LTC=2"
+    shape: {l2cache: true}
+    args: "chase"
+  # Two lanes load two lines of channel 0 at once, placed with the golden map: a
+  # same-bank different-row pair costs one row cycle over a different-bank pair
+  # (07 §4: 70 +-10 SM cycles, checked by the app); a same-row pair costs nothing.
+  - id: pair-conflict-h8
+    app: dram_bench
+    drivers: [simx, rtlsim]
+    configs: *h8
+    shape: {l2cache: true}
+    args: "pair -t conflict"
+  - id: pair-samerow-h8
+    app: dram_bench
+    drivers: [simx]
+    configs: *h8
+    shape: {l2cache: true}
+    args: "pair -t samerow"
+  - id: pair-otherbank-h8
+    app: dram_bench
+    drivers: [simx]
+    configs: *h8
+    shape: {l2cache: true}
+    args: "pair -t otherbank"
+  - id: legacy-chase
+    app: dram_bench
+    drivers: [simx]
+    shape: {l2cache: true}
+    args: "chase"
+
+  # Read, write and 1:1 streams over 2 MiB, twice the L2, so write-backs reach DRAM.
+  - id: stream-rd-h16
+    app: dram_bench
+    drivers: [simx]
+    tier: full
+    configs: &h16 "-DVX_CFG_DRAM_MODEL=H100 -DVX_CFG_NUM_PARTITIONS=2 -DVX_CFG_GPCS_PER_PARTITION=4 -DVX_CFG_SMS_PER_TPC=2 -DVX_CFG_LTCS_PER_MP=2 -DVX_CFG_SLICES_PER_LTC=4"
+    shape: {l2cache: true}
+    args: "stream -w 0 -n 1024"
+  - id: stream-wr-h16
+    app: dram_bench
+    drivers: [simx]
+    tier: full
+    configs: *h16
+    shape: {l2cache: true}
+    args: "stream -w 8 -n 1024"
+  - id: stream-mix4-h16
+    app: dram_bench
+    drivers: [simx]
+    tier: full
+    configs: *h16
+    shape: {l2cache: true}
+    args: "stream -w 4 -n 1024"
+  - id: sparse-ld64-h16
+    app: dram_bench
+    drivers: [simx]
+    tier: full
+    configs: *h16
+    shape: {l2cache: true}
+    args: "sparse -p ld64 -n 1024"
+  - id: sparse-st32-h16
+    app: dram_bench
+    drivers: [simx]
+    tier: full
+    configs: *h16
+    shape: {l2cache: true}
+    args: "sparse -p st32 -n 1024"
+  - id: sparse-st64-h16
+    app: dram_bench
+    drivers: [simx]
+    tier: full
+    configs: *h16
+    shape: {l2cache: true}
+    args: "sparse -p st64 -n 1024"
+  # A 1 MiB buffer right below the stacks at the top of a 16 GiB memory: the
+  # stack, local-memory and DLMEM bases follow the memory size.
+  - id: top-h16
+    app: dram_bench
+    drivers: [simx]
+    tier: full
+    configs: *h16
+    shape: {l2cache: true}
+    args: "top"
+
+  # The per-channel paths must be exercised, not only pass: a 1:1 stream first
+  # into channel 0 alone (its queue fills: backpressure) and then over every
+  # channel, and the simulator's "PERF: dram" totals must show responses out of
+  # request order, refused sends and, on xrtsim, one AXI B per DRAM write.
+  - id: stream-mix4-h8
+    via: script
+    driver: simx
+    configs: *h8
+    env: {DRIVER: simx, ARGS: "stream -w 4 -c both -n 512", NEED: "ooo_rsps bp_stalls"}
+    run: &counters_run |
+      set -u
+      tmp=$(mktemp -d)
+      if ! make -C sw/runtime/"$DRIVER" > "$tmp/build.log" 2>&1 \
+         || ! make -C tests/regression/dram_bench >> "$tmp/build.log" 2>&1; then
+        echo "FAIL: the build failed with CONFIGS=${CONFIGS:-}"; tail -n 20 "$tmp/build.log"
+        rm -rf "$tmp"; exit 1
+      fi
+      fail=0
+      if ! ./ci/blackbox.sh --driver="$DRIVER" --app=dram_bench --l2cache --args="$ARGS" > "$tmp/run.log" 2>&1; then
+        echo "FAIL: '$ARGS' failed on $DRIVER"; tail -n 30 "$tmp/run.log"; fail=1
+      fi
+      line=$(grep '^PERF: dram ' "$tmp/run.log" | tail -n 1)
+      echo "$line"
+      val() { echo "$line" | sed -n "s/.* $1=\([0-9]*\).*/\1/p"; }
+      for k in $NEED; do
+        v=$(val "$k")
+        if [ -z "$v" ] || [ "$v" -eq 0 ]; then echo "FAIL: $k is '${v}' on $DRIVER, must be > 0"; fail=1; fi
+      done
+      if [ "${WR_EQ:-0}" = 1 ]; then
+        a=$(val wr_rsps); b=$(val wr_reqs)
+        if [ -z "$a" ] || [ "$a" != "$b" ]; then echo "FAIL: wr_rsps '$a' != wr_reqs '$b'"; fail=1; fi
+      fi
+      rm -rf "$tmp"
+      exit $fail
+  - id: stream-mix4-h8
+    via: script
+    driver: rtlsim
+    configs: *h8
+    env: {DRIVER: rtlsim, ARGS: "stream -w 4 -c both -n 512", NEED: "ooo_rsps bp_stalls"}
+    run: *counters_run
+  - id: xrt-stream-mix-h4
+    via: script
+    driver: xrt
+    tier: full
+    configs: "-DVX_CFG_DRAM_MODEL=H100 -DVX_CFG_GPCS_PER_PARTITION=2 -DVX_CFG_SMS_PER_TPC=2 -DVX_CFG_LTCS_PER_MP=2 -DVX_CFG_SLICES_PER_LTC=2"
+    env: {DRIVER: xrt, ARGS: "stream -w 4 -c both -n 512", NEED: "ooo_rsps bp_stalls wr_rsps", WR_EQ: "1"}
+    run: *counters_run
+
+  # SimX against the RTL on the new per-channel paths (XLEN 64: the H100 model).
+  - id: parity-chase-h8
+    check: model_parity
+    app: dram_bench
+    xlen: [64]
+    configs: *h8
+    shape: {l2cache: true}
+    args: "chase"
+  - id: parity-stream-mix4-h8
+    check: model_parity
+    app: dram_bench
+    xlen: [64]
+    configs: *h8
+    shape: {l2cache: true}
+    args: "stream -w 4 -c both -n 512"

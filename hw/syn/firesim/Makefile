@@ -91,7 +91,7 @@ SYNTH_DEFINES := -DSYNTHESIS -DVIVADO -DNDEBUG
 # depend on the memory model echoing rid bit-exact -- an assumption real AXI
 # satisfies but a timing model need not. One port removes the dependency
 # entirely and matches what the wrapper actually presents.
-PLATFORM_DEFINES := -DVX_CFG_PLATFORM_MEMORY_NUM_BANKS=1
+PLATFORM_DEFINES := -DVX_CFG_DRAM_CHANNELS=1
 
 # Paired with idBits in VortexConfig (VortexTarget.scala) -- change neither alone.
 # That one shapes the IO the blackbox is instantiated with, this one shapes the

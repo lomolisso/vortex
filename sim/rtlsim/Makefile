@@ -13,14 +13,10 @@ CXXFLAGS += -fPIC -Wno-maybe-uninitialized
 CXXFLAGS += -fno-tree-loop-distribute-patterns
 CXXFLAGS += -I$(ROOT_DIR)/sw -I$(ROOT_DIR)/hw -I$(SIM_COMMON_DIR) -I$(SW_COMMON_DIR)
 CXXFLAGS += -I$(THIRD_PARTY_DIR)/softfloat/source/include
-CXXFLAGS += -I$(THIRD_PARTY_DIR)/ramulator/ext/spdlog/include
-CXXFLAGS += -I$(THIRD_PARTY_DIR)/ramulator/ext/yaml-cpp/include
-CXXFLAGS += -I$(THIRD_PARTY_DIR)/ramulator/src
 CXXFLAGS += -DVX_CFG_XLEN=$(XLEN) -DVX_CFG_XLEN_$(XLEN)
 CXXFLAGS += $(CONFIGS)
 
 LDFLAGS += $(THIRD_PARTY_DIR)/softfloat/build/Linux-x86_64-GCC/softfloat.a
-LDFLAGS += -Wl,-rpath,$(THIRD_PARTY_DIR)/ramulator  -L$(THIRD_PARTY_DIR)/ramulator -lramulator
 
 # control RTL debug tracing states
 DBG_TRACE_FLAGS += -DDBG_TRACE_PIPELINE
@@ -36,6 +32,8 @@ DBG_TRACE_FLAGS += -DDBG_TRACE_RTU
 override CONFIGS += -DSIMULATION -DSV_DPI
 
 XCONFIGS := $(shell python3 $(ROOT_DIR)/ci/gen_config.py --config=$(VORTEX_HOME)/VX_config.toml --cflags='$(CONFIGS) -DVX_CFG_XLEN=$(XLEN)')
+DRAM_ENUMS := $(filter -DVX_CFG_DRAM_MODEL_% -DVX_CFG_DRAM_PAGE_POLICY_% -DVX_CFG_DRAM_RW_POLICY_% -DVX_CFG_DRAM_SCHED_% -DVX_CFG_DRAM_REFRESH_%,$(XCONFIGS))
+CXXFLAGS += $(DRAM_ENUMS)
 
 DBG_FLAGS += -DVX_DBG_DEBUG_LEVEL=$(DEBUG) $(DBG_TRACE_FLAGS)
 RTL_PKGS = $(RTL_DIR)/VX_gpu_pkg.sv $(RTL_DIR)/fpu/VX_fpu_pkg.sv
@@ -137,7 +135,7 @@ endif
 
 RTL_PKGS += $(RTL_DIR)/VX_trace_pkg.sv
 
-SRCS = $(SW_COMMON_DIR)/util.cpp $(SIM_COMMON_DIR)/mem.cpp $(SW_COMMON_DIR)/softfloat_ext.cpp $(SW_COMMON_DIR)/rvfloats.cpp $(SIM_COMMON_DIR)/dram_sim.cpp $(SIM_COMMON_DIR)/elf_loader.cpp $(SIM_COMMON_DIR)/host_monitor.cpp $(SIM_COMMON_DIR)/cout_drainer.cpp
+SRCS = $(SW_COMMON_DIR)/util.cpp $(SIM_COMMON_DIR)/mem.cpp $(SW_COMMON_DIR)/softfloat_ext.cpp $(SW_COMMON_DIR)/rvfloats.cpp $(SIM_COMMON_DIR)/elf_loader.cpp $(SIM_COMMON_DIR)/host_monitor.cpp $(SIM_COMMON_DIR)/cout_drainer.cpp
 SRCS += $(DPI_DIR)/dpi_util.cpp $(DPI_DIR)/dpi_float.cpp
 # The H100 FEDP model behind the DPI tensor backend (knob on, from CONFIGS or the toml).
 ifneq (,$(filter -DVX_CFG_TCU_H100_ENABLE,$(XCONFIGS)))
@@ -161,7 +159,7 @@ VL_FLAGS += -DVX_CFG_XLEN=$(XLEN) -DVX_CFG_XLEN_$(XLEN)
 # leaves the RTL `ifdef selectors (which key off the *companion*
 # VX_CFG_TCU_TYPE_DPI) unmatched. Add just the enum companions gen_config
 # resolves, so a CONFIGS enum override actually selects its RTL implementation.
-VL_FLAGS += $(CONFIGS) $(filter -DVX_CFG_TCU_TYPE_% -DVX_CFG_FPU_TYPE_%,$(XCONFIGS))
+VL_FLAGS += $(CONFIGS) $(filter -DVX_CFG_TCU_TYPE_% -DVX_CFG_FPU_TYPE_%,$(XCONFIGS)) $(DRAM_ENUMS)
 VL_FLAGS += $(RTL_INCLUDE)
 VL_FLAGS += $(RTL_PKGS)
 VL_FLAGS += $(RTL_PRE_SRCS)
@@ -215,10 +213,13 @@ PROJECT := rtlsim
 
 all: $(DESTDIR)/$(PROJECT)
 
-$(DESTDIR)/$(PROJECT): $(SRCS) $(SRC_DIR)/main.cpp $(CONFIG_FILE) $(RTL_SRCS)
+include $(SIM_COMMON_DIR)/dram/ramulator.mk
+LDFLAGS += $(VXDRAM_LDFLAGS)
+
+$(DESTDIR)/$(PROJECT): $(SRCS) $(SRC_DIR)/main.cpp $(CONFIG_FILE) $(RTL_SRCS) $(VXDRAM_LIB)
 	$(VERILATOR_PATH)/bin/verilator --build $(VL_FLAGS) $(SRCS) $(SRC_DIR)/main.cpp -CFLAGS '$(CXXFLAGS)' -LDFLAGS '$(LDFLAGS)' --MMD --Mdir $@.obj_dir -o $@
 
-$(DESTDIR)/lib$(PROJECT).so: $(SRCS) $(CONFIG_FILE) $(RTL_SRCS)
+$(DESTDIR)/lib$(PROJECT).so: $(SRCS) $(CONFIG_FILE) $(RTL_SRCS) $(VXDRAM_LIB)
 	$(VERILATOR_PATH)/bin/verilator --build $(VL_FLAGS) $(SRCS) -CFLAGS '$(CXXFLAGS)' -LDFLAGS '-shared $(LDFLAGS)' --MMD --Mdir $@.obj_dir -o $@
 
 # updates the timestamp when flags changed.
@@ -240,4 +241,4 @@ clean-exe:
 	rm -rf $(DESTDIR)/$(PROJECT).obj_dir
 	rm -f $(DESTDIR)/$(PROJECT)
 
-clean: clean-lib clean-exe
+clean: clean-lib clean-exe clean-vxdram
