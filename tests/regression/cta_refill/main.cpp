@@ -12,14 +12,17 @@
 //            clusters of 1 and clusters of 2. On every SM the gap from a block's
 //            last clock read to the next block's first is at least the refill
 //            knob of its launch kind (VX_CFG_CTA_REFILL_*CYCLES, anchored at the
-//            CTA-done event, which comes after the last read); with -t it is
-//            at most the knob plus that kind's tail measured with the knobs at 0.
+//            CTA-done event, which comes after the last read); with -t the gaps
+//            after an SM's first block are at most the knob plus that kind's
+//            tail measured the same way with the knobs at 0. A launch starts
+//            with cold caches, so the first block's exit path fetches its code
+//            from DRAM and its gap carries a DRAM latency the refill does not.
 //   -M       first wave: 1.5 x M1 + 1 long clusters of one-warp blocks for K = 1,
 //            2 and the largest K; the clusters that start before the first one
 //            ends must number M1 = vx_occupancy_max_active_clusters = the sum
 //            over GPCs of floor(SMs x c / K), c = min(VX_CFG_MAX_CTAS_PER_SM_CLUSTER,
 //            NUM_WARPS).
-//   -n N     clusters (-H, default 8) or waves (-R, default 3)
+//   -n N     clusters (-H, default 8) or waves (-R, default 3, at least 3)
 //   -L I     ALU iterations of cluster 0 (-H, default 4000) or of every block (-M, default 4000)
 //   -S I     ALU iterations of the other clusters (-H) or of every block (-R) (default 16)
 //   -t P,C1,C2  -R: the tails of plain blocks, clusters of 1 and clusters of 2, in cycles (0: not checked)
@@ -92,7 +95,7 @@ void parse_args(int argc, char** argv) {
   }
   if (req_n == 0)
     req_n = (mode == 'R') ? 3 : 8;
-  if (mode == 0 || optind < argc || req_n < 2) {
+  if (mode == 0 || optind < argc || req_n < ((mode == 'R') ? 3u : 2u)) {
     usage();
     std::exit(-1);
   }
@@ -254,8 +257,9 @@ int run_h4(vx_device_h dev, vx_queue_h q, vx_kernel_h kernel, const Caps& caps) 
 }
 
 // The gaps between consecutive blocks on each SM: thread 0's last clock read of
-// one block to the first read of the next.
-struct Gaps { uint64_t min = ~0ull, max = 0, count = 0; };
+// one block to the first read of the next; warm_max leaves out the gap after the
+// SM's first block.
+struct Gaps { uint64_t min = ~0ull, max = 0, count = 0, warm_max = 0, warm_count = 0; };
 
 Gaps gaps_of(const Caps& caps, const Run& run) {
   std::vector<std::vector<const Rec*>> per_sm(caps.num_cores);
@@ -269,6 +273,10 @@ Gaps gaps_of(const Caps& caps, const Run& run) {
       g.min = std::min(g.min, gap);
       g.max = std::max(g.max, gap);
       ++g.count;
+      if (i >= 2) {
+        g.warm_max = std::max(g.warm_max, gap);
+        ++g.warm_count;
+      }
     }
   }
   return g;
@@ -297,10 +305,11 @@ int run_refill(vx_device_h dev, vx_queue_h q, vx_kernel_h kernel, const Caps& ca
     if (e)
       continue;
     const Gaps g = gaps_of(caps, run);
-    bool ok = g.count != 0 && g.min >= kd.knob && (kd.tail == 0 || g.max <= kd.knob + kd.tail);
-    std::printf("%s refill: %s, %llu gaps of %llu..%llu cycles, knob %llu, tail %llu\n",
+    bool ok = g.warm_count != 0 && g.min >= kd.knob && (kd.tail == 0 || g.warm_max <= kd.knob + kd.tail);
+    std::printf("%s refill: %s, %llu gaps of %llu..%llu cycles, %llu warm up to %llu, knob %llu, tail %llu\n",
                 ok ? "" : "***", kd.name, (unsigned long long)g.count, (unsigned long long)g.min,
-                (unsigned long long)g.max, (unsigned long long)kd.knob, (unsigned long long)kd.tail);
+                (unsigned long long)g.max, (unsigned long long)g.warm_count, (unsigned long long)g.warm_max,
+                (unsigned long long)kd.knob, (unsigned long long)kd.tail);
     errors += ok ? 0 : 1;
   }
   return errors;

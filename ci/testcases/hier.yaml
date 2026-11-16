@@ -288,11 +288,15 @@ tests:
 
   # Refill: one whole-SM block per SM, several waves, as plain blocks and as
   # clusters of 1 and 2. On every SM the gap from a block's last clock read to
-  # the next block's first is at least the launch kind's refill knob and at most
-  # the knob plus the tail measured with the three knobs at 0 (-t: the largest
-  # knob-0 gap per kind over the cell's drivers). Plain blocks take the
-  # cluster-1 tail: at knob 0 a plain block starts on a warp the old block
-  # frees while its warp 0 still exits, so its knob-0 gap misses that exit.
+  # the next block's first is at least the launch kind's refill knob, and after
+  # the SM's first block at most the knob plus the tail measured with the three
+  # knobs at 0 (-t: the largest such knob-0 gap per kind over the cell's
+  # drivers). The first block's gap is left out of the upper bound: a launch
+  # starts with cold caches, so that block's exit path misses in the I-cache and
+  # waits on DRAM, which moves with the memory model, not with the dispatcher.
+  # Plain blocks take the cluster-1 tail: at knob 0 a plain block starts on a
+  # warp the old block frees while its warp 0 still exits, so its knob-0 gap
+  # misses that exit.
   - id: refill-micro
     app: cta_refill
     drivers: [simx, rtlsim]
