@@ -59,6 +59,9 @@ public:
 
   const PerfStats& perf_stats() const;
 
+  // A fragment waiting on its destination read holds no channel packet.
+  bool busy() const;
+
 protected:
   void on_reset();
   void on_tick();

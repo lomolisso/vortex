@@ -387,6 +387,13 @@ public:
       return true;
     }
   #endif
+  #ifdef VX_CFG_EXT_OM_ENABLE
+    // vx_om4 retires at export, so the ROP holds the launch until it drains,
+    // as the RTL's graphics busy does.
+    if (om_core_->busy()) {
+      return true;
+    }
+  #endif
   #ifdef VX_CFG_VM_ENABLE
     // A parked fill holds no channel packet while it waits, so completion
     // must ask the TLB directly. (The device walker is the processor's.)
