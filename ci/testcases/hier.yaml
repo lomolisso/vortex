@@ -1,0 +1,373 @@
+# Compute hierarchy: partitions > GPCs > CPCs > TPCs > SMs, cluster dispatch over
+# the GPCs, SM identity and the SimX execution domains, at the H100 shapes and at
+# today's (degenerate) shapes. RV64, DLMEM and atomics on; the atomics need one
+# shared last level, so several GPCs run with an L3 and one GPC with its L2. See
+# docs/proposals/h100_organization_proposal.md.
+#
+# Shapes, as the five level counts (partitions/GPCs per partition/CPCs per
+# GPC/TPCs per CPC/SMs per TPC): micro 2/1/1/1/2 (4 SMs), cpc4 1/1/2/2/1 (4 SMs,
+# the smallest with 2 CPCs and 2 TPC slots), nano 2/4/1/1/2 (16), pocket 2/4/2/1/2
+# (32), npB 2/2/4/1/2 (32, not a preset), h100 2/4/2/4/2 (128), gpc1 2/1/1/1/1 (2); degenerate shapes
+# set NUM_CLUSTERS / NUM_CORES / SOCKET_SIZE instead.
+category: hier
+defaults:
+  xlen: [64]
+  configs: "-DVX_CFG_EXT_DLMEM_ENABLE -DVX_CFG_EXT_A_ENABLE"
+  tier: smoke
+  touches: [VX_config.toml, VX_types.toml, ci/gen_config.py, hw/rtl/Vortex.sv, hw/rtl/VX_gpu_pkg.sv,
+            hw/rtl/VX_partition.sv, hw/rtl/VX_cluster.sv, hw/rtl/VX_cpc.sv, hw/rtl/VX_socket.sv,
+            hw/rtl/VX_gpc_boundary.sv, hw/rtl/VX_kmu.sv, hw/rtl/core/VX_kmu_bus_arb.sv,
+            hw/rtl/interfaces/VX_kmu_bus_if.sv, hw/rtl/core/VX_dcr_data.sv, hw/rtl/core/VX_cta_dispatch.sv,
+            hw/rtl/core/VX_csr_data.sv, hw/rtl/dlmem, hw/rtl/cp/VX_cp_axil_regfile.sv,
+            sim/simx/processor.cpp, sim/simx/processor.h, sim/simx/processor_impl.h, sim/simx/partition,
+            sim/simx/cluster, sim/simx/cpc, sim/simx/socket, sim/simx/constants.h, sim/simx/cta_dispatcher,
+            sim/simx/barrier_unit, sim/simx/kmu, sim/simx/csr_unit.cpp, sim/simx/exec_domains.h,
+            sim/simx/regslice.h, sim/simx/Makefile, sim/common/simobject.h, sim/common/cmd_processor,
+            sw/common/dlmem_ref.h, sw/common/vx_hier.h, sw/runtime/common, sw/runtime/include/vortex2.h,
+            sw/runtime/include/vx_cuda_runtime.h, sw/kernel/include/vx_cuda.h,
+            tests/regression/cta_gang, tests/regression/cta_refill, tests/regression/sm_identity]
+tests:
+  # One GPC never blocks another: clusters of K = a GPC's SMs, each block a whole
+  # SM, cluster 0 long; every other cluster must run in the GPC cluster 0 leaves
+  # free while it runs. Before the per-GPC dispatch a cluster routed to cluster
+  # 0's busy GPC held back the ones behind it.
+  - id: h4-2cl
+    app: cta_refill
+    drivers: [simx, rtlsim]
+    shape: {clusters: 2, cores: 2, l3cache: true}
+    args: "-H -v"
+  - id: h4-micro
+    app: cta_refill
+    drivers: [simx, rtlsim]
+    configs+: &micro "-DVX_CFG_H100_ORG_ENABLE -DVX_CFG_NUM_PARTITIONS=2 -DVX_CFG_GPCS_PER_PARTITION=1 -DVX_CFG_CPCS_PER_GPC=1 -DVX_CFG_TPCS_PER_CPC=1 -DVX_CFG_SMS_PER_TPC=2"
+    shape: {l3cache: true}
+    args: "-H -v"
+  - id: parity-h4-2cl
+    check: model_parity
+    app: cta_refill
+    xlen: [64]
+    shape: {clusters: 2, cores: 2, l3cache: true}
+    args: "-H -n 4 -L 2000"
+
+  # One block per SM reads %smid and %nsmid; the host decodes every %smid into
+  # (partition, GPC, CPC, TPC, SM) with vx_hier.h and the level counts from the
+  # caps: a bijection onto the SMs, each position once.
+  - id: identity-degen
+    app: sm_identity
+    drivers: [simx]
+    configs+: "-DVX_CFG_SOCKET_SIZE=2"
+    shape: {clusters: 2, cores: 4, l3cache: true}
+  - id: identity-micro
+    app: sm_identity
+    drivers: [simx, rtlsim]
+    configs+: *micro
+    shape: {l3cache: true}
+  - id: identity-cpc4
+    app: sm_identity
+    drivers: [simx, rtlsim]
+    configs+: &cpc4 "-DVX_CFG_H100_ORG_ENABLE -DVX_CFG_NUM_PARTITIONS=1 -DVX_CFG_GPCS_PER_PARTITION=1 -DVX_CFG_CPCS_PER_GPC=2 -DVX_CFG_TPCS_PER_CPC=2 -DVX_CFG_SMS_PER_TPC=1"
+    shape: {l2cache: true}
+  - id: identity-npB
+    app: sm_identity
+    drivers: [simx]
+    configs+: &npB "-DVX_CFG_H100_ORG_ENABLE -DVX_CFG_NUM_PARTITIONS=2 -DVX_CFG_GPCS_PER_PARTITION=2 -DVX_CFG_CPCS_PER_GPC=4 -DVX_CFG_TPCS_PER_CPC=1 -DVX_CFG_SMS_PER_TPC=2"
+    shape: {l3cache: true}
+  - id: identity-pocket
+    app: sm_identity
+    drivers: [simx]
+    configs+: &pocket "-DVX_CFG_H100_ORG_ENABLE -DVX_CFG_NUM_PARTITIONS=2 -DVX_CFG_GPCS_PER_PARTITION=4 -DVX_CFG_CPCS_PER_GPC=2 -DVX_CFG_TPCS_PER_CPC=1 -DVX_CFG_SMS_PER_TPC=2"
+    shape: {l3cache: true}
+  - id: identity-h100
+    app: sm_identity
+    drivers: [simx]
+    tier: nightly
+    configs+: &h100 "-DVX_CFG_H100_ORG_ENABLE -DVX_CFG_NUM_PARTITIONS=2 -DVX_CFG_GPCS_PER_PARTITION=4 -DVX_CFG_CPCS_PER_GPC=2 -DVX_CFG_TPCS_PER_CPC=4 -DVX_CFG_SMS_PER_TPC=2"
+    shape: {l3cache: true}
+
+  # Bad configurations stop at configuration time, with the check's name. The
+  # check runs where the build resolves its -D overrides (gen_config.py), and the
+  # SimX build is tried only if that accepts them; COMPILE_ONLY gives the -D to
+  # the compiler alone, which the header's #error must catch.
+  - id: cfg-mixed-knobs
+    via: script
+    driver: simx
+    configs+: "-DVX_CFG_H100_ORG_ENABLE -DVX_CFG_NUM_PARTITIONS=2 -DVX_CFG_SMS_PER_TPC=2 -DVX_CFG_NUM_CORES=4"
+    env: {EXPECT: "ORG_ALIASES"}
+    run: &cfg_run |
+      set -u
+      tmp=$(mktemp -d)
+      read -r vh xl <<< "$(printf 'include config.mk\nall:\n\t@echo $(VORTEX_HOME) $(XLEN)\n' | make -s -f -)"
+      if [ -n "${COMPILE_ONLY:-}" ]; then
+        gen_rc=0
+      else
+        python3 "$vh/ci/gen_config.py" --config="$vh/VX_config.toml" --format=cpp --resolved \
+          --cflags="${CONFIGS:-} -DVX_CFG_XLEN=$xl" -o "$tmp/VX_config.h" > "$tmp/gen.log" 2>&1; gen_rc=$?
+      fi
+      fail=0
+      if [ $gen_rc -ne 0 ]; then
+        if grep -qF "$EXPECT" "$tmp/gen.log"; then
+          echo "OK: the configuration is refused: $(grep -F -m1 "$EXPECT" "$tmp/gen.log")"
+        else
+          echo "FAIL: the configuration was refused without '$EXPECT':"; tail -n 20 "$tmp/gen.log"; fail=1
+        fi
+      else
+        make -C sim/simx DESTDIR="$tmp" "$tmp/obj/processor.o" > "$tmp/simx.log" 2>&1; simx_rc=$?
+        want="$EXPECT"; [ -n "${COMPILE_ONLY:-}" ] && want="#error \"$EXPECT"
+        if [ $simx_rc -eq 0 ]; then
+          echo "FAIL: the configuration and the SimX build accepted CONFIGS=${CONFIGS:-}"; fail=1
+        elif ! grep -qF "$want" "$tmp/simx.log"; then
+          echo "FAIL: the SimX build failed without '$want':"; tail -n 20 "$tmp/simx.log"; fail=1
+        else
+          echo "OK: the SimX build refuses it: $(grep -F -m1 "$want" "$tmp/simx.log")"
+        fi
+      fi
+      rm -rf "$tmp"
+      exit $fail
+  - id: cfg-gpc-start
+    via: script
+    driver: simx
+    configs+: "-DVX_CFG_H100_ORG_ENABLE -DVX_CFG_NUM_PARTITIONS=2 -DVX_CFG_GPCS_PER_PARTITION=4 -DVX_CFG_SMS_PER_TPC=2 -DVX_CFG_CLUSTER_GPC_START=8"
+    env: {EXPECT: "GPC_START_RANGE"}
+    run: *cfg_run
+  - id: cfg-cluster-ctas
+    via: script
+    driver: simx
+    configs+: "-DVX_CFG_SM_MAX_CLUSTER_BLOCKS=0"
+    env: {EXPECT: "CLUSTER_CTAS_RANGE"}
+    run: *cfg_run
+  - id: cfg-boundary-delay
+    via: script
+    driver: simx
+    configs+: "-DVX_CFG_DOMAIN_BOUNDARY_DELAY=0"
+    env: {EXPECT: "BOUNDARY_DELAY_MIN"}
+    run: *cfg_run
+  - id: cfg-boundary-delay-max
+    via: script
+    driver: simx
+    configs+: "-DVX_CFG_DOMAIN_BOUNDARY_DELAY=2"
+    env: {EXPECT: "BOUNDARY_DELAY_MAX"}
+    run: *cfg_run
+  - id: cfg-compile-only
+    via: script
+    driver: simx
+    configs+: "-DVX_CFG_H100_ORG_ENABLE -DVX_CFG_NUM_PARTITIONS=2 -DVX_CFG_GPCS_PER_PARTITION=4 -DVX_CFG_SMS_PER_TPC=2 -DVX_CFG_CLUSTER_GPC_START=8"
+    env: {EXPECT: "GPC_START_RANGE", COMPILE_ONLY: "1"}
+    run: *cfg_run
+  - id: cfg-cpcs-pow2
+    via: script
+    driver: simx
+    configs+: "-DVX_CFG_H100_ORG_ENABLE -DVX_CFG_CPCS_PER_GPC=3"
+    env: {EXPECT: "CPCS_PER_GPC_POW2"}
+    run: *cfg_run
+  - id: cfg-maxcluster
+    via: script
+    driver: simx
+    configs+: "-DVX_CFG_H100_ORG_ENABLE -DVX_CFG_NUM_PARTITIONS=2 -DVX_CFG_GPCS_PER_PARTITION=4 -DVX_CFG_CPCS_PER_GPC=2 -DVX_CFG_SMS_PER_TPC=2 -DVX_CFG_DLMEM_MAX_CLUSTER=8"
+    env: {EXPECT: "DLMEM_MAX_CLUSTER must be between 1 and the cores of a cluster"}
+    run: *cfg_run
+
+  # The E1 placement at the new shapes (-x hier): for K = 1, 2 and the largest K
+  # an idle chip's first wave lands as dlmem_ref::place_chip places it, within the
+  # per-SM CTA caps, twice in a row; clusters above the largest K are refused.
+  - id: cta_gang-micro
+    app: cta_gang
+    drivers: [simx, rtlsim]
+    configs+: *micro
+    shape: {l3cache: true}
+    args: "-x hier"
+  - id: cta_gang-cpc4
+    app: cta_gang
+    drivers: [simx, rtlsim]
+    configs+: *cpc4
+    shape: {l2cache: true}
+    args: "-x hier"
+  - id: cta_gang-nano
+    app: cta_gang
+    drivers: [simx]
+    configs+: &nano "-DVX_CFG_H100_ORG_ENABLE -DVX_CFG_NUM_PARTITIONS=2 -DVX_CFG_GPCS_PER_PARTITION=4 -DVX_CFG_CPCS_PER_GPC=1 -DVX_CFG_TPCS_PER_CPC=1 -DVX_CFG_SMS_PER_TPC=2"
+    shape: {l3cache: true}
+    args: "-x hier"
+  - id: cta_gang-pocket
+    app: cta_gang
+    drivers: [simx]
+    configs+: *pocket
+    shape: {l3cache: true}
+    args: "-x hier"
+  # Sixteen warps: 16 CTA slots per SM, so the cluster cap of 8 binds.
+  - id: cta_gang-pocket-w16
+    app: cta_gang
+    drivers: [simx]
+    configs+: "-DVX_CFG_H100_ORG_ENABLE -DVX_CFG_NUM_PARTITIONS=2 -DVX_CFG_GPCS_PER_PARTITION=4 -DVX_CFG_CPCS_PER_GPC=2 -DVX_CFG_TPCS_PER_CPC=1 -DVX_CFG_SMS_PER_TPC=2 -DVX_CFG_NUM_WARPS=16"
+    shape: {l3cache: true}
+    args: "-x hier"
+  - id: cta_gang-npB
+    app: cta_gang
+    drivers: [simx]
+    configs+: *npB
+    shape: {l3cache: true}
+    args: "-x hier"
+  # One SM per GPC: the admission's lane into the GPC has no fan-out.
+  - id: cta_gang-gpc1
+    app: cta_gang
+    drivers: [simx]
+    configs+: &gpc1 "-DVX_CFG_H100_ORG_ENABLE -DVX_CFG_NUM_PARTITIONS=2"
+    shape: {l3cache: true}
+    args: "-x hier"
+  - id: identity-gpc1
+    app: sm_identity
+    drivers: [simx]
+    configs+: *gpc1
+    shape: {l3cache: true}
+  - id: identity-sm1
+    app: sm_identity
+    drivers: [simx]
+    configs+: "-DVX_CFG_H100_ORG_ENABLE"
+    shape: {l2cache: true}
+  - id: cta_gang-h100
+    app: cta_gang
+    drivers: [simx]
+    tier: nightly
+    configs+: *h100
+    shape: {l3cache: true}
+    args: "-x hier"
+  - id: reject-k-pocket
+    app: cta_gang
+    drivers: [simx]
+    configs+: *pocket
+    shape: {l3cache: true}
+    args: "-x reject-k"
+  - id: parity-cta_gang-micro-w16
+    check: model_parity
+    app: cta_gang
+    xlen: [64]
+    configs+: "-DVX_CFG_H100_ORG_ENABLE -DVX_CFG_NUM_PARTITIONS=2 -DVX_CFG_GPCS_PER_PARTITION=1 -DVX_CFG_CPCS_PER_GPC=1 -DVX_CFG_TPCS_PER_CPC=1 -DVX_CFG_SMS_PER_TPC=2 -DVX_CFG_NUM_WARPS=16"
+    shape: {l3cache: true}
+    args: "-p -k 2 -n 24"
+  - id: parity-cta_gang-cpc4
+    check: model_parity
+    app: cta_gang
+    xlen: [64]
+    configs+: *cpc4
+    shape: {l2cache: true}
+    args: "-p -k 4 -n 8"
+
+  # The first wave of 1.5 x M1 + 1 long clusters for K = 1, 2 and the largest K
+  # is M1 = vx_occupancy_max_active_clusters = the sum over GPCs of
+  # floor(SMs x min(MAX_CTAS_PER_SM_CLUSTER, warps) / K).
+  - id: m1-micro
+    app: cta_refill
+    drivers: [simx, rtlsim]
+    configs+: *micro
+    shape: {l3cache: true}
+    args: "-M"
+  - id: m1-micro-w16
+    app: cta_refill
+    drivers: [simx, rtlsim]
+    configs+: "-DVX_CFG_H100_ORG_ENABLE -DVX_CFG_NUM_PARTITIONS=2 -DVX_CFG_GPCS_PER_PARTITION=1 -DVX_CFG_CPCS_PER_GPC=1 -DVX_CFG_TPCS_PER_CPC=1 -DVX_CFG_SMS_PER_TPC=2 -DVX_CFG_NUM_WARPS=16"
+    shape: {l3cache: true}
+    args: "-M"
+  - id: m1-npB
+    app: cta_refill
+    drivers: [simx]
+    configs+: *npB
+    shape: {l3cache: true}
+    args: "-M"
+  - id: m1-pocket
+    app: cta_refill
+    drivers: [simx]
+    configs+: *pocket
+    shape: {l3cache: true}
+    args: "-M"
+  - id: m1-h100
+    app: cta_refill
+    drivers: [simx]
+    tier: nightly
+    configs+: *h100
+    shape: {l3cache: true}
+    args: "-M"
+
+  # Refill: one whole-SM block per SM, several waves, as plain blocks and as
+  # clusters of 1 and 2. On every SM the gap from a block's last clock read to
+  # the next block's first is at least the launch kind's refill knob and at most
+  # the knob plus the tail measured with the three knobs at 0 (-t: the largest
+  # knob-0 gap per kind over the cell's drivers). Plain blocks take the
+  # cluster-1 tail: at knob 0 a plain block starts on a warp the old block
+  # frees while its warp 0 still exits, so its knob-0 gap misses that exit.
+  - id: refill-micro
+    app: cta_refill
+    drivers: [simx, rtlsim]
+    configs+: *micro
+    shape: {l3cache: true}
+    args: "-R -t 463,463,465"
+  - id: refill-pocket
+    app: cta_refill
+    drivers: [simx]
+    configs+: *pocket
+    shape: {l3cache: true}
+    args: "-R -t 555,555,512"
+  - id: parity-refill-micro
+    check: model_parity
+    app: cta_refill
+    xlen: [64]
+    configs+: *micro
+    shape: {l3cache: true}
+    args: "-R -t 463,463,465"
+
+  # 128 SMs run; SIMX_MT gives serial's cycles; every channel between two
+  # execution domains is a registered boundary stage.
+  - id: demo-h100
+    app: demo
+    drivers: [simx]
+    tier: nightly
+    configs+: *h100
+    shape: {l3cache: true}
+  - id: mt-pocket
+    via: script
+    driver: simx
+    configs+: *pocket
+    env: {RUNS: "cta_gang:-x hier;demo:"}
+    run: |
+      set -u
+      tmp=$(mktemp -d); fail=0
+      IFS=';' read -r -a runs <<< "$RUNS"
+      for run in "${runs[@]}"; do
+        app=${run%%:*}; args=${run#*:}
+        for mt in 1 4; do
+          CONFIGS="${CONFIGS:-} -DSIMX_MT=$mt" ./ci/blackbox.sh --driver=simx --app="$app" --l3cache ${args:+--args="$args"} \
+            > "$tmp/$app.$mt.log" 2>&1 || { echo "FAIL: $app at SIMX_MT=$mt"; tail -n 20 "$tmp/$app.$mt.log"; fail=1; }
+          grep '^PERF:' "$tmp/$app.$mt.log" > "$tmp/$app.$mt.perf"
+        done
+        if [ ! -s "$tmp/$app.1.perf" ] || ! cmp -s "$tmp/$app.1.perf" "$tmp/$app.4.perf"; then
+          echo "FAIL: $app: SIMX_MT=4 differs from serial"; diff "$tmp/$app.1.perf" "$tmp/$app.4.perf" | head; fail=1
+        else
+          echo "OK: $app: SIMX_MT=4 = serial ($(grep -c . "$tmp/$app.1.perf") PERF lines)"
+        fi
+      done
+      rm -rf "$tmp"
+      exit $fail
+  - id: audit-pocket
+    via: script
+    driver: simx
+    configs+: *pocket
+    env: {APP: cta_gang, ARGS: "-x hier"}
+    run: &audit_run |
+      set -u
+      tmp=$(mktemp -d); fail=0
+      VX_SIMX_AUDIT_BOUNDARY=1 ./ci/blackbox.sh --driver=simx --app="$APP" --l3cache ${ARGS:+--args="$ARGS"} > "$tmp/run.log" 2>&1 \
+        || { echo "FAIL: $APP $ARGS"; tail -n 20 "$tmp/run.log"; fail=1; }
+      if ! grep -q '^BOUNDARY-AUDIT: ' "$tmp/run.log"; then
+        echo "FAIL: no boundary audit in the run"; fail=1
+      elif grep -E '^BOUNDARY-AUDIT: .*UNREGISTERED' "$tmp/run.log"; then
+        echo "FAIL: a cross-domain edge without a registered stage"; fail=1
+      else
+        echo "OK: $(grep -m1 '^BOUNDARY-AUDIT: ' "$tmp/run.log")"
+      fi
+      rm -rf "$tmp"
+      exit $fail
+  - id: audit-h100
+    via: script
+    driver: simx
+    tier: nightly
+    configs+: *h100
+    env: {APP: demo, ARGS: ""}
+    run: *audit_run

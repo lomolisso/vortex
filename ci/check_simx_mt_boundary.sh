@@ -11,7 +11,9 @@
 # Allowlist: sim/simx/dtm/ hosts the debug-transport TCP server, which is
 # host-side tooling with its own service thread — not a timed component.
 # sim/simx/regslice.h is a framework element (the registered boundary
-# stage), not model code.
+# stage), not model code. sim/simx/exec_domains.h is the one place that
+# decides which containers own a domain (the build's domain level), so
+# containers never allocate or name domains themselves.
 
 set -euo pipefail
 
@@ -25,7 +27,8 @@ scan() {
     hits=$(grep -rnE "$pattern" "$ROOT/sim/simx" \
              --include='*.cpp' --include='*.h' \
              2>/dev/null | grep -v "^$ROOT/sim/simx/dtm/" \
-                         | grep -v "^$ROOT/sim/simx/regslice.h:" || true)
+                         | grep -v "^$ROOT/sim/simx/regslice.h:" \
+                         | grep -v "^$ROOT/sim/simx/exec_domains.h:" || true)
     if [ -n "$hits" ]; then
         echo "ERROR: $label" >&2
         echo >&2
@@ -40,6 +43,9 @@ scan "sim/simx uses deferred-call plumbing (use SimChannel/SimEventLink):" \
 
 scan "sim/simx reads execution-domain internals:" \
     '->domain\(\)|\bexec_domain\b'
+
+scan "sim/simx allocates or names execution domains outside exec_domains.h (use ExecDomain):" \
+    '\balloc_domain\b|\bbuild_domain\b|DomainScope[[:space:]]+[[:alnum:]_]+[[:space:]]*\([[:space:]]*[0-9]'
 
 scan "sim/simx declares threading state (atomics/threads/locks):" \
     'std::atomic|std::thread|std::mutex|std::shared_mutex|std::lock_guard|std::unique_lock|std::shared_lock|std::scoped_lock|std::condition_variable'

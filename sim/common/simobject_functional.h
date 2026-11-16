@@ -123,6 +123,11 @@ public:
   // stage. Topology validation requires a marked channel on every chain that
   // crosses an execution-domain boundary; only boundary stages call this.
   void mark_boundary() { boundary_stage_ = true; }
+  bool boundary_stage() const { return boundary_stage_; }
+
+  // The timed kernel's crossing (the producer's own delay is the boundary
+  // stage); with back-pressure disabled it needs no credits here.
+  void mark_crossing(uint32_t /*min_delay*/) { boundary_stage_ = true; }
 
   // Invoked on every endpoint pop; a boundary stage installs this on its
   // downstream endpoint to return a flow-control credit.
@@ -1371,7 +1376,7 @@ inline void SimPlatform::audit_send(SimChannelBase* channel, uint64_t delay) {
     key << "host";
   } else {
     key << "d" << tl_exec_domain_ << ":"
-        << (tl_exec_object_ ? tl_exec_object_->name() : "?");
+        << (tl_exec_object_ ? tl_exec_object_ : channel->module_)->name();
   }
   key << " -> d" << dst << ":" << endpoint->module_->name()
       << " delay=" << delay;

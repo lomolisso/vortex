@@ -108,6 +108,19 @@ public:
   // stage. Topology validation requires a marked channel on every chain that
   // crosses an execution-domain boundary; only boundary stages call this.
   void mark_boundary() { boundary_stage_ = true; }
+  bool boundary_stage() const { return boundary_stage_; }
+
+  // Declares this channel, the producer-side end of a chain that crosses an
+  // execution-domain boundary, as the crossing itself: the producer's own
+  // send delay is the registered stage, so no cycle is added. Every send over
+  // it must carry at least `min_delay` cycles, and the producer sees
+  // back-pressure from a credit pool of the endpoint's capacity that each
+  // endpoint pop refills one cycle later (a registered ready).
+  void mark_crossing(uint32_t min_delay) {
+    __assert(min_delay >= 1, "a crossing requires a registered delay");
+    crossing_delay_ = min_delay;
+    boundary_stage_ = true;
+  }
 
   // Invoked on every endpoint pop; a boundary stage installs this on its
   // downstream endpoint to return a flow-control credit.
@@ -146,6 +159,30 @@ protected:
   SimChannelBase* endpoint_cache_ = nullptr;
   bool boundary_stage_ = false;
   SmallFunction<void(), 48> pop_cb_;
+
+  // Crossing state (mark_crossing); the credits are touched only from the
+  // producer's domain.
+  uint32_t crossing_delay_ = 0;
+  int32_t  credits_ = 0;
+  SimChannelBase* crossing_cache_ = nullptr;
+  bool crossing_resolved_ = false;
+
+  // The crossing on this channel's bind chain, if any (cached like endpoint()).
+  SimChannelBase* crossing() {
+    if (!crossing_resolved_) {
+      for (auto* e = this; e != nullptr; e = e->sink_) {
+        if (e->crossing_delay_ != 0) {
+          crossing_cache_ = e;
+          break;
+        }
+      }
+      crossing_resolved_ = true;
+    }
+    return crossing_cache_;
+  }
+
+  // Defined after SimPlatform.
+  void take_credit(uint64_t delay);
 
   // Terminal endpoint of the bind chain (cached: bindings are immutable
   // after construction).
@@ -439,6 +476,8 @@ private:
   // Channel registry (elaboration-time only) for topology validation.
   std::vector<SimChannelBase*> channels_;
   bool topo_validated_ = false;
+  // Crossings found by the validation; their credit pools refill at reset.
+  std::vector<SimChannelBase*> crossings_;
 
   void register_channel(SimChannelBase* ch) {
     channels_.push_back(ch);
@@ -450,7 +489,10 @@ private:
       *it = channels_.back();
       channels_.pop_back();
     }
+    crossings_.erase(std::remove(crossings_.begin(), crossings_.end(), ch), crossings_.end());
   }
+
+  void reset_crossings();
 
   void validate_topology();
 
@@ -664,6 +706,9 @@ public:
       source_ = nullptr;
       endpoint_cache_ = nullptr;
       pop_cb_ = {};
+      crossing_delay_ = 0;
+      crossing_cache_ = nullptr;
+      crossing_resolved_ = false;
       storage_ = RingQueue<Pkt>(other.storage_.capacity());
       pending_count_ = 0;
       convert_fn_ = other.convert_fn_;
@@ -700,6 +745,9 @@ public:
   void tx_callback(F&& callback) { tx_cb_ = std::forward<F>(callback); }
 
   bool full() const override {
+    if (crossing_delay_ != 0) {
+      return credits_ <= 0;
+    }
     if (sink_) {
       return sink_->full();
     }
@@ -709,6 +757,9 @@ public:
 
   void send(const Pkt& pkt, uint64_t delay = 1) {
     auto& platform = SimPlatform::instance();
+    if (auto* crossing = this->crossing()) {
+      crossing->take_credit(delay);
+    }
     // A send whose endpoint lives in another domain is handed to that
     // domain's owner as a deferred call: it re-issues the send locally next
     // cycle with one less delay, landing on the same absolute cycle. All
@@ -717,15 +768,18 @@ public:
     // boundary, so a deferred send always finds space.
     if (platform.is_cross_exec(this->endpoint()->module_)) {
       __assert(delay >= 1, "cross-domain send requires a registered delay");
+      if (platform.audit_enabled()) {
+        platform.audit_send(this, delay);
+      }
       // Boxed: keeps the capture pointer-sized for any packet type; boundary
       // traffic is a handful of packets per cycle.
       platform.cross_call(this->endpoint()->module_->domain(),
         [this, p = std::make_shared<Pkt>(pkt), delay]() {
-          this->send(*p, delay - 1);
+          this->deliver(*p, delay - 1);
         });
       return;
     }
-    __assert(!this->full(), "channel is full");
+    __assert(!this->endpoint()->full(), "channel is full");
     if (platform.audit_enabled()) {
       platform.audit_send(this, delay);
     }
@@ -735,15 +789,21 @@ public:
 
   void send(Pkt&& pkt, uint64_t delay = 1) {
     auto& platform = SimPlatform::instance();
+    if (auto* crossing = this->crossing()) {
+      crossing->take_credit(delay);
+    }
     if (platform.is_cross_exec(this->endpoint()->module_)) {
       __assert(delay >= 1, "cross-domain send requires a registered delay");
+      if (platform.audit_enabled()) {
+        platform.audit_send(this, delay);
+      }
       platform.cross_call(this->endpoint()->module_->domain(),
         [this, p = std::make_shared<Pkt>(std::move(pkt)), delay]() {
-          this->send(*p, delay - 1);
+          this->deliver(*p, delay - 1);
         });
       return;
     }
-    __assert(!this->full(), "channel is full");
+    __assert(!this->endpoint()->full(), "channel is full");
     if (platform.audit_enabled()) {
       platform.audit_send(this, delay);
     }
@@ -789,6 +849,9 @@ public:
   }
 
   uint32_t size() const override {
+    if (crossing_delay_ != 0) {
+      return this->capacity() - uint32_t(credits_);
+    }
     if (sink_) {
       return sink_->size();
     }
@@ -802,6 +865,14 @@ public:
   }
 
 protected:
+  // The deferred half of a cross-domain send, run in the endpoint's domain:
+  // the endpoint is local here, so its occupancy is the capacity check.
+  void deliver(const Pkt& pkt, uint64_t delay) {
+    __assert(!this->endpoint()->full(), "channel is full");
+    this->reserve();
+    SimPlatform::instance().schedule(this, pkt, delay);
+  }
+
   void reserve() override {
     if (sink_) {
       sink_->reserve();
@@ -1118,10 +1189,30 @@ inline void SimPlatform::validate_topology() {
     return;
   }
   topo_validated_ = true;
+  bool clamped = false;
+  for (auto* ch : channels_) {
+    if (ch->crossing_delay_ != 0) {
+      // A crossing carries its producer's domain: it must sit in the domain
+      // of the chain's head, alone, on a chain that does cross.
+      auto* head = ch;
+      while (head->source_) {
+        head = head->source_;
+      }
+      uint32_t stages = 0;
+      for (auto* e = head; e != nullptr; e = e->sink_) {
+        stages += e->boundary_stage_ ? 1 : 0;
+      }
+      __assert(ch->module_->domain() == head->module_->domain(),
+               "a crossing must belong to its producer's domain");
+      __assert(ch->endpoint()->module_->domain() != ch->module_->domain(),
+               "a crossing on an edge that stays in one domain");
+      __assert(stages == 1, "a crossing chain carries another boundary stage");
+      crossings_.push_back(ch);
+    }
+  }
   if (num_domains_ < 2) {
     return;
   }
-  bool clamped = false;
   for (auto* ch : channels_) {
     if (ch->source_ != nullptr || ch->sink_ == nullptr) {
       continue; // interior link or standalone endpoint
@@ -1179,6 +1270,8 @@ inline void SimPlatform::reset() {
   for (auto* object : active_reset_) {
     object->do_reset();
   }
+
+  this->reset_crossings();
 
   // Re-arm every tick-gated object for the new run.
   for (auto& object : objects_) {
@@ -1295,6 +1388,7 @@ inline void SimPlatform::cleanup() {
     }
   }
   domains_.clear();
+  crossings_.clear();
   cross_inbox_.clear();
   cross_pending_ = 0;
   num_domains_ = 1;
@@ -1341,6 +1435,30 @@ inline SimChannelBase::~SimChannelBase() {
   SimPlatform::instance().unregister_channel(this);
 }
 
+inline void SimChannelBase::take_credit(uint64_t delay) {
+  __assert(!SimPlatform::instance().is_cross_exec(module_),
+           "a crossing is sent from its producer's domain only");
+  __assert(delay >= crossing_delay_, "a send across a domain boundary carries less than its boundary delay");
+  __assert(credits_ > 0, "crossing credit underflow");
+  --credits_;
+}
+
+// Runs single-threaded at reset, after the objects' resets: refill every
+// crossing's pool from its endpoint and (re)install the credit return, which
+// reaches the producer's domain one cycle after each endpoint pop.
+inline void SimPlatform::reset_crossings() {
+  for (auto* ch : crossings_) {
+    auto* ep = ch->endpoint();
+    __assert(ep->size() == 0, "crossing refill with stale downstream packets");
+    ch->credits_ = static_cast<int32_t>(ep->capacity());
+    ep->pop_callback([ch]() {
+      SimPlatform::instance().cross_call(ch->module_->domain(), [ch]() {
+        ++ch->credits_;
+      });
+    });
+  }
+}
+
 inline void SimPlatform::audit_send(SimChannelBase* channel, uint64_t delay) {
   auto* endpoint = channel;
   while (endpoint->sink_) {
@@ -1355,10 +1473,14 @@ inline void SimPlatform::audit_send(SimChannelBase* channel, uint64_t delay) {
     key << "host";
   } else {
     key << "d" << tl_exec_domain_ << ":"
-        << (tl_exec_object_ ? tl_exec_object_->name() : "?");
+        << (tl_exec_object_ ? tl_exec_object_ : channel->module_)->name();
+  }
+  bool registered = false;
+  for (auto* e = channel; e != nullptr; e = e->sink_) {
+    registered = registered || e->boundary_stage_;
   }
   key << " -> d" << dst << ":" << endpoint->module_->name()
-      << " delay=" << delay;
+      << " delay=" << delay << (registered ? " registered" : " UNREGISTERED");
   ++audit_hist_[key.str()];
 }
 

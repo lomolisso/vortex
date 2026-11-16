@@ -43,6 +43,7 @@ struct kmu_req_t {
 #ifdef VX_CFG_EXT_DLMEM_ENABLE
   uint32_t cluster_rank;
   uint32_t policy;          // KMU_POLICY_* from the launch's cluster-policy DCR
+  bool     explicit_cluster; // the launch named a cluster shape (cluster dispatch, even K = 1)
   // Stamped by the cluster's gang unit on a SPREAD block.
   bool     pinned;          // routed to dest_core, not balanced
   uint32_t dest_core;       // core within the hardware cluster
@@ -117,8 +118,10 @@ private:
   uint32_t cluster_dim_[3];
 #ifdef VX_CFG_EXT_DLMEM_ENABLE
   uint32_t policy_;
+  bool     explicit_;
 #endif
   bool     running_;
+  uint64_t next_issue_ = 0;
   uint32_t cta_id_;
   uint8_t  ctx_id_;
   // Nested counter: group_origin advances by cluster_dim per axis;

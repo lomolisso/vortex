@@ -15,6 +15,7 @@
 
 #include <vortex2.h>
 #include "vortex2_internal.h"
+#include "caps.h"
 #include <dlmem_ref.h>
 
 #include <algorithm>
@@ -74,6 +75,11 @@ vx_result_t cluster_info(vx_device_h dev, const vx_launch_info_t* info, ClusterI
     if (r != VX_SUCCESS) return r;
     ci.dlmem = (isa & VX_ISA_EXT_DLMEM) != 0;
     if (ci.policy == VX_CLUSTER_POLICY_SPREAD && !ci.dlmem) return VX_ERR_NOT_SUPPORTED;
+    uint64_t distinct = 0, max_ctas_sm = 0;
+    r = vx_device_query(dev, vortex::CAPS_INTERNAL_CLUSTER_DISTINCT_SMS, &distinct);
+    if (r != VX_SUCCESS) return r;
+    ci.distinct = ci.dlmem && distinct != 0;
+    if (ci.distinct && ci.policy == VX_CLUSTER_POLICY_SINGLE_CORE) return VX_ERR_NOT_SUPPORTED;
     r = vx_device_query(dev, VX_CAPS_NUM_WARPS, &ci.nw);
     if (r == VX_SUCCESS) r = vx_device_query(dev, VX_CAPS_NUM_THREADS, &ci.nt);
     if (r == VX_SUCCESS) r = vx_device_query(dev, VX_CAPS_NUM_CORES, &ci.cores);
@@ -81,6 +87,8 @@ vx_result_t cluster_info(vx_device_h dev, const vx_launch_info_t* info, ClusterI
     if (r == VX_SUCCESS) r = vx_device_query(dev, VX_CAPS_DLMEM_MAX_CLUSTER, &ci.max_cluster);
     if (r == VX_SUCCESS) r = vx_device_query(dev, VX_CAPS_LOCAL_MEM_SIZE, &ci.lmem_cap);
     if (r == VX_SUCCESS) r = vx_device_query(dev, VX_CAPS_CACHE_LINE_SIZE, &line);
+    if (r == VX_SUCCESS) r = vx_device_query(dev, VX_CAPS_MAX_CTAS_PER_SM, &max_ctas_sm);
+    if (r == VX_SUCCESS) r = vx_device_query(dev, VX_CAPS_MAX_CTAS_PER_SM_CLUSTER, &ci.max_ctas_sm_cluster);
     if (r != VX_SUCCESS) return r;
     ci.ncc = ci.cores / std::max<uint64_t>(ci.num_clusters, 1);
 
@@ -101,7 +109,7 @@ vx_result_t cluster_info(vx_device_h dev, const vx_launch_info_t* info, ClusterI
     align = std::max<uint64_t>(align, (uint64_t)VX_CFG_LMEM_NUM_BANKS * (VX_CFG_XLEN / 8));
 #endif
     const uint64_t stride = (info->lmem_size + align - 1) / align * align;
-    ci.slots = (stride == 0) ? ci.nw : std::min(ci.nw, ci.lmem_cap / stride);
+    ci.slots = (stride == 0) ? max_ctas_sm : std::min(max_ctas_sm, ci.lmem_cap / stride);
     ci.per_core = (ci.warps > ci.nw) ? 0 : std::min(ci.slots, ci.nw / ci.warps);
     *out = ci;
     return VX_SUCCESS;
@@ -134,6 +142,16 @@ uint64_t spread_fit(const vx::ClusterInfo& ci, uint64_t k) {
     return n;
 }
 
+// Clusters of k blocks on distinct cores the device holds at once, on an idle
+// one: least-occupied placement fills each hardware cluster's ncc x c
+// cluster-block slots, so it holds floor(ncc * c / k).
+uint64_t distinct_fit(const vx::ClusterInfo& ci, uint64_t k) {
+    if (k == 0 || k > ci.max_cluster || k > ci.ncc)
+        return 0;
+    const uint64_t c = std::min(ci.per_core, ci.max_ctas_sm_cluster);
+    return ci.num_clusters * (ci.ncc * c / k);
+}
+
 // Single-core clusters of k blocks one core holds at once.
 uint64_t single_core_fit(const vx::ClusterInfo& ci, uint64_t k) {
     if (k == 0 || k > std::max(ci.nw, ci.max_cluster))
@@ -154,7 +172,8 @@ extern "C" vx_result_t vx_occupancy_max_active_clusters(vx_device_h dev,
     if (r != VX_SUCCESS) return r;
     if (ci.dlmem && ci.k > VX_CLUSTER_MAX_PORTABLE && !(ci.flags & VX_CLUSTER_FLAG_NON_PORTABLE))
         return VX_ERR_INVALID_VALUE;
-    const uint64_t n = ci.spread ? spread_fit(ci, ci.k) * ci.num_clusters
+    const uint64_t n = ci.distinct ? distinct_fit(ci, ci.k)
+                     : ci.spread ? spread_fit(ci, ci.k) * ci.num_clusters
                                  : single_core_fit(ci, ci.k) * ci.cores;
     *out = (uint32_t)n;
     return VX_SUCCESS;
@@ -171,7 +190,12 @@ extern "C" vx_result_t vx_occupancy_max_potential_cluster_size(vx_device_h dev,
     if (r != VX_SUCCESS) return r;
     uint64_t best = 0;
     const bool portable = ci.dlmem && !(ci.flags & VX_CLUSTER_FLAG_NON_PORTABLE);
-    if (ci.dlmem && ci.policy != VX_CLUSTER_POLICY_SINGLE_CORE) {
+    if (ci.distinct) {
+        uint64_t limit = std::min(ci.max_cluster, ci.ncc);
+        if (portable)
+            limit = std::min<uint64_t>(limit, VX_CLUSTER_MAX_PORTABLE);
+        best = (ci.per_core != 0 && ci.max_ctas_sm_cluster != 0) ? limit : 0;
+    } else if (ci.dlmem && ci.policy != VX_CLUSTER_POLICY_SINGLE_CORE) {
         const uint64_t limit = portable ? std::min<uint64_t>(ci.max_cluster, VX_CLUSTER_MAX_PORTABLE)
                                         : ci.max_cluster;
         for (uint64_t k = limit; k >= 2 && best == 0; --k) {

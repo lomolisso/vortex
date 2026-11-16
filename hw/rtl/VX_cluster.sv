@@ -42,6 +42,18 @@ module VX_cluster import VX_gpu_pkg::*, VX_tlb_pkg::*;
     VX_raster_launch_if.slave   raster_launch_if[1],
 `endif
 
+`ifdef VX_CFG_EXT_DLMEM_ENABLE
+    // Gang table sideband with the chip's cluster admission (VX_cta_admit).
+    input  wire                 gang_mode,
+    input  wire                 alloc_valid,
+    input  wire [GANG_ID_W-1:0] alloc_gang,
+    input  wire                 alloc_epoch,
+    input  wire [DLMEM_K_W-1:0] alloc_k,
+    output wire                 done_valid,
+    output dlmem_cta_done_t     done_data,
+    output wire [DLMEM_NUM_GANGS-1:0] rel_pend,
+`endif
+
 `ifdef VX_CFG_VM_ENABLE
     // Device MMU sideband from the top DCR surface.
     input  wire [`VX_CFG_XLEN-1:0] mmu_satp,
@@ -59,8 +71,8 @@ module VX_cluster import VX_gpu_pkg::*, VX_tlb_pkg::*;
 );
 
 `ifdef SCOPE
-    localparam scope_socket = 0;
-    `SCOPE_IO_SWITCH (NUM_SOCKETS);
+    localparam scope_cpc = 0;
+    `SCOPE_IO_SWITCH (CPCS_PER_GPC);
 `endif
 
 `ifdef PERF_ENABLE
@@ -149,9 +161,8 @@ module VX_cluster import VX_gpu_pkg::*, VX_tlb_pkg::*;
         .bus_out_if (per_socket_kmu_bus_if)
     );
 `elsif VX_CFG_EXT_DLMEM_ENABLE
-    // Gang admission sits between the cluster's launch input and its socket
-    // distributor: a SPREAD cluster leaves it as pinned beats, routed by `dest`.
-    VX_kmu_bus_if    gang_kmu_bus_if[1]();
+    // The gang table beside the gbar unit; placed beats arrive pinned from the
+    // chip's admission and are routed by `dest`.
     wire             gang_busy;
     wire             gang_evt_valid;
     wire [1:0]       gang_evt_kind;
@@ -164,13 +175,15 @@ module VX_cluster import VX_gpu_pkg::*, VX_tlb_pkg::*;
 
     VX_cta_gang #(
         .INSTANCE_ID (`SFORMATF(("%s-cta_gang", INSTANCE_ID))),
-        .CLUSTER_ID  (CLUSTER_ID),
-        .OUT_BUF     (3)
+        .CLUSTER_ID  (CLUSTER_ID)
     ) cta_gang (
         .clk        (clk),
         .reset      (reset),
-        .bus_in_if  (kmu_bus_if[0]),
-        .bus_out_if (gang_kmu_bus_if[0]),
+        .gang_mode  (gang_mode),
+        .alloc_valid(alloc_valid),
+        .alloc_gang (alloc_gang),
+        .alloc_epoch(alloc_epoch),
+        .alloc_k    (alloc_k),
         .evt_valid  (gang_evt_valid),
         .evt_kind   (gang_evt_kind),
         .evt_data   (gang_evt_data),
@@ -179,8 +192,12 @@ module VX_cluster import VX_gpu_pkg::*, VX_tlb_pkg::*;
         .rel_gang   (gang_rel_gang),
         .rel_epoch  (gang_rel_epoch),
         .rel_ready  (gang_rel_ready),
+        .rel_pend   (rel_pend),
         .busy       (gang_busy)
     );
+
+    assign done_valid = gang_evt_valid && (gang_evt_kind == GBAR_KIND_CTA_DONE);
+    assign done_data  = gang_evt_data;
 
     VX_kmu_bus_arb #(
         .NUM_INPUTS (1),
@@ -190,7 +207,7 @@ module VX_cluster import VX_gpu_pkg::*, VX_tlb_pkg::*;
     ) kmu_arb (
         .clk        (clk),
         .reset      (reset),
-        .bus_in_if  (gang_kmu_bus_if),
+        .bus_in_if  (kmu_bus_if),
         .bus_out_if (per_socket_kmu_bus_if)
     );
 `else
@@ -485,13 +502,108 @@ module VX_cluster import VX_gpu_pkg::*, VX_tlb_pkg::*;
     end
 `endif
 
-    for (genvar socket_id = 0; socket_id < NUM_SOCKETS; ++socket_id) begin : g_sockets
+    // CPC c holds the GPC's sockets t * CPCS_PER_GPC + c; its port arrays are
+    // pure wire joins onto the GPC's per-socket buses.
+    for (genvar c = 0; c < CPCS_PER_GPC; ++c) begin : g_cpcs
 
-        VX_socket #(
-            .SOCKET_ID ((CLUSTER_ID * NUM_SOCKETS) + socket_id),
-            .INSTANCE_ID (`SFORMATF(("%s-socket%0d", INSTANCE_ID, socket_id)))
-        ) socket (
-            `SCOPE_IO_BIND  (scope_socket+socket_id)
+        VX_dcr_bus_if cpc_dcr_bus_if[TPCS_PER_CPC]();
+
+        VX_mem_bus_if #(
+            .DATA_SIZE (`VX_CFG_L1_LINE_SIZE),
+            .TAG_WIDTH (L2_TAG_WIDTH)
+        ) cpc_mem_bus_if[TPCS_PER_CPC * L1_MEM_PORTS]();
+
+    `ifdef VX_CFG_VM_ENABLE
+        VX_tlb_bus_if #(.ID_WIDTH (TLB_SOCKET_ID_WIDTH)) cpc_tlb_bus_if[TPCS_PER_CPC]();
+    `endif
+
+    `ifdef EXT_GFX_ANY_ENABLE
+        VX_dcr_flush_if cpc_flush_if[TPCS_PER_CPC]();
+    `endif
+
+        VX_kmu_bus_if cpc_kmu_bus_if[TPCS_PER_CPC]();
+
+        VX_gbar_bus_if cpc_gbar_bus_if[TPCS_PER_CPC]();
+
+    `ifdef VX_CFG_EXT_DLMEM_ENABLE
+        VX_dlmem_bus_if #(
+            .DATAW (VX_dlmem_pkg::DLMEM_REQ_DATAW),
+            .DST_W (DLMEM_CORE_W)
+        ) cpc_dlmem_req_up_if[TPCS_PER_CPC](), cpc_dlmem_req_down_if[TPCS_PER_CPC]();
+
+        VX_dlmem_bus_if #(
+            .DATAW (VX_dlmem_pkg::DLMEM_RSP_DATAW),
+            .DST_W (DLMEM_CORE_W)
+        ) cpc_dlmem_rsp_up_if[TPCS_PER_CPC](), cpc_dlmem_rsp_down_if[TPCS_PER_CPC]();
+    `endif
+
+        for (genvar t = 0; t < TPCS_PER_CPC; ++t) begin : g_tpc_links
+            localparam j = t * CPCS_PER_GPC + c;
+
+            assign cpc_dcr_bus_if[t].req_valid = per_socket_dcr_bus_if[j].req_valid;
+            assign cpc_dcr_bus_if[t].req_data  = per_socket_dcr_bus_if[j].req_data;
+            assign per_socket_dcr_bus_if[j].rsp_valid = cpc_dcr_bus_if[t].rsp_valid;
+            assign per_socket_dcr_bus_if[j].rsp_data  = cpc_dcr_bus_if[t].rsp_data;
+
+            for (genvar m = 0; m < L1_MEM_PORTS; ++m) begin : g_mem
+                `ASSIGN_VX_MEM_BUS_IF (socket_mem_bus_if[j * L1_MEM_PORTS + m], cpc_mem_bus_if[t * L1_MEM_PORTS + m]);
+            end
+
+        `ifdef VX_CFG_VM_ENABLE
+            `ASSIGN_VX_MEM_BUS_IF (per_socket_tlb_bus_if[j], cpc_tlb_bus_if[t]);
+        `endif
+
+        `ifdef EXT_GFX_ANY_ENABLE
+            assign per_socket_cluster_flush_if[j].req = cpc_flush_if[t].req;
+            assign cpc_flush_if[t].done = per_socket_cluster_flush_if[j].done;
+        `endif
+
+            assign cpc_kmu_bus_if[t].valid = per_socket_kmu_bus_if[j].valid;
+            assign cpc_kmu_bus_if[t].kind  = per_socket_kmu_bus_if[j].kind;
+            assign cpc_kmu_bus_if[t].eop   = per_socket_kmu_bus_if[j].eop;
+            assign cpc_kmu_bus_if[t].dest  = per_socket_kmu_bus_if[j].dest;
+            assign cpc_kmu_bus_if[t].data  = per_socket_kmu_bus_if[j].data;
+        `ifdef VX_CFG_EXT_DLMEM_ENABLE
+            assign cpc_kmu_bus_if[t].pin   = per_socket_kmu_bus_if[j].pin;
+        `endif
+            assign per_socket_kmu_bus_if[j].ready = cpc_kmu_bus_if[t].ready;
+
+            `ASSIGN_VX_MEM_BUS_IF (per_socket_gbar_bus_if[j], cpc_gbar_bus_if[t]);
+
+        `ifdef VX_CFG_EXT_DLMEM_ENABLE
+            assign per_socket_dlmem_req_up_if[j].valid = cpc_dlmem_req_up_if[t].valid;
+            assign per_socket_dlmem_req_up_if[j].data  = cpc_dlmem_req_up_if[t].data;
+            assign per_socket_dlmem_req_up_if[j].dst   = cpc_dlmem_req_up_if[t].dst;
+            assign cpc_dlmem_req_up_if[t].ready        = per_socket_dlmem_req_up_if[j].ready;
+
+            assign cpc_dlmem_req_down_if[t].valid      = per_socket_dlmem_req_down_if[j].valid;
+            assign cpc_dlmem_req_down_if[t].data       = per_socket_dlmem_req_down_if[j].data;
+            assign cpc_dlmem_req_down_if[t].dst        = per_socket_dlmem_req_down_if[j].dst;
+            assign per_socket_dlmem_req_down_if[j].ready = cpc_dlmem_req_down_if[t].ready;
+
+            assign per_socket_dlmem_rsp_up_if[j].valid = cpc_dlmem_rsp_up_if[t].valid;
+            assign per_socket_dlmem_rsp_up_if[j].data  = cpc_dlmem_rsp_up_if[t].data;
+            assign per_socket_dlmem_rsp_up_if[j].dst   = cpc_dlmem_rsp_up_if[t].dst;
+            assign cpc_dlmem_rsp_up_if[t].ready        = per_socket_dlmem_rsp_up_if[j].ready;
+
+            assign cpc_dlmem_rsp_down_if[t].valid      = per_socket_dlmem_rsp_down_if[j].valid;
+            assign cpc_dlmem_rsp_down_if[t].data       = per_socket_dlmem_rsp_down_if[j].data;
+            assign cpc_dlmem_rsp_down_if[t].dst        = per_socket_dlmem_rsp_down_if[j].dst;
+            assign per_socket_dlmem_rsp_down_if[j].ready = cpc_dlmem_rsp_down_if[t].ready;
+        `endif
+        end
+
+        wire [TPCS_PER_CPC-1:0] cpc_busy;
+        for (genvar t = 0; t < TPCS_PER_CPC; ++t) begin : g_tpc_busy
+            assign per_socket_busy[t * CPCS_PER_GPC + c] = cpc_busy[t];
+        end
+
+        VX_cpc #(
+            .CLUSTER_ID  (CLUSTER_ID),
+            .CPC_ID      (c),
+            .INSTANCE_ID (INSTANCE_ID)
+        ) cpc (
+            `SCOPE_IO_BIND  (scope_cpc + c)
 
             .clk            (clk),
             .reset          (reset),
@@ -500,33 +612,30 @@ module VX_cluster import VX_gpu_pkg::*, VX_tlb_pkg::*;
             .sysmem_perf    (sysmem_perf_tmp),
         `endif
 
-            .dcr_bus_if     (per_socket_dcr_bus_if[socket_id]),
+            .dcr_bus_if     (cpc_dcr_bus_if),
 
-            .mem_bus_if     (socket_mem_bus_if[socket_id * L1_MEM_PORTS +: L1_MEM_PORTS]),
+            .mem_bus_if     (cpc_mem_bus_if),
 
         `ifdef VX_CFG_VM_ENABLE
-            .cluster_tlb_bus_if (per_socket_tlb_bus_if[socket_id]),
-        `endif
-
-        `ifdef VX_CFG_EXT_OM_ENABLE
+            .cluster_tlb_bus_if (cpc_tlb_bus_if),
         `endif
 
         `ifdef EXT_GFX_ANY_ENABLE
-            .cluster_flush_if (per_socket_cluster_flush_if[socket_id]),
+            .cluster_flush_if (cpc_flush_if),
         `endif
 
-            .kmu_bus_if     (per_socket_kmu_bus_if[socket_id +: 1]),
+            .kmu_bus_if     (cpc_kmu_bus_if),
 
-            .gbar_bus_if    (per_socket_gbar_bus_if[socket_id]),
+            .gbar_bus_if    (cpc_gbar_bus_if),
 
         `ifdef VX_CFG_EXT_DLMEM_ENABLE
-            .dlmem_req_up_if   (per_socket_dlmem_req_up_if[socket_id]),
-            .dlmem_req_down_if (per_socket_dlmem_req_down_if[socket_id]),
-            .dlmem_rsp_up_if   (per_socket_dlmem_rsp_up_if[socket_id]),
-            .dlmem_rsp_down_if (per_socket_dlmem_rsp_down_if[socket_id]),
+            .dlmem_req_up_if   (cpc_dlmem_req_up_if),
+            .dlmem_req_down_if (cpc_dlmem_req_down_if),
+            .dlmem_rsp_up_if   (cpc_dlmem_rsp_up_if),
+            .dlmem_rsp_down_if (cpc_dlmem_rsp_down_if),
         `endif
 
-            .busy           (per_socket_busy[socket_id])
+            .busy           (cpc_busy)
         );
     end
 
@@ -605,9 +714,6 @@ module VX_cluster import VX_gpu_pkg::*, VX_tlb_pkg::*;
     // The merge->distribute link is a registered cluster-internal launch bus; a beat
     // resident in it is covered here just like the input and per-socket links.
     wire launch_link_busy = kmu_bus_if[0].valid | cluster_merged_kmu_if[0].valid | (|per_socket_kmu_valid);
-`elsif VX_CFG_EXT_DLMEM_ENABLE
-    // the gang's output link is a registered cluster-internal launch bus too
-    wire launch_link_busy = kmu_bus_if[0].valid | gang_kmu_bus_if[0].valid | (|per_socket_kmu_valid);
 `else
     wire launch_link_busy = kmu_bus_if[0].valid | (|per_socket_kmu_valid);
 `endif
@@ -619,7 +725,7 @@ module VX_cluster import VX_gpu_pkg::*, VX_tlb_pkg::*;
     `BUFFER_EX(busy_r, dcr_bus_if.req_valid | (|per_socket_busy) | mmu_busy, 1'b1, 1, (NUM_SOCKETS > 1));
 `endif
 `ifdef VX_CFG_EXT_DLMEM_ENABLE
-    // The gang stays busy until every placed block has reported done.
+    // The gang table stays busy until its last release has left.
     assign busy = busy_r | dcr_bus_if.req_valid | launch_link_busy | gang_busy;
 `else
     assign busy = busy_r | dcr_bus_if.req_valid | launch_link_busy;

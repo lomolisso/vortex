@@ -54,9 +54,11 @@ void sim_trace_enable(bool enable) {
 using Sim = vl_simulator<VVX_kmu_top>;
 
 // A same-core cluster fills at most one core's warps; a distributed one spans
-// up to DLMEM_MAX_CLUSTER cores.
+// up to DLMEM_MAX_CLUSTER cores, and with distinct SMs it is the only kind.
 #if VX_CFG_EXT_DLMEM_ENABLED
-constexpr uint32_t MAX_K = std::max<uint32_t>(VX_CFG_NUM_WARPS, VX_CFG_DLMEM_MAX_CLUSTER);
+constexpr uint32_t MAX_K = VX_CFG_CLUSTER_DISTINCT_SMS_ENABLED
+                         ? VX_CFG_DLMEM_MAX_CLUSTER
+                         : std::max<uint32_t>(VX_CFG_NUM_WARPS, VX_CFG_DLMEM_MAX_CLUSTER);
 #else
 constexpr uint32_t MAX_K = VX_CFG_NUM_WARPS;
 #endif
@@ -283,12 +285,14 @@ int main(int argc, char **argv) {
   std::vector<Launch> launches = {
     {{3, 2, 2}, {1, 1, 1}},
     {{4, 3, 1}, {2, 1, 1}},
-    {{4, 2, 2}, {2, 2, 1}},
-    {{2, 4, 2}, {1, 2, 2}},
-    {{2 * MAX_K, 2, 1}, {MAX_K, 1, 1}},
-    {{1, MAX_K, 3}, {1, MAX_K, 1}},
-    {{2, 1, 2 * MAX_K}, {1, 1, MAX_K}},
   };
+  if (MAX_K >= 4) {
+    launches.push_back({{4, 2, 2}, {2, 2, 1}});
+    launches.push_back({{2, 4, 2}, {1, 2, 2}});
+  }
+  launches.push_back({{2 * MAX_K, 2, 1}, {MAX_K, 1, 1}});
+  launches.push_back({{1, MAX_K, 3}, {1, MAX_K, 1}});
+  launches.push_back({{2, 1, 2 * MAX_K}, {1, 1, MAX_K}});
   if (MAX_K >= 4) {
     launches.push_back({{4, MAX_K, 2}, {2, MAX_K / 2, 1}});
   }

@@ -30,14 +30,15 @@ package VX_gpu_pkg;
     localparam NT_WIDTH = `UP(NT_BITS);
     localparam NB_WIDTH = `UP(NB_BITS);
 
-    localparam NUM_CTA_MAX = `VX_CFG_NUM_WARPS;
+    localparam NUM_CTA_MAX = `VX_CFG_MAX_CTAS_PER_SM;
     localparam NCTA_BITS  = `CLOG2(NUM_CTA_MAX);
     localparam NCTA_WIDTH = `UP(NCTA_BITS);
 
 `ifdef VX_CFG_EXT_DLMEM_ENABLE
     // A same-core cluster holds at most one core's warps; a distributed one
-    // spans up to DLMEM_MAX_CLUSTER cores.
-    localparam MAX_CLUSTER_SIZE = `MAX(`VX_CFG_NUM_WARPS, `VX_CFG_DLMEM_MAX_CLUSTER);
+    // spans up to DLMEM_MAX_CLUSTER cores, and with distinct SMs it is the only kind.
+    localparam MAX_CLUSTER_SIZE = `VX_CFG_CLUSTER_DISTINCT_SMS_ENABLED ? `VX_CFG_DLMEM_MAX_CLUSTER
+                                : `MAX(`VX_CFG_NUM_WARPS, `VX_CFG_DLMEM_MAX_CLUSTER);
     localparam RANK_W           = `UP(`CLOG2(MAX_CLUSTER_SIZE));
     localparam CLUSTER_SIZE_W   = RANK_W + 1;
 `endif
@@ -148,6 +149,40 @@ package VX_gpu_pkg;
     // Cores actually built: SOCKET_SIZE > NUM_CORES still fills a whole socket.
     localparam NUM_TOTAL_CORES = `VX_CFG_NUM_CLUSTERS * NUM_SOCKETS * `VX_CFG_SOCKET_SIZE;
 
+    // Compute levels: partition > GPC (VX_cluster) > CPC > TPC (VX_socket) > SM (VX_core).
+    // Read from the old knobs, which hold the real counts in every build (VX_config.toml).
+    localparam NUM_PARTITIONS     = `VX_CFG_NUM_PARTITIONS;
+    localparam GPCS_PER_PARTITION = `VX_CFG_NUM_CLUSTERS / NUM_PARTITIONS;
+    localparam CPCS_PER_GPC       = `VX_CFG_CPCS_PER_GPC;
+    localparam TPCS_PER_CPC       = NUM_SOCKETS / CPCS_PER_GPC;
+    localparam SMS_PER_TPC        = `VX_CFG_SOCKET_SIZE;
+    localparam SMS_PER_GPC        = NUM_SOCKETS * SMS_PER_TPC;
+
+    // Global SM index: sm = gpc * SMS_PER_GPC + (tpc_slot * CPCS_PER_GPC + cpc) * SMS_PER_TPC + parity,
+    // gpc = partition * GPCS_PER_PARTITION + gpc_in_partition (sw/common/vx_hier.h).
+    function automatic integer sm_gpc_global(input integer sm);
+        return sm / SMS_PER_GPC;
+    endfunction
+    function automatic integer sm_partition(input integer sm);
+        return sm_gpc_global(sm) / GPCS_PER_PARTITION;
+    endfunction
+    function automatic integer sm_gpc(input integer sm);
+        return sm_gpc_global(sm) % GPCS_PER_PARTITION;
+    endfunction
+    function automatic integer sm_cpc(input integer sm);
+        return ((sm % SMS_PER_GPC) / SMS_PER_TPC) % CPCS_PER_GPC;
+    endfunction
+    function automatic integer sm_tpc_slot(input integer sm);
+        return ((sm % SMS_PER_GPC) / SMS_PER_TPC) / CPCS_PER_GPC;
+    endfunction
+    function automatic integer sm_parity(input integer sm);
+        return sm % SMS_PER_TPC;
+    endfunction
+    // TPC slots from the L2 block and the SM-to-SM hub: the highest slot is nearest.
+    function automatic integer sm_slot_dist(input integer sm);
+        return TPCS_PER_CPC - 1 - sm_tpc_slot(sm);
+    endfunction
+
 `ifdef VX_CFG_EXT_DLMEM_ENABLE
     // Cores of one hardware cluster: the DLMEM network's endpoints and a gang's placement domain.
     localparam DLMEM_NCC          = NUM_SOCKETS * `VX_CFG_SOCKET_SIZE;
@@ -156,8 +191,8 @@ package VX_gpu_pkg;
     // The aperture decodes a power-of-two rank field: window = 2^(LMEM_LOG + RANK_BITS).
     localparam DLMEM_RANK_BITS    = `CLOG2(DLMEM_MAX_CLUSTER);
     localparam DLMEM_K_W          = `CLOG2(DLMEM_MAX_CLUSTER + 1);
-    // Only a gang of two or more blocks holds an id, so NCC*NW/2 ids never stall placement.
-    localparam DLMEM_NUM_GANGS    = `MAX(2, (DLMEM_NCC * `VX_CFG_NUM_WARPS) / 2);
+    // Only a gang of two or more blocks holds an id, so NCC*CTAS/2 ids never stall placement.
+    localparam DLMEM_NUM_GANGS    = `VX_CFG_DLMEM_NUM_GANGS;
     localparam GANG_ID_W          = `CLOG2(DLMEM_NUM_GANGS);
     localparam KMU_POLICY_DEFAULT = 1'b0;
     localparam KMU_POLICY_SPREAD  = 1'b1;
@@ -795,6 +830,7 @@ package VX_gpu_pkg;
 
     typedef struct packed {
         logic                    policy;       // KMU_POLICY_*
+        logic                    explicit_cluster; // the launch named a cluster shape (cluster dispatch, even K = 1)
         logic                    epoch;        // gang-id generation
         logic [GANG_ID_W-1:0]    gang_id;      // gang_id and epoch: valid only for a SPREAD gang of K > 1
         logic [NW_WIDTH-1:0]     forced_slot;  // SPREAD: the slot the gang reserved on its core
@@ -982,11 +1018,15 @@ package VX_gpu_pkg;
     // Device-wide, so the hint can name any core: VX_CFG_NUM_CORES is per-cluster.
     // `UP` so a single-core build still has a 1-bit (unused) hint rather than a
     // zero-width vector.
-    localparam KMU_DEST_W = `UP(`CLOG2(`VX_CFG_NUM_CLUSTERS * `VX_CFG_NUM_CORES));
+    localparam KMU_DEST_W = `UP(`CLOG2(`VX_CFG_NUM_SMS));
 
-    localparam KMU_DEST_LSB_SOCKET  = 0;
-    localparam KMU_DEST_LSB_CLUSTER = `CLOG2(`VX_CFG_SOCKET_SIZE);
-    localparam KMU_DEST_LSB_DEVICE  = KMU_DEST_LSB_CLUSTER + `CLOG2(NUM_SOCKETS);
+    // The fields of the global SM index, LSB first: SM in TPC, CPC, TPC slot, GPC in partition, partition.
+    localparam KMU_DEST_LSB_SOCKET    = 0;
+    localparam KMU_DEST_LSB_CLUSTER   = `CLOG2(`VX_CFG_SOCKET_SIZE);
+    localparam KMU_DEST_LSB_CPC       = KMU_DEST_LSB_CLUSTER;
+    localparam KMU_DEST_LSB_TPC       = KMU_DEST_LSB_CPC + `CLOG2(CPCS_PER_GPC);
+    localparam KMU_DEST_LSB_DEVICE    = KMU_DEST_LSB_CLUSTER + `CLOG2(NUM_SOCKETS);
+    localparam KMU_DEST_LSB_PARTITION = KMU_DEST_LSB_DEVICE + `CLOG2(GPCS_PER_PARTITION);
 
     typedef struct packed {
         logic [NCTA_WIDTH-1:0] cta_id;

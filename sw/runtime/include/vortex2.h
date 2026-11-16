@@ -75,6 +75,13 @@ typedef struct vx_kernel* vx_kernel_h;
 #define VX_CAPS_VM_PINNED_SIZE      0x10  // pinned-region total size (bytes); 0 if disabled
 #define VX_CAPS_VM_PINNED_FREE      0x11  // pinned-region free  size (bytes); 0 if disabled
 #define VX_CAPS_DLMEM_MAX_CLUSTER   0x12  // largest distributed thread-block cluster; 0 if DLMEM is off
+#define VX_CAPS_NUM_PARTITIONS      0x13  // GPU partitions
+#define VX_CAPS_GPCS_PER_PARTITION  0x14  // GPCs (VX_CAPS_NUM_CLUSTERS in all) per partition
+#define VX_CAPS_CPCS_PER_GPC        0x15  // CPCs per GPC
+#define VX_CAPS_TPCS_PER_CPC        0x16  // TPCs (sockets) per CPC
+#define VX_CAPS_SMS_PER_TPC         0x17  // SMs (cores) per TPC, = VX_CAPS_SOCKET_SIZE
+#define VX_CAPS_MAX_CTAS_PER_SM     0x18  // resident blocks per core
+#define VX_CAPS_MAX_CTAS_PER_SM_CLUSTER 0x19  // resident blocks per core of a launch with a cluster shape
 
 // ============================================================================
 // Device ISA flags  (decode a VX_CAPS_ISA_FLAGS query result)

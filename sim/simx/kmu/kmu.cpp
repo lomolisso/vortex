@@ -24,8 +24,8 @@ using Level = LaunchTree::Level;
 // The RTL's launch fan-out levels below the KMU, device first.
 std::vector<Level> launch_levels() {
 #ifdef VX_CFG_EXT_DLMEM_ENABLE
-  // Each cluster's gang unit is an endpoint; it owns the levels below.
-  return {Level(VX_CFG_NUM_CLUSTERS)};
+  // The chip's cluster admission is the one endpoint; it owns the levels below.
+  return {Level(1)};
 #elif defined(VX_CFG_EXT_RASTER_ENABLE)
   // The cluster registers the stream it merges with its raster engines.
   return {Level(VX_CFG_NUM_CLUSTERS), Level(1, true), Level(NUM_SOCKETS), Level(VX_CFG_SOCKET_SIZE)};
@@ -47,6 +47,7 @@ Kmu::Kmu(const SimContext& ctx, const char* name, uint32_t num_lanes)
   , block_size_(0)
 #ifdef VX_CFG_EXT_DLMEM_ENABLE
   , policy_(KMU_POLICY_DEFAULT)
+  , explicit_(false)
 #endif
   , running_(false)
   , cta_id_(0)
@@ -81,6 +82,8 @@ void Kmu::on_reset() {
   cta_id_          = 0;
   group_origin_[0] = group_origin_[1] = group_origin_[2] = 0;
   intra_offset_[0] = intra_offset_[1] = intra_offset_[2] = 0;
+  // the platform's cycle count restarts at 0 each run; the RTL's gap counter is saturated by then
+  next_issue_      = 0;
   tree_->reset();
 }
 
@@ -107,7 +110,10 @@ void Kmu::dcr_write(uint32_t addr, uint32_t value) {
   case VX_DCR_KMU_CLUSTER_DIM_Y: cluster_dim_[1] = value; break;
   case VX_DCR_KMU_CLUSTER_DIM_Z: cluster_dim_[2] = value; break;
 #ifdef VX_CFG_EXT_DLMEM_ENABLE
-  case VX_DCR_KMU_CLUSTER_POLICY: policy_ = value & 1; break;
+  case VX_DCR_KMU_CLUSTER_POLICY:
+    policy_   = value & 1;
+    explicit_ = (value >> 1) & 1;
+    break;
 #endif
   default: break;
   }
@@ -151,7 +157,13 @@ void Kmu::on_tick() {
     beat.eop = ((intra_offset_[0] + 1) == cluster_dim_[0])
             && ((intra_offset_[1] + 1) == cluster_dim_[1])
             && ((intra_offset_[2] + 1) == cluster_dim_[2]);
-    if (tree_->ready(beat)) {
+    bool first = (intra_offset_[0] == 0) && (intra_offset_[1] == 0) && (intra_offset_[2] == 0);
+    // a message starts no sooner than CTA_DISPATCH_CYCLES after the last one did
+    bool issue_ok = !first || (now >= next_issue_);
+    if (issue_ok && tree_->ready(beat)) {
+      if (first) {
+        next_issue_ = now + VX_CFG_CTA_DISPATCH_CYCLES;
+      }
       this->next_cta(&beat.req);
       DT(1, this->name() << " cta-fire: cta_id=" << beat.req.cta_id << ", block_idx=["
             << beat.req.block_idx[0] << "," << beat.req.block_idx[1] << "," << beat.req.block_idx[2] << "]");
@@ -203,6 +215,7 @@ void Kmu::next_cta(kmu_req_t* req) {
   req->cluster_rank = intra_offset_[0]
                     + cluster_dim_[0] * (intra_offset_[1] + cluster_dim_[1] * intra_offset_[2]);
   req->policy       = policy_;
+  req->explicit_cluster = explicit_;
 #endif
 
   // Advance the intra-cluster offset first (fills the cluster), then the

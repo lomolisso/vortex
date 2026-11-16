@@ -63,8 +63,9 @@ module VX_kmu import VX_gpu_pkg::*; import VX_trace_pkg::*; #(
     // each use.
     reg [2:0][`KMU_CLUSTER_MSB:0] dcr_cluster_dim;
 `ifdef VX_CFG_EXT_DLMEM_ENABLE
-    // Cluster placement policy (KMU_POLICY_*): sticky, like the other launch DCRs.
+    // Cluster placement policy (KMU_POLICY_*) and the explicit-cluster bit: sticky, like the other launch DCRs.
     reg dcr_policy_r;
+    reg dcr_explicit_r;
 `endif
     `UNUSED_VAR(dcr_param)
 
@@ -140,6 +141,7 @@ module VX_kmu import VX_gpu_pkg::*; import VX_trace_pkg::*; #(
             dcr_cluster_dim <= {3{(`KMU_CLUSTER_MSB+1)'(1)}};
         `ifdef VX_CFG_EXT_DLMEM_ENABLE
             dcr_policy_r    <= KMU_POLICY_DEFAULT;
+            dcr_explicit_r  <= 1'b0;
         `endif
         end else if (dcr_req_valid && dcr_req_rw) begin
             case(dcr_req_addr)
@@ -177,7 +179,10 @@ module VX_kmu import VX_gpu_pkg::*; import VX_trace_pkg::*; #(
                 `VX_DCR_KMU_CLUSTER_DIM_Y: dcr_cluster_dim[1] <= dcr_req_data[`KMU_CLUSTER_MSB:0];
                 `VX_DCR_KMU_CLUSTER_DIM_Z: dcr_cluster_dim[2] <= dcr_req_data[`KMU_CLUSTER_MSB:0];
             `ifdef VX_CFG_EXT_DLMEM_ENABLE
-                `VX_DCR_KMU_CLUSTER_POLICY: dcr_policy_r <= dcr_req_data[0];
+                `VX_DCR_KMU_CLUSTER_POLICY: begin
+                    dcr_policy_r   <= dcr_req_data[0];
+                    dcr_explicit_r <= dcr_req_data[1];
+                end
             `endif
                 default: ;
             endcase
@@ -391,7 +396,7 @@ module VX_kmu import VX_gpu_pkg::*; import VX_trace_pkg::*; #(
     assign kmu_comp.cluster_size = cluster_size_r;
 `ifdef VX_CFG_EXT_DLMEM_ENABLE
     assign kmu_comp.cluster_rank = rank_r;
-    assign kmu_comp.dlmem        = '{policy: dcr_policy_r, default: '0};
+    assign kmu_comp.dlmem        = '{policy: dcr_policy_r, explicit_cluster: dcr_explicit_r, default: '0};
 `endif
     assign kmu_comp.is_first_of_cluster = is_first_r;
 
@@ -409,7 +414,27 @@ module VX_kmu import VX_gpu_pkg::*; import VX_trace_pkg::*; #(
     // it, so clusters -- not CTAs -- are what round-robin across the machine.
     // `kind` is a tap of the payload tag so the arbiter routes without unpacking
     // `data`.
-    assign kmu_bus_if.valid = running;
+    // A message starts no sooner than CTA_DISPATCH_CYCLES after the last one did.
+    localparam ISSUE_GAP = `VX_CFG_CTA_DISPATCH_CYCLES;
+    wire issue_ok;
+    if (ISSUE_GAP > 1) begin : g_issue_gap
+        localparam GAP_W = `CLOG2(ISSUE_GAP + 1);
+        reg [GAP_W-1:0] gap_r;
+        always @(posedge clk) begin
+            if (reset) begin
+                gap_r <= GAP_W'(ISSUE_GAP);
+            end else if (kmu_bus_if_fire && is_first_r) begin
+                gap_r <= GAP_W'(1);
+            end else if (gap_r != GAP_W'(ISSUE_GAP)) begin
+                gap_r <= gap_r + GAP_W'(1);
+            end
+        end
+        assign issue_ok = ~is_first_r || (gap_r == GAP_W'(ISSUE_GAP));
+    end else begin : g_no_issue_gap
+        assign issue_ok = 1'b1;
+    end
+
+    assign kmu_bus_if.valid = running && issue_ok;
     assign kmu_bus_if.data  = KMU_DATAW'(kmu_req);
     assign kmu_bus_if.kind  = kmu_req.kind;
     assign kmu_bus_if.eop   = is_last_r;

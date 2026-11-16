@@ -238,7 +238,7 @@ public:
   }
 
   void push_back(T *obj) {
-    insert(iterator(tail_), obj);
+    insert(this->end(), obj);
   }
 
   void push_front(T *obj) {

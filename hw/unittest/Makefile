@@ -3,7 +3,7 @@ include $(ROOT_DIR)/config.mk
 
 # Distributed local memory units: the feature is RV64 only. A unit is listed
 # once its directory exists, so its bench can land without touching the lists.
-DLMEM_UNIT_DIRS := dlmem_noc cta_gang bar_unit dlmem_xlate dlmem_ep
+DLMEM_UNIT_DIRS := dlmem_noc cta_gang cluster_dispatch bar_unit dlmem_xlate dlmem_ep
 DLMEM_UNITS := $(if $(filter 64,$(XLEN)),$(patsubst %/Makefile,%,$(wildcard $(addsuffix /Makefile,$(DLMEM_UNIT_DIRS)))))
 
 all:
@@ -280,7 +280,9 @@ endif
 # (8 cores) and with a 256 KB local memory; the KMU carries the sticky cluster
 # policy, and the dispatcher takes pinned blocks into their forced slots, writes
 # every block's peer row, and reports each pinned block's CTA_DONE event once,
-# holding its slot until the event leaves.
+# holding its slot until the event leaves. The H100 builds cap the slots at
+# MAX_CTAS_PER_SM (SM_MAX_BLOCKS 4 of 8 warps) and pad each freed slot by the
+# refill gap of its CTA's launch kind (plain, cluster of 1, larger cluster).
 define cta_case
 	$(MAKE) -C cta_dispatcher clean
 	$(MAKE) -C cta_dispatcher CONFIGS="$(1)"
@@ -292,10 +294,45 @@ endef
 run-cta:
 	$(call cta_case,)
 	$(call cta_case,-DVX_CFG_NUM_WARPS=8)
+	$(call cta_case,-DVX_CFG_H100_ORG_ENABLE -DVX_CFG_NUM_WARPS=8 -DVX_CFG_SM_MAX_BLOCKS=4)
 ifeq ($(XLEN),64)
 	$(call cta_case,-DVX_CFG_EXT_DLMEM_ENABLE)
 	$(call cta_case,-DVX_CFG_EXT_DLMEM_ENABLE -DVX_CFG_NUM_CORES=8)
 	$(call cta_case,-DVX_CFG_EXT_DLMEM_ENABLE -DVX_CFG_NUM_WARPS=8 -DVX_CFG_LMEM_LOG_SIZE=18)
+	$(call cta_case,-DVX_CFG_EXT_DLMEM_ENABLE -DVX_CFG_H100_ORG_ENABLE -DVX_CFG_SMS_PER_TPC=2 -DVX_CFG_NUM_WARPS=8 \
+		-DVX_CFG_SM_MAX_BLOCKS=4)
+endif
+
+# Chip-wide cluster dispatch (RV64 only): the admission next to the KMU under
+# one scenario per shape of shapes.mk (clusters of 2 run twice back to back, the
+# largest K with two-warp blocks, clusters of 1, plain blocks), checked against
+# dlmem_ref::place_chip; the SimX CtaAdmit's run of the same scenario must write
+# the same CSV line for line; the SM position functions are checked against
+# vx_hier.h. Each shape builds its own SimX objects (CONFIGS shape the model).
+include $(VORTEX_HOME)/tests/unittest/cluster_dispatch/shapes.mk
+define cluster_dispatch_case
+	$(MAKE) -C cluster_dispatch clean
+	$(MAKE) -C cluster_dispatch CONFIGS="-DVX_CFG_EXT_DLMEM_ENABLE $(CD_$(1))"
+	$(MAKE) -C cluster_dispatch run CONFIGS="-DVX_CFG_EXT_DLMEM_ENABLE $(CD_$(1))" OPTS="--csv=rtl_$(1).csv"
+	$(MAKE) -C $(ROOT_DIR)/sim/simx DESTDIR=$(CURDIR)/cluster_dispatch/simx_$(1) \
+		$(CURDIR)/cluster_dispatch/simx_$(1)/cluster_dispatch_test CONFIGS="-DVX_CFG_EXT_DLMEM_ENABLE $(CD_$(1))"
+	cluster_dispatch/simx_$(1)/cluster_dispatch_test --csv=cluster_dispatch/simx_$(1).csv
+	diff -q cluster_dispatch/rtl_$(1).csv cluster_dispatch/simx_$(1).csv || \
+		{ diff cluster_dispatch/rtl_$(1).csv cluster_dispatch/simx_$(1).csv | head -20; false; }
+endef
+run-cluster-dispatch:
+ifeq ($(XLEN),64)
+	$(call cluster_dispatch_case,micro)
+	$(call cluster_dispatch_case,nano)
+	$(call cluster_dispatch_case,pocket)
+	$(call cluster_dispatch_case,h100)
+	$(call cluster_dispatch_case,npB)
+	$(call cluster_dispatch_case,cpc4)
+	$(call cluster_dispatch_case,degen)
+	$(MAKE) -C cluster_dispatch clean
+	rm -rf cluster_dispatch/simx_*
+else
+	@echo "run-cluster-dispatch: cluster dispatch is RV64 only; nothing to run at XLEN $(XLEN)"
 endif
 
 # Distributed local memory units, each over its parameter sets (RV64 only).
@@ -352,8 +389,11 @@ else
 	@echo "run-dlmem: distributed local memory is RV64 only; nothing to run at XLEN $(XLEN)"
 endif
 
-# Gang admission. The gang unit at every placement shape, also as a second
-# cluster, over 6 cores (3 sockets, MAX_CLUSTER 3) and with 16 warps: directed
+# Gang admission. The gang unit at every placement shape, also in a
+# two-cluster build (wider dest field), over 6 cores (3 sockets, MAX_CLUSTER 3) and with 16 warps, and one
+# GPC of the H100 shapes (least-occupied placement on distinct SMs: cpc4's 2
+# CPCs of 2 TPCs, pocket's 2 CPCs of 2-SM TPCs, and an h100 GPC of 16 SMs at
+# 16 warps, where the cluster-CTA cap of 8 per SM binds): directed
 # scenarios and random traffic against dlmem_ref, then the deterministic
 # schedule, whose placement CSV must match the SimX model's run of the same
 # schedule row for row, commit cycles included (placement parity). The same
@@ -366,25 +406,25 @@ endif
 # releases, warp and block exits, all mixed) and both latencies, at 1 core, 2x2,
 # 4x2 and 16x4; a warp that arrives twice in one phase must stop the run.
 # $(1)=NUM_CORES $(2)=SOCKET_SIZE $(3)=NUM_WARPS $(4)=DLMEM_MAX_CLUSTER
-# $(5)=LMEM_LOG_SIZE $(6)=CLUSTER_ID $(7)=seed $(8)=other CONFIGS
+# $(5)=LMEM_LOG_SIZE $(6)=seed $(7)=other CONFIGS $(8)=SimX twin (default: the shared one)
 CTA_GANG_SIMX := cta_gang/simx/cta_gang_test
 define cta_gang_case
 	$(MAKE) -C cta_gang clean
-	$(MAKE) -C cta_gang CLUSTER_ID=$(6) CONFIGS="-DVX_CFG_EXT_DLMEM_ENABLE -DVX_CFG_NUM_CORES=$(1) \
-		-DVX_CFG_SOCKET_SIZE=$(2) -DVX_CFG_NUM_WARPS=$(3) -DVX_CFG_DLMEM_MAX_CLUSTER=$(4) -DVX_CFG_LMEM_LOG_SIZE=$(5) $(8)"
-	$(MAKE) -C cta_gang run CLUSTER_ID=$(6) CONFIGS="-DVX_CFG_EXT_DLMEM_ENABLE -DVX_CFG_NUM_CORES=$(1) \
-		-DVX_CFG_SOCKET_SIZE=$(2) -DVX_CFG_NUM_WARPS=$(3) -DVX_CFG_DLMEM_MAX_CLUSTER=$(4) -DVX_CFG_LMEM_LOG_SIZE=$(5) $(8)" \
-		OPTS="--seed=$(7) --csv=placement_c$(1)s$(2)w$(3)m$(4)k$(6).csv --cbar-csv=cbar_c$(1)s$(2)w$(3)m$(4)k$(6).csv \
-		--cbarx-csv=cbarx_c$(1)s$(2)w$(3)m$(4)k$(6).csv"
-	$(CTA_GANG_SIMX) --shape=$(1),$(2),$(3),$(4),$(5) --csv=cta_gang/simx_placement_c$(1)s$(2)w$(3)m$(4)k$(6).csv \
-		--cbar-csv=cta_gang/simx_cbar_c$(1)s$(2)w$(3)m$(4)k$(6).csv \
-		--cbarx-csv=cta_gang/simx_cbarx_c$(1)s$(2)w$(3)m$(4)k$(6).csv
+	$(MAKE) -C cta_gang CONFIGS="-DVX_CFG_EXT_DLMEM_ENABLE -DVX_CFG_NUM_CORES=$(1) \
+		-DVX_CFG_SOCKET_SIZE=$(2) -DVX_CFG_NUM_WARPS=$(3) -DVX_CFG_DLMEM_MAX_CLUSTER=$(4) -DVX_CFG_LMEM_LOG_SIZE=$(5) $(7)"
+	$(MAKE) -C cta_gang run CONFIGS="-DVX_CFG_EXT_DLMEM_ENABLE -DVX_CFG_NUM_CORES=$(1) \
+		-DVX_CFG_SOCKET_SIZE=$(2) -DVX_CFG_NUM_WARPS=$(3) -DVX_CFG_DLMEM_MAX_CLUSTER=$(4) -DVX_CFG_LMEM_LOG_SIZE=$(5) $(7)" \
+		OPTS="--seed=$(6) --csv=placement_c$(1)s$(2)w$(3)m$(4)_$(6).csv --cbar-csv=cbar_c$(1)s$(2)w$(3)m$(4)_$(6).csv \
+		--cbarx-csv=cbarx_c$(1)s$(2)w$(3)m$(4)_$(6).csv"
+	$(or $(8),$(CTA_GANG_SIMX)) --shape=$(1),$(2),$(3),$(4),$(5) --csv=cta_gang/simx_placement_c$(1)s$(2)w$(3)m$(4)_$(6).csv \
+		--cbar-csv=cta_gang/simx_cbar_c$(1)s$(2)w$(3)m$(4)_$(6).csv \
+		--cbarx-csv=cta_gang/simx_cbarx_c$(1)s$(2)w$(3)m$(4)_$(6).csv
 	python3 $(VORTEX_HOME)/hw/unittest/cta_gang/compare_placement.py \
-		cta_gang/placement_c$(1)s$(2)w$(3)m$(4)k$(6).csv cta_gang/simx_placement_c$(1)s$(2)w$(3)m$(4)k$(6).csv
+		cta_gang/placement_c$(1)s$(2)w$(3)m$(4)_$(6).csv cta_gang/simx_placement_c$(1)s$(2)w$(3)m$(4)_$(6).csv
 	python3 $(VORTEX_HOME)/hw/unittest/cta_gang/compare_cbar.py \
-		cta_gang/cbar_c$(1)s$(2)w$(3)m$(4)k$(6).csv cta_gang/simx_cbar_c$(1)s$(2)w$(3)m$(4)k$(6).csv
+		cta_gang/cbar_c$(1)s$(2)w$(3)m$(4)_$(6).csv cta_gang/simx_cbar_c$(1)s$(2)w$(3)m$(4)_$(6).csv
 	python3 $(VORTEX_HOME)/hw/unittest/cta_gang/compare_cbar.py \
-		cta_gang/cbarx_c$(1)s$(2)w$(3)m$(4)k$(6).csv cta_gang/simx_cbarx_c$(1)s$(2)w$(3)m$(4)k$(6).csv
+		cta_gang/cbarx_c$(1)s$(2)w$(3)m$(4)_$(6).csv cta_gang/simx_cbarx_c$(1)s$(2)w$(3)m$(4)_$(6).csv
 endef
 # $(1)=CONFIGS $(2)=seed
 define bar_unit_case
@@ -392,23 +432,33 @@ define bar_unit_case
 	$(MAKE) -C bar_unit CONFIGS="-DVX_CFG_EXT_DLMEM_ENABLE $(1)"
 	$(MAKE) -C bar_unit run CONFIGS="-DVX_CFG_EXT_DLMEM_ENABLE $(1)" OPTS="--seed=$(2)"
 endef
+# The H100 shapes' timing knobs and policy are build-time, so each builds its own SimX twin.
+define cta_gang_h100_case
+	$(MAKE) -C $(ROOT_DIR)/sim/simx DESTDIR=$(CURDIR)/cta_gang/simx_h$(6) $(CURDIR)/cta_gang/simx_h$(6)/cta_gang_test \
+		CONFIGS="-DVX_CFG_EXT_DLMEM_ENABLE -DVX_CFG_H100_ORG_ENABLE -DVX_CFG_NUM_CORES=$(1) -DVX_CFG_SOCKET_SIZE=$(2) \
+		-DVX_CFG_NUM_WARPS=$(3) -DVX_CFG_DLMEM_MAX_CLUSTER=$(4) -DVX_CFG_LMEM_LOG_SIZE=$(5) $(7)"
+	$(call cta_gang_case,$(1),$(2),$(3),$(4),$(5),$(6),-DVX_CFG_H100_ORG_ENABLE $(7),cta_gang/simx_h$(6)/cta_gang_test)
+endef
 run-dlmem-gang:
 ifeq ($(XLEN),64)
 	$(MAKE) -C $(ROOT_DIR)/sim/simx DESTDIR=$(CURDIR)/cta_gang/simx $(CURDIR)/$(CTA_GANG_SIMX) \
 		CONFIGS="-DVX_CFG_EXT_DLMEM_ENABLE"
-	$(call cta_gang_case,1,1,4,1,14,0,1,)
-	$(call cta_gang_case,2,1,4,2,14,0,2,)
-	$(call cta_gang_case,2,2,8,2,14,0,3,)
-	$(call cta_gang_case,4,2,4,2,14,0,4,)
-	$(call cta_gang_case,4,4,8,4,14,0,5,)
-	$(call cta_gang_case,8,2,4,8,14,0,6,)
-	$(call cta_gang_case,8,4,8,4,14,0,7,)
-	$(call cta_gang_case,8,1,8,8,14,0,8,)
-	$(call cta_gang_case,4,2,4,4,14,1,9,-DVX_CFG_NUM_CLUSTERS=2)
-	$(call cta_gang_case,6,2,4,3,14,0,10,)
-	$(call cta_gang_case,4,2,16,4,17,0,11,-DVX_CFG_NUM_THREADS=8)
-	$(call cta_gang_case,16,4,4,16,14,0,12,)
-	$(call cta_gang_case,16,4,8,16,18,0,13,)
+	$(call cta_gang_case,1,1,4,1,14,1,)
+	$(call cta_gang_case,2,1,4,2,14,2,)
+	$(call cta_gang_case,2,2,8,2,14,3,)
+	$(call cta_gang_case,4,2,4,2,14,4,)
+	$(call cta_gang_case,4,4,8,4,14,5,)
+	$(call cta_gang_case,8,2,4,8,14,6,)
+	$(call cta_gang_case,8,4,8,4,14,7,)
+	$(call cta_gang_case,8,1,8,8,14,8,)
+	$(call cta_gang_case,4,2,4,4,14,9,-DVX_CFG_NUM_CLUSTERS=2)
+	$(call cta_gang_case,6,2,4,3,14,10,)
+	$(call cta_gang_case,4,2,16,4,17,11,-DVX_CFG_NUM_THREADS=8)
+	$(call cta_gang_case,16,4,4,16,14,12,)
+	$(call cta_gang_case,16,4,8,16,18,13,)
+	$(call cta_gang_h100_case,4,1,4,4,14,14,-DVX_CFG_CPCS_PER_GPC=2 -DVX_CFG_TPCS_PER_CPC=2)
+	$(call cta_gang_h100_case,4,2,4,4,14,15,-DVX_CFG_CPCS_PER_GPC=2 -DVX_CFG_SMS_PER_TPC=2)
+	$(call cta_gang_h100_case,16,2,16,16,14,16,-DVX_CFG_CPCS_PER_GPC=2 -DVX_CFG_TPCS_PER_CPC=4 -DVX_CFG_SMS_PER_TPC=2)
 	$(call bar_unit_case,-DVX_CFG_NUM_CORES=1 -DVX_CFG_SOCKET_SIZE=1,1)
 	! bar_unit/bar_unit --mode=twice > bar_unit/twice.log 2>&1
 	grep -q "warp arrived twice at the cluster barrier in one phase" bar_unit/twice.log
@@ -416,6 +466,7 @@ ifeq ($(XLEN),64)
 	$(call bar_unit_case,-DVX_CFG_NUM_CORES=8 -DVX_CFG_SOCKET_SIZE=2 -DVX_CFG_NUM_WARPS=8,3)
 	$(call bar_unit_case,-DVX_CFG_NUM_CORES=16 -DVX_CFG_SOCKET_SIZE=4,4)
 	$(MAKE) -C cta_gang clean
+	rm -rf cta_gang/simx_h*
 	$(MAKE) -C bar_unit clean
 endif
 

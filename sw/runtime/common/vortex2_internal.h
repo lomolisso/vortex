@@ -354,7 +354,7 @@ public:
 
 private:
     friend class RefCounted<Device>;
-    Device(std::unique_ptr<Platform> plat, uint64_t dev_caps, uint64_t isa_caps);
+    Device(std::unique_ptr<Platform> plat, uint64_t dev_caps, uint64_t isa_caps, uint64_t org_caps);
     ~Device();
 
     // Allocate ring/head/cmpl buffers and program the CP regfile.
@@ -436,9 +436,10 @@ private:
     // Live CP-visible host regions, keyed by cp_addr.
     std::map<uint64_t, HostMem>    host_mems_;
 
-    // Lazily-loaded device/ISA caps words (read once from the CP regfile).
+    // Lazily-loaded static caps words (read once from the CP regfile).
     uint64_t                       dev_caps_    = 0;
     uint64_t                       isa_caps_    = 0;
+    uint64_t                       org_caps_    = 0;
     bool                           caps_loaded_ = false;
 
     std::mutex                     mu_;
@@ -855,10 +856,12 @@ struct ClusterInfo {
     uint64_t slots;             // blocks of the launch's local-memory size a core holds
     uint64_t per_core;          // blocks of the launch an idle core holds
     uint64_t cores, ncc, num_clusters, nw, nt, max_cluster, lmem_cap;
+    bool     distinct;          // a cluster's blocks always on distinct cores (H100 placement)
+    uint64_t max_ctas_sm_cluster;
 };
 
 // VX_ERR_INVALID_VALUE for an unknown policy or flag, VX_ERR_NOT_SUPPORTED
-// for SPREAD on a device without DLMEM.
+// for SPREAD on a device without DLMEM or SINGLE_CORE on a distinct-core one.
 vx_result_t cluster_info(vx_device_h dev, const vx_launch_info_t* info, ClusterInfo* out);
 
 // ============================================================================

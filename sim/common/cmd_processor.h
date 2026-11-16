@@ -32,6 +32,8 @@
 //     0x01C GPU_DEV_CAPS_HI  device-config caps, high 32 bits  (RO)
 //     0x020 GPU_ISA_CAPS_LO  ISA caps, low 32 bits             (RO)
 //     0x024 GPU_ISA_CAPS_HI  ISA caps, high 32 bits            (RO)
+//     0x040 GPU_ORG_CAPS_LO  hierarchy caps, low 32 bits       (RO)
+//     0x044 GPU_ORG_CAPS_HI  hierarchy caps, high 32 bits      (RO)
 //   Per queue 0 (CP-internal offsets 0x100..0x13F)
 //     0x100/04 Q_RING_BASE_LO/HI
 //     0x108/0C Q_HEAD_ADDR_LO/HI   (where the CP publishes head)

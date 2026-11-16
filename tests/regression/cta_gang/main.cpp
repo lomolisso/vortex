@@ -25,6 +25,15 @@
 //            K - 1 capable cores and must wait for the last one, as on the
 //            H100, instead of placing two of its blocks on one core (DEFAULT
 //            policy, or -s / -c)
+//   -x hier  the chip-wide placement: for K = 1, 2 and the largest K, a first
+//            wave of long clusters (as many as an idle chip holds) must land as
+//            vortex::dlmem_ref::place_chip places them (round-robin over the GPCs from
+//            CLUSTER_GPC_START, in a GPC the configured policy), within the
+//            per-SM CTA caps, and a second identical launch must land the same;
+//            then the -x reject-k launches
+//   -x reject-k  clusters above the largest K, also the next power of two up
+//            to 16, are refused at launch and the largest K runs; on a build
+//            whose clusters take distinct SMs, SINGLE_CORE is refused too
 //   -v       print every cluster's placement (core:slot by rank), to diff models
 //
 // Every block records its core, slot, rank and local-memory base; the host checks
@@ -37,6 +46,7 @@
 
 #include <vortex2.h>
 #include <VX_types.h>
+#include <dlmem_ref.h>
 #include "common.h"
 
 #include <algorithm>
@@ -76,6 +86,8 @@ bool        verbose     = false;
 const char* req_x       = nullptr;
 
 constexpr uint32_t kTailWork = 20000;
+// ALU iterations of every thread outside parity mode (-x hier keeps its first wave resident).
+uint32_t block_work = 0;
 
 struct Caps {
   uint64_t num_cores = 0, num_clusters = 0, num_warps = 0, num_threads = 0;
@@ -98,7 +110,7 @@ struct Launch {
 void usage() {
   std::printf("Usage: [-k cluster size] [-w warps per block] [-l local-memory bytes]"
               " [-n clusters] [-s: SPREAD | -c: SINGLE_CORE | -d: DEFAULT] [-p: parity] [-r: rejections]"
-              " [-x default-spread|single-core|nowrap] [-v: placement] [-h]\n");
+              " [-x default-spread|single-core|nowrap|hier|reject-k] [-v: placement] [-h]\n");
 }
 
 void parse_args(int argc, char** argv) {
@@ -121,7 +133,8 @@ void parse_args(int argc, char** argv) {
     }
   }
   const bool bad_x = req_x && std::strcmp(req_x, "default-spread") != 0
-                   && std::strcmp(req_x, "single-core") != 0 && std::strcmp(req_x, "nowrap") != 0;
+                   && std::strcmp(req_x, "single-core") != 0 && std::strcmp(req_x, "nowrap") != 0
+                   && std::strcmp(req_x, "hier") != 0 && std::strcmp(req_x, "reject-k") != 0;
   if (bad_x || optind < argc || req_w == 0 || req_g == 0 || req_lmem % sizeof(uint32_t) != 0) {
     usage();
     std::exit(-1);
@@ -177,7 +190,7 @@ void job_create(vx_device_h dev, vx_queue_h q, vx_kernel_h kernel, const Caps& c
   j.arg.k          = L.k;
   j.arg.lmem_bytes = L.lmem;
   j.arg.bound      = kRendezvousBound;
-  j.arg.work       = parity_mode ? kParityWork : 0;
+  j.arg.work       = parity_mode ? kParityWork : block_work;
   j.arg.tail_work  = L.tail_work;
 
   vx_launch_info_t& li = j.li;
@@ -552,12 +565,151 @@ int run_occupancy(const Caps& caps, vx_device_h dev) {
   return errors;
 }
 
-// -x default-spread / single-core / nowrap.
+
+constexpr uint32_t kHierWork = 4000;
+
+vortex::dlmem_ref::Cfg chip_cfg(const Caps& caps) {
+  vortex::dlmem_ref::Cfg cfg = {};
+  cfg.ncc              = caps.ncc();
+  cfg.nw               = (uint32_t)caps.num_warps;
+  cfg.nt               = (uint32_t)caps.num_threads;
+  cfg.max_cluster      = (uint32_t)caps.max_cluster;
+  cfg.lmem_log         = VX_CFG_LMEM_LOG_SIZE;
+  cfg.num_gangs        = VX_CFG_DLMEM_NUM_GANGS;
+  cfg.socket_size      = VX_CFG_SOCKET_SIZE;
+  cfg.num_sockets      = caps.ncc() / VX_CFG_SOCKET_SIZE;
+  cfg.dlmem_base       = VX_MEM_DLMEM_BASE_ADDR;
+  cfg.lmem_base        = VX_MEM_LMEM_BASE_ADDR;
+  cfg.nslots           = VX_CFG_MAX_CTAS_PER_SM;
+  cfg.max_cluster_ctas = VX_CFG_MAX_CTAS_PER_SM_CLUSTER;
+  cfg.num_gpcs         = (uint32_t)caps.num_clusters;
+#ifdef VX_CFG_CLUSTER_PLACEMENT_H100
+  cfg.policy           = vortex::dlmem_ref::PLACE_H100;
+#else
+  cfg.policy           = vortex::dlmem_ref::PLACE_SPREAD;
+#endif
+  cfg.gpc_start        = VX_CFG_CLUSTER_GPC_START;
+  return cfg;
+}
+
+// A whole first wave on an idle chip, launched twice: each launch must place
+// every cluster as the golden does, since no block ends before the last one is
+// placed.
+int run_hier_k(vx_device_h dev, vx_queue_h q, vx_kernel_h kernel, const Caps& caps, uint32_t k) {
+  const vortex::dlmem_ref::Cfg cfg = chip_cfg(caps);
+  vortex::dlmem_ref::Chip chip;
+  vortex::dlmem_ref::reset(cfg, chip);
+  vortex::dlmem_ref::new_launch(cfg, chip);
+  std::vector<vortex::dlmem_ref::Placed> want;
+  vortex::dlmem_ref::Placed p;
+  while (vortex::dlmem_ref::place_chip(cfg, chip, {k, 1, vortex::dlmem_ref::slots(cfg)}, p))
+    want.push_back(p);
+  const uint32_t g = (uint32_t)want.size();
+  if (g == 0) {
+    std::printf("*** hier: no cluster of K=%u fits an idle chip\n", k);
+    return 1;
+  }
+  int errors = 0;
+  std::vector<std::vector<std::pair<uint32_t, uint32_t>>> first;
+  for (int rep = 0; rep < 2; ++rep) {
+    const Launch L = {k, g, 1, 0, VX_CLUSTER_POLICY_SPREAD, Submit::Launch, rep ? "hier-again" : "hier", 0};
+    const bool rendezvous = caps.atomics();
+    Job j;
+    job_create(dev, q, kernel, caps, L, rendezvous, j);
+    std::printf("%s: K=%u, %u clusters (an idle chip's first wave)\n", L.name, k, g);
+    vx_event_h ev = nullptr;
+    CHECK(submit(q, j.li, L.how, &ev));
+    job_wait(q, j, ev);
+    int e = check_records(caps, L, VX_CLUSTER_POLICY_SPREAD, j, rendezvous);
+    std::vector<std::vector<std::pair<uint32_t, uint32_t>>> got(g);
+    std::vector<uint32_t> per_sm(caps.num_cores, 0);
+    for (uint32_t c = 0; c < g && e == 0; ++c) {
+      std::set<uint32_t> sms;
+      for (uint32_t r = 0; r < k; ++r) {
+        const uint32_t* rec = &j.recs[(size_t)(c * k + r) * REC_WORDS];
+        got[c].push_back({rec[REC_CORE], rec[REC_CTA_ID]});
+        sms.insert(rec[REC_CORE]);
+        ++per_sm[rec[REC_CORE]];
+        const uint32_t wcore = want[c].gpc * caps.ncc() + want[c].peers[r].core;
+        const uint32_t wslot = want[c].peers[r].slot;
+        if (rec[REC_CORE] != wcore || rec[REC_CTA_ID] != wslot) {
+          if (e < 16)
+            std::printf("*** %s: cluster %u rank %u on %u:%u, golden %u:%u\n", L.name, c, r,
+                        rec[REC_CORE], rec[REC_CTA_ID], wcore, wslot);
+          ++e;
+        }
+      }
+      if (VX_CFG_CLUSTER_DISTINCT_SMS_ENABLED && sms.size() != k) {
+        std::printf("*** %s: cluster %u on %zu distinct SMs, expected %u\n", L.name, c, sms.size(), k);
+        ++e;
+      }
+    }
+    for (uint32_t sm = 0; sm < caps.num_cores && e == 0; ++sm) {
+      if (per_sm[sm] > (uint32_t)VX_CFG_MAX_CTAS_PER_SM_CLUSTER || per_sm[sm] > (uint32_t)VX_CFG_MAX_CTAS_PER_SM) {
+        std::printf("*** %s: SM %u holds %u cluster CTAs, caps %u / %u\n", L.name, sm, per_sm[sm],
+                    (uint32_t)VX_CFG_MAX_CTAS_PER_SM_CLUSTER, (uint32_t)VX_CFG_MAX_CTAS_PER_SM);
+        ++e;
+      }
+    }
+    if (e == 0 && rep == 0)
+      first = got;
+    if (e == 0 && rep == 1 && got != first) {
+      std::printf("*** %s: the second identical launch placed differently\n", L.name);
+      ++e;
+    }
+    job_release(q, j);
+    errors += e;
+  }
+  return errors;
+}
+
+int run_reject_k(vx_device_h dev, vx_queue_h q, vx_kernel_h kernel, const Caps& caps) {
+  const uint32_t kmax = (uint32_t)caps.max_cluster;
+  int errors = 0;
+  std::set<uint32_t> over = {kmax + 1};
+  uint32_t p2 = 1;
+  while (p2 <= kmax)
+    p2 <<= 1;
+  if (p2 <= VX_CFG_CLUSTER_MAX_NONPORTABLE)
+    over.insert(p2);
+  for (uint32_t k : over) {
+    for (auto policy : {VX_CLUSTER_POLICY_SPREAD, VX_CLUSTER_POLICY_DEFAULT}) {
+      const Launch L = {k, 1, 1, 0, policy, Submit::Launch, "reject-k", 0};
+      char what[96];
+      std::snprintf(what, sizeof(what), "%s with K=%u above the largest cluster %u",
+                    policy_name(policy), k, kmax);
+      errors += expect_reject(dev, q, kernel, caps, L, VX_ERR_INVALID_VALUE, what);
+    }
+  }
+  if (VX_CFG_CLUSTER_DISTINCT_SMS_ENABLED) {
+    const Launch L = {2, 1, 1, 0, VX_CLUSTER_POLICY_SINGLE_CORE, Submit::Launch, "reject-k", 0};
+    errors += expect_reject(dev, q, kernel, caps, L, VX_ERR_NOT_SUPPORTED,
+                            "SINGLE_CORE where a cluster takes distinct SMs");
+  }
+  const Launch L = {kmax, 4, 1, 0, VX_CLUSTER_POLICY_SPREAD, Submit::Launch, "largest-k", 0};
+  const int e = run_launch(dev, q, kernel, caps, L);
+  errors += (e < 0) ? 1 : e;
+  return errors;
+}
+
+// -x default-spread / single-core / nowrap / hier / reject-k.
 int run_x(vx_device_h dev, vx_queue_h q, vx_kernel_h kernel, const Caps& caps) {
   const uint32_t ncc = caps.ncc();
   const uint32_t g = req_g;
   std::vector<Launch> runs;
   int errors = 0;
+  if (std::strcmp(req_x, "hier") == 0) {
+    std::set<uint32_t> ks = {1};
+    if (caps.dlmem() && caps.max_cluster >= 2)
+      ks.insert({2, (uint32_t)caps.max_cluster});
+    block_work = kHierWork;
+    for (uint32_t k : ks)
+      errors += run_hier_k(dev, q, kernel, caps, k);
+    block_work = 0;
+    return errors + run_reject_k(dev, q, kernel, caps);
+  }
+  if (std::strcmp(req_x, "reject-k") == 0)
+    return run_reject_k(dev, q, kernel, caps);
   if (std::strcmp(req_x, "default-spread") == 0) {
     const uint32_t k = std::min<uint32_t>(caps.dlmem() ? std::min<uint32_t>((uint32_t)caps.max_cluster, ncc) : 2,
                                           (uint32_t)caps.num_warps);

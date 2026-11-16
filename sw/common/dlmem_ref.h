@@ -24,9 +24,13 @@
 namespace vortex {
 namespace dlmem_ref {
 
+// In-GPC placement policies (VX_CFG_CLUSTER_PLACEMENT).
+constexpr uint32_t PLACE_SPREAD = 0;  // round-robin from the core after the last placed one
+constexpr uint32_t PLACE_H100   = 1;  // least-occupied core first, then the lowest in-GPC index
+
 struct Cfg {
   uint32_t ncc;          // cores of one hardware cluster (NUM_SOCKETS * SOCKET_SIZE)
-  uint32_t nw;           // warps per core, also its CTA slots
+  uint32_t nw;           // warps per core
   uint32_t nt;           // threads per warp
   uint32_t max_cluster;  // VX_CFG_DLMEM_MAX_CLUSTER
   uint32_t lmem_log;     // log2 of a core's local memory size
@@ -35,7 +39,21 @@ struct Cfg {
   uint32_t num_sockets;
   uint64_t dlmem_base;   // VX_MEM_DLMEM_BASE_ADDR
   uint64_t lmem_base;    // VX_MEM_LMEM_BASE_ADDR
+  // 0 in nslots / max_cluster_ctas is the pre-H100 rule: one CTA slot per warp, no cluster cap.
+  uint32_t nslots = 0;            // CTA slots per core (VX_CFG_MAX_CTAS_PER_SM)
+  uint32_t max_cluster_ctas = 0;  // cluster CTAs per core (VX_CFG_MAX_CTAS_PER_SM_CLUSTER)
+  uint32_t num_gpcs = 1;          // hardware clusters of the chip (VX_CFG_NUM_CLUSTERS)
+  uint32_t policy = PLACE_SPREAD; // VX_CFG_CLUSTER_PLACEMENT
+  uint32_t gpc_start = 0;         // VX_CFG_CLUSTER_GPC_START
 };
+
+inline uint32_t slots(const Cfg& cfg) {
+  return cfg.nslots ? cfg.nslots : cfg.nw;
+}
+
+inline uint32_t cluster_cap(const Cfg& cfg) {
+  return cfg.max_cluster_ctas ? cfg.max_cluster_ctas : slots(cfg);
+}
 
 struct Peer {
   uint32_t core;
@@ -75,9 +93,9 @@ inline uint32_t warps_of(uint32_t block_size, uint32_t nt) {
 // Identical to VX_cta_dispatch's occupancy bound.
 inline uint32_t usable_slots(const Cfg& cfg, uint32_t stride) {
   if (stride == 0)
-    return cfg.nw;
+    return slots(cfg);
   uint32_t u = 1;
-  for (uint32_t m = 1; m <= cfg.nw; ++m) {
+  for (uint32_t m = 1; m <= slots(cfg); ++m) {
     if (uint64_t(m) * stride <= (uint64_t(1) << cfg.lmem_log))
       u = m;
   }
@@ -99,8 +117,13 @@ struct Mirror {
   uint32_t rr;
 };
 
+// Placed CTAs on core c: every one of them is a cluster CTA.
+inline uint32_t resident(const Cfg& cfg, const Mirror& m, uint32_t c) {
+  return uint32_t(__builtin_popcountll(~m.free[c] & low_mask(slots(cfg))));
+}
+
 inline void reset(const Cfg& cfg, Mirror& m) {
-  m.free.assign(cfg.ncc, low_mask(cfg.nw));
+  m.free.assign(cfg.ncc, low_mask(slots(cfg)));
   m.used.assign(cfg.ncc, 0);
   m.rr = 0;
 }
@@ -119,7 +142,8 @@ inline bool place(const Cfg& cfg, Mirror& m, uint32_t K, uint32_t W, uint32_t U,
     bool any_cand = false;
     for (uint32_t c = 0; c < cfg.ncc; ++c) {
       check(s.used[c] <= cfg.nw, "place: core over-reserved");
-      const bool capable = ((s.free[c] & umask) != 0) && (cfg.nw - s.used[c] >= W);
+      const bool capable = ((s.free[c] & umask) != 0) && (cfg.nw - s.used[c] >= W)
+                        && (resident(cfg, s, c) < cluster_cap(cfg));
       cand[c] = capable && !visited[c];
       any_cand = any_cand || cand[c];
     }
@@ -146,6 +170,48 @@ inline bool place(const Cfg& cfg, Mirror& m, uint32_t K, uint32_t W, uint32_t U,
   s.rr = (out[K - 1].core + 1) % cfg.ncc;
   m = s;
   return true;
+}
+
+// The H100 policy: the K capable cores of least resident CTAs, ties to the
+// lowest in-GPC index (the lowest free SM ids, a TPC at a time, on an idle
+// GPC; 03/spec.md §4); rank r on the r-th, each on its lowest free usable
+// slot. All or nothing; on failure m is unchanged. m.rr is not used.
+inline bool place_h100(const Cfg& cfg, Mirror& m, uint32_t K, uint32_t W, uint32_t U, std::vector<Peer>& out) {
+  check(K >= 1, "place_h100: empty gang");
+  uint64_t umask = low_mask(U);
+  std::vector<bool> taken(cfg.ncc, false);
+  out.clear();
+  for (uint32_t r = 0; r < K; ++r) {
+    int best = -1;
+    for (uint32_t c = 0; c < cfg.ncc; ++c) {
+      check(m.used[c] <= cfg.nw, "place_h100: core over-reserved");
+      const bool capable = !taken[c] && ((m.free[c] & umask) != 0) && (cfg.nw - m.used[c] >= W)
+                        && (resident(cfg, m, c) < cluster_cap(cfg));
+      if (capable && (best < 0 || resident(cfg, m, c) < resident(cfg, m, uint32_t(best))))
+        best = int(c);
+    }
+    if (best < 0) {
+      out.clear();
+      return false;
+    }
+    taken[best] = true;
+    uint64_t avail = m.free[best] & umask;
+    uint32_t sl = 0;
+    while (((avail >> sl) & 1) == 0) {
+      ++sl;
+    }
+    out.push_back({uint32_t(best), sl});
+  }
+  for (const auto& p : out) {
+    m.free[p.core] &= ~(uint64_t(1) << p.slot);
+    m.used[p.core] += W;
+  }
+  return true;
+}
+
+// The configured in-GPC policy.
+inline bool place_gpc(const Cfg& cfg, Mirror& m, uint32_t K, uint32_t W, uint32_t U, std::vector<Peer>& out) {
+  return (cfg.policy == PLACE_H100) ? place_h100(cfg, m, K, W, U, out) : place(cfg, m, K, W, U, out);
 }
 
 inline void release(Mirror& m, uint32_t core, uint32_t slot, uint32_t W) {
@@ -224,7 +290,7 @@ inline int cbar_pop(GangIds& g) {
 // A launch starts with nothing in flight, so rr and the epochs restart.
 inline void new_launch(const Cfg& cfg, Mirror& m, GangIds& g) {
   for (uint32_t c = 0; c < cfg.ncc; ++c) {
-    check(m.free.at(c) == low_mask(cfg.nw) && m.used.at(c) == 0, "new_launch: mirror not empty");
+    check(m.free.at(c) == low_mask(slots(cfg)) && m.used.at(c) == 0, "new_launch: mirror not empty");
   }
   for (bool l : g.live) {
     check(!l, "new_launch: gang id still live");
@@ -234,6 +300,73 @@ inline void new_launch(const Cfg& cfg, Mirror& m, GangIds& g) {
   }
   m.rr = 0;
   g.epoch.assign(g.epoch.size(), 0);
+}
+
+///////////////////////////////////////////////////////////////////////////////
+// Chip-wide cluster dispatch: one in-order queue over the GPCs (the H4 fix).
+
+struct Chip {
+  std::vector<Mirror>  gpc;    // per GPC: its admission mirror
+  std::vector<GangIds> gangs;  // per GPC: its gang table's ids
+  uint32_t ptr;                // the GPC the next scan starts from
+};
+
+inline void reset(const Cfg& cfg, Chip& chip) {
+  chip.gpc.resize(cfg.num_gpcs);
+  chip.gangs.resize(cfg.num_gpcs);
+  for (uint32_t g = 0; g < cfg.num_gpcs; ++g) {
+    reset(cfg, chip.gpc[g]);
+    reset(cfg, chip.gangs[g]);
+  }
+  chip.ptr = cfg.gpc_start;
+}
+
+// A cluster message: K CTAs of W warps on U usable slots. K = 1 takes no gang id.
+struct Msg {
+  uint32_t K;
+  uint32_t W;
+  uint32_t U;
+};
+
+struct Placed {
+  uint32_t gpc;
+  std::vector<Peer> peers;  // indexed by rank; Peer::core is the in-GPC index
+  int gang;                 // -1 for K = 1
+};
+
+// Every kernel starts from CLUSTER_GPC_START, so an idle GPU places a launch
+// shape the same way every time (03/spec.md §4).
+inline void new_launch(const Cfg& cfg, Chip& chip) {
+  for (uint32_t g = 0; g < cfg.num_gpcs; ++g) {
+    new_launch(cfg, chip.gpc[g], chip.gangs[g]);
+  }
+  chip.ptr = cfg.gpc_start;
+}
+
+// The head message goes to the first GPC from the pointer that can place it
+// now; the pointer moves past that GPC. False: no GPC can, the head waits and
+// nothing behind it issues; chip is unchanged.
+inline bool place_chip(const Cfg& cfg, Chip& chip, const Msg& msg, Placed& out) {
+  check(cfg.num_gpcs >= 1 && chip.gpc.size() == cfg.num_gpcs, "place_chip: chip not reset");
+  for (uint32_t i = 0; i < cfg.num_gpcs; ++i) {
+    uint32_t g = (chip.ptr + i) % cfg.num_gpcs;
+    if (msg.K > 1) {
+      bool id_free = false;
+      for (size_t j = 0; j < chip.gangs[g].live.size(); ++j) {
+        id_free = id_free || (!chip.gangs[g].live[j] && !chip.gangs[g].rel_pend[j]);
+      }
+      if (!id_free)
+        continue;
+    }
+    if (!place_gpc(cfg, chip.gpc[g], msg.K, msg.W, msg.U, out.peers))
+      continue;
+    out.gpc  = g;
+    out.gang = (msg.K > 1) ? alloc(chip.gangs[g], msg.K) : -1;
+    chip.ptr = (g + 1) % cfg.num_gpcs;
+    return true;
+  }
+  out.peers.clear();
+  return false;
 }
 
 // A same-core cluster's row: its members sit in consecutive slots of one core.

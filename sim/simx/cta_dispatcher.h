@@ -13,6 +13,7 @@
 
 #pragma once
 
+#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <vector>
@@ -164,6 +165,12 @@ private:
   // cycles after it exits: the retirement pipeline, then the count write-back.
   static constexpr uint64_t RETIRE_DELAY = 3;
   std::vector<uint64_t> slot_free_at_;
+  std::vector<uint32_t> refill_;   // per slot: the refill gap of its CTA's launch kind
+  // With a refill gap, a CTA's warps stay taken from their exit until its slot frees.
+  static constexpr bool kRefill = uint64_t(std::max({VX_CFG_CTA_REFILL_CYCLES, VX_CFG_CTA_REFILL_CLUSTER1_CYCLES,
+                                                     VX_CFG_CTA_REFILL_CLUSTER_CYCLES})) > RETIRE_DELAY;
+  std::vector<uint64_t> warp_free_at_;
+  std::vector<uint32_t> held_slot_;
   std::array<uint64_t, RETIRE_DELAY + 1> done_cycle_;  // exit cycle + 1, by cycle
 
   // The selected warp (warp_fire_r) and the one that goes active this cycle.

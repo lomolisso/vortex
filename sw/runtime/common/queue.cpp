@@ -280,8 +280,10 @@ vx_result_t launch_policy(Device* dev, const vx_launch_info_t* info,
     if (!ci.dlmem) return VX_SUCCESS;
     if (info->ndim == 0)
         return (ci.policy == VX_CLUSTER_POLICY_SPREAD) ? VX_ERR_INVALID_VALUE : VX_SUCCESS;
-    // The KMU's rank counter holds the largest cluster of either placement.
-    if (ci.k > std::max(ci.nw, ci.max_cluster)) return VX_ERR_INVALID_VALUE;
+    // The KMU's rank counter holds the largest cluster of either placement;
+    // a distinct-core device has only the spread one.
+    if (ci.k > (ci.distinct ? ci.max_cluster : std::max(ci.nw, ci.max_cluster)))
+        return VX_ERR_INVALID_VALUE;
     // Past the portable size a cluster needs the caller's opt-in, whatever its placement.
     if (ci.k > VX_CLUSTER_MAX_PORTABLE && !(ci.flags & VX_CLUSTER_FLAG_NON_PORTABLE))
         return VX_ERR_INVALID_VALUE;

@@ -16,6 +16,7 @@
 #include "core.h"
 #include "cluster.h"
 #include "constants.h"
+#include "exec_domains.h"
 #include "types.h"
 #ifdef VX_CFG_EXT_DXA_ENABLE
 #include "dxa_core.h"
@@ -55,12 +56,13 @@ public:
   Impl(Socket* simobject)
     : simobject_(simobject)
     , cores_(VX_CFG_SOCKET_SIZE)
-    , domain_id_(SimPlatform::instance().alloc_domain())
+    , domain_(DomainLevel::Socket)
   {
-    // The socket is one execution domain: its cores, L1 cache clusters, and
-    // socket-resident engines interact with same-cycle visibility; everything
-    // below the socket's memory interface slices is uncore (domain 0).
-    SimPlatform::DomainScope domain_scope(domain_id_);
+    // Outside H100 builds the socket is one execution domain: its cores, L1
+    // cache clusters, and socket-resident engines interact with same-cycle
+    // visibility; everything below the socket's memory interface slices is
+    // uncore (domain 0). In H100 builds the whole GPC is the domain.
+    auto domain_scope = domain_.enter();
 
     auto cores_per_socket = cores_.size();
 
@@ -217,7 +219,7 @@ public:
       snprintf(bname, 100, "%s-brsp%d", name.c_str(), port);
       MemRspSlice::Ptr brsp;
       {
-        SimPlatform::DomainScope uncore_scope(0u);
+        auto outer_scope = domain_.enter_outer();
         brsp = MemRspSlice::Create(bname, 1);
       }
       req_src.bind(&breq->In);
@@ -565,7 +567,7 @@ public:
 private:
   Socket*                 simobject_;
   std::vector<Core::Ptr>  cores_;
-  uint32_t                domain_id_;
+  ExecDomain              domain_;
   CacheCluster::Ptr       icaches_;
   CacheCluster::Ptr       dcaches_;
 #ifdef VX_CFG_EXT_DXA_ENABLE

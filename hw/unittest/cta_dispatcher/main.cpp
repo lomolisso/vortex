@@ -59,9 +59,14 @@ void sim_trace_enable(bool enable) {
 using Sim = vl_simulator<VVX_cta_dispatch_top>;
 
 constexpr uint32_t NUM_WARPS   = VX_CFG_NUM_WARPS;
+constexpr uint32_t NUM_SLOTS   = VX_CFG_MAX_CTAS_PER_SM;
 constexpr uint32_t NUM_THREADS = VX_CFG_NUM_THREADS;
 constexpr uint32_t LMEM_SIZE   = 1u << VX_CFG_LMEM_LOG_SIZE;
 constexpr uint32_t BLOCK_ALIGN = VX_CFG_MEM_BLOCK_SIZE;
+
+#if !VX_CFG_EXT_DLMEM_ENABLED
+constexpr uint32_t MAX_K       = NUM_WARPS;
+#endif
 
 #if VX_CFG_EXT_DLMEM_ENABLED
 static constexpr uint32_t c_clog2(uint64_t x) {
@@ -76,12 +81,14 @@ static constexpr uint32_t c_up(uint32_t x) {
 }
 constexpr uint32_t NCC     = c_up(VX_CFG_NUM_CORES / VX_CFG_SOCKET_SIZE) * VX_CFG_SOCKET_SIZE;
 constexpr uint32_t MAXC    = VX_CFG_DLMEM_MAX_CLUSTER;
+// VX_gpu_pkg MAX_CLUSTER_SIZE: the widest K the cluster-size field carries.
+constexpr uint32_t MAX_K   = VX_CFG_CLUSTER_DISTINCT_SMS_ENABLED ? MAXC : std::max<uint32_t>(NUM_WARPS, MAXC);
 constexpr uint32_t CORE_W  = c_up(c_clog2(NCC));
 constexpr uint32_t NW_W    = c_up(c_clog2(NUM_WARPS));
 constexpr uint32_t K_W     = c_clog2(MAXC + 1);
 constexpr uint32_t PEER_W  = CORE_W + NW_W;
 constexpr uint32_t ROW_W   = K_W + MAXC * PEER_W;
-constexpr uint32_t GANGS   = std::max<uint32_t>(2, NCC * NUM_WARPS / 2);
+constexpr uint32_t GANGS   = VX_CFG_DLMEM_NUM_GANGS;
 constexpr uint32_t GANG_W  = c_clog2(GANGS);
 constexpr uint32_t MY_CORE = TB_CORE_ID % NCC;
 
@@ -253,11 +260,11 @@ static uint32_t stride_of(uint32_t lmem_size) {
 
 static uint32_t usable_slots(uint32_t stride) {
   if (stride == 0) {
-    return NUM_WARPS;
+    return NUM_SLOTS;
   }
   uint32_t fit = LMEM_SIZE / stride;
-  if (fit > NUM_WARPS) {
-    fit = NUM_WARPS;
+  if (fit > NUM_SLOTS) {
+    fit = NUM_SLOTS;
   }
   return fit ? fit : 1;
 }
@@ -321,6 +328,8 @@ public:
   uint32_t cbar_records = 0;   // cluster-barrier records checked
   uint32_t cbar_gangs = 0;     // of them, gangs that complete through the gang unit
   std::vector<uint64_t> accept_cycle;
+  std::vector<uint64_t> done_cycle;   // per CTA: the cycle its last warp's exit reached the dispatcher
+  std::vector<uint64_t> fire_cycle;   // per CTA: the cycle its first warp launched
   std::map<uint32_t, uint64_t> last_event_cycle;   // slot -> cycle its last event left
 
   // Runs the CTAs in order, the host waiting for the device to drain between
@@ -341,6 +350,8 @@ public:
     cbar_records = 0;
     cbar_gangs = 0;
     accept_cycle.assign(ctas.size(), 0);
+    done_cycle.assign(ctas.size(), 0);
+    fire_cycle.assign(ctas.size(), ~0ull);
     last_event_cycle.clear();
     warp_cta_.assign(NUM_WARPS, -1);
     left_.assign(ctas.size(), 0);
@@ -394,6 +405,10 @@ public:
       csr_read_.reset();
       if (lookup_) {
         int slot = sim_->schedule_cta_id;
+        if (uint32_t(slot) >= NUM_SLOTS) {
+          std::printf("FAIL: CTA %d runs in slot %d, MAX_CTAS_PER_SM is %u\n", lookup_->second, slot, NUM_SLOTS);
+          return false;
+        }
         int& s = slots.at(lookup_->second);
         if (s < 0) {
           s = slot;
@@ -414,6 +429,7 @@ public:
           return false;
         }
         lookup_ = std::make_pair(wid, cur);
+        fire_cycle[cur] = std::min(fire_cycle[cur], cycle_);
         warp_cta_[wid] = cur;
       }
 
@@ -700,6 +716,7 @@ private:
       // gang reuses it only after that.
       int c = warp_cta_[w];
       if (c >= 0 && left_[c] > 0 && --left_[c] == 0) {
+        done_cycle[c] = cycle_;
         if (pinned_cta(c)) {
           pending_[uint32_t(slot_of_[c])] = c;
         } else {
@@ -842,7 +859,7 @@ static bool multi_launch(Sim& sim, uint64_t& tick, uint32_t seed, uint32_t num_l
 #endif
     uint32_t k;
     do {
-      k = 1 + rng() % NUM_WARPS;
+      k = 1 + rng() % std::min(NUM_WARPS, MAX_K);
     } while (k > 4 && (k & (k - 1)) != 0);
 #if VX_CFG_EXT_DLMEM_ENABLED
     if (pinned) {
@@ -929,24 +946,71 @@ static bool done_pend_blocks(Sim& sim, uint64_t& tick) {
 // Inside one launch a pinned block leaves the round-robin tail alone: legacy,
 // pinned to the last slot, legacy lands in slots 0, NW-1, 1.
 static bool pinned_keeps_tail(Sim& sim, uint64_t& tick) {
-  if (NUM_WARPS < 3) {
+  if (NUM_SLOTS < 3) {
     std::printf("pinned-tail: needs 3 CTA slots, skipped\n");
     return true;
   }
   std::vector<Cta> ctas;
   add_launch(ctas, 0, 1, 1, 3, 0, NUM_THREADS);
   ctas[1].pinned = true;
-  ctas[1].want_slot = NUM_WARPS - 1;
+  ctas[1].want_slot = NUM_SLOTS - 1;
   PlacementBench bench(sim, tick, 11);
   std::vector<int> slots;
   bool ok = bench.run(ctas, slots);
   tick = bench.tick();
   ok = ok && check_slots("pinned-tail", ctas, slots)
-          && (slots[0] == 0) && (slots[1] == int(NUM_WARPS - 1)) && (slots[2] == 1);
+          && (slots[0] == 0) && (slots[1] == int(NUM_SLOTS - 1)) && (slots[2] == 1);
   std::printf("pinned-tail: slots %d %d %d: %s\n", slots[0], slots[1], slots[2], ok ? "ok" : "FAILED");
   return ok;
 }
 #endif
+
+// CTA refill gap (03/spec.md §5): CTAs of one kind follow each other on the
+// core, each needing what the one before frees. Slot-bound (the local memory
+// fits one CTA): the next one is taken exactly the kind's refill knob after the
+// last warp of the one before exited. Warp-bound (every warp, no local memory):
+// another slot is free at once, but the next CTA's first warp launches no
+// sooner than the knob after that exit, and within a few cycles of it.
+static bool refill_case(Sim& sim, uint64_t& tick, const char* name, uint32_t knob, uint32_t k, bool pinned,
+                        bool warp_bound) {
+  std::vector<Cta> ctas;
+  add_launch(ctas, 0, 1, k, 3 * k, warp_bound ? 0 : LMEM_SIZE, warp_bound ? NUM_WARPS * NUM_THREADS : NUM_THREADS,
+             pinned);
+  if (!warp_bound) {
+    for (Cta& c : ctas) {
+      c.want_slot = 0;
+    }
+  }
+  PlacementBench bench(sim, tick, 13);
+  std::vector<int> slots;
+  bool ok = bench.run(ctas, slots);
+  tick = bench.tick();
+  std::printf("refill %s, %s-bound (knob %u):", name, warp_bound ? "warp" : "slot", knob);
+  for (size_t i = 1; ok && i < ctas.size(); ++i) {
+    uint64_t at = warp_bound ? bench.fire_cycle[i] : (bench.accept_cycle[i] - 1);
+    int64_t gap = int64_t(at) - int64_t(bench.done_cycle[i - 1]);
+    std::printf(" %ld", (long)gap);
+    if (knob != 0 && (warp_bound ? (gap < int64_t(knob) || gap > int64_t(knob) + 4) : (gap != int64_t(knob)))) {
+      ok = false;
+    }
+  }
+  std::printf(": %s\n", ok ? "ok" : "FAILED");
+  return ok;
+}
+
+static bool refill_gap(Sim& sim, uint64_t& tick) {
+  bool ok = true;
+  for (bool warp_bound : {false, true}) {
+    ok = refill_case(sim, tick, "plain", VX_CFG_CTA_REFILL_CYCLES, 1, false, warp_bound) && ok;
+#if VX_CFG_EXT_DLMEM_ENABLED
+    ok = refill_case(sim, tick, "cluster of 1", VX_CFG_CTA_REFILL_CLUSTER1_CYCLES, 1, true, warp_bound) && ok;
+    if (MAXC >= 2) {
+      ok = refill_case(sim, tick, "cluster of 2", VX_CFG_CTA_REFILL_CLUSTER_CYCLES, 2, true, warp_bound) && ok;
+    }
+#endif
+  }
+  return ok;
+}
 
 int main(int argc, char **argv) {
   Verilated::commandArgs(argc, argv);
@@ -969,8 +1033,8 @@ int main(int argc, char **argv) {
 
   Sim sim;
   uint64_t tick = 0;
-  std::printf("cta_dispatcher: warps=%u threads=%u lmem=%u dlmem=%d seed=%u\n", NUM_WARPS, NUM_THREADS, LMEM_SIZE,
-              VX_CFG_EXT_DLMEM_ENABLED, seed);
+  std::printf("cta_dispatcher: warps=%u slots=%u threads=%u lmem=%u dlmem=%d seed=%u\n", NUM_WARPS, NUM_SLOTS,
+              NUM_THREADS, LMEM_SIZE, VX_CFG_EXT_DLMEM_ENABLED, seed);
 #if VX_CFG_EXT_DLMEM_ENABLED
   std::printf("cta_dispatcher: core %u of %u, max cluster %u\n", MY_CORE, NCC, MAXC);
 #endif
@@ -983,6 +1047,7 @@ int main(int argc, char **argv) {
   ok = done_pend_blocks(sim, tick) && ok;
   ok = pinned_keeps_tail(sim, tick) && ok;
 #endif
+  ok = refill_gap(sim, tick) && ok;
   ok = multi_launch(sim, tick, seed, launches) && ok;
 
   if (!ok) {

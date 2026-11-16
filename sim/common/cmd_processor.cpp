@@ -15,7 +15,8 @@ namespace vortex {
 // ============================================================================
 // Static GPU capability words
 //
-// GPU_DEV_CAPS / GPU_ISA_CAPS register values exposed as read-only MMIO.
+// GPU_DEV_CAPS / GPU_ISA_CAPS / GPU_ORG_CAPS register values exposed as
+// read-only MMIO.
 // sw/runtime/common/vx_caps.h is the matching decoder.
 // ============================================================================
 namespace {
@@ -46,6 +47,21 @@ uint64_t gpu_dev_caps() {
     caps |= (uint64_t(VX_CFG_DLMEM_MAX_CLUSTER) & 0x7F) << 42;
 #endif
     return caps;
+}
+static_assert(VX_CFG_MAX_CTAS_PER_SM < 128, "MAX_CTAS_PER_SM does not fit its 7-bit caps field");
+static_assert(VX_CFG_MAX_CTAS_PER_SM_CLUSTER < 128, "MAX_CTAS_PER_SM_CLUSTER does not fit its 7-bit caps field");
+static_assert(cp_clog2(VX_CFG_NUM_PARTITIONS) < 16, "NUM_PARTITIONS does not fit its 4-bit log2 caps field");
+static_assert(cp_clog2(VX_CFG_CPCS_PER_GPC) < 16, "CPCS_PER_GPC does not fit its 4-bit log2 caps field");
+static_assert(cp_clog2(VX_CFG_NUM_CLUSTERS) < 8, "NUM_CLUSTERS does not fit its 3-bit log2 caps field");
+static_assert(cp_clog2(VX_CFG_NUM_CORES / VX_CFG_SOCKET_SIZE) < 8, "NUM_CORES / SOCKET_SIZE does not fit its 3-bit log2 caps field");
+
+// [31:23] are reserved for compute fields, [63:32] for the memory side.
+uint64_t gpu_org_caps() {
+    return  (uint64_t(cp_clog2(VX_CFG_NUM_PARTITIONS)) & 0xF)
+         | ((uint64_t(cp_clog2(VX_CFG_CPCS_PER_GPC))   & 0xF)  << 4)
+         | ((uint64_t(VX_CFG_MAX_CTAS_PER_SM)          & 0x7F) << 8)
+         | ((uint64_t(VX_CFG_MAX_CTAS_PER_SM_CLUSTER)  & 0x7F) << 15)
+         | ((uint64_t(VX_CFG_CLUSTER_DISTINCT_SMS_ENABLED) & 0x1) << 22);
 }
 uint64_t gpu_isa_caps() {
     return  (uint64_t(VX_CFG_MISA_EXT) << 32)
@@ -81,7 +97,8 @@ void CommandProcessor::mmio_write(uint32_t off, uint32_t value) {
         case 0x02C: satp_ = (satp_ & 0x00000000FFFFFFFFULL) | (uint64_t(value) << 32);  return;
         // STATUS / DEV_CAPS / CYCLE / GPU caps are RO; ignore writes.
         case 0x004: case 0x008: case 0x010: case 0x014:
-        case 0x018: case 0x01C: case 0x020: case 0x024: return;
+        case 0x018: case 0x01C: case 0x020: case 0x024:
+        case 0x040: case 0x044: return;
     }
     // Queue 0 (offsets 0x100..0x12F)
     if (off >= 0x100 && off < 0x140) {
@@ -138,6 +155,8 @@ uint32_t CommandProcessor::mmio_read(uint32_t off) const {
         case 0x024: return uint32_t(gpu_isa_caps() >> 32);
         case 0x028: return uint32_t(satp_ & 0xFFFFFFFF);
         case 0x02C: return uint32_t(satp_ >> 32);
+        case 0x040: return uint32_t(gpu_org_caps() & 0xFFFFFFFF);
+        case 0x044: return uint32_t(gpu_org_caps() >> 32);
     }
     if (off >= 0x100 && off < 0x140) {
         switch (off - 0x100) {

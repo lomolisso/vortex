@@ -13,13 +13,14 @@
 
 `include "VX_define.vh"
 
-// One hardware cluster's gang unit with its launch beats flattened. The input
-// payload is a raw fill with the fields the gang reads overlaid on it, so every
+// One GPC's gang admission as the Vortex top wires it in a one-GPC build: the
+// placement (VX_cta_admit, beside the KMU) and the gang table (VX_cta_gang,
+// beside the gbar unit), across the same GPC boundary, with the launch beats
+// flattened. The input payload is
+// a raw fill with the fields the admission reads overlaid on it, so every
 // payload bit is driven (the bench checks them bit for bit and synthesis keeps
 // the whole beat path).
-module VX_cta_gang_top import VX_gpu_pkg::*; #(
-    parameter CLUSTER_ID = 0
-) (
+module VX_cta_gang_top import VX_gpu_pkg::*; (
     input  wire                             clk,
     input  wire                             reset,
 
@@ -133,14 +134,53 @@ module VX_cta_gang_top import VX_gpu_pkg::*; #(
     assign evt_data.epoch   = evt_epoch;
     assign evt_data.arrived = evt_arrived;
 
-    VX_cta_gang #(
-        .INSTANCE_ID ("cta_gang"),
-        .CLUSTER_ID  (CLUSTER_ID)
-    ) cta_gang (
+    // a GPC is its own SimX execution domain in H100 builds: every edge to it is registered
+    localparam BD = `VX_CFG_H100_ORG_ENABLED ? `VX_CFG_DOMAIN_BOUNDARY_DELAY : 0;
+
+    wire                        gpc_done_valid = evt_valid && (evt_kind == GBAR_KIND_CTA_DONE);
+    wire                        admit_done_valid;
+    dlmem_cta_done_t            admit_done_data;
+    wire [DLMEM_NUM_GANGS-1:0]  gpc_rel_pend, admit_rel_pend;
+    wire                        admit_alloc_valid, admit_alloc_epoch, admit_gang_mode;
+    wire                        gpc_alloc_valid, gpc_alloc_epoch, gpc_gang_mode;
+    wire [GANG_ID_W-1:0]        admit_alloc_gang, gpc_alloc_gang;
+    wire [DLMEM_K_W-1:0]        admit_alloc_k, gpc_alloc_k;
+    wire                        admit_busy, gang_busy;
+
+    VX_cta_admit #(
+        .INSTANCE_ID ("cta_admit"),
+        .NUM_GPCS    (1)
+    ) cta_admit (
         .clk        (clk),
         .reset      (reset),
         .bus_in_if  (bus_in_if),
         .bus_out_if (bus_out_if),
+        .done_valid (admit_done_valid),
+        .done_data  (admit_done_data),
+        .rel_pend   (admit_rel_pend),
+        .alloc_valid(admit_alloc_valid),
+        .alloc_gang (admit_alloc_gang),
+        .alloc_epoch(admit_alloc_epoch),
+        .alloc_k    (admit_alloc_k),
+        .gang_mode  (admit_gang_mode),
+        .busy       (admit_busy)
+    );
+
+    `BUFFER_EX({admit_done_valid, admit_done_data, admit_rel_pend},
+               {gpc_done_valid, evt_data, gpc_rel_pend}, 1'b1, 1, BD);
+    `BUFFER_EX({gpc_alloc_valid, gpc_alloc_gang, gpc_alloc_epoch, gpc_alloc_k, gpc_gang_mode},
+               {admit_alloc_valid, admit_alloc_gang, admit_alloc_epoch, admit_alloc_k, admit_gang_mode}, 1'b1, 1, BD);
+
+    VX_cta_gang #(
+        .INSTANCE_ID ("cta_gang")
+    ) cta_gang (
+        .clk        (clk),
+        .reset      (reset),
+        .gang_mode  (gpc_gang_mode),
+        .alloc_valid(gpc_alloc_valid),
+        .alloc_gang (gpc_alloc_gang),
+        .alloc_epoch(gpc_alloc_epoch),
+        .alloc_k    (gpc_alloc_k),
         .evt_valid  (evt_valid),
         .evt_kind   (evt_kind),
         .evt_data   (evt_data),
@@ -149,7 +189,10 @@ module VX_cta_gang_top import VX_gpu_pkg::*; #(
         .rel_gang   (rel_gang),
         .rel_epoch  (rel_epoch),
         .rel_ready  (rel_ready),
-        .busy       (busy)
+        .rel_pend   (gpc_rel_pend),
+        .busy       (gang_busy)
     );
+
+    assign busy = admit_busy || gang_busy;
 
 endmodule

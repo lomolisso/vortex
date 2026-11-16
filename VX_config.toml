@@ -1,9 +1,10 @@
 # Each `VX_CFG_X_ENABLE` boolean auto-generates its integer mirror `VX_CFG_X_ENABLED` (0/1); author only the boolean.
 
 [platform]
-VX_CFG_NUM_CLUSTERS = 1
-VX_CFG_NUM_CORES = 1
-VX_CFG_SOCKET_SIZE = 1
+# The H100 level counts drive these in H100 builds; today's shapes override them instead.
+VX_CFG_NUM_CLUSTERS = "expr: $VX_CFG_NUM_GPCS"
+VX_CFG_NUM_CORES = "expr: $VX_CFG_SMS_PER_GPC"
+VX_CFG_SOCKET_SIZE = "expr: $VX_CFG_SMS_PER_TPC"
 
 VX_CFG_RESET_DELAY = 8
 
@@ -64,6 +65,53 @@ VX_CFG_H100_L2_CLOCK_MHZ = 1559                      # 19/spec.md §0 (lts__cycl
 VX_CFG_H100_DRAM_VISIT_RD_PS = 2000                  # 18/spec.md §9.6 (noc.hbm.line_visit_floor_read_ns, 2.0 ns)
 VX_CFG_H100_DRAM_VISIT_WR1_PS = 2270                 # 07/spec.md §10.3 (gran.write_visit_1sector_ns, 2.27 ns)
 VX_CFG_H100_DRAM_VISIT_WR2_PS = 2470                 # 07/spec.md §10.3 (gran.write_visit_2sector_ns, 2.47 ns)
+VX_CFG_H100_CTA_DISPATCH_PS = 550                    # 03/spec.md §5 (launch.dispatch_per_cluster_of_1 note: plain CTA 0.55 ns)
+VX_CFG_H100_CLUSTER_DISPATCH_PS = 2500               # 03/spec.md §5 (launch.dispatch_per_cluster_of_1, 2.5 ns)
+VX_CFG_H100_CTA_REFILL_NS = 220                      # 03/spec.md §5 (launch.refill_gap.plain)
+VX_CFG_H100_CTA_REFILL_CLUSTER1_NS = 260             # 03/spec.md §5 (launch.refill_gap, K = 1)
+VX_CFG_H100_CTA_REFILL_CLUSTER_NS = 290              # 03/spec.md §5 (launch.refill_gap.cluster, K = 2-16)
+
+[compute]
+# Global SM index: gpc * NUM_CORES + (tpc_slot * CPCS_PER_GPC + cpc) * SOCKET_SIZE + sm (sw/common/vx_hier.h).
+VX_CFG_NUM_SMS = "expr: $VX_CFG_NUM_CLUSTERS * $VX_CFG_NUM_CORES"
+VX_CFG_SMS_PER_CPC = "expr: $VX_CFG_NUM_CORES // $VX_CFG_CPCS_PER_GPC"
+# Cluster sizes 9-16 need the non-portable attribute; 16 is also the ctaMask width (03/spec.md §1, 14/spec.md §1).
+VX_CFG_CLUSTER_MAX_NONPORTABLE = 16
+# The CTAs of one cluster on distinct SMs (03/spec.md §2 item 3); off keeps a cluster on one core.
+VX_CFG_CLUSTER_DISTINCT_SMS_ENABLE = "expr: $VX_CFG_H100_ORG_ENABLE"
+# H100: least-occupied SM first, then the lowest in-GPC index; SPREAD: round-robin from the last placed core.
+VX_CFG_CLUSTER_PLACEMENT = "expr: 'H100' if $VX_CFG_H100_ORG_ENABLE else 'SPREAD'"
+# GPC the cluster round-robin starts from at every kernel start (03/spec.md §4: one cluster lands in GPC 0).
+VX_CFG_CLUSTER_GPC_START = 0
+# CTA slots per SM (01/spec.md §8, sm.max_blocks) and per SM for a cluster launch (03/spec.md §2 item 5).
+VX_CFG_SM_MAX_BLOCKS = 32
+VX_CFG_SM_MAX_CLUSTER_BLOCKS = 8
+VX_CFG_MAX_CTAS_PER_SM = "expr: min($VX_CFG_SM_MAX_BLOCKS, $VX_CFG_NUM_WARPS) if $VX_CFG_H100_ORG_ENABLE else $VX_CFG_NUM_WARPS"
+VX_CFG_MAX_CTAS_PER_SM_CLUSTER = "expr: min($VX_CFG_SM_MAX_CLUSTER_BLOCKS, $VX_CFG_MAX_CTAS_PER_SM) if $VX_CFG_H100_ORG_ENABLE else $VX_CFG_MAX_CTAS_PER_SM"
+# Dispatch timing in SM cycles at the H100 clock, rounded to nearest; 0 leaves only the structure's own latency.
+VX_CFG_CTA_DISPATCH_CYCLES = "expr: ($VX_CFG_H100_CTA_DISPATCH_PS * $VX_CFG_H100_SM_CLOCK_MHZ + 500000) // 1000000 if $VX_CFG_H100_ORG_ENABLE else 0"
+VX_CFG_CLUSTER_DISPATCH_CYCLES = "expr: ($VX_CFG_H100_CLUSTER_DISPATCH_PS * $VX_CFG_H100_SM_CLOCK_MHZ + 500000) // 1000000 if $VX_CFG_H100_ORG_ENABLE else 0"
+VX_CFG_CTA_REFILL_CYCLES = "expr: ($VX_CFG_H100_CTA_REFILL_NS * $VX_CFG_H100_SM_CLOCK_MHZ + 500) // 1000 if $VX_CFG_H100_ORG_ENABLE else 0"
+VX_CFG_CTA_REFILL_CLUSTER1_CYCLES = "expr: ($VX_CFG_H100_CTA_REFILL_CLUSTER1_NS * $VX_CFG_H100_SM_CLOCK_MHZ + 500) // 1000 if $VX_CFG_H100_ORG_ENABLE else 0"
+VX_CFG_CTA_REFILL_CLUSTER_CYCLES = "expr: ($VX_CFG_H100_CTA_REFILL_CLUSTER_NS * $VX_CFG_H100_SM_CLOCK_MHZ + 500) // 1000 if $VX_CFG_H100_ORG_ENABLE else 0"
+# Register stage on every channel between two SimX execution domains, carried by the RTL on the same edge;
+# bounded by the shortest crossing edge, the launch and credit edges into a GPC (one register stage each).
+VX_CFG_DOMAIN_BOUNDARY_DELAY = 1
+# CTA-done path from the gbar unit to the admission mirror: its output register, one fan-in stage per
+# level with several inputs (SMs of a TPC, TPCs of a GPC), and the GPC domain crossing.
+VX_CFG_CTA_DONE_LINK_DELAY = "expr: 1 + ($VX_CFG_SOCKET_SIZE > 1) + ($VX_CFG_NUM_CORES > $VX_CFG_SOCKET_SIZE) + $VX_CFG_DOMAIN_BOUNDARY_DELAY * $VX_CFG_H100_ORG_ENABLED"
+
+[[check]]
+ORG_ALIASES = ["expr: ($VX_CFG_NUM_GPCS == 1 and $VX_CFG_SMS_PER_GPC == 1) or ($VX_CFG_NUM_CLUSTERS == $VX_CFG_NUM_GPCS and $VX_CFG_NUM_CORES == $VX_CFG_SMS_PER_GPC and $VX_CFG_SOCKET_SIZE == $VX_CFG_SMS_PER_TPC)", "set either the H100 level counts or NUM_CLUSTERS/NUM_CORES/SOCKET_SIZE, not both"]
+MAX_NUM_SMS = ["expr: $VX_CFG_NUM_SMS <= 1024", "VX_CFG_NUM_SMS (NUM_CLUSTERS x NUM_CORES) must be at most 1024"]
+CPC_DIVIDES = ["expr: $VX_CFG_CPCS_PER_GPC == 1 or $VX_CFG_NUM_CORES % ($VX_CFG_SOCKET_SIZE * $VX_CFG_CPCS_PER_GPC) == 0", "VX_CFG_CPCS_PER_GPC must divide the TPCs of a GPC (NUM_CORES / SOCKET_SIZE)"]
+GPC_START_RANGE = ["expr: $VX_CFG_CLUSTER_GPC_START >= 0 and $VX_CFG_CLUSTER_GPC_START < $VX_CFG_NUM_CLUSTERS", "VX_CFG_CLUSTER_GPC_START must name a GPC (0 to NUM_CLUSTERS - 1)"]
+CTAS_PER_SM_RANGE = ["expr: $VX_CFG_SM_MAX_BLOCKS >= 1 and $VX_CFG_SM_MAX_BLOCKS <= 64 and $VX_CFG_MAX_CTAS_PER_SM >= 1 and $VX_CFG_MAX_CTAS_PER_SM <= $VX_CFG_NUM_WARPS and $VX_CFG_MAX_CTAS_PER_SM <= 64", "VX_CFG_MAX_CTAS_PER_SM (from VX_CFG_SM_MAX_BLOCKS) must be between 1 and min(NUM_WARPS, 64)"]
+CLUSTER_CTAS_RANGE = ["expr: $VX_CFG_SM_MAX_CLUSTER_BLOCKS >= 1 and $VX_CFG_MAX_CTAS_PER_SM_CLUSTER >= 1 and $VX_CFG_MAX_CTAS_PER_SM_CLUSTER <= $VX_CFG_MAX_CTAS_PER_SM", "VX_CFG_MAX_CTAS_PER_SM_CLUSTER (from VX_CFG_SM_MAX_CLUSTER_BLOCKS) must be between 1 and VX_CFG_MAX_CTAS_PER_SM"]
+NONPORTABLE_RANGE = ["expr: is_pow2($VX_CFG_CLUSTER_MAX_NONPORTABLE) and $VX_CFG_CLUSTER_MAX_NONPORTABLE <= 16", "VX_CFG_CLUSTER_MAX_NONPORTABLE must be a power of two of at most 16"]
+MAX_CLUSTER_RANGE = ["expr: $VX_CFG_DLMEM_MAX_CLUSTER >= 1 and $VX_CFG_DLMEM_MAX_CLUSTER <= min($VX_CFG_CLUSTER_MAX_NONPORTABLE, $VX_CFG_NUM_CORES)", "DLMEM_MAX_CLUSTER must be between 1 and the cores of a cluster"]
+BOUNDARY_DELAY_MIN = ["expr: $VX_CFG_DOMAIN_BOUNDARY_DELAY >= 1", "VX_CFG_DOMAIN_BOUNDARY_DELAY must be at least 1"]
+BOUNDARY_DELAY_MAX = ["expr: $VX_CFG_DOMAIN_BOUNDARY_DELAY <= 1", "VX_CFG_DOMAIN_BOUNDARY_DELAY must be at most 1, the one register stage of the launch and credit edges into a GPC"]
 
 
 [isa]
@@ -498,7 +546,9 @@ VX_CFG_DXA_MAX_INFLIGHT = 8
 # Largest thread-block cluster a distributed launch may place across the
 # cores of one hardware cluster. As on the H100, the runtime accepts more than
 # 8 blocks (CUDA's portable limit) only with VX_CLUSTER_FLAG_NON_PORTABLE.
-VX_CFG_DLMEM_MAX_CLUSTER = "expr: min(16, $VX_CFG_NUM_CORES)"
+VX_CFG_DLMEM_MAX_CLUSTER = "expr: min($VX_CFG_CLUSTER_MAX_NONPORTABLE, $VX_CFG_NUM_CORES)"
+# Gang-table entries of one GPC: its most co-resident clusters of K >= 2 (a K = 1 cluster takes none).
+VX_CFG_DLMEM_NUM_GANGS = "expr: max(2, $VX_CFG_NUM_CORES * $VX_CFG_MAX_CTAS_PER_SM_CLUSTER // 2)"
 # Remote stores a core may have unacknowledged; bounds the per-warp store counters.
 VX_CFG_DLMEM_STORE_CREDITS = 8
 # Remote loads and AMOs a core may have outstanding; sizes the egress response table.
@@ -654,6 +704,7 @@ VX_CFG_DRAM_PAGE_POLICY = ["SHARED", "CAP", "OPEN"]
 VX_CFG_DRAM_RW_POLICY = ["AGE", "WATERMARK"]
 VX_CFG_DRAM_SCHED = ["FRFCFS", "ROWHIT"]
 VX_CFG_DRAM_REFRESH = ["PERBANK", "ALLBANK", "OFF"]
+VX_CFG_CLUSTER_PLACEMENT = ["H100", "SPREAD"]
 
 [[param]]
 VX_CFG_DCACHE_NUM_REQS = "int"

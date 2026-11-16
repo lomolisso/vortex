@@ -13,6 +13,7 @@
 
 #include "cluster.h"
 #include "socket.h"
+#include "cpc.h"
 #include "core.h"
 #include "local_mem.h"
 #include "constants.h"
@@ -31,6 +32,7 @@
 #ifdef VX_CFG_EXT_DLMEM_ENABLE
 #include "scheduler.h"
 #include "cta_gang.h"
+#include "launch_tree.h"
 #include "dlmem/dlmem_xbar.h"
 #endif
 
@@ -48,14 +50,14 @@ public:
     char sname[100];
 
     uint32_t sockets_per_cluster = sockets_.size();
-    uint32_t cluster_id = simobject_->id();
 
-    // create sockets
-
+    // create the CPCs, each with its sockets; socket i is TPC slot i / CPCS_PER_GPC of CPC i % CPCS_PER_GPC
+    for (uint32_t c = 0; c < VX_CFG_CPCS_PER_GPC; ++c) {
+      snprintf(sname, 100, "%s-cpc%d", name.c_str(), c);
+      cpcs_.push_back(Cpc::Create(sname, c, simobject_));
+    }
     for (uint32_t i = 0; i < sockets_per_cluster; ++i) {
-      uint32_t socket_id = cluster_id * sockets_per_cluster + i;
-      snprintf(sname, 100, "%s-socket%d", name.c_str(), i);
-      sockets_.at(i) = Socket::Create(sname, socket_id, simobject_);
+      sockets_.at(i) = cpcs_.at(i % VX_CFG_CPCS_PER_GPC)->socket(i / VX_CFG_CPCS_PER_GPC);
     }
 
     // Global-barrier event links: each core's arrive end fans into the
@@ -69,29 +71,38 @@ public:
     }
 
 #ifdef VX_CFG_EXT_DLMEM_ENABLE
-    // Gang unit on the cluster's launch input, then the launch fan-out to the
-    // cores; a cluster of one core has no fan-out, so the gang's output skid
-    // feeds the core. The per-core lanes follow the KMU's launch-lane pattern:
-    // a registered stage into the core's domain, and the admission credits
-    // back through a stage the core owns.
+    // The chip's admission feeds the cluster's launch fan-out to the cores; a
+    // cluster of one core has no fan-out, so the admission's lane is the
+    // core's own. The per-core lanes follow the KMU's launch-lane pattern: a
+    // registered stage into the core's domain, and the admission credits back
+    // through a stage the core owns. In H100 builds a one-core cluster's lane
+    // stage is the admission's own registered send, which is the GPC boundary
+    // crossing, and its credit stage is the crossing back. The gang table sits
+    // beside the gbar unit.
     snprintf(sname, 100, "%s-cta-gang", name.c_str());
     cta_gang_ = CtaGang::Create(sname, dlmem_cfg());
     bool fanout = (sockets_per_cluster * cores_per_socket_) > 1;
     if (fanout) {
       snprintf(sname, 100, "%s-launch", name.c_str());
       launch_ = LaunchFanout::Create(sname, sockets_per_cluster, cores_per_socket_);
-      cta_gang_->bus_out.bind(&launch_->bus_in);
-      launch_->credit_out.bind(&cta_gang_->credit_in);
     }
     for (uint32_t i = 0; i < sockets_per_cluster; ++i) {
       for (uint32_t c = 0; c < cores_per_socket_; ++c) {
         uint32_t lane = i * cores_per_socket_ + c;
         auto* core = sockets_.at(i)->core(c).get();
         auto* dispatcher = core->scheduler().cta_dispatcher();
-        snprintf(sname, 100, "%s-gang-lane%d", name.c_str(), lane);
-        auto slice = RegSlice<kmu_req_t>::Create(sname, 1);
-        (fanout ? launch_->bus_out.at(lane) : cta_gang_->bus_out).bind(&slice->In);
-        slice->Out.bind(&dispatcher->bus_in);
+        if (fanout || !VX_CFG_H100_ORG_ENABLED) {
+          snprintf(sname, 100, "%s-gang-lane%d", name.c_str(), lane);
+          auto slice = RegSlice<kmu_req_t>::Create(sname, 1);
+          if (fanout) {
+            launch_->bus_out.at(lane).bind(&slice->In);
+          } else {
+            direct_lane_ = &slice->In;
+          }
+          slice->Out.bind(&dispatcher->bus_in);
+        } else {
+          direct_lane_ = &dispatcher->bus_in;
+        }
         snprintf(sname, 100, "%s-gang-credit%d", name.c_str(), lane);
         RegSlice<uint8_t>::Ptr cslice;
         {
@@ -99,7 +110,11 @@ public:
           cslice = RegSlice<uint8_t>::Create(sname, 1);
         }
         dispatcher->credit_out.bind(&cslice->In);
-        cslice->Out.bind(fanout ? &launch_->credit_in.at(lane) : &cta_gang_->credit_in);
+        if (fanout) {
+          cslice->Out.bind(&launch_->credit_in.at(lane));
+        } else {
+          direct_credit_ = cslice;
+        }
         // cluster-barrier releases share the core's global-barrier resume end
         cta_gang_->release_out.at(lane).bind(&core->gbar_resume_in);
       }
@@ -432,14 +447,24 @@ public:
     evt.count   = msg.count;
     evt.arrived = msg.arrived;
     cta_gang_->cta_event(evt);
+    // the admission's copy keeps the same queue order; across the GPC boundary in H100 builds
+    simobject_->gang_evt_out.send(evt, VX_CFG_H100_ORG_ENABLED ? VX_CFG_DOMAIN_BOUNDARY_DELAY : 0);
   }
 
   SimChannel<kmu_req_t>& kmu_bus_in() {
-    return cta_gang_->bus_in;
+    return launch_ ? launch_->bus_in : *direct_lane_;
   }
 
   SimChannel<uint8_t>& kmu_credit_out() {
-    return cta_gang_->credit_out;
+    return launch_ ? launch_->credit_out : direct_credit_->Out;
+  }
+
+  SimChannel<GangAlloc>& gang_alloc_in() {
+    return cta_gang_->alloc_in;
+  }
+
+  SimChannel<GangRelPend>& gang_relp_out() {
+    return cta_gang_->relp_out;
   }
 #endif
 
@@ -649,6 +674,7 @@ public:
 
 private:
   Cluster*                    simobject_;
+  std::vector<Cpc::Ptr>       cpcs_;
   std::vector<Socket::Ptr>    sockets_;
   std::vector<core_barrier_t> gbarriers_;
   Cache::Ptr                  l2cache_;
@@ -658,6 +684,8 @@ private:
 #endif
 #ifdef VX_CFG_EXT_DLMEM_ENABLE
   CtaGang::Ptr                cta_gang_;
+  SimChannel<kmu_req_t>*      direct_lane_ = nullptr;
+  RegSlice<uint8_t>::Ptr      direct_credit_;
   LaunchFanout::Ptr           launch_;
   DlmemXbar<DlmemReqPkt>::Ptr dlmem_req_xbar_;
   DlmemXbar<DlmemRspPkt>::Ptr dlmem_rsp_xbar_;
@@ -687,6 +715,9 @@ Cluster::Cluster(const SimContext& ctx,
   , mem_rsp_in(VX_CFG_L2_MEM_PORTS, this)
   , gbar_arrive_in(this)
   , gbar_resume_out(NUM_SOCKETS * VX_CFG_SOCKET_SIZE, this)
+#ifdef VX_CFG_EXT_DLMEM_ENABLE
+  , gang_evt_out(this, 64)
+#endif
   , cluster_id_(cluster_id)
   , processor_(processor)
   , impl_(new Impl(this))
@@ -761,6 +792,14 @@ SimChannel<kmu_req_t>& Cluster::kmu_bus_in() {
 
 SimChannel<uint8_t>& Cluster::kmu_credit_out() {
   return impl_->kmu_credit_out();
+}
+
+SimChannel<GangAlloc>& Cluster::gang_alloc_in() {
+  return impl_->gang_alloc_in();
+}
+
+SimChannel<GangRelPend>& Cluster::gang_relp_out() {
+  return impl_->gang_relp_out();
 }
 #endif
 

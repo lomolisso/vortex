@@ -86,9 +86,11 @@ uint64_t BarrierUnit::gbar_book(uint64_t now) {
 // RTL path of a done event, from the last warp's exit: the dispatcher's
 // retirement pipe (2) and its pending register (1) push it into the request
 // queue; after the queue, one arbiter stage per fan-in level that exists, and
-// the gbar unit's output register.
+// the gbar unit's output register, where the gang table takes it (the
+// admission's copy then crosses the GPC boundary in H100 builds).
 static constexpr uint64_t CTA_DONE_PUSH_DELAY = 3;
-static constexpr uint64_t CTA_DONE_LINK_DELAY = 1 + (VX_CFG_SOCKET_SIZE > 1 ? 1 : 0) + (NUM_SOCKETS > 1 ? 1 : 0);
+static constexpr uint64_t CTA_DONE_LINK_DELAY = VX_CFG_CTA_DONE_LINK_DELAY
+    - (VX_CFG_H100_ORG_ENABLED ? VX_CFG_DOMAIN_BOUNDARY_DELAY : 0);
 
 void BarrierUnit::send_cta_done(const CtaDone& done) {
   uint64_t now  = SimPlatform::instance().cycles();

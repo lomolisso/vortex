@@ -127,20 +127,31 @@ constexpr uint32_t MAXC        = VX_CFG_DLMEM_MAX_CLUSTER;
 constexpr uint32_t LMEM_LOG    = VX_CFG_LMEM_LOG_SIZE;
 constexpr uint32_t LMEM_SIZE   = 1u << LMEM_LOG;
 constexpr uint32_t BLOCK_ALIGN = VX_CFG_MEM_BLOCK_SIZE;
-constexpr uint32_t NUM_GANGS   = std::max<uint32_t>(2, NCC * NW / 2);
+constexpr uint32_t NUM_GANGS   = VX_CFG_DLMEM_NUM_GANGS;
+constexpr uint32_t ISSUE_GAP   = VX_CFG_CLUSTER_DISPATCH_CYCLES;
+// the GPC boundary between the admission and the gang table, as Vortex.sv composes them
+constexpr uint32_t BD          = VX_CFG_H100_ORG_ENABLED ? VX_CFG_DOMAIN_BOUNDARY_DELAY : 0;
 constexpr uint32_t CORE_W      = c_up(c_clog2(NCC));
 constexpr uint32_t NW_W        = c_up(c_clog2(NW));
 constexpr uint32_t K_W         = c_clog2(MAXC + 1);
 constexpr uint32_t PEER_W      = CORE_W + NW_W;
 constexpr uint32_t DEST_W      = c_up(c_clog2(VX_CFG_NUM_CLUSTERS * VX_CFG_NUM_CORES));
-constexpr uint32_t CLUSTER_ID  = TB_CLUSTER_ID;
 constexpr uint32_t MAX_LEGACY  = std::max<uint32_t>(NW, MAXC);
 constexpr uint32_t NC_W        = c_up(c_clog2(VX_CFG_NUM_CORES));
 constexpr uint32_t EVT_DONE    = 1;   // GBAR_KIND_CTA_DONE
 constexpr uint32_t EVT_CBAR    = 2;   // GBAR_KIND_CBAR
 constexpr uint64_t NEVER       = ~0ull;
 
-static const Cfg CFG = {NCC, NW, NT, MAXC, LMEM_LOG, NUM_GANGS, SOCKET_SIZE, NUM_SOCKETS, 0, 0};
+static Cfg make_cfg() {
+  Cfg c = {NCC, NW, NT, MAXC, LMEM_LOG, NUM_GANGS, SOCKET_SIZE, NUM_SOCKETS, 0, 0};
+  c.nslots           = VX_CFG_MAX_CTAS_PER_SM;
+  c.max_cluster_ctas = VX_CFG_MAX_CTAS_PER_SM_CLUSTER;
+#ifdef VX_CFG_CLUSTER_PLACEMENT_H100
+  c.policy           = PLACE_H100;
+#endif
+  return c;
+}
+static const Cfg CFG = make_cfg();
 
 ///////////////////////////////////////////////////////////////////////////////
 // Port access: Verilator picks the C type from the width.
@@ -258,8 +269,9 @@ static bool same_row(const Row& a, const Row& b) {
 }
 
 ///////////////////////////////////////////////////////////////////////////////
-// Cycle model of VX_cta_gang (and of its 2-entry registered output buffer).
-// Within a cycle the CTA_DONE event applies first, then the unit decides.
+// Cycle model of VX_cta_admit and VX_cta_gang across the GPC boundary (and of
+// the admission's 2-entry registered output buffer). Within a cycle the
+// CTA_DONE event applies first, then the admission decides.
 
 class GangModel {
 public:
@@ -268,6 +280,8 @@ public:
   GangModel() {
     reset(CFG, m_);
     reset(CFG, g_);
+    reset(CFG, a_);
+    relp_hist_.assign(BD, std::vector<bool>(CFG.num_gangs, false));
   }
 
   struct Out {
@@ -287,11 +301,12 @@ public:
     o.front = buf_.empty() ? nullptr : &buf_.front();
     bool used = false;
     for (uint32_t c = 0; c < NCC; ++c) {
-      used = used || (m_.free[c] != low_mask(NW));
+      used = used || (m_.free[c] != low_mask(slots(CFG)));
     }
-    bool live = false;
-    for (bool l : g_.live) {
-      live = live || l;
+    const std::vector<bool>& view = this->relp_view();
+    bool live = !done_q_.empty() || !alloc_q_.empty();
+    for (size_t i = 0; i < g_.live.size(); ++i) {
+      live = live || g_.live[i] || a_.live[i] || view[i];
     }
     int rel = this->lowest_rel();
     o.busy = in_valid || vout_ || (phase_ != IDLE) || used || live || (rel >= 0);
@@ -308,9 +323,31 @@ public:
     // the release on the port this cycle, chosen before this cycle's event
     int rel = this->lowest_rel();
     const Evt* done = (evt && evt->kind == EVT_DONE) ? evt : nullptr;
+    // the admission sees the gang table's pending releases and the CTA_DONEs
+    // across the boundary; the gang table sees the admission's grants across it
+    if (BD > 0) {
+      a_.rel_pend = relp_hist_.front();
+      relp_hist_.pop_front();
+      relp_hist_.push_back(g_.rel_pend);
+    }
+    this->apply_allocs(cycle);
+    if (done) {
+      done_q_.push_back({cycle + BD, *done});
+    }
+    bool a_done = false;
+    if (!done_q_.empty() && done_q_.front().first <= cycle) {
+      const Evt& d = done_q_.front().second;
+      a_done = true;
+      if (policy_) {
+        release(m_, d.core, d.slot, w_);
+        if (k_ > 1) {
+          vortex::dlmem_ref::done(a_, d.gang, d.epoch);
+        }
+      }
+      done_q_.pop_front();
+    }
     if (done) {
       if (policy_) {
-        release(m_, done->core, done->slot, w_);
         if (k_ > 1) {
           // a block that ends takes its arrival along only while that arrival's phase is open
           auto& op = open_[done->gang];
@@ -339,6 +376,9 @@ public:
         open_[evt->gang].clear();
       }
     }
+    if (BD == 0) {
+      a_.rel_pend = g_.rel_pend;
+    }
 
     bool buf_valid_in = false;
     bool in_ready = false;
@@ -350,7 +390,14 @@ public:
       if (head) {
         bool is_new = (head->ctx != ctx_);
         if (is_new) {
-          new_launch(CFG, m_, g_);
+          new_launch(CFG, m_, a_);
+          for (size_t i = 0; i < g_.live.size(); ++i) {
+            if (g_.live[i] || g_.rel_pend[i]) {
+              err = "model: a new launch while the gang table still holds a gang";
+              return false;
+            }
+          }
+          g_.epoch.assign(g_.epoch.size(), 0);
           failed_ = false;
         }
         if (!head->spread) {
@@ -362,21 +409,22 @@ public:
         } else {
           uint32_t K = head->k;
           bool id_free = (K == 1);
-          for (size_t i = 0; i < g_.live.size(); ++i) {
-            id_free = id_free || (!g_.live[i] && !g_.rel_pend[i]);
+          for (size_t i = 0; i < a_.live.size(); ++i) {
+            id_free = id_free || (!a_.live[i] && !a_.rel_pend[i]);
           }
-          if (id_free && (!failed_ || dirty_)) {
+          bool gap_ok = (gap_ + 1 > ISSUE_GAP) || is_new;
+          if (id_free && (!failed_ || dirty_) && gap_ok) {
             start = true;
             uint32_t W = warps_of(head->block_size, NT);
             uint32_t U = usable_slots(CFG, head->stride);
             Mirror s = m_;
-            ok_ = place(CFG, s, K, W, U, members_);
+            ok_ = place_gpc(CFG, s, K, W, U, members_);
             fail_step_ = K;
             if (!ok_) {
               for (uint32_t kk = 1; kk <= K; ++kk) {
                 Mirror t = m_;
                 std::vector<Peer> tmp;
-                if (!place(CFG, t, kk, W, U, tmp)) {
+                if (!place_gpc(CFG, t, kk, W, U, tmp)) {
                   fail_step_ = kk - 1;
                   break;
                 }
@@ -403,13 +451,15 @@ public:
         }
         m_.rr = (members_.back().core + 1) % NCC;
         if (k_ > 1) {
-          int id = alloc(g_, k_);
+          int id = alloc(a_, k_);
           if (id < 0) {
             err = "model: no free gang id at commit";
             return false;
           }
           cur_gang_ = uint32_t(id);
-          cur_epoch_ = g_.epoch[id];
+          cur_epoch_ = a_.epoch[id];
+          alloc_q_.push_back({cycle + BD, cur_gang_, k_, cur_epoch_});
+          this->apply_allocs(cycle);
         } else {
           cur_gang_ = 0;
           cur_epoch_ = 0;
@@ -447,7 +497,12 @@ public:
       phase_n_ = start ? PLACE : IDLE;
       idx_n_ = 0;
     }
-    dirty_ = start ? false : (dirty_ || (done != nullptr));
+    dirty_ = start ? false : (dirty_ || a_done);
+    if (start) {
+      gap_ = 1;
+    } else if (gap_ + 1 <= ISSUE_GAP) {
+      ++gap_;
+    }
     if (rel >= 0 && rel_ready) {
       g_.rel_pend[rel] = false;
     }
@@ -475,6 +530,26 @@ public:
   }
 
 private:
+  struct Grant {
+    uint64_t due;
+    uint32_t id, k, epoch;
+  };
+
+  const std::vector<bool>& relp_view() const {
+    return (BD > 0) ? relp_hist_.front() : g_.rel_pend;
+  }
+
+  void apply_allocs(uint64_t cycle) {
+    while (!alloc_q_.empty() && alloc_q_.front().due <= cycle) {
+      const Grant& a = alloc_q_.front();
+      g_.live[a.id] = true;
+      g_.cnt[a.id] = a.k;
+      g_.epoch[a.id] = uint8_t(a.epoch);
+      g_.arrived[a.id] = 0;
+      alloc_q_.pop_front();
+    }
+  }
+
   int lowest_rel() const {
     for (size_t i = 0; i < g_.rel_pend.size(); ++i) {
       if (g_.rel_pend[i]) {
@@ -505,7 +580,8 @@ private:
     e.pin = true;
     e.eop = true;
     e.policy = true;
-    e.dest = kmu_dest(CFG, CLUSTER_ID, p.core) & uint32_t(low_mask(DEST_W));
+    // the bench's admission serves one GPC, so the gang is GPC 0 even in a multi-cluster build
+    e.dest = kmu_dest(CFG, 0, p.core) & uint32_t(low_mask(DEST_W));
     e.epoch = cur_epoch_;
     e.gang = cur_gang_;
     e.forced = p.slot;
@@ -521,13 +597,18 @@ private:
   }
 
   Mirror   m_;
-  GangIds  g_;
+  GangIds  g_;   // the gang table's
+  GangIds  a_;   // the admission's: its live ids, and the pending releases it sees
+  std::deque<std::vector<bool>> relp_hist_;   // the gang table's pending releases, the last BD cycles
+  std::deque<std::pair<uint64_t, Evt>> done_q_;   // CTA_DONEs on their way to the admission
+  std::deque<Grant> alloc_q_;                     // grants on their way to the gang table
   Phase    phase_ = IDLE, phase_n_ = IDLE;
   uint32_t idx_ = 0, idx_n_ = 0;
   uint32_t ctx_ = 0;
   bool     policy_ = false;
   uint32_t k_ = 1, w_ = 1;
   bool     failed_ = false, dirty_ = false;
+  uint32_t gap_ = 0;   // cycles since the last cluster placement started, saturating at ISSUE_GAP
   bool     ok_ = false;
   uint32_t fail_step_ = 0;
   std::vector<Peer> members_;
@@ -1107,11 +1188,12 @@ static bool t_share(Sim& sim, uint64_t& tick) {
   }
   uint32_t K = 2;
   uint32_t W = NW / 2;
-  // gangs 0..NCC-1 load every core with two blocks; core 0's leave soon
+  // gangs 0..NCC-1 load every core with two blocks; core 0's leave once all of them are placed
   Bench b(sim, tick, 41);
   RunOpts o;
-  o.life = [](int seq, uint32_t, uint32_t core) {
-    return (seq >= 0 && core != 0) ? uint64_t(800) : uint64_t(30);
+  const uint64_t short_life = 30 + 10 * uint64_t(NCC);
+  o.life = [short_life](int seq, uint32_t, uint32_t core) {
+    return (seq >= 0 && core != 0) ? uint64_t(800) + short_life : short_life;
   };
   uint32_t G = NCC + 1;
   bool ok = b.run({{true, K, W, 0, G}}, o);
@@ -1637,8 +1719,8 @@ int main(int argc, char** argv) {
     }
   }
 
-  std::printf("cta_gang: cores=%u (%u sockets of %u) warps=%u max cluster=%u gang ids=%u lmem=%u cluster=%u seed=%u\n",
-              NCC, NUM_SOCKETS, SOCKET_SIZE, NW, MAXC, NUM_GANGS, LMEM_SIZE, CLUSTER_ID, seed);
+  std::printf("cta_gang: cores=%u (%u sockets of %u) warps=%u max cluster=%u gang ids=%u lmem=%u seed=%u\n",
+              NCC, NUM_SOCKETS, SOCKET_SIZE, NW, MAXC, NUM_GANGS, LMEM_SIZE, seed);
 
   Sim sim;
   uint64_t tick = 0;

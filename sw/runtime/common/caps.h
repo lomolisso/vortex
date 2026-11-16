@@ -17,8 +17,9 @@
 // ============================================================================
 // caps.h — shared device/ISA capability decoder for all runtime backends.
 //
-// The two 64-bit capability words (GPU_DEV_CAPS / GPU_ISA_CAPS) are read
-// from the Command Processor regfile at the CP-internal offsets below.
+// The three 64-bit capability words (GPU_DEV_CAPS / GPU_ISA_CAPS /
+// GPU_ORG_CAPS) are read from the Command Processor regfile at the
+// CP-internal offsets below.
 //
 // CACHE_LINE_SIZE / CLOCK_RATE / PEAK_MEM_BW are NOT
 // encoded in the caps words (they are platform/runtime-specific); for
@@ -36,13 +37,27 @@ static constexpr uint32_t CP_REG_GPU_DEV_CAPS_LO = 0x018;
 static constexpr uint32_t CP_REG_GPU_DEV_CAPS_HI = 0x01C;
 static constexpr uint32_t CP_REG_GPU_ISA_CAPS_LO = 0x020;
 static constexpr uint32_t CP_REG_GPU_ISA_CAPS_HI = 0x024;
+static constexpr uint32_t CP_REG_GPU_ORG_CAPS_LO = 0x040;
+static constexpr uint32_t CP_REG_GPU_ORG_CAPS_HI = 0x044;
 
-// Decode a VX_CAPS_* id from the two CP capability words. Returns true
+// Runtime-internal id, not in vortex2.h: 1 when the CTAs of a cluster are
+// always placed on distinct cores (H100 placement), 0 for today's placement.
+static constexpr uint32_t CAPS_INTERNAL_CLUSTER_DISTINCT_SMS = 0x10000;
+
+// GPU_ORG_CAPS fields: [3:0] log2 partitions, [7:4] log2 CPCs per GPC,
+// [14:8] MAX_CTAS_PER_SM, [21:15] MAX_CTAS_PER_SM_CLUSTER, [22] distinct SMs,
+// [31:23] reserved (compute), [63:32] reserved (memory side).
+
+// Decode a VX_CAPS_* id from the CP capability words. Returns true
 // and writes *out when the id is encoded in the words; returns false
 // for ids the caller must resolve itself (CACHE_LINE_SIZE, CLOCK_RATE,
 // PEAK_MEM_BW).
-inline bool decode_caps(uint64_t dev_caps, uint64_t isa_caps,
+inline bool decode_caps(uint64_t dev_caps, uint64_t isa_caps, uint64_t org_caps,
                         uint32_t caps_id, uint64_t* out) {
+  const uint64_t num_clusters = 1ull << ((dev_caps >> 20) & 0x7);
+  const uint64_t cluster_size = 1ull << ((dev_caps >> 17) & 0x7);
+  const uint64_t partitions   = 1ull << ((org_caps >> 0) & 0xf);
+  const uint64_t cpcs         = 1ull << ((org_caps >> 4) & 0xf);
   switch (caps_id) {
   case VX_CAPS_VERSION:
     *out = (dev_caps >> 0) & 0xff;
@@ -53,18 +68,14 @@ inline bool decode_caps(uint64_t dev_caps, uint64_t isa_caps,
   case VX_CAPS_NUM_WARPS:
     *out = 1ull << ((dev_caps >> 11) & 0x7);
     return true;
-  case VX_CAPS_NUM_CORES: {
-    uint32_t socket_size  = 1u << ((dev_caps >> 14) & 0x7);
-    uint32_t cluster_size = 1u << ((dev_caps >> 17) & 0x7);
-    uint32_t num_clusters = 1u << ((dev_caps >> 20) & 0x7);
-    *out = uint64_t(num_clusters) * cluster_size * socket_size;
+  case VX_CAPS_NUM_CORES:
+    *out = num_clusters * cluster_size * (1ull << ((dev_caps >> 14) & 0x7));
     return true;
-  }
   case VX_CAPS_SOCKET_SIZE:
     *out = 1ull << ((dev_caps >> 14) & 0x7);
     return true;
   case VX_CAPS_NUM_CLUSTERS:
-    *out = 1ull << ((dev_caps >> 20) & 0x7);
+    *out = num_clusters;
     return true;
   case VX_CAPS_ISSUE_WIDTH:
     *out = 1ull << ((dev_caps >> 23) & 0x7);
@@ -88,18 +99,42 @@ inline bool decode_caps(uint64_t dev_caps, uint64_t isa_caps,
     // A plain count, not a log2: the knob need not be a power of two.
     *out = (dev_caps >> 42) & 0x7f;
     return true;
+  case VX_CAPS_NUM_PARTITIONS:
+    *out = partitions;
+    return true;
+  case VX_CAPS_GPCS_PER_PARTITION:
+    *out = num_clusters / partitions;
+    return true;
+  case VX_CAPS_CPCS_PER_GPC:
+    *out = cpcs;
+    return true;
+  case VX_CAPS_TPCS_PER_CPC:
+    *out = cluster_size / cpcs;
+    return true;
+  case VX_CAPS_SMS_PER_TPC:
+    *out = 1ull << ((dev_caps >> 14) & 0x7);
+    return true;
+  case VX_CAPS_MAX_CTAS_PER_SM:
+    *out = (org_caps >> 8) & 0x7f;
+    return true;
+  case VX_CAPS_MAX_CTAS_PER_SM_CLUSTER:
+    *out = (org_caps >> 15) & 0x7f;
+    return true;
+  case CAPS_INTERNAL_CLUSTER_DISTINCT_SMS:
+    *out = (org_caps >> 22) & 0x1;
+    return true;
   default:
     return false;
   }
 }
 
-// Read GPU_DEV_CAPS / GPU_ISA_CAPS from the CP regfile through a
+// Read GPU_DEV_CAPS / GPU_ISA_CAPS / GPU_ORG_CAPS from the CP regfile through a
 // backend's cp_mmio_read primitive. `Reader` is any callable matching
 // int(uint32_t off, uint32_t* out) — returns non-zero on failure.
 // Returns 0 on success.
 template <typename Reader>
 inline int load_caps(Reader&& cp_mmio_read,
-                     uint64_t* dev_caps, uint64_t* isa_caps) {
+                     uint64_t* dev_caps, uint64_t* isa_caps, uint64_t* org_caps) {
   uint32_t lo = 0, hi = 0;
   if (cp_mmio_read(CP_REG_GPU_DEV_CAPS_LO, &lo)) return -1;
   if (cp_mmio_read(CP_REG_GPU_DEV_CAPS_HI, &hi)) return -1;
@@ -107,6 +142,9 @@ inline int load_caps(Reader&& cp_mmio_read,
   if (cp_mmio_read(CP_REG_GPU_ISA_CAPS_LO, &lo)) return -1;
   if (cp_mmio_read(CP_REG_GPU_ISA_CAPS_HI, &hi)) return -1;
   *isa_caps = uint64_t(lo) | (uint64_t(hi) << 32);
+  if (cp_mmio_read(CP_REG_GPU_ORG_CAPS_LO, &lo)) return -1;
+  if (cp_mmio_read(CP_REG_GPU_ORG_CAPS_HI, &hi)) return -1;
+  *org_caps = uint64_t(lo) | (uint64_t(hi) << 32);
   return 0;
 }
 

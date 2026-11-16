@@ -19,14 +19,16 @@
 #include <dlmem_ref.h>
 #include "types.h"
 #include "kmu.h"
-#include "launch_tree.h"
 
 namespace vortex {
 
-// The build's hardware-cluster shape, as the placement model sees it.
+// The build's GPC shape, as the placement model sees it.
 dlmem_ref::Cfg dlmem_cfg();
 
-// An event of a SPREAD block toward its gang unit, in its core's queue order.
+// The dispatcher's slot pitch: the footprint rounded up to a memory block.
+uint32_t slot_stride(const kmu_req_t& req);
+
+// An event of a placed block toward its GPC's gang table and the admission, in its core's queue order.
 struct GangEvent {
   enum Kind { CTA_DONE, CBAR };
   Kind     kind;
@@ -35,46 +37,45 @@ struct GangEvent {
   uint32_t gang_id;
   uint32_t epoch;
   uint32_t count;     // CBAR: the gang's block count
-#ifdef VX_CFG_EXT_DLMEM_ENABLE
   bool     arrived = false;  // CTA_DONE: the block's arrival counts in the open phase
-#else
-#line 37
-#endif
 };
 
-// Gang unit of one hardware cluster (VX_cta_gang): it sits between the
-// cluster's launch lane and its cores.
+// A gang table's pending-release register, as the admission reads it.
+struct GangRelPend {
+  std::vector<bool> pend;
+};
+
+// From the admission to a gang table: a gang id taken, or the launch's gang mode.
+struct GangAlloc {
+  bool     mode;    // a mode update: k > 1 is gang mode on
+  uint32_t gang;
+  uint32_t epoch;
+  uint32_t k;
+};
+
+// Gang table of one GPC (VX_cta_gang), beside its gbar unit: the
+// cluster-barrier half of gang admission; the placement half is the chip's
+// admission (CtaAdmit, next to the KMU), which takes the gang ids and tells
+// this table one cycle later.
 //
-// A DEFAULT launch passes through; the cluster's fan-out picks its core. A SPREAD
-// message's K blocks are placed all or nothing, one per core, on an exact
-// mirror of every core's free CTA slots and used warps, one greedy step per
-// cycle, and then leave as K pinned beats, one per cycle. A slot returns to
-// the mirror only when its block's CTA_DONE event arrives, so the slot a beat
-// forces is always free when the beat reaches its core.
-//
-// It also counts the gang's cluster-barrier arrivals (CBAR events) and, when
-// all K blocks arrived, broadcasts the phase's release to every core.
+// It counts the gangs' cluster-barrier arrivals (CBAR events) and, when every
+// live block arrived, broadcasts the phase's release to every core; a block
+// that ends counts as arrived. An id stays taken until its last release has
+// left, which the admission learns from relp_out.
 class CtaGang : public SimObject<CtaGang> {
 public:
-  // The cluster's launch-lane endpoint, and its admission credit to the KMU.
-  SimChannel<kmu_req_t> bus_in;
-  SimChannel<uint8_t>   credit_out;
-
-  // The unit's output skid, into the cluster's launch fan-out (or the core of
-  // a one-core cluster), and one credit per beat taken from it.
-  SimChannel<kmu_req_t> bus_out;
-  SimChannel<uint8_t>   credit_in;
-
   // Cluster-barrier releases, one link per core.
   std::vector<SimEventLink<GbarResume>> release_out;
+
+  SimChannel<GangAlloc>   alloc_in;
+  SimChannel<GangRelPend> relp_out;
 
   CtaGang(const SimContext& ctx, const char* name, const dlmem_ref::Cfg& cfg);
 
   // Always accepted, applied at most one per cycle like the RTL's single event port.
   void cta_event(const GangEvent& evt);
 
-  // Busy until every placed block has reported done and every release has
-  // left, so the next launch starts on an empty mirror.
+  // Busy until every release has left.
   bool busy() const;
 
   // Cycles from the release leaving this unit to its arrival at a core's barrier unit.
@@ -85,60 +86,24 @@ protected:
   void on_tick();
 
 private:
-  enum class State { IDLE, PLACE, EMIT };
-
-  bool out_ready(const LaunchTree::Beat& beat) const;
-  void send_beat(const LaunchTree::Beat& beat);
-  void apply_done(const GangEvent& d);
   void apply_cbar(const GangEvent& a);
-  bool id_free() const;
-  void forward_legacy();
-  void start_attempt(const kmu_req_t& head);
-  void commit();
-  void emit();
-
-  dlmem_ref::Cfg cfg_;
-
-  // Live mirror and gang-id pool.
-  dlmem_ref::Mirror  mirror_;
-  dlmem_ref::GangIds gids_;
-  uint32_t           blocks_;     // placed blocks still owing their done event
-
-  State    state_;
-  uint32_t step_;                 // PLACE: greedy step; EMIT: member being sent
-  uint32_t fail_step_;            // PLACE: the step that fails, or K on success
-  std::vector<dlmem_ref::Peer> members_;
-  dlmem_ref::Mirror  snap_;       // the mirror after a successful placement
-  uint32_t cur_gang_;
-  uint32_t cur_epoch_;
-  bool     failed_;
-  bool     dirty_;                // a block finished since the last attempt started
-
-  // Per-launch latches: the done events of a launch use its K and W.
-  uint8_t  ctx_;
-  uint32_t policy_;
-  uint32_t k_;
-  uint32_t w_;
-
-  std::deque<GangEvent> evt_q_;
-
-  LaunchTree out_;
-  bool       direct_;             // no fan-out: the output skid is the core's
-
-  uint64_t rel_delay_;
-#ifdef VX_CFG_EXT_DLMEM_ENABLE
-
   void done_phase(const GangEvent& d, bool before);
-  uint32_t done_cnt_ = 0;          // the live count a done event found
+
+  dlmem_ref::Cfg     cfg_;
+  dlmem_ref::GangIds gids_;
+  std::vector<uint32_t> gk_;       // each gang's block count
+  bool               mode_;        // the launch's blocks belong to gangs
+  std::deque<GangEvent> evt_q_;
+  std::vector<bool>  relp_sent_;   // the pending-release bits the admission was last told
+  uint64_t           rel_delay_;
+  uint64_t           relp_delay_;
+  uint32_t           done_cnt_ = 0; // the live count a done event found
 
   // Each gang's phase parity, flipped by its releases, and the parity of each
   // block's last arrival: a block that ends after arriving still counts only
   // while that phase is open.
   std::vector<bool> gph_;
   std::vector<std::vector<bool>> sph_;
-#else
-#line 123
-#endif
 
   friend class SimObject<CtaGang>;
 };

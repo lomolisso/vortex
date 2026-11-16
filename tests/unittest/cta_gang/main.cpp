@@ -12,8 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// SimX gang unit (CtaGang) driven from host context the way hw/unittest/cta_gang
-// drives VX_cta_gang, and checked cycle by cycle against a model built on the
+// SimX cluster admission of one GPC (AdmitUnit) and its gang table (CtaGang),
+// bound as the processor binds them, driven from host context the way
+// hw/unittest/cta_gang drives VX_cta_admit and VX_cta_gang, and checked cycle by cycle against a model built on the
 // dlmem_ref placement functions: every cycle the unit's input take, its busy,
 // the beat on its output lane and the cluster-barrier release it sends must
 // match the model, field for field. The model
@@ -64,10 +65,16 @@
 #include <dlmem_ref.h>
 #include "kmu.h"
 #include "cta_gang.h"
+#include "cta_admit.h"
 #include "barrier_unit.h"
 
 using namespace vortex;
 namespace ref = vortex::dlmem_ref;
+
+// two cluster placements start at least this many cycles apart (a new launch's first excepted)
+constexpr uint32_t kIssueGap = VX_CFG_CLUSTER_DISPATCH_CYCLES;
+// the GPC boundary between the admission and the gang table, as the processor binds them
+constexpr uint32_t kBD = VX_CFG_H100_ORG_ENABLED ? VX_CFG_DOMAIN_BOUNDARY_DELAY : 0;
 
 namespace {
 
@@ -92,7 +99,16 @@ ref::Cfg make_cfg(uint32_t ncc, uint32_t socket_size, uint32_t nw, uint32_t max_
   cfg.num_sockets = ncc / socket_size;
   cfg.nw          = nw;
   cfg.max_cluster = max_cluster;
-  cfg.num_gangs   = std::max<uint32_t>(2, ncc * nw / 2);
+  cfg.num_gpcs    = 1;
+#ifdef VX_CFG_CLUSTER_PLACEMENT_H100
+  // an H100 build runs the shape it was built for: its CTA caps and gang count stand
+  ref::check(ncc == VX_CFG_NUM_CORES && nw == VX_CFG_NUM_WARPS && max_cluster == VX_CFG_DLMEM_MAX_CLUSTER,
+             "an H100 build runs only its own shape");
+#else
+  cfg.nslots           = 0;
+  cfg.max_cluster_ctas = 0;
+  cfg.num_gangs        = std::max<uint32_t>(2, ncc * nw / 2);
+#endif
   return cfg;
 }
 
@@ -187,17 +203,20 @@ public:
     : cfg_(cfg), lane_cap_(lane_cap) {
     ref::reset(cfg_, m_);
     ref::reset(cfg_, g_);
+    ref::reset(cfg_, a_);
+    relp_hist_.assign(kBD, std::vector<bool>(cfg_.num_gangs, false));
   }
 
   // The unit's busy, before this cycle's inputs apply.
   bool busy(bool in_valid) const {
     bool used = false;
     for (uint32_t c = 0; c < cfg_.ncc; ++c) {
-      used = used || (m_.free[c] != ref::low_mask(cfg_.nw));
+      used = used || (m_.free[c] != ref::low_mask(ref::slots(cfg_)));
     }
-    bool live = false;
+    const std::vector<bool>& view = this->relp_view();
+    bool live = !done_q_.empty() || !alloc_q_.empty();
     for (size_t i = 0; i < g_.live.size(); ++i) {
-      live = live || g_.live[i] || g_.rel_pend[i];
+      live = live || g_.live[i] || g_.rel_pend[i] || a_.live[i] || view[i];
     }
     return in_valid || (phase_ != IDLE) || used || live;
   }
@@ -220,8 +239,30 @@ public:
   // is the gang whose release leaves this cycle, or -1, and *rel_ep its epoch.
   int step(uint64_t cycle, const Beat* head, const DoneEvt* ev, std::string& err, int* rel, uint32_t* rel_ep) {
     const DoneEvt* done = (ev && !ev->cbar) ? ev : nullptr;
+    // the admission sees the gang table's pending releases and the CTA_DONEs
+    // across the boundary; the gang table sees the admission's grants across it
+    a_.rel_pend = this->relp_view();
+    if (kBD > 0) {
+      relp_hist_.pop_front();
+      relp_hist_.push_back(g_.rel_pend);
+    }
+    this->apply_allocs(cycle);
+    if (done) {
+      done_q_.push_back({cycle + kBD, *done});
+    }
+    bool a_done = false;
+    if (!done_q_.empty() && done_q_.front().first <= cycle) {
+      const DoneEvt& d = done_q_.front().second;
+      a_done = true;
+      if (policy_) {
+        ref::release(m_, d.core, d.slot, w_);
+        if (k_ > 1) {
+          ref::done(a_, d.gang, d.epoch);
+        }
+      }
+      done_q_.pop_front();
+    }
     if (done && policy_) {
-      ref::release(m_, done->core, done->slot, w_);
       if (k_ > 1) {
         // a block that ends takes its arrival along only while that arrival's phase is open
         auto& op = open_[done->gang];
@@ -247,8 +288,16 @@ public:
         const kmu_req_t& h = head->req;
         uint32_t K = cluster_size(h);
         uint32_t W = ref::warps_of(h.block_size, cfg_.nt);
-        if (h.ctx_id != ctx_) {
-          ref::new_launch(cfg_, m_, g_);
+        bool is_new = (h.ctx_id != ctx_);
+        if (is_new) {
+          ref::new_launch(cfg_, m_, a_);
+          for (uint32_t i = 0; i < cfg_.num_gangs; ++i) {
+            if (g_.live[i] || g_.rel_pend[i]) {
+              err = "model: a new launch while the gang table still holds a gang";
+              return -1;
+            }
+          }
+          g_.epoch.assign(g_.epoch.size(), 0);
           failed_ = false;
         }
         if (h.policy != KMU_POLICY_SPREAD) {
@@ -258,20 +307,21 @@ public:
           }
         } else {
           bool id_free = (K == 1);
-          for (size_t i = 0; i < g_.live.size(); ++i) {
-            id_free = id_free || (!g_.live[i] && !g_.rel_pend[i]);
+          for (size_t i = 0; i < a_.live.size(); ++i) {
+            id_free = id_free || (!a_.live[i] && !a_.rel_pend[i]);
           }
-          if (id_free && (!failed_ || dirty_)) {
+          bool gap_ok = (gap_ + 1 > kIssueGap) || is_new;
+          if (id_free && (!failed_ || dirty_) && gap_ok) {
             start = true;
             uint32_t U = ref::usable_slots(cfg_, align_up(h.lmem_size));
             ref::Mirror s = m_;
-            ok_ = ref::place(cfg_, s, K, W, U, members_);
+            ok_ = ref::place_gpc(cfg_, s, K, W, U, members_);
             fail_step_ = K;
             if (!ok_) {
               for (uint32_t kk = 1; kk <= K; ++kk) {
                 ref::Mirror t = m_;
                 std::vector<ref::Peer> tmp;
-                if (!ref::place(cfg_, t, kk, W, U, tmp)) {
+                if (!ref::place_gpc(cfg_, t, kk, W, U, tmp)) {
                   fail_step_ = kk - 1;
                   break;
                 }
@@ -299,13 +349,15 @@ public:
         }
         m_.rr = (members_.back().core + 1) % cfg_.ncc;
         if (k_ > 1) {
-          int id = ref::alloc(g_, k_);
+          int id = ref::alloc(a_, k_);
           if (id < 0) {
             err = "model: no free gang id at commit";
             return -1;
           }
           cur_gang_ = uint32_t(id);
-          cur_epoch_ = g_.epoch[id];
+          cur_epoch_ = a_.epoch[id];
+          alloc_q_.push_back({cycle + kBD, cur_gang_, k_, cur_epoch_});
+          this->apply_allocs(cycle);
         } else {
           cur_gang_ = 0;
           cur_epoch_ = 0;
@@ -340,7 +392,12 @@ public:
       break;
     }
 
-    dirty_ = start ? false : (dirty_ || (done != nullptr));
+    dirty_ = start ? false : (dirty_ || a_done);
+    if (start) {
+      gap_ = 1;
+    } else if (gap_ + 1 <= kIssueGap) {
+      ++gap_;
+    }
     phase_ = phase_n;
     idx_ = idx_n;
 
@@ -368,6 +425,26 @@ public:
   }
 
 private:
+  struct Grant {
+    uint64_t due;
+    uint32_t id, k, epoch;
+  };
+
+  const std::vector<bool>& relp_view() const {
+    return (kBD > 0) ? relp_hist_.front() : g_.rel_pend;
+  }
+
+  void apply_allocs(uint64_t cycle) {
+    while (!alloc_q_.empty() && alloc_q_.front().due <= cycle) {
+      const Grant& a = alloc_q_.front();
+      g_.live[a.id] = true;
+      g_.cnt[a.id] = a.k;
+      g_.epoch[a.id] = uint8_t(a.epoch);
+      g_.arrived[a.id] = 0;
+      alloc_q_.pop_front();
+    }
+  }
+
   bool lane_ready() const {
     return lane_.size() < lane_cap_;
   }
@@ -407,13 +484,18 @@ private:
 
   ref::Cfg    cfg_;
   ref::Mirror m_;
-  ref::GangIds g_;
+  ref::GangIds g_;   // the gang table's
+  ref::GangIds a_;   // the admission's: its live ids, and the pending releases it sees
+  std::deque<std::vector<bool>> relp_hist_;   // the gang table's pending releases, the last kBD cycles
+  std::deque<std::pair<uint64_t, DoneEvt>> done_q_;   // CTA_DONEs on their way to the admission
+  std::deque<Grant> alloc_q_;                         // grants on their way to the gang table
   Phase    phase_ = IDLE;
   uint32_t idx_ = 0;
   uint32_t ctx_ = 0;
   bool     policy_ = false;
   uint32_t k_ = 1, w_ = 1;
   bool     failed_ = false, dirty_ = false;
+  uint32_t gap_ = 0;   // cycles since the last cluster placement started, saturating at kIssueGap
   bool     ok_ = false;
   uint32_t fail_step_ = 0;
   std::vector<ref::Peer> members_;
@@ -515,7 +597,11 @@ public:
     platform.set_num_workers(1);
     bool ok;
     {
+      // the admission ticks ahead of the gang table, as in the processor
+      auto admit = AdmitUnit::Create("cta-admit", cfg_, cfg_.ncc == 1);
       auto gang = CtaGang::Create("cta-gang", cfg_);
+      admit->alloc_out.at(0).bind(&gang->alloc_in);
+      gang->relp_out.bind(&admit->relp_in.at(0));
       std::vector<ReleaseSink::Ptr> sinks;
       for (uint32_t c = 0; c < cfg_.ncc; ++c) {
         std::string name = "release-sink" + std::to_string(c);
@@ -523,7 +609,7 @@ public:
         gang->release_out.at(c).bind(&sinks.back()->in);
       }
       platform.reset();
-      ok = this->loop(*gang, sinks, launches, o);
+      ok = this->loop(*admit, *gang, sinks, launches, o);
     }
     platform.finalize();
     return ok;
@@ -662,8 +748,8 @@ private:
     ++ph.phase;
   }
 
-  bool loop(CtaGang& gang, std::vector<ReleaseSink::Ptr>& sinks, const std::vector<Launch>& launches,
-            const RunOpts& o) {
+  bool loop(AdmitUnit& admit, CtaGang& gang, std::vector<ReleaseSink::Ptr>& sinks,
+            const std::vector<Launch>& launches, const RunOpts& o) {
     auto& platform = SimPlatform::instance();
     const uint32_t NCC = cfg_.ncc;
     // the gbar unit's response register, then one fork stage per fan-out level
@@ -673,7 +759,7 @@ private:
                  (unsigned long)delay);
       return false;
     }
-    GangModel model(cfg_, gang.bus_out.capacity());
+    GangModel model(cfg_, admit.bus_out.at(0).capacity());
     std::vector<std::deque<Beat>> beats(launches.size());
     int gang_seq = 0;
     for (uint32_t l = 0; l < launches.size(); ++l) {
@@ -777,6 +863,7 @@ private:
         ge.count   = dev.count;
         ge.arrived = dev.arrived;
         gang.cta_event(ge);
+        admit.evt_in.at(0).send(ge, kBD);
         // the bench's own count: a phase completes once every block not done has arrived
         auto pit = phases.find(e.seq);
         if (pit != phases.end()) {
@@ -809,12 +896,12 @@ private:
         head = beats[cur_launch].front();
         beats[cur_launch].pop_front();
         head_valid = true;
-        gang.bus_in.send(head.req, 0);
+        admit.bus_in.send(head.req, 0);
       }
 
       // the output lane: a beat visible before the tick is taken before it
       bool out_fire = false;
-      bool had = !gang.bus_out.empty();
+      bool had = !admit.bus_out.at(0).empty();
       if (had == model.lane_empty()) {
         this->fail("the lane holds %s beat, the model says %s", had ? "a" : "no", had ? "none" : "one");
         return false;
@@ -823,9 +910,9 @@ private:
       kmu_req_t beat{};
       Expect e{};
       if (had && rdy) {
-        beat = gang.bus_out.peek();
-        gang.bus_out.pop();
-        gang.credit_in.send(1, 0);
+        beat = admit.bus_out.at(0).peek();
+        admit.bus_out.at(0).pop();
+        admit.credit_in.at(0).send(1, 0);
         out_fire = true;
         model.take(&e);
         this->check_out(beat, e);
@@ -912,7 +999,7 @@ private:
       }
 
 
-      bool busy = gang.busy();
+      bool busy = admit.busy() || gang.busy();
       if (busy != model.busy(head_valid)) {
         this->fail("busy=%d, the model says %d", int(busy), int(!busy));
       }
@@ -955,14 +1042,14 @@ private:
       bool rel_progress = false;
       this->check_releases(sinks, rel_expect, phases, delay, &rel_progress);
 
-      bool in_fire = head_valid && (gang.bus_in.size() == 0);
+      bool in_fire = head_valid && (admit.bus_in.size() == 0);
       if (head_valid && in_fire != (want >= 0)) {
         this->fail("input %s, the model says %s (launch %u, gang %d, rank %u)", in_fire ? "taken" : "held",
                    (want >= 0) ? "taken" : "held", head.launch + 1, head.gang_seq, head.rank);
       }
       uint32_t credits = 0;
-      while (!gang.credit_out.empty()) {
-        gang.credit_out.pop();
+      while (!admit.credit_out.empty()) {
+        admit.credit_out.pop();
         ++credits;
       }
       if (credits != (in_fire ? 1u : 0u)) {
@@ -994,7 +1081,7 @@ private:
     if (!rel_expect.empty()) {
       this->fail("%zu releases never reached the cores", rel_expect.size());
     }
-    if (gang.busy()) {
+    if (admit.busy() || gang.busy()) {
       this->fail("%s", "the unit is still busy at the end");
     }
     return errors == 0;
@@ -1198,11 +1285,12 @@ bool t_share(const ref::Cfg& cfg) {
   }
   uint32_t K = 2;
   uint32_t W = cfg.nw / 2;
-  // gangs 0..NCC-1 load every core with two blocks; core 0's leave soon
+  // gangs 0..NCC-1 load every core with two blocks; core 0's leave once all of them are placed
   Bench b(cfg, 41);
   RunOpts o;
-  o.life = [](int seq, uint32_t, uint32_t core) {
-    return (seq >= 0 && core != 0) ? uint64_t(800) : uint64_t(30);
+  const uint64_t short_life = 30 + 10 * uint64_t(cfg.ncc);
+  o.life = [short_life](int seq, uint32_t, uint32_t core) {
+    return (seq >= 0 && core != 0) ? uint64_t(800) + short_life : short_life;
   };
   uint32_t G = cfg.ncc + 1;
   bool ok = b.run({{true, K, W, 0, G}}, o);
@@ -1385,7 +1473,8 @@ bool t_cbar_phases(const ref::Cfg& cfg) {
 }
 
 // A gang's last done event lands in the cycle its release leaves: its id is
-// not free in that cycle, so the gang waiting for an id starts one cycle later.
+// not free in that cycle, so the gang waiting for an id starts one cycle later,
+// plus the boundary delay the admission sees the release through.
 bool t_cbar_id_hold(const ref::Cfg& cfg) {
   if (cfg.max_cluster < 2 || 2 * cfg.num_gangs > cfg.ncc * cfg.nw) {
     std::printf("gang id held by a pending release: needs MAX_CLUSTER >= 2 and 2 slots per gang id, skipped\n");
@@ -1415,10 +1504,10 @@ bool t_cbar_id_hold(const ref::Cfg& cfg) {
                   (unsigned long)last_done, (unsigned long)c.release_cycle);
       ok = false;
     }
-    if (w.gang_id != g0.gang_id || w.out_cycle[0] != c.release_cycle + 1 + K + 2) {
+    if (w.gang_id != g0.gang_id || w.out_cycle[0] != c.release_cycle + 1 + kBD + K + 2) {
       std::printf("FAIL id-hold: gang %d got id %u, first beat in cycle %lu; want id %u in cycle %lu\n", G,
                   w.gang_id, (unsigned long)w.out_cycle[0], g0.gang_id,
-                  (unsigned long)(c.release_cycle + 1 + K + 2));
+                  (unsigned long)(c.release_cycle + 1 + kBD + K + 2));
       ok = false;
     }
   }
@@ -1655,8 +1744,11 @@ int main(int argc, char** argv) {
     }
   }
 
-  std::printf("cta_gang: cores=%u (%u sockets of %u) warps=%u max cluster=%u gang ids=%u lmem=%u seed=%u\n", cfg.ncc,
-              cfg.num_sockets, cfg.socket_size, cfg.nw, cfg.max_cluster, cfg.num_gangs, lmem_size_of(cfg), seed);
+  cfg.num_gpcs = 1;
+  std::printf("cta_gang: cores=%u (%u sockets of %u) warps=%u slots=%u max cluster=%u cluster CTAs per core=%u"
+              " gang ids=%u lmem=%u policy=%s seed=%u\n", cfg.ncc, cfg.num_sockets, cfg.socket_size, cfg.nw,
+              ref::slots(cfg), cfg.max_cluster, ref::cluster_cap(cfg), cfg.num_gangs, lmem_size_of(cfg),
+              (cfg.policy == ref::PLACE_H100) ? "H100" : "SPREAD", seed);
 
   bool ok = true;
   ok = t_ref_vectors() && ok;

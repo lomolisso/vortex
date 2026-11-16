@@ -8,7 +8,7 @@ PROJECT := cta_gang
 SRC_DIR := $(VORTEX_HOME)/tests/regression/$(PROJECT)
 
 SRCS := $(SRC_DIR)/main.cpp
-HDRS := $(SRC_DIR)/common.h
+HDRS := $(SRC_DIR)/common.h $(SW_COMMON_DIR)/dlmem_ref.h
 
 VX_SRCS := $(SRC_DIR)/kernel.cpp
 VX_HDRS := $(SRC_DIR)/common.h

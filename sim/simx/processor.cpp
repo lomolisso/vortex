@@ -41,10 +41,22 @@ ProcessorImpl::ProcessorImpl()
   SimPlatform::instance().initialize();
   SimPlatform::instance().set_num_workers(SIMX_NUM_WORKERS);
 
+  static_assert(VX_CFG_NUM_SMS <= MAX_NUM_CORES, "NUM_SMS must be at most MAX_NUM_CORES");
+  static_assert((VX_CFG_NUM_CLUSTERS % VX_CFG_NUM_PARTITIONS) == 0, "NUM_PARTITIONS must divide NUM_CLUSTERS");
+  static_assert((NUM_SOCKETS % VX_CFG_CPCS_PER_GPC) == 0, "CPCS_PER_GPC must divide the TPCs of a GPC");
+  static_assert(VX_CFG_MAX_CTAS_PER_SM >= 1 && VX_CFG_MAX_CTAS_PER_SM <= VX_CFG_NUM_WARPS && VX_CFG_MAX_CTAS_PER_SM <= 64,
+                "MAX_CTAS_PER_SM must be between 1 and min(NUM_WARPS, 64)");
+  static_assert(VX_CFG_MAX_CTAS_PER_SM_CLUSTER >= 1 && VX_CFG_MAX_CTAS_PER_SM_CLUSTER <= VX_CFG_MAX_CTAS_PER_SM,
+                "MAX_CTAS_PER_SM_CLUSTER must be between 1 and MAX_CTAS_PER_SM");
+  static_assert(VX_CFG_CLUSTER_GPC_START >= 0 && VX_CFG_CLUSTER_GPC_START < VX_CFG_NUM_CLUSTERS,
+                "CLUSTER_GPC_START must name a GPC");
+  static_assert(VX_CFG_DOMAIN_BOUNDARY_DELAY >= 1 && VX_CFG_DOMAIN_BOUNDARY_DELAY <= 1,
+                "DOMAIN_BOUNDARY_DELAY must be 1: at least 1, at most the launch and credit edges' one register stage");
+
   // create kernel management unit (SimObject)
 #ifdef VX_CFG_EXT_DLMEM_ENABLE
-  // One launch lane per hardware cluster, into its gang unit.
-  kmu_ = Kmu::Create("kmu", VX_CFG_NUM_CLUSTERS);
+  // One launch lane, into the chip's cluster admission.
+  kmu_ = Kmu::Create("kmu", 1);
 #else
   constexpr uint32_t total_cores = VX_CFG_NUM_CLUSTERS * NUM_SOCKETS * VX_CFG_SOCKET_SIZE;
   kmu_ = Kmu::Create("kmu", total_cores);
@@ -59,21 +71,38 @@ ProcessorImpl::ProcessorImpl()
 
   char sname[100];
 
-  // create clusters
-  for (uint32_t i = 0; i < VX_CFG_NUM_CLUSTERS; ++i) {
-    snprintf(sname, 100, "cluster%d", i);
-    clusters_.at(i) = Cluster::Create(sname, i, this);
+#ifdef VX_CFG_EXT_DLMEM_ENABLE
+  // Created ahead of the clusters so it ticks before their launch lanes, as the gang unit it replaces did.
+  admit_ = AdmitUnit::Create("cta-admit", dlmem_cfg(), !VX_CFG_H100_ORG_ENABLED && (NUM_SOCKETS * VX_CFG_SOCKET_SIZE) == 1);
+#endif
+
+  // create the partitions, each with its clusters (GPCs)
+  for (uint32_t p = 0; p < VX_CFG_NUM_PARTITIONS; ++p) {
+    snprintf(sname, 100, "partition%d", p);
+    partitions_.push_back(Partition::Create(sname, p, this));
+    for (uint32_t g = 0; g < partitions_.back()->num_clusters(); ++g) {
+      clusters_.at(p * partitions_.back()->num_clusters() + g) = partitions_.back()->cluster(g);
+    }
   }
 
 #ifdef VX_CFG_EXT_DLMEM_ENABLE
-  // Launch bus: a registered, credit-gated lane from the KMU to each
-  // cluster's gang unit, ahead of the cluster's launch fan-out.
+  // Launch bus: a registered, credit-gated lane from the KMU to the chip's
+  // cluster admission, then one lane per GPC into its launch fan-out; each
+  // GPC's gang table trades events, pending releases and grants with it.
+  {
+    auto slice = RegSlice<kmu_req_t>::Create("kmu-lane0", 1);
+    kmu_->bus_out.at(0).bind(&slice->In);
+    slice->Out.bind(&admit_->bus_in);
+    admit_->credit_out.bind(&kmu_->credit_in.at(0));
+  }
   for (uint32_t i = 0; i < VX_CFG_NUM_CLUSTERS; ++i) {
-    snprintf(sname, 100, "kmu-lane%d", i);
-    auto slice = RegSlice<kmu_req_t>::Create(sname, 1);
-    kmu_->bus_out.at(i).bind(&slice->In);
-    slice->Out.bind(&clusters_.at(i)->kmu_bus_in());
-    clusters_.at(i)->kmu_credit_out().bind(&kmu_->credit_in.at(i));
+    // every one of these producers sends with a registered delay: it is the GPC boundary in H100 builds
+    const auto& d = this->gpc_domain(i);
+    d.link(admit_->bus_out.at(i), clusters_.at(i)->kmu_bus_in());
+    d.link(clusters_.at(i)->kmu_credit_out(), admit_->credit_in.at(i));
+    d.link(clusters_.at(i)->gang_evt_out, admit_->evt_in.at(i));
+    d.link(clusters_.at(i)->gang_relp_out(), admit_->relp_in.at(i));
+    d.link(admit_->alloc_out.at(i), clusters_.at(i)->gang_alloc_in());
   }
 #else
   // Launch bus: a registered, credit-gated lane from the KMU to each core's
@@ -156,6 +185,12 @@ ProcessorImpl::ProcessorImpl()
                 "DLMEM_MAX_CLUSTER must be between 1 and the cores of a cluster");
   // The window stride is the local-memory size, and the RV64 base is only 256 KB aligned.
   static_assert(VX_CFG_LMEM_LOG_SIZE <= 18, "DLMEM requires a local memory of at most 256 KB");
+  // The window sits above global memory, aligned to its own size (local memory x rank field).
+  static_assert(uint64_t(VX_CFG_GLOBAL_MEM_SIZE) <= uint64_t(VX_MEM_DLMEM_BASE_ADDR),
+                "DLMEM requires the DLMEM window above global memory (GLOBAL_MEM_SIZE <= DLMEM_BASE_ADDR)");
+  static_assert((uint64_t(VX_MEM_DLMEM_BASE_ADDR)
+                 % (uint64_t(1) << (VX_CFG_LMEM_LOG_SIZE + log2ceil(VX_CFG_DLMEM_MAX_CLUSTER)))) == 0,
+                "DLMEM requires DLMEM_BASE_ADDR aligned to LMEM_SIZE x 2^clog2(DLMEM_MAX_CLUSTER)");
   static_assert(VX_CFG_SOCKET_SIZE <= VX_CFG_NUM_CORES, "DLMEM requires SOCKET_SIZE <= NUM_CORES");
   // The gang unit's mirror and done events index a hardware cluster's cores
   // by the same number the global-barrier path does.
@@ -183,11 +218,15 @@ ProcessorImpl::ProcessorImpl()
 #line 178
 #endif
 
-  // connect L3 core interfaces
+  // connect L3 core interfaces; neither side registers its send, so a GPC boundary adds a stage
   for (uint32_t i = 0; i < VX_CFG_NUM_CLUSTERS; ++i) {
+    const auto& d = this->gpc_domain(i);
     for (uint32_t j = 0; j < VX_CFG_L2_MEM_PORTS; ++j) {
-      clusters_.at(i)->mem_req_out.at(j).bind(&l3cache_->core_req_in.at(i * VX_CFG_L2_MEM_PORTS + j));
-      l3cache_->core_rsp_out.at(i * VX_CFG_L2_MEM_PORTS + j).bind(&clusters_.at(i)->mem_rsp_in.at(j));
+      uint32_t k = i * VX_CFG_L2_MEM_PORTS + j;
+      snprintf(sname, 100, "cluster%d-mreq%d", i, j);
+      d.stage(sname, clusters_.at(i)->mem_req_out.at(j), l3cache_->core_req_in.at(k), false);
+      snprintf(sname, 100, "cluster%d-mrsp%d", i, j);
+      d.stage(sname, l3cache_->core_rsp_out.at(k), clusters_.at(i)->mem_rsp_in.at(j), true);
     }
   }
 
@@ -197,16 +236,17 @@ ProcessorImpl::ProcessorImpl()
   dev_ptw_ = Ptw::Create("dev-ptw");
   dev_ptw_mux_ = PtwMux::Create("dev-ptwmux", VX_CFG_NUM_CLUSTERS);
   for (uint32_t i = 0; i < VX_CFG_NUM_CLUSTERS; ++i) {
-    clusters_.at(i)->ptw_req_out().bind(&dev_ptw_mux_->ReqIn.at(i));
-    dev_ptw_mux_->RspOut.at(i).bind(&clusters_.at(i)->ptw_rsp_in());
+    const auto& d = this->gpc_domain(i);
+    d.link(clusters_.at(i)->ptw_req_out(), dev_ptw_mux_->ReqIn.at(i));
+    d.link(dev_ptw_mux_->RspOut.at(i), clusters_.at(i)->ptw_rsp_in());
   }
   dev_ptw_mux_->ReqOut.bind(&dev_ptw_->ReqIn);
   dev_ptw_->RspOut.bind(&dev_ptw_mux_->RspIn);
   // PTE fetches ride the LLC: the single cluster's L2 when that L2 is the
   // LLC (PTW_ON_L2), the L3's dedicated client slot otherwise.
   if constexpr (PTW_ON_L2 != 0) {
-    dev_ptw_->MemReqOut.bind(&clusters_.at(0)->ptw_mem_req_in());
-    clusters_.at(0)->ptw_mem_rsp_out().bind(&dev_ptw_->MemRspIn);
+    this->gpc_domain(0).stage("cluster0-ptwreq", dev_ptw_->MemReqOut, clusters_.at(0)->ptw_mem_req_in(), true);
+    this->gpc_domain(0).stage("cluster0-ptwrsp", clusters_.at(0)->ptw_mem_rsp_out(), dev_ptw_->MemRspIn, false);
   } else {
     dev_ptw_->MemReqOut.bind(&l3cache_->core_req_in.at(VX_CFG_L3_PTW_IDX));
     l3cache_->core_rsp_out.at(VX_CFG_L3_PTW_IDX).bind(&dev_ptw_->MemRspIn);
@@ -335,6 +375,9 @@ int ProcessorImpl::run() {
   do {
     SimPlatform::instance().tick();
     bool any_running = kmu_->running();
+#ifdef VX_CFG_EXT_DLMEM_ENABLE
+    any_running = any_running || admit_->busy();
+#endif
     for (auto cluster : clusters_) {
       if (cluster->running()) {
         any_running = true;
@@ -500,6 +543,9 @@ bool ProcessorImpl::any_running() const {
   for (auto& cluster : clusters_) {
     if (cluster->running()) return true;
   }
+#ifdef VX_CFG_EXT_DLMEM_ENABLE
+  if (admit_->busy()) return true;
+#endif
   return kmu_->running() || !SimPlatform::instance().idle();
 }
 

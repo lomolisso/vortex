@@ -32,7 +32,7 @@ CXXFLAGS += $(filter -DVX_CFG_DRAM_MODEL_% -DVX_CFG_DRAM_PAGE_POLICY_% -DVX_CFG_
 
 # Source files definition
 SRCS = $(SW_COMMON_DIR)/util.cpp $(SIM_COMMON_DIR)/mem.cpp $(SW_COMMON_DIR)/softfloat_ext.cpp $(SW_COMMON_DIR)/rvfloats.cpp $(SIM_COMMON_DIR)/cmd_processor.cpp $(SIM_COMMON_DIR)/elf_loader.cpp $(SIM_COMMON_DIR)/host_monitor.cpp $(SIM_COMMON_DIR)/cout_drainer.cpp
-SRCS += $(SRC_DIR)/processor.cpp $(SRC_DIR)/cluster.cpp $(SRC_DIR)/socket.cpp $(SRC_DIR)/core.cpp $(SRC_DIR)/scheduler.cpp $(SRC_DIR)/cta_dispatcher.cpp $(SRC_DIR)/barrier_unit.cpp
+SRCS += $(SRC_DIR)/processor.cpp $(SRC_DIR)/partition.cpp $(SRC_DIR)/cluster.cpp $(SRC_DIR)/cpc.cpp $(SRC_DIR)/socket.cpp $(SRC_DIR)/core.cpp $(SRC_DIR)/scheduler.cpp $(SRC_DIR)/cta_dispatcher.cpp $(SRC_DIR)/barrier_unit.cpp
 SRCS += $(SRC_DIR)/kmu/kmu.cpp
 SRCS += $(SRC_DIR)/decode.cpp $(SRC_DIR)/decompressor.cpp $(SRC_DIR)/scoreboard.cpp $(SRC_DIR)/sequencer.cpp $(SRC_DIR)/opc_unit.cpp $(SRC_DIR)/dispatcher.cpp
 SRCS += $(SRC_DIR)/alu_unit.cpp $(SRC_DIR)/fpu_unit.cpp $(SRC_DIR)/lsu_unit.cpp $(SRC_DIR)/sfu_unit.cpp $(SRC_DIR)/wctl_unit.cpp $(SRC_DIR)/csr_unit.cpp
@@ -72,6 +72,7 @@ endif
 # Add DLMEM extension sources; a unit joins once its source exists.
 ifneq ($(filter -DVX_CFG_EXT_DLMEM_ENABLE, $(XCONFIGS)),)
 	SRCS += $(wildcard $(SRC_DIR)/kmu/cta_gang.cpp)
+	SRCS += $(wildcard $(SRC_DIR)/kmu/cta_admit.cpp)
 	SRCS += $(wildcard $(SRC_DIR)/dlmem/dlmem_xlate.cpp)
 	SRCS += $(SRC_DIR)/dlmem/dlmem_egress.cpp $(SRC_DIR)/dlmem/dlmem_ingress.cpp $(SRC_DIR)/dlmem/dlmem_wtrack.cpp
 	SRCS += $(SRC_DIR)/dlmem/dlmem_switch.cpp $(SRC_DIR)/dlmem/dlmem_xbar.cpp
@@ -172,6 +173,10 @@ DLMEM_NOC_TEST     := $(DESTDIR)/dlmem_noc_test
 CTA_GANG_TEST_OBJ := $(OBJ_DIR)/tests/cta_gang_test.o
 CTA_GANG_TEST     := $(DESTDIR)/cta_gang_test
 
+# The cluster-dispatch test drives the admission unit (kmu/cta_admit) from libsimx.
+CLUSTER_DISPATCH_TEST_OBJ := $(OBJ_DIR)/tests/cluster_dispatch_test.o
+CLUSTER_DISPATCH_TEST     := $(DESTDIR)/cluster_dispatch_test
+
 # The DLMEM translation and endpoints link standalone into their unit tests.
 DLMEM_XLATE_SRCS     := $(SRC_DIR)/dlmem/dlmem_xlate.cpp $(SRC_DIR)/dlmem/dlmem_wtrack.cpp
 DLMEM_XLATE_OBJS     := $(patsubst $(SRC_DIR)/%.cpp,$(OBJ_DIR)/%.o,$(DLMEM_XLATE_SRCS))
@@ -233,7 +238,7 @@ PROJECT := simx
 VORTEX_LIB := libvortex.so
 VORTEX_GEM5_LIB := libvortex-gem5.so
 
-.PHONY: all force test-dxa-ooo test-rvc-decompress test-dlmem-noc test-cta-gang test-dlmem-xlate test-dlmem-ep test-lmem-switch test-mbar-waiters test-dxa-compl test-dxa-bulk test-cpa-unit test-bg-unit test-dxa-tmap-core clean clean-lib clean-exe clean-obj libvortex clean-libvortex libvortex-gem5 clean-libvortex-gem5
+.PHONY: all force test-dxa-ooo test-rvc-decompress test-dlmem-noc test-cta-gang test-cluster-dispatch test-dlmem-xlate test-dlmem-ep test-lmem-switch test-mbar-waiters test-dxa-compl test-dxa-bulk test-cpa-unit test-bg-unit test-dxa-tmap-core clean clean-lib clean-exe clean-obj libvortex clean-libvortex libvortex-gem5 clean-libvortex-gem5
 
 ifeq ($(USE_SST), 1)
 all: $(DESTDIR)/$(PROJECT) $(DESTDIR)/$(VORTEX_LIB)
@@ -288,6 +293,10 @@ $(DLMEM_NOC_TEST_OBJ): $(VORTEX_HOME)/tests/unittest/dlmem_noc/main.cpp $(CONFIG
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
 $(CTA_GANG_TEST_OBJ): $(VORTEX_HOME)/tests/unittest/cta_gang/main.cpp $(CONFIG_FILE)
+	@mkdir -p $(@D)
+	$(CXX) $(CXXFLAGS) -c $< -o $@
+
+$(CLUSTER_DISPATCH_TEST_OBJ): $(VORTEX_HOME)/tests/unittest/cluster_dispatch/main.cpp $(CONFIG_FILE)
 	@mkdir -p $(@D)
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
@@ -354,6 +363,12 @@ test-cta-gang: $(CTA_GANG_TEST)
 
 $(CTA_GANG_TEST): $(OBJS) $(CTA_GANG_TEST_OBJ)
 	$(CXX) $(CXXFLAGS) $(filter-out $(VXDRAM_LIB),$^) $(LDFLAGS) -o $@
+
+test-cluster-dispatch: $(CLUSTER_DISPATCH_TEST)
+	$(CLUSTER_DISPATCH_TEST) $(CLUSTER_DISPATCH_OPTS)
+
+$(CLUSTER_DISPATCH_TEST): $(OBJS) $(CLUSTER_DISPATCH_TEST_OBJ)
+	$(CXX) $(CXXFLAGS) $^ $(LDFLAGS) -o $@
 
 test-dlmem-xlate: $(DLMEM_XLATE_TEST)
 	$(DLMEM_XLATE_TEST) $(DLMEM_XLATE_OPTS)

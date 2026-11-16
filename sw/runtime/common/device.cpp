@@ -25,9 +25,9 @@
 
 namespace vx {
 
-static uint64_t caps_global_mem_size(uint64_t dev_caps, uint64_t isa_caps) {
+static uint64_t caps_global_mem_size(uint64_t dev_caps, uint64_t isa_caps, uint64_t org_caps) {
     uint64_t size = 0;
-    vortex::decode_caps(dev_caps, isa_caps, VX_CAPS_GLOBAL_MEM_SIZE, &size);
+    vortex::decode_caps(dev_caps, isa_caps, org_caps, VX_CAPS_GLOBAL_MEM_SIZE, &size);
     return size;
 }
 
@@ -121,12 +121,12 @@ thread_local const Device* tls_batch_owner = nullptr;
 
 } // namespace
 
-Device::Device(std::unique_ptr<Platform> plat, uint64_t dev_caps, uint64_t isa_caps)
+Device::Device(std::unique_ptr<Platform> plat, uint64_t dev_caps, uint64_t isa_caps, uint64_t org_caps)
     : platform_(std::move(plat)), cycle_freq_hz_(0),
-      global_mem_size_(caps_global_mem_size(dev_caps, isa_caps)),
+      global_mem_size_(caps_global_mem_size(dev_caps, isa_caps, org_caps)),
       global_mem_(ALLOC_BASE_ADDR, global_mem_size_ - ALLOC_BASE_ADDR,
                   RAM_PAGE_SIZE, CACHE_BLOCK_SIZE),
-      dev_caps_(dev_caps), isa_caps_(isa_caps), caps_loaded_(true) {
+      dev_caps_(dev_caps), isa_caps_(isa_caps), org_caps_(org_caps), caps_loaded_(true) {
     // cycle_freq_hz_=0 tells the ns conversion path to use the wall clock.
     // global_mem_ is the device-memory allocator — pure host-side address
     // bookkeeping; the CP DMAs to whatever addresses it hands out.
@@ -228,13 +228,13 @@ vx_result_t Device::open(uint32_t index, Device** out) {
     std::unique_ptr<Platform> plat(new CallbacksAdapter(*cb, dev_ctx));
     // The memory size is a property of the device, as CUDA's totalGlobalMem:
     // the allocator is sized from the caps word before anything is allocated.
-    uint64_t dev_caps = 0, isa_caps = 0;
+    uint64_t dev_caps = 0, isa_caps = 0, org_caps = 0;
     auto rd = [&plat](uint32_t off, uint32_t* v) -> int {
         return plat->cp_reg_read(off, v) == VX_SUCCESS ? 0 : -1;
     };
-    if (vortex::load_caps(rd, &dev_caps, &isa_caps) != 0)
+    if (vortex::load_caps(rd, &dev_caps, &isa_caps, &org_caps) != 0)
         return VX_ERR_DEVICE_LOST;
-    Device* d = new Device(std::move(plat), dev_caps, isa_caps);
+    Device* d = new Device(std::move(plat), dev_caps, isa_caps, org_caps);
     auto cr = d->cp_init();
     if (cr != VX_SUCCESS) {
         d->release();
@@ -1188,7 +1188,7 @@ vx_result_t Device::memory_info(uint64_t* out_free, uint64_t* out_used) {
 
 vx_result_t Device::query_caps(uint32_t caps_id, uint64_t* out_value) {
     if (!out_value) return VX_ERR_INVALID_VALUE;
-    // The two static caps words are read once from the CP regfile caps
+    // The static caps words are read once from the CP regfile caps
     // window; serialize the load against concurrent cp_reg_* traffic.
     if (!caps_loaded_) {
         std::lock_guard<std::mutex> g(cp_mu_);
@@ -1196,12 +1196,12 @@ vx_result_t Device::query_caps(uint32_t caps_id, uint64_t* out_value) {
             auto rd = [this](uint32_t off, uint32_t* v) -> int {
                 return platform_->cp_reg_read(off, v) == VX_SUCCESS ? 0 : -1;
             };
-            if (vortex::load_caps(rd, &dev_caps_, &isa_caps_) != 0)
+            if (vortex::load_caps(rd, &dev_caps_, &isa_caps_, &org_caps_) != 0)
                 return VX_ERR_DEVICE_LOST;
             caps_loaded_ = true;
         }
     }
-    if (vortex::decode_caps(dev_caps_, isa_caps_, caps_id, out_value))
+    if (vortex::decode_caps(dev_caps_, isa_caps_, org_caps_, caps_id, out_value))
         return VX_SUCCESS;
     // Caps not encoded in the CP words — platform/runtime constants.
     switch (caps_id) {

@@ -17,7 +17,11 @@
 #include "cache.h"
 #include "constants.h"
 #include "cluster.h"
+#include "partition.h"
 #include "kmu.h"
+#ifdef VX_CFG_EXT_DLMEM_ENABLE
+#include "cta_admit.h"
+#endif
 
 namespace vortex {
 
@@ -83,7 +87,17 @@ private:
   // True once the device walker has latched a page fault.
   bool mmu_fault_pending() const;
 
+  // The execution domain of cluster (GPC) i, for binding the channels that leave it.
+  const ExecDomain& gpc_domain(uint32_t i) const {
+    uint32_t g = VX_CFG_NUM_CLUSTERS / VX_CFG_NUM_PARTITIONS;
+    return partitions_.at(i / g)->gpc_domain(i % g);
+  }
+
   Kmu::Ptr    kmu_;
+#ifdef VX_CFG_EXT_DLMEM_ENABLE
+  AdmitUnit::Ptr admit_;
+#endif
+  std::vector<Partition::Ptr> partitions_;
   std::vector<Cluster::Ptr> clusters_;
   Memory::Ptr memsim_;
 #ifdef VX_CFG_VM_ENABLE

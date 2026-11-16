@@ -36,6 +36,7 @@
 #endif
 #ifdef VX_CFG_EXT_DLMEM_ENABLE
 #include "kmu.h"
+#include "cta_gang.h"
 #endif
 
 namespace vortex {
@@ -115,10 +116,14 @@ public:
   int dcr_read(uint32_t addr, uint32_t tag, uint32_t* value);
 
 #ifdef VX_CFG_EXT_DLMEM_ENABLE
-  // The cluster's launch lane (its gang unit's input), exported for the
-  // processor to bind to the KMU.
-  SimChannel<kmu_req_t>& kmu_bus_in();
-  SimChannel<uint8_t>&   kmu_credit_out();
+  // The cluster's launch lane and its gang table's links, exported for the
+  // processor to bind to the chip's admission.
+  SimChannel<kmu_req_t>&   kmu_bus_in();
+  SimChannel<uint8_t>&     kmu_credit_out();
+  SimChannel<GangAlloc>&   gang_alloc_in();
+  SimChannel<GangRelPend>& gang_relp_out();
+  // every gang event, in the gang table's queue order
+  SimChannel<GangEvent>    gang_evt_out;
 #endif
 
   class Core* get_core(uint32_t idx) const;

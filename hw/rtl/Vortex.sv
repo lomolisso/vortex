@@ -53,6 +53,22 @@ module Vortex import VX_gpu_pkg::*, VX_trace_pkg::*, VX_tlb_pkg::*; (
     `STATIC_ASSERT(`IS_POW2(`VX_CFG_NUM_CLUSTERS), ("NUM_CLUSTERS must be a power of 2"));
     `STATIC_ASSERT(`IS_POW2(`VX_CFG_NUM_CORES), ("NUM_CORES must be a power of 2"));
     `STATIC_ASSERT(`IS_POW2(`VX_CFG_SOCKET_SIZE), ("SOCKET_SIZE must be a power of 2"));
+    `STATIC_ASSERT(`IS_POW2(`VX_CFG_NUM_PARTITIONS), ("NUM_PARTITIONS must be a power of 2"));
+    `STATIC_ASSERT(`IS_POW2(`VX_CFG_GPCS_PER_PARTITION), ("GPCS_PER_PARTITION must be a power of 2"));
+    `STATIC_ASSERT(`IS_POW2(`VX_CFG_CPCS_PER_GPC), ("CPCS_PER_GPC must be a power of 2"));
+    `STATIC_ASSERT(`IS_POW2(`VX_CFG_TPCS_PER_CPC), ("TPCS_PER_CPC must be a power of 2"));
+    `STATIC_ASSERT(`IS_POW2(`VX_CFG_SMS_PER_TPC), ("SMS_PER_TPC must be a power of 2"));
+    `STATIC_ASSERT((`VX_CFG_NUM_CLUSTERS % `VX_CFG_NUM_PARTITIONS) == 0, ("NUM_PARTITIONS must divide NUM_CLUSTERS"));
+    `STATIC_ASSERT((NUM_SOCKETS % CPCS_PER_GPC) == 0, ("CPCS_PER_GPC must divide the TPCs of a GPC"));
+    `STATIC_ASSERT(`VX_CFG_NUM_SMS <= 1024, ("NUM_SMS must be at most 1024"));
+    `STATIC_ASSERT((`VX_CFG_CLUSTER_GPC_START >= 0) && (`VX_CFG_CLUSTER_GPC_START < `VX_CFG_NUM_CLUSTERS),
+        ("CLUSTER_GPC_START must name a GPC"));
+    `STATIC_ASSERT((NUM_CTA_MAX >= 1) && (NUM_CTA_MAX <= `VX_CFG_NUM_WARPS) && (NUM_CTA_MAX <= 64),
+        ("MAX_CTAS_PER_SM must be between 1 and min(NUM_WARPS, 64)"));
+    `STATIC_ASSERT((`VX_CFG_MAX_CTAS_PER_SM_CLUSTER >= 1) && (`VX_CFG_MAX_CTAS_PER_SM_CLUSTER <= NUM_CTA_MAX),
+        ("MAX_CTAS_PER_SM_CLUSTER must be between 1 and MAX_CTAS_PER_SM"));
+    `STATIC_ASSERT(`VX_CFG_DOMAIN_BOUNDARY_DELAY >= 1, ("DOMAIN_BOUNDARY_DELAY must be at least 1"));
+    `STATIC_ASSERT(`VX_CFG_DOMAIN_BOUNDARY_DELAY <= 1, ("DOMAIN_BOUNDARY_DELAY must be at most 1, the launch and credit edges' one register stage"));
 
     // Every cache strictly above the LLC must be write-through.
     // A WB intermediate could absorb a hart-B store without the LLC
@@ -88,6 +104,10 @@ module Vortex import VX_gpu_pkg::*, VX_trace_pkg::*, VX_tlb_pkg::*; (
                        "DLMEM_MAX_CLUSTER must be between 1 and the cores of a cluster")
         + dlmem_reject(`VX_CFG_SOCKET_SIZE > `VX_CFG_NUM_CORES, "DLMEM requires SOCKET_SIZE <= NUM_CORES")
         + dlmem_reject(`VX_CFG_LMEM_LOG_SIZE > 18, "DLMEM requires a local memory of at most 256 KB")
+        + dlmem_reject(64'(`VX_CFG_GLOBAL_MEM_SIZE) > 64'(`VX_MEM_DLMEM_BASE_ADDR),
+                       "DLMEM requires the DLMEM window above global memory (GLOBAL_MEM_SIZE <= DLMEM_BASE_ADDR)")
+        + dlmem_reject((64'(`VX_MEM_DLMEM_BASE_ADDR) % (64'(1) << (`VX_CFG_LMEM_LOG_SIZE + DLMEM_RANK_BITS))) != 0,
+                       "DLMEM requires DLMEM_BASE_ADDR aligned to LMEM_SIZE x 2^clog2(DLMEM_MAX_CLUSTER)")
         + dlmem_reject((`VX_CFG_NUM_CORES % `VX_CFG_SOCKET_SIZE) != 0,
                        "DLMEM requires NUM_CORES to be a multiple of SOCKET_SIZE")
         // a pinned launch names its core field by field: cluster, socket, core in socket
@@ -130,8 +150,8 @@ module Vortex import VX_gpu_pkg::*, VX_trace_pkg::*, VX_tlb_pkg::*; (
     );
 
 `ifdef SCOPE
-    localparam scope_cluster = 0;
-    `SCOPE_IO_SWITCH (`VX_CFG_NUM_CLUSTERS);
+    localparam scope_partition = 0;
+    `SCOPE_IO_SWITCH (NUM_PARTITIONS);
 `endif
 
 `ifdef PERF_ENABLE
@@ -215,6 +235,64 @@ module Vortex import VX_gpu_pkg::*, VX_trace_pkg::*, VX_tlb_pkg::*; (
 
     VX_kmu_bus_if per_cluster_kmu_bus_if[`VX_CFG_NUM_CLUSTERS]();
 
+`ifdef VX_CFG_EXT_DLMEM_ENABLE
+    // Cluster admission for the whole chip, ahead of the per-GPC launch lanes;
+    // its mirrors learn of finished blocks from each GPC's gbar unit.
+    localparam NGPC = `VX_CFG_NUM_CLUSTERS;
+    // a GPC is its own SimX execution domain in H100 builds: every edge to it is registered
+    localparam BD = `VX_CFG_H100_ORG_ENABLED ? `VX_CFG_DOMAIN_BOUNDARY_DELAY : 0;
+
+    VX_kmu_bus_if admit_kmu_bus_if[1]();
+    wire admit_busy;
+
+    wire [NGPC-1:0]                      gpc_done_valid, admit_done_valid;
+    dlmem_cta_done_t [NGPC-1:0]          gpc_done_data, admit_done_data;
+    wire [NGPC-1:0][DLMEM_NUM_GANGS-1:0] gpc_rel_pend, admit_rel_pend;
+    wire [NGPC-1:0]                      admit_alloc_valid, gpc_alloc_valid;
+    wire [GANG_ID_W-1:0]                 admit_alloc_gang, gpc_alloc_gang;
+    wire                                 admit_alloc_epoch, gpc_alloc_epoch;
+    wire [DLMEM_K_W-1:0]                 admit_alloc_k, gpc_alloc_k;
+    wire                                 admit_gang_mode, gpc_gang_mode;
+
+    VX_cta_admit #(
+        .INSTANCE_ID ("cta_admit"),
+        .NUM_GPCS    (NGPC),
+        .OUT_BUF     (3)
+    ) cta_admit (
+        .clk         (clk),
+        .reset       (reset),
+        .bus_in_if   (kmu_bus_in[0]),
+        .bus_out_if  (admit_kmu_bus_if[0]),
+        .done_valid  (admit_done_valid),
+        .done_data   (admit_done_data),
+        .rel_pend    (admit_rel_pend),
+        .alloc_valid (admit_alloc_valid),
+        .alloc_gang  (admit_alloc_gang),
+        .alloc_epoch (admit_alloc_epoch),
+        .alloc_k     (admit_alloc_k),
+        .gang_mode   (admit_gang_mode),
+        .busy        (admit_busy)
+    );
+
+    `BUFFER_EX({admit_done_valid, admit_done_data, admit_rel_pend},
+               {gpc_done_valid, gpc_done_data, gpc_rel_pend}, 1'b1, 1, BD);
+    `BUFFER_EX({gpc_alloc_valid, gpc_alloc_gang, gpc_alloc_epoch, gpc_alloc_k, gpc_gang_mode},
+               {admit_alloc_valid, admit_alloc_gang, admit_alloc_epoch, admit_alloc_k, admit_gang_mode}, 1'b1, 1, BD);
+
+    VX_kmu_bus_arb #(
+        .NUM_INPUTS (1),
+        .NUM_OUTPUTS (`VX_CFG_NUM_CLUSTERS),
+        .DEST_LSB   (KMU_DEST_LSB_DEVICE),
+        .OUT_BUF    ((`VX_CFG_NUM_CLUSTERS > 1) ? 3 : 0)  // register per-cluster kmu fan-out (SLR-crossing skid)
+    ) kmu_arb (
+        .clk        (clk),
+        .reset      (reset),
+        .bus_in_if  (admit_kmu_bus_if),
+        .bus_out_if (per_cluster_kmu_bus_if)
+    );
+`else
+    wire admit_busy = 1'b0;
+
     VX_kmu_bus_arb #(
         .NUM_INPUTS (1),
         .NUM_OUTPUTS (`VX_CFG_NUM_CLUSTERS),
@@ -226,6 +304,7 @@ module Vortex import VX_gpu_pkg::*, VX_trace_pkg::*, VX_tlb_pkg::*; (
         .bus_in_if  (kmu_bus_in),
         .bus_out_if (per_cluster_kmu_bus_if)
     );
+`endif
 
 `ifdef VX_CFG_EXT_RASTER_ENABLE
     VX_raster_launch_if per_cluster_raster_launch_if[`VX_CFG_NUM_CLUSTERS]();
@@ -352,14 +431,15 @@ module Vortex import VX_gpu_pkg::*, VX_trace_pkg::*, VX_tlb_pkg::*; (
         .bus_out_if (per_cluster_dcr_bus_if)
     );
 
-    // Generate all clusters
-    for (genvar cluster_id = 0; cluster_id < `VX_CFG_NUM_CLUSTERS; ++cluster_id) begin : g_clusters
+    // Partitions of GPCs; GPC g of partition p is cluster p * GPCS_PER_PARTITION + g.
+    for (genvar p = 0; p < NUM_PARTITIONS; ++p) begin : g_partitions
 
-        VX_cluster #(
-            .CLUSTER_ID (cluster_id),
-            .INSTANCE_ID (`SFORMATF(("cluster%0d", cluster_id)))
-        ) cluster (
-            `SCOPE_IO_BIND (scope_cluster + cluster_id)
+        localparam G0 = p * GPCS_PER_PARTITION;
+
+        VX_partition #(
+            .PARTITION_ID (p)
+        ) partition (
+            `SCOPE_IO_BIND (scope_partition + p)
 
             .clk                (clk),
             .reset              (reset),
@@ -368,25 +448,36 @@ module Vortex import VX_gpu_pkg::*, VX_trace_pkg::*, VX_tlb_pkg::*; (
             .sysmem_perf        (sysmem_perf),
         `endif
 
-            .dcr_bus_if         (per_cluster_dcr_bus_if[cluster_id]),
+            .dcr_bus_if         (per_cluster_dcr_bus_if[G0 +: GPCS_PER_PARTITION]),
 
-            .mem_bus_if         (per_cluster_mem_bus_if[cluster_id * L2_MEM_PORTS +: L2_MEM_PORTS]),
+            .mem_bus_if         (per_cluster_mem_bus_if[G0 * L2_MEM_PORTS +: GPCS_PER_PARTITION * L2_MEM_PORTS]),
 
-            .kmu_bus_if         (per_cluster_kmu_bus_if[cluster_id +: 1]),
+            .kmu_bus_if         (per_cluster_kmu_bus_if[G0 +: GPCS_PER_PARTITION]),
 
         `ifdef VX_CFG_EXT_RASTER_ENABLE
-            .raster_launch_if   (per_cluster_raster_launch_if[cluster_id +: 1]),
+            .raster_launch_if   (per_cluster_raster_launch_if[G0 +: GPCS_PER_PARTITION]),
+        `endif
+
+        `ifdef VX_CFG_EXT_DLMEM_ENABLE
+            .gang_mode          (gpc_gang_mode),
+            .alloc_valid        (gpc_alloc_valid[G0 +: GPCS_PER_PARTITION]),
+            .alloc_gang         (gpc_alloc_gang),
+            .alloc_epoch        (gpc_alloc_epoch),
+            .alloc_k            (gpc_alloc_k),
+            .done_valid         (gpc_done_valid[G0 +: GPCS_PER_PARTITION]),
+            .done_data          (gpc_done_data[G0 +: GPCS_PER_PARTITION]),
+            .rel_pend           (gpc_rel_pend[G0 +: GPCS_PER_PARTITION]),
         `endif
 
         `ifdef VX_CFG_VM_ENABLE
             .mmu_satp           (mmu_satp),
-            .dev_ptw_if         (per_cluster_dev_ptw_if[cluster_id]),
-            .dev_ptw_mem_if     (per_cluster_ptw_mem_if[cluster_id]),
+            .dev_ptw_if         (per_cluster_dev_ptw_if[G0 +: GPCS_PER_PARTITION]),
+            .dev_ptw_mem_if     (per_cluster_ptw_mem_if[G0 +: GPCS_PER_PARTITION]),
             .mmu_flush_req      (mmu_flush_req),
-            .mmu_flush_done     (cl_mmu_flush_done[cluster_id]),
+            .mmu_flush_done     (cl_mmu_flush_done[G0 +: GPCS_PER_PARTITION]),
         `endif
 
-            .busy               (per_cluster_busy[cluster_id])
+            .busy               (per_cluster_busy[G0 +: GPCS_PER_PARTITION])
         );
     end
     // Launch liveness: a beat resident in a per-cluster output skid is folded into
@@ -398,7 +489,7 @@ module Vortex import VX_gpu_pkg::*, VX_trace_pkg::*, VX_tlb_pkg::*; (
         assign per_cluster_kmu_valid[c] = per_cluster_kmu_bus_if[c].valid;
     end
     wire busy_r;
-    `BUFFER_EX(busy_r, kmu_busy | dcr_bus_if.req_valid | (|per_cluster_busy) | dev_mmu_busy, 1'b1, 1, (`VX_CFG_NUM_CLUSTERS > 1));
+    `BUFFER_EX(busy_r, kmu_busy | dcr_bus_if.req_valid | (|per_cluster_busy) | admit_busy | dev_mmu_busy, 1'b1, 1, (`VX_CFG_NUM_CLUSTERS > 1));
     assign busy = busy_r | kmu_busy | dcr_bus_if.req_valid | (|per_cluster_kmu_valid);
 
 `ifdef PERF_ENABLE

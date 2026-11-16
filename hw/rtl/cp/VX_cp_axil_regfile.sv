@@ -22,6 +22,8 @@
 //     0x01C GPU_DEV_CAPS_HI RO  device-config caps, high 32 bits
 //     0x020 GPU_ISA_CAPS_LO RO  ISA caps, low 32 bits
 //     0x024 GPU_ISA_CAPS_HI RO  ISA caps, high 32 bits
+//     0x040 GPU_ORG_CAPS_LO RO  hierarchy caps, low 32 bits
+//     0x044 GPU_ORG_CAPS_HI RO  hierarchy caps, high 32 bits
 //
 //   Per-queue, base = 0x100 + qid * 0x40
 //     +0x00 Q_RING_BASE_LO  RW
@@ -149,6 +151,24 @@ module VX_cp_axil_regfile
     8'(`VX_ISA_IMPL_ID)
   };
 
+  // [31:23] are reserved for compute fields, [63:32] for the memory side.
+  wire [63:0] gpu_org_caps = {
+    32'b0,
+    9'b0,
+    1'(`VX_CFG_CLUSTER_DISTINCT_SMS_ENABLED),
+    7'(`VX_CFG_MAX_CTAS_PER_SM_CLUSTER),
+    7'(`VX_CFG_MAX_CTAS_PER_SM),
+    4'($clog2(`VX_CFG_CPCS_PER_GPC)),
+    4'($clog2(`VX_CFG_NUM_PARTITIONS))
+  };
+
+  `STATIC_ASSERT(`VX_CFG_MAX_CTAS_PER_SM < 128, ("MAX_CTAS_PER_SM does not fit its 7-bit caps field"))
+  `STATIC_ASSERT(`VX_CFG_MAX_CTAS_PER_SM_CLUSTER < 128, ("MAX_CTAS_PER_SM_CLUSTER does not fit its 7-bit caps field"))
+  `STATIC_ASSERT($clog2(`VX_CFG_NUM_PARTITIONS) < 16, ("NUM_PARTITIONS does not fit its 4-bit log2 caps field"))
+  `STATIC_ASSERT($clog2(`VX_CFG_CPCS_PER_GPC) < 16, ("CPCS_PER_GPC does not fit its 4-bit log2 caps field"))
+  `STATIC_ASSERT($clog2(`VX_CFG_NUM_CLUSTERS) < 8, ("NUM_CLUSTERS does not fit its 3-bit log2 caps field"))
+  `STATIC_ASSERT($clog2(GPU_CLUSTER_SIZE) < 8, ("NUM_CORES / SOCKET_SIZE does not fit its 3-bit log2 caps field"))
+
   wire [63:0] gpu_isa_caps = {
     32'(`VX_CFG_MISA_EXT),
     2'(`CLOG2(`VX_CFG_XLEN)-4),
@@ -220,6 +240,10 @@ module VX_cp_axil_regfile
     if (is_global(addr, 8'h34)) return dbg_host_r_counts;
     if (is_global(addr, 8'h38)) return 32'd0;   // pad: completes block 0x30
     if (is_global(addr, 8'h3C)) return 32'd0;   // pad: completes block 0x30
+    if (is_global(addr, 8'h40)) return gpu_org_caps[31:0];
+    if (is_global(addr, 8'h44)) return gpu_org_caps[63:32];
+    if (is_global(addr, 8'h48)) return 32'd0;   // pad: completes block 0x40
+    if (is_global(addr, 8'h4C)) return 32'd0;   // pad: completes block 0x40
     if (decode_queue(addr, qid, off)) begin
       case (off)
         6'h00: return r_ring_base[qid][31:0];
@@ -282,6 +306,10 @@ module VX_cp_axil_regfile
     if (is_global(addr, 8'h34)) return 1'b1;
     if (is_global(addr, 8'h38)) return 1'b1;   // pad: completes block 0x30
     if (is_global(addr, 8'h3C)) return 1'b1;   // pad: completes block 0x30
+    if (is_global(addr, 8'h40)) return 1'b1;
+    if (is_global(addr, 8'h44)) return 1'b1;
+    if (is_global(addr, 8'h48)) return 1'b1;   // pad: completes block 0x40
+    if (is_global(addr, 8'h4C)) return 1'b1;   // pad: completes block 0x40
     if (decode_queue(addr, qid, off)) begin
       case (off)
         6'h00, 6'h04, 6'h08, 6'h0C, 6'h10, 6'h14,
