@@ -25,8 +25,8 @@ namespace vortex {
 // egress: DecIn for store acks, DoneIn for answered loads, AMOs and SCs, never
 // both in one cycle (the core merges them into the RTL's one decrement port).
 // The core's second instance counts local accesses instead: increments from
-// the translation, one decrement per bank commit on CommitIn, several banks
-// in one cycle.
+// the translation, decrements on CommitIn: one per bank commit, or under the
+// H100 SM the lanes one bank access performed; several banks in one cycle.
 // drained(w) is the registered cnt[w] == 0 of the cycle after.
 class DlmemWTrack : public SimObject<DlmemWTrack> {
 public:
@@ -35,7 +35,12 @@ public:
   std::vector<SimChannel<WtInc>> IncIn;
   SimChannel<uint32_t> DecIn;
   SimChannel<uint32_t> DoneIn;
+#ifdef VX_CFG_H100_SM_ENABLE
+  std::vector<SimChannel<WtInc>> CommitIn;
+#else
   std::vector<SimChannel<uint32_t>> CommitIn;
+#endif
+#line 39
 
   DlmemWTrack(const SimContext& ctx,
               const char* name,

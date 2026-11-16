@@ -994,6 +994,9 @@ module VX_cache_amo import VX_gpu_pkg::*; #(
                                || (core_req_is_amo && amo_admit_full));
 
         `UNUSED_VAR (amo_st0) // only amo_valid/amo_op are consumed at S0
+    `ifdef VX_CFG_H100_SM_ENABLE
+        `UNUSED_VAR (amo_st1)
+    `endif
         `UNUSED_VAR (is_replay_st1)
         `UNUSED_VAR (mshr_alloc_id_st0)
         `UNUSED_VAR (mshr_id_st1)

@@ -304,6 +304,10 @@ package VX_gpu_pkg;
     // must reach wherever the read-modify-write commits, which is the local
     // bank for shared memory and the last-level bank for global memory.
     typedef struct packed {
+    `ifdef VX_CFG_H100_SM_ENABLE
+        // Two 32-bit atomics in one 8-B bank word, one per 4-B half (the shared-memory gate merges lane pairs).
+        logic                        amo_pair;
+    `endif
         logic [HART_ID_WIDTH-1:0]   hart_id;
     `ifdef VX_CFG_EXT_ZACAS_ENABLE
         logic [`VX_CFG_XLEN-1:0]     amo_cmp;
@@ -1763,8 +1767,36 @@ package VX_gpu_pkg;
     // LMEM DMA port parameters. (The raster FWD needs no LMEM DMA agent —
     // the raster stamp rides the launch itself.)
     localparam LMEM_DMA_EN         = (`VX_CFG_EXT_DXA_ENABLED + `VX_CFG_TCU_WGMMA_ENABLED) != 0;
+`ifdef VX_CFG_H100_SM_ENABLE
+    // One SM datapath wide: shared memory serves one wavefront of it per cycle over all clients.
+    localparam LMEM_BANK_BYTES        = `VX_CFG_LMEM_BANK_BYTES;
+    localparam LMEM_PORT_BYTES        = `VX_CFG_LMEM_PORT_BYTES;
+    // Warp requests per LSU block the shared-memory port holds before the bank
+    // commit: none, it only stalls requests in the buffers that hold them today.
+    localparam LMEM_REQ_STAGES        = 0;
+    // The L1 hit hold counts from a global load's request leaving the LSU; the
+    // core's stages outside that interval and the L1's own path come off the
+    // measured latency (same numbers as SimX's cache.h).
+    // The operand collectors' routing stage an instruction passes when there is more than one collector.
+    localparam OPC_ROUTE_STAGES       = (`VX_CFG_NUM_OPCS > 1) ? 1 : 0;
+    localparam L1_CORE_PRE_STAGES     = 7 + OPC_ROUTE_STAGES;
+    localparam L1_CORE_POST_STAGES    = 3;
+    localparam L1_HIT_STAGES          = 14;
+    localparam L1_MISS_STAGES         = 25;
+    localparam L1_CORE_STAGES         = L1_CORE_PRE_STAGES + L1_CORE_POST_STAGES;
+    localparam L1_PIPE_OVERHEAD       = L1_CORE_STAGES + L1_HIT_STAGES;
+    localparam L1_MISS_PIPE_OVERHEAD  = L1_CORE_STAGES + L1_MISS_STAGES;
+    localparam LMEM_INGRESS_DATA_SIZE = `VX_CFG_N5_SLOT_BYTES;
+    // A request on the SM port is at most one L1 line, its sectors selected by byteen.
+    localparam DCACHE_MEM_DATA_SIZE   = `VX_CFG_DCACHE_LINE_SIZE;
+    localparam DXA_GMEM_LINE_SIZE     = `VX_CFG_DCACHE_LINE_SIZE;
+    localparam SM_PORT_LINE_SIZE      = `VX_CFG_DCACHE_LINE_SIZE;
+    localparam LMEM_DMA_DATA_SIZE  = LMEM_PORT_BYTES;
+    localparam LMEM_DMA_ADDR_WIDTH = `VX_CFG_LMEM_LOG_SIZE - `CLOG2(LMEM_PORT_BYTES);
+`else
     localparam LMEM_DMA_DATA_SIZE  = `VX_CFG_LMEM_NUM_BANKS * LSU_WORD_SIZE;
     localparam LMEM_DMA_ADDR_WIDTH = `VX_CFG_LMEM_LOG_SIZE - `CLOG2(`VX_CFG_LMEM_NUM_BANKS * LSU_WORD_SIZE);
+`endif
     localparam LMEM_DMA_ATTR_W     = `MAX(DXA_LMEM_ATTR_W, TCU_LMEM_ATTR_W);
     localparam LMEM_DMA_DXA_IDX    = 0;
     localparam LMEM_DMA_TCU_IDX    = LMEM_DMA_DXA_IDX + `VX_CFG_EXT_DXA_ENABLED;
@@ -1855,15 +1887,27 @@ package VX_gpu_pkg;
     localparam DCACHE_TAG_WIDTH       = DCACHE_TAG_WIDTH_BASE;
 
     // Memory request data bits (mem transacts in sectors)
+`ifdef VX_CFG_H100_SM_ENABLE
+    localparam DCACHE_MEM_DATA_WIDTH = (DCACHE_MEM_DATA_SIZE * 8);
+`else
     localparam DCACHE_MEM_DATA_WIDTH = (DCACHE_SECTOR_SIZE * 8);
+`endif
 
     // Memory request tag bits (computed with DCACHE_TAG_WIDTH since
     // VX_cache_cluster sees the post-arb tag width). The bypass tag encodes the
     // in-block offset at the mem granule, so it uses the sector, not the line.
+`ifdef VX_CFG_H100_SM_ENABLE
+`ifdef VX_CFG_DCACHE_ENABLE
+    localparam DCACHE_MEM_TAG_WIDTH = `CACHE_CLUSTER_NC_MEM_TAG_WIDTH(`VX_CFG_DCACHE_MSHR_SIZE, DCACHE_NUM_BANKS, DCACHE_NUM_REQS, L1_MEM_PORTS, DCACHE_MEM_DATA_SIZE, DCACHE_WORD_SIZE, DCACHE_TAG_WIDTH, `VX_CFG_SOCKET_SIZE, `VX_CFG_NUM_DCACHES, UUID_WIDTH);
+`else
+    localparam DCACHE_MEM_TAG_WIDTH = `CACHE_CLUSTER_BYPASS_MEM_TAG_WIDTH(DCACHE_NUM_REQS, L1_MEM_PORTS, DCACHE_MEM_DATA_SIZE, DCACHE_WORD_SIZE, DCACHE_TAG_WIDTH, `VX_CFG_SOCKET_SIZE, `VX_CFG_NUM_DCACHES);
+`endif
+`else
 `ifdef VX_CFG_DCACHE_ENABLE
     localparam DCACHE_MEM_TAG_WIDTH = `CACHE_CLUSTER_NC_MEM_TAG_WIDTH(`VX_CFG_DCACHE_MSHR_SIZE, DCACHE_NUM_BANKS, DCACHE_NUM_REQS, L1_MEM_PORTS, DCACHE_SECTOR_SIZE, DCACHE_WORD_SIZE, DCACHE_TAG_WIDTH, `VX_CFG_SOCKET_SIZE, `VX_CFG_NUM_DCACHES, UUID_WIDTH);
 `else
     localparam DCACHE_MEM_TAG_WIDTH = `CACHE_CLUSTER_BYPASS_MEM_TAG_WIDTH(DCACHE_NUM_REQS, L1_MEM_PORTS, DCACHE_SECTOR_SIZE, DCACHE_WORD_SIZE, DCACHE_TAG_WIDTH, `VX_CFG_SOCKET_SIZE, `VX_CFG_NUM_DCACHES);
+`endif
 `endif
 
     // L1 dcache is the LLC iff neither L2 nor L3 is enabled.

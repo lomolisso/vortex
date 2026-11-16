@@ -35,6 +35,9 @@ module VX_dlmem_wtrack import VX_gpu_pkg::*, VX_dlmem_pkg::*; #(
 
     input wire [NUM_DEC-1:0]                    dec_valid,
     input wire [NUM_DEC-1:0][NW_WIDTH-1:0]      dec_wid,
+`ifdef VX_CFG_H100_SM_ENABLE
+    input wire [NUM_DEC-1:0][CNT_W-1:0]         dec_cnt,
+`endif
 
     output wire [`VX_CFG_NUM_WARPS-1:0]         drained,
     output wire                                 empty
@@ -42,7 +45,12 @@ module VX_dlmem_wtrack import VX_gpu_pkg::*, VX_dlmem_pkg::*; #(
     localparam CNTR_W = `CLOG2(MAX_COUNT + 1);
     // Wide enough for a counter plus every same-cycle increment, so overflow is detectable.
     localparam SUM_W = CNTR_W + `CLOG2(NUM_INC + 1) + CNT_W;
+`ifdef VX_CFG_H100_SM_ENABLE
+    localparam DEC_W = `CLOG2(NUM_DEC + 1) + CNT_W;
+    `STATIC_ASSERT (DEC_W <= SUM_W, ("the decrement sum fits the counter arithmetic"))
+`else
     localparam DEC_W = `CLOG2(NUM_DEC + 1);
+`endif
 
     reg [`VX_CFG_NUM_WARPS-1:0][CNTR_W-1:0] cnt_r;
     reg [`VX_CFG_NUM_WARPS-1:0]             drained_r;
@@ -61,12 +69,27 @@ module VX_dlmem_wtrack import VX_gpu_pkg::*, VX_dlmem_pkg::*; #(
             end
         end
 
+`ifdef VX_CFG_H100_SM_ENABLE
+        wire [NUM_DEC-1:0][DEC_W-1:0] dec_w;
+        for (genvar i = 0; i < NUM_DEC; ++i) begin : g_dec
+            assign dec_w[i] = (dec_valid[i] && (dec_wid[i] == NW_WIDTH'(w))) ? DEC_W'(dec_cnt[i]) : '0;
+        end
+
+        reg [DEC_W-1:0] dec_sum;
+        always @(*) begin
+            dec_sum = '0;
+            for (integer i = 0; i < NUM_DEC; ++i) begin
+                dec_sum = dec_sum + dec_w[i];
+            end
+        end
+`else
         wire [NUM_DEC-1:0] dec_w;
         for (genvar i = 0; i < NUM_DEC; ++i) begin : g_dec
             assign dec_w[i] = dec_valid[i] && (dec_wid[i] == NW_WIDTH'(w));
         end
         wire [DEC_W-1:0] dec_sum;
         `POP_COUNT(dec_sum, dec_w);
+`endif
 
         wire [SUM_W-1:0] cnt_inc = SUM_W'(cnt_r[w]) + inc_sum;
         wire [SUM_W-1:0] cnt_n   = cnt_inc - SUM_W'(dec_sum);

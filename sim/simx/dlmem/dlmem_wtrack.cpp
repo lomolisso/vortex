@@ -25,7 +25,13 @@ DlmemWTrack::DlmemWTrack(const SimContext& ctx,
   , IncIn(num_inc, this)
   , DecIn(this)
   , DoneIn(this)
+#ifdef VX_CFG_H100_SM_ENABLE
+  // A bank commits one atomic per cycle, its pulse sent 2 cycles on: 3 in flight.
+  , CommitIn(num_commit, SimChannel<WtInc>(this, 3))
+#else
   , CommitIn(num_commit, this)
+#endif
+#line 29
   , max_count_(max_count)
   , cnt_(num_warps, 0)
   , drained_(num_warps, true) {
@@ -79,9 +85,17 @@ void DlmemWTrack::on_tick() {
     if (in.empty()) {
       continue;
     }
+#ifdef VX_CFG_H100_SM_ENABLE
+    auto& c = in.peek();
+    __assert(c.wid < NW, this->name() << ": commit warp id " << c.wid << " out of range");
+    dec[c.wid] += c.cnt;
+#else
+#line 82
     uint32_t wid = in.peek();
     __assert(wid < NW, this->name() << ": commit warp id " << wid << " out of range");
     ++dec[wid];
+#endif
+#line 85
     in.pop();
   }
   for (uint32_t w = 0; w < NW; ++w) {

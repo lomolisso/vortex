@@ -156,6 +156,17 @@ private:
 	// Per-cycle handlers.
 	void process_response_step(uint32_t b);
 	void process_request_step(uint32_t b);
+#ifdef VX_CFG_H100_SM_ENABLE
+	// The response this cycle's step takes: a held completion whose hit time
+	// has come, else the port's head; nullptr when there is none to take.
+	SimChannel<LsuRsp>* h100_rsp_source(uint32_t b);
+#else
+#if (defined(DXA_MBAR_ENABLE) && defined(TCU_META_ENABLE)) || (defined(DXA_MBAR_ENABLE))
+#line 155
+#else
+#line 133
+#endif
+#endif
 
 	// Drain Inputs[b] into req_queue.
 	void ingest_inputs(uint32_t b);
@@ -212,6 +223,12 @@ private:
 	#ifdef VX_CFG_EXT_DLMEM_ENABLE
 		bool        gload      = false;  // a global read packet, counted in gload_
 	#endif
+#ifdef VX_CFG_H100_SM_ENABLE
+		// a global load's response leaves no earlier than this cycle (its L1 hit time)
+		uint64_t    h100_release = 0;
+#else
+#line 177
+#endif
 	};
 
 	// Per-block LSU state. Each member is a named hardware sub-block.
@@ -239,6 +256,14 @@ private:
 
 	std::array<lsu_state_t, VX_CFG_NUM_LSU_BLOCKS> states_;
 	uint64_t pending_loads_;
+#ifdef VX_CFG_H100_SM_ENABLE
+	// Per block: the responses that complete a load before its L1 hit time,
+	// in arrival order, until that time.
+	std::vector<SimChannel<LsuRsp>> h100_held_ = std::vector<SimChannel<LsuRsp>>(
+		VX_CFG_NUM_LSU_BLOCKS, SimChannel<LsuRsp>(this, VX_CFG_L1_HIT_LATENCY));
+#else
+#line 204
+#endif
 
 #ifdef VX_CFG_EXT_DLMEM_ENABLE
 	// Packets of each warp's acquire AMO answered so far; a warp has at most one,

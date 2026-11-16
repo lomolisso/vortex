@@ -42,7 +42,19 @@ protected:
 	// is registered before the update is computed, so an atomic owns its bank
 	// for three cycles -- read, capture, write back -- and it accepts nothing
 	// else meanwhile.
+#ifdef VX_CFG_H100_SM_ENABLE
+	// The H100 port pipelines a bank's atomics, one update a cycle: an
+	// atomic occupies no extra cycle and leaves no read-after-write shadow.
+	static constexpr uint32_t AMO_BANK_STALL_CYCLES = 0;
+	// The one cycle after its accept in which an atomic holds the bank's write
+	// port (if it stores) and its commit port (if counted).
+	std::vector<uint64_t> amo_wb_store_at_;
+	std::vector<uint64_t> amo_commit_at_;
+#else
+#line 45
 	static constexpr uint32_t AMO_BANK_STALL_CYCLES = 2;
+#endif
+#line 46
 	std::vector<uint32_t> amo_busy_;
 	// A read issued the cycle after a write to the same word returns the word's
 	// pre-update value, so the bank holds such a read off for one cycle. The
@@ -56,7 +68,8 @@ protected:
 	// neither leaves a shadow behind.
 	std::vector<bool>     amo_rdw_pending_;
 #endif
-	MemCrossBar::Ptr mem_xbar_;
+#line 59
+	MemCrossBar::Ptr mem_xbar_; LMEM_PAIR_MEMBER
 	mutable PerfStats perf_stats_;
 #ifdef VX_CFG_EXT_DLMEM_ENABLE
 	// Per bank, the cycle the last commit pulse lands.
@@ -129,7 +142,7 @@ protected:
 	// The word a bank is addressed by. Two byte addresses falling in one word
 	// are the same access as far as the bank is concerned.
 	uint64_t bank_word(uint64_t addr) {
-		return to_local_addr(addr) >> log2ceil(config_.line_size);
+		return to_local_addr(addr) >> log2ceil(LMEM_BANK_GRAIN);
 	}
 #endif
 
@@ -168,7 +181,7 @@ public:
 	{
 		char sname[100];
 		snprintf(sname, 100, "%s-xbar", simobject->name().c_str());
-		uint32_t lg2_line_size = log2ceil(config_.line_size);
+		uint32_t lg2_line_size = log2ceil(LMEM_BANK_GRAIN);
 		uint32_t num_banks = 1 << config.B;
 		// Round-robin across the LSU ports: a fixed priority lets a lower LSU
 		// block hold a contended bank forever and starve the others.
@@ -219,12 +232,17 @@ public:
 	virtual ~Impl() {}
 
 	void reset() {
-		perf_stats_ = PerfStats();
+		perf_stats_ = PerfStats(); LMEM_PAIR_RESET
 #if VX_CFG_EXT_A_ENABLED
 		amo_unit_.reset();
 		std::fill(amo_busy_.begin(), amo_busy_.end(), 0);
 		std::fill(amo_rdw_valid_.begin(), amo_rdw_valid_.end(), false);
 		std::fill(amo_rdw_pending_.begin(), amo_rdw_pending_.end(), false);
+#ifdef VX_CFG_H100_SM_ENABLE
+		amo_wb_store_at_.assign(amo_busy_.size(), ~uint64_t(0));
+		amo_commit_at_.assign(amo_busy_.size(), ~uint64_t(0));
+#endif
+#line 228
 #endif
 #ifdef VX_CFG_EXT_DLMEM_ENABLE
 		std::fill(commit_due_.begin(), commit_due_.end(), 0);
@@ -271,8 +289,29 @@ public:
 		__assert(due > commit_due_.at(bank), simobject_->name() << "-bank" << bank
 		         << ": two commit pulses in one cycle");
 		commit_due_.at(bank) = due;
+#ifdef VX_CFG_H100_SM_ENABLE
+		simobject_->CommitOut.at(bank).send(WtInc{(req.hart_id >> LOG_THREADS) & WID_MASK, 1}, delay);
+#else
 		simobject_->CommitOut.at(bank).send((req.hart_id >> LOG_THREADS) & WID_MASK, delay);
+#endif
 	}
+#endif
+#if defined(VX_CFG_EXT_DLMEM_ENABLE) && !defined(VX_CFG_EXT_FPAMO_ENABLE) && defined(DXA_MBAR_ENABLE)
+#line 175
+#elif defined(VX_CFG_EXT_DLMEM_ENABLE) && !defined(VX_CFG_EXT_FPAMO_ENABLE) && defined(VX_CFG_EXT_MBAR_ENABLE)
+#line 163
+#elif defined(VX_CFG_EXT_DLMEM_ENABLE) && !defined(VX_CFG_EXT_FPAMO_ENABLE) && defined(VX_CFG_EXT_DXA_ENABLE)
+#line 156
+#elif defined(VX_CFG_EXT_DLMEM_ENABLE) && !defined(VX_CFG_EXT_FPAMO_ENABLE)
+#line 151
+#elif defined(DXA_MBAR_ENABLE)
+#line 270
+#elif defined(VX_CFG_EXT_MBAR_ENABLE)
+#line 181
+#elif defined(VX_CFG_EXT_DXA_ENABLE)
+#line 174
+#else
+#line 169
 #endif
 
 #ifdef VX_CFG_EXT_MBAR_ENABLE
@@ -565,11 +604,11 @@ private:
 		const uint32_t num_banks = 1u << config_.B;
 		if (!req.is_write())
 			return ~uint64_t(0) >> (64 - num_banks);
-		const uint32_t lg_word = log2ceil(config_.line_size);
+		const uint32_t lg_word = log2ceil(LMEM_BANK_GRAIN);
 		const uint64_t block = req.addr & ~uint64_t(VX_CFG_MEM_BLOCK_SIZE - 1);
 		uint64_t banks = 0;
-		for (uint32_t w = 0; w < VX_CFG_MEM_BLOCK_SIZE / config_.line_size; ++w) {
-			if ((req.byteen >> (w * config_.line_size)) & ((uint64_t(1) << config_.line_size) - 1)) {
+		for (uint32_t w = 0; w < VX_CFG_MEM_BLOCK_SIZE / LMEM_BANK_GRAIN; ++w) {
+			if ((req.byteen >> (w * LMEM_BANK_GRAIN)) & ((uint64_t(1) << LMEM_BANK_GRAIN) - 1)) {
 				banks |= uint64_t(1) << (((block >> lg_word) + w) & (num_banks - 1));
 			}
 		}
@@ -585,7 +624,12 @@ private:
 	// the one behind it waits in the engine's buffer.
 	void bulk_take(uint32_t input, const MemReq& req) {
 		// A row wider than a block comes as one access per block, side by side.
+#ifdef VX_CFG_H100_SM_ENABLE
+		const uint32_t row_blocks = std::max<uint32_t>(1, VX_CFG_LMEM_PORT_BYTES / VX_CFG_MEM_BLOCK_SIZE);
+#else
+#line 588
 		const uint32_t row_blocks = std::max<uint32_t>(1, (config_.line_size << config_.B) / VX_CFG_MEM_BLOCK_SIZE);
+#endif
 		if (bulk_port_.size() >= 2 * row_blocks)
 			return;
 		if (dxa_hold_ && is_dxa_write(req) && !beat_before(req.dxa.beat, dxa_hold_beat_))
@@ -639,6 +683,10 @@ private:
 			bool busy = false;
 			for (uint32_t b = 0; b < (1u << config_.B); ++b) {
 				busy |= ((e.banks >> b) & 1) && amo_busy_[b] != 0;
+#ifdef VX_CFG_H100_SM_ENABLE
+				busy |= ((e.banks >> b) & 1) && amo_wb_store_at_[b] == now;
+#endif
+#line 642
 			}
 			if (busy || !this->serve_bulk_dma(e.req))
 				break;
@@ -677,7 +725,7 @@ private:
 			ram_.read(rsp.data->data(), block, VX_CFG_MEM_BLOCK_SIZE);
 			out.send(rsp, 1);
 		}
-		DT(4, simobject_->name() << "-bank" << (uint32_t(req.addr >> log2ceil(config_.line_size)) & ((1u << config_.B) - 1))
+		DT(4, simobject_->name() << "-bank" << (uint32_t(req.addr >> log2ceil(LMEM_BANK_GRAIN)) & ((1u << config_.B) - 1))
 		   << (req.dxa.remote ? " row : " : " bulk : ") << req);
 		perf_stats_.reads  += !req.is_write();
 		perf_stats_.writes += req.is_write();
@@ -768,13 +816,25 @@ public:
 			if (xbar_req_out.empty())
 				continue;
 
-			auto& bank_req = xbar_req_out.peek();
+			auto& bank_req = xbar_req_out.peek(); LMEM_PAIR_HELD(i, bank_req)
 
 #if VX_CFG_EXT_A_ENABLED
 			// A read of the word the write-back just stored waits a cycle. An
 			// atomic reads the bank for its old value, so it counts as a reader
 			// here even though the request carries a write flag; that is what
 			// makes contending atomics on one word cost four cycles.
+#ifdef VX_CFG_H100_SM_ENABLE
+			if (!memop_is_atomic(bank_req.op)) {
+				const uint64_t now = SimPlatform::instance().cycles();
+				if (bank_req.is_write() && amo_wb_store_at_[i] == now)
+					continue;
+#ifdef VX_CFG_EXT_DLMEM_ENABLE
+				if (bank_req.flags.lacc && amo_commit_at_[i] == now)
+					continue;
+#endif
+			}
+#endif
+#line 778
 			const bool reads_bank = !bank_req.is_write() || memop_is_atomic(bank_req.op);
 			if (rdw_shadow
 			 && reads_bank
@@ -850,6 +910,30 @@ public:
 #line 236
 #endif
 #endif
+#ifdef VX_CFG_H100_SM_ENABLE
+				if (smem_amo_pair(bank_req) && width == 3) {
+					const auto lo = amo_compute(op, 2, old_word, rhs, bank_req.flags.amo_unsigned);
+					const auto hi = amo_compute(op, 2, old_word >> 32, rhs >> 32, bank_req.flags.amo_unsigned);
+					rmw.new_word = (lo.new_word & 0xffffffffull) | (hi.new_word << 32);
+					rmw.ret_word = (lo.ret_word & 0xffffffffull) | (hi.ret_word << 32);
+				}
+#elif defined(VX_CFG_EXT_FPAMO_ENABLE) && defined(DXA_MBAR_ENABLE)
+#line 758
+#elif defined(VX_CFG_EXT_FPAMO_ENABLE) && defined(VX_CFG_EXT_MBAR_ENABLE)
+#line 296
+#elif defined(VX_CFG_EXT_FPAMO_ENABLE) && defined(VX_CFG_EXT_DXA_ENABLE)
+#line 376
+#elif defined(VX_CFG_EXT_FPAMO_ENABLE)
+#line 256
+#elif defined(DXA_MBAR_ENABLE)
+#line 617
+#elif defined(VX_CFG_EXT_MBAR_ENABLE)
+#line 277
+#elif defined(VX_CFG_EXT_DXA_ENABLE)
+#line 357
+#else
+#line 237
+#endif
 #ifdef VX_CFG_EXT_MBAR_ENABLE
 				if (is_mbar) {
 					const uint32_t err = mbar_ref::apply(mbar_op_code(op), old_word, rhs).err;
@@ -916,8 +1000,21 @@ public:
 				DT(4, simobject_->name() << "-bank" << i << " amo : " << bank_req);
 				amo_rdw_addr_[i]    = this->bank_word(bank_req.addr);
 				amo_rdw_pending_[i] = do_store;
+#ifdef VX_CFG_H100_SM_ENABLE
+				amo_wb_store_at_[i] = do_store ? SimPlatform::instance().cycles() + 1 : ~uint64_t(0);
+				pair_hold_.write_back(i, do_store, bank_req.addr, bank_req.byteen, SimPlatform::instance().cycles() + 1);
+#endif
+#line 919
 #ifdef VX_CFG_EXT_DLMEM_ENABLE
+#ifdef VX_CFG_H100_SM_ENABLE
+				// Committed at the write-back, the cycle after the accept, registered.
+				amo_commit_at_[i] = bank_req.flags.lacc ? SimPlatform::instance().cycles() + 1 : ~uint64_t(0);
+				this->commit_pulse(i, bank_req, 2);
+#else
+#line 920
 				this->commit_pulse(i, bank_req, AMO_BANK_STALL_CYCLES + 1);
+#endif
+#line 921
 #endif
 #ifdef VX_CFG_EXT_MBAR_ENABLE
 				if (is_mbar) {
@@ -926,7 +1023,7 @@ public:
 #else
 #line 283
 #endif
-				xbar_req_out.pop();
+				LMEM_PAIR_TAKE(i, bank_req) xbar_req_out.pop();
 				amo_busy_[i] = AMO_BANK_STALL_CYCLES;   // capture, then write back
 #ifdef VX_CFG_EXT_FPAMO_ENABLE
 #elif defined(DXA_MBAR_ENABLE)
@@ -1044,7 +1141,7 @@ public:
 #endif
 
 			// remove input
-			xbar_req_out.pop();
+			LMEM_PAIR_TAKE(i, bank_req) xbar_req_out.pop();
 		}
 #ifdef VX_CFG_EXT_MBAR_ENABLE
 		if (cpa_xbar_) {
@@ -1065,6 +1162,29 @@ public:
 		perf_stats_.bank_stalls = mem_xbar_->collisions();
 		return perf_stats_;
 	}
+#ifdef VX_CFG_H100_SM_ENABLE
+
+	void sm_init() {
+		if ((uint64_t(1) << VX_CFG_LMEM_LOG_SIZE) > VX_CFG_LMEM_DESC_REACH_BYTES)
+			throw std::runtime_error("the local memory exceeds the wgmma descriptor reach");
+		// Every other client's access takes the port for a cycle, charged
+		// when it arrives.
+		for (uint32_t i = LSU_NUM_REQS; i < simobject_->Inputs.size(); ++i) {
+			simobject_->Inputs.at(i).tx_callback([this](const MemReq&, uint64_t) { this->ext_mark(); });
+		}
+	}
+
+private:
+	void ext_mark() {
+		const uint64_t now = SimPlatform::instance().cycles();
+		if (ext_cycle_ == now)
+			return;
+		ext_cycle_ = now;
+		simobject_->ExtOut.send(true, 1);
+	}
+
+	uint64_t ext_cycle_ = UINT64_MAX;
+#endif
 
 };
 
@@ -1115,7 +1235,13 @@ LocalMem::LocalMem(const SimContext& ctx, const char* name, const Config& config
 #line 371
 #endif
 	, impl_(new Impl(this, config))
+#ifdef VX_CFG_H100_SM_ENABLE
+{
+	impl_->sm_init();
+}
+#else
 {}
+#endif
 
 LocalMem::~LocalMem() {
   delete impl_;

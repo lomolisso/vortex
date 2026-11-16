@@ -771,3 +771,64 @@ tests:
 
   shape:
     threads: [4, 16]
+
+# E12: the H100 SM path (VX_CFG_H100_SM_ENABLE); expectations come from sw/common/{smem_bank,l1,sm_port}_ref.h.
+- id: sm-tma-tpc
+  via: blackbox
+  drivers: [simx, rtlsim]
+  xlen: [64]
+  app: sm_port
+  configs: "-DVX_CFG_H100_SM_ENABLE -DVX_CFG_L2_ENABLE -DVX_CFG_EXT_DLMEM_ENABLE -DVX_CFG_EXT_A_ENABLE -DVX_CFG_EXT_MBAR_ENABLE -DVX_CFG_EXT_DXA_ENABLE -DVX_CFG_SOCKET_SIZE=2"
+  shape: {cores: 2, warps: 4, threads: 32}
+  touches: [VX_config.toml, hw/rtl/VX_gpu_pkg.sv, hw/rtl/VX_socket.sv, hw/rtl/mem, hw/rtl/cache, hw/rtl/core,
+            hw/rtl/dlmem, hw/rtl/dxa, hw/rtl/libs/VX_mem_coalescer.sv, sim/simx, sw/common/smem_bank_ref.h,
+            sw/common/l1_ref.h, sw/common/sm_port_ref.h, tests/regression/smem_bank, tests/regression/l1_sector,
+            tests/regression/sm_port]
+  args: "-m 10"
+- id: model_parity-org-dxa_load
+  check: model_parity
+  xlen: [64]
+  app: dxa_load
+  configs: "-DVX_CFG_H100_SM_ENABLE -DVX_CFG_L2_ENABLE -DVX_CFG_EXT_DLMEM_ENABLE -DVX_CFG_EXT_A_ENABLE -DVX_CFG_EXT_MBAR_ENABLE -DVX_CFG_EXT_DXA_ENABLE"
+  shape: {cores: 1, warps: 4, threads: 32}
+  touches: [VX_config.toml, hw/rtl/VX_gpu_pkg.sv, hw/rtl/VX_socket.sv, hw/rtl/mem, hw/rtl/cache, hw/rtl/core,
+            hw/rtl/dlmem, hw/rtl/dxa, hw/rtl/libs/VX_mem_coalescer.sv, sim/simx, sw/common/smem_bank_ref.h,
+            sw/common/l1_ref.h, sw/common/sm_port_ref.h, tests/regression/smem_bank, tests/regression/l1_sector,
+            tests/regression/sm_port]
+  args: "-m swz -s 128"
+- id: org-dxa_load
+  via: blackbox
+  drivers: [simx]
+  xlen: [64]
+  app: dxa_load
+  configs: "-DVX_CFG_H100_SM_ENABLE -DVX_CFG_L2_ENABLE -DVX_CFG_EXT_DLMEM_ENABLE -DVX_CFG_EXT_A_ENABLE -DVX_CFG_EXT_MBAR_ENABLE -DVX_CFG_EXT_DXA_ENABLE"
+  shape: {cores: 1, warps: 4, threads: 32}
+  touches: [VX_config.toml, hw/rtl/VX_gpu_pkg.sv, hw/rtl/VX_socket.sv, hw/rtl/mem, hw/rtl/cache, hw/rtl/core,
+            hw/rtl/dlmem, hw/rtl/dxa, hw/rtl/libs/VX_mem_coalescer.sv, sim/simx, sw/common/smem_bank_ref.h,
+            sw/common/l1_ref.h, sw/common/sm_port_ref.h, tests/regression/smem_bank, tests/regression/l1_sector,
+            tests/regression/sm_port]
+  args: "-m swz -s 128"
+- id: org-dxa_store
+  via: blackbox
+  drivers: [simx]
+  xlen: [64]
+  app: dxa_store
+  configs: "-DVX_CFG_H100_SM_ENABLE -DVX_CFG_L2_ENABLE -DVX_CFG_EXT_DLMEM_ENABLE -DVX_CFG_EXT_A_ENABLE -DVX_CFG_EXT_MBAR_ENABLE -DVX_CFG_EXT_DXA_ENABLE"
+  shape: {cores: 1, warps: 4, threads: 32}
+  touches: [VX_config.toml, hw/rtl/VX_gpu_pkg.sv, hw/rtl/VX_socket.sv, hw/rtl/mem, hw/rtl/cache, hw/rtl/core,
+            hw/rtl/dlmem, hw/rtl/dxa, hw/rtl/libs/VX_mem_coalescer.sv, sim/simx, sw/common/smem_bank_ref.h,
+            sw/common/l1_ref.h, sw/common/sm_port_ref.h, tests/regression/smem_bank, tests/regression/l1_sector,
+            tests/regression/sm_port]
+  args: "-m bst"
+- id: org-dxa_copy_mcast
+  via: blackbox
+  drivers: [simx, rtlsim]
+  xlen: [64]
+  app: dxa_copy_mcast
+  configs: "-DVX_CFG_H100_SM_ENABLE -DVX_CFG_EXT_DXA_ENABLE"
+  shape: {cores: 2, threads: 32, l2cache: true}
+  args: "-r16 -c32 -R16 -C32"
+  touches: [VX_config.toml, hw/rtl/VX_gpu_pkg.sv, hw/rtl/VX_socket.sv, hw/rtl/mem, hw/rtl/cache, hw/rtl/core,
+            hw/rtl/dlmem, hw/rtl/dxa, hw/rtl/libs/VX_mem_coalescer.sv, sim/simx, sw/common/smem_bank_ref.h,
+            sw/common/l1_ref.h, sw/common/sm_port_ref.h, tests/regression/smem_bank, tests/regression/l1_sector,
+            tests/regression/sm_port]

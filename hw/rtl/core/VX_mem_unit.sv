@@ -41,6 +41,12 @@ module VX_mem_unit import VX_gpu_pkg::*; #(
     // Per local-memory bank, an LSU access performed in the previous cycle, and its warp
     output wire [`VX_CFG_LMEM_NUM_BANKS-1:0] lmem_commit_valid,
     output wire [`VX_CFG_LMEM_NUM_BANKS-1:0][NW_WIDTH-1:0] lmem_commit_wid,
+`ifdef VX_CFG_H100_SM_ENABLE
+    // Per LSU block, counted lanes the shared-memory port served with another lane's access
+    output wire [`VX_CFG_NUM_LSU_BLOCKS-1:0] lmem_fold_valid,
+    output wire [`VX_CFG_NUM_LSU_BLOCKS-1:0][NW_WIDTH-1:0] lmem_fold_wid,
+    output wire [`VX_CFG_NUM_LSU_BLOCKS-1:0][`CLOG2(`VX_CFG_NUM_LSU_LANES+1)-1:0] lmem_fold_cnt,
+`endif
 `endif
 
 `ifdef VX_CFG_EXT_MBAR_ENABLE
@@ -146,6 +152,40 @@ module VX_mem_unit import VX_gpu_pkg::*; #(
     `endif
     end
 
+`ifdef VX_CFG_H100_SM_ENABLE
+    `STATIC_ASSERT((64'(1) << `VX_CFG_LMEM_LOG_SIZE) <= 64'(`VX_CFG_LMEM_DESC_REACH_BYTES), ("LMEM exceeds the wgmma descriptor reach"))
+
+    // The SM's shared-memory port: one wavefront a cycle over the LSU blocks.
+    VX_lsu_mem_if #(
+        .NUM_LANES (`VX_CFG_NUM_LSU_LANES),
+        .DATA_SIZE (LSU_WORD_SIZE),
+        .TAG_WIDTH (LSU_TAG_WIDTH)
+    ) lsu_lmem_g_if[`VX_CFG_NUM_LSU_BLOCKS]();
+
+    wire lmem_ext_valid;
+
+    VX_smem_gate #(
+        .INSTANCE_ID  (`SFORMATF(("%s-smem-gate", INSTANCE_ID))),
+        .NUM_BLOCKS   (`VX_CFG_NUM_LSU_BLOCKS),
+        .NUM_LANES    (`VX_CFG_NUM_LSU_LANES),
+        .WORD_SIZE    (LSU_WORD_SIZE),
+        .TAG_WIDTH    (LSU_TAG_WIDTH),
+        .TAG_SEL_BITS (LSU_TAG_WIDTH - UUID_WIDTH),
+        .ADDR_WIDTH   (LSU_ADDR_WIDTH)
+    ) smem_gate (
+        .clk       (clk),
+        .reset     (reset),
+        .ext_valid (lmem_ext_valid),
+        .in_if     (lsu_lmem_if),
+        .out_if    (lsu_lmem_g_if)
+    `ifdef VX_CFG_EXT_DLMEM_ENABLE
+        , .fold_valid (lmem_fold_valid)
+        , .fold_wid   (lmem_fold_wid)
+        , .fold_cnt   (lmem_fold_cnt)
+    `endif
+    );
+
+`endif
     // Per-block local memory adapters to avoid deadlock when NUM_LSU_BLOCKS > 1.
     // Each block gets dedicated ports into local memory, eliminating the circular
     // dependency that arises from sharing a single adapter's unpack/pack buffers.
@@ -188,6 +228,52 @@ module VX_mem_unit import VX_gpu_pkg::*; #(
     ) lmem_adapt_if[LSU_NUM_REQS + 1]();
 `endif
 
+`ifdef VX_CFG_H100_SM_ENABLE
+    // The ingress presents one SM-to-SM slot; the word its bytes select goes
+    // to the banks, and the read word comes back at every word of the slot.
+    localparam ING_WORDS    = LMEM_INGRESS_DATA_SIZE / LSU_WORD_SIZE;
+    localparam ING_OFF_BITS = `CLOG2(ING_WORDS);
+    `STATIC_ASSERT(LMEM_INGRESS_DATA_SIZE % LSU_WORD_SIZE == 0, ("the ingress slot must hold whole LSU words"))
+    `STATIC_ASSERT(($bits(dlmem_lmem_if.req_data.addr) + ING_OFF_BITS) == LMEM_ADDR_WIDTH, ("invalid parameter"))
+    `STATIC_ASSERT($bits(dlmem_lmem_if.req_data.tag) == LSU_TAG_WIDTH, ("invalid parameter"))
+
+    wire [ING_WORDS-1:0] ing_word_en;
+    for (genvar k = 0; k < ING_WORDS; ++k) begin : g_ing_word_en
+        assign ing_word_en[k] = |dlmem_lmem_if.req_data.byteen[k * LSU_WORD_SIZE +: LSU_WORD_SIZE];
+    end
+    wire [`UP(ING_OFF_BITS)-1:0] ing_off;
+    VX_priority_encoder #(
+        .N (ING_WORDS)
+    ) ing_word_enc (
+        .data_in   (ing_word_en),
+        .index_out (ing_off),
+        `UNUSED_PIN (onehot_out),
+        `UNUSED_PIN (valid_out)
+    );
+    `RUNTIME_ASSERT(~dlmem_lmem_if.req_valid || ($countones(ing_word_en) <= 1),
+        ("%t: *** %s: an ingress slot request with more than one word", $time, INSTANCE_ID))
+
+    wire [LMEM_ADDR_WIDTH-1:0] ing_word_addr;
+    if (ING_OFF_BITS != 0) begin : g_ing_word_addr
+        assign ing_word_addr = {dlmem_lmem_if.req_data.addr, ing_off[ING_OFF_BITS-1:0]};
+    end else begin : g_ing_word_addr1
+        assign ing_word_addr = dlmem_lmem_if.req_data.addr;
+    end
+
+    assign lmem_adapt_if[LMEM_INGRESS_IDX].req_valid       = dlmem_lmem_if.req_valid;
+    assign lmem_adapt_if[LMEM_INGRESS_IDX].req_data.rw     = dlmem_lmem_if.req_data.rw;
+    assign lmem_adapt_if[LMEM_INGRESS_IDX].req_data.addr   = LSU_ADDR_WIDTH'(ing_word_addr);
+    assign lmem_adapt_if[LMEM_INGRESS_IDX].req_data.data   = dlmem_lmem_if.req_data.data[ing_off * LSU_WORD_SIZE * 8 +: LSU_WORD_SIZE * 8];
+    assign lmem_adapt_if[LMEM_INGRESS_IDX].req_data.byteen = dlmem_lmem_if.req_data.byteen[ing_off * LSU_WORD_SIZE +: LSU_WORD_SIZE];
+    assign lmem_adapt_if[LMEM_INGRESS_IDX].req_data.attr   = dlmem_lmem_if.req_data.attr;
+    assign lmem_adapt_if[LMEM_INGRESS_IDX].req_data.tag    = dlmem_lmem_if.req_data.tag;
+    assign dlmem_lmem_if.req_ready = lmem_adapt_if[LMEM_INGRESS_IDX].req_ready;
+
+    assign dlmem_lmem_if.rsp_valid     = lmem_adapt_if[LMEM_INGRESS_IDX].rsp_valid;
+    assign dlmem_lmem_if.rsp_data.data = {ING_WORDS{lmem_adapt_if[LMEM_INGRESS_IDX].rsp_data.data}};
+    assign dlmem_lmem_if.rsp_data.tag  = lmem_adapt_if[LMEM_INGRESS_IDX].rsp_data.tag;
+    assign lmem_adapt_if[LMEM_INGRESS_IDX].rsp_ready = dlmem_lmem_if.rsp_ready;
+`else
     `STATIC_ASSERT($bits(dlmem_lmem_if.req_data.addr) == LMEM_ADDR_WIDTH, ("invalid parameter"))
     `STATIC_ASSERT($bits(dlmem_lmem_if.req_data.tag) == LSU_TAG_WIDTH, ("invalid parameter"))
 
@@ -203,6 +289,7 @@ module VX_mem_unit import VX_gpu_pkg::*; #(
     assign dlmem_lmem_if.rsp_valid = lmem_adapt_if[LMEM_INGRESS_IDX].rsp_valid;
     assign dlmem_lmem_if.rsp_data  = lmem_adapt_if[LMEM_INGRESS_IDX].rsp_data;
     assign lmem_adapt_if[LMEM_INGRESS_IDX].rsp_ready = dlmem_lmem_if.rsp_ready;
+`endif
 `else
     VX_mem_bus_if #(
         .DATA_SIZE (LSU_WORD_SIZE),
@@ -228,7 +315,11 @@ module VX_mem_unit import VX_gpu_pkg::*; #(
         ) lmem_adapter (
             .clk        (clk),
             .reset      (reset),
+        `ifdef VX_CFG_H100_SM_ENABLE
+            .lsu_mem_if (lsu_lmem_g_if[i]),
+        `else
             .lsu_mem_if (lsu_lmem_if[i]),
+        `endif
             .mem_bus_if (lmem_block_if)
         );
 
@@ -355,10 +446,21 @@ module VX_mem_unit import VX_gpu_pkg::*; #(
     `ifdef VX_CFG_EXT_DXA_ENABLE
         wire [`VX_CFG_LMEM_NUM_BANKS-1:0] dxa_bank_wr_fire;
         for (genvar i = 0; i < `VX_CFG_LMEM_NUM_BANKS; ++i) begin : g_dxa_bank_wr_fire
+        `ifdef VX_CFG_H100_SM_ENABLE
+            // A port access covers the banks of its part of the row.
+            localparam BANKS_PER_PORT = LMEM_DMA_DATA_SIZE / LSU_WORD_SIZE;
+            wire in_part = (lmem_dma_if.req_data.addr % (`VX_CFG_LMEM_NUM_BANKS / BANKS_PER_PORT)) == (i / BANKS_PER_PORT);
+            assign dxa_bank_wr_fire[i] = lmem_dma_if.req_valid
+                                      && lmem_dma_if.req_ready
+                                      && lmem_dma_if.req_data.rw
+                                      && in_part
+                                      && (|lmem_dma_if.req_data.byteen[(i % BANKS_PER_PORT)*LSU_WORD_SIZE +: LSU_WORD_SIZE]);
+        `else
             assign dxa_bank_wr_fire[i] = lmem_dma_if.req_valid
                                       && lmem_dma_if.req_ready
                                       && lmem_dma_if.req_data.rw
                                       && (|lmem_dma_if.req_data.byteen[i*LSU_WORD_SIZE +: LSU_WORD_SIZE]);
+        `endif
         end
 
         VX_dxa_completion #(
@@ -404,11 +506,78 @@ module VX_mem_unit import VX_gpu_pkg::*; #(
     end
 
 `ifdef VX_CFG_EXT_MBAR_ENABLE
+`ifdef VX_CFG_H100_SM_ENABLE
+    localparam LMEM_ROW_WIDTH = `VX_CFG_LMEM_LOG_SIZE - `CLOG2(`VX_CFG_LMEM_NUM_BANKS * `VX_CFG_LMEM_BANK_BYTES);
+`else
     localparam LMEM_ROW_WIDTH = LMEM_ADDR_WIDTH - `CLOG2(`VX_CFG_LMEM_NUM_BANKS);
+`endif
     wire [`VX_CFG_LMEM_NUM_BANKS-1:0]                     mbar_evt_valid;
     wire [`VX_CFG_LMEM_NUM_BANKS-1:0]                     mbar_evt_flip;
     wire [`VX_CFG_LMEM_NUM_BANKS-1:0][NW_WIDTH-1:0]       mbar_evt_wid;
     wire [`VX_CFG_LMEM_NUM_BANKS-1:0][LMEM_ROW_WIDTH-1:0] mbar_evt_row;
+`endif
+
+`ifdef VX_CFG_H100_SM_ENABLE
+    // The port's LMEM_PORT_BYTES accesses into the banks' wider rows: the
+    // access's part of the row by its low address bits, carried in the tag
+    // to pick the read data.
+    localparam LMEM_ROW_BYTES = `VX_CFG_LMEM_NUM_BANKS * `VX_CFG_LMEM_BANK_BYTES;
+    localparam LMEM_ROW_PARTS = LMEM_ROW_BYTES / LMEM_DMA_DATA_SIZE;
+    localparam LMEM_PART_BITS = `CLOG2(LMEM_ROW_PARTS);
+    `STATIC_ASSERT(LMEM_ROW_BYTES % LMEM_DMA_DATA_SIZE == 0, ("the shared-memory port must divide a bank row"))
+
+    VX_mem_bus_if #(
+        .DATA_SIZE   (LMEM_ROW_BYTES),
+        .TAG_WIDTH   (LMEM_DMA_TAG_WIDTH + LMEM_PART_BITS),
+        .ATTR_WIDTH  (LMEM_DMA_ATTR_W),
+        .ADDR_WIDTH  (LMEM_DMA_ADDR_WIDTH - LMEM_PART_BITS)
+    ) lmem_row_if();
+
+    if (LMEM_ROW_PARTS > 1) begin : g_lmem_row_parts
+        wire [LMEM_PART_BITS-1:0] req_part = lmem_dma_if.req_data.addr[LMEM_PART_BITS-1:0];
+        wire [LMEM_PART_BITS-1:0] rsp_part = lmem_row_if.rsp_data.tag[LMEM_PART_BITS-1:0];
+        assign lmem_row_if.req_valid       = lmem_dma_if.req_valid;
+        assign lmem_row_if.req_data.rw     = lmem_dma_if.req_data.rw;
+        assign lmem_row_if.req_data.addr   = lmem_dma_if.req_data.addr[LMEM_DMA_ADDR_WIDTH-1:LMEM_PART_BITS];
+        assign lmem_row_if.req_data.data   = {LMEM_ROW_PARTS{lmem_dma_if.req_data.data}};
+        assign lmem_row_if.req_data.byteen = LMEM_ROW_BYTES'(lmem_dma_if.req_data.byteen) << (req_part * LMEM_DMA_DATA_SIZE);
+        assign lmem_row_if.req_data.attr   = lmem_dma_if.req_data.attr;
+        assign lmem_row_if.req_data.tag    = {lmem_dma_if.req_data.tag, req_part};
+        assign lmem_dma_if.req_ready       = lmem_row_if.req_ready;
+        assign lmem_dma_if.rsp_valid       = lmem_row_if.rsp_valid;
+        assign lmem_dma_if.rsp_data.data   = lmem_row_if.rsp_data.data[rsp_part * LMEM_DMA_DATA_SIZE * 8 +: LMEM_DMA_DATA_SIZE * 8];
+        assign lmem_dma_if.rsp_data.tag    = lmem_row_if.rsp_data.tag[LMEM_PART_BITS +: LMEM_DMA_TAG_WIDTH];
+        assign lmem_row_if.rsp_ready       = lmem_dma_if.rsp_ready;
+    end else begin : g_lmem_row_whole
+        `ASSIGN_VX_MEM_BUS_IF (lmem_row_if, lmem_dma_if);
+    end
+
+    // Every other client's access takes the port for a cycle, charged when
+    // it is first presented.
+`ifdef VX_CFG_EXT_MBAR_ENABLE
+    localparam LMEM_ALL_REQS = LMEM_NUM_REQS;
+`elsif VX_CFG_EXT_DLMEM_ENABLE
+    localparam LMEM_ALL_REQS = LSU_NUM_REQS + 1;
+`else
+    localparam LMEM_ALL_REQS = LSU_NUM_REQS;
+`endif
+    localparam LMEM_EXT_REQS = LMEM_ALL_REQS - LSU_NUM_REQS + 1;
+    wire [LMEM_EXT_REQS-1:0] lmem_ext_req, lmem_ext_fire;
+    assign lmem_ext_req[0]  = LMEM_DMA_EN && lmem_dma_if.req_valid;
+    assign lmem_ext_fire[0] = LMEM_DMA_EN && lmem_dma_if.req_valid && lmem_dma_if.req_ready;
+    for (genvar i = 1; i < LMEM_EXT_REQS; ++i) begin : g_lmem_ext
+        assign lmem_ext_req[i]  = lmem_adapt_if[LSU_NUM_REQS + i - 1].req_valid;
+        assign lmem_ext_fire[i] = lmem_adapt_if[LSU_NUM_REQS + i - 1].req_valid && lmem_adapt_if[LSU_NUM_REQS + i - 1].req_ready;
+    end
+    reg [LMEM_EXT_REQS-1:0] lmem_ext_wait_r;
+    always @(posedge clk) begin
+        if (reset) begin
+            lmem_ext_wait_r <= '0;
+        end else begin
+            lmem_ext_wait_r <= lmem_ext_req & ~lmem_ext_fire;
+        end
+    end
+    assign lmem_ext_valid = |(lmem_ext_req & ~lmem_ext_wait_r);
 `endif
 
     VX_local_mem #(
@@ -433,7 +602,11 @@ module VX_mem_unit import VX_gpu_pkg::*; #(
         .ADDR_WIDTH  (LMEM_ADDR_WIDTH),
         .TAG_WIDTH   (LSU_TAG_WIDTH),
         .DMA_ENABLE  (LMEM_DMA_EN),
+    `ifdef VX_CFG_H100_SM_ENABLE
+        .DMA_TAG_WIDTH (LMEM_DMA_TAG_WIDTH + LMEM_PART_BITS),
+    `else
         .DMA_TAG_WIDTH (LMEM_DMA_TAG_WIDTH),
+    `endif
         .AMO_ENABLE  (`VX_CFG_EXT_A_ENABLED),
         .OUT_BUF     (3)
     ) local_mem (
@@ -452,7 +625,11 @@ module VX_mem_unit import VX_gpu_pkg::*; #(
         .mbar_evt_wid      (mbar_evt_wid),
         .mbar_evt_row      (mbar_evt_row),
     `endif
+    `ifdef VX_CFG_H100_SM_ENABLE
+        .dma_bus_if  (lmem_row_if),
+    `else
         .dma_bus_if  (lmem_dma_if),
+    `endif
         .lsu_bus_if  (lmem_adapt_if)
     );
 
@@ -512,7 +689,11 @@ module VX_mem_unit import VX_gpu_pkg::*; #(
 
         for (genvar i = 0; i < `VX_CFG_NUM_LSU_BLOCKS; ++i) begin : g_coalescers
 
+        `ifdef VX_CFG_H100_SM_ENABLE
+            VX_mem_coalescer_h100 #(
+        `else
             VX_mem_coalescer #(
+        `endif
                 .INSTANCE_ID    (`SFORMATF(("%s-coalescer%0d", INSTANCE_ID, i))),
                 .NUM_REQS       (`VX_CFG_NUM_LSU_LANES),
                 .DATA_IN_SIZE   (LSU_WORD_SIZE),

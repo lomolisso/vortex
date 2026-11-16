@@ -317,3 +317,54 @@ tests:
     touches: [sim/simx/dxa, sim/simx/mem/local_mem, sim/simx/types.h, sim/simx/Makefile,
               sim/simx/cta_dispatcher, sim/simx/barrier_unit, tests/unittest/dxa_compl,
               tests/unittest/Makefile, sw/common/mbar_ref.h]
+  # The H100 SM path (RV64, VX_CFG_H100_SM_ENABLE). Each RTL bench runs its SimX
+  # twin on the same cases; the shared-memory port and L1 timing CSVs must be
+  # identical. The shared-memory port: wavefronts over 4-B banks with
+  # broadcast, atomic passes and every read's latency against
+  # smem_bank_ref.h, the other clients ahead of the LSU, one wavefront a cycle
+  # over 4 LSU blocks, counted DLMEM loads, 16 threads.
+  - id: hw-lmem-banks
+    via: script
+    xlen: [64]
+    run: "make -C hw/unittest run-lmem-banks"
+    touches: &e12_smem_touches [hw/rtl/mem/VX_smem_gate.sv, hw/rtl/mem/VX_lsu_mem_if.sv, hw/rtl/VX_gpu_pkg.sv,
+              hw/rtl/libs, sw/common/smem_bank_ref.h, hw/unittest/smem_gate, hw/unittest/Makefile,
+              sim/simx/mem/smem_gate.h, sim/simx/types.h, tests/unittest/smem_bank, VX_config.toml]
+  - id: sw-smem-bank
+    via: script
+    xlen: [64]
+    run: "make -C tests/unittest/smem_bank run CONFIGS='-DVX_CFG_H100_SM_ENABLE -DVX_CFG_NUM_THREADS=32 -DVX_CFG_EXT_A_ENABLE -DVX_CFG_EXT_ZACAS_ENABLE'"
+    touches: *e12_smem_touches
+  # The SM's L1 (VX_cache with H100_L1): sector fills, byte-valid store
+  # allocate, the XOR set index, insertion-ordered replacement, whole-L1
+  # invalidation, one line request per miss with its sector mask, two misses
+  # to one line; every outcome against l1_ref.h, at 16 and 32 ways.
+  - id: hw-cache-l1h100
+    via: script
+    xlen: [64]
+    run: "make -C hw/unittest run-l1h100"
+    touches: &e12_l1_touches [hw/rtl/cache, hw/rtl/VX_gpu_pkg.sv, hw/rtl/libs, sw/common/l1_ref.h,
+              hw/unittest/l1h100, hw/unittest/Makefile, sim/simx/mem/cache.h, sim/simx/mem/cache.cpp,
+              sim/simx/mem/sm_port.h, tests/unittest/l1_sector, VX_config.toml]
+  - id: sw-l1-sector
+    via: script
+    xlen: [64]
+    run: "make -C tests/unittest/l1_sector run CONFIGS='-DVX_CFG_H100_SM_ENABLE -DVX_CFG_NUM_THREADS=32'"
+    touches: *e12_l1_touches
+  # The SM port: egress rates and every leave cycle against sm_port_ref.h's
+  # SmEgressRef, the single-sector issue limits, the injection credit loop,
+  # the 5 : 1 ingress gate and the ejection cap, a DSMEM head holding the L2
+  # request behind it; with DLMEM and with a 64-B egress. The twin checks the
+  # same rates (its port also splits items into memory blocks).
+  - id: hw-sm-port
+    via: script
+    xlen: [64]
+    run: "make -C hw/unittest run-sm-port"
+    touches: &e12_port_touches [hw/rtl/mem/VX_sm_port.sv, hw/rtl/mem/VX_sm_ingress.sv, hw/rtl/VX_gpu_pkg.sv,
+              hw/rtl/dlmem/VX_dlmem_pkg.sv, hw/rtl/libs, sw/common/sm_port_ref.h, hw/unittest/sm_port,
+              hw/unittest/Makefile, sim/simx/mem/sm_port.h, tests/unittest/sm_port, VX_config.toml]
+  - id: sw-sm-port
+    via: script
+    xlen: [64]
+    run: "make -C tests/unittest/sm_port run CONFIGS='-DVX_CFG_H100_SM_ENABLE -DVX_CFG_NUM_THREADS=32 -DVX_CFG_EXT_DLMEM_ENABLE'"
+    touches: *e12_port_touches

@@ -269,6 +269,64 @@ void DlmemEgress::issue() {
       ent.uuid = req.uuid;
       ent.data = nullptr;
     }
+#ifdef VX_CFG_H100_SM_ENABLE
+    {
+      // The lanes of this request bound for one destination line form one SM
+      // packet, whose slot cost rides on its first message; an mbarrier
+      // operation is a packet of its own; an async request's extra bytes ride
+      // on its first message.
+      constexpr uint32_t kLine = VX_CFG_N5_LINE_BYTES;
+      constexpr uint32_t kSlot = VX_CFG_N5_SLOT_BYTES;
+      dlmem_ref::Cfg cfg{};
+      cfg.ncc = config_.ncc;
+      cfg.lmem_log = config_.lmem_log;
+      cfg.dlmem_base = config_.dlmem_base;
+      uint32_t sect_mask = 0;
+      bool pkt_first = true;
+      for (uint32_t k = 0; k < config_.num_lanes; ++k) {
+        if (!req.mask.test(k))
+          continue;
+        uint32_t kd = 0;
+        uint64_t kb = 0;
+        dlmem_ref::decode_remote(cfg, req.addrs.at(k), &kd, &kb);
+        if (kd != dst || (kb / kLine) != (lb / kLine))
+          continue;
+        sect_mask |= 1u << ((kb % kLine) / kSlot);
+        if (!rem_mask_.test(k))
+          pkt_first = false;
+      }
+      uint32_t sectors = __builtin_popcount(sect_mask);
+      bool mbar_op = false;
+      bool red_async = false;
+      uint32_t extra_hb = 0;
+    #ifdef VX_CFG_EXT_MBAR_ENABLE
+      bool req_first = (rem_mask_ == req.mask);
+      mbar_op = memop_is_mbar(req.op) && !is_async;
+      red_async = is_async && (req.op != MemOp::ST);
+      if (req_first && is_async) {
+        uint32_t bytes = red_async ? VX_CFG_N5_REDASYNC_EXTRA_BYTES
+                       : ((__builtin_popcountll(req.byteen.at(l)) <= 4) ? VX_CFG_N5_ASYNC_EXTRA_BYTES_B32
+                                                                        : VX_CFG_N5_ASYNC_EXTRA_BYTES_V4);
+        extra_hb = 2 * bytes / kSlot;
+      }
+    #endif
+      uint32_t cost;
+      if (req.op == MemOp::ST) {
+        cost = std::max<uint32_t>(sectors, VX_CFG_N5_MIN_SLOTS) * VX_CFG_SM_HB_DSMEM_SLOT;
+      } else if (pkt.op == MemOp::LD) {
+        cost = VX_CFG_SM_HB_DSMEM_LD_LINE;
+      } else {
+        cost = (sectors + VX_CFG_DSMEM_ATOM_EXTRA_SLOTS) * VX_CFG_SM_HB_DSMEM_SLOT;
+      }
+      pkt.pkt_hb = mbar_op ? VX_CFG_SM_HB_MBAR : (pkt_first ? cost + extra_hb : 0);
+      pkt.rsp_hb = (pkt_first && !mbar_op && !red_async && req.op != MemOp::ST)
+                 ? sectors * VX_CFG_SM_HB_DSMEM_SLOT : 0;
+    }
+#elif defined(VX_CFG_EXT_MBAR_ENABLE)
+#line 259
+#else
+#line 252
+#endif
     NetReqOut.send(pkt, 1);
     DT(4, this->name() << " issue block" << b << " lane" << l << ": " << pkt);
   }

@@ -48,7 +48,12 @@ module VX_dlmem_row_egress import VX_gpu_pkg::*, VX_dlmem_pkg::*; #(
 );
     `UNUSED_SPARAM (INSTANCE_ID)
 
+`ifdef VX_CFG_H100_SM_ENABLE
+    // A data word is one LSU word of the shared-memory port's row.
+    localparam NUM_BANKS = LMEM_DMA_DATA_SIZE / LSU_WORD_SIZE;
+`else
     localparam NUM_BANKS = `VX_CFG_LMEM_NUM_BANKS;
+`endif
     localparam BANK_BITS = `CLOG2(NUM_BANKS);
     localparam BANK_W    = `UP(BANK_BITS);
     localparam WORD_W    = LSU_WORD_SIZE * 8;

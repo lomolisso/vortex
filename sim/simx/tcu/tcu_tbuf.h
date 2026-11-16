@@ -45,6 +45,23 @@ public:
   // (abuf × Q, bbuf × 1) into one bank-row request channel.
   SimChannel<MemReq> lmem_req_out;
   SimChannel<MemRsp> lmem_rsp_in;
+#ifdef VX_CFG_H100_SM_ENABLE
+
+  // The local-memory inputs the buffers take. A read fetches a whole port row
+  // in one cycle as the RTL does, its 64-B blocks after the first on the
+  // adjacent inputs below; the TCU_H100 buffers read through one input.
+#ifdef VX_CFG_TCU_H100_ENABLE
+  static constexpr uint32_t LMEM_PORTS = 1;
+#else
+  static constexpr uint32_t LMEM_PORTS =
+      (VX_CFG_LMEM_PORT_BYTES > VX_CFG_MEM_BLOCK_SIZE)
+          ? (VX_CFG_LMEM_PORT_BYTES / VX_CFG_MEM_BLOCK_SIZE) : 1;
+  std::vector<SimChannel<MemReq>> lmem_row_req_out;
+  std::vector<SimChannel<MemRsp>> lmem_row_rsp_in;
+#endif
+#else
+#line 42
+#endif
 
   TcuTbuf(const SimContext& ctx, const char* name);
   virtual ~TcuTbuf();

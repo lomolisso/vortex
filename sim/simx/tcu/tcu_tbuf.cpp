@@ -24,6 +24,11 @@ using namespace vortex;
 namespace {
 
 constexpr uint64_t kLineMask = ~uint64_t(VX_CFG_MEM_BLOCK_SIZE - 1);
+#if defined(VX_CFG_H100_SM_ENABLE) && !defined(VX_CFG_TCU_H100_ENABLE)
+constexpr uint64_t kRowMask = ~uint64_t(VX_CFG_LMEM_PORT_BYTES - 1);
+#else
+#line 26
+#endif
 
 // Q+1 sources fan into one external LMEM port. Source IDs:
 //   0 .. VX_CFG_NUM_TCU_BLOCKS-1   → abuf[b]
@@ -46,6 +51,11 @@ struct LineBuf {
     for (auto& kv : inflight_) inflight_set.insert(kv.second);
     for (auto a : line_addrs) {
       uint64_t line = a & kLineMask;
+#if defined(VX_CFG_H100_SM_ENABLE) && !defined(VX_CFG_TCU_H100_ENABLE)
+      line = a & kRowMask;
+#else
+#line 48
+#endif
       if (resident_.count(line)) continue;
       if (inflight_set.count(line)) continue;
       pending_q_.push_back(line);
@@ -159,6 +169,55 @@ public:
       break;
     }
   }
+#if defined(VX_CFG_H100_SM_ENABLE) && !defined(VX_CFG_TCU_H100_ENABLE)
+
+  // One port row a cycle: its blocks leave on adjacent inputs in the same
+  // cycle, so the local memory charges one port cycle for the row.
+  void tick_rows() {
+    auto drain = [this](SimChannel<MemRsp>& rsp) {
+      if (rsp.empty()) return;
+      auto& r = rsp.peek();
+      uint32_t source = unpack_source(r.tag);
+      if (source < kNumSources) {
+        auto& buf = bufs_.at(source);
+        auto it = buf.inflight_.find(unpack_sub_tag(r.tag));
+        if (it != buf.inflight_.end()) {
+          if (r.data) buf.resident_[it->second] = r.data;
+          buf.inflight_.erase(it);
+        }
+      }
+      rsp.pop();
+    };
+    drain(simobject_->lmem_rsp_in);
+    for (auto& ch : simobject_->lmem_row_rsp_in) drain(ch);
+
+    if (simobject_->lmem_req_out.full()) return;
+    for (auto& ch : simobject_->lmem_row_req_out) {
+      if (ch.full()) return;
+    }
+    for (uint32_t i = 0; i < kNumSources; ++i) {
+      uint32_t s = (rr_next_ + i) % kNumSources;
+      auto& buf = bufs_.at(s);
+      if (buf.pending_q_.empty()) continue;
+      uint64_t row = buf.pending_q_.front();
+      for (uint32_t k = 0; k < TcuTbuf::LMEM_PORTS; ++k) {
+        uint64_t addr = row + k * VX_CFG_MEM_BLOCK_SIZE;
+        uint32_t sub_tag = (buf.next_tag_++) & kSubTagMask;
+        MemReq m(MemOp::LD, addr, /*data*/nullptr, /*byteen*/0, pack_tag(s, sub_tag), /*hart_id*/0, /*uuid*/0);
+        m.flags.local = 1;
+        auto& ch = (k == 0) ? simobject_->lmem_req_out : simobject_->lmem_row_req_out.at(k - 1);
+        ch.send(m, 1);
+        buf.inflight_[sub_tag] = addr;
+      }
+      buf.pending_q_.pop_front();
+      ++buf.reads_;
+      rr_next_ = (s + 1) % kNumSources;
+      break;
+    }
+  }
+#else
+#line 161
+#endif
 
 private:
   TcuTbuf* simobject_;
@@ -170,6 +229,12 @@ TcuTbuf::TcuTbuf(const SimContext& ctx, const char* name)
   : SimObject<TcuTbuf>(ctx, name)
   , lmem_req_out(this)
   , lmem_rsp_in(this)
+#if defined(VX_CFG_H100_SM_ENABLE) && !defined(VX_CFG_TCU_H100_ENABLE)
+  , lmem_row_req_out(LMEM_PORTS - 1, this)
+  , lmem_row_rsp_in(LMEM_PORTS - 1, this)
+#else
+#line 172
+#endif
   , impl_(new Impl(this))
 {}
 
@@ -178,6 +243,9 @@ TcuTbuf::~TcuTbuf() { delete impl_; }
 #ifdef VX_CFG_TCU_H100_ENABLE
 void TcuTbuf::on_reset() { impl_->reset(); h100_.reset(); }
 void TcuTbuf::on_tick()  { h100_.tick(lmem_req_out, lmem_rsp_in, SimPlatform::instance().cycles()); }
+#elif defined(VX_CFG_H100_SM_ENABLE)
+void TcuTbuf::on_reset() { impl_->reset(); }
+void TcuTbuf::on_tick()  { impl_->tick_rows(); }
 #else
 #line 178
 void TcuTbuf::on_reset() { impl_->reset(); }

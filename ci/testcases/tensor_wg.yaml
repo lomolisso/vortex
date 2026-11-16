@@ -1049,3 +1049,52 @@ tests:
   env: {EXPECT: "H100 WGMMA requires 32 threads", SIDES: simx}
   touches: *h100_touches
   run: *h100_reject_run
+
+# E12: the H100 SM path (VX_CFG_H100_SM_ENABLE); expectations come from sw/common/{smem_bank,l1,sm_port}_ref.h.
+- id: model_parity-org-wgmma_h100-tma
+  check: model_parity
+  xlen: [64]
+  app: wgmma_h100
+  configs: "-DVX_CFG_ISSUE_WIDTH=4 -DVX_CFG_LMEM_LOG_SIZE=18 -DVX_CFG_EXT_DLMEM_ENABLE -DVX_CFG_EXT_A_ENABLE -DVX_CFG_EXT_ZACAS_ENABLE -DVX_CFG_EXT_MBAR_ENABLE -DVX_CFG_EXT_DXA_ENABLE -DVX_CFG_EXT_FPAMO_ENABLE -DVX_CFG_EXT_TCU_ENABLE -DVX_CFG_TCU_WGMMA_ENABLE -DVX_CFG_TCU_FP8_ENABLE -DVX_CFG_TCU_H100_ENABLE -DWGMMA_SS -DVX_CFG_H100_SM_ENABLE"
+  shape: {cores: 1, warps: 4, threads: 32, l2cache: true}
+  touches: [VX_config.toml, hw/rtl/VX_gpu_pkg.sv, hw/rtl/VX_socket.sv, hw/rtl/mem, hw/rtl/cache, hw/rtl/core,
+            hw/rtl/dlmem, hw/rtl/dxa, hw/rtl/libs/VX_mem_coalescer.sv, sim/simx, sw/common/smem_bank_ref.h,
+            sw/common/l1_ref.h, sw/common/sm_port_ref.h, tests/regression/smem_bank, tests/regression/l1_sector,
+            tests/regression/sm_port]
+  args: "-g tma -l 128 -t f16f32 -n 64 -c 2 -r 1"
+- id: org-wgmma_h100-tma
+  via: blackbox
+  drivers: [simx, rtlsim]
+  xlen: [64]
+  app: wgmma_h100
+  configs: "-DVX_CFG_ISSUE_WIDTH=4 -DVX_CFG_LMEM_LOG_SIZE=18 -DVX_CFG_EXT_DLMEM_ENABLE -DVX_CFG_EXT_A_ENABLE -DVX_CFG_EXT_ZACAS_ENABLE -DVX_CFG_EXT_MBAR_ENABLE -DVX_CFG_EXT_DXA_ENABLE -DVX_CFG_EXT_FPAMO_ENABLE -DVX_CFG_EXT_TCU_ENABLE -DVX_CFG_TCU_WGMMA_ENABLE -DVX_CFG_TCU_FP8_ENABLE -DVX_CFG_TCU_H100_ENABLE -DWGMMA_SS -DVX_CFG_H100_SM_ENABLE"
+  shape: {cores: 1, warps: 4, threads: 32, l2cache: true}
+  touches: [VX_config.toml, hw/rtl/VX_gpu_pkg.sv, hw/rtl/VX_socket.sv, hw/rtl/mem, hw/rtl/cache, hw/rtl/core,
+            hw/rtl/dlmem, hw/rtl/dxa, hw/rtl/libs/VX_mem_coalescer.sv, sim/simx, sw/common/smem_bank_ref.h,
+            sw/common/l1_ref.h, sw/common/sm_port_ref.h, tests/regression/smem_bank, tests/regression/l1_sector,
+            tests/regression/sm_port]
+  args: "-g tma -l 128 -t f16f32 -n 64 -c 2 -r 1"
+- id: org-wgmma_h100-sw128
+  via: blackbox
+  drivers: [simx]
+  xlen: [64]
+  app: wgmma_h100
+  configs: "-DVX_CFG_ISSUE_WIDTH=4 -DVX_CFG_LMEM_LOG_SIZE=18 -DVX_CFG_EXT_DLMEM_ENABLE -DVX_CFG_EXT_A_ENABLE -DVX_CFG_EXT_ZACAS_ENABLE -DVX_CFG_EXT_MBAR_ENABLE -DVX_CFG_EXT_DXA_ENABLE -DVX_CFG_EXT_FPAMO_ENABLE -DVX_CFG_EXT_TCU_ENABLE -DVX_CFG_TCU_WGMMA_ENABLE -DVX_CFG_TCU_FP8_ENABLE -DVX_CFG_TCU_H100_ENABLE -DWGMMA_SS -DVX_CFG_H100_SM_ENABLE"
+  shape: {cores: 1, warps: 4, threads: 32, l2cache: true}
+  touches: [VX_config.toml, hw/rtl/VX_gpu_pkg.sv, hw/rtl/VX_socket.sv, hw/rtl/mem, hw/rtl/cache, hw/rtl/core,
+            hw/rtl/dlmem, hw/rtl/dxa, hw/rtl/libs/VX_mem_coalescer.sv, sim/simx, sw/common/smem_bank_ref.h,
+            sw/common/l1_ref.h, sw/common/sm_port_ref.h, tests/regression/smem_bank, tests/regression/l1_sector,
+            tests/regression/sm_port]
+  args: "-l 128 -t f16f32 -n 64 -c 2 -r 2"
+- id: org-sgemm_tcu_wg_dxa_mcast
+  via: blackbox
+  drivers: [simx]
+  xlen: [64]
+  app: sgemm_tcu_wg_dxa_mcast
+  configs: "-DVX_CFG_H100_SM_ENABLE -DVX_CFG_EXT_TCU_ENABLE -DVX_CFG_EXT_DXA_ENABLE -DVX_CFG_TCU_TYPE=DPI"
+  shape: {cores: 2, threads: 32, l2cache: true}
+  args: "-m 256"
+  touches: [VX_config.toml, hw/rtl/VX_gpu_pkg.sv, hw/rtl/VX_socket.sv, hw/rtl/mem, hw/rtl/cache, hw/rtl/core,
+            hw/rtl/dlmem, hw/rtl/dxa, hw/rtl/libs/VX_mem_coalescer.sv, sim/simx, sw/common/smem_bank_ref.h,
+            sw/common/l1_ref.h, sw/common/sm_port_ref.h, tests/regression/smem_bank, tests/regression/l1_sector,
+            tests/regression/sm_port]

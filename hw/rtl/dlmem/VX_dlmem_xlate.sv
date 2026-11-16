@@ -78,7 +78,11 @@ module VX_dlmem_xlate import VX_gpu_pkg::*, VX_dlmem_pkg::*; #(
     localparam RB       = DLMEM_RANK_BITS;
     localparam RB_W     = `UP(RB);
     localparam WIN_LSB  = LMEM_AW + RB;
+`ifdef VX_CFG_H100_SM_ENABLE
+    localparam LINE_W   = `CLOG2(`VX_CFG_MEM_BLOCK_SIZE) - WA;   // word bits of the memory block every kind keeps
+`else
     localparam LINE_W   = 6 - WA;   // word bits of the 64-byte granule every kind keeps
+`endif
     localparam MY_CORE  = CORE_ID % DLMEM_NCC;
     localparam PID_BITS = `CLOG2(`VX_CFG_NUM_THREADS / NUM_LANES);
     localparam HDR_W    = $bits(lsu_header_t);

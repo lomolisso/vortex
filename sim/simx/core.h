@@ -23,6 +23,11 @@
 #endif
 #ifdef DXA_MBAR_ENABLE
 #include "dxa/dxa_bg.h"
+#ifdef VX_CFG_H100_SM_ENABLE
+#include "tcu/tcu_tbuf.h"
+#else
+#line 25
+#endif
 #else
 #line 23
 #endif
@@ -157,10 +162,17 @@ public:
   static constexpr uint32_t LMEM_DXA_PORT = LSU_NUM_REQS + 2;
   // A peer's DXA words over the DLMEM network: the last DMA port, after the
   // DXA's row ports and the TCU tile buffer.
+#ifdef VX_CFG_H100_SM_ENABLE
+  static constexpr uint32_t LMEM_DXA_ROW_PORT = LMEM_DXA_PORT
+      + ((VX_CFG_LMEM_PORT_BYTES > VX_CFG_MEM_BLOCK_SIZE)
+         ? (VX_CFG_LMEM_PORT_BYTES / VX_CFG_MEM_BLOCK_SIZE) : 1)
+      + VX_CFG_EXT_TCU_ENABLED * TcuTbuf::LMEM_PORTS;
+#else
   static constexpr uint32_t LMEM_DXA_ROW_PORT = LMEM_DXA_PORT
       + ((VX_CFG_LMEM_NUM_BANKS * (VX_CFG_XLEN / 8) > VX_CFG_MEM_BLOCK_SIZE)
          ? (VX_CFG_LMEM_NUM_BANKS * (VX_CFG_XLEN / 8) / VX_CFG_MEM_BLOCK_SIZE) : 1)
       + VX_CFG_EXT_TCU_ENABLED;
+#endif
 #elif defined(VX_CFG_EXT_DLMEM_ENABLE)
 #line 134
   // LocalMem ports: the LSU's, the DLMEM ingress in their round-robin class,

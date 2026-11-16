@@ -310,6 +310,11 @@ public:
       w.km_elem_idx = 0;
       w.writes_emitted = 0;
     }
+#ifdef VX_CFG_H100_SM_ENABLE
+    for (auto& q : core_q_) {
+      q.clear();
+    }
+#endif
   }
 
   int dcr_write(uint32_t addr, uint32_t value) {
@@ -463,7 +468,53 @@ public:
     }
 
     // 3) Dispatch from queue to idle workers.
+#if defined(VX_CFG_H100_SM_ENABLE)
+    // One engine per SM: the head waits for its issuing core's worker.
 #ifdef DXA_MBAR_ENABLE
+    if (this->head_ready()) {
+      auto& w = workers_.at(queue_.front().core->id() % kCoresPerSocket);
+      if (w.state == WState::IDLE) {
+        const bool fetched = queue_.front().fetched;
+        start_worker(w, queue_.front()), queue_.pop_front();
+        this->head_popped(fetched);
+      }
+    }
+#else
+    if (!queue_.empty()) {
+      auto& w = workers_.at(queue_.front().core->id() % kCoresPerSocket);
+      if (w.state == WState::IDLE)
+        start_worker(w, queue_.front()), queue_.pop_front();
+    }
+#endif
+    // Each SM's requests wait in its own queue; its head enters the shared
+    // lookup only when its worker is idle and none of its requests is ahead,
+    // so a busy SM never holds another SM's request at the shared head.
+    for (uint32_t i = 0; i < kCoresPerSocket && queue_.size() < VX_CFG_DXA_QUEUE_SIZE; ++i) {
+      const uint32_t c = (rr_req_ + i) % kCoresPerSocket;
+      auto& q = core_q_.at(c);
+      if (q.empty() || workers_.at(c).state != WState::IDLE)
+        continue;
+      if (std::any_of(queue_.begin(), queue_.end(),
+                      [c](const DxaReq& r) { return r.core->id() % kCoresPerSocket == c; }))
+        continue;
+      queue_.push_back(q.front()), q.pop_front();
+#ifdef DXA_MBAR_ENABLE
+      queue_.back().held = true;
+#endif
+      rr_req_ = (c + 1) % kCoresPerSocket;
+      break;
+    }
+    auto& chs = simobject_->dxa_req_in;
+    for (uint32_t c = 0; c < chs.size(); ++c) {
+      auto& ch = chs.at(c);
+      if (!ch.empty() && core_q_.at(c).size() < VX_CFG_DXA_QUEUE_SIZE) {
+        core_q_.at(c).push_back(ch.peek());
+        ch.pop();
+      }
+    }
+    return;
+#elif defined(DXA_MBAR_ENABLE)
+#line 467
     // A map operand at the queue head is looked up first; a miss blocks the
     // head until its map is fetched, and the tensormap ops end there.
     bool ready = this->head_ready();
@@ -3171,6 +3222,13 @@ private:
   MemArbiter* gmem_arb_;
   std::array<Descriptor, VX_DCR_DXA_DESC_COUNT> descriptors_;
   std::deque<DxaReq>     queue_;
+#if defined(VX_CFG_H100_SM_ENABLE)
+  std::vector<std::deque<DxaReq>> core_q_ = std::vector<std::deque<DxaReq>>(kCoresPerSocket);
+#elif defined(DXA_MBAR_ENABLE)
+#line 2842
+#else
+#line 1232
+#endif
   std::vector<Worker>    workers_;
   uint32_t               rr_req_ = 0;
   uint32_t               xfer_seq_ = 1;

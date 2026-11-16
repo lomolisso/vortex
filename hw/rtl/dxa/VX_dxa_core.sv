@@ -89,6 +89,33 @@ module VX_dxa_core import VX_gpu_pkg::*, VX_dxa_pkg::*; #(
     // ================================================================
     localparam REQ_DATAW = $bits(dxa_req_data_t);
 
+`ifdef VX_CFG_H100_SM_ENABLE
+    // One TMA unit per SM: each core's requests wait in its own queue, and its
+    // head enters the shared lookup only when the core's worker is idle and no
+    // request of the core is ahead, so a busy SM never holds another SM's.
+    `STATIC_ASSERT (NUM_REQS == `VX_CFG_NUM_DXA_CORES, ("the H100 SM path has one DXA worker per core"))
+    VX_dxa_req_bus_if core_q_bus_if[NUM_REQS]();
+    VX_dxa_req_bus_if arb_in_bus_if[NUM_REQS]();
+    reg [NUM_REQS-1:0] core_pend_r;
+
+    for (genvar i = 0; i < NUM_REQS; ++i) begin : g_core_queues
+        VX_elastic_buffer #(
+            .DATAW  (REQ_DATAW),
+            .SIZE   (`VX_CFG_DXA_QUEUE_SIZE),
+            .LUTRAM (0)
+        ) core_queue (
+            .clk       (clk),
+            .reset     (reset),
+            .valid_in  (req_bus_if[i].req_valid),
+            .ready_in  (req_bus_if[i].req_ready),
+            .data_in   (req_bus_if[i].req_data),
+            .valid_out (core_q_bus_if[i].req_valid),
+            .ready_out (core_q_bus_if[i].req_ready),
+            .data_out  (core_q_bus_if[i].req_data)
+        );
+    end
+`endif
+
     VX_dxa_req_bus_if arb_out_bus_if[1]();
 
     VX_dxa_req_arb #(
@@ -100,7 +127,11 @@ module VX_dxa_core import VX_gpu_pkg::*, VX_dxa_pkg::*; #(
     ) req_arb (
         .clk        (clk),
         .reset      (reset),
+`ifdef VX_CFG_H100_SM_ENABLE
+        .bus_in_if  (arb_in_bus_if),
+`else
         .bus_in_if  (req_bus_if),
+`endif
         .bus_out_if (arb_out_bus_if)
     );
 
@@ -123,6 +154,11 @@ module VX_dxa_core import VX_gpu_pkg::*, VX_dxa_pkg::*; #(
         .data_out  (queue_out_bus_if[0].req_data)
     );
 
+`ifdef VX_CFG_H100_SM_ENABLE
+    // A block request's place in its SM-port line rides the port tag's top bits.
+    localparam GMEM_PART_BITS = `CLOG2(DXA_GMEM_LINE_SIZE / `VX_CFG_L1_LINE_SIZE);
+    localparam TM_PORT_TAG_W = SOCKET_MEM_TAG_WIDTH - GMEM_PART_BITS;
+`endif
 `ifdef DXA_MBAR_ENABLE
     // The queue head reads its descriptor from a DCR slot or a cached tensor
     // map. A slot request and a map hit read the RAM in the IDLE cycle and are
@@ -209,7 +245,9 @@ module VX_dxa_core import VX_gpu_pkg::*, VX_dxa_pkg::*; #(
     localparam TM_LINE_W   = `UP(`CLOG2(TM_LINES));
     localparam TM_CNT_W    = `CLOG2(TM_LINES + 1);
     localparam TM_LADDR_W  = `VX_CFG_MEM_ADDR_WIDTH - TM_LG_CL;
+`ifndef VX_CFG_H100_SM_ENABLE
     localparam TM_PORT_TAG_W = SOCKET_MEM_TAG_WIDTH;
+`endif
     localparam TM_VAL_W    = TM_PORT_TAG_W - UUID_WIDTH;
     localparam TM_ARB_SEL_BITS = `ARB_SEL_BITS(`VX_CFG_NUM_DXA_CORES, GMEM_OUT_PORTS);
     // A fetch tag sets the top value bit, which no worker tag reaches (a
@@ -217,6 +255,10 @@ module VX_dxa_core import VX_gpu_pkg::*, VX_dxa_pkg::*; #(
     `STATIC_ASSERT ((SOCKET_MEM_TAG_WIDTH - TM_ARB_SEL_BITS - UUID_WIDTH) > `CLOG2(`VX_CFG_DXA_MAX_INFLIGHT),
         ("DXA GMEM tag has no room for the tensor-map fetch"))
     `STATIC_ASSERT (TM_VAL_W > TM_LINE_W, ("DXA GMEM tag has no room for the tensor-map fetch"))
+`ifdef VX_CFG_H100_SM_ENABLE
+    `STATIC_ASSERT ((TM_PORT_TAG_W - TM_ARB_SEL_BITS - UUID_WIDTH) > `CLOG2(`VX_CFG_DXA_MAX_INFLIGHT),
+        ("DXA GMEM tag has no room for the tensor-map fetch"))
+`endif
 
     wire [`VX_CFG_MEM_ADDR_WIDTH-1:0] tm_byte = {q_tm.addr, DXA_TMAP_ALIGN'(0)};
     wire [TM_LG_CL-1:0] tm_off;   // the map's byte offset in its first line
@@ -432,7 +474,11 @@ module VX_dxa_core import VX_gpu_pkg::*, VX_dxa_pkg::*; #(
     // Workers
     // ================================================================
     localparam GMEM_ARB_SEL_BITS = `ARB_SEL_BITS(`VX_CFG_NUM_DXA_CORES, GMEM_OUT_PORTS);
+`ifdef VX_CFG_H100_SM_ENABLE
+    localparam WORKER_GMEM_TAG_WIDTH = TM_PORT_TAG_W - GMEM_ARB_SEL_BITS;
+`else
     localparam WORKER_GMEM_TAG_WIDTH = SOCKET_MEM_TAG_WIDTH - GMEM_ARB_SEL_BITS;
+`endif
 
     VX_mem_bus_if #(
         .DATA_SIZE (`VX_CFG_L1_LINE_SIZE),
@@ -583,6 +629,101 @@ module VX_dxa_core import VX_gpu_pkg::*, VX_dxa_pkg::*; #(
     // ================================================================
     // Output arbitration
     // ================================================================
+`ifdef VX_CFG_H100_SM_ENABLE
+    VX_mem_bus_if #(
+        .DATA_SIZE (`VX_CFG_L1_LINE_SIZE),
+        .TAG_WIDTH (TM_PORT_TAG_W)
+    ) gmem_blk_if[GMEM_OUT_PORTS]();
+
+    for (genvar i = 0; i < GMEM_OUT_PORTS; ++i) begin : g_gmem_line
+        VX_dxa_gmem_line #(
+            .IN_SIZE   (`VX_CFG_L1_LINE_SIZE),
+            .OUT_SIZE  (DXA_GMEM_LINE_SIZE),
+            .TAG_WIDTH (TM_PORT_TAG_W)
+        ) gmem_line (
+            .bus_in_if  (gmem_blk_if[i]),
+            .bus_out_if (gmem_bus_if[i])
+        );
+    end
+
+`ifdef DXA_MBAR_ENABLE
+    VX_mem_bus_if #(
+        .DATA_SIZE (`VX_CFG_L1_LINE_SIZE),
+        .TAG_WIDTH (TM_PORT_TAG_W)
+    ) gmem_arb_out_if[GMEM_OUT_PORTS]();
+`endif
+
+    VX_mem_bus_arb #(
+        .NUM_INPUTS  (`VX_CFG_NUM_DXA_CORES),
+        .NUM_OUTPUTS (GMEM_OUT_PORTS),
+        .DATA_SIZE   (`VX_CFG_L1_LINE_SIZE),
+        .TAG_WIDTH   (WORKER_GMEM_TAG_WIDTH),
+        .ARBITER     ("R"),
+        .REQ_OUT_BUF ((`VX_CFG_NUM_DXA_CORES > 1) ? 3 : 0)
+    ) gmem_arb (
+        .clk        (clk),
+        .reset      (reset),
+        .bus_in_if  (worker_gmem_bus_if),
+    `ifdef DXA_MBAR_ENABLE
+        .bus_out_if (gmem_arb_out_if)
+    `else
+        .bus_out_if (gmem_blk_if)
+    `endif
+    );
+
+`ifdef DXA_MBAR_ENABLE
+    // Map line reads share port 0: the fetch wins while it has a request,
+    // and its responses come back under the fetch tag bit.
+    VX_mem_bus_if #(
+        .DATA_SIZE (`VX_CFG_L1_LINE_SIZE),
+        .TAG_WIDTH (TM_PORT_TAG_W)
+    ) tm_bus_if();
+
+    assign tm_bus_if.req_valid            = tm_req_valid;
+    assign tm_bus_if.req_data.rw          = 1'b0;
+    assign tm_bus_if.req_data.addr        = tm_first + TM_LADDR_W'(tm_req_cnt_r);
+    assign tm_bus_if.req_data.data        = '0;
+    assign tm_bus_if.req_data.byteen      = {`VX_CFG_L1_LINE_SIZE{1'b1}};
+    assign tm_bus_if.req_data.attr        = '0;
+    assign tm_bus_if.req_data.tag.uuid    = '0;
+    // Map reads leave through SM 0's port: the arbiter's core field stays 0.
+    if (TM_ARB_SEL_BITS != 0) begin : g_tm_tag_core
+        assign tm_bus_if.req_data.tag.value = {1'b1, (TM_VAL_W-1-TM_ARB_SEL_BITS)'(tm_req_cnt_r), TM_ARB_SEL_BITS'(0)};
+        assign tm_rsp_line = TM_LINE_W'(tm_bus_if.rsp_data.tag.value[TM_VAL_W-2:TM_ARB_SEL_BITS]);
+    end else begin : g_tm_tag
+        assign tm_bus_if.req_data.tag.value = {1'b1, (TM_VAL_W-1)'(tm_req_cnt_r)};
+        assign tm_rsp_line = TM_LINE_W'(tm_bus_if.rsp_data.tag.value);
+    end
+
+    wire gmem_rsp_tm = gmem_blk_if[0].rsp_data.tag.value[TM_VAL_W-1];
+
+    assign gmem_blk_if[0].req_valid = tm_req_valid || gmem_arb_out_if[0].req_valid;
+    assign gmem_blk_if[0].req_data  = tm_req_valid ? tm_bus_if.req_data : gmem_arb_out_if[0].req_data;
+    assign gmem_arb_out_if[0].req_ready = gmem_blk_if[0].req_ready && ~tm_req_valid;
+    assign tm_bus_if.req_ready = gmem_blk_if[0].req_ready;
+    assign gmem_arb_out_if[0].rsp_valid = gmem_blk_if[0].rsp_valid && ~gmem_rsp_tm;
+    assign gmem_arb_out_if[0].rsp_data  = gmem_blk_if[0].rsp_data;
+    assign tm_bus_if.rsp_valid = gmem_blk_if[0].rsp_valid && gmem_rsp_tm;
+    assign tm_bus_if.rsp_data  = gmem_blk_if[0].rsp_data;
+    assign tm_bus_if.rsp_ready = tm_fill_ready;
+    assign gmem_blk_if[0].rsp_ready = gmem_rsp_tm ? tm_bus_if.rsp_ready : gmem_arb_out_if[0].rsp_ready;
+
+    assign tm_req_ready = tm_bus_if.req_ready;
+    assign tm_rsp_valid = tm_bus_if.rsp_valid;
+    assign tm_rsp_data  = tm_bus_if.rsp_data.data;
+    `UNUSED_VAR (tm_bus_if.rsp_data.tag)
+
+    for (genvar i = 1; i < GMEM_OUT_PORTS; ++i) begin : g_gmem_pass
+        assign gmem_blk_if[i].req_valid     = gmem_arb_out_if[i].req_valid;
+        assign gmem_blk_if[i].req_data      = gmem_arb_out_if[i].req_data;
+        assign gmem_arb_out_if[i].req_ready = gmem_blk_if[i].req_ready;
+        assign gmem_arb_out_if[i].rsp_valid = gmem_blk_if[i].rsp_valid;
+        assign gmem_arb_out_if[i].rsp_data  = gmem_blk_if[i].rsp_data;
+        assign gmem_blk_if[i].rsp_ready     = gmem_arb_out_if[i].rsp_ready;
+    end
+`endif
+
+`else
 `ifdef DXA_MBAR_ENABLE
     VX_mem_bus_if #(
         .DATA_SIZE (`VX_CFG_L1_LINE_SIZE),
@@ -652,6 +793,8 @@ module VX_dxa_core import VX_gpu_pkg::*, VX_dxa_pkg::*; #(
         assign gmem_arb_out_if[i].rsp_data  = gmem_bus_if[i].rsp_data;
         assign gmem_bus_if[i].rsp_ready     = gmem_arb_out_if[i].rsp_ready;
     end
+`endif
+
 `endif
 
 `ifdef DXA_MBAR_ENABLE
@@ -728,13 +871,47 @@ module VX_dxa_core import VX_gpu_pkg::*, VX_dxa_pkg::*; #(
     // ================================================================
     wire [NUM_REQS-1:0] req_bus_valid;
     for (genvar i = 0; i < NUM_REQS; ++i) begin : g_req_valid
+`ifdef VX_CFG_H100_SM_ENABLE
+        assign req_bus_valid[i] = req_bus_if[i].req_valid | core_q_bus_if[i].req_valid | core_pend_r[i];
+`else
         assign req_bus_valid[i] = req_bus_if[i].req_valid;
+`endif
     end
 
     wire [`VX_CFG_NUM_DXA_CORES-1:0] worker_idle;
     for (genvar i = 0; i < `VX_CFG_NUM_DXA_CORES; ++i) begin : g_worker_idle
         assign worker_idle[i] = worker_req_if[i].ready;
     end
+
+`ifdef VX_CFG_H100_SM_ENABLE
+    localparam CQ_SEL_BITS = `CLOG2(NUM_REQS);
+    wire q_pop = queue_out_bus_if[0].req_valid && queue_out_bus_if[0].req_ready;
+    wire [`UP(CQ_SEL_BITS)-1:0] q_pop_core;
+    if (CQ_SEL_BITS != 0) begin : g_q_pop_core
+        assign q_pop_core = queue_out_bus_if[0].req_data.core_id[`UP(CQ_SEL_BITS)-1:0];
+    end else begin : g_q_pop_core1
+        assign q_pop_core = '0;
+    end
+    wire [NUM_REQS-1:0] core_admit_fire;
+    for (genvar i = 0; i < NUM_REQS; ++i) begin : g_core_admit
+        wire admit = ~core_pend_r[i] && worker_idle[i];
+        assign arb_in_bus_if[i].req_valid = core_q_bus_if[i].req_valid && admit;
+        assign arb_in_bus_if[i].req_data  = core_q_bus_if[i].req_data;
+        assign core_q_bus_if[i].req_ready = arb_in_bus_if[i].req_ready && admit;
+        assign core_admit_fire[i] = arb_in_bus_if[i].req_valid && arb_in_bus_if[i].req_ready;
+    end
+    always @(posedge clk) begin
+        for (integer i = 0; i < NUM_REQS; ++i) begin
+            if (reset) begin
+                core_pend_r[i] <= 1'b0;
+            end else if (core_admit_fire[i]) begin
+                core_pend_r[i] <= 1'b1;
+            end else if (q_pop && (q_pop_core == `UP(CQ_SEL_BITS)'(i))) begin
+                core_pend_r[i] <= 1'b0;
+            end
+        end
+    end
+`endif
 
     reg dxa_busy_r;
     always @(posedge clk) begin

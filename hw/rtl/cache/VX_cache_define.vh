@@ -95,5 +95,8 @@
 `define CS_REPL_RANDOM  0
 `define CS_REPL_FIFO    1
 `define CS_REPL_PLRU    2
+`ifdef VX_CFG_H100_SM_ENABLE
+`define CS_REPL_H100    3
+`endif
 
 `endif // VX_CACHE_DEFINE_VH

@@ -12,6 +12,9 @@
 // limitations under the License.
 
 `include "VX_define.vh"
+`ifdef VX_CFG_H100_SM_ENABLE
+`include "VX_cache_define.vh"
+`endif
 
 module VX_socket import VX_gpu_pkg::*, VX_tlb_pkg::*;
 `ifdef VX_CFG_EXT_DXA_ENABLE
@@ -194,10 +197,20 @@ module VX_socket import VX_gpu_pkg::*, VX_tlb_pkg::*;
         .TAG_WIDTH (DCACHE_TAG_WIDTH)
     ) dcache_phys_bus_if[`VX_CFG_SOCKET_SIZE * DCACHE_NUM_REQS]();
 
+`ifdef VX_CFG_H100_SM_ENABLE
+    // One L1 per SM, each with its own memory side: the SM's port (below).
+    localparam SM_DCACHE_MEM_TAG_WIDTH = `CACHE_CLUSTER_NC_MEM_TAG_WIDTH(`VX_CFG_DCACHE_MSHR_SIZE, DCACHE_NUM_BANKS,
+        DCACHE_NUM_REQS, 1, DCACHE_MEM_DATA_SIZE, DCACHE_WORD_SIZE, DCACHE_TAG_WIDTH, 1, 1, UUID_WIDTH);
+    VX_mem_bus_if #(
+        .DATA_SIZE (DCACHE_MEM_DATA_SIZE),
+        .TAG_WIDTH (SM_DCACHE_MEM_TAG_WIDTH)
+    ) sm_dcache_mem_bus_if[`VX_CFG_SOCKET_SIZE]();
+`else
     VX_mem_bus_if #(
         .DATA_SIZE (DCACHE_SECTOR_SIZE),
         .TAG_WIDTH (DCACHE_MEM_TAG_WIDTH)
     ) dcache_mem_bus_if[L1_MEM_PORTS]();
+`endif
 
     // The dcache is the device's shared level, where a fence drains, only when
     // no other cache or memory port could hold or read data behind it: no L2
@@ -211,6 +224,63 @@ module VX_socket import VX_gpu_pkg::*, VX_tlb_pkg::*;
                                   && (`VX_CFG_EXT_RTU_ENABLED == 0) && (`VX_CFG_EXT_RASTER_ENABLED == 0)
                                   && (`VX_CFG_EXT_OM_ENABLED == 0);
 
+`ifdef VX_CFG_H100_SM_ENABLE
+`ifdef PERF_ENABLE
+    cache_perf_t sm_dcache_perf [`VX_CFG_SOCKET_SIZE];
+    `PERF_CACHE_ADD (dcache_perf, sm_dcache_perf, `VX_CFG_SOCKET_SIZE)
+`endif
+    for (genvar c = 0; c < `VX_CFG_SOCKET_SIZE; ++c) begin : g_sm_dcache
+        VX_mem_bus_if #(
+            .DATA_SIZE (DCACHE_MEM_DATA_SIZE),
+            .TAG_WIDTH (SM_DCACHE_MEM_TAG_WIDTH)
+        ) mem_bus_tmp_if[1]();
+
+        VX_cache_cluster #(
+            .INSTANCE_ID    (`SFORMATF(("%s-dcache%0d", INSTANCE_ID, c))),
+            .NUM_UNITS      (1),
+            .NUM_INPUTS     (1),
+            .TAG_SEL_IDX    (0),
+            .CACHE_SIZE     (`VX_CFG_DCACHE_SIZE),
+            .LINE_SIZE      (DCACHE_LINE_SIZE),
+            .SECTOR_SIZE    (DCACHE_MEM_DATA_SIZE),
+            .H100_L1        (1),
+            .NUM_BANKS      (DCACHE_NUM_BANKS),
+            .NUM_WAYS       (`VX_CFG_DCACHE_NUM_WAYS),
+            .WORD_SIZE      (DCACHE_WORD_SIZE),
+            .NUM_REQS       (DCACHE_NUM_REQS),
+            .MEM_PORTS      (1),
+            .CRSQ_SIZE      (`VX_CFG_DCACHE_CRSQ_SIZE),
+            .MSHR_SIZE      (`VX_CFG_DCACHE_MSHR_SIZE),
+            .MRSQ_SIZE      (`VX_CFG_DCACHE_MRSQ_SIZE),
+            .MREQ_SIZE      (`VX_CFG_DCACHE_MREQ_SIZE),
+            .LATENCY        (`VX_CFG_DCACHE_LATENCY),
+            .TAG_WIDTH      (DCACHE_TAG_WIDTH),
+            .WRITE_ENABLE   (1),
+            .WRITEBACK      (`VX_CFG_DCACHE_WRITEBACK),
+            .DIRTY_BYTES    (`VX_CFG_DCACHE_DIRTYBYTES),
+            .REPL_POLICY    (`VX_CFG_DCACHE_REPL_POLICY),
+            .NC_ENABLE      (1),
+            .CORE_OUT_BUF   (3),
+            .MEM_OUT_BUF    (3),
+            .IS_LLC         (DCACHE_IS_LLC),
+            .SHARED_LEVEL   (DCACHE_SHARED_LEVEL),
+        `ifdef VX_CFG_EXT_DLMEM_ENABLE
+            .CTA_FENCE      (1),
+        `endif
+            .AMO_ENABLE     (`VX_CFG_EXT_A_ENABLED)
+        ) dcache (
+        `ifdef PERF_ENABLE
+            .cache_perf     (sm_dcache_perf[c]),
+        `endif
+            .clk            (clk),
+            .reset          (reset),
+            .core_bus_if    (dcache_phys_bus_if[c * DCACHE_NUM_REQS +: DCACHE_NUM_REQS]),
+            .mem_bus_if     (mem_bus_tmp_if)
+        );
+
+        `ASSIGN_VX_MEM_BUS_IF (sm_dcache_mem_bus_if[c], mem_bus_tmp_if[0]);
+    end
+`else
     VX_cache_cluster #(
         .INSTANCE_ID    (`SFORMATF(("%s-dcache", INSTANCE_ID))),
         .NUM_UNITS      (`VX_CFG_NUM_DCACHES),
@@ -252,6 +322,7 @@ module VX_socket import VX_gpu_pkg::*, VX_tlb_pkg::*;
         .core_bus_if    (dcache_phys_bus_if),
         .mem_bus_if     (dcache_mem_bus_if)
     );
+`endif
 
     ///////////////////////////////////////////////////////////////////////////
     // Socket MMUs — one per L1 cache. Each translates the (virtual) addresses
@@ -685,10 +756,17 @@ module VX_socket import VX_gpu_pkg::*, VX_tlb_pkg::*;
 `ifdef VX_CFG_EXT_DXA_ENABLE
     VX_dxa_req_bus_if per_core_dxa_req_bus_if[`VX_CFG_SOCKET_SIZE]();
 
+`ifdef VX_CFG_H100_SM_ENABLE
+    VX_mem_bus_if #(
+        .DATA_SIZE (DXA_GMEM_LINE_SIZE),
+        .TAG_WIDTH (SOCKET_MEM_TAG_WIDTH)
+    ) dxa_gmem_bus_if[1]();
+`else
     VX_mem_bus_if #(
         .DATA_SIZE (`VX_CFG_L1_LINE_SIZE),
         .TAG_WIDTH (SOCKET_MEM_TAG_WIDTH)
     ) dxa_gmem_bus_if[1]();
+`endif
 
     VX_mem_bus_if #(
         .DATA_SIZE   (DXA_LMEM_WORD_SIZE),
@@ -780,6 +858,132 @@ module VX_socket import VX_gpu_pkg::*, VX_tlb_pkg::*;
 
     ///////////////////////////////////////////////////////////////////////////
 
+`ifdef VX_CFG_H100_SM_ENABLE
+    // One port per SM (VX_sm_port): its L1's line requests, its TMA engine's
+    // and its SM-to-SM packets in one in-order FIFO, its L2 side split into
+    // memory blocks. Instruction fetch and the texture caches are not L1TEX
+    // traffic: they join SM 0's memory port behind its adapter.
+    localparam SM_DXA_SRCS    = `VX_CFG_EXT_DXA_ENABLED;
+    localparam SM_NUM_SRCS    = 1 + SM_DXA_SRCS;
+    localparam SM_SRC_TAG_W   = `MAX(SM_DCACHE_MEM_TAG_WIDTH, SM_DXA_SRCS ? SOCKET_MEM_TAG_WIDTH : 0);
+    localparam SM_SECT_W      = `CLOG2(SM_PORT_LINE_SIZE / `VX_CFG_SM_EGRESS_BEAT + 1);
+    localparam SM_PORT_TAG_W  = SM_SRC_TAG_W + SM_SECT_W + `LOG2UP(SM_NUM_SRCS);
+    localparam SM_PENDING     = 2 * `VX_CFG_SM_MAX_READ_LINES;
+    localparam SM_BLOCKS      = SM_PORT_LINE_SIZE / `VX_CFG_L1_LINE_SIZE;
+    localparam SM_MEM_TAG_W   = UUID_WIDTH + `CLOG2(SM_PENDING) + ((SM_BLOCKS > 1) ? `CLOG2(SM_BLOCKS) : 0);
+    // The port's own stages on an L2 access: request FIFO and output register,
+    // the adapter's request buffer and reply queue, input register and reply
+    // buffer. The rest of the SM side beyond the core and L1 stages is a delay
+    // split over the two directions.
+    localparam SM_PORT_EG_STAGES   = 2;
+    localparam SM_ADAPTER_STAGES   = 2;
+    localparam SM_PORT_IG_STAGES   = 2;
+    localparam SM_PORT_MISS_STAGES = SM_PORT_EG_STAGES + SM_ADAPTER_STAGES + SM_PORT_IG_STAGES;
+    localparam SM_MISS_DELAY  = `VX_CFG_SM_L2_SIDE_LATENCY - L1_MISS_PIPE_OVERHEAD - SM_PORT_MISS_STAGES;
+    `STATIC_ASSERT (SM_MISS_DELAY >= 0, ("sm port: VX_CFG_SM_L2_SIDE_LATENCY below the pipeline's own stages"))
+    `STATIC_ASSERT (SM_MEM_TAG_W <= SOCKET_MEM_TAG_WIDTH, ("sm port: adapter tag wider than the socket memory tag"))
+    `STATIC_ASSERT (`VX_CFG_XLEN == 64, ("the H100 SM path requires XLEN 64"))
+
+`ifdef VX_CFG_EXT_DXA_ENABLE
+    // The TMA engine's line requests go to the issuing SM's port.
+    localparam SM_DXA_CORE_BITS = `CLOG2(`VX_CFG_SOCKET_SIZE);
+    VX_mem_bus_if #(
+        .DATA_SIZE (DXA_GMEM_LINE_SIZE),
+        .TAG_WIDTH (SOCKET_MEM_TAG_WIDTH)
+    ) sm_dxa_gmem_bus_if[`VX_CFG_SOCKET_SIZE]();
+
+    wire [`UP(SM_DXA_CORE_BITS)-1:0] sm_dxa_sel;
+    if (`VX_CFG_SOCKET_SIZE > 1) begin : g_sm_dxa_sel
+        assign sm_dxa_sel = dxa_gmem_bus_if[0].req_data.tag.value[VX_dxa_pkg::DXA_GMEM_CORE_LSB +: SM_DXA_CORE_BITS];
+    end else begin : g_sm_dxa_sel1
+        assign sm_dxa_sel = '0;
+    end
+
+    VX_mem_bus_switch #(
+        .NUM_INPUTS  (1),
+        .NUM_OUTPUTS (`VX_CFG_SOCKET_SIZE),
+        .DATA_SIZE   (DXA_GMEM_LINE_SIZE),
+        .TAG_WIDTH   (SOCKET_MEM_TAG_WIDTH),
+        .REQ_OUT_BUF ((`VX_CFG_SOCKET_SIZE > 1) ? 3 : 0),
+        .RSP_OUT_BUF ((`VX_CFG_SOCKET_SIZE > 1) ? 3 : 0)
+    ) sm_dxa_switch (
+        .clk        (clk),
+        .reset      (reset),
+        .bus_sel    (sm_dxa_sel),
+        .bus_in_if  (dxa_gmem_bus_if),
+        .bus_out_if (sm_dxa_gmem_bus_if)
+    );
+`endif
+
+`ifdef VX_CFG_EXT_DLMEM_ENABLE
+    // Each SM's SM-to-SM traffic between its core and the socket switches.
+    VX_dlmem_bus_if #(
+        .DATAW (VX_dlmem_pkg::DLMEM_REQ_DATAW),
+        .DST_W (DLMEM_CORE_W)
+    ) sm_dlmem_req_out_if[`VX_CFG_SOCKET_SIZE](), sm_dlmem_req_in_if[`VX_CFG_SOCKET_SIZE]();
+
+    VX_dlmem_bus_if #(
+        .DATAW (VX_dlmem_pkg::DLMEM_RSP_DATAW),
+        .DST_W (DLMEM_CORE_W)
+    ) sm_dlmem_rsp_out_if[`VX_CFG_SOCKET_SIZE](), sm_dlmem_rsp_in_if[`VX_CFG_SOCKET_SIZE]();
+`endif
+
+    VX_mem_bus_if #(
+        .DATA_SIZE (`VX_CFG_L1_LINE_SIZE),
+        .TAG_WIDTH (SM_MEM_TAG_W)
+    ) sm_mem_bus_if[`VX_CFG_SOCKET_SIZE]();
+
+    for (genvar i = 0; i < L1_MEM_PORTS; ++i) begin : g_mem_bus_if
+        if (i == 0) begin : g_i0
+            VX_mem_bus_if #(
+                .DATA_SIZE (`VX_CFG_L1_LINE_SIZE),
+                .TAG_WIDTH (SOCKET_MEM_TAG_WIDTH)
+            ) socket_arb_in_if[SOCKET_MEM_ARB_REQS]();
+
+            VX_mem_bus_if #(
+                .DATA_SIZE (`VX_CFG_L1_LINE_SIZE),
+                .TAG_WIDTH (SOCKET_MEM_ARB_TAG_WIDTH)
+            ) socket_arb_out_if[1]();
+
+            `ASSIGN_VX_MEM_BUS_IF_EX (socket_arb_in_if[ICACHE_MEM_ARB_IDX], icache_mem_bus_if[0], SOCKET_MEM_TAG_WIDTH, ICACHE_MEM_TAG_WIDTH, UUID_WIDTH);
+            `ASSIGN_VX_MEM_BUS_IF_EX (socket_arb_in_if[DCACHE_MEM_ARB_IDX], sm_mem_bus_if[0], SOCKET_MEM_TAG_WIDTH, SM_MEM_TAG_W, UUID_WIDTH);
+        `ifdef VX_CFG_EXT_TEX_ENABLE
+            `ASSIGN_VX_MEM_BUS_IF_EX (socket_arb_in_if[TCACHE_MEM_ARB_IDX], tcache_mem_bus_tmp_if[0], SOCKET_MEM_TAG_WIDTH, TCACHE_MEM_TAG_WIDTH, UUID_WIDTH);
+        `endif
+        `ifdef VX_CFG_EXT_RTU_ENABLE
+            `ASSIGN_VX_MEM_BUS_IF_EX (socket_arb_in_if[RTCACHE_MEM_ARB_IDX], rtcache_mem_bus_tmp_if[0], SOCKET_MEM_TAG_WIDTH, RTCACHE_MEM_TAG_WIDTH, UUID_WIDTH);
+        `endif
+        `ifdef VX_CFG_EXT_DXA_ENABLE
+            assign socket_arb_in_if[DXA_MEM_ARB_IDX].req_valid = 1'b0;
+            assign socket_arb_in_if[DXA_MEM_ARB_IDX].req_data  = '0;
+            assign socket_arb_in_if[DXA_MEM_ARB_IDX].rsp_ready = 1'b1;
+            `UNUSED_VAR (socket_arb_in_if[DXA_MEM_ARB_IDX].req_ready)
+            `UNUSED_VAR (socket_arb_in_if[DXA_MEM_ARB_IDX].rsp_valid)
+            `UNUSED_VAR (socket_arb_in_if[DXA_MEM_ARB_IDX].rsp_data)
+        `endif
+
+            VX_mem_bus_arb #(
+                .NUM_INPUTS (SOCKET_MEM_ARB_REQS),
+                .NUM_OUTPUTS(1),
+                .DATA_SIZE  (`VX_CFG_L1_LINE_SIZE),
+                .TAG_WIDTH  (SOCKET_MEM_TAG_WIDTH),
+                .TAG_SEL_IDX(0),
+                .ARBITER    ("P"),
+                .REQ_OUT_BUF(3),
+                .RSP_OUT_BUF(3)
+            ) mem_arb (
+                .clk        (clk),
+                .reset      (reset),
+                .bus_in_if  (socket_arb_in_if),
+                .bus_out_if (socket_arb_out_if)
+            );
+
+            `ASSIGN_VX_MEM_BUS_IF (mem_bus_if[0], socket_arb_out_if[0]);
+        end else begin : g_i
+            `ASSIGN_VX_MEM_BUS_IF_EX (mem_bus_if[i], sm_mem_bus_if[i], SOCKET_MEM_ARB_TAG_WIDTH, SM_MEM_TAG_W, UUID_WIDTH);
+        end
+    end
+`else
     // L2-facing memory ports. Port 0 arbitrates icache and dcache with the
     // socket-resident units' memory ports (tcache, rtcache, DXA gmem) as
     // peers; priority order keeps icache first and DXA bulk traffic last so
@@ -836,6 +1040,8 @@ module VX_socket import VX_gpu_pkg::*, VX_tlb_pkg::*;
             `ASSIGN_VX_MEM_BUS_IF (mem_bus_if[i], l1_mem_arb_bus_if);
         end
     end
+
+`endif
 
     ///////////////////////////////////////////////////////////////////////////
 
@@ -896,8 +1102,13 @@ module VX_socket import VX_gpu_pkg::*, VX_tlb_pkg::*;
     ) dlmem_req_switch (
         .clk           (clk),
         .reset         (reset),
+    `ifdef VX_CFG_H100_SM_ENABLE
+        .core_in_if    (sm_dlmem_req_out_if),
+        .core_out_if   (sm_dlmem_req_in_if),
+    `else
         .core_in_if    (per_core_dlmem_req_out_if),
         .core_out_if   (per_core_dlmem_req_in_if),
+    `endif
     `ifdef DXA_MBAR_ENABLE
         .row_in_if     (dxa_row_if),
     `endif
@@ -927,14 +1138,84 @@ module VX_socket import VX_gpu_pkg::*, VX_tlb_pkg::*;
     ) dlmem_rsp_switch (
         .clk           (clk),
         .reset         (reset),
+    `ifdef VX_CFG_H100_SM_ENABLE
+        .core_in_if    (sm_dlmem_rsp_out_if),
+        .core_out_if   (sm_dlmem_rsp_in_if),
+    `else
         .core_in_if    (per_core_dlmem_rsp_out_if),
         .core_out_if   (per_core_dlmem_rsp_in_if),
+    `endif
     `ifdef DXA_MBAR_ENABLE
         .row_in_if     (dlmem_rsp_no_row_if),
     `endif
         .uplink_in_if  (dlmem_rsp_down_if),
         .uplink_out_if (dlmem_rsp_up_if)
     );
+`endif
+
+`ifdef VX_CFG_H100_SM_ENABLE
+    wire [`VX_CFG_SOCKET_SIZE-1:0] sm_port_empty;
+
+    for (genvar c = 0; c < `VX_CFG_SOCKET_SIZE; ++c) begin : g_sm_port
+        VX_mem_bus_if #(
+            .DATA_SIZE (SM_PORT_LINE_SIZE),
+            .TAG_WIDTH (SM_SRC_TAG_W)
+        ) src_bus_if[SM_NUM_SRCS]();
+
+        VX_mem_bus_if #(
+            .DATA_SIZE (SM_PORT_LINE_SIZE),
+            .TAG_WIDTH (SM_PORT_TAG_W)
+        ) line_bus_if();
+
+        `ASSIGN_VX_MEM_BUS_IF_EX (src_bus_if[0], sm_dcache_mem_bus_if[c], SM_SRC_TAG_W, SM_DCACHE_MEM_TAG_WIDTH, UUID_WIDTH);
+    `ifdef VX_CFG_EXT_DXA_ENABLE
+        `ASSIGN_VX_MEM_BUS_IF_EX (src_bus_if[1], sm_dxa_gmem_bus_if[c], SM_SRC_TAG_W, SOCKET_MEM_TAG_WIDTH, UUID_WIDTH);
+    `endif
+
+        wire port_empty, adapter_empty;
+
+        VX_sm_port #(
+            .INSTANCE_ID   (`SFORMATF(("%s-smport%0d", INSTANCE_ID, c))),
+            .NUM_SRCS      (SM_NUM_SRCS),
+            .SRC_TAG_WIDTH (SM_SRC_TAG_W),
+            .LINE_SIZE     (SM_PORT_LINE_SIZE),
+            .EGRESS_DELAY  ((SM_MISS_DELAY + 1) / 2),
+            .INGRESS_DELAY (SM_MISS_DELAY / 2)
+        ) sm_port (
+            .clk            (clk),
+            .reset          (reset),
+            .src_bus_if     (src_bus_if),
+            .mem_bus_if     (line_bus_if),
+        `ifdef VX_CFG_EXT_DLMEM_ENABLE
+            .dsm_req_in_if  (per_core_dlmem_req_out_if[c]),
+            .dsm_req_out_if (sm_dlmem_req_out_if[c]),
+            .dsm_rsp_in_if  (per_core_dlmem_rsp_out_if[c]),
+            .dsm_rsp_out_if (sm_dlmem_rsp_out_if[c]),
+            .arr_req_in_if  (sm_dlmem_req_in_if[c]),
+            .arr_req_out_if (per_core_dlmem_req_in_if[c]),
+            .arr_rsp_in_if  (sm_dlmem_rsp_in_if[c]),
+            .arr_rsp_out_if (per_core_dlmem_rsp_in_if[c]),
+        `endif
+            .empty          (port_empty)
+        );
+
+        VX_sm_mem_adapter #(
+            .LINE_SIZE     (SM_PORT_LINE_SIZE),
+            .BLOCK_SIZE    (`VX_CFG_L1_LINE_SIZE),
+            .TAG_IN_WIDTH  (SM_PORT_TAG_W),
+            .TAG_OUT_WIDTH (SM_MEM_TAG_W),
+            .PENDING       (SM_PENDING)
+        ) adapter (
+            .clk         (clk),
+            .reset       (reset),
+            .line_bus_if (line_bus_if),
+            .mem_bus_if  (sm_mem_bus_if[c]),
+            .empty       (adapter_empty)
+        );
+
+        assign sm_port_empty[c] = port_empty && adapter_empty;
+    end
+
 `endif
 
     // Generate all cores
@@ -1027,6 +1308,10 @@ module VX_socket import VX_gpu_pkg::*, VX_tlb_pkg::*;
     end
     wire busy_r;
     `BUFFER_EX(busy_r, dcr_bus_if.req_valid | (|per_core_busy), 1'b1, 1, (`VX_CFG_SOCKET_SIZE > 1));
+`ifdef VX_CFG_H100_SM_ENABLE
+    assign busy = busy_r | dcr_bus_if.req_valid | kmu_bus_if[0].valid | (|per_core_kmu_valid) | ~(&sm_port_empty);
+`else
     assign busy = busy_r | dcr_bus_if.req_valid | kmu_bus_if[0].valid | (|per_core_kmu_valid);
+`endif
 
 endmodule

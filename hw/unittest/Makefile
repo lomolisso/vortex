@@ -5,6 +5,9 @@ include $(ROOT_DIR)/config.mk
 # once its directory exists, so its bench can land without touching the lists.
 DLMEM_UNIT_DIRS := dlmem_noc cta_gang cluster_dispatch bar_unit dlmem_xlate dlmem_ep
 DLMEM_UNITS := $(if $(filter 64,$(XLEN)),$(patsubst %/Makefile,%,$(wildcard $(addsuffix /Makefile,$(DLMEM_UNIT_DIRS)))))
+# The H100 SM path's units: RV64 only, listed once their directory exists.
+H100_SM_UNIT_DIRS := smem_gate l1h100 sm_port
+H100_SM_UNITS := $(if $(filter 64,$(XLEN)),$(patsubst %/Makefile,%,$(wildcard $(addsuffix /Makefile,$(H100_SM_UNIT_DIRS)))))
 
 all:
 	$(MAKE) -C generic_queue
@@ -37,6 +40,7 @@ all:
 	$(MAKE) -C fcvt_unit
 	$(MAKE) -C fdivsqrt_unit
 	$(foreach u,$(DLMEM_UNITS),$(MAKE) -C $(u) &&) true
+	$(foreach u,$(H100_SM_UNITS),$(MAKE) -C $(u) CONFIGS="$(CONFIGS) $(H100_SM_BASE)" &&) true
 
 run:
 	$(MAKE) -C generic_queue run
@@ -69,6 +73,7 @@ run:
 	$(MAKE) -C fcvt_unit run
 	$(MAKE) -C fdivsqrt_unit run
 	$(foreach u,$(DLMEM_UNITS),$(MAKE) -C $(u) run &&) true
+	$(foreach u,$(H100_SM_UNITS),$(MAKE) -C $(u) run CONFIGS="$(CONFIGS) $(H100_SM_BASE)" &&) true
 
 # FPU arithmetic units only — executed (not just built) so CI gates correctness.
 run-fpu:
@@ -294,12 +299,12 @@ endef
 run-cta:
 	$(call cta_case,)
 	$(call cta_case,-DVX_CFG_NUM_WARPS=8)
-	$(call cta_case,-DVX_CFG_H100_ORG_ENABLE -DVX_CFG_NUM_WARPS=8 -DVX_CFG_SM_MAX_BLOCKS=4)
 ifeq ($(XLEN),64)
+	$(call cta_case,-DVX_CFG_H100_ORG_ENABLE -DVX_CFG_NUM_THREADS=16 -DVX_CFG_NUM_WARPS=8 -DVX_CFG_SM_MAX_BLOCKS=4)
 	$(call cta_case,-DVX_CFG_EXT_DLMEM_ENABLE)
 	$(call cta_case,-DVX_CFG_EXT_DLMEM_ENABLE -DVX_CFG_NUM_CORES=8)
 	$(call cta_case,-DVX_CFG_EXT_DLMEM_ENABLE -DVX_CFG_NUM_WARPS=8 -DVX_CFG_LMEM_LOG_SIZE=18)
-	$(call cta_case,-DVX_CFG_EXT_DLMEM_ENABLE -DVX_CFG_H100_ORG_ENABLE -DVX_CFG_SMS_PER_TPC=2 -DVX_CFG_NUM_WARPS=8 \
+	$(call cta_case,-DVX_CFG_EXT_DLMEM_ENABLE -DVX_CFG_H100_ORG_ENABLE -DVX_CFG_NUM_THREADS=16 -DVX_CFG_SMS_PER_TPC=2 -DVX_CFG_NUM_WARPS=8 \
 		-DVX_CFG_SM_MAX_BLOCKS=4)
 endif
 
@@ -435,9 +440,9 @@ endef
 # The H100 shapes' timing knobs and policy are build-time, so each builds its own SimX twin.
 define cta_gang_h100_case
 	$(MAKE) -C $(ROOT_DIR)/sim/simx DESTDIR=$(CURDIR)/cta_gang/simx_h$(6) $(CURDIR)/cta_gang/simx_h$(6)/cta_gang_test \
-		CONFIGS="-DVX_CFG_EXT_DLMEM_ENABLE -DVX_CFG_H100_ORG_ENABLE -DVX_CFG_NUM_CORES=$(1) -DVX_CFG_SOCKET_SIZE=$(2) \
+		CONFIGS="-DVX_CFG_EXT_DLMEM_ENABLE -DVX_CFG_H100_ORG_ENABLE -DVX_CFG_NUM_THREADS=16 -DVX_CFG_NUM_CORES=$(1) -DVX_CFG_SOCKET_SIZE=$(2) \
 		-DVX_CFG_NUM_WARPS=$(3) -DVX_CFG_DLMEM_MAX_CLUSTER=$(4) -DVX_CFG_LMEM_LOG_SIZE=$(5) $(7)"
-	$(call cta_gang_case,$(1),$(2),$(3),$(4),$(5),$(6),-DVX_CFG_H100_ORG_ENABLE $(7),cta_gang/simx_h$(6)/cta_gang_test)
+	$(call cta_gang_case,$(1),$(2),$(3),$(4),$(5),$(6),-DVX_CFG_H100_ORG_ENABLE -DVX_CFG_NUM_THREADS=16 $(7),cta_gang/simx_h$(6)/cta_gang_test)
 endef
 run-dlmem-gang:
 ifeq ($(XLEN),64)
@@ -895,3 +900,66 @@ clean:
 	$(MAKE) -C fcvt_unit clean
 	$(MAKE) -C fdivsqrt_unit clean
 	$(foreach u,$(DLMEM_UNITS),$(MAKE) -C $(u) clean &&) true
+	$(foreach u,$(H100_SM_UNITS),$(MAKE) -C $(u) clean &&) true
+
+# The H100 SM path (RV64; VX_CFG_H100_SM_ENABLE). Each RTL bench runs with its
+# SimX twin on the same cases, and their per-request timing CSVs must match.
+H100_SM_COMMON := -DVX_CFG_H100_SM_ENABLE -DVX_CFG_EXT_A_ENABLE -DVX_CFG_EXT_ZACAS_ENABLE
+H100_SM_BASE := $(H100_SM_COMMON) -DVX_CFG_NUM_THREADS=32
+# $(1)=bench dir $(2)=twin dir under tests/unittest $(3)=CONFIGS $(4)=OPTS $(5)=make variables of the bench
+define h100_twin_case
+	$(MAKE) -C $(1) clean $(5)
+	$(MAKE) -C $(1) CONFIGS="$(3)" $(5)
+	$(MAKE) -C $(1) run CONFIGS="$(3)" $(5) OPTS="$(4) --csv=$(CURDIR)/$(1)/rtl.csv"
+	$(MAKE) -C $(ROOT_DIR)/tests/unittest/$(2) clean
+	$(MAKE) -C $(ROOT_DIR)/tests/unittest/$(2) run CONFIGS="$(3)" OPTS="$(4) --csv=$(CURDIR)/$(1)/simx.csv"
+	cmp $(1)/rtl.csv $(1)/simx.csv
+endef
+# The shared-memory port: wavefronts over 4-B banks, atomic passes, per-request
+# latency against smem_bank_ref.h, the other clients ahead of the LSU, one
+# wavefront a cycle over the LSU blocks (issue width 4), counted DLMEM loads.
+run-lmem-banks:
+ifeq ($(XLEN),64)
+	$(call h100_twin_case,smem_gate,smem_bank,$(H100_SM_BASE),--seed=1)
+	$(call h100_twin_case,smem_gate,smem_bank,$(H100_SM_BASE) -DVX_CFG_ISSUE_WIDTH=4,--seed=2)
+	$(call h100_twin_case,smem_gate,smem_bank,$(H100_SM_BASE) -DVX_CFG_EXT_DLMEM_ENABLE,--seed=3)
+	$(call h100_twin_case,smem_gate,smem_bank,$(H100_SM_COMMON) -DVX_CFG_NUM_THREADS=16,--seed=4)
+	$(MAKE) -C smem_gate clean
+else
+	@echo "run-lmem-banks: the H100 SM path is RV64 only (skipped at XLEN $(XLEN))"
+endif
+
+# The SM's L1 (VX_cache with H100_L1): sector fills, byte-valid store allocate,
+# the XOR set index, the insertion-ordered replacement, whole-L1 invalidation
+# and line requests with sector masks, every outcome against l1_ref.h.
+run-l1h100:
+ifeq ($(XLEN),64)
+	$(call h100_twin_case,l1h100,l1_sector,$(H100_SM_BASE),--seed=1)
+	$(call h100_twin_case,l1h100,l1_sector,$(H100_SM_BASE) -DVX_CFG_DCACHE_NUM_WAYS=32,--seed=2 --quick)
+	$(MAKE) -C l1h100 clean
+else
+	@echo "run-l1h100: the H100 SM path is RV64 only (skipped at XLEN $(XLEN))"
+endif
+
+# The SM port (VX_sm_port with its ingress gate): egress rates and every leave
+# cycle against sm_port_ref.h's SmEgressRef, the single-sector issue limits,
+# the injection credit loop, the 5 : 1 ingress gate, the ejection cap, a DSMEM
+# head holding the L2 request behind it; then a 64-B egress.
+# The SimX twin runs the same scenarios against the same golden; its port also
+# splits items into memory blocks (the RTL's adapter), so no CSV is compared.
+define sm_port_case
+	$(MAKE) -C sm_port clean
+	$(MAKE) -C sm_port CONFIGS="$(1)"
+	$(MAKE) -C sm_port run CONFIGS="$(1)" OPTS="--csv=$(CURDIR)/sm_port/rtl.csv"
+	$(MAKE) -C $(ROOT_DIR)/tests/unittest/sm_port clean
+	$(MAKE) -C $(ROOT_DIR)/tests/unittest/sm_port run CONFIGS="$(1)"
+endef
+run-sm-port:
+ifeq ($(XLEN),64)
+	$(call sm_port_case,$(H100_SM_BASE))
+	$(call sm_port_case,$(H100_SM_BASE) -DVX_CFG_EXT_DLMEM_ENABLE)
+	$(call sm_port_case,$(H100_SM_BASE) -DVX_CFG_EXT_DLMEM_ENABLE -DVX_CFG_SM_EGRESS_BYTES=64)
+	$(MAKE) -C sm_port clean
+else
+	@echo "run-sm-port: the H100 SM path is RV64 only (skipped at XLEN $(XLEN))"
+endif

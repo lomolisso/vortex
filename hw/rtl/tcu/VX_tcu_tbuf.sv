@@ -71,6 +71,12 @@ module VX_tcu_tbuf import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
 );
     `UNUSED_SPARAM (INSTANCE_ID)
 
+`ifdef VX_CFG_H100_SM_ENABLE
+    // The buffers fetch through the shared-memory port, one port row at a time.
+    localparam ROW_BANKS  = LMEM_DMA_DATA_SIZE / (`VX_CFG_XLEN / 8);
+    localparam ROW_ADDR_W = BANK_ADDR_WIDTH + `CLOG2(NUM_BANKS / ROW_BANKS);
+    `STATIC_ASSERT (NUM_BANKS % ROW_BANKS == 0, ("the shared-memory port must divide a bank row"))
+`endif
     localparam BBUF_IDX         = BLOCK_SIZE;
     localparam NUM_LMEM_MASTERS = BLOCK_SIZE + 1;
 
@@ -79,10 +85,18 @@ module VX_tcu_tbuf import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
     // -----------------------------------------------------------------------
 
     VX_mem_bus_if #(
+`ifdef VX_CFG_H100_SM_ENABLE
+        .DATA_SIZE  (ROW_BANKS * (`VX_CFG_XLEN / 8)),
+`else
         .DATA_SIZE  (NUM_BANKS * (`VX_CFG_XLEN / 8)),
+`endif
         .TAG_WIDTH  (TCU_LMEM_BLK_TAG_W),
         .ATTR_WIDTH (LMEM_DMA_ATTR_W),
+`ifdef VX_CFG_H100_SM_ENABLE
+        .ADDR_WIDTH (ROW_ADDR_W)
+`else
         .ADDR_WIDTH (BANK_ADDR_WIDTH)
+`endif
     ) lmem_masters[NUM_LMEM_MASTERS]();
 
     // -----------------------------------------------------------------------
@@ -100,11 +114,19 @@ module VX_tcu_tbuf import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
     for (genvar b = 0; b < BLOCK_SIZE; ++b) begin : g_abufs
         VX_tcu_abuf #(
             .INSTANCE_ID    (`SFORMATF(("%s-abuf%0d", INSTANCE_ID, b))),
+`ifdef VX_CFG_H100_SM_ENABLE
+            .NUM_BANKS      (ROW_BANKS),
+`else
             .NUM_BANKS      (NUM_BANKS),
+`endif
         `ifdef VX_CFG_TCU_H100_ENABLE
             .BLOCK_IDX      (b),
         `endif
+`ifdef VX_CFG_H100_SM_ENABLE
+            .BANK_ADDR_WIDTH(ROW_ADDR_W)
+`else
             .BANK_ADDR_WIDTH(BANK_ADDR_WIDTH)
+`endif
         ) abuf (
             .clk            (clk),
             .reset          (reset),
@@ -282,8 +304,16 @@ module VX_tcu_tbuf import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
 
     VX_tcu_bbuf #(
         .INSTANCE_ID    (`SFORMATF(("%s-bbuf", INSTANCE_ID))),
+`ifdef VX_CFG_H100_SM_ENABLE
+        .NUM_BANKS      (ROW_BANKS),
+`else
         .NUM_BANKS      (NUM_BANKS),
+`endif
+`ifdef VX_CFG_H100_SM_ENABLE
+        .BANK_ADDR_WIDTH(ROW_ADDR_W)
+`else
         .BANK_ADDR_WIDTH(BANK_ADDR_WIDTH)
+`endif
     ) bbuf (
         .clk              (clk),
         .reset            (reset),
@@ -317,19 +347,35 @@ module VX_tcu_tbuf import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
     // -----------------------------------------------------------------------
 
     VX_mem_bus_if #(
+`ifdef VX_CFG_H100_SM_ENABLE
+        .DATA_SIZE  (ROW_BANKS * (`VX_CFG_XLEN / 8)),
+`else
         .DATA_SIZE  (NUM_BANKS * (`VX_CFG_XLEN / 8)),
+`endif
         .TAG_WIDTH  (TCU_LMEM_TAG_W),
         .ATTR_WIDTH (LMEM_DMA_ATTR_W),
+`ifdef VX_CFG_H100_SM_ENABLE
+        .ADDR_WIDTH (ROW_ADDR_W)
+`else
         .ADDR_WIDTH (BANK_ADDR_WIDTH)
+`endif
     ) lmem_arb_out_if[1]();
 
     VX_mem_bus_arb #(
         .NUM_INPUTS  (NUM_LMEM_MASTERS),
         .NUM_OUTPUTS (1),
+`ifdef VX_CFG_H100_SM_ENABLE
+        .DATA_SIZE   (ROW_BANKS * (`VX_CFG_XLEN / 8)),
+`else
         .DATA_SIZE   (NUM_BANKS * (`VX_CFG_XLEN / 8)),
+`endif
         .TAG_WIDTH   (TCU_LMEM_BLK_TAG_W),
         .ATTR_WIDTH  (LMEM_DMA_ATTR_W),
+`ifdef VX_CFG_H100_SM_ENABLE
+        .ADDR_WIDTH  (ROW_ADDR_W),
+`else
         .ADDR_WIDTH  (BANK_ADDR_WIDTH),
+`endif
         .ARBITER     ("P")
     ) lmem_arb (
         .clk        (clk),

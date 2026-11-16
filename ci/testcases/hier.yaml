@@ -39,7 +39,7 @@ tests:
   - id: h4-micro
     app: cta_refill
     drivers: [simx, rtlsim]
-    configs+: &micro "-DVX_CFG_H100_ORG_ENABLE -DVX_CFG_NUM_PARTITIONS=2 -DVX_CFG_GPCS_PER_PARTITION=1 -DVX_CFG_CPCS_PER_GPC=1 -DVX_CFG_TPCS_PER_CPC=1 -DVX_CFG_SMS_PER_TPC=2"
+    configs+: &micro "-DVX_CFG_H100_ORG_ENABLE -DVX_CFG_NUM_PARTITIONS=2 -DVX_CFG_GPCS_PER_PARTITION=1 -DVX_CFG_CPCS_PER_GPC=1 -DVX_CFG_TPCS_PER_CPC=1 -DVX_CFG_SMS_PER_TPC=2 -DVX_CFG_NUM_THREADS=16"
     shape: {l3cache: true}
     args: "-H -v"
   - id: parity-h4-2cl
@@ -65,23 +65,23 @@ tests:
   - id: identity-cpc4
     app: sm_identity
     drivers: [simx, rtlsim]
-    configs+: &cpc4 "-DVX_CFG_H100_ORG_ENABLE -DVX_CFG_NUM_PARTITIONS=1 -DVX_CFG_GPCS_PER_PARTITION=1 -DVX_CFG_CPCS_PER_GPC=2 -DVX_CFG_TPCS_PER_CPC=2 -DVX_CFG_SMS_PER_TPC=1"
+    configs+: &cpc4 "-DVX_CFG_H100_ORG_ENABLE -DVX_CFG_NUM_PARTITIONS=1 -DVX_CFG_GPCS_PER_PARTITION=1 -DVX_CFG_CPCS_PER_GPC=2 -DVX_CFG_TPCS_PER_CPC=2 -DVX_CFG_SMS_PER_TPC=1 -DVX_CFG_NUM_THREADS=16"
     shape: {l2cache: true}
   - id: identity-npB
     app: sm_identity
     drivers: [simx]
-    configs+: &npB "-DVX_CFG_H100_ORG_ENABLE -DVX_CFG_NUM_PARTITIONS=2 -DVX_CFG_GPCS_PER_PARTITION=2 -DVX_CFG_CPCS_PER_GPC=4 -DVX_CFG_TPCS_PER_CPC=1 -DVX_CFG_SMS_PER_TPC=2"
+    configs+: &npB "-DVX_CFG_H100_ORG_ENABLE -DVX_CFG_NUM_PARTITIONS=2 -DVX_CFG_GPCS_PER_PARTITION=2 -DVX_CFG_CPCS_PER_GPC=4 -DVX_CFG_TPCS_PER_CPC=1 -DVX_CFG_SMS_PER_TPC=2 -DVX_CFG_NUM_THREADS=16"
     shape: {l3cache: true}
   - id: identity-pocket
     app: sm_identity
     drivers: [simx]
-    configs+: &pocket "-DVX_CFG_H100_ORG_ENABLE -DVX_CFG_NUM_PARTITIONS=2 -DVX_CFG_GPCS_PER_PARTITION=4 -DVX_CFG_CPCS_PER_GPC=2 -DVX_CFG_TPCS_PER_CPC=1 -DVX_CFG_SMS_PER_TPC=2"
+    configs+: &pocket "-DVX_CFG_H100_ORG_ENABLE -DVX_CFG_NUM_PARTITIONS=2 -DVX_CFG_GPCS_PER_PARTITION=4 -DVX_CFG_CPCS_PER_GPC=2 -DVX_CFG_TPCS_PER_CPC=1 -DVX_CFG_SMS_PER_TPC=2 -DVX_CFG_NUM_THREADS=16"
     shape: {l3cache: true}
   - id: identity-h100
     app: sm_identity
     drivers: [simx]
     tier: nightly
-    configs+: &h100 "-DVX_CFG_H100_ORG_ENABLE -DVX_CFG_NUM_PARTITIONS=2 -DVX_CFG_GPCS_PER_PARTITION=4 -DVX_CFG_CPCS_PER_GPC=2 -DVX_CFG_TPCS_PER_CPC=4 -DVX_CFG_SMS_PER_TPC=2"
+    configs+: &h100 "-DVX_CFG_H100_ORG_ENABLE -DVX_CFG_NUM_PARTITIONS=2 -DVX_CFG_GPCS_PER_PARTITION=4 -DVX_CFG_CPCS_PER_GPC=2 -DVX_CFG_TPCS_PER_CPC=4 -DVX_CFG_SMS_PER_TPC=2 -DVX_CFG_NUM_THREADS=16"
     shape: {l3cache: true}
 
   # Bad configurations stop at configuration time, with the check's name. The
@@ -91,7 +91,7 @@ tests:
   - id: cfg-mixed-knobs
     via: script
     driver: simx
-    configs+: "-DVX_CFG_H100_ORG_ENABLE -DVX_CFG_NUM_PARTITIONS=2 -DVX_CFG_SMS_PER_TPC=2 -DVX_CFG_NUM_CORES=4"
+    configs+: "-DVX_CFG_H100_ORG_ENABLE -DVX_CFG_NUM_PARTITIONS=2 -DVX_CFG_SMS_PER_TPC=2 -DVX_CFG_NUM_CORES=4 -DVX_CFG_NUM_THREADS=16"
     env: {EXPECT: "ORG_ALIASES"}
     run: &cfg_run |
       set -u
@@ -126,7 +126,7 @@ tests:
   - id: cfg-gpc-start
     via: script
     driver: simx
-    configs+: "-DVX_CFG_H100_ORG_ENABLE -DVX_CFG_NUM_PARTITIONS=2 -DVX_CFG_GPCS_PER_PARTITION=4 -DVX_CFG_SMS_PER_TPC=2 -DVX_CFG_CLUSTER_GPC_START=8"
+    configs+: "-DVX_CFG_H100_ORG_ENABLE -DVX_CFG_NUM_PARTITIONS=2 -DVX_CFG_GPCS_PER_PARTITION=4 -DVX_CFG_SMS_PER_TPC=2 -DVX_CFG_CLUSTER_GPC_START=8 -DVX_CFG_NUM_THREADS=16"
     env: {EXPECT: "GPC_START_RANGE"}
     run: *cfg_run
   - id: cfg-cluster-ctas
@@ -150,19 +150,19 @@ tests:
   - id: cfg-compile-only
     via: script
     driver: simx
-    configs+: "-DVX_CFG_H100_ORG_ENABLE -DVX_CFG_NUM_PARTITIONS=2 -DVX_CFG_GPCS_PER_PARTITION=4 -DVX_CFG_SMS_PER_TPC=2 -DVX_CFG_CLUSTER_GPC_START=8"
+    configs+: "-DVX_CFG_H100_ORG_ENABLE -DVX_CFG_NUM_PARTITIONS=2 -DVX_CFG_GPCS_PER_PARTITION=4 -DVX_CFG_SMS_PER_TPC=2 -DVX_CFG_CLUSTER_GPC_START=8 -DVX_CFG_NUM_THREADS=16"
     env: {EXPECT: "GPC_START_RANGE", COMPILE_ONLY: "1"}
     run: *cfg_run
   - id: cfg-cpcs-pow2
     via: script
     driver: simx
-    configs+: "-DVX_CFG_H100_ORG_ENABLE -DVX_CFG_CPCS_PER_GPC=3"
+    configs+: "-DVX_CFG_H100_ORG_ENABLE -DVX_CFG_CPCS_PER_GPC=3 -DVX_CFG_NUM_THREADS=16"
     env: {EXPECT: "CPCS_PER_GPC_POW2"}
     run: *cfg_run
   - id: cfg-maxcluster
     via: script
     driver: simx
-    configs+: "-DVX_CFG_H100_ORG_ENABLE -DVX_CFG_NUM_PARTITIONS=2 -DVX_CFG_GPCS_PER_PARTITION=4 -DVX_CFG_CPCS_PER_GPC=2 -DVX_CFG_SMS_PER_TPC=2 -DVX_CFG_DLMEM_MAX_CLUSTER=8"
+    configs+: "-DVX_CFG_H100_ORG_ENABLE -DVX_CFG_NUM_PARTITIONS=2 -DVX_CFG_GPCS_PER_PARTITION=4 -DVX_CFG_CPCS_PER_GPC=2 -DVX_CFG_SMS_PER_TPC=2 -DVX_CFG_DLMEM_MAX_CLUSTER=8 -DVX_CFG_NUM_THREADS=16"
     env: {EXPECT: "DLMEM_MAX_CLUSTER must be between 1 and the cores of a cluster"}
     run: *cfg_run
 
@@ -184,7 +184,7 @@ tests:
   - id: cta_gang-nano
     app: cta_gang
     drivers: [simx]
-    configs+: &nano "-DVX_CFG_H100_ORG_ENABLE -DVX_CFG_NUM_PARTITIONS=2 -DVX_CFG_GPCS_PER_PARTITION=4 -DVX_CFG_CPCS_PER_GPC=1 -DVX_CFG_TPCS_PER_CPC=1 -DVX_CFG_SMS_PER_TPC=2"
+    configs+: &nano "-DVX_CFG_H100_ORG_ENABLE -DVX_CFG_NUM_PARTITIONS=2 -DVX_CFG_GPCS_PER_PARTITION=4 -DVX_CFG_CPCS_PER_GPC=1 -DVX_CFG_TPCS_PER_CPC=1 -DVX_CFG_SMS_PER_TPC=2 -DVX_CFG_NUM_THREADS=16"
     shape: {l3cache: true}
     args: "-x hier"
   - id: cta_gang-pocket
@@ -197,7 +197,7 @@ tests:
   - id: cta_gang-pocket-w16
     app: cta_gang
     drivers: [simx]
-    configs+: "-DVX_CFG_H100_ORG_ENABLE -DVX_CFG_NUM_PARTITIONS=2 -DVX_CFG_GPCS_PER_PARTITION=4 -DVX_CFG_CPCS_PER_GPC=2 -DVX_CFG_TPCS_PER_CPC=1 -DVX_CFG_SMS_PER_TPC=2 -DVX_CFG_NUM_WARPS=16"
+    configs+: "-DVX_CFG_H100_ORG_ENABLE -DVX_CFG_NUM_PARTITIONS=2 -DVX_CFG_GPCS_PER_PARTITION=4 -DVX_CFG_CPCS_PER_GPC=2 -DVX_CFG_TPCS_PER_CPC=1 -DVX_CFG_SMS_PER_TPC=2 -DVX_CFG_NUM_WARPS=16 -DVX_CFG_NUM_THREADS=16"
     shape: {l3cache: true}
     args: "-x hier"
   - id: cta_gang-npB
@@ -210,7 +210,7 @@ tests:
   - id: cta_gang-gpc1
     app: cta_gang
     drivers: [simx]
-    configs+: &gpc1 "-DVX_CFG_H100_ORG_ENABLE -DVX_CFG_NUM_PARTITIONS=2"
+    configs+: &gpc1 "-DVX_CFG_H100_ORG_ENABLE -DVX_CFG_NUM_PARTITIONS=2 -DVX_CFG_NUM_THREADS=16"
     shape: {l3cache: true}
     args: "-x hier"
   - id: identity-gpc1
@@ -221,7 +221,7 @@ tests:
   - id: identity-sm1
     app: sm_identity
     drivers: [simx]
-    configs+: "-DVX_CFG_H100_ORG_ENABLE"
+    configs+: "-DVX_CFG_H100_ORG_ENABLE -DVX_CFG_NUM_THREADS=16"
     shape: {l2cache: true}
   - id: cta_gang-h100
     app: cta_gang
@@ -240,7 +240,7 @@ tests:
     check: model_parity
     app: cta_gang
     xlen: [64]
-    configs+: "-DVX_CFG_H100_ORG_ENABLE -DVX_CFG_NUM_PARTITIONS=2 -DVX_CFG_GPCS_PER_PARTITION=1 -DVX_CFG_CPCS_PER_GPC=1 -DVX_CFG_TPCS_PER_CPC=1 -DVX_CFG_SMS_PER_TPC=2 -DVX_CFG_NUM_WARPS=16"
+    configs+: "-DVX_CFG_H100_ORG_ENABLE -DVX_CFG_NUM_PARTITIONS=2 -DVX_CFG_GPCS_PER_PARTITION=1 -DVX_CFG_CPCS_PER_GPC=1 -DVX_CFG_TPCS_PER_CPC=1 -DVX_CFG_SMS_PER_TPC=2 -DVX_CFG_NUM_WARPS=16 -DVX_CFG_NUM_THREADS=16"
     shape: {l3cache: true}
     args: "-p -k 2 -n 24"
   - id: parity-cta_gang-cpc4
@@ -263,7 +263,7 @@ tests:
   - id: m1-micro-w16
     app: cta_refill
     drivers: [simx, rtlsim]
-    configs+: "-DVX_CFG_H100_ORG_ENABLE -DVX_CFG_NUM_PARTITIONS=2 -DVX_CFG_GPCS_PER_PARTITION=1 -DVX_CFG_CPCS_PER_GPC=1 -DVX_CFG_TPCS_PER_CPC=1 -DVX_CFG_SMS_PER_TPC=2 -DVX_CFG_NUM_WARPS=16"
+    configs+: "-DVX_CFG_H100_ORG_ENABLE -DVX_CFG_NUM_PARTITIONS=2 -DVX_CFG_GPCS_PER_PARTITION=1 -DVX_CFG_CPCS_PER_GPC=1 -DVX_CFG_TPCS_PER_CPC=1 -DVX_CFG_SMS_PER_TPC=2 -DVX_CFG_NUM_WARPS=16 -DVX_CFG_NUM_THREADS=16"
     shape: {l3cache: true}
     args: "-M"
   - id: m1-npB

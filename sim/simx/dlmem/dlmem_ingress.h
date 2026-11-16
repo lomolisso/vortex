@@ -72,6 +72,11 @@ private:
     bool ack = false;
     std::shared_ptr<mem_block_t> data;
     uint64_t uuid = 0;
+#ifdef VX_CFG_H100_SM_ENABLE
+    uint32_t rsp_hb = 0;   // the reply packet's cost, from its request
+#else
+#line 74
+#endif
 #ifdef DXA_MBAR_ENABLE
     bool posted = false;   // a COMPL's complete_tx: its response is dropped
 #endif

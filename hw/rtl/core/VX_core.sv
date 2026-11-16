@@ -203,6 +203,14 @@ module VX_core import VX_gpu_pkg::*, VX_tlb_pkg::*; #(
     ) mmu_icache_if[1]();
 
 `ifdef VX_CFG_TCU_WGMMA_ENABLE
+`ifdef VX_CFG_H100_SM_ENABLE
+    VX_mem_bus_if #(
+        .DATA_SIZE  (LMEM_DMA_DATA_SIZE),
+        .TAG_WIDTH  (TCU_LMEM_TAG_W),
+        .ATTR_WIDTH (LMEM_DMA_ATTR_W),
+        .ADDR_WIDTH (LMEM_DMA_ADDR_WIDTH)
+    ) tcu_lmem_if();
+`else
     localparam TCU_LMEM_BANK_ADDR_W = `VX_CFG_LMEM_LOG_SIZE - `CLOG2(LSU_WORD_SIZE) - `CLOG2(`VX_CFG_LMEM_NUM_BANKS);
     VX_mem_bus_if #(
         .DATA_SIZE  (`VX_CFG_LMEM_NUM_BANKS * LSU_WORD_SIZE),
@@ -210,6 +218,7 @@ module VX_core import VX_gpu_pkg::*, VX_tlb_pkg::*; #(
         .ATTR_WIDTH (LMEM_DMA_ATTR_W),
         .ADDR_WIDTH (TCU_LMEM_BANK_ADDR_W)
     ) tcu_lmem_if();
+`endif
 `endif
 
 
@@ -642,14 +651,27 @@ module VX_core import VX_gpu_pkg::*, VX_tlb_pkg::*; #(
         .TAG_WIDTH (LSU_TAG_WIDTH)
     ) dlmem_remote_if[`VX_CFG_NUM_LSU_BLOCKS]();
 
+`ifdef VX_CFG_H100_SM_ENABLE
+    VX_mem_bus_if #(
+        .DATA_SIZE  (LMEM_INGRESS_DATA_SIZE),
+        .TAG_WIDTH  (LSU_TAG_WIDTH),
+        .ADDR_WIDTH (VX_dlmem_pkg::DLMEM_LMEM_AW - `CLOG2(LMEM_INGRESS_DATA_SIZE / LSU_WORD_SIZE))
+    ) dlmem_lmem_if();
+`else
     VX_mem_bus_if #(
         .DATA_SIZE  (LSU_WORD_SIZE),
         .TAG_WIDTH  (LSU_TAG_WIDTH),
         .ADDR_WIDTH (VX_dlmem_pkg::DLMEM_LMEM_AW)
     ) dlmem_lmem_if();
+`endif
 
     wire [`VX_CFG_LMEM_NUM_BANKS-1:0]               lmem_commit_valid;
     wire [`VX_CFG_LMEM_NUM_BANKS-1:0][NW_WIDTH-1:0] lmem_commit_wid;
+`ifdef VX_CFG_H100_SM_ENABLE
+    wire [`VX_CFG_NUM_LSU_BLOCKS-1:0]               lmem_fold_valid;
+    wire [`VX_CFG_NUM_LSU_BLOCKS-1:0][NW_WIDTH-1:0] lmem_fold_wid;
+    wire [`VX_CFG_NUM_LSU_BLOCKS-1:0][`CLOG2(`VX_CFG_NUM_LSU_LANES+1)-1:0] lmem_fold_cnt;
+`endif
 `endif
 `ifdef DXA_MBAR_ENABLE
     VX_mem_bus_if #(
@@ -681,6 +703,11 @@ module VX_core import VX_gpu_pkg::*, VX_tlb_pkg::*; #(
         .dlmem_lmem_if (dlmem_lmem_if),
         .lmem_commit_valid (lmem_commit_valid),
         .lmem_commit_wid (lmem_commit_wid),
+    `ifdef VX_CFG_H100_SM_ENABLE
+        .lmem_fold_valid (lmem_fold_valid),
+        .lmem_fold_wid (lmem_fold_wid),
+        .lmem_fold_cnt (lmem_fold_cnt),
+    `endif
     `endif
     `ifdef VX_CFG_EXT_MBAR_ENABLE
         .mbar_retire_valid (mbar_retire_valid),
@@ -752,6 +779,9 @@ module VX_core import VX_gpu_pkg::*, VX_tlb_pkg::*; #(
         // The egress never raises ack and done in one cycle.
         .dec_valid (dlmem_ack_valid || dlmem_done_valid),
         .dec_wid   (dlmem_ack_valid ? dlmem_ack_wid : dlmem_done_wid),
+`ifdef VX_CFG_H100_SM_ENABLE
+        .dec_cnt   (`CLOG2(`VX_CFG_NUM_LSU_LANES+1)'(1)),
+`endif
         .drained   (dlmem_drained),
         .empty     (dlmem_wtrack_empty)
     );
@@ -761,7 +791,11 @@ module VX_core import VX_gpu_pkg::*, VX_tlb_pkg::*; #(
         ("the local-access bound covers at most three crossbar arbiter levels"))
     VX_dlmem_wtrack #(
         .NUM_INC   (`VX_CFG_NUM_LSU_BLOCKS),
+    `ifdef VX_CFG_H100_SM_ENABLE
+        .NUM_DEC   (`VX_CFG_LMEM_NUM_BANKS + `VX_CFG_NUM_LSU_BLOCKS),
+    `else
         .NUM_DEC   (`VX_CFG_LMEM_NUM_BANKS),
+    `endif
         .MAX_COUNT (VX_dlmem_pkg::DLMEM_LACC_MAX)
     ) lmem_acc_track (
         .clk       (clk),
@@ -769,8 +803,14 @@ module VX_core import VX_gpu_pkg::*, VX_tlb_pkg::*; #(
         .inc_valid (xlate_lacc_inc_valid),
         .inc_wid   (xlate_lacc_inc_wid),
         .inc_cnt   (xlate_lacc_inc_cnt),
+`ifdef VX_CFG_H100_SM_ENABLE
+        .dec_valid ({lmem_fold_valid, lmem_commit_valid}),
+        .dec_wid   ({lmem_fold_wid, lmem_commit_wid}),
+        .dec_cnt   ({lmem_fold_cnt, {`VX_CFG_LMEM_NUM_BANKS{`CLOG2(`VX_CFG_NUM_LSU_LANES+1)'(1)}}}),
+`else
         .dec_valid (lmem_commit_valid),
         .dec_wid   (lmem_commit_wid),
+`endif
         .drained   (lmem_acc_drained),
         .empty     (lmem_acc_track_empty)
     );

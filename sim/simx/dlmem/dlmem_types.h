@@ -17,13 +17,28 @@
 #include <iostream>
 #include <memory>
 #include "types.h"
+#ifdef VX_CFG_H100_SM_ENABLE
+#include "smem_gate.h"
+#else
+#line 19
+#endif
 
 namespace vortex {
 
 // VX_dlmem_pkg's endpoint sizes.
+#ifdef VX_CFG_H100_SM_ENABLE
+constexpr uint32_t DLMEM_INGRESS_SLOTS = VX_CFG_DLMEM_INGRESS_SLOTS;
+// The remote-store window in lanes: a credit per LSU word of every line it holds.
+constexpr uint32_t DLMEM_STORE_LANE_CREDITS = VX_CFG_DLMEM_STORE_CREDITS * (VX_CFG_N5_LINE_BYTES / (VX_CFG_XLEN / 8));
+constexpr uint32_t DLMEM_WT_MAX = DLMEM_STORE_LANE_CREDITS + VX_CFG_DLMEM_PENDING_SIZE
+                                + (VX_CFG_LSU_QUEUE_IN_SIZE + 3) * VX_CFG_NUM_LSU_LANES;
+#else
+#line 24
 constexpr uint32_t DLMEM_INGRESS_SLOTS = 4;
 constexpr uint32_t DLMEM_WT_MAX = VX_CFG_DLMEM_STORE_CREDITS + VX_CFG_DLMEM_PENDING_SIZE
                                 + (VX_CFG_LSU_QUEUE_IN_SIZE + 3) * VX_CFG_NUM_LSU_LANES;
+#endif
+#line 27
 
 constexpr uint32_t dlmem_clog2(uint64_t x) {
   uint32_t n = 0;
@@ -44,8 +59,16 @@ constexpr uint32_t DLMEM_LACC_XB_IN = VX_CFG_NUM_LSU_BLOCKS * VX_CFG_NUM_LSU_LAN
 constexpr uint32_t DLMEM_LACC_XB_G1 = (DLMEM_LACC_XB_IN > 12) ? (DLMEM_LACC_XB_IN + 7) / 8 : 0;
 constexpr uint32_t DLMEM_LACC_XB_G2 = (DLMEM_LACC_XB_G1 > 12) ? (DLMEM_LACC_XB_G1 + 7) / 8 : 0;
 static_assert(DLMEM_LACC_XB_G2 <= 12, "the local-access bound covers at most three crossbar arbiter levels");
+#ifdef VX_CFG_H100_SM_ENABLE
+// The shared-memory port's held warp requests come on top.
+constexpr uint32_t DLMEM_LACC_MAX = (VX_CFG_LSU_QUEUE_IN_SIZE + 3 + SmemGate::REQ_STAGES) * VX_CFG_NUM_LSU_LANES
+                                  + (5 + 2 * (DLMEM_LACC_XB_G1 + DLMEM_LACC_XB_G2)) * VX_CFG_LMEM_NUM_BANKS;
+#else
+#line 47
 constexpr uint32_t DLMEM_LACC_MAX = (VX_CFG_LSU_QUEUE_IN_SIZE + 3) * VX_CFG_NUM_LSU_LANES
                                   + (5 + 2 * (DLMEM_LACC_XB_G1 + DLMEM_LACC_XB_G2)) * VX_CFG_LMEM_NUM_BANKS;
+#endif
+#line 49
 
 // The local-access tracker's largest count, 2^DLMEM_LACC_W - 1.
 constexpr uint32_t DLMEM_LACC_LIMIT = (1u << dlmem_clog2(uint64_t(DLMEM_LACC_MAX) + 1)) - 1;
@@ -53,6 +76,12 @@ constexpr uint32_t DLMEM_LACC_LIMIT = (1u << dlmem_clog2(uint64_t(DLMEM_LACC_MAX
 // Request network packet (VX_dlmem_pkg dlmem_req_pkt_t); the fabric routes it
 // to `dst`, the target core.
 struct DlmemReqPkt {
+#ifdef VX_CFG_H100_SM_ENABLE
+  uint32_t pkt_hb = 0;               // the packet's cost on the SM ports in half-beats, on its first message
+  uint32_t rsp_hb = 0;               // its reply packet's cost, on its first message
+#else
+#line 55
+#endif
   uint32_t dst = 0;
   uint32_t src = 0;                    // requesting core, the response's dst
   MemOp    op = MemOp::LD;             // LD, ST or a read-modify-write atomic
@@ -103,6 +132,13 @@ struct DlmemReqPkt {
 
 // Response network packet (dlmem_rsp_pkt_t); `dst` is the requesting core.
 struct DlmemRspPkt {
+#ifdef VX_CFG_H100_SM_ENABLE
+  uint32_t pkt_hb = 0;               // the reply packet's cost on the SM ports in half-beats, on its first message
+#elif defined(VX_CFG_EXT_MBAR_ENABLE)
+#line 103
+#else
+#line 89
+#endif
   uint32_t dst = 0;
   bool     ack = false;                // store committed; data unused
   uint32_t tag = 0;

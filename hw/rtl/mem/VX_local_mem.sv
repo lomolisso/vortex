@@ -75,7 +75,11 @@ module VX_local_mem import VX_gpu_pkg::*; #(
     output wire [NUM_BANKS-1:0]                mbar_evt_valid,
     output wire [NUM_BANKS-1:0]                mbar_evt_flip,
     output wire [NUM_BANKS-1:0][NW_WIDTH-1:0]  mbar_evt_wid,
+`ifdef VX_CFG_H100_SM_ENABLE
+    output wire [NUM_BANKS-1:0][ADDR_WIDTH-`CLOG2(NUM_BANKS)+`CLOG2(WORD_SIZE/`VX_CFG_LMEM_BANK_BYTES)-1:0] mbar_evt_row,
+`else
     output wire [NUM_BANKS-1:0][ADDR_WIDTH-`CLOG2(NUM_BANKS)-1:0] mbar_evt_row,
+`endif
 `endif
 
     // LSU read/write port
@@ -90,7 +94,18 @@ module VX_local_mem import VX_gpu_pkg::*; #(
     localparam REQ_SEL_WIDTH   = `UP(REQ_SEL_BITS);
     localparam WORD_WIDTH      = WORD_SIZE * 8;
     localparam NUM_WORDS       = SIZE / WORD_SIZE;
+`ifdef VX_CFG_H100_SM_ENABLE
+    // A lane word spans LMEM_PAIR banks of one row; an 8-B lane takes the even
+    // bank of its pair and holds the odd one.
+    localparam BANK_BYTES      = `VX_CFG_LMEM_BANK_BYTES;
+    localparam BANK_WIDTH      = BANK_BYTES * 8;
+    localparam LMEM_PAIR       = WORD_SIZE / BANK_BYTES;
+    localparam PAIR_BITS       = `CLOG2(LMEM_PAIR);
+    localparam WORDS_PER_BANK  = SIZE / (NUM_BANKS * BANK_BYTES);
+    `UNUSED_PARAM (NUM_WORDS)
+`else
     localparam WORDS_PER_BANK  = NUM_WORDS / NUM_BANKS;
+`endif
     localparam BANK_ADDR_WIDTH = `CLOG2(WORDS_PER_BANK);
     localparam BANK_SEL_BITS   = `CLOG2(NUM_BANKS);
     localparam BANK_SEL_WIDTH  = `UP(BANK_SEL_BITS);
@@ -105,7 +120,12 @@ module VX_local_mem import VX_gpu_pkg::*; #(
 `else
     localparam AMO_CMP_WIDTH   = 0;
 `endif
+`ifdef VX_CFG_H100_SM_ENABLE
+    // plus the paired-halves marker
+    localparam AMO_SB_WIDTH    = 2 + $bits(amo_op_e) + 1 + HART_ID_WIDTH + AMO_CMP_WIDTH;
+`else
     localparam AMO_SB_WIDTH    = 1 + $bits(amo_op_e) + 1 + HART_ID_WIDTH + AMO_CMP_WIDTH;
+`endif
 `ifdef VX_CFG_EXT_DLMEM_ENABLE
     // plus the is_lacc marker
     localparam REQ_DATAW       = 1 + BANK_ADDR_WIDTH + WORD_SIZE + WORD_WIDTH + TAG_WIDTH + AMO_SB_WIDTH + 1;
@@ -114,14 +134,32 @@ module VX_local_mem import VX_gpu_pkg::*; #(
 `endif
     localparam RSP_DATAW       = WORD_WIDTH + TAG_WIDTH;
 
+`ifdef VX_CFG_H100_SM_ENABLE
+    `STATIC_ASSERT(ADDR_WIDTH + PAIR_BITS == (BANK_ADDR_WIDTH + `CLOG2(NUM_BANKS)), ("invalid parameter"))
+    `STATIC_ASSERT((LMEM_PAIR == 1) || (LMEM_PAIR == 2 && NUM_BANKS >= 4), ("invalid parameter"))
+`else
     `STATIC_ASSERT(ADDR_WIDTH == (BANK_ADDR_WIDTH + `CLOG2(NUM_BANKS)), ("invalid parameter"))
+`endif
+`ifdef VX_CFG_H100_SM_ENABLE
+    `STATIC_ASSERT(64'(SIZE) <= 64'(`VX_CFG_LMEM_DESC_REACH_BYTES), ("LMEM exceeds the wgmma descriptor reach"))
+`endif
 
     // bank selection
 
     wire [NUM_REQS-1:0][BANK_SEL_WIDTH-1:0] req_bank_idx;
     if (NUM_BANKS > 1) begin : g_req_bank_idx
         for (genvar i = 0; i < NUM_REQS; ++i) begin : g_req_bank_idxs
+        `ifdef VX_CFG_H100_SM_ENABLE
+            if (LMEM_PAIR > 1) begin : g_pair
+                // a lane on the upper half of its word goes to the odd bank
+                wire hi = ~(|lsu_bus_if[i].req_data.byteen[0 +: BANK_BYTES]);
+                assign req_bank_idx[i] = {lsu_bus_if[i].req_data.addr[0 +: BANK_SEL_BITS-1], hi};
+            end else begin : g_word
+                assign req_bank_idx[i] = lsu_bus_if[i].req_data.addr[0 +: BANK_SEL_BITS];
+            end
+        `else
             assign req_bank_idx[i] = lsu_bus_if[i].req_data.addr[0 +: BANK_SEL_BITS];
+        `endif
         end
     end else begin : g_req_bank_idx_0
         assign req_bank_idx = 0;
@@ -131,7 +169,11 @@ module VX_local_mem import VX_gpu_pkg::*; #(
 
     wire [NUM_REQS-1:0][BANK_ADDR_WIDTH-1:0] req_bank_addr;
     for (genvar i = 0; i < NUM_REQS; ++i) begin : g_req_bank_addr
+    `ifdef VX_CFG_H100_SM_ENABLE
+        assign req_bank_addr[i] = lsu_bus_if[i].req_data.addr[BANK_SEL_BITS-PAIR_BITS +: BANK_ADDR_WIDTH];
+    `else
         assign req_bank_addr[i] = lsu_bus_if[i].req_data.addr[BANK_SEL_BITS +: BANK_ADDR_WIDTH];
+    `endif
     end
 
     // AMO sideband per request, from the shared mem-bus attr.
@@ -144,6 +186,9 @@ module VX_local_mem import VX_gpu_pkg::*; #(
 `endif
 `ifdef VX_CFG_EXT_DLMEM_ENABLE
     wire [NUM_REQS-1:0]                  req_lacc;
+`endif
+`ifdef VX_CFG_H100_SM_ENABLE
+    wire [NUM_REQS-1:0]                  req_amo_pair;
 `endif
     // Gated by AMO_ENABLE: the widths stay constant and the zeros constant-fold
     // through the crossbar payload (the VX_cache_bank pattern).
@@ -162,6 +207,9 @@ module VX_local_mem import VX_gpu_pkg::*; #(
     `endif
     `ifdef VX_CFG_EXT_ZACAS_ENABLE
         assign req_amo_cmp[i]      = AMO_ENABLE ? lane_attr.amo.amo_cmp : '0;
+    `endif
+    `ifdef VX_CFG_H100_SM_ENABLE
+        assign req_amo_pair[i]     = AMO_ENABLE ? lane_attr.amo.amo_pair : 1'b0;
     `endif
         `UNUSED_VAR (lane_attr)
     end
@@ -184,6 +232,9 @@ module VX_local_mem import VX_gpu_pkg::*; #(
 `ifdef VX_CFG_EXT_DLMEM_ENABLE
     wire [NUM_BANKS-1:0]                    per_bank_req_lacc;
 `endif
+`ifdef VX_CFG_H100_SM_ENABLE
+    wire [NUM_BANKS-1:0]                    per_bank_req_amo_pair;
+`endif
     wire [NUM_BANKS-1:0][REQ_SEL_WIDTH-1:0] per_bank_req_idx;
     wire [NUM_BANKS-1:0]                    per_bank_req_ready;
 
@@ -202,6 +253,9 @@ module VX_local_mem import VX_gpu_pkg::*; #(
         assign req_data_in[i] = {
         `ifdef VX_CFG_EXT_DLMEM_ENABLE
             req_lacc[i],
+        `endif
+        `ifdef VX_CFG_H100_SM_ENABLE
+            req_amo_pair[i],
         `endif
             req_amo_valid[i],
             req_amo_op[i],
@@ -345,6 +399,9 @@ module VX_local_mem import VX_gpu_pkg::*; #(
         `ifdef VX_CFG_EXT_DLMEM_ENABLE
             per_bank_req_lacc[i],
         `endif
+        `ifdef VX_CFG_H100_SM_ENABLE
+            per_bank_req_amo_pair[i],
+        `endif
             per_bank_req_amo_valid[i],
             per_bank_req_amo_op[i],
             per_bank_req_amo_unsigned[i],
@@ -387,8 +444,14 @@ module VX_local_mem import VX_gpu_pkg::*; #(
 
         wire [NUM_BANKS-1:0] dma_touch;
         for (genvar i = 0; i < NUM_BANKS; ++i) begin : g_dma_touch
+        `ifdef VX_CFG_H100_SM_ENABLE
+            // a beat on either bank of a pair holds both
+            assign dma_touch[i] = ~dma_bus_if.req_data.rw
+                               || (|dma_bus_if.req_data.byteen[(i/LMEM_PAIR)*WORD_SIZE +: WORD_SIZE]);
+        `else
             assign dma_touch[i] = ~dma_bus_if.req_data.rw
                                || (|dma_bus_if.req_data.byteen[i*WORD_SIZE +: WORD_SIZE]);
+        `endif
         end
         assign dma_amo_stall = |(bank_amo_busy & dma_touch);
 
@@ -433,8 +496,14 @@ module VX_local_mem import VX_gpu_pkg::*; #(
             end
         end
         for (genvar i = 0; i < NUM_BANKS; ++i) begin : g_dma_rsp_data
+        `ifdef VX_CFG_H100_SM_ENABLE
+            localparam HALF = (i % LMEM_PAIR) * BANK_WIDTH;
+            assign dma_bus_if.rsp_data.data[i*BANK_WIDTH +: BANK_WIDTH] = dma_rsp_hold_valid_r ? dma_rsp_hold_data_r[i][HALF +: BANK_WIDTH]
+                                                                                              : per_bank_rsp_data[i][HALF +: BANK_WIDTH];
+        `else
             assign dma_bus_if.rsp_data.data[i*WORD_WIDTH +: WORD_WIDTH] =
                 dma_rsp_hold_valid_r ? dma_rsp_hold_data_r[i] : per_bank_rsp_data[i];
+        `endif
         end
 
     end else begin : g_no_dma
@@ -449,14 +518,38 @@ module VX_local_mem import VX_gpu_pkg::*; #(
         `UNUSED_VAR (bank_amo_busy)
     end
 
+`ifdef VX_CFG_H100_SM_ENABLE
+    // Each bank's SRAM requests, joined per pair after the bank loop.
+    wire [NUM_BANKS-1:0]                      bk_read;
+    wire [NUM_BANKS-1:0]                      bk_write;
+    wire [NUM_BANKS-1:0][BANK_ADDR_WIDTH-1:0] bk_raddr;
+    wire [NUM_BANKS-1:0][BANK_ADDR_WIDTH-1:0] bk_waddr;
+    wire [NUM_BANKS-1:0][WORD_WIDTH-1:0]      bk_wdata;
+    wire [NUM_BANKS-1:0][WORD_SIZE-1:0]       bk_wren;
+    wire [NUM_BANKS-1:0]                      bk_take_hi; // accepted access reaching the pair's upper half
+    wire [NUM_BANKS-1:0]                      bk_wb_hi;   // owed atomic write-back to the pair's upper half
+`endif
+
     for (genvar i = 0; i < NUM_BANKS; ++i) begin : g_data_store
         wire bank_rsp_valid, bank_rsp_ready;
 
         // DMA active signals (priority over LSU)
+    `ifdef VX_CFG_H100_SM_ENABLE
+        // A beat on either bank of a pair takes both, so an 8-B access never
+        // meets it on the shared upper bank.
+        wire dma_wr_req = DMA_ENABLE
+                       && dma_bus_if.req_valid
+                       && dma_bus_if.req_data.rw
+                       && (|dma_bus_if.req_data.byteen[(i/LMEM_PAIR)*WORD_SIZE +: WORD_SIZE]);
+        // the bank's slice of the beat, at its place in the lane word
+        wire [WORD_SIZE-1:0]  dma_bank_byteen = WORD_SIZE'(dma_bus_if.req_data.byteen[i*BANK_BYTES +: BANK_BYTES]) << ((i % LMEM_PAIR) * BANK_BYTES);
+        wire [WORD_WIDTH-1:0] dma_bank_data   = {LMEM_PAIR{dma_bus_if.req_data.data[i*BANK_WIDTH +: BANK_WIDTH]}};
+    `else
         wire dma_wr_req = DMA_ENABLE
                        && dma_bus_if.req_valid
                        && dma_bus_if.req_data.rw
                        && (|dma_bus_if.req_data.byteen[i*WORD_SIZE +: WORD_SIZE]);
+    `endif
 
         wire dma_rd_req = DMA_ENABLE
                        && dma_bus_if.req_valid
@@ -476,6 +569,9 @@ module VX_local_mem import VX_gpu_pkg::*; #(
         // none of the atomic hardware is synthesized (the dcache counterpart is
         // AMO_ENABLE in VX_cache_bank).
         wire                       amo_busy;      // an atomic owns the bank port
+    `ifdef VX_CFG_H100_SM_ENABLE
+        wire                       pair_busy;     // the pair's shared upper bank is taken
+    `endif
         wire                       amo_wb_store;  // owed atomic write-back
         wire [BANK_ADDR_WIDTH-1:0] amo_wb_addr;
         wire [WORD_SIZE-1:0]       amo_wb_byteen;
@@ -516,12 +612,22 @@ module VX_local_mem import VX_gpu_pkg::*; #(
             // read, capture, write back.
             reg                       amo_rd_valid_r;
             reg                       amo_wb_valid_r;
+        `ifdef VX_CFG_H100_SM_ENABLE
+            // One update per bank a cycle: the atomic computes on the SRAM output
+            // and writes back in its read cycle, and the write-first port gives
+            // the next cycle's read the new word, so atomics follow back to back.
+            wire [WORD_WIDTH-1:0]     amo_old_r = per_bank_rsp_data[i];
+        `else
             reg [WORD_WIDTH-1:0]      amo_old_r;
+        `endif
             reg [BANK_ADDR_WIDTH-1:0] amo_wb_addr_r;
             reg [WORD_SIZE-1:0]       amo_wb_byteen_r;
             reg [$bits(amo_op_e)-1:0] amo_wb_op_r;
             reg                       amo_wb_unsigned_r;
             reg [WORD_WIDTH-1:0]      amo_wb_rhs_r;
+        `ifdef VX_CFG_H100_SM_ENABLE
+            reg                       amo_wb_pair_r;
+        `endif
         `ifdef VX_CFG_EXT_ZACAS_ENABLE
             reg [AMO_CMP_WIDTH-1:0]   amo_wb_cmp_r;
         `endif
@@ -574,7 +680,11 @@ module VX_local_mem import VX_gpu_pkg::*; #(
             end
 
             `RUNTIME_ASSERT(~(lsu_active && dma_wr_req), ("%t: *** %s bank%0d: LSU request accepted beside a pending DMA write", $time, INSTANCE_ID, i))
+        `ifdef VX_CFG_H100_SM_ENABLE
+            `RUNTIME_ASSERT(~(dma_wr_b && amo_wb_store), ("%t: *** %s bank%0d: DMA write beside an atomic's write-back", $time, INSTANCE_ID, i))
+        `else
             `RUNTIME_ASSERT(~(dma_wr_b && amo_busy), ("%t: *** %s bank%0d: DMA write inside an atomic", $time, INSTANCE_ID, i))
+        `endif
             `RUNTIME_ASSERT(~(res_dma_r && res_valid_r), ("%t: *** %s bank%0d: DMA write and LSU request share the reservation stage", $time, INSTANCE_ID, i))
 
             // A store-conditional fails when its reservation is gone. The outcome is
@@ -616,6 +726,10 @@ module VX_local_mem import VX_gpu_pkg::*; #(
                                   || (res_is_sc_r && res_check);
         `endif
 
+        `ifdef VX_CFG_H100_SM_ENABLE
+            wire amo_wb_is_lr_r   = res_is_lr_r;
+            wire amo_wb_sc_fail_r = sc_fail;
+        `else
             reg amo_wb_is_lr_r;
             reg amo_wb_sc_fail_r;
             always @(posedge clk) begin
@@ -624,6 +738,7 @@ module VX_local_mem import VX_gpu_pkg::*; #(
                     amo_wb_sc_fail_r <= sc_fail;
                 end
             end
+        `endif
 
             // A load-reserved leaves the word alone, and a failed store-conditional
             // must not store; every other atomic writes its computed value back.
@@ -633,7 +748,19 @@ module VX_local_mem import VX_gpu_pkg::*; #(
         `else
             assign amo_wb_store = amo_wb_valid_r && ~amo_wb_is_lr_r && ~amo_wb_sc_fail_r;
         `endif
+        `ifdef VX_CFG_H100_SM_ENABLE
+            // Only the write port outlives an atomic's read: a store or DMA beat
+            // waits out its write-back, a counted access its commit.
+        `ifdef VX_CFG_EXT_DLMEM_ENABLE
+            assign amo_busy = pair_busy
+                           || (~per_bank_req_amo_valid[i]
+                            && ((per_bank_req_rw[i] && amo_wb_store) || (per_bank_req_lacc[i] && amo_commit)));
+        `else
+            assign amo_busy = pair_busy || (~per_bank_req_amo_valid[i] && per_bank_req_rw[i] && amo_wb_store);
+        `endif
+        `else
             assign amo_busy = amo_rd_valid_r || amo_wb_valid_r;
+        `endif
         `ifdef VX_CFG_EXT_FPAMO_ENABLE
             // Float atomics execute only in the last-level cache; on local memory
             // the kernel headers run them as compare-and-swap loops.
@@ -648,17 +775,26 @@ module VX_local_mem import VX_gpu_pkg::*; #(
                     amo_wb_valid_r <= 1'b0;
                 end else begin
                     amo_rd_valid_r <= amo_accept;
+                `ifdef VX_CFG_H100_SM_ENABLE
+                    amo_wb_valid_r <= amo_accept;
+                `else
                     amo_wb_valid_r <= amo_rd_valid_r;
+                `endif
                 end
+            `ifndef VX_CFG_H100_SM_ENABLE
                 if (amo_rd_valid_r) begin
                     amo_old_r <= per_bank_rsp_data[i];
                 end
+            `endif
                 if (amo_accept) begin
                     amo_wb_addr_r     <= per_bank_req_addr[i];
                     amo_wb_byteen_r   <= per_bank_req_byteen[i];
                     amo_wb_op_r       <= per_bank_req_amo_op[i];
                     amo_wb_unsigned_r <= per_bank_req_amo_unsigned[i];
                     amo_wb_rhs_r      <= per_bank_req_data[i];
+                `ifdef VX_CFG_H100_SM_ENABLE
+                    amo_wb_pair_r     <= per_bank_req_amo_pair[i];
+                `endif
                 `ifdef VX_CFG_EXT_ZACAS_ENABLE
                     amo_wb_cmp_r      <= per_bank_req_amo_cmp[i];
                 `endif
@@ -703,12 +839,44 @@ module VX_local_mem import VX_gpu_pkg::*; #(
             wire [1:0]  amo_width;
             if (WORD_WIDTH == 64) begin : g_amo_lane
                 wire lane_hi = ~amo_wb_byteen_r[0];
+            `ifdef VX_CFG_H100_SM_ENABLE
+                // A paired word carries one 32-bit atomic per half.
+                wire [63:0] amo_pair_new, amo_pair_ret;
+                VX_amo_alu #(
+                    .DATA_WIDTH (64)
+                ) amo_pair_alu (
+                    .op          (amo_op_e'(amo_wb_op_r)),
+                    .is_unsigned (amo_wb_unsigned_r),
+                    .width       (2'd2),
+                    .old_word    ({32'h0, amo_old_r[63:32]}),
+                    .rhs         ({32'h0, amo_wb_rhs_r[63:32]}),
+                    .cmp         (64'b0),
+                `ifdef VX_CFG_EXT_MBAR_ENABLE
+                    `UNUSED_PIN  (mbar_flip),
+                    `UNUSED_PIN  (mbar_err),
+                `endif
+                    .new_word    (amo_pair_new),
+                    .ret_word    (amo_pair_ret)
+                );
+                `UNUSED_VAR (amo_pair_new[63:32])
+                `UNUSED_VAR (amo_pair_ret)
+                assign amo_width    = ((&amo_wb_byteen_r) && ~amo_wb_pair_r) ? 2'd3 : 2'd2;
+            `else
                 assign amo_width    = (&amo_wb_byteen_r) ? 2'd3 : 2'd2;
+            `endif
                 assign amo_old_lane = lane_hi ? {32'h0, amo_old_r[63:32]} : amo_old_r;
                 assign amo_rhs_lane = lane_hi ? {32'h0, amo_wb_rhs_r[63:32]} : amo_wb_rhs_r;
+            `ifdef VX_CFG_H100_SM_ENABLE
+                assign amo_wb_data  = amo_wb_pair_r ? {amo_pair_new[31:0], amo_new_word[31:0]}
+                                    : (lane_hi ? {amo_new_word[31:0], 32'h0} : amo_new_word);
+            `else
                 assign amo_wb_data  = lane_hi ? {amo_new_word[31:0], 32'h0} : amo_new_word;
+            `endif
             end else begin : g_amo_word
                 assign amo_width    = 2'd2;
+            `ifdef VX_CFG_H100_SM_ENABLE
+                `UNUSED_VAR (amo_wb_pair_r)
+            `endif
                 assign amo_old_lane = 64'(amo_old_r);
                 assign amo_rhs_lane = 64'(amo_wb_rhs_r);
                 assign amo_wb_data  = amo_new_word[WORD_WIDTH-1:0];
@@ -816,7 +984,11 @@ module VX_local_mem import VX_gpu_pkg::*; #(
             assign amo_wb_byteen = amo_wb_byteen_r;
 
         end else begin : g_no_amo
+        `ifdef VX_CFG_H100_SM_ENABLE
+            assign amo_busy      = pair_busy;
+        `else
             assign amo_busy      = 1'b0;
+        `endif
             assign amo_wb_store  = 1'b0;
             assign amo_wb_addr   = '0;
             assign amo_wb_byteen = '0;
@@ -845,7 +1017,11 @@ module VX_local_mem import VX_gpu_pkg::*; #(
         `endif
         end
 
+    `ifdef VX_CFG_H100_SM_ENABLE
+        assign bank_amo_busy[i] = amo_wb_store;
+    `else
         assign bank_amo_busy[i] = amo_busy;
+    `endif
 
         // SRAM address / write-data / write-enable mux: DMA first, then an owed
         // atomic write-back, then the incoming request
@@ -856,13 +1032,54 @@ module VX_local_mem import VX_gpu_pkg::*; #(
         assign bank_sram_addr  = dma_active   ? BANK_ADDR_WIDTH'(dma_bus_if.req_data.addr)
                                : amo_wb_store ? amo_wb_addr
                                               : per_bank_req_addr[i];
+    `ifdef VX_CFG_H100_SM_ENABLE
+        assign bank_sram_wdata = dma_wr_b     ? dma_bank_data
+                               : amo_wb_store ? amo_wb_data
+                                              : per_bank_req_data[i];
+        assign bank_sram_wren  = dma_wr_b     ? dma_bank_byteen
+                               : amo_wb_store ? amo_wb_byteen
+                                              : per_bank_req_byteen[i];
+    `else
         assign bank_sram_wdata = dma_wr_b     ? dma_bus_if.req_data.data[i*WORD_WIDTH +: WORD_WIDTH]
                                : amo_wb_store ? amo_wb_data
                                               : per_bank_req_data[i];
         assign bank_sram_wren  = dma_wr_b     ? dma_bus_if.req_data.byteen[i*WORD_SIZE +: WORD_SIZE]
                                : amo_wb_store ? amo_wb_byteen
                                               : per_bank_req_byteen[i];
+    `endif
 
+    `ifdef VX_CFG_H100_SM_ENABLE
+        wire [BANK_ADDR_WIDTH-1:0] bank_sram_raddr = dma_rd_b ? BANK_ADDR_WIDTH'(dma_bus_if.req_data.addr)
+                                                              : per_bank_req_addr[i];
+        assign bk_read[i]  = dma_rd_b || (lsu_active && ~per_bank_req_rw[i]);
+        assign bk_write[i] = dma_wr_b || amo_wb_store || (lsu_active && per_bank_req_rw[i]);
+        assign bk_raddr[i] = bank_sram_raddr;
+        assign bk_waddr[i] = bank_sram_addr;
+        assign bk_wdata[i] = bank_sram_wdata;
+        assign bk_wren[i]  = bank_sram_wren;
+
+        if (LMEM_PAIR > 1) begin : g_pair_busy
+            wire req_hi = |per_bank_req_byteen[i][WORD_SIZE-1:BANK_BYTES];
+            assign bk_take_hi[i] = lsu_active && req_hi;
+            assign bk_wb_hi[i]   = amo_wb_store && (|amo_wb_byteen[WORD_SIZE-1:BANK_BYTES]);
+            // The even bank's access owns the upper bank in its cycle, its
+            // atomic's write-back the upper write port; the odd bank's
+            // write-back holds the even bank's stores to the upper half.
+            if ((i % 2) != 0) begin : g_odd
+                assign pair_busy = bk_take_hi[i-1]
+                                || (per_bank_req_rw[i] && ~per_bank_req_amo_valid[i] && bk_wb_hi[i-1]);
+            end else begin : g_even
+                assign pair_busy = per_bank_req_rw[i] && ~per_bank_req_amo_valid[i] && req_hi && bk_wb_hi[i+1];
+            end
+        end else begin : g_no_pair_busy
+            assign bk_take_hi[i] = 1'b0;
+            assign bk_wb_hi[i]   = 1'b0;
+            assign pair_busy     = 1'b0;
+        end
+
+        // The write-first port leaves no read-during-write hazard.
+        wire is_rdw_hazard = 1'b0;
+    `else
         VX_sp_ram #(
             .DATAW (WORD_WIDTH),
             .SIZE  (WORDS_PER_BANK),
@@ -895,6 +1112,7 @@ module VX_local_mem import VX_gpu_pkg::*; #(
             last_wr_addr <= bank_sram_addr;
         end
         wire is_rdw_hazard = last_wr_valid && ~per_bank_req_rw[i] && (per_bank_req_addr[i] == last_wr_addr);
+    `endif
 
         // LSU response valid / request ready — blocked by DMA and RDW hazards
 
@@ -1007,6 +1225,52 @@ module VX_local_mem import VX_gpu_pkg::*; #(
                                                            : bank_rsp_word;
 
     end
+
+`ifdef VX_CFG_H100_SM_ENABLE
+    // The bank SRAMs, a pair at a time: an access of the even bank that
+    // reaches the upper half drives the odd bank's SRAM at its own row, the
+    // odd bank being held that cycle.
+    for (genvar p = 0; p < NUM_BANKS / LMEM_PAIR; ++p) begin : g_bank_pairs
+        localparam EVEN = p * LMEM_PAIR;
+        wire [LMEM_PAIR-1:0][BANK_WIDTH-1:0] pair_rdata;
+        for (genvar h = 0; h < LMEM_PAIR; ++h) begin : g_halves
+            localparam BANK = EVEN + h;
+            wire rd_even, wr_even;
+            if (h != 0) begin : g_upper
+                assign rd_even = bk_read[EVEN] && bk_take_hi[EVEN];
+                assign wr_even = bk_write[EVEN] && (|bk_wren[EVEN][h*BANK_BYTES +: BANK_BYTES]);
+            end else begin : g_lower
+                assign rd_even = 1'b0;
+                assign wr_even = 1'b0;
+            end
+            `RUNTIME_ASSERT(~(rd_even && bk_read[BANK]), ("%t: *** %s bank%0d: two reads of one bank", $time, INSTANCE_ID, BANK))
+            `RUNTIME_ASSERT(~(wr_even && bk_write[BANK]), ("%t: *** %s bank%0d: two writes of one bank", $time, INSTANCE_ID, BANK))
+            wire [BANK_ADDR_WIDTH-1:0] wsrc_addr  = wr_even ? bk_waddr[EVEN] : bk_waddr[BANK];
+            wire [BANK_WIDTH-1:0]      wsrc_data  = wr_even ? bk_wdata[EVEN][h*BANK_WIDTH +: BANK_WIDTH] : bk_wdata[BANK][h*BANK_WIDTH +: BANK_WIDTH];
+            wire [BANK_BYTES-1:0]      wsrc_wren  = wr_even ? bk_wren[EVEN][h*BANK_BYTES +: BANK_BYTES]  : bk_wren[BANK][h*BANK_BYTES +: BANK_BYTES];
+            VX_dp_ram #(
+                .DATAW (BANK_WIDTH),
+                .SIZE  (WORDS_PER_BANK),
+                .WRENW (BANK_BYTES),
+                .OUT_REG (1),
+                .RDW_MODE ("W")
+            ) lmem_store (
+                .clk   (clk),
+                .reset (reset),
+                .read  (bk_read[BANK] || rd_even),
+                .write (bk_write[BANK] || wr_even),
+                .wren  (wsrc_wren),
+                .waddr (wsrc_addr),
+                .wdata (wsrc_data),
+                .raddr (rd_even ? bk_raddr[EVEN] : bk_raddr[BANK]),
+                .rdata (pair_rdata[h])
+            );
+        end
+        for (genvar h = 0; h < LMEM_PAIR; ++h) begin : g_pair_rsp
+            assign per_bank_rsp_data[EVEN + h] = pair_rdata;
+        end
+    end
+`endif
 
     // bank responses gather
 

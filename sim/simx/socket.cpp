@@ -48,6 +48,16 @@
 #include "dlmem/dlmem_egress.h"
 #include "dlmem/dlmem_ingress.h"
 #endif
+#ifdef VX_CFG_H100_SM_ENABLE
+#include "sm_port.h"
+#endif
+#if !defined(VX_CFG_EXT_DXA_ENABLE)
+#line 36
+#elif !defined(DXA_MBAR_ENABLE)
+#line 41
+#else
+#line 49
+#endif
 
 using namespace vortex;
 
@@ -90,6 +100,44 @@ public:
       false,                  // is_llc (icache never carries AMO state)
     });
 
+#ifdef VX_CFG_H100_SM_ENABLE
+    // One L1 per SM, each with its own memory side: the SM's port.
+    for (uint32_t i = 0; i < cores_per_socket; ++i) {
+      snprintf(sname, 100, "%s-dcache%d", name.c_str(), i);
+      Cache::Config cfg{
+        !VX_CFG_DCACHE_ENABLED,
+        log2ceil(VX_CFG_DCACHE_SIZE),      // C
+        log2ceil(VX_CFG_DCACHE_LINE_SIZE), // L
+        log2ceil(VX_CFG_DCACHE_SECTOR_SIZE), // S
+        log2ceil(DCACHE_WORD_SIZE),        // W
+        log2ceil(VX_CFG_DCACHE_NUM_WAYS),  // A
+        log2ceil(VX_CFG_DCACHE_NUM_BANKS), // B
+        VX_CFG_XLEN,                       // address bits
+        VX_CFG_DCACHE_NUM_REQS,            // number of inputs
+        1,                                 // memory ports
+        VX_CFG_DCACHE_WRITEBACK,           // write-back
+        VX_CFG_DCACHE_DIRTYBYTES,          // dirty bytes
+        false,                             // write response
+        VX_CFG_DCACHE_MSHR_SIZE,           // mshr size
+        VX_CFG_DCACHE_LATENCY,             // pipeline latency
+        VX_CFG_DCACHE_REPL_POLICY,         // replacement policy
+        (VX_CFG_DCACHE_ENABLED != 0) && (VX_CFG_L2_ENABLED == 0) && (VX_CFG_L3_ENABLED == 0), // is_llc
+        DCACHE_FENCE_SHARED,               // fence_shared
+      #ifdef VX_CFG_EXT_DLMEM_ENABLE
+        true,                              // fence_cta
+      #endif
+      };
+      cfg.h100_l1 = true;
+      sm_dcaches_.push_back(CacheCluster::Create(sname, 1, 1, cfg));
+    }
+#else
+#if !defined(VX_CFG_EXT_DXA_ENABLE)
+#line 76
+#elif !defined(DXA_MBAR_ENABLE)
+#line 81
+#else
+#line 89
+#endif
     snprintf(sname, 100, "%s-dcache", name.c_str());
     // L1 dcache is the LLC iff neither L2 nor L3 is enabled.
     dcaches_ = CacheCluster::Create(sname, cores_per_socket, VX_CFG_NUM_DCACHES, Cache::Config{
@@ -115,6 +163,14 @@ public:
       true,                   // fence_cta
     #endif
     });
+#endif
+#if !defined(VX_CFG_EXT_DXA_ENABLE)
+#line 100
+#elif !defined(DXA_MBAR_ENABLE)
+#line 105
+#else
+#line 113
+#endif
 
 #ifdef VX_CFG_EXT_TEX_ENABLE
     // ── Socket-resident TEX engine + tcache ─────────────────────────────
@@ -228,6 +284,69 @@ public:
       brsp->Out.bind(&rsp_dst);
     };
 
+#ifdef VX_CFG_H100_SM_ENABLE
+    __unused(overlap);
+    // One port per SM (VX_sm_port) for its L1's and its TMA engine's line
+    // requests and its SM-to-SM packets. Instruction fetch and the texture
+    // caches are not L1TEX traffic: they join SM 0's memory port.
+    static_assert(VX_CFG_ICACHE_MEM_PORTS == 1, "the H100 SM path has one instruction-cache memory port");
+    static_assert(VX_CFG_L1_MEM_PORTS == VX_CFG_SOCKET_SIZE, "the H100 SM path has one memory port per SM");
+    constexpr int32_t kMissDelay = int32_t(VX_CFG_SM_L2_SIDE_LATENCY) - int32_t(L1_MISS_PIPE_OVERHEAD)
+                                 - int32_t(SmPort::MISS_STAGES);
+    static_assert(kMissDelay >= 0, "VX_CFG_SM_L2_SIDE_LATENCY below the pipeline's own stages");
+    {
+      SmPort::Config pcfg;
+      pcfg.num_srcs      = 1 + VX_CFG_EXT_DXA_ENABLED;
+      pcfg.line_bytes    = VX_CFG_DCACHE_LINE_SIZE;
+      pcfg.egress_delay  = (kMissDelay + 1) / 2;
+      pcfg.ingress_delay = kMissDelay / 2;
+      for (uint32_t i = 0; i < cores_per_socket; ++i) {
+        snprintf(sname, 100, "%s-smport%d", name.c_str(), i);
+        auto port = SmPort::Create(sname, pcfg);
+        sm_dcaches_.at(i)->mem_req_out.at(0).bind(&port->SrcReqIn.at(SmPort::SRC_L1));
+        port->SrcRspOut.at(SmPort::SRC_L1).bind(&sm_dcaches_.at(i)->mem_rsp_in.at(0));
+        sm_ports_.push_back(port);
+      }
+    }
+  #ifdef VX_CFG_EXT_DXA_ENABLE
+    snprintf(sname, 100, "%s-smtma", name.c_str());
+    sm_tma_split_ = SmTmaSplit::Create(sname, cores_per_socket);
+    dxa_core_->gmem_req_out.at(0).bind(&sm_tma_split_->ReqIn);
+    sm_tma_split_->RspOut.bind(&dxa_core_->gmem_rsp_in.at(0));
+    for (uint32_t i = 0; i < cores_per_socket; ++i) {
+      sm_tma_split_->ReqOut.at(i).bind(&sm_ports_.at(i)->SrcReqIn.at(SmPort::SRC_TMA));
+      sm_ports_.at(i)->SrcRspOut.at(SmPort::SRC_TMA).bind(&sm_tma_split_->RspIn.at(i));
+    }
+  #endif
+    {
+      constexpr uint32_t kArbIns = 2 + VX_CFG_EXT_TEX_ENABLED + VX_CFG_EXT_RTU_ENABLED;
+      snprintf(sname, 100, "%s-mem_arb0", name.c_str());
+      auto sock_arb = MemArbiter::Create(sname, ArbiterType::Priority, kArbIns, 1);
+      icaches_->mem_req_out.at(0).bind(&sock_arb->ReqIn.at(0));
+      sock_arb->RspOut.at(0).bind(&icaches_->mem_rsp_in.at(0));
+      sm_ports_.at(0)->MemReqOut.bind(&sock_arb->ReqIn.at(1));
+      sock_arb->RspOut.at(1).bind(&sm_ports_.at(0)->MemRspIn);
+    #ifdef VX_CFG_EXT_TEX_ENABLE
+      tcache_->mem_req_out.at(0).bind(&sock_arb->ReqIn.at(2));
+      sock_arb->RspOut.at(2).bind(&tcache_->mem_rsp_in.at(0));
+    #endif
+    #ifdef VX_CFG_EXT_RTU_ENABLE
+      rtcache_->mem_req_out.at(0).bind(&sock_arb->ReqIn.at(2 + VX_CFG_EXT_TEX_ENABLED));
+      sock_arb->RspOut.at(2 + VX_CFG_EXT_TEX_ENABLED).bind(&rtcache_->mem_rsp_in.at(0));
+    #endif
+      bind_mem_port(0, sock_arb->ReqOut.at(0), sock_arb->RspIn.at(0));
+      for (uint32_t i = 1; i < cores_per_socket; ++i) {
+        bind_mem_port(i, sm_ports_.at(i)->MemReqOut, sm_ports_.at(i)->MemRspIn);
+      }
+    }
+#else
+#if !defined(VX_CFG_EXT_DXA_ENABLE)
+#line 211
+#elif !defined(DXA_MBAR_ENABLE)
+#line 216
+#else
+#line 224
+#endif
 #if defined(VX_CFG_EXT_TEX_ENABLE) || defined(VX_CFG_EXT_RTU_ENABLE) || defined(VX_CFG_EXT_DXA_ENABLE)
     // Port 0: icache and dcache arbitrate with the socket-resident units'
     // memory ports as peers. Priority order — icache, dcache, tcache,
@@ -288,6 +407,14 @@ public:
       }
     }
 #endif
+#endif
+#if !defined(VX_CFG_EXT_DXA_ENABLE)
+#line 271
+#elif !defined(DXA_MBAR_ENABLE)
+#line 276
+#else
+#line 284
+#endif
 
 #ifdef VX_CFG_EXT_DLMEM_ENABLE
     // The DLMEM endpoints and switches tick in the order their models need:
@@ -306,7 +433,25 @@ public:
         cfg.dlmem_base    = VX_MEM_DLMEM_BASE_ADDR;
         cfg.num_blocks    = VX_CFG_NUM_LSU_BLOCKS;
         cfg.num_lanes     = VX_CFG_NUM_LSU_LANES;
+#ifdef VX_CFG_H100_SM_ENABLE
+        cfg.store_credits = DLMEM_STORE_LANE_CREDITS;
+#else
+#if !defined(VX_CFG_EXT_DXA_ENABLE)
+#line 289
+#elif !defined(DXA_MBAR_ENABLE)
+#line 294
+#else
+#line 302
+#endif
         cfg.store_credits = VX_CFG_DLMEM_STORE_CREDITS;
+#endif
+#if !defined(VX_CFG_EXT_DXA_ENABLE)
+#line 290
+#elif !defined(DXA_MBAR_ENABLE)
+#line 295
+#else
+#line 303
+#endif
         cfg.pending_size  = VX_CFG_DLMEM_PENDING_SIZE;
         cfg.lrsc_assert   = true;
         snprintf(sname, 100, "%s-dlmem_egress%d", name.c_str(), i);
@@ -324,12 +469,45 @@ public:
       snprintf(sname, 100, "%s-dlmem_rsp_switch", name.c_str());
       dlmem_rsp_switch_ = Socket::DlmemRspSwitch::Create(sname, socket_idx, cores_per_socket, NUM_SOCKETS);
       for (uint32_t i = 0; i < cores_per_socket; ++i) {
+#ifdef VX_CFG_H100_SM_ENABLE
+        auto& port = sm_ports_.at(i);
+        dlmem_egress_.at(i)->NetReqOut.bind(&port->DsmReqIn);
+        port->DsmReqOut.bind(&dlmem_req_switch_->CoreIn.at(i));
+        dlmem_req_switch_->CoreOut.at(i).bind(&port->ArrReqIn);
+        port->ArrReqOut.bind(&dlmem_ingress_.at(i)->NetReqIn);
+        dlmem_ingress_.at(i)->NetRspOut.bind(&port->DsmRspIn);
+        port->DsmRspOut.bind(&dlmem_rsp_switch_->CoreIn.at(i));
+        dlmem_rsp_switch_->CoreOut.at(i).bind(&port->ArrRspIn);
+        port->ArrRspOut.bind(&dlmem_egress_.at(i)->NetRspIn);
+#else
+#if !defined(VX_CFG_EXT_DXA_ENABLE)
+#line 307
+#elif !defined(DXA_MBAR_ENABLE)
+#line 312
+#else
+#line 320
+#endif
         dlmem_egress_.at(i)->NetReqOut.bind(&dlmem_req_switch_->CoreIn.at(i));
         dlmem_req_switch_->CoreOut.at(i).bind(&dlmem_ingress_.at(i)->NetReqIn);
         dlmem_ingress_.at(i)->NetRspOut.bind(&dlmem_rsp_switch_->CoreIn.at(i));
         dlmem_rsp_switch_->CoreOut.at(i).bind(&dlmem_egress_.at(i)->NetRspIn);
+#endif
+#if !defined(VX_CFG_EXT_DXA_ENABLE)
+#line 311
+#elif !defined(DXA_MBAR_ENABLE)
+#line 316
+#else
+#line 324
+#endif
       }
     }
+#endif
+#if !defined(VX_CFG_EXT_DXA_ENABLE)
+#line 314
+#elif !defined(DXA_MBAR_ENABLE)
+#line 319
+#else
+#line 327
 #endif
 
     // create cores
@@ -345,8 +523,27 @@ public:
         icaches_->core_rsp_out.at(i).at(0).bind(&cores_.at(i)->icache_rsp_in.at(0));
 
       for (uint32_t j = 0; j < VX_CFG_DCACHE_NUM_REQS; ++j) {
+#ifdef VX_CFG_H100_SM_ENABLE
+        cores_.at(i)->dcache_req_out.at(j).bind(&sm_dcaches_.at(i)->core_req_in.at(0).at(j));
+        sm_dcaches_.at(i)->core_rsp_out.at(0).at(j).bind(&cores_.at(i)->dcache_rsp_in.at(j));
+#else
+#if !defined(VX_CFG_EXT_DXA_ENABLE)
+#line 328
+#elif !defined(DXA_MBAR_ENABLE)
+#line 333
+#else
+#line 341
+#endif
         cores_.at(i)->dcache_req_out.at(j).bind(&dcaches_->core_req_in.at(i).at(j));
         dcaches_->core_rsp_out.at(i).at(j).bind(&cores_.at(i)->dcache_rsp_in.at(j));
+#endif
+#if !defined(VX_CFG_EXT_DXA_ENABLE)
+#line 330
+#elif !defined(DXA_MBAR_ENABLE)
+#line 335
+#else
+#line 343
+#endif
       }
     }
 
@@ -463,6 +660,19 @@ public:
         return true;
     }
   #endif
+#ifdef VX_CFG_H100_SM_ENABLE
+    for (auto& port : sm_ports_) {
+      if (!port->empty())
+        return true;
+    }
+#endif
+#if defined(VX_CFG_EXT_DXA_ENABLE) && !defined(DXA_MBAR_ENABLE)
+#line 428
+#elif !defined(VX_CFG_EXT_DXA_ENABLE)
+#line 433
+#else
+#line 459
+#endif
     return false;
   }
 
@@ -477,7 +687,27 @@ public:
   Socket::PerfStats perf_stats() const {
     Socket::PerfStats perf_stats;
     perf_stats.icache = icaches_->perf_stats();
+#ifdef VX_CFG_H100_SM_ENABLE
+    for (auto& dcache : sm_dcaches_) {
+      perf_stats.dcache += dcache->perf_stats();
+    }
+#else
+#if defined(VX_CFG_EXT_DXA_ENABLE) && !defined(DXA_MBAR_ENABLE)
+#line 442
+#elif !defined(VX_CFG_EXT_DXA_ENABLE)
+#line 447
+#else
+#line 473
+#endif
     perf_stats.dcache = dcaches_->perf_stats();
+#endif
+#if defined(VX_CFG_EXT_DXA_ENABLE) && !defined(DXA_MBAR_ENABLE)
+#line 443
+#elif !defined(VX_CFG_EXT_DXA_ENABLE)
+#line 448
+#else
+#line 474
+#endif
 #ifdef VX_CFG_EXT_DXA_ENABLE
     perf_stats.dxa = dxa_core_->perf_stats();
 #endif
@@ -538,8 +768,36 @@ public:
     return cores_.at(idx);
   }
 
+#ifdef VX_CFG_H100_SM_ENABLE
+  void dcache_flush_begin() {
+    for (auto& dcache : sm_dcaches_)
+      dcache->flush_begin();
+  }
+  bool dcache_flush_done() const {
+    for (auto& dcache : sm_dcaches_) {
+      if (!dcache->flush_done())
+        return false;
+    }
+    return true;
+  }
+#else
+#if defined(VX_CFG_EXT_DXA_ENABLE) && !defined(DXA_MBAR_ENABLE)
+#line 493
+#elif !defined(VX_CFG_EXT_DXA_ENABLE)
+#line 498
+#else
+#line 534
+#endif
   void dcache_flush_begin() { dcaches_->flush_begin(); }
   bool dcache_flush_done() const { return dcaches_->flush_done(); }
+#endif
+#if defined(VX_CFG_EXT_DXA_ENABLE) && !defined(DXA_MBAR_ENABLE)
+#line 495
+#elif !defined(VX_CFG_EXT_DXA_ENABLE)
+#line 500
+#else
+#line 536
+#endif
   void icache_flush_begin() { icaches_->flush_begin(); }
   bool icache_flush_done() const { return icaches_->flush_done(); }
 #ifdef VX_CFG_EXT_TEX_ENABLE
@@ -588,6 +846,20 @@ private:
   std::vector<DlmemIngress::Ptr> dlmem_ingress_;
   Socket::DlmemReqSwitch::Ptr    dlmem_req_switch_;
   Socket::DlmemRspSwitch::Ptr    dlmem_rsp_switch_;
+#endif
+#ifdef VX_CFG_H100_SM_ENABLE
+  std::vector<CacheCluster::Ptr> sm_dcaches_;
+  std::vector<SmPort::Ptr>       sm_ports_;
+#ifdef VX_CFG_EXT_DXA_ENABLE
+  SmTmaSplit::Ptr                sm_tma_split_;
+#endif
+#endif
+#if defined(VX_CFG_EXT_DXA_ENABLE) && !defined(DXA_MBAR_ENABLE)
+#line 544
+#elif !defined(VX_CFG_EXT_DXA_ENABLE)
+#line 549
+#else
+#line 585
 #endif
 };
 

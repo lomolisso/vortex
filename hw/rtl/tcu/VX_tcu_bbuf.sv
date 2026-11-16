@@ -103,7 +103,12 @@ module VX_tcu_bbuf import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
     localparam ROW_HWORDS     = NUM_BANKS * (`VX_CFG_XLEN / 16);
     localparam LANE_W         = ROW_BYTES_LOG - 2;
     localparam B_BLOCK_WORDS  = TCU_WG_FEDP_K * TCU_TC_N;
+`ifdef VX_CFG_H100_SM_ENABLE
+    // NUM_BANKS is the SM port row here, not a bank row; the buffer still holds both column parities.
+    localparam B_BUF_WORDS    = B_BLOCK_WORDS * TCU_WG_B_SUB_BLOCKS;
+`else
     localparam B_BUF_WORDS    = NUM_BANKS;
+`endif
     localparam SN_W           = $bits(req_step_n);
     localparam CTR_W          = 4;
     localparam NUM_READS      = 8;

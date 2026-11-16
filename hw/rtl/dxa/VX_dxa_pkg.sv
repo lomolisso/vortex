@@ -20,8 +20,16 @@ package VX_dxa_pkg;
 
     import VX_gpu_pkg::*;
 
+`ifdef VX_CFG_H100_SM_ENABLE
+    // DXA local-memory path: one shared-memory port access, a native row.
+    localparam DXA_LMEM_WORD_SIZE = LMEM_DMA_DATA_SIZE;
+    // In the global request's tag value, the gmem arbiter's input: the
+    // issuing SM, since worker i serves core i.
+    localparam DXA_GMEM_CORE_LSB  = 0;
+`else
     // DXA local-memory path: dimensioned to cover all banks in one request.
     localparam DXA_LMEM_WORD_SIZE = `VX_CFG_LMEM_NUM_BANKS * (`VX_CFG_XLEN / 8);
+`endif
     localparam DXA_LMEM_ADDR_W = LMEM_DMA_ADDR_WIDTH;
 
     // LMEM byte-address width: an LMEM-relative byte offset, same as

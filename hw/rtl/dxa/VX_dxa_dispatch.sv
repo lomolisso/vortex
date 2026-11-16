@@ -47,6 +47,27 @@ module VX_dxa_dispatch import VX_gpu_pkg::*, VX_dxa_pkg::*; #(
         assign ready_out[i] = req_out[i].ready;
     end
 
+`ifdef VX_CFG_H100_SM_ENABLE
+    // One engine per SM: a request goes to the worker of the core that issued it.
+    `STATIC_ASSERT (NUM_INPUTS == 1, ("invalid parameter"))
+    `STATIC_ASSERT (NUM_OUTPUTS == `VX_CFG_SOCKET_SIZE, ("the H100 SM path has one DXA worker per core"))
+    `STATIC_ASSERT (BUFFERED == 0, ("invalid parameter"))
+    `UNUSED_VAR ({clk, reset})
+    localparam SEL_BITS = `CLOG2(NUM_OUTPUTS);
+    // The socket-local core index is the core id's low bits.
+    `STATIC_ASSERT ((1 << SEL_BITS) == NUM_OUTPUTS, ("the socket size must be a power of two"))
+    wire [`UP(SEL_BITS)-1:0] sel;
+    if (SEL_BITS != 0) begin : g_sel
+        assign sel = req_in[0].req_data.core_id[SEL_BITS-1:0];
+    end else begin : g_sel1
+        assign sel = '0;
+    end
+    for (genvar i = 0; i < NUM_OUTPUTS; ++i) begin : g_route
+        assign valid_out[i] = valid_in[0] && (sel == `UP(SEL_BITS)'(i));
+        assign data_out[i]  = data_in[0];
+    end
+    assign ready_in[0] = ready_out[sel];
+`else
     VX_stream_dispatch #(
         .NUM_INPUTS  (NUM_INPUTS),
         .NUM_OUTPUTS (NUM_OUTPUTS),
@@ -63,5 +84,6 @@ module VX_dxa_dispatch import VX_gpu_pkg::*, VX_dxa_pkg::*; #(
         .data_out  (data_out),
         .ready_out (ready_out)
     );
+`endif
 
 endmodule

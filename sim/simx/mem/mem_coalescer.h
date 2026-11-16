@@ -53,6 +53,14 @@ protected:
 
 private:
   void flush_out_round();
+#ifdef VX_CFG_H100_SM_ENABLE
+  void build_line_round(const LsuReq& in_req);
+  static constexpr uint8_t LANE_NO_CH = 0xff;
+  // per response tag of a line round, per input lane: its output channel, or none
+  std::vector<std::vector<uint8_t>> lane_ch_;
+#else
+#line 55
+#endif
 
   struct pending_req_t {
     uint32_t tag;

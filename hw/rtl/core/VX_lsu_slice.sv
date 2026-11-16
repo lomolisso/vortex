@@ -234,6 +234,9 @@ module VX_lsu_slice import VX_gpu_pkg::*; #(
         // operand slot for it; every other atomic leaves the slot unread.
         assign lane_amo.amo_cmp      = execute_if.data.rs3_data[i];
     `endif
+    `ifdef VX_CFG_H100_SM_ENABLE
+        assign lane_amo.amo_pair     = 1'b0;
+    `endif
         // make_hart_id(cid, wid, tid) — packed concatenation, low bits = tid.
         // Lane i of packet pid carries warp thread pid * NUM_LANES + i.
         wire [HART_ID_WIDTH-1:0] lane_tid = (PID_BITS != 0)

@@ -3935,3 +3935,17 @@ tests:
     env: {DG_SHAPE_N: "640", DG_SHAPE_K: "1024", DG_NUM_GROUPS: "2", DG_NUM_SMS: "2"}
     touches: *deepgemm_touches
     args: "-m 384"
+
+  # E12: the H100 SM path (VX_CFG_H100_SM_ENABLE); expectations come from sw/common/{smem_bank,l1,sm_port}_ref.h.
+  - id: org-mbar_remote
+    via: blackbox
+    drivers: [simx]
+    xlen: [64]
+    app: mbar_remote
+    configs: "-DVX_CFG_H100_SM_ENABLE -DVX_CFG_EXT_DLMEM_ENABLE -DVX_CFG_EXT_A_ENABLE -DVX_CFG_EXT_MBAR_ENABLE"
+    shape: {cores: 2, threads: 32, l2cache: true}
+    touches: [VX_config.toml, hw/rtl/VX_gpu_pkg.sv, hw/rtl/VX_socket.sv, hw/rtl/mem, hw/rtl/cache, hw/rtl/core,
+            hw/rtl/dlmem, hw/rtl/dxa, hw/rtl/libs/VX_mem_coalescer.sv, sim/simx, sw/common/smem_bank_ref.h,
+            sw/common/l1_ref.h, sw/common/sm_port_ref.h, tests/regression/smem_bank, tests/regression/l1_sector,
+            tests/regression/sm_port]
+    args: "-m all -d 0"

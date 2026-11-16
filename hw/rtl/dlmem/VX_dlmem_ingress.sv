@@ -52,7 +52,17 @@ module VX_dlmem_ingress import VX_gpu_pkg::*, VX_dlmem_pkg::*; #(
 );
     localparam SLOT_W     = `LOG2UP(NUM_SLOTS);
     localparam WORD_W     = LSU_WORD_SIZE * 8;
+`ifdef VX_CFG_H100_SM_ENABLE
+    // The local memory takes one SM-to-SM slot per request; a lane sits at its offset in it.
+    localparam ING_WORDS  = LMEM_INGRESS_DATA_SIZE / LSU_WORD_SIZE;
+    localparam OFF_BITS   = `CLOG2(ING_WORDS);
+    localparam OFF_W      = `UP(OFF_BITS);
+    localparam LMEM_DATAW = 1 + (DLMEM_LMEM_AW - OFF_BITS) + LMEM_INGRESS_DATA_SIZE * 8 + LMEM_INGRESS_DATA_SIZE
+                          + MEM_ATTR_WIDTH + LSU_TAG_WIDTH;
+    `STATIC_ASSERT (LMEM_INGRESS_DATA_SIZE % LSU_WORD_SIZE == 0, ("dlmem ingress: the slot must be whole LSU words"))
+`else
     localparam LMEM_DATAW = 1 + DLMEM_LMEM_AW + WORD_W + LSU_WORD_SIZE + MEM_ATTR_WIDTH + LSU_TAG_WIDTH;
+`endif
     localparam RSP_DATAW  = DLMEM_CORE_W + DLMEM_RSP_DATAW;
 
     `STATIC_ASSERT (NUM_SLOTS >= 1, ("invalid parameter"))
@@ -69,6 +79,10 @@ module VX_dlmem_ingress import VX_gpu_pkg::*, VX_dlmem_pkg::*; #(
     reg [NUM_SLOTS-1:0][DLMEM_CORE_W-1:0]  src_r;
     reg [NUM_SLOTS-1:0][DLMEM_TAG_W-1:0]   tag_r;
     reg [NUM_SLOTS-1:0][WORD_W-1:0]        data_r;
+`ifdef VX_CFG_H100_SM_ENABLE
+    reg [NUM_SLOTS-1:0][OFF_W-1:0]         off_r;
+    reg [NUM_SLOTS-1:0][DLMEM_HB_W-1:0]    rsp_hb_r;
+`endif
 `ifdef VX_CFG_EXT_MBAR_ENABLE
     reg [NUM_SLOTS-1:0]                    async_r;
     reg [NUM_SLOTS-1:0]                    cx_sent_r;
@@ -92,6 +106,9 @@ module VX_dlmem_ingress import VX_gpu_pkg::*, VX_dlmem_pkg::*; #(
 
     dlmem_req_pkt_t req_pkt;
     assign req_pkt = dlmem_req_pkt_t'(req_in_if.data);
+`ifdef VX_CFG_H100_SM_ENABLE
+    `UNUSED_VAR (req_pkt)
+`endif
 
 `ifdef DXA_MBAR_ENABLE
     wire is_row   = (req_pkt.op == DLMEM_OP_DXA);
@@ -108,7 +125,11 @@ module VX_dlmem_ingress import VX_gpu_pkg::*, VX_dlmem_pkg::*; #(
     `UNUSED_VAR (req_in_if.dst)
 
     // A data word is one bank's lane of a DMA beat.
+`ifdef VX_CFG_H100_SM_ENABLE
+    localparam NUM_BANKS = LMEM_DMA_DATA_SIZE / LSU_WORD_SIZE;
+`else
     localparam NUM_BANKS = `VX_CFG_LMEM_NUM_BANKS;
+`endif
     localparam BANK_BITS = `CLOG2(NUM_BANKS);
     wire [`UP(BANK_BITS)-1:0] row_bank;
     if (BANK_BITS != 0) begin : g_row_bank
@@ -151,6 +172,18 @@ module VX_dlmem_ingress import VX_gpu_pkg::*, VX_dlmem_pkg::*; #(
     `UNUSED_VAR (req_in_if.dst)
 `endif
 
+`ifdef VX_CFG_H100_SM_ENABLE
+    wire [OFF_W-1:0] req_off;
+    if (OFF_BITS != 0) begin : g_req_off
+        assign req_off = req_pkt.addr[OFF_BITS-1:0];
+    end else begin : g_req_off0
+        assign req_off = '0;
+    end
+    wire [DLMEM_LMEM_AW-OFF_BITS-1:0]    req_slot_addr = req_pkt.addr[DLMEM_LMEM_AW-1:OFF_BITS];
+    wire [LMEM_INGRESS_DATA_SIZE*8-1:0]  req_slot_data = {ING_WORDS{req_pkt.data}};
+    wire [LMEM_INGRESS_DATA_SIZE-1:0]    req_slot_be   = LMEM_INGRESS_DATA_SIZE'(req_pkt.byteen) << (32'(req_off) * LSU_WORD_SIZE);
+`endif
+
     mem_bus_attr_t lmem_attr;
     always @(*) begin
         lmem_attr                  = '0;
@@ -187,6 +220,16 @@ module VX_dlmem_ingress import VX_gpu_pkg::*, VX_dlmem_pkg::*; #(
         default: '0
     };
     wire [LSU_TAG_WIDTH-1:0] cx_tag = {UUID_WIDTH'(0), (LSU_TAG_WIDTH-UUID_WIDTH)'({1'b1, head_slot})};
+`ifdef VX_CFG_H100_SM_ENABLE
+    wire [OFF_W-1:0] cx_off;
+    if (OFF_BITS != 0) begin : g_cx_off
+        assign cx_off = mbar_addr_r[head_slot][OFF_BITS-1:0];
+    end else begin : g_cx_off0
+        assign cx_off = '0;
+    end
+    wire [DLMEM_LMEM_AW-OFF_BITS-1:0] cx_slot_addr = mbar_addr_r[head_slot][DLMEM_LMEM_AW-1:OFF_BITS];
+    wire [LMEM_INGRESS_DATA_SIZE-1:0] cx_slot_be   = LMEM_INGRESS_DATA_SIZE'({LSU_WORD_SIZE{1'b1}}) << (32'(cx_off) * LSU_WORD_SIZE);
+`endif
 
     VX_elastic_buffer #(
         .DATAW   (LMEM_DATAW),
@@ -197,6 +240,23 @@ module VX_dlmem_ingress import VX_gpu_pkg::*, VX_dlmem_pkg::*; #(
         .reset     (reset),
         .valid_in  (lmem_req_valid || cx_valid),
         .ready_in  (lmem_req_ready),
+    `ifdef VX_CFG_H100_SM_ENABLE
+        .data_in   (cx_valid ? {
+            1'b0,
+            cx_slot_addr,
+            {ING_WORDS{WORD_W'(bytes_r[head_slot])}},
+            cx_slot_be,
+            MEM_ATTR_WIDTH'(CX_ATTR),
+            cx_tag
+        } : {
+            (req_pkt.op == DLMEM_OP_ST),
+            req_slot_addr,
+            req_slot_data,
+            req_slot_be,
+            MEM_ATTR_WIDTH'(lmem_attr),
+            lmem_tag
+        }),
+    `else
         .data_in   (cx_valid ? {
             1'b0,
             mbar_addr_r[head_slot],
@@ -212,6 +272,7 @@ module VX_dlmem_ingress import VX_gpu_pkg::*, VX_dlmem_pkg::*; #(
             MEM_ATTR_WIDTH'(lmem_attr),
             lmem_tag
         }),
+    `endif
         .data_out  (lmem_bus_if.req_data),
         .valid_out (lmem_bus_if.req_valid),
         .ready_out (lmem_bus_if.req_ready)
@@ -236,6 +297,16 @@ module VX_dlmem_ingress import VX_gpu_pkg::*, VX_dlmem_pkg::*; #(
         .reset     (reset),
         .valid_in  (lmem_req_valid),
         .ready_in  (lmem_req_ready),
+    `ifdef VX_CFG_H100_SM_ENABLE
+        .data_in   ({
+            (req_pkt.op == DLMEM_OP_ST),
+            req_slot_addr,
+            req_slot_data,
+            req_slot_be,
+            MEM_ATTR_WIDTH'(lmem_attr),
+            lmem_tag
+        }),
+    `else
         .data_in   ({
             (req_pkt.op == DLMEM_OP_ST),
             req_pkt.addr,
@@ -244,6 +315,7 @@ module VX_dlmem_ingress import VX_gpu_pkg::*, VX_dlmem_pkg::*; #(
             MEM_ATTR_WIDTH'(lmem_attr),
             lmem_tag
         }),
+    `endif
         .data_out  (lmem_bus_if.req_data),
         .valid_out (lmem_bus_if.req_valid),
         .ready_out (lmem_bus_if.req_ready)
@@ -330,6 +402,10 @@ module VX_dlmem_ingress import VX_gpu_pkg::*, VX_dlmem_pkg::*; #(
             `endif
                 src_r[s] <= req_pkt.src;
                 tag_r[s] <= req_pkt.tag;
+            `ifdef VX_CFG_H100_SM_ENABLE
+                off_r[s]    <= req_off;
+                rsp_hb_r[s] <= req_pkt.rsp_hb;
+            `endif
             end
         `ifdef VX_CFG_EXT_MBAR_ENABLE
             if (alloc_s) begin
@@ -339,7 +415,11 @@ module VX_dlmem_ingress import VX_gpu_pkg::*, VX_dlmem_pkg::*; #(
             end
         `endif
             if (done_s) begin
+            `ifdef VX_CFG_H100_SM_ENABLE
+                data_r[s] <= lmem_bus_if.rsp_data.data[off_r[s] * WORD_W +: WORD_W];
+            `else
                 data_r[s] <= lmem_bus_if.rsp_data.data;
+            `endif
             end
         end
     end
@@ -351,6 +431,9 @@ module VX_dlmem_ingress import VX_gpu_pkg::*, VX_dlmem_pkg::*; #(
         rsp_pkt      = '0;
         rsp_pkt.ack  = ack_r[head_slot];
         rsp_pkt.tag  = tag_r[head_slot];
+    `ifdef VX_CFG_H100_SM_ENABLE
+        rsp_pkt.pkt_hb = rsp_hb_r[head_slot];
+    `endif
     `ifdef VX_CFG_EXT_MBAR_ENABLE
         rsp_pkt.data = ack_r[head_slot] ? `VX_CFG_XLEN'(async_r[head_slot]) : data_r[head_slot];
     `else

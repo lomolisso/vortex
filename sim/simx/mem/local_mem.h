@@ -67,9 +67,17 @@ public:
   std::vector<SimChannel<MemReq>> Inputs;
   std::vector<SimChannel<MemRsp>> Outputs;
 #ifdef VX_CFG_EXT_DLMEM_ENABLE
+#ifdef VX_CFG_H100_SM_ENABLE
+  // Per bank: the warp and lanes of each such access when it commits, 1 cycle after the
+  // bank takes a load or store and 3 cycles after it takes an atomic.
+  std::vector<SimChannel<WtInc>> CommitOut;
+#else
+#line 70
   // Per bank: the warp of each such access when it commits, 1 cycle after the
   // bank takes a load or store and 3 cycles after it takes an atomic.
   std::vector<SimChannel<uint32_t>> CommitOut;
+#endif
+#line 73
 #endif
 #ifdef VX_CFG_EXT_MBAR_ENABLE
   // Per bank, at most one per cycle: an insert 1 cycle after the bank takes the
@@ -105,6 +113,40 @@ protected:
   Impl* impl_;
 
   friend class SimObject<LocalMem>;
+#ifdef VX_CFG_H100_SM_ENABLE
+public:
+  // A client other than the LSU blocks presented an access, toward the shared-memory port.
+  SimChannel<bool> ExtOut{this};
+#endif
 };
 
 }
+
+#ifdef VX_CFG_H100_SM_ENABLE
+#include "smem_gate.h"
+#endif
+
+// The bytes a bank interleaves by inside LocalMem: the H100's 4-B banks (an 8-B
+// lane on the even bank of its pair), otherwise one lane word.
+#ifdef VX_CFG_H100_SM_ENABLE
+#define LMEM_BANK_GRAIN VX_CFG_LMEM_BANK_BYTES
+#else
+#define LMEM_BANK_GRAIN config_.line_size
+#endif
+
+// The H100's bank pairs (lmem_pair.h); each use shares a line with existing
+// code, so a build without the H100 SM preprocesses to the same text.
+#ifdef VX_CFG_H100_SM_ENABLE
+#include "lmem_pair.h"
+#define LMEM_PAIR_MEMBER LmemPairHold pair_hold_;
+#define LMEM_PAIR_RESET pair_hold_.reset(1u << config_.B);
+#define LMEM_PAIR_HELD(bank, req) \
+	if (pair_hold_.held(bank, (req).is_write() && !memop_is_atomic((req).op), (req).addr, (req).byteen, SimPlatform::instance().cycles())) \
+		continue;
+#define LMEM_PAIR_TAKE(bank, req) pair_hold_.take(bank, (req).addr, (req).byteen, SimPlatform::instance().cycles());
+#else
+#define LMEM_PAIR_MEMBER
+#define LMEM_PAIR_RESET
+#define LMEM_PAIR_HELD(bank, req)
+#define LMEM_PAIR_TAKE(bank, req)
+#endif

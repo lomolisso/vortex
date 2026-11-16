@@ -160,9 +160,21 @@ public:
     uint32_t lmem_tcu_port = LMEM_DXA_PORT
         + VX_CFG_EXT_DXA_ENABLED * DxaCore::LMEM_PORTS_PER_CORE;
     uint32_t lmem_num_reqs = lmem_tcu_port + VX_CFG_EXT_TCU_ENABLED;
+#if defined(VX_CFG_H100_SM_ENABLE) && defined(VX_CFG_EXT_TCU_ENABLE)
+    lmem_num_reqs = lmem_tcu_port + VX_CFG_EXT_TCU_ENABLED * TcuTbuf::LMEM_PORTS;
+#else
+#line 162
+#endif
 #ifdef DXA_MBAR_ENABLE
+#ifdef VX_CFG_H100_SM_ENABLE
+    static_assert(LMEM_DXA_ROW_PORT == LMEM_DXA_PORT + DxaCore::LMEM_PORTS_PER_CORE + VX_CFG_EXT_TCU_ENABLED * TcuTbuf::LMEM_PORTS,
+                  "the DXA row port follows the DXA's and the TCU's");
+#else
+#line 164
     static_assert(LMEM_DXA_ROW_PORT == LMEM_DXA_PORT + DxaCore::LMEM_PORTS_PER_CORE + VX_CFG_EXT_TCU_ENABLED,
                   "the DXA row port follows the DXA's and the TCU's");
+#line 165
+#endif
     lmem_num_reqs = LMEM_DXA_ROW_PORT + 1;
 #elif defined(VX_CFG_EXT_DXA_ENABLE)
 #line 148
@@ -206,10 +218,24 @@ public:
     }
 
     // connect lmem switch to per-block adapters
+#ifdef VX_CFG_H100_SM_ENABLE
+    snprintf(sname, 100, "%s-smem_gate", name.c_str());
+    smem_gate_ = SmemGate::Create(sname, VX_CFG_NUM_LSU_BLOCKS);
+    local_mem_->ExtOut.bind(&smem_gate_->ExtIn);
+    for (uint32_t b = 0; b < VX_CFG_NUM_LSU_BLOCKS; ++b) {
+      lmem_switch_.at(b)->ReqOutLmem.bind(&smem_gate_->ReqIn.at(b));
+      smem_gate_->RspOut.at(b).bind(&lmem_switch_.at(b)->RspInLmem);
+      smem_gate_->ReqOut.at(b).bind(&lsu_lmem_adapter.at(b)->ReqIn);
+      lsu_lmem_adapter.at(b)->RspOut.bind(&smem_gate_->RspIn.at(b));
+    }
+#else
+#line 209
     for (uint32_t b = 0; b < VX_CFG_NUM_LSU_BLOCKS; ++b) {
       lmem_switch_.at(b)->ReqOutLmem.bind(&lsu_lmem_adapter.at(b)->ReqIn);
       lsu_lmem_adapter.at(b)->RspOut.bind(&lmem_switch_.at(b)->RspInLmem);
     }
+#endif
+#line 213
 
     // connect per-block lmem adapters to local memory ports
     for (uint32_t b = 0; b < VX_CFG_NUM_LSU_BLOCKS; ++b) {
@@ -316,6 +342,14 @@ public:
       auto& tbuf = tcu_unit_->tbuf();
       tbuf->lmem_req_out.bind(&local_mem_->Inputs.at(lmem_tcu_port));
       local_mem_->Outputs.at(lmem_tcu_port).bind(&tbuf->lmem_rsp_in);
+#if defined(VX_CFG_H100_SM_ENABLE) && !defined(VX_CFG_TCU_H100_ENABLE)
+      for (uint32_t k = 1; k < TcuTbuf::LMEM_PORTS; ++k) {
+        tbuf->lmem_row_req_out.at(k - 1).bind(&local_mem_->Inputs.at(lmem_tcu_port + k));
+        local_mem_->Outputs.at(lmem_tcu_port + k).bind(&tbuf->lmem_row_rsp_in.at(k - 1));
+      }
+#else
+#line 318
+#endif
     }
   #ifdef TCU_META_ENABLE
     // Bind the TCU metadata AGU to the LSU block-0 client port.
@@ -354,7 +388,13 @@ public:
     // after them for the same reason.
     snprintf(sname, 100, "%s-lmem_acc_track", name.c_str());
     lmem_acc_track_ = DlmemWTrack::Create(sname, VX_CFG_NUM_LSU_BLOCKS, VX_CFG_NUM_WARPS, DLMEM_LACC_LIMIT,
+#ifdef VX_CFG_H100_SM_ENABLE
+                                          VX_CFG_LMEM_NUM_BANKS + VX_CFG_NUM_LSU_BLOCKS);
+#else
+#line 357
                                           VX_CFG_LMEM_NUM_BANKS);
+#endif
+#line 358
   #ifdef VX_CFG_EXT_MBAR_ENABLE
     snprintf(sname, 100, "%s-mbar_waiters", name.c_str());
     mbar_waiters_ = MbarWaiterTable::Create(sname, VX_CFG_LMEM_NUM_BANKS, VX_CFG_NUM_LSU_BLOCKS,
@@ -378,6 +418,12 @@ public:
       for (uint32_t i = 0; i < VX_CFG_LMEM_NUM_BANKS; ++i) {
         local_mem_->CommitOut.at(i).bind(&lmem_acc_track_->CommitIn.at(i));
       }
+#ifdef VX_CFG_H100_SM_ENABLE
+      for (uint32_t b = 0; b < VX_CFG_NUM_LSU_BLOCKS; ++b) {
+        smem_gate_->FoldOut.at(b).bind(&lmem_acc_track_->CommitIn.at(VX_CFG_LMEM_NUM_BANKS + b));
+      }
+#endif
+#line 381
     #ifdef VX_CFG_EXT_MBAR_ENABLE
       for (uint32_t i = 0; i < VX_CFG_LMEM_NUM_BANKS; ++i) {
         local_mem_->MbarEvtOut.at(i).bind(&mbar_waiters_->BankEvtIn.at(i));
@@ -1400,6 +1446,10 @@ private:
   Mmu::Ptr dcache_mmu_;
   Mmu::Ptr icache_mmu_;
 #endif
+#ifdef VX_CFG_H100_SM_ENABLE
+  SmemGate::Ptr smem_gate_;
+#endif
+#line 1403
 #ifdef VX_CFG_EXT_DLMEM_ENABLE
   DlmemXlate::Ptr dlmem_xlate_;
   DlmemWTrack::Ptr dlmem_wtrack_;

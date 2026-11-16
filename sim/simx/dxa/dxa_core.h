@@ -82,8 +82,12 @@ public:
   // LocalMem model's byteen scope is one VX_CFG_MEM_BLOCK_SIZE block, so a
   // row beat is emitted as LMEM_PORTS_PER_CORE same-cycle block writes on
   // adjacent input ports (one per row half).
+#ifdef VX_CFG_H100_SM_ENABLE
+  static constexpr uint32_t LMEM_ROW_SIZE = VX_CFG_LMEM_PORT_BYTES;
+#else
   static constexpr uint32_t LMEM_ROW_SIZE =
       VX_CFG_LMEM_NUM_BANKS * (VX_CFG_XLEN / 8);
+#endif
   static constexpr uint32_t LMEM_PORTS_PER_CORE =
       (LMEM_ROW_SIZE > VX_CFG_MEM_BLOCK_SIZE)
           ? (LMEM_ROW_SIZE / VX_CFG_MEM_BLOCK_SIZE) : 1;

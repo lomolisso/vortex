@@ -53,6 +53,9 @@ module VX_cache import VX_gpu_pkg::*; #(
 `ifdef VX_CFG_EXT_DLMEM_ENABLE
     parameter CTA_FENCE             = 0,      // a CTA-scope fence drains here, at any level, and goes no further.
 `endif
+`ifdef VX_CFG_H100_SM_ENABLE
+    parameter H100_L1               = 0,      // the H100 L1: byte-valid store allocate, XOR set index, line requests with a sector mask
+`endif
 
     parameter AMO_ENABLE            = 0       // synthesize atomic-op logic in the banks
  ) (
@@ -68,6 +71,11 @@ module VX_cache import VX_gpu_pkg::*; #(
     `STATIC_ASSERT(WRITE_ENABLE || !WRITEBACK, ("invalid parameter: writeback requires write enable"))
     `STATIC_ASSERT(WRITEBACK || !DIRTY_BYTES, ("invalid parameter: dirty bytes require writeback"))
     `STATIC_ASSERT(NUM_BANKS >= MEM_PORTS, ("invalid parameter: number of banks must be greater or equal to number of memory ports"))
+`ifdef VX_CFG_H100_SM_ENABLE
+    // one 128-B line per cycle per SM is one bank (L1_ONE_LINE_PER_CYCLE)
+    `STATIC_ASSERT((H100_L1 == 0) || (NUM_BANKS == 1), ("invalid parameter: the H100 L1 is one bank"))
+    `STATIC_ASSERT((H100_L1 == 0) || (`VX_CFG_SM_MAX_READ_LINES >= NUM_BANKS * MSHR_SIZE), ("invalid parameter: the H100 L1 keeps SM_MAX_READ_LINES lines in flight"))
+`endif
     localparam REQ_SEL_WIDTH   = `UP(`CS_REQ_SEL_BITS);
     localparam WORD_SEL_WIDTH  = `UP(`CS_WORD_SEL_BITS);
     localparam MSHR_ADDR_WIDTH = `LOG2UP(MSHR_SIZE);
@@ -343,6 +351,9 @@ module VX_cache import VX_gpu_pkg::*; #(
             .MRSQ_SIZE    (MRSQ_SIZE),
             .MREQ_SIZE    (MREQ_SIZE),
             .LATENCY      (LATENCY),
+        `ifdef VX_CFG_H100_SM_ENABLE
+            .H100_L1      (H100_L1),
+        `endif
             .TAG_WIDTH    (TAG_WIDTH),
             .CORE_OUT_BUF (CORE_RSP_BUF_ENABLE ? 3 : 0),
             .MEM_OUT_BUF  (MEM_REQ_BUF_ENABLE ? 3 : 0),
