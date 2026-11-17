@@ -1258,6 +1258,61 @@ tests:
     drivers: [simx, rtlsim]
     touches: *e4_touches
     args: "-m orphan"
+  # The same modes on the H100 SM memory path at the H100 organisation's 16
+  # threads: 127 copy slots per LSU block, and a sectored L1 that returns only
+  # the bytes a read enables.
+  - id: h100sm-cp_async
+    app: cp_async
+    drivers: [simx, rtlsim]
+    configs+: &cpa_h100_configs "-DVX_CFG_H100_SM_ENABLE -DVX_CFG_L2_ENABLE"
+    shape: {threads: 16}
+    touches: &cpa_h100_touches [tests/regression/cp_async, sw/kernel/include/vx_cp_async.h,
+              sw/common/mbar_ref.h, VX_config.toml, hw/rtl/VX_gpu_pkg.sv, hw/rtl/VX_socket.sv,
+              hw/rtl/core, hw/rtl/mem, hw/rtl/cache, hw/rtl/dlmem, hw/rtl/libs/VX_mem_coalescer_h100.sv,
+              sim/simx]
+    args: "-m zfill"
+  - id: h100sm-cp_async-groups
+    app: cp_async
+    drivers: [simx, rtlsim]
+    configs+: *cpa_h100_configs
+    shape: {threads: 16}
+    touches: *cpa_h100_touches
+    args: "-m groups"
+  - id: h100sm-cp_async-bar
+    app: cp_async
+    drivers: [simx]
+    configs+: *cpa_h100_configs
+    shape: {warps: 8, threads: 16}
+    touches: *cpa_h100_touches
+    args: "-m bar"
+  - id: h100sm-cp_async-stream
+    app: cp_async
+    drivers: [simx]
+    configs+: *cpa_h100_configs
+    shape: {cores: 2, threads: 16}
+    touches: *cpa_h100_touches
+    args: "-m stream -r 16"
+  - id: h100sm-cp_async-pipe
+    app: cp_async
+    drivers: [simx]
+    configs+: *cpa_h100_configs
+    shape: {threads: 16}
+    touches: *cpa_h100_touches
+    args: "-m pipe -r 16"
+  - id: h100sm-cp_async-mix
+    app: cp_async
+    drivers: [simx, rtlsim]
+    configs+: *cpa_h100_configs
+    shape: {threads: 16}
+    touches: *cpa_h100_touches
+    args: "-m mix -r 8"
+  - id: h100sm-cp_async-orphan
+    app: cp_async
+    drivers: [simx]
+    configs+: *cpa_h100_configs
+    shape: {threads: 16}
+    touches: *cpa_h100_touches
+    args: "-m orphan"
 
   # --- fence.mbarrier_init (mbar_init_fence) ---
   # A lost-arrive reproducer: each round rank 0 initialises a fresh mbarrier with a

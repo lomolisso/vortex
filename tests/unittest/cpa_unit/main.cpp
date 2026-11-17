@@ -40,6 +40,7 @@
 #include <cstdio>
 #include <cstring>
 #include <algorithm>
+#include <bitset>
 #include <functional>
 #include <map>
 #include <random>
@@ -62,6 +63,16 @@ constexpr uint32_t L     = VX_CFG_NUM_LSU_LANES;
 constexpr uint32_t NPIDS = CpaUnit::NUM_PIDS;
 constexpr uint64_t LMEM  = VX_MEM_LMEM_BASE_ADDR;
 constexpr uint32_t BLK   = VX_CFG_MEM_BLOCK_SIZE;
+
+// Every copy slot free but the listed ones.
+std::bitset<CPA_SLOTS> free_but(std::initializer_list<uint32_t> busy) {
+  std::bitset<CPA_SLOTS> m;
+  m.set();
+  for (uint32_t s : busy) {
+    m.reset(s);
+  }
+  return m;
+}
 
 // Plays the slice: actions run in their cycle, ahead of the unit.
 class Driver : public SimObject<Driver> {
@@ -299,10 +310,10 @@ void test_ooo_acks() {
   r.at(14, [&] { r.drv->AckOut.send(ack(0, 0x1), 0); });
   r.run(24);
   auto st = [&](uint64_t c) { return r.sink->status_at(c); };
-  CHECK(st(2).free_slots == ((uint64_t(1) << CpaUnit::SLOTS) - 2));
-  CHECK(st(3).free_slots == ((uint64_t(1) << CpaUnit::SLOTS) - 4));
-  CHECK((st(11).free_slots & 2) && !(st(10).free_slots & 2));  // slot 1 free at ack+1
-  CHECK((st(15).free_slots & 1) && !(st(14).free_slots & 1));
+  CHECK(st(2).free_slots == free_but({0}));
+  CHECK(st(3).free_slots == free_but({0, 1}));
+  CHECK(st(11).free_slots.test(1) && !st(10).free_slots.test(1));  // slot 1 free at ack+1
+  CHECK(st(15).free_slots.test(0) && !st(14).free_slots.test(0));
   // Entry 0 pops at 15, entry 1 at 16: the boundary at 2 is passed at 16, the
   // wait is satisfied at 17 on the registered head, pulses at 18 and the
   // scheduler takes it at 19.
@@ -330,7 +341,7 @@ void test_full_flags() {
       CHECK(!st(n).fifo_full.test(2) && st(n + 1).fifo_full.test(2));
     }
     if (n == CpaUnit::SLOTS) {
-      CHECK(st(n).free_slots != 0 && st(n + 1).free_slots == 0);
+      CHECK(st(n).free_slots.any() && st(n + 1).free_slots.none());
     }
   }
   Rig& r = rig("grp");
@@ -504,7 +515,7 @@ void test_pids() {
     CHECK(q[0].first == 4 && q[0].second.addrs.at(0) == LMEM + 0x100);
     CHECK(q[1].first == 5 && q[1].second.addrs.at(0) == LMEM + 0x100 + L * 8);
   }
-  CHECK(!(r.sink->status_at(9).free_slots & 4) && (r.sink->status_at(10).free_slots & 4));
+  CHECK(!r.sink->status_at(9).free_slots.test(2) && r.sink->status_at(10).free_slots.test(2));
 
   // A uop issued as two packets: the first takes the slot and the FIFO entry,
   // the second fills them; acks of the first packet's lanes alone leave the
@@ -525,9 +536,8 @@ void test_pids() {
   m.at(12, [&] { m.drv->RspOut.send(rsp(3, 1, all_lanes()), 0); });
   m.at(16, [&] { m.drv->AckOut.send(ack(3, all_lanes()), 0); });
   m.run(26);
-  const uint64_t all_slots = (uint64_t(1) << CpaUnit::SLOTS) - 1;
-  CHECK(m.sink->status_at(3).free_slots == (all_slots & ~uint64_t(8)));
-  CHECK(!(m.sink->status_at(16).free_slots & 8) && (m.sink->status_at(17).free_slots & 8));
+  CHECK(m.sink->status_at(3).free_slots == free_but({3}));
+  CHECK(!m.sink->status_at(16).free_slots.test(3) && m.sink->status_at(17).free_slots.test(3));
   CHECK(m.sink->unlocks.size() == 1);
   if (!m.sink->unlocks.empty()) {
     // the entry pops at 17, the wait is satisfied at 18 and reaches the scheduler at 20
@@ -698,7 +708,7 @@ void test_data() {
     uint32_t n = (L > 1) ? 2 : 1;
     CHECK(w == (mbar_ref::init(n) | (uint64_t(1) << 63)));
   }
-  CHECK(sink->status_at(~uint64_t(0) >> 1).free_slots == ((uint64_t(1) << CpaUnit::SLOTS) - 1));
+  CHECK(sink->status_at(~uint64_t(0) >> 1).free_slots.all());
   std::printf("data: %zu copies byte-exact (4/8 bytes x every src-size x 3 offsets), arrive completes the phase\n",
               cases.size());
 }

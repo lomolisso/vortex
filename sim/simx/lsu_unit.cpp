@@ -411,14 +411,14 @@ void LsuUnit::process_cpa_copy(uint32_t b, instr_trace_t* trace) {
 			// The uop's first packet takes a slot; its later packets fill it.
 			uint32_t slot = cpa_open_.at(trace->wid);
 			if (trace->sop) {
-				if (status.fifo_full.test(trace->wid) || status.free_slots == 0) {
+				if (status.fifo_full.test(trace->wid) || status.free_slots.none()) {
 					if (!trace->log_once(true)) {
 						DT(4, this->name() << " cpa-full: " << *trace);
 					}
 					return; // stall
 				}
 				trace->log_once(false);
-				slot = __builtin_ctzll(status.free_slots);
+				slot = status.first_free();
 				cpa_open_.at(trace->wid) = slot;
 			}
 			const auto args = std::get<IntrLsuArgs>(trace->instr_ptr->get_args());
@@ -453,6 +453,17 @@ void LsuUnit::process_cpa_copy(uint32_t b, instr_trace_t* trace) {
 			lsu_req.mask.set(i);
 			lsu_req.addrs.at(i) = e.addr;
 			lsu_req.tids.at(i) = e.tid;
+		#ifdef VX_CFG_H100_SM_ENABLE
+			// the copy's word, as a load sends it: the H100 L1 reads only the bytes enabled
+			uint32_t off = e.addr & (VX_CFG_MEM_BLOCK_SIZE - 1);
+			lsu_req.byteen.at(i) = ((1ull << e.size) - 1) << off;
+		#else
+		#ifdef VX_CFG_EXT_DXA_ENABLE
+		#line 413
+		#else
+		#line 386
+		#endif
+		#endif
 		}
 		state.remain_addrs -= beat_n;
 		lsu_req.tag  = CPA_TAG_BASE + CpaUnit::rsp_tag(cpa_slot_.at(b), t0 / VX_CFG_NUM_LSU_LANES);

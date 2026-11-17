@@ -20,7 +20,7 @@ using namespace vortex;
 
 CpaStatus CpaStatus::idle() {
   CpaStatus s;
-  s.free_slots = (CpaUnit::SLOTS == 64) ? ~uint64_t(0) : ((uint64_t(1) << CpaUnit::SLOTS) - 1);
+  s.free_slots.set();
   return s;
 }
 
@@ -384,8 +384,16 @@ CpaStatus CpaUnit::status() const {
   }
   for (uint32_t si = 0; si < SLOTS; ++si) {
     if (!slots_[si].valid) {
-      st.free_slots |= uint64_t(1) << si;
+      st.free_slots.set(si);
     }
   }
   return st;
+}
+
+uint32_t CpaStatus::first_free() const {
+  uint32_t s = 0;
+  while (s < CPA_SLOTS && !free_slots.test(s)) {
+    ++s;
+  }
+  return s;
 }

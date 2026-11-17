@@ -16,10 +16,15 @@
 #ifdef VX_CFG_EXT_MBAR_ENABLE
 
 #include <algorithm>
+#include <bitset>
 #include <deque>
 #include "types.h"
 
 namespace vortex {
+
+// A slot id is a write tag; the all-ones tag is the arrives'.
+constexpr uint32_t CPA_SLOTS = std::min<uint32_t>(VX_CFG_LSU_PENDING_SIZE,
+                                 (1u << log2ceil(VX_CFG_LSU_PENDING_SIZE)) - 1);
 
 // One lane of a cp.async uop: where its bytes go, how many come from the
 // source, and the source's offset in the read block.
@@ -53,9 +58,11 @@ struct CpaStatus {
   WarpMask fifo_full;
   WarpMask groups_full;
   WarpMask arrive_pending;
-  uint64_t free_slots = 0;
+  std::bitset<CPA_SLOTS> free_slots;
 
   static CpaStatus idle();
+
+  uint32_t first_free() const;
 
   bool operator==(const CpaStatus& o) const {
     return fifo_full == o.fifo_full && groups_full == o.groups_full
@@ -76,12 +83,9 @@ public:
 
   static constexpr uint32_t DEPTH  = 8;
   static constexpr uint32_t GROUPS = 8;
-  // A slot id is a write tag; the all-ones tag is the arrives'.
-  static constexpr uint32_t SLOTS  = std::min<uint32_t>(VX_CFG_LSU_PENDING_SIZE,
-                                       (1u << log2ceil(VX_CFG_LSU_PENDING_SIZE)) - 1);
+  static constexpr uint32_t SLOTS  = CPA_SLOTS;
   static constexpr uint32_t NUM_PIDS = (VX_CFG_NUM_THREADS + VX_CFG_NUM_LSU_LANES - 1) / VX_CFG_NUM_LSU_LANES;
   static constexpr uint32_t ARRIVE_TAG = (1u << log2ceil(SLOTS + 1)) - 1;
-  static_assert(SLOTS <= 64, "copy slots exceed the status mask");
 
   // The tag of a read response, relative to the LSU's cp.async tag base.
   static uint32_t rsp_tag(uint32_t slot, uint32_t pid) { return slot * NUM_PIDS + pid; }
