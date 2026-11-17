@@ -289,9 +289,9 @@ VX_CFG_DRAM_ATOM_BYTES = 32
 VX_CFG_DRAM_INTERLEAVE_SHIFT = "expr: clog2($VX_CFG_DRAM_LINE_BYTES / $VX_CFG_DRAM_PORT_DATA_SIZE) if $dram_h100 else 0"
 VX_CFG_DRAM_ROW_BYTES = 1024
 
-# The per-SM share is carried by width: 64 bits per slice (07 §1) times the slice's SMs over the
-# H100's SMs per slice, rounded up to a power of two (the JESD238 organisation scales by whole 64-bit
-# channels). Bandwidth then follows from the width and the device timing.
+# 64 bits per slice (07 §1), widened by whole 64-bit channels (JESD238 organisation, power of two) only
+# when a slice serves more SMs than the H100's 132 / 94; a slice serving fewer keeps 64 bits, so the
+# slice count sets the per-SM share. Bandwidth then follows from the width and the device timing.
 dram_share_num = "expr: $dram_num_sms * $VX_CFG_H100_NUM_SLICES"
 dram_share_den = "expr: $VX_CFG_NUM_SLICES * $VX_CFG_H100_NUM_SMS"
 VX_CFG_DRAM_WIDTH_FACTOR = "expr: pow(2, clog2(($dram_share_num + $dram_share_den - 1) / $dram_share_den))"

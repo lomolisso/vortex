@@ -95,7 +95,7 @@ constexpr double H100_SLICE_WR_MBPS = 40800;   // 18 §9.3
 constexpr double H100_VISIT_RD_PS = 2000;      // 18 §9.6, 1-2 sector read visit floor
 constexpr double H100_VISIT_WR1_PS = 2270;     // 07 §10.3
 constexpr double H100_VISIT_WR2_PS = 2470;     // 07 §10.3
-constexpr double H100_TURN_NS = 60;            // 18 §9.8 [I, low]
+constexpr double H100_TURN_NS = 60;            // 18 §9.8 [I, low], data-bus idle per direction switch
 constexpr double H100_ROW_CONFLICT_SM = 70;    // 07 §4
 constexpr double H100_MIX_1TO1_RATIO = 0.869;  // 07 §10.3, 1:1 mix over read-only
 
@@ -110,6 +110,26 @@ uint64_t zero_rd_expect(uint32_t sectors) {
 
 uint64_t zero_wr_expect() {
   return ticks_to_sm(VX_DRAM_NRCDWR_TICKS + VX_DRAM_WRITE_DONE_TICKS) + WRAPPER_STAGES;
+}
+
+double ticks_to_ps(double ticks) { return ticks * 1e6 / DRAM_MHZ; }
+
+// Ticks a closed-page write visit holds its bank: ACT to precharged (tRCDWR, the columns, write data, tWR, tRP), at
+// least tRC.
+uint64_t wr_visit_ticks(uint32_t sectors) {
+  return std::max<uint64_t>(VX_DRAM_NRC_TICKS, VX_DRAM_NRCDWR_TICKS + (sectors * ATOM / VX_DRAM_TX_BYTES - 1) * VX_DRAM_NCCDS_TICKS
+                                                 + VX_DRAM_WRITE_DONE_TICKS + VX_DRAM_NWR_TICKS + VX_DRAM_NRP_TICKS);
+}
+
+// Shortest request interval one channel's structure allows for closed-page `sectors`-sector requests: the data bus,
+// the bank array (one visit per bank at a time), and the activate windows of its pseudo-channels (four per tFAW,
+// one per tRRDS each).
+double struct_interval_ps(uint32_t sectors, bool write) {
+  double bus = sectors * double(ATOM) * 1e6 / PEAK_MBPS;
+  double banks = ticks_to_ps(double(write ? wr_visit_ticks(sectors) : VX_DRAM_NRC_TICKS)) / VX_CFG_DRAM_BANKS;
+  double faw = ticks_to_ps(double(VX_DRAM_NFAW_TICKS)) / (4.0 * VX_CFG_DRAM_PCS);
+  double rrd = ticks_to_ps(double(VX_DRAM_NRRDS_TICKS)) / VX_CFG_DRAM_PCS;
+  return std::max(std::max(bus, banks), std::max(faw, rrd));
 }
 #endif
 
@@ -480,6 +500,22 @@ void case_rates() {
     check(need_ps <= sm_to_ps(double(one.last0)), "T4",
           fmt("one channel %s: %lu lines by cycle %lu need %.0f ps of a %.0f MB/s bus, %.0f elapsed",
               write ? "write" : "read", one.total0, one.last0, need_ps, PEAK_MBPS, sm_to_ps(double(one.last0))));
+    // Floor: a closed-page stream of random lines loses only where every queued request waits for a busy bank or
+    // the queue holds work for one pseudo-channel while the other's bus idles. A visit spans tRC (read) or the
+    // longer write visit, i.e. visit / line-time banks must be busy at once; 32 random requests over 32 banks cover
+    // 20.5 distinct banks on average, enough for reads (14) with margin and writes (about 20) only just, hence the
+    // larger write floor gap (measured 0.97 / 0.92 at 32 entries). A service limit at the H100 slice rate scaled by
+    // any per-SM share below 0.9, or a queue that cannot cover the busy banks, falls below it.
+    double line_ps = struct_interval_ps(ATOMS, write);
+    double visit_ps = ticks_to_ps(double(write ? wr_visit_ticks(ATOMS) : VX_DRAM_NRC_TICKS));
+    double banks_needed = visit_ps / line_ps;
+    double distinct = VX_CFG_DRAM_BANKS * (1 - std::pow(1 - 1.0 / VX_CFG_DRAM_BANKS, double(write ? VX_CFG_DRAM_QD_WR : VX_CFG_DRAM_QD_RD)));
+    printf("PERF: T4 %s banks_busy_needed=%.1f distinct_banks_queued=%.1f\n", write ? "wr" : "rd", banks_needed, distinct);
+    double floor = write ? 0.88 : 0.95;
+    double struct_mbps = LINE * 1e6 / line_ps;
+    check(one.mbps_per_ch >= floor * struct_mbps, "T4",
+          fmt("one channel %s %.0f MB/s >= %.2f x the structural limit %.0f MB/s (bus, banks / visit, activate windows)",
+              write ? "write" : "read", one.mbps_per_ch, floor, struct_mbps));
     h100ref(write ? "dram_slice_wr_mbps_per_64b" : "dram_slice_rd_mbps_per_64b",
             write ? H100_SLICE_WR_MBPS : H100_SLICE_RD_MBPS, one.mbps_per_ch / WIDTH_FACTOR);
     for (uint32_t n = 2; n <= std::min<uint32_t>(8, SYS_CHANNELS); n *= 2) {
@@ -503,6 +539,14 @@ void case_rates() {
     check(r.interval_ps >= bus_ps * 0.99 && r.interval_ps <= line_ps[t.write] * 1.01, "T5",
           fmt("%s interval %.0f ps within its bus time %.0f .. a 128-B request's %.0f", t.name, r.interval_ps, bus_ps,
               line_ps[t.write]));
+    // 64-B reads are bound by the activate window (eight activates per tFAW over the two pseudo-channels), not the
+    // bus: random requests leave one pseudo-channel's window short while the other's is full (measured 0.83).
+    if (!t.write) {
+      double lim_ps = struct_interval_ps(t.k, false);
+      check(r.interval_ps * 0.75 <= lim_ps, "T5",
+            fmt("%s interval %.0f ps <= the structural limit %.0f ps / 0.75 (bus, banks / tRC, activate windows)", t.name,
+                r.interval_ps, lim_ps));
+    }
     // The H100's visit floor is per 64-bit slice: compare with the interval at that width.
     char metric[64];
     snprintf(metric, sizeof(metric), "dram_visit_%s_ps_per_64b", t.name);
@@ -511,8 +555,32 @@ void case_rates() {
 }
 
 // In-order source of 128-B requests, write slots spread over 8 (hbmsim's OP_MIX rule); one channel.
-double mix_rate(uint32_t num, uint32_t den, uint64_t limit, uint64_t warm, uint64_t win, uint64_t* switches) {
+// `switch_idle`: mean data-bus idle of channel 0 at a direction switch, SM cycles: from the end of the last data of
+// one direction to the start of the first data of the other.
+double mix_rate(uint32_t num, uint32_t den, uint64_t limit, uint64_t warm, uint64_t win, uint64_t* switches,
+                double* switch_idle = nullptr) {
   Harness h;
+  double phase_end = 0, idle_sum = 0;
+  uint64_t idle_n = 0;
+  int phase_dir = -1;
+  if (switch_idle) {
+    const double rd_start = double(VX_DRAM_READ_LATENCY_TICKS - VX_DRAM_NBL_TICKS) * SM_MHZ / DRAM_MHZ;
+    const double wr_start = double(VX_DRAM_WRITE_DONE_TICKS - VX_DRAM_NBL_TICKS) * SM_MHZ / DRAM_MHZ;
+    const double burst = double(VX_DRAM_NBL_TICKS) * SM_MHZ / DRAM_MHZ;
+    h.dram().set_issue_observer([&, rd_start, wr_start, burst](uint32_t channel, const char* cmd, const uint32_t*, uint64_t) {
+      std::string c(cmd);
+      bool wr = (c == "WR" || c == "WRA");
+      if (channel != 0 || !(wr || c == "RD" || c == "RDA"))
+        return;
+      double start = double(h.now()) + (wr ? wr_start : rd_start);
+      if (phase_dir == int(!wr) && h.now() >= warm) {
+        idle_sum += start - phase_end;
+        ++idle_n;
+      }
+      phase_end = (phase_dir == int(wr)) ? std::max(phase_end, start + burst) : start + burst;
+      phase_dir = int(wr);
+    });
+  }
   std::deque<bool> q;
   uint64_t slot = 0, made = 0;
   uint32_t nw = 8 * num / den;
@@ -536,6 +604,8 @@ double mix_rate(uint32_t num, uint32_t den, uint64_t limit, uint64_t warm, uint6
       break;
   }
   *switches = h.dram().stats(0).dir_switches;
+  if (switch_idle)
+    *switch_idle = idle_n ? idle_sum / idle_n : 0;
   uint64_t bytes = 0;
   for (auto& d : h.done())
     bytes += d.bytes;
@@ -549,13 +619,17 @@ void case_t6() {
     double base = 0;
     for (auto& s : shares) {
       uint64_t sw = 0;
-      double r = shallow ? mix_rate(s[0], s[1], 256 * 1024 / LINE, 0, 0, &sw) : mix_rate(s[0], s[1], 0, 20000, 160000, &sw);
+      double idle = 0;
+      double r = shallow ? mix_rate(s[0], s[1], 256 * 1024 / LINE, 0, 0, &sw)
+                         : mix_rate(s[0], s[1], 0, 20000, 160000, &sw, &idle);
       if (base == 0)
         base = r;
-      printf("PERF: T6 %s share=%.3f ratio=%.4f rate_mbps=%.0f switches=%lu\n", shallow ? "shallow" : "deep",
-             double(s[0]) / s[1], r / base, r, sw);
-      if (!shallow && 2 * s[0] == s[1])
+      printf("PERF: T6 %s share=%.3f ratio=%.4f rate_mbps=%.0f switches=%lu switch_idle_sm=%.1f\n",
+             shallow ? "shallow" : "deep", double(s[0]) / s[1], r / base, r, sw, idle);
+      if (!shallow && 2 * s[0] == s[1]) {
         h100ref("dram_mix_1to1_over_rd_ratio", H100_MIX_1TO1_RATIO, r / base);
+        h100ref("dram_rw_turnaround_ns", H100_TURN_NS, idle * 1000.0 / SM_MHZ);
+      }
     }
   }
 }
@@ -610,9 +684,7 @@ void case_age() {
   // The read waits the age, then at most a started write visit of its bank (ACT to precharged: tRCDWR, the line's
   // columns, write data, tWR, tRP; at least tRC), the write-to-read turnaround and a refresh of its bank before its
   // own zero-load time.
-  const uint64_t wr_visit = std::max<uint64_t>(VX_DRAM_NRC_TICKS,
-      VX_DRAM_NRCDWR_TICKS + (LINE / VX_DRAM_TX_BYTES - 1) * VX_DRAM_NCCDS_TICKS + VX_DRAM_WRITE_DONE_TICKS + VX_DRAM_NWR_TICKS
-      + VX_DRAM_NRP_TICKS);
+  const uint64_t wr_visit = wr_visit_ticks(ATOMS);
   double lo = ps_to_sm(VX_CFG_DRAM_T_AGE_PS) + double(g_zrd64) - 2;
   double hi = ps_to_sm(VX_CFG_DRAM_T_AGE_PS) + double(g_zrd64)
             + double(ticks_to_sm(wr_visit + VX_DRAM_NWTRS_TICKS + VX_DRAM_NRFCPB_TICKS)) + 2;
@@ -620,8 +692,8 @@ void case_age() {
         fmt("read under a saturating write stream: %lu SM cycles, expected age + zero-load .. + write visit + tWTR + tRFCpb = "
             "%.0f .. %.0f", l, lo, hi));
   check(h.dram().stats(0).dir_switches > 0, "AGE", fmt("dir_switches %lu > 0", h.dram().stats(0).dir_switches));
-  h100ref("dram_rw_turnaround_ns", H100_TURN_NS,
-          (double(l) - ps_to_sm(VX_CFG_DRAM_T_AGE_PS) - double(g_zrd64)) * 1000.0 / SM_MHZ);
+  printf("PERF: AGE read_after_age_residual_ns=%.1f\n",
+         (double(l) - ps_to_sm(VX_CFG_DRAM_T_AGE_PS) - double(g_zrd64)) * 1000.0 / SM_MHZ);
 }
 
 // HBM3 per-bank refresh runs: over a few tREFI every bank of a pseudo-channel gets its REFpb.

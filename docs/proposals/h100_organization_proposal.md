@@ -478,11 +478,11 @@ Each sub-task uses the policy the spec measured. Where the spec only assumes one
 
   - **One 64-bit HBM3 channel per slice** at the H100's pin rate and timing.
   - **The controller queues and policies are modelled per slice,** as the spec measures them. The MC and FBPA are groupings, because the spec finds no limit at those levels.
-  - **Bandwidth follows the scaling rule:** each slice path runs at 47/66 of an H100 slice (28.9 GB/s), through a service-interval limiter. Latencies stay H100 values (534 local / 697 far miss).
-  - **Queues scale with that unit:** 64 → 46 entries.
+  - **Bandwidth comes from the channel:** a slice's rate is the JESD238 HBM3 timing at its width, with no service limiter. The width widens by whole 64-bit channels only where a slice serves more SMs than the H100's 1.40, so the preset's slice count sets the per-SM share.
+  - **Queue depth = the banks of the channel** (32 per 64 bits): one waiting request per bank, so a closed-page scheduler finds work for every bank that frees.
 - **DRAM timings:**
   - The spec does not measure tRCD, tCL, tRP, tRAS, tWR, tWTR, tFAW, tRRD or refresh (`07/spec.md §9`).
-  - E17 starts from the JEDEC HBM3 values (JESD238) and tunes them to the measured targets: the 534/697-cycle misses, the +70 bank conflict, the per-slice rates, the read/write mix and the loaded latency.
+  - E17 takes the JEDEC HBM3 values (JESD238), with tRC from the measured row cycle (`07/spec.md §4`) and per-bank refresh on. The H100's misses (534/697 cycles), bank conflict, per-slice rates, read/write mix and loaded latency are reference data for task G, not tuning targets.
 - **The Vortex-to-Ramulator wrapper** (`sim/common/dram_sim.cpp`, upstream Vortex code) is replaced:
   - today it has one queue for all channels and sends one 16-B piece per cycle (about 16 B/cycle in total);
   - the pieces of neighbouring lines overlap in address;
