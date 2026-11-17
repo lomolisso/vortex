@@ -74,11 +74,26 @@ RT_HDRS := $(wildcard $(SW_COMMON_DIR)/*.h) \
            $(wildcard $(RT_COMMON_DIR)/*.h) \
            $(wildcard $(INC_DIR)/*.h)
 
-$(OUT_DIR)/$(PROJECT): $(SRCS) $(RT_HDRS)
+# The runtime reads build switches too (VX_CFG_* through CONFIGS), so a change
+# of CONFIGS alone must rebuild it, as the driver libraries already do.
+CONFIG_FILE := $(OUT_DIR)/stub_rt_config.stamp
+
+$(OUT_DIR)/$(PROJECT): $(SRCS) $(RT_HDRS) $(CONFIG_FILE)
 	@mkdir -p $(OUT_DIR)
-	$(CXX) $(CXXFLAGS) $(filter-out $(RT_HDRS),$^) $(LDFLAGS) -o $@
+	$(CXX) $(CXXFLAGS) $(filter-out $(RT_HDRS) $(CONFIG_FILE),$^) $(LDFLAGS) -o $@
+
+# Rewritten only when the flags changed; PID-suffixed tmp for concurrent makes.
+$(CONFIG_FILE): force
+	@mkdir -p $(@D)
+	@TMP=$@.tmp.$$$$ ; \
+	 printf '%s\n' "$(CXX) $(CXXFLAGS)" > $$TMP ; \
+	 if ! cmp -s $$TMP $@ 2>/dev/null; then \
+	   mv -f $$TMP $@ ; \
+	 else \
+	   rm -f $$TMP ; \
+	 fi
 
 clean:
-	rm -f $(DESTDIR)/$(PROJECT) $(DESTDIR)/aarch64/$(PROJECT) $(DESTDIR)/armhf/$(PROJECT)
+	rm -f $(DESTDIR)/$(PROJECT) $(DESTDIR)/aarch64/$(PROJECT) $(DESTDIR)/armhf/$(PROJECT) $(OUT_DIR)/stub_rt_config.stamp
 
-.PHONY: all clean
+.PHONY: all clean force
