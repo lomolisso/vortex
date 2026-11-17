@@ -107,6 +107,25 @@ module VX_partition import VX_gpu_pkg::*, VX_tlb_pkg::*; #(
         );
     `endif
 
+        // sv2v cannot resolve a slice of a port array as a modport binding, so
+        // the cluster's array ports go through local arrays.
+        VX_kmu_bus_if gpc_kmu_bus_if[1]();
+        assign gpc_kmu_bus_if[0].valid = kmu_bus_if[g].valid;
+        assign gpc_kmu_bus_if[0].kind  = kmu_bus_if[g].kind;
+        assign gpc_kmu_bus_if[0].eop   = kmu_bus_if[g].eop;
+        assign gpc_kmu_bus_if[0].dest  = kmu_bus_if[g].dest;
+        assign gpc_kmu_bus_if[0].data  = kmu_bus_if[g].data;
+    `ifdef VX_CFG_EXT_DLMEM_ENABLE
+        assign gpc_kmu_bus_if[0].pin   = kmu_bus_if[g].pin;
+    `endif
+        assign kmu_bus_if[g].ready = gpc_kmu_bus_if[0].ready;
+
+    `ifdef VX_CFG_EXT_RASTER_ENABLE
+        VX_raster_launch_if gpc_raster_launch_if[1]();
+        assign gpc_raster_launch_if[0].valid = raster_launch_if[g].valid;
+        assign raster_launch_if[g].ready = gpc_raster_launch_if[0].ready;
+    `endif
+
         VX_cluster #(
             .CLUSTER_ID (CLUSTER_ID),
             .INSTANCE_ID (`SFORMATF(("cluster%0d", CLUSTER_ID)))
@@ -124,10 +143,10 @@ module VX_partition import VX_gpu_pkg::*, VX_tlb_pkg::*; #(
 
             .mem_bus_if         (gpc_mem_bus_if),
 
-            .kmu_bus_if         (kmu_bus_if[g +: 1]),
+            .kmu_bus_if         (gpc_kmu_bus_if),
 
         `ifdef VX_CFG_EXT_RASTER_ENABLE
-            .raster_launch_if   (raster_launch_if[g +: 1]),
+            .raster_launch_if   (gpc_raster_launch_if),
         `endif
 
         `ifdef VX_CFG_EXT_DLMEM_ENABLE

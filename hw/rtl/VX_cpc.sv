@@ -66,6 +66,28 @@ module VX_cpc import VX_gpu_pkg::*, VX_tlb_pkg::*; #(
 
         localparam SOCKET_IN_GPC = t * CPCS_PER_GPC + CPC_ID;
 
+        // sv2v cannot resolve a slice of a port array as a modport binding, so
+        // the socket's array ports go through local arrays.
+        VX_mem_bus_if #(
+            .DATA_SIZE (`VX_CFG_L1_LINE_SIZE),
+            .TAG_WIDTH (L2_TAG_WIDTH)
+        ) socket_mem_bus_if[L1_MEM_PORTS]();
+
+        for (genvar m = 0; m < L1_MEM_PORTS; ++m) begin : g_mem
+            `ASSIGN_VX_MEM_BUS_IF (mem_bus_if[t * L1_MEM_PORTS + m], socket_mem_bus_if[m]);
+        end
+
+        VX_kmu_bus_if socket_kmu_bus_if[1]();
+        assign socket_kmu_bus_if[0].valid = kmu_bus_if[t].valid;
+        assign socket_kmu_bus_if[0].kind  = kmu_bus_if[t].kind;
+        assign socket_kmu_bus_if[0].eop   = kmu_bus_if[t].eop;
+        assign socket_kmu_bus_if[0].dest  = kmu_bus_if[t].dest;
+        assign socket_kmu_bus_if[0].data  = kmu_bus_if[t].data;
+    `ifdef VX_CFG_EXT_DLMEM_ENABLE
+        assign socket_kmu_bus_if[0].pin   = kmu_bus_if[t].pin;
+    `endif
+        assign kmu_bus_if[t].ready = socket_kmu_bus_if[0].ready;
+
         VX_socket #(
             .SOCKET_ID   ((CLUSTER_ID * NUM_SOCKETS) + SOCKET_IN_GPC),
             .INSTANCE_ID (`SFORMATF(("%s-socket%0d", INSTANCE_ID, SOCKET_IN_GPC)))
@@ -81,7 +103,7 @@ module VX_cpc import VX_gpu_pkg::*, VX_tlb_pkg::*; #(
 
             .dcr_bus_if     (dcr_bus_if[t]),
 
-            .mem_bus_if     (mem_bus_if[t * L1_MEM_PORTS +: L1_MEM_PORTS]),
+            .mem_bus_if     (socket_mem_bus_if),
 
         `ifdef VX_CFG_VM_ENABLE
             .cluster_tlb_bus_if (cluster_tlb_bus_if[t]),
@@ -91,7 +113,7 @@ module VX_cpc import VX_gpu_pkg::*, VX_tlb_pkg::*; #(
             .cluster_flush_if (cluster_flush_if[t]),
         `endif
 
-            .kmu_bus_if     (kmu_bus_if[t +: 1]),
+            .kmu_bus_if     (socket_kmu_bus_if),
 
             .gbar_bus_if    (gbar_bus_if[t]),
 
