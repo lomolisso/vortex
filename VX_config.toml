@@ -348,8 +348,8 @@ VX_CFG_DRAM_QD_RD = "expr: $VX_CFG_DRAM_BANKS"
 VX_CFG_DRAM_QD_WR = "expr: $VX_CFG_DRAM_QD_RD"
 # SimX mirror of the rtlsim shim's registered response path, SM cycles.
 VX_CFG_DRAM_RSP_BOUNDARY_DELAY = 3
-# MB/s: the H100's vendor peak per SM x SMs (07 §1).
-VX_CFG_PEAK_MEM_BW = "expr: ($VX_CFG_H100_PEAK_MEM_BW_MBPS * $dram_num_sms / $VX_CFG_H100_NUM_SMS) if $dram_h100 else 460000"
+# MB/s: the built channels' peak, channels x bytes per transfer x transfer rate.
+VX_CFG_PEAK_MEM_BW = "expr: ($VX_CFG_DRAM_CHANNELS * $VX_CFG_DRAM_CHANNEL_BITS / 8 * $VX_CFG_DRAM_DATA_RATE_MTS) if $dram_h100 else 460000"
 
 [[check]]
 DRAM_MODEL_XLEN = ["expr: not $VX_CFG_DRAM_MODEL_H100 or $VX_CFG_XLEN_64", "VX_CFG_DRAM_MODEL H100 requires XLEN 64"]
