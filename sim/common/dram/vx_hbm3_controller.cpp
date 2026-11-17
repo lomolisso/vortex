@@ -64,14 +64,9 @@ void VxHBM3::init() {
   RAMULATOR_PARSE_PARAM(rw_policy, std::string, "rw_policy").default_val("AGE");
   RAMULATOR_PARSE_PARAM(m_qd[RD], int, "qd_rd").default_val(0);
   RAMULATOR_PARSE_PARAM(m_qd[WR], int, "qd_wr").default_val(0);
-  RAMULATOR_PARSE_PARAM(m_t_turn, Clk_t, "t_turn_ticks").default_val(0);
   RAMULATOR_PARSE_PARAM(m_t_age, Clk_t, "t_age_ticks").default_val(0);
   RAMULATOR_PARSE_PARAM(m_cmd_buses, int, "cmd_buses").default_val(1);
   RAMULATOR_PARSE_PARAM(m_pcs_per_cmd_bus, int, "pcs_per_cmd_bus").default_val(1);
-  for (uint32_t k = 1; k <= VISIT_MAX_K; ++k) {
-    RAMULATOR_PARSE_PARAM(m_occ[RD][k], int64_t, "occ_rd" + std::to_string(k) + "_milliticks").default_val(0);
-    RAMULATOR_PARSE_PARAM(m_occ[WR][k], int64_t, "occ_wr" + std::to_string(k) + "_milliticks").default_val(0);
-  }
   if (rw_policy == "AGE") {
     m_age_policy = true;
   } else if (rw_policy == "WATERMARK") {
@@ -114,8 +109,8 @@ bool VxHBM3::send(Request& req) {
   const Dir dir = (req.type_id == Request::Type::Write) ? WR : RD;
   auto& buffer = (dir == WR) ? m_write_buffer : m_read_buffer;
   if (v.head) {
-    // As c4's controller queue: a request holds its slot until its visit starts. The buffer check
-    // keeps every tail of an admitted head admissible.
+    // A request holds its queue slot until its visit starts. The buffer check keeps every tail of an
+    // admitted head admissible.
     if (m_unstarted[dir] >= m_qd[dir] || buffer.size() + v.k > buffer.max_size) {
       return false;
     }
@@ -197,10 +192,6 @@ void VxHBM3::update_direction() {
     m_dir = m_is_write_mode ? WR : RD;
     return;
   }
-  // As the c4 controller: decide only when the visit server is free.
-  if (m_clk * 1000 < m_next_visit) {
-    return;
-  }
   const Dir cur = m_dir;
   const Dir oth = (cur == RD) ? WR : RD;
   oldest_unstarted(cur);  // drops started heads from the front, so the queue stays bounded
@@ -212,10 +203,7 @@ void VxHBM3::update_direction() {
   const bool aged = (m_clk - std::max(*oth_oldest, m_t_sw)) > m_t_age;
   if (cur_empty || aged) {
     m_dir = oth;
-    // The turnaround is server time after the old direction's last visit, as in c4; a server idle
-    // for t_turn already has it behind.
-    m_next_visit = std::max(m_clk * 1000, m_next_visit + m_t_turn * 1000);
-    m_t_sw = m_next_visit / 1000;
+    m_t_sw = m_clk;
     ++m_ctrl_stats.dir_switches;
   }
 }
@@ -233,7 +221,7 @@ bool VxHBM3::eligible(const Request& req) const {
     return false;  // never ahead of its head
   }
   const Dir dir = (req.type_id == Request::Type::Write) ? WR : RD;
-  return dir == m_dir && m_clk * 1000 >= m_next_visit;
+  return dir == m_dir;
 }
 
 bool VxHBM3::on_bus(const Request& req, int bus) const {
@@ -244,7 +232,7 @@ bool VxHBM3::on_bus(const Request& req, int bus) const {
   return (pc < 0 ? 0 : pc / m_pcs_per_cmd_bus) == bus;
 }
 
-// A visit is one row opening for all its transactions (c4's visit server): once started, its row
+// A visit is one row opening for all its transactions: once started, its row
 // stays open until its last transaction, so a tail held behind other column commands is not
 // stranded by another request's precharge.
 bool VxHBM3::closes_started_visit(const Request& req) {
@@ -325,16 +313,10 @@ std::optional<HBMControllerBase::IssuedCommand> VxHBM3::issue_slot(SlotType slot
     const Visit v = visit_decode(cand.it->ingress_id);
     auto it = m_entries.find(v.seq);
     if (v.head && it != m_entries.end() && !it->second.started) {
-      // As c4's server: a visit starts when the server is free and a request of its direction waits,
-      // not at the tick its command issues, so neither tick rounding nor a command held back by DRAM
-      // timing lowers the slice rate.
-      const Dir dir = it->second.dir;
-      const int64_t start = std::max(m_next_visit, int64_t(*oldest_unstarted(dir)) * 1000);
       it->second.started = true;
       it->second.pinned = true;
       ++m_visit_pins[it->second.bank];
-      --m_unstarted[dir];
-      m_next_visit = start + m_occ[dir][v.k];
+      --m_unstarted[it->second.dir];
     }
   }
 

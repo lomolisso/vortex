@@ -24,7 +24,6 @@ import argparse
 import math
 import shlex
 import sys
-from fractions import Fraction
 
 import ramulator
 from ramulator.components import Component
@@ -38,18 +37,9 @@ class VxHBM3(ramulator.controller.HBM12):
     rw_policy = Param(str, default="AGE")
     qd_rd = Param(int, default=0)
     qd_wr = Param(int, default=0)
-    t_turn_ticks = Param(int, default=0)
     t_age_ticks = Param(int, default=0)
     cmd_buses = Param(int, default=1)
     pcs_per_cmd_bus = Param(int, default=1)
-    occ_rd1_milliticks = Param(int, default=0)
-    occ_rd2_milliticks = Param(int, default=0)
-    occ_rd3_milliticks = Param(int, default=0)
-    occ_rd4_milliticks = Param(int, default=0)
-    occ_wr1_milliticks = Param(int, default=0)
-    occ_wr2_milliticks = Param(int, default=0)
-    occ_wr3_milliticks = Param(int, default=0)
-    occ_wr4_milliticks = Param(int, default=0)
 
 
 class VxHBM3Device(HBM3):
@@ -157,21 +147,6 @@ def hbm3_timings(k, tck_ps, bgs, banks_per_bg):
     return t
 
 
-def occupancy_milliticks(k, direction, sectors, atom_bytes):
-    """Visit interval of a request of `sectors` atoms: the H100 per-slice interval scaled by 1/duty."""
-    if direction == "rd":
-        rate = k("H100_SLICE_RD_MBPS")
-        floor_ps = k("H100_DRAM_VISIT_RD_PS")
-    else:
-        rate = k("H100_SLICE_WR_MBPS")
-        floor_ps = k("H100_DRAM_VISIT_WR1_PS") if sectors == 1 else k("H100_DRAM_VISIT_WR2_PS")
-    data_ps = Fraction(sectors * atom_bytes * 10**6, rate)
-    occ_ps = max(Fraction(floor_ps), data_ps)
-    scale = Fraction(k("DRAM_SERVICE_SCALE_NUM"), k("DRAM_SERVICE_SCALE_DEN"))
-    mt = occ_ps * scale * k("DRAM_CLOCK_MHZ") / 1000
-    return int(mt + Fraction(1, 2))
-
-
 def build_h100(k):
     channels = k("DRAM_CHANNELS")
     parts = k("NUM_PARTITIONS")
@@ -215,17 +190,15 @@ def build_h100(k):
     qd_rd, qd_wr = k("DRAM_QD_RD"), k("DRAM_QD_WR")
     require(qd_rd >= 1 and qd_wr >= 1, "DRAM_QD_RD and DRAM_QD_WR must be >= 1")
     max_k = k("DRAM_LINE_BYTES") // atom
-    t_turn = cycles(k("DRAM_T_TURN_PS") * dram_mhz, 10**6)
     t_age = cycles(k("DRAM_T_AGE_PS") * dram_mhz, 10**6)
     pcs_per_bus = k("DRAM_PCS_PER_64B")
     require(pcs % pcs_per_bus == 0, "DRAM_PCS must be a multiple of DRAM_PCS_PER_64B")
-    occ = {f"occ_{d}{n}_milliticks": occupancy_milliticks(k, d, n, atom) for d in ("rd", "wr") for n in range(1, 5)}
 
     def controller():
         # Transactions of started requests stay buffered until issued: room for a second queue's worth.
         return VxHBM3(read_buffer_size=2 * qd_rd * max_k, write_buffer_size=2 * qd_wr * max_k,
                       rw_policy=k("DRAM_RW_POLICY"), qd_rd=qd_rd, qd_wr=qd_wr,
-                      t_turn_ticks=t_turn, t_age_ticks=t_age, **occ,
+                      t_age_ticks=t_age,
                       cmd_buses=pcs // pcs_per_bus, pcs_per_cmd_bus=pcs_per_bus,
                       scheduler=sched(), refresh_manager=refresh(), row_policy=row_policy,
                       addr_mapper=ramulator.addr_mapper.ChRaBaRoCo(), dram=dram)
@@ -246,7 +219,7 @@ def build_h100(k):
         "pcs": pcs, "sids": 1, "bgs": bgs, "banks_per_bg": bpg, "rows": rows, "tx_per_row": tx_per_row,
         "tx_bytes": atom, "intra_bits": intra_bits,
         "read_latency": cfg["read_latency"], "write_done": ticks["nCWL"] + ticks["nBL"],
-        "ticks": ticks, "ck": t, "tck_ps": tck_ps, "t_turn": t_turn, "t_age": t_age, "occ": occ,
+        "ticks": ticks, "ck": t, "tck_ps": tck_ps, "t_age": t_age,
     }
     return ms, info
 
@@ -279,7 +252,7 @@ def build_legacy(k):
         "pcs": org["pseudochannel"], "sids": org["sid"], "bgs": org["bankgroup"], "banks_per_bg": org["bank"],
         "rows": org["row"], "tx_per_row": tx_per_row, "tx_bytes": tx, "intra_bits": intra_bits,
         "read_latency": cfg["read_latency"], "write_done": ticks["nCWL"] + ticks["nBL"],
-        "ticks": ticks, "ck": None, "tck_ps": ticks["tCK_ps"], "t_turn": 0, "t_age": 0, "occ": {},
+        "ticks": ticks, "ck": None, "tck_ps": ticks["tCK_ps"], "t_age": 0,
     }
     return ms, info
 
@@ -304,10 +277,7 @@ def emit(ms, info, cflags_text):
     out.append(f"#define VX_DRAM_INTRA_CHANNEL_BITS {info['intra_bits']}")
     out.append(f"#define VX_DRAM_READ_LATENCY_TICKS {info['read_latency']}")
     out.append(f"#define VX_DRAM_WRITE_DONE_TICKS {info['write_done']}")
-    out.append(f"#define VX_DRAM_T_TURN_TICKS {info['t_turn']}")
     out.append(f"#define VX_DRAM_T_AGE_TICKS {info['t_age']}")
-    for name, value in info["occ"].items():
-        out.append(f"#define VX_DRAM_{name.upper()} {value}")
     out.append("")
     out.append(f"// Timings in Ramulator ticks (one tick = one DRAM clock; tCK = {info['tck_ps']} ps).")
     for name, value in info["ticks"].items():

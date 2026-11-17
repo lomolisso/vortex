@@ -30,9 +30,8 @@ using Ramulator::Factory;
 struct MsEntry;
 
 // The H100's per-slice DRAM controller on Ramulator 2.1's HBMControllerBase: reads and writes
-// served in turns with an age switch and an idle turnaround per switch, a visit server that spaces
-// request heads by the scaled H100 visit interval, and a queue depth counted in requests waiting for
-// their visit.
+// served in turns with an age switch (the device's tWTR/tRTW time each switch), a request's sectors
+// served in one row visit, and a queue depth counted in requests waiting for their visit.
 class VxHBM3 final : public Ramulator::HBMControllerBase {
   RAMULATOR_REGISTER_IMPLEMENTATION_DERIVED(Ramulator::IController, VxHBM3, Ramulator::HBMControllerBase, "VxHBM3")
 
@@ -63,9 +62,7 @@ class VxHBM3 final : public Ramulator::HBMControllerBase {
 
   bool m_age_policy = true;
   int m_qd[2] = {0, 0};
-  Ramulator::Clk_t m_t_turn = 0;
   Ramulator::Clk_t m_t_age = 0;
-  int64_t m_occ[2][VISIT_MAX_K + 1] = {};
   int m_row_level = -1;
   int m_pc_level = -1;
   int m_cmd_buses = 1;
@@ -79,7 +76,6 @@ class VxHBM3 final : public Ramulator::HBMControllerBase {
 
   Dir m_dir = RD;
   Ramulator::Clk_t m_t_sw = 0;
-  int64_t m_next_visit = 0;  // milli-ticks
 
   MsEntry* m_ms_entry = nullptr;
   CtrlStats m_ctrl_stats = {};

@@ -77,9 +77,9 @@ static_assert(VX_DRAM_TX_BYTES == VX_CFG_DRAM_ATOM_BYTES, "one Ramulator transac
 #ifdef VX_CFG_DRAM_MODEL_H100
 static_assert(VX_DRAM_MODEL_H100, "vx_dram_config.h was generated for another DRAM model");
 static_assert(is_pow2(VX_CFG_DRAM_WIDTH_FACTOR), "VX_CFG_DRAM_WIDTH_FACTOR must be a power of two");
-static_assert(uint64_t(VX_CFG_DRAM_CHANNEL_BITS) * 2 * 1000 / 8 * VX_CFG_NUM_SLICES * VX_CFG_H100_NUM_SMS
-              >= uint64_t(VX_CFG_H100_SLICE_RD_MILLIBYTES_PER_DRAMCLK) * VX_CFG_NUM_GPCS * VX_CFG_SMS_PER_GPC * VX_CFG_H100_NUM_SLICES,
-              "the DRAM channel is narrower than its per-slice read share");
+static_assert(uint64_t(VX_CFG_DRAM_CHANNEL_BITS) * VX_CFG_NUM_SLICES * VX_CFG_H100_NUM_SMS
+              >= uint64_t(VX_CFG_H100_DRAM_CHANNEL_BITS) * VX_CFG_NUM_GPCS * VX_CFG_SMS_PER_GPC * VX_CFG_H100_NUM_SLICES,
+              "the DRAM channel is narrower than its per-SM share of the H100's");
 static_assert(VX_CFG_DRAM_PCS <= VX_CFG_DRAM_BANKS, "more pseudo-channels than banks");
 static_assert(VX_CFG_DRAM_PCS * VX_CFG_DRAM_BGS * VX_CFG_DRAM_BANKS_PER_BG == VX_CFG_DRAM_BANKS,
               "pseudo-channels x bank groups x banks per group must equal VX_CFG_DRAM_BANKS");
@@ -140,7 +140,7 @@ public:
       e.second.reported = false;
     }
     for (auto& ch : channels_) {
-      ch.read_pipe.clear();
+      ch.read_done.clear();
       ch.write_pipe.clear();
       ch.rsps.clear();
       ch.unanswered.clear();
@@ -160,10 +160,8 @@ public:
       this->dram_tick();
     }
     for (auto& ch : channels_) {
-      while (!ch.read_pipe.empty() && ch.read_pipe.front().ready <= sm_cycles_) {
-        ch.rsps.push_back(ch.read_pipe.front().rsp);
-        ch.read_pipe.pop_front();
-      }
+      ch.rsps.insert(ch.rsps.end(), ch.read_done.begin(), ch.read_done.end());
+      ch.read_done.clear();
     }
   }
 
@@ -283,8 +281,8 @@ private:
 
   struct Channel {
     Skid skid[2];
-    std::deque<Pending> read_pipe;   // ready time in SM cycles
-    std::deque<Pending> write_pipe;  // ready time in DRAM ticks
+    std::deque<OrderedRsp> read_done;  // reads completed in this SM cycle's DRAM ticks
+    std::deque<Pending> write_pipe;    // ready time in DRAM ticks
     std::deque<OrderedRsp> rsps;
     std::set<uint64_t> unanswered;
     uint64_t next_order = 0;
@@ -342,7 +340,7 @@ private:
       if (e.write) {
         ch.write_pipe.push_back({dram_ticks_ + VX_DRAM_WRITE_DONE_TICKS, {{e.tag, true}, e.order}});
       } else {
-        ch.read_pipe.push_back({sm_cycles_ + VX_CFG_DRAM_MISS_PREMIUM, {{e.tag, false}, e.order}});
+        ch.read_done.push_back({{e.tag, false}, e.order});
       }
     }
     retired_.push_back(seq);

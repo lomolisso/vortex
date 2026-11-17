@@ -91,18 +91,10 @@ VX_CFG_H100_NUM_SMS = 132                            # 01/spec.md §2 (chip.sms_
 VX_CFG_H100_NUM_SLICES = 94                          # 01/spec.md §2 (L2 slices)
 VX_CFG_H100_FB_USABLE_BYTES = 0x1745770000           # 07/spec.md §1 (org.framebuffer_usable, 93.09 GiB)
 VX_CFG_H100_DRAM_CHANNEL_BITS = 64                   # 07/spec.md §1 (org.bus_bits_per_slice)
-VX_CFG_H100_SLICE_RD_MILLIBYTES_PER_DRAMCLK = 15500  # 18/spec.md §9.3 (noc.hbm.slice_read_bytes_per_dram_cycle, 15.5 B)
-VX_CFG_H100_SLICE_PEAK_BYTES_PER_DRAMCLK = 16        # 18/spec.md §9.3 (noc.hbm.slice_peak_bytes_per_dram_cycle)
-VX_CFG_H100_SLICE_RD_MBPS = 40600                    # 18/spec.md §9.3 (per-slice DRAM read, 40.6 GB/s)
-VX_CFG_H100_SLICE_WR_MBPS = 40800                    # 18/spec.md §9.3 (per-slice DRAM write, 40.8 GB/s)
-VX_CFG_H100_DRAM_QD = 64                             # 18/spec.md §0.6 D3 (noc.sim.c4.qd)
 VX_CFG_H100_PEAK_MEM_BW_MBPS = 3938000               # 07/spec.md §1 (peak bandwidth, 3938 GB/s)
 VX_CFG_H100_SM_CLOCK_MHZ = 1635                      # 19/spec.md §1 (clock.sm_lock)
 VX_CFG_H100_DRAM_CLOCK_MHZ = 2619                    # 19/spec.md §0 (dram__cycles_elapsed; 18 noc.hbm.dram_clock)
 VX_CFG_H100_L2_CLOCK_MHZ = 1559                      # 19/spec.md §0 (lts__cycles_elapsed)
-VX_CFG_H100_DRAM_VISIT_RD_PS = 2000                  # 18/spec.md §9.6 (noc.hbm.line_visit_floor_read_ns, 2.0 ns)
-VX_CFG_H100_DRAM_VISIT_WR1_PS = 2270                 # 07/spec.md §10.3 (gran.write_visit_1sector_ns, 2.27 ns)
-VX_CFG_H100_DRAM_VISIT_WR2_PS = 2470                 # 07/spec.md §10.3 (gran.write_visit_2sector_ns, 2.47 ns)
 VX_CFG_H100_CTA_DISPATCH_PS = 550                    # 03/spec.md §5 (launch.dispatch_per_cluster_of_1 note: plain CTA 0.55 ns)
 VX_CFG_H100_CLUSTER_DISPATCH_PS = 2500               # 03/spec.md §5 (launch.dispatch_per_cluster_of_1, 2.5 ns)
 VX_CFG_H100_CTA_REFILL_NS = 220                      # 03/spec.md §5 (launch.refill_gap.plain)
@@ -297,10 +289,12 @@ VX_CFG_DRAM_ATOM_BYTES = 32
 VX_CFG_DRAM_INTERLEAVE_SHIFT = "expr: clog2($VX_CFG_DRAM_LINE_BYTES / $VX_CFG_DRAM_PORT_DATA_SIZE) if $dram_h100 else 0"
 VX_CFG_DRAM_ROW_BYTES = 1024
 
-# 64 bits per slice (07 §1), widened to the next power of two that carries the per-slice read share.
-dram_need = "expr: $VX_CFG_H100_SLICE_RD_MILLIBYTES_PER_DRAMCLK * $dram_num_sms * $VX_CFG_H100_NUM_SLICES"
-dram_cap = "expr: $VX_CFG_NUM_SLICES * $VX_CFG_H100_NUM_SMS * $VX_CFG_H100_SLICE_PEAK_BYTES_PER_DRAMCLK * 1000"
-VX_CFG_DRAM_WIDTH_FACTOR = "expr: pow(2, clog2(($dram_need + $dram_cap - 1) / $dram_cap))"
+# The per-SM share is carried by width: 64 bits per slice (07 §1) times the slice's SMs over the
+# H100's SMs per slice, rounded up to a power of two (the JESD238 organisation scales by whole 64-bit
+# channels). Bandwidth then follows from the width and the device timing.
+dram_share_num = "expr: $dram_num_sms * $VX_CFG_H100_NUM_SLICES"
+dram_share_den = "expr: $VX_CFG_NUM_SLICES * $VX_CFG_H100_NUM_SMS"
+VX_CFG_DRAM_WIDTH_FACTOR = "expr: pow(2, clog2(($dram_share_num + $dram_share_den - 1) / $dram_share_den))"
 VX_CFG_DRAM_CHANNEL_BITS = "expr: $VX_CFG_H100_DRAM_CHANNEL_BITS * $VX_CFG_DRAM_WIDTH_FACTOR"
 # JESD238: two 32-bit pseudo-channels and 32 banks per 64 bits, four bank groups.
 VX_CFG_DRAM_PCS_PER_64B = 2
@@ -316,13 +310,12 @@ VX_CFG_DRAM_DATA_RATE_MTS = "expr: 2 * $VX_CFG_DRAM_CLOCK_MHZ"
 VX_CFG_DRAM_NUM_MCS = "expr: $VX_CFG_NUM_PARTITIONS * $VX_CFG_MPS_PER_PARTITION"
 
 # Controller policies: close the row unless a queued request hits it (07 §4, §8),
-# age-based read/write switch (18 §9.8, §9.11); scheduler not in the spec. Device
-# refresh is off in the H100 model: the measured slice rates and read/write mixes
-# (07 §6, §10.3) the visit server reproduces already include the H100's refresh.
+# age-based read/write switch (18 §9.8, §9.11); scheduler not in the spec; HBM3
+# per-bank refresh (JESD238).
 VX_CFG_DRAM_PAGE_POLICY = "expr: 'SHARED' if $dram_h100 else 'OPEN'"
 VX_CFG_DRAM_RW_POLICY = "expr: 'AGE' if $dram_h100 else 'WATERMARK'"
 VX_CFG_DRAM_SCHED = "FRFCFS"
-VX_CFG_DRAM_REFRESH = "expr: 'OFF' if $dram_h100 else 'ALLBANK'"
+VX_CFG_DRAM_REFRESH = "expr: 'PERBANK' if $dram_h100 else 'ALLBANK'"
 
 # Device timings (H100 model): tRC measured (07 §4); the rest JESD238 / Ramulator's HBM3 preset.
 VX_CFG_DRAM_T_RC_PS = 43000
@@ -346,23 +339,13 @@ VX_CFG_DRAM_T_REFI_PS = 3900000
 VX_CFG_DRAM_T_RFC_PS = 350000
 VX_CFG_DRAM_T_RFCPB_PS = 200000
 VX_CFG_DRAM_T_RREFD_PS = 8000
-# Read/write turnaround idle and the age after which the other direction is served (18 §9.8).
-VX_CFG_DRAM_T_TURN_PS = 60000
+# Age after which the waiting direction is served (18 §9.8); each switch is timed by the device's tWTR/tRTW.
 VX_CFG_DRAM_T_AGE_PS = 600000
 
-# Controller queue: the H100's 64 + 64 (18 §0.6 D3) per SM share.
-VX_CFG_DRAM_QD_RD = "expr: (2 * $VX_CFG_H100_DRAM_QD * $dram_num_sms * $VX_CFG_H100_NUM_SLICES + $VX_CFG_NUM_SLICES * $VX_CFG_H100_NUM_SMS) / (2 * $VX_CFG_NUM_SLICES * $VX_CFG_H100_NUM_SMS)"
-VX_CFG_DRAM_QD_WR = "expr: (2 * $VX_CFG_H100_DRAM_QD * $dram_num_sms * $VX_CFG_H100_NUM_SLICES + $VX_CFG_NUM_SLICES * $VX_CFG_H100_NUM_SMS) / (2 * $VX_CFG_NUM_SLICES * $VX_CFG_H100_NUM_SMS)"
-# Per-slice service rate = the H100's (18 §9.3) per SM share; the visit server runs 1/duty slower.
-VX_CFG_DRAM_SLICE_RD_MBPS = "expr: $VX_CFG_H100_SLICE_RD_MBPS * $dram_num_sms * $VX_CFG_H100_NUM_SLICES / ($VX_CFG_NUM_SLICES * $VX_CFG_H100_NUM_SMS)"
-VX_CFG_DRAM_SLICE_WR_MBPS = "expr: $VX_CFG_H100_SLICE_WR_MBPS * $dram_num_sms * $VX_CFG_H100_NUM_SLICES / ($VX_CFG_NUM_SLICES * $VX_CFG_H100_NUM_SMS)"
-VX_CFG_DRAM_SERVICE_SCALE_NUM = "expr: $VX_CFG_NUM_SLICES * $VX_CFG_H100_NUM_SMS"
-VX_CFG_DRAM_SERVICE_SCALE_DEN = "expr: $dram_num_sms * $VX_CFG_H100_NUM_SLICES"
-
-# Zero-load DRAM read over a local L2 hit, SM cycles (17 §3, DR-03); the premium closes it:
-# 242 minus the 72 cycles of today's L2 miss path and DRAM (dram_bench chase, h8).
-VX_CFG_DRAM_LOCAL_OVER_HIT = 242
-VX_CFG_DRAM_MISS_PREMIUM = "expr: 170 if $dram_h100 else 0"
+# Controller queue, requests per direction waiting for their row visit: one per bank of the channel
+# (sized by the occupancy of the bank array), so a closed-page scheduler finds a request for every bank that frees.
+VX_CFG_DRAM_QD_RD = "expr: $VX_CFG_DRAM_BANKS"
+VX_CFG_DRAM_QD_WR = "expr: $VX_CFG_DRAM_QD_RD"
 # SimX mirror of the rtlsim shim's registered response path, SM cycles.
 VX_CFG_DRAM_RSP_BOUNDARY_DELAY = 3
 # MB/s: the H100's vendor peak per SM x SMs (07 §1).
@@ -382,10 +365,7 @@ DRAM_ATOM_H100 = ["expr: not $VX_CFG_DRAM_MODEL_H100 or $VX_CFG_DRAM_ATOM_BYTES 
 DRAM_BANKS_POW2 = ["expr: is_pow2($VX_CFG_DRAM_BANKS_PER_64B) and $VX_CFG_DRAM_BANKS_PER_64B <= 32", "VX_CFG_DRAM_BANKS_PER_64B must be a power of two <= 32"]
 DRAM_ROW_BYTES_SHAPE = ["expr: is_pow2($VX_CFG_DRAM_ROW_BYTES) and $VX_CFG_DRAM_ROW_BYTES >= $VX_CFG_DRAM_LINE_BYTES", "VX_CFG_DRAM_ROW_BYTES: power of two, >= one line"]
 DRAM_T_RAS = ["expr: $VX_CFG_DRAM_T_RC_PS - $VX_CFG_DRAM_T_RP_PS >= $VX_CFG_DRAM_T_RCDRD_PS", "tRC - tRP must cover tRCDRD"]
-DRAM_T_AGE_TURN = ["expr: $VX_CFG_DRAM_T_TURN_PS >= 0 and $VX_CFG_DRAM_T_AGE_PS > $VX_CFG_DRAM_T_TURN_PS", "0 <= VX_CFG_DRAM_T_TURN_PS < VX_CFG_DRAM_T_AGE_PS"]
-DRAM_QD_POS = ["expr: $VX_CFG_DRAM_QD_RD >= 1 and $VX_CFG_DRAM_QD_WR >= 1", "DRAM controller queues need at least one entry"]
-DRAM_SERVICE_SCALE_POS = ["expr: $VX_CFG_DRAM_SERVICE_SCALE_NUM > 0 and $VX_CFG_DRAM_SERVICE_SCALE_DEN > 0", "DRAM service scale must be > 0"]
-DRAM_MISS_PREMIUM_POS = ["expr: $VX_CFG_DRAM_MISS_PREMIUM >= 0", "VX_CFG_DRAM_MISS_PREMIUM must be >= 0"]
+DRAM_T_AGE_POS = ["expr: $VX_CFG_DRAM_T_AGE_PS > 0", "VX_CFG_DRAM_T_AGE_PS must be > 0"]
 DRAM_RSP_BOUNDARY_DELAY_POS = ["expr: $VX_CFG_DRAM_RSP_BOUNDARY_DELAY >= 1", "VX_CFG_DRAM_RSP_BOUNDARY_DELAY must be >= 1"]
 DRAM_RW_POLICY_AGE = ["expr: not $VX_CFG_DRAM_RW_POLICY_AGE or $VX_CFG_DRAM_MODEL_H100", "VX_CFG_DRAM_RW_POLICY AGE requires the H100 DRAM model"]
 

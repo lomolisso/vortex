@@ -176,6 +176,10 @@ int run_chase(kernel_arg_t& arg) {
   printf("PERF: chase dram_miss median=%u p10=%u p90=%u\n", pct(miss, 50), pct(miss, 10), pct(miss, 90));
   printf("PERF: chase l2_hit median=%u p10=%u p90=%u\n", pct(hit, 50), pct(hit, 10), pct(hit, 90));
   printf("PERF: chase offset=%d (DRAM miss over L2 hit, SM cycles)\n", int(pct(miss, 50)) - int(pct(hit, 50)));
+#ifdef VX_CFG_DRAM_MODEL_H100
+  // 17 §3 DR-03: reference data for task G, not a target.
+  printf("H100REF metric=dram_over_l2_hit_sm_cycles h100=242 vortex=%d\n", int(pct(miss, 50)) - int(pct(hit, 50)));
+#endif
   if (end != arg.list_addr) {
     printf("error: chase ended at 0x%lx, expected 0x%lx\n", end, arg.list_addr);
     return 1;
@@ -264,10 +268,16 @@ int run_pair(kernel_arg_t& arg) {
     int d = int(pct(by[kinds[0]], 50)) - int(pct(by[OTHERBANK], 50));
     printf("PERF: pair %s_minus_otherbank=%d\n", names[kinds[0]], d);
 #ifdef VX_CFG_DRAM_MODEL_H100
-    // 07 §4: a concurrent same-bank different-row pair costs one row cycle, ~70 SM cycles
-    if (kinds[0] == CONFLICT && (d < 60 || d > 80)) {
-      printf("error: conflict - otherbank = %d, expected 70 +-10\n", d);
-      ++errors;
+    // A same-bank different-row pair costs one row cycle less the ACT-to-ACT spacing of an other-bank pair;
+    // +-10 SM cycles for the L1/L2 path the two misses take.
+    const int rc = int((uint64_t(VX_CFG_DRAM_T_RC_PS) * VX_CFG_SM_CLOCK_MHZ + 999999) / 1000000);
+    const int rrd = int((uint64_t(VX_CFG_DRAM_T_RRDS_PS) * VX_CFG_SM_CLOCK_MHZ + 999999) / 1000000);
+    if (kinds[0] == CONFLICT) {
+      printf("H100REF metric=dram_row_conflict_sm_cycles h100=70 vortex=%d\n", d);  // 07 §4
+      if (d < rc - rrd - 10 || d > rc + 10) {
+        printf("error: conflict - otherbank = %d, expected tRC - tRRDS .. tRC (%d .. %d) +-10\n", d, rc - rrd, rc);
+        ++errors;
+      }
     }
 #endif
   }

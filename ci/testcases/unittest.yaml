@@ -15,11 +15,12 @@ tests:
     run: "make -C tests/unittest/dram_map run"
     touches: [sw/common/vx_dram_map.h, tests/unittest/dram_map]
   # DramSim alone, one binary per memory shape (legacy HBM2, micro, nano, pocket
-  # memory on the H100 model, h100 for wall time): zero-load read and write, row
-  # conflict and same-row pairs, per-channel rates and visit intervals, the age
-  # switch, queue bounds, completion order, the clock ratio and the golden map of
-  # every issued column command; the read/write mixes and loaded latency are printed
-  # for the configuration sweep.
+  # memory on the H100 model, h100 for wall time), against the device timings, the
+  # channel width and the queue depth: zero-load read and write, row conflict and
+  # same-row pairs, per-channel rates under the data-bus peak, request intervals,
+  # the age switch, per-bank refresh, queue bounds, completion order, the clock
+  # ratio and the golden map of every issued column command; the read/write mixes,
+  # loaded latency and the H100 reference values (H100REF lines) are printed.
   - id: sw-dram-sim
     via: script
     xlen: [64]

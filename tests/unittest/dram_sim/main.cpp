@@ -1,6 +1,8 @@
 // DramSim host test: the DRAM path alone (wrapper + Ramulator), in SM cycles at the build's clock pair.
 // Device numbers are computed from the toml knobs (-D flags) and the generated vx_dram_config.h.
-// Cases: SEC, Z-RD, Z-WR, T2, T3a, T3b, T4, T5, T6 (print only), T7 (print only), AGE, Q, ORD, CLK, MAP,
+// Checks are structural (device timings, channel width, controller queue); H100 measurements are printed as
+// "H100REF metric=... h100=... vortex=..." lines for task G, never asserted.
+// Cases: SEC, GEN, Z-RD, Z-WR, T2, T3a, T3b, T4, T5, T6 (print only), T7 (print only), AGE, REF, Q, ORD, CLK, MAP,
 // LEG (HBM2 build); SPEED (argument SPEED: wall time of every channel saturated).
 
 #include <dram_sim.h>
@@ -83,24 +85,27 @@ uint64_t ticks_to_sm(uint64_t ticks) { return (ticks * SM_MHZ + DRAM_MHZ - 1) / 
 double ps_to_sm(double ps) { return ps * SM_MHZ / 1e6; }
 double sm_to_ps(double sm) { return sm * 1e6 / SM_MHZ; }
 
-// Visit interval of the controller's service limiter (contract §3 "Visit intervals"), in ps.
-double occ_ps(bool write, uint32_t k) {
-  double floor_ps = write ? (k == 1 ? VX_CFG_H100_DRAM_VISIT_WR1_PS : VX_CFG_H100_DRAM_VISIT_WR2_PS)
-                          : VX_CFG_H100_DRAM_VISIT_RD_PS;
-  double rate_mbps = write ? VX_CFG_H100_SLICE_WR_MBPS : VX_CFG_H100_SLICE_RD_MBPS;
-  double data_ps = k * double(ATOM) * 1e6 / rate_mbps;
-  return double(VX_CFG_DRAM_SERVICE_SCALE_NUM) / VX_CFG_DRAM_SERVICE_SCALE_DEN * std::max(floor_ps, data_ps);
-}
+// The channel's data-bus peak: its width at the data rate.
+constexpr double PEAK_MBPS = double(VX_CFG_DRAM_CHANNEL_BITS) / 8 * VX_CFG_DRAM_DATA_RATE_MTS;
+constexpr uint32_t WIDTH_FACTOR = VX_CFG_DRAM_WIDTH_FACTOR;
 
-// One channel's rate at the exact share (the SLICE_*_MBPS knobs are floored to whole MB/s).
-double slice_mbps(bool write) {
-  return double(write ? VX_CFG_H100_SLICE_WR_MBPS : VX_CFG_H100_SLICE_RD_MBPS) * VX_CFG_DRAM_SERVICE_SCALE_DEN /
-         VX_CFG_DRAM_SERVICE_SCALE_NUM;
+// H100 reference data (task G): printed next to what Vortex does, never asserted.
+constexpr double H100_SLICE_RD_MBPS = 40600;   // 18 §9.3, per 64-bit slice
+constexpr double H100_SLICE_WR_MBPS = 40800;   // 18 §9.3
+constexpr double H100_VISIT_RD_PS = 2000;      // 18 §9.6, 1-2 sector read visit floor
+constexpr double H100_VISIT_WR1_PS = 2270;     // 07 §10.3
+constexpr double H100_VISIT_WR2_PS = 2470;     // 07 §10.3
+constexpr double H100_TURN_NS = 60;            // 18 §9.8 [I, low]
+constexpr double H100_ROW_CONFLICT_SM = 70;    // 07 §4
+constexpr double H100_MIX_1TO1_RATIO = 0.869;  // 07 §10.3, 1:1 mix over read-only
+
+void h100ref(const char* metric, double h100, double vortex) {
+  printf("H100REF metric=%s h100=%.2f vortex=%.2f\n", metric, h100, vortex);
 }
 
 uint64_t zero_rd_expect(uint32_t sectors) {
   uint64_t t = VX_DRAM_NRCDRD_TICKS + VX_DRAM_NCCDS_TICKS * (sectors - 1) + VX_DRAM_READ_LATENCY_TICKS;
-  return ticks_to_sm(t) + VX_CFG_DRAM_MISS_PREMIUM + WRAPPER_STAGES;
+  return ticks_to_sm(t) + WRAPPER_STAGES;
 }
 
 uint64_t zero_wr_expect() {
@@ -306,15 +311,17 @@ void case_gen() {
   };
   for (auto& x : t)
     check(x.got == x.want, "GEN", fmt("%s %lu ticks, knob gives %lu", x.name, x.got, x.want));
-  struct { const char* name; uint64_t got; bool write; uint32_t k; } o[] = {
-    {"occ rd2", VX_DRAM_OCC_RD2_MILLITICKS, false, 2}, {"occ rd4", VX_DRAM_OCC_RD4_MILLITICKS, false, 4},
-    {"occ wr1", VX_DRAM_OCC_WR1_MILLITICKS, true, 1}, {"occ wr2", VX_DRAM_OCC_WR2_MILLITICKS, true, 2},
-    {"occ wr4", VX_DRAM_OCC_WR4_MILLITICKS, true, 4},
-  };
-  for (auto& x : o) {
-    double want = occ_ps(x.write, x.k) * DRAM_MHZ / 1000.0;
-    check(std::abs(double(x.got) - want) <= 1.0, "GEN", fmt("%s %lu milliticks, knobs give %.1f", x.name, x.got, want));
-  }
+  // One waiting request per bank of the channel.
+  check(VX_CFG_DRAM_QD_RD == VX_CFG_DRAM_BANKS && VX_CFG_DRAM_QD_WR == VX_CFG_DRAM_BANKS, "GEN",
+        fmt("queue depth rd %d wr %d = banks of the channel %d", VX_CFG_DRAM_QD_RD, VX_CFG_DRAM_QD_WR, VX_CFG_DRAM_BANKS));
+  // The per-SM share is width: the H100's 64 bits per slice x this slice's SM share, as a power of two.
+  uint64_t num = uint64_t(VX_CFG_NUM_GPCS) * VX_CFG_SMS_PER_GPC * VX_CFG_H100_NUM_SLICES;
+  uint64_t den = uint64_t(VX_CFG_NUM_SLICES) * VX_CFG_H100_NUM_SMS;
+  uint64_t w = 1;
+  while (w * den < num)
+    w *= 2;
+  check(WIDTH_FACTOR == w && VX_CFG_DRAM_CHANNEL_BITS == VX_CFG_H100_DRAM_CHANNEL_BITS * w, "GEN",
+        fmt("width factor %u, SM share %lu/%lu gives %lu", WIDTH_FACTOR, num, den, w));
 }
 
 uint64_t zero_latency(uint32_t sectors, bool write, int samples = 63) {
@@ -336,7 +343,8 @@ void case_zero() {
   g_zrd128 = zero_latency(4, false);
   uint64_t e = zero_rd_expect(2);
   check(g_zrd64 + 2 >= e && g_zrd64 <= e + 2, "Z-RD",
-        fmt("64-B read at idle %lu SM cycles, expected %lu +-2 (premium %d)", g_zrd64, e, VX_CFG_DRAM_MISS_PREMIUM));
+        fmt("64-B read at idle %lu SM cycles, expected tRCD + tCCD + read latency + wrapper = %lu +-2", g_zrd64, e));
+  check(g_zrd128 >= g_zrd64, "Z-RD", fmt("128-B read %lu >= 64-B read %lu", g_zrd128, g_zrd64));
   uint64_t w = zero_latency(1, true);
   uint64_t ew = zero_wr_expect();
   check(w + 2 >= ew && w <= ew + 2, "Z-WR", fmt("32-B write at idle %lu SM cycles, expected %lu +-2", w, ew));
@@ -371,7 +379,13 @@ void case_pairs() {
   }
   int64_t mc = median(conflict), ms = median(samerow), mo = median(other);
   printf("PERF: pair conflict=%ld samerow=%ld otherbank=%ld (median second completion, SM cycles)\n", mc, ms, mo);
-  check(mc - mo >= 60 && mc - mo <= 80, "T2", fmt("conflict - otherbank = %ld, expected 70 +-10", mc - mo));
+  // A same-bank different-row second request waits one row cycle after the first's ACT; an other-bank one at most
+  // tRRDS (same pseudo-channel) after it.
+  int64_t rc_lo = int64_t(ticks_to_sm(VX_DRAM_NRC_TICKS - VX_DRAM_NRRDS_TICKS)) - 2;
+  int64_t rc_hi = int64_t(ticks_to_sm(VX_DRAM_NRC_TICKS)) + 2;
+  check(mc - mo >= rc_lo && mc - mo <= rc_hi, "T2",
+        fmt("conflict - otherbank = %ld, expected tRC - tRRDS .. tRC = %ld .. %ld", mc - mo, rc_lo, rc_hi));
+  h100ref("dram_row_conflict_sm_cycles", H100_ROW_CONFLICT_SM, double(mc - mo));
   check(ms - mo <= 5, "T3a", fmt("samerow - otherbank = %ld, expected <= +5", ms - mo));
 
   // sequential: the second request is sent after the first returns
@@ -404,12 +418,14 @@ struct Rate {
 Rate saturate(uint32_t nch, uint32_t sectors, bool write, uint64_t warm = 20000, uint64_t win = 100000) {
   Harness h;
   std::vector<uint64_t> bytes(nch, 0), count(nch, 0);
+  // Every channel gets the same address stream, so independent channels run identical schedules.
+  std::vector<std::mt19937_64> rng(nch, std::mt19937_64(29));
   uint64_t warm0 = 0;
   bool skid_ok = true;
   for (uint64_t c = 0; c < warm + win; ++c) {
     for (uint32_t ch = 0; ch < nch; ++ch) {
       if (h.can(ch, write)) {
-        h.send(ch, rand_lc(), mask_of(0, sectors), write);
+        h.send(ch, rng[ch]() % LINES_PER_CHANNEL, mask_of(0, sectors), write);
         skid_ok &= !h.can(ch, write);
       }
     }
@@ -450,38 +466,47 @@ Rate saturate(uint32_t nch, uint32_t sectors, bool write, uint64_t warm = 20000,
   return r;
 }
 
+double g_sat_rd_mbps = 0;
+
 void case_rates() {
   for (bool write : {false, true}) {
-    double target = slice_mbps(write);
     Rate one = saturate(1, 4, write);
-    double ratio = one.mbps_per_ch / target;
-    printf("PERF: T4 %s ch=1 rate_mbps=%.0f target=%.0f ratio=%.4f\n", write ? "wr" : "rd", one.mbps_per_ch, target, ratio);
-    check(ratio >= 0.95, "T4", fmt("one channel %s %.0f MB/s = %.4f x %.0f", write ? "write" : "read", one.mbps_per_ch,
-                                   ratio, target));
-    // A window's rate can exceed the server's by its edge visits' latency difference (FR-FCFS reorders the queue), so the
-    // ceiling is checked from cycle 0: visit n starts (n - 1) server intervals after the first and completes after it.
-    double occ4 = double(write ? VX_DRAM_OCC_WR4_MILLITICKS : VX_DRAM_OCC_RD4_MILLITICKS) * 1000 / DRAM_MHZ;
-    double need_ps = double(one.total0 - 1) * occ4;
+    if (!write)
+      g_sat_rd_mbps = one.mbps_per_ch;
+    double ratio = one.mbps_per_ch / PEAK_MBPS;
+    printf("PERF: T4 %s ch=1 rate_mbps=%.0f peak=%.0f ratio=%.4f\n", write ? "wr" : "rd", one.mbps_per_ch, PEAK_MBPS, ratio);
+    // From cycle 0, so no window edge can lift it: n line requests need n x LINE bytes of data bus.
+    double need_ps = double(one.total0) * LINE * 1e6 / PEAK_MBPS;
     check(need_ps <= sm_to_ps(double(one.last0)), "T4",
-          fmt("one channel %s: %lu visits by cycle %lu need %.0f ps of visit server, %.0f elapsed", write ? "write" : "read",
-              one.total0, one.last0, need_ps, sm_to_ps(double(one.last0))));
+          fmt("one channel %s: %lu lines by cycle %lu need %.0f ps of a %.0f MB/s bus, %.0f elapsed",
+              write ? "write" : "read", one.total0, one.last0, need_ps, PEAK_MBPS, sm_to_ps(double(one.last0))));
+    h100ref(write ? "dram_slice_wr_mbps_per_64b" : "dram_slice_rd_mbps_per_64b",
+            write ? H100_SLICE_WR_MBPS : H100_SLICE_RD_MBPS, one.mbps_per_ch / WIDTH_FACTOR);
     for (uint32_t n = 2; n <= std::min<uint32_t>(8, SYS_CHANNELS); n *= 2) {
       Rate m = saturate(n, 4, write);
       double worst = 0;
       for (double v : m.per_ch)
         worst = std::max(worst, std::abs(v / one.mbps_per_ch - 1));
       printf("PERF: T4 %s ch=%u worst_dev=%.4f\n", write ? "wr" : "rd", n, worst);
-      check(worst <= 0.01, "T4", fmt("%u channels: every channel within 1 %% of one (worst %.4f)", n, worst));
+      check(worst <= 0.001, "T4", fmt("%u channels on one address stream: every channel's rate = one channel's (worst %.4f)",
+                                      n, worst));
     }
   }
-  struct { bool write; uint32_t k; const char* name; } t5[] = {{false, 2, "rd64"}, {true, 1, "wr32"}, {true, 2, "wr64"}};
+  // Request intervals of smaller requests: never below their data-bus time, never above a full line's interval.
+  struct { bool write; uint32_t k; const char* name; double h100_ps; } t5[] = {
+    {false, 2, "rd64", H100_VISIT_RD_PS}, {true, 1, "wr32", H100_VISIT_WR1_PS}, {true, 2, "wr64", H100_VISIT_WR2_PS}};
+  double line_ps[2] = {saturate(1, 4, false).interval_ps, saturate(1, 4, true).interval_ps};
   for (auto& t : t5) {
     Rate r = saturate(1, t.k, t.write);
-    double e = occ_ps(t.write, t.k);
-    double dev = r.interval_ps / e - 1;
-    printf("PERF: T5 %s interval_ps=%.0f occ_ps=%.0f\n", t.name, r.interval_ps, e);
-    check(std::abs(dev) <= 0.03, "T5", fmt("%s visit interval %.0f ps vs occ %.0f ps (%.2f %%)", t.name, r.interval_ps, e,
-                                            100 * dev));
+    double bus_ps = t.k * double(ATOM) * 1e6 / PEAK_MBPS;
+    printf("PERF: T5 %s interval_ps=%.0f bus_ps=%.0f line_ps=%.0f\n", t.name, r.interval_ps, bus_ps, line_ps[t.write]);
+    check(r.interval_ps >= bus_ps * 0.99 && r.interval_ps <= line_ps[t.write] * 1.01, "T5",
+          fmt("%s interval %.0f ps within its bus time %.0f .. a 128-B request's %.0f", t.name, r.interval_ps, bus_ps,
+              line_ps[t.write]));
+    // The H100's visit floor is per 64-bit slice: compare with the interval at that width.
+    char metric[64];
+    snprintf(metric, sizeof(metric), "dram_visit_%s_ps_per_64b", t.name);
+    h100ref(metric, t.h100_ps, r.interval_ps * WIDTH_FACTOR);
   }
 }
 
@@ -529,17 +554,21 @@ void case_t6() {
         base = r;
       printf("PERF: T6 %s share=%.3f ratio=%.4f rate_mbps=%.0f switches=%lu\n", shallow ? "shallow" : "deep",
              double(s[0]) / s[1], r / base, r, sw);
+      if (!shallow && 2 * s[0] == s[1])
+        h100ref("dram_mix_1to1_over_rd_ratio", H100_MIX_1TO1_RATIO, r / base);
     }
   }
 }
 
 void case_t7() {
+  if (g_sat_rd_mbps == 0)
+    g_sat_rd_mbps = saturate(1, 4, false).mbps_per_ch;
   const int loads[] = {45, 63, 78, 94, 100};
   const uint64_t n_req = 20000;
   for (int load : loads) {
     Harness h;
     // one Bernoulli trial per SM cycle: random arrivals, as a slice sees from many SMs
-    double p_req = load / 100.0 * slice_mbps(false) / double(SM_MHZ) / LINE;
+    double p_req = load / 100.0 * g_sat_rd_mbps / double(SM_MHZ) / LINE;
     std::bernoulli_distribution arrive(p_req);
     std::mt19937_64 rng(23);
     uint64_t made = 0;
@@ -578,11 +607,38 @@ void case_age() {
       break;
   }
   uint64_t l = h.latency(rd);
-  double e = ps_to_sm(VX_CFG_DRAM_T_AGE_PS + VX_CFG_DRAM_T_TURN_PS + occ_ps(true, 4)) + double(g_zrd64);
-  double dev = double(l) / e - 1;
-  check(std::abs(dev) <= 0.05, "AGE", fmt("read under a saturating write stream: %lu SM cycles, expected %.0f (%.1f %%)",
-                                          l, e, 100 * dev));
+  // The read waits the age, then at most a started write visit of its bank (ACT to precharged: tRCDWR, the line's
+  // columns, write data, tWR, tRP; at least tRC), the write-to-read turnaround and a refresh of its bank before its
+  // own zero-load time.
+  const uint64_t wr_visit = std::max<uint64_t>(VX_DRAM_NRC_TICKS,
+      VX_DRAM_NRCDWR_TICKS + (LINE / VX_DRAM_TX_BYTES - 1) * VX_DRAM_NCCDS_TICKS + VX_DRAM_WRITE_DONE_TICKS + VX_DRAM_NWR_TICKS
+      + VX_DRAM_NRP_TICKS);
+  double lo = ps_to_sm(VX_CFG_DRAM_T_AGE_PS) + double(g_zrd64) - 2;
+  double hi = ps_to_sm(VX_CFG_DRAM_T_AGE_PS) + double(g_zrd64)
+            + double(ticks_to_sm(wr_visit + VX_DRAM_NWTRS_TICKS + VX_DRAM_NRFCPB_TICKS)) + 2;
+  check(double(l) >= lo && double(l) <= hi, "AGE",
+        fmt("read under a saturating write stream: %lu SM cycles, expected age + zero-load .. + write visit + tWTR + tRFCpb = "
+            "%.0f .. %.0f", l, lo, hi));
   check(h.dram().stats(0).dir_switches > 0, "AGE", fmt("dir_switches %lu > 0", h.dram().stats(0).dir_switches));
+  h100ref("dram_rw_turnaround_ns", H100_TURN_NS,
+          (double(l) - ps_to_sm(VX_CFG_DRAM_T_AGE_PS) - double(g_zrd64)) * 1000.0 / SM_MHZ);
+}
+
+// HBM3 per-bank refresh runs: over a few tREFI every bank of a pseudo-channel gets its REFpb.
+void case_refresh() {
+  Harness h;
+  uint64_t refpb = 0, other = 0;
+  h.dram().set_issue_observer([&](uint32_t channel, const char* cmd, const uint32_t*, uint64_t) {
+    if (channel != 0)
+      return;
+    std::string c(cmd);
+    refpb += (c == "REFpb");
+    other += (c == "REFab");
+  });
+  uint64_t trefi_sm = uint64_t(ps_to_sm(VX_CFG_DRAM_T_REFI_PS));
+  h.run(4 * trefi_sm);
+  check(other == 0 && refpb >= 3 * uint64_t(VX_CFG_DRAM_BANKS), "REF",
+        fmt("4 tREFI idle: %lu REFpb (>= 3 x %lu banks), %lu REFab", refpb, uint64_t(VX_CFG_DRAM_BANKS), other));
 }
 
 void case_order() {
@@ -805,6 +861,7 @@ int main(int argc, char** argv) {
   if (want("T6")) case_t6();
   if (want("T7")) case_t7();
   if (want("AGE")) case_age();
+  if (want("REF")) case_refresh();
   if (want("ORD")) case_order();
   if (want("MAP")) case_map();
 #else

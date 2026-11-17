@@ -15,7 +15,8 @@ defaults:
             tests/regression/dram_bench, VX_config.toml]
 tests:
   # Dependent chase over cold lines, then the same chain again from the L2:
-  # median, p10 and p90 of both and the miss-over-hit offset.
+  # median, p10 and p90 of both and the miss-over-hit offset (H100REF line next to
+  # the H100's 242 of 17 §3).
   - id: chase-h8
     app: dram_bench
     drivers: [simx, rtlsim]
@@ -24,7 +25,8 @@ tests:
     args: "chase"
   # Two lanes load two lines of channel 0 at once, placed with the golden map: a
   # same-bank different-row pair costs one row cycle over a different-bank pair
-  # (07 §4: 70 +-10 SM cycles, checked by the app); a same-row pair costs nothing.
+  # (tRC - tRRDS .. tRC +-10 SM cycles, checked by the app; the H100's 70 of 07 §4
+  # is printed as H100REF); a same-row pair costs nothing.
   - id: pair-conflict-h8
     app: dram_bench
     drivers: [simx, rtlsim]
