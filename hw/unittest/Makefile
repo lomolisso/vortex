@@ -990,3 +990,34 @@ ifeq ($(XLEN),64)
 else
 	@echo "run-sm-port: the H100 SM path is RV64 only (skipped at XLEN $(XLEN))"
 endif
+
+# The front end's PEs; the benches and their SimX twins build with the switch on. Each bench's
+# CSV must equal its twin's row for row (the twins check themselves against the goldens):
+# the warp-op unit and its per-warp issue hold under random streams at the default knobs and with
+# every knob at its floor (completion-queue pressure); the uniform datapath (UR file, scoreboard UR mask, operand
+# substitution, uniform PE) at the default latency and at a long one.
+# $(1)=bench dir $(2)=CONFIGS $(3)=rows compared (grep pattern)
+define fe_bench_case
+	$(MAKE) -C $(1) clean
+	$(MAKE) -C $(1) CONFIGS="$(2)"
+	$(MAKE) -C $(1) run CONFIGS="$(2)" OPTS="--csv=hw.csv"
+	$(MAKE) -C $(ROOT_DIR)/tests/unittest/$(1) clean
+	$(MAKE) -C $(ROOT_DIR)/tests/unittest/$(1) CONFIGS="$(2)"
+	$(ROOT_DIR)/tests/unittest/$(1)/$(1) --csv=$(CURDIR)/$(1)/sw.csv
+	grep '$(3)' $(1)/hw.csv > $(1)/hw_cmp.csv
+	grep '$(3)' $(1)/sw.csv > $(1)/sw_cmp.csv
+	diff -q $(1)/hw_cmp.csv $(1)/sw_cmp.csv || { diff $(1)/hw_cmp.csv $(1)/sw_cmp.csv | head -20; false; }
+endef
+comma := ,
+WARP_OPS_SHAPE := -DVX_CFG_NUM_THREADS=32 -DVX_CFG_NUM_WARPS=8
+run-warp-ops:
+	$(call fe_bench_case,warp_ops,$(WARP_OPS_SHAPE),^[01]$(comma))
+	$(call fe_bench_case,warp_ops,-DVX_CFG_NUM_THREADS=4 -DVX_CFG_NUM_WARPS=4,^[01]$(comma))
+	$(call fe_bench_case,warp_ops,$(WARP_OPS_SHAPE) -DWOP_BENCH_PORTS=2,^[0-3]$(comma))
+	$(call fe_bench_case,warp_ops,$(WARP_OPS_SHAPE) -DWOP_BENCH_PORTS=4,^[0-7]$(comma))
+	$(MAKE) -C warp_ops clean
+
+UNIFORM_SHAPE := -DVX_CFG_NUM_THREADS=8 -DVX_CFG_NUM_WARPS=4
+run-uniform:
+	$(call fe_bench_case,uniform,$(UNIFORM_SHAPE),.)
+	$(MAKE) -C uniform clean

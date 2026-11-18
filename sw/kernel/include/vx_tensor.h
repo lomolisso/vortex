@@ -15,6 +15,9 @@
 
 #include <tensor_cfg.h>
 #include <vx_intrinsics.h>
+#if VX_CFG_H100_FE_ENABLED
+#include <vx_uniform.h>
+#endif
 
 // wgmma ordering, after PTX wgmma.fence / commit_group / wait_group. A wgmma
 // reads its local-memory operands after it issues, so a warp that releases
@@ -1363,6 +1366,14 @@ constexpr uint32_t acc_col(uint32_t t, uint32_t r, uint32_t half = 0) {
   "+f"(__vx_f##a), "+f"(__vx_f##b), "+f"(__vx_f##c), "+f"(__vx_f##e),           \
   "+f"(__vx_f##f), "+f"(__vx_f##g), "+f"(__vx_f##h), "+f"(__vx_f##k)
 #define __VX_H100_L8(M)  M(0) M(1) M(2) M(3) M(4) M(5) M(6) M(7)
+#if VX_CFG_H100_FE_ENABLED
+// The uops read descriptor A from UR8 and B from UR9, written in the wgmma's own asm block.
+#define __VX_H100_DESC VX_UASM_R2UR(8, "%[da]") VX_UASM_R2UR(9, "%[db]")
+#define __VX_H100_DIN  [da]"r"(ra), [db]"r"(rb)
+#else
+#define __VX_H100_DESC
+#define __VX_H100_DIN  "r"(ra), "r"(rb)
+#endif
 #define __VX_H100_L16(M) __VX_H100_L8(M) M(8) M(9) M(10) M(11) M(12) M(13) M(14) M(15)
 #define __VX_H100_L32(M) __VX_H100_L16(M) M(16) M(17) M(18) M(19) M(20) M(21) M(22) M(23) \
                          M(24) M(25) M(26) M(27) M(28) M(29) M(30) M(31)
@@ -1386,28 +1397,33 @@ inline __attribute__((always_inline)) void wgmma(uint64_t da, uint64_t db, acc<N
 
   if (!scale_d)
     d.zero();
+#if VX_CFG_H100_FE_ENABLED
+  const uint64_t ra = da | (tnspA ? desc_mn_major_bit : 0);
+  const uint64_t rb = db | (tnspB ? desc_mn_major_bit : 0);
+#else
   register uint64_t ra __asm__("a0") = da | (tnspA ? desc_mn_major_bit : 0);
   register uint64_t rb __asm__("a1") = db | (tnspB ? desc_mn_major_bit : 0);
+#endif
   if constexpr (NRC == 8) {
     __VX_H100_L8(__VX_H100_DECL)
-    __asm__ volatile (".insn r %[insn], 1, 2, x%[fmd], x%[fms], x%[flags]"
+    __asm__ volatile (__VX_H100_DESC ".insn r %[insn], 1, 2, x%[fmd], x%[fms], x%[flags]"
       : __VX_H100_O8(0, 1, 2, 3, 4, 5, 6, 7)
-      : [insn]"i"(RISCV_CUSTOM0), [fmd]"i"(Dt::id), [fms]"i"(At::id), [flags]"i"(flags), "r"(ra), "r"(rb)
+      : [insn]"i"(RISCV_CUSTOM0), [fmd]"i"(Dt::id), [fms]"i"(At::id), [flags]"i"(flags), __VX_H100_DIN
       : "memory");
     __VX_H100_L8(__VX_H100_BACK)
   } else if constexpr (NRC == 16) {
     __VX_H100_L16(__VX_H100_DECL)
-    __asm__ volatile (".insn r %[insn], 1, 2, x%[fmd], x%[fms], x%[flags]"
+    __asm__ volatile (__VX_H100_DESC ".insn r %[insn], 1, 2, x%[fmd], x%[fms], x%[flags]"
       : __VX_H100_O8(0, 1, 2, 3, 4, 5, 6, 7), __VX_H100_O8(8, 9, 10, 11, 12, 13, 14, 15)
-      : [insn]"i"(RISCV_CUSTOM0), [fmd]"i"(Dt::id), [fms]"i"(At::id), [flags]"i"(flags), "r"(ra), "r"(rb)
+      : [insn]"i"(RISCV_CUSTOM0), [fmd]"i"(Dt::id), [fms]"i"(At::id), [flags]"i"(flags), __VX_H100_DIN
       : "memory");
     __VX_H100_L16(__VX_H100_BACK)
   } else {
     __VX_H100_L32(__VX_H100_DECL)
-    __asm__ volatile (".insn r %[insn], 1, 2, x%[fmd], x%[fms], x%[flags]"
+    __asm__ volatile (__VX_H100_DESC ".insn r %[insn], 1, 2, x%[fmd], x%[fms], x%[flags]"
       : __VX_H100_O8(0, 1, 2, 3, 4, 5, 6, 7), __VX_H100_O8(8, 9, 10, 11, 12, 13, 14, 15),
         __VX_H100_O8(16, 17, 18, 19, 20, 21, 22, 23), __VX_H100_O8(24, 25, 26, 27, 28, 29, 30, 31)
-      : [insn]"i"(RISCV_CUSTOM0), [fmd]"i"(Dt::id), [fms]"i"(At::id), [flags]"i"(flags), "r"(ra), "r"(rb)
+      : [insn]"i"(RISCV_CUSTOM0), [fmd]"i"(Dt::id), [fms]"i"(At::id), [flags]"i"(flags), __VX_H100_DIN
       : "memory");
     __VX_H100_L32(__VX_H100_BACK)
   }
@@ -1419,6 +1435,8 @@ inline __attribute__((always_inline)) void wgmma(uint64_t da, uint64_t db, acc<N
 #undef __VX_H100_O8
 #undef __VX_H100_BACK
 #undef __VX_H100_DECL
+#undef __VX_H100_DESC
+#undef __VX_H100_DIN
 
 } // namespace h100
 } // namespace vortex

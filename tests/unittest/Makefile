@@ -46,3 +46,12 @@ ifeq ($(XLEN),64)
 else
 	@echo "run-cluster-dispatch: cluster dispatch is RV64 only; nothing to run at XLEN $(XLEN)"
 endif
+
+# The front end's SimX twins against their goldens (any XLEN; they build with the switch on).
+run-warp-ops:
+	$(MAKE) -C warp_ops clean
+	$(MAKE) -C warp_ops run
+
+run-uniform:
+	$(MAKE) -C uniform clean
+	$(MAKE) -C uniform run

@@ -433,6 +433,20 @@ module VX_tcu_uops import VX_tcu_pkg::*, VX_gpu_pkg::*; (
             end else begin
                 ibuf_r.used_rs[1] = 1'b0;
             end
+        `ifdef VX_CFG_TCU_H100_ENABLE
+        `ifdef VX_CFG_H100_FE_ENABLE
+            if (is_wg_first_compute_uop && wg_a_from_smem) begin
+                ibuf_r.rs1 = NUM_REGS_BITS'(TCU_WG_DESC_UR);
+                ibuf_r.used_rs[0] = 1'b0;
+                ibuf_r.ur_rs[0] = 1'b1;
+            end
+            if (is_wg_first_compute_uop && !wg_needs_setup) begin
+                ibuf_r.rs2 = NUM_REGS_BITS'(TCU_WG_DESC_UR + 1);
+                ibuf_r.used_rs[1] = 1'b0;
+                ibuf_r.ur_rs[1] = 1'b1;
+            end
+        `endif
+        `endif
         end else
     `endif
         begin

@@ -138,7 +138,11 @@ module VX_dxa_worker import VX_gpu_pkg::*, VX_dxa_pkg::*; #(
     wire                        sw_transfer_done;
     wire                        st_done;
     wire                        st_progress;
+`ifdef DXA_FE_PIPE
+    assign transfer_done = (sw_transfer_done && ~fe_sel) || st_done;
+`else
     assign transfer_done = sw_transfer_done || st_done;
+`endif
 `endif
     wire [31:0]                 wr_done_count;
     wire                        smem_req_fire;
@@ -177,6 +181,60 @@ module VX_dxa_worker import VX_gpu_pkg::*, VX_dxa_pkg::*; #(
     wire [31:0]                 perf_lmem_writes;
 `endif
 
+`ifdef DXA_FE_PIPE
+    // Pipelined G->S copies: the front (setup, AGU, line requests) moves on to
+    // the next copy once the AGU issued the last line; each copy in flight
+    // keeps what smem_wr needs of it in a context, and smem_wr drains the
+    // lines of one context at a time.
+    localparam CTX_N = MAX_OUTSTANDING;
+    localparam CTX_W = `UP(`CLOG2(CTX_N));
+    typedef struct packed {
+        logic [NC_WIDTH-1:0]        core_id;
+        logic [UUID_WIDTH-1:0]      uuid;
+        logic [BAR_ADDR_W-1:0]      bar_addr;
+        logic                       notify;
+        logic                       c_mode;
+        logic [DXA_MBAR_OFF_W-1:0]  c_mbar_off;
+        logic [DXA_TX_BYTES_W-1:0]  c_tx_bytes;
+        logic [NW_WIDTH-1:0]        c_slot;
+        logic [DXA_CTA_GEN_W-1:0]   c_gen;
+        logic [DLMEM_CORE_W-1:0]    c_dst_core;
+        logic [31:0]                cfill;
+        logic                       dest_kmajor;
+        logic [15:0]                per_lane_stride_bytes;
+        logic [3:0]                 elem_bytes;
+        logic [1:0]                 dest_mode;
+        logic [3:0]                 lg_ratio;
+        logic [3:0]                 lg_tcN;
+        logic [3:0]                 lg_nsteps;
+        logic [3:0]                 lg_bkK;
+        logic [DXA_SMEM_ADDR_W-1:0] smem_base;
+        dxa_tma_wr_t                tma;
+    } fe_ctx_t;
+
+    wire                        active_pipe;
+    wire                        front_done;
+    wire                        ctx_free;
+    wire                        ctx_idle;
+    wire [CTX_W-1:0]            free_ctx;
+    reg  [CTX_W-1:0]            front_ctx_r;
+    reg                         smem_pipe_r;
+    reg  [CTX_W-1:0]            smem_ctx_r;
+    reg                         smem_settle_r;
+    wire [CTX_W:0]              sw_ctx_tag;
+    wire                        smw_sw_ready;
+    wire                        smw_idle;
+    wire                        fe_pipe_last;
+    wire                        fe_sel;
+    wire                        fe_match;
+    wire [CTX_N-1:0]            ctx_busy, ctx_agd;
+    wire [CTX_N-1:0][SEQ_W-1:0] ctx_out;
+    fe_ctx_t                    fe_cur;
+    dxa_compl_t                 fe_compl;
+    dxa_tma_wr_t                fe_tma;
+    fe_ctx_t                    ctx_tab_r [CTX_N];
+`endif
+
     // ════════════════════════════════════════════════════════════════════
     // Stage 1: Setup
     // ════════════════════════════════════════════════════════════════════
@@ -189,6 +247,12 @@ module VX_dxa_worker import VX_gpu_pkg::*, VX_dxa_pkg::*; #(
         .req_data             (req_if.req_data),
         .desc_data            (req_if.desc_data),
         .transfer_done        (transfer_done),
+    `ifdef DXA_FE_PIPE
+        .front_done           (front_done),
+        .ctx_free             (ctx_free),
+        .ctx_idle             (ctx_idle),
+        .active_pipe          (active_pipe),
+    `endif
         .transfer_active      (transfer_active),
         .pipeline_start       (pipeline_start),
         .setup_params         (setup_params),
@@ -267,15 +331,30 @@ module VX_dxa_worker import VX_gpu_pkg::*, VX_dxa_pkg::*; #(
     assign gmem_bus_if.req_data  = st_bus_if.req_valid ? st_bus_if.req_data : gr_bus_if.req_data;
     assign gr_bus_if.req_ready   = gmem_bus_if.req_ready;
     assign st_bus_if.req_ready   = gmem_bus_if.req_ready;
+`ifdef VX_CFG_H100_FE_ENABLE
+    // A store fence's tag sets the tensor-map fetch's bit, which no line slot
+    // reaches: its answer goes to the fence table whatever the worker runs now.
+    localparam FT_VAL_W = GMEM_TAG_WIDTH - UUID_WIDTH;
+    wire ft_rsp = gmem_bus_if.rsp_data.tag.value[FT_VAL_W-1];
+    assign gr_bus_if.rsp_valid   = gmem_bus_if.rsp_valid && ~st_mode && ~ft_rsp;
+    assign st_bus_if.rsp_valid   = gmem_bus_if.rsp_valid && st_mode && ~ft_rsp;
+    assign gr_bus_if.rsp_data    = gmem_bus_if.rsp_data;
+    assign st_bus_if.rsp_data    = gmem_bus_if.rsp_data;
+    assign gmem_bus_if.rsp_ready = ft_rsp || (st_mode ? st_bus_if.rsp_ready : gr_bus_if.rsp_ready);
+`else
     assign gr_bus_if.rsp_valid   = gmem_bus_if.rsp_valid && ~st_mode;
     assign st_bus_if.rsp_valid   = gmem_bus_if.rsp_valid && st_mode;
     assign gr_bus_if.rsp_data    = gmem_bus_if.rsp_data;
     assign st_bus_if.rsp_data    = gmem_bus_if.rsp_data;
     assign gmem_bus_if.rsp_ready = st_mode ? st_bus_if.rsp_ready : gr_bus_if.rsp_ready;
 `endif
+`endif
 
     VX_dxa_gmem_req #(
         .MAX_OUTSTANDING (MAX_OUTSTANDING),
+    `ifdef DXA_FE_PIPE
+        .CTX_TAG_W       (CTX_W + 1),
+    `endif
         .GMEM_ADDR_WIDTH (GMEM_ADDR_WIDTH),
         .GMEM_TAG_WIDTH  (GMEM_TAG_WIDTH),
         .CL_OFF_BITS     (GMEM_OFF_BITS),
@@ -333,6 +412,10 @@ module VX_dxa_worker import VX_gpu_pkg::*, VX_dxa_pkg::*; #(
         .sw_outstanding     (sw_outstanding),
         .release_en         (sw_release_en),
         .release_tag        (sw_release_tag),
+    `ifdef DXA_FE_PIPE
+        .ag_ctx             ({active_pipe, front_ctx_r}),
+        .sw_ctx             (sw_ctx_tag),
+    `endif
         .gmem_req_fire      (gmem_req_fire),
         .stall_no_slot      (stall_no_slot)
     );
@@ -355,6 +438,24 @@ module VX_dxa_worker import VX_gpu_pkg::*, VX_dxa_pkg::*; #(
     `ifdef PERF_ENABLE
         .perf_lmem_writes      (perf_lmem_writes),
     `endif
+    `ifdef DXA_FE_PIPE
+        .transfer_active       (transfer_active || ~ctx_idle),
+        .transfer_start        (pipeline_start && ctx_idle),
+        .cfill                 (fe_sel ? fe_cur.cfill : ag_cfill),
+        .active_core_id        (fe_sel ? fe_cur.core_id : active_core_id),
+        .active_uuid           (fe_sel ? fe_cur.uuid : active_uuid),
+        .active_bar_addr       (fe_sel ? fe_cur.bar_addr : active_bar_addr),
+        .active_notify_smem_done (fe_sel ? fe_cur.notify : active_notify_smem_done),
+        .active_compl          (fe_compl),
+        .slot_stride           (slot_stride),
+        .tma                   (fe_tma),
+        .pf_end                (ag_pf_end && ~fe_sel),
+        .sw_valid              (sw_valid && fe_match),
+        .sw_ready              (smw_sw_ready),
+        .pipe                  (fe_sel),
+        .pipe_last             (fe_pipe_last),
+        .idle                  (smw_idle),
+    `else
         .transfer_active       (transfer_active),
         .transfer_start        (pipeline_start),
         .cfill                 (ag_cfill),
@@ -370,6 +471,7 @@ module VX_dxa_worker import VX_gpu_pkg::*, VX_dxa_pkg::*; #(
     `endif
         .sw_valid              (sw_valid),
         .sw_ready              (sw_ready),
+    `endif
         .sw_tag                (sw_tag),
         .sw_data               (sw_data),
         .sw_smem_byte_addr     (sw_smem_byte_addr),
@@ -394,6 +496,20 @@ module VX_dxa_worker import VX_gpu_pkg::*, VX_dxa_pkg::*; #(
     `endif
         .wr_done_count         (wr_done_count),
         .smem_req_fire         (smem_req_fire),
+    `ifdef DXA_FE_PIPE
+        .is_multicast          (active_is_multicast && ~fe_sel),
+        .cta_mask              (active_cta_mask),
+        .smem_stride           (active_smem_stride),
+        .dest_kmajor           (fe_sel ? fe_cur.dest_kmajor : ag_dest_kmajor),
+        .per_lane_stride_bytes (fe_sel ? fe_cur.per_lane_stride_bytes : ag_per_lane_stride_bytes),
+        .elem_bytes            (fe_sel ? fe_cur.elem_bytes : ag_elem_bytes),
+        .dest_mode             (fe_sel ? fe_cur.dest_mode : ag_dest_mode),
+        .lg_ratio              (fe_sel ? fe_cur.lg_ratio : ag_lg_ratio),
+        .lg_tcN                (fe_sel ? fe_cur.lg_tcN : ag_lg_tcN),
+        .lg_nsteps             (fe_sel ? fe_cur.lg_nsteps : ag_lg_nsteps),
+        .lg_bkK                (fe_sel ? fe_cur.lg_bkK : ag_lg_bkK),
+        .smem_base             (fe_sel ? fe_cur.smem_base : ag_smem_base)
+    `else
         .is_multicast          (active_is_multicast),
         .cta_mask              (active_cta_mask),
         .smem_stride           (active_smem_stride),
@@ -406,7 +522,134 @@ module VX_dxa_worker import VX_gpu_pkg::*, VX_dxa_pkg::*; #(
         .lg_nsteps             (ag_lg_nsteps),
         .lg_bkK                (ag_lg_bkK),
         .smem_base             (ag_smem_base)
+    `endif
     );
+
+`ifdef DXA_FE_PIPE
+    // ── Copy contexts ──
+    wire fe_acc   = ag_valid && ag_ready && ~st_mode && active_pipe;
+    wire fe_alloc = pipeline_start && active_pipe;
+    wire fe_rel   = sw_release_en && smem_pipe_r;
+    assign front_done = fe_acc && ag_last;
+
+    VX_priority_encoder #(
+        .N (CTX_N)
+    ) ctx_pe (
+        .data_in   (~ctx_busy),
+        .index_out (free_ctx),
+        .valid_out (ctx_free),
+        `UNUSED_PIN (onehot_out)
+    );
+
+    for (genvar c = 0; c < CTX_N; ++c) begin : g_ctx
+        wire inc = fe_acc && (front_ctx_r == CTX_W'(c));
+        wire dec = fe_rel && (smem_ctx_r == CTX_W'(c));
+        reg busy_r, agd_r;
+        reg [SEQ_W-1:0] out_r;
+        wire ends = dec && ~inc && agd_r && (out_r == SEQ_W'(1));
+        always @(posedge clk) begin
+            if (reset) begin
+                busy_r <= 1'b0;
+                agd_r  <= 1'b0;
+                out_r  <= '0;
+            end else begin
+                if (fe_alloc && (free_ctx == CTX_W'(c))) begin
+                    busy_r <= 1'b1;
+                end else if (ends) begin
+                    busy_r <= 1'b0;
+                end
+                if (inc && ag_last) begin
+                    agd_r <= 1'b1;
+                end else if (ends) begin
+                    agd_r <= 1'b0;
+                end
+                case ({inc, dec})
+                2'b10:   out_r <= out_r + SEQ_W'(1);
+                2'b01:   out_r <= out_r - SEQ_W'(1);
+                default: out_r <= out_r;
+                endcase
+            end
+        end
+        assign ctx_busy[c] = busy_r;
+        assign ctx_agd[c]  = agd_r;
+        assign ctx_out[c]  = out_r;
+    end
+    assign ctx_idle = ~(|ctx_busy);
+    assign fe_pipe_last = ctx_agd[smem_ctx_r] && (ctx_out[smem_ctx_r] == SEQ_W'(1));
+
+    fe_ctx_t fe_live;
+    assign fe_live.core_id               = active_core_id;
+    assign fe_live.uuid                  = active_uuid;
+    assign fe_live.bar_addr              = active_bar_addr;
+    assign fe_live.notify                = active_notify_smem_done;
+    assign fe_live.c_mode                = active_compl.mode;
+    assign fe_live.c_mbar_off            = active_compl.mbar_off;
+    assign fe_live.c_tx_bytes            = active_compl.tx_bytes;
+    assign fe_live.c_slot                = active_compl.slot;
+    assign fe_live.c_gen                 = active_compl.gen;
+    assign fe_live.c_dst_core            = active_compl.dst_core;
+    assign fe_live.cfill                 = ag_cfill;
+    assign fe_live.dest_kmajor           = ag_dest_kmajor;
+    assign fe_live.per_lane_stride_bytes = ag_per_lane_stride_bytes;
+    assign fe_live.elem_bytes            = ag_elem_bytes;
+    assign fe_live.dest_mode             = ag_dest_mode;
+    assign fe_live.lg_ratio              = ag_lg_ratio;
+    assign fe_live.lg_tcN                = ag_lg_tcN;
+    assign fe_live.lg_nsteps             = ag_lg_nsteps;
+    assign fe_live.lg_bkK                = ag_lg_bkK;
+    assign fe_live.smem_base             = ag_smem_base;
+    assign fe_live.tma                   = ag_tma_wr;
+
+    always @(posedge clk) begin
+        if (fe_acc) begin
+            ctx_tab_r[front_ctx_r] <= fe_live;
+        end
+    end
+
+    // smem_wr samples a copy's fields one cycle ahead of its first line, so a
+    // line of another context waits until smem_wr is idle, then one cycle more.
+    assign fe_match = (sw_ctx_tag[CTX_W] == smem_pipe_r)
+                 && (~smem_pipe_r || (sw_ctx_tag[CTX_W-1:0] == smem_ctx_r))
+                 && ~smem_settle_r;
+    wire fe_switch = sw_valid && ~fe_match && ~smem_settle_r && smw_idle;
+    assign sw_ready = smw_sw_ready && fe_match;
+    always @(posedge clk) begin
+        if (reset) begin
+            front_ctx_r   <= '0;
+            smem_pipe_r   <= 1'b0;
+            smem_ctx_r    <= '0;
+            smem_settle_r <= 1'b0;
+        end else begin
+            if (fe_alloc) begin
+                front_ctx_r <= free_ctx;
+            end
+            if (fe_switch) begin
+                smem_pipe_r <= sw_ctx_tag[CTX_W];
+                smem_ctx_r  <= sw_ctx_tag[CTX_W-1:0];
+            end
+            smem_settle_r <= fe_switch;
+        end
+    end
+
+    // A context's fields while its lines drain; the live ones once all drained.
+    assign fe_sel = smem_pipe_r && ~ctx_idle;
+    assign fe_cur = ctx_tab_r[smem_ctx_r];
+    always @(*) begin
+        fe_compl = active_compl;
+        fe_tma   = ag_tma_wr;
+        if (fe_sel) begin
+            fe_compl.mode     = fe_cur.c_mode;
+            fe_compl.mbar_off = fe_cur.c_mbar_off;
+            fe_compl.tx_bytes = fe_cur.c_tx_bytes;
+            fe_compl.slot     = fe_cur.c_slot;
+            fe_compl.gen      = fe_cur.c_gen;
+            fe_compl.remote   = 1'b0;
+            fe_compl.dst_core = fe_cur.c_dst_core;
+            fe_compl.cluster  = 1'b0;
+            fe_tma            = fe_cur.tma;
+        end
+    end
+`endif
 
 `ifdef DXA_MBAR_ENABLE
     // ════════════════════════════════════════════════════════════════════
@@ -452,6 +695,14 @@ module VX_dxa_worker import VX_gpu_pkg::*, VX_dxa_pkg::*; #(
     // Store engine (funct3 5): local memory to global memory or a block.
     // ════════════════════════════════════════════════════════════════════
     wire st_evt_valid, st_evt_rd, st_evt_wr;
+`ifdef VX_CFG_H100_FE_ENABLE
+    localparam FT_N = `VX_CFG_TMA_STORE_QUEUE_OPS;
+    localparam FT_W = `LOG2UP(FT_N);
+    `STATIC_ASSERT (FT_VAL_W - 3 >= FT_W, ("the store fence tag does not fit the worker's tag"))
+    wire              ft_room, ft_sent;
+    wire [FT_W-1:0]   ft_free;
+    wire [FT_VAL_W-1:0] ft_tag = (FT_VAL_W'(5) << (FT_VAL_W - 3)) | FT_VAL_W'(ft_free);
+`endif
 
     VX_dxa_st #(
         .INSTANCE_ID    (`SFORMATF(("%s-st", INSTANCE_ID))),
@@ -487,6 +738,11 @@ module VX_dxa_worker import VX_gpu_pkg::*, VX_dxa_pkg::*; #(
         .rsp_valid         (st_rsp_valid),
         .rsp_data          (st_rsp_data),
         .gmem_bus_if       (st_bus_if),
+    `ifdef VX_CFG_H100_FE_ENABLE
+        .fence_room        (ft_room),
+        .fence_tag         (ft_tag),
+        .fence_sent        (ft_sent),
+    `endif
         .amo_valid         (amo_valid),
         .amo_pkt           (amo_pkt),
         .amo_dst           (amo_dst),
@@ -499,12 +755,77 @@ module VX_dxa_worker import VX_gpu_pkg::*, VX_dxa_pkg::*; #(
         .progress          (st_progress)
     );
 
+`ifdef VX_CFG_H100_FE_ENABLE
+    // A store's fence table: one entry per fence in flight, filled when the
+    // fence goes; its answer queues the store's write_done, sent after the
+    // engine's own events.
+    reg  [FT_N-1:0]     ft_valid, ft_ans, ft_bg;
+    reg  [NW_WIDTH-1:0] ft_wid  [FT_N];
+    reg  [DXA_BG_SEQ_W-1:0] ft_seq [FT_N];
+    reg  [NC_WIDTH-1:0] ft_core [FT_N];
+    reg  [FT_W-1:0]     ft_ev;
+    reg  [FT_W-1:0]     ft_free_r;
+    always @(*) begin
+        ft_free_r = '0;
+        for (integer i = FT_N - 1; i >= 0; --i) begin
+            if (~ft_valid[i]) ft_free_r = FT_W'(i);
+        end
+        ft_ev = '0;
+        for (integer i = FT_N - 1; i >= 0; --i) begin
+            if (ft_ans[i]) ft_ev = FT_W'(i);
+        end
+    end
+    assign ft_free = ft_free_r;
+    assign ft_room = ~(&ft_valid);
+
+    wire [FT_W-1:0] ft_rsp_idx = FT_W'(gmem_bus_if.rsp_data.tag.value);
+    wire ft_rsp_fire = gmem_bus_if.rsp_valid && ft_rsp;
+    wire ft_evt_valid = (|ft_ans) && ~st_evt_valid;
+    wire ft_evt_fire  = ft_evt_valid && bg_evt_ready;
+
+    always @(posedge clk) begin
+        if (reset) begin
+            ft_valid <= '0;
+            ft_ans   <= '0;
+        end else begin
+            if (ft_sent) begin
+                ft_valid[ft_free] <= 1'b1;
+                ft_bg[ft_free]    <= active_bg;
+                ft_wid[ft_free]   <= active_wid;
+                ft_seq[ft_free]   <= active_bg_seq;
+                ft_core[ft_free]  <= active_core_id;
+            end
+            if (ft_rsp_fire) begin
+                if (ft_bg[ft_rsp_idx]) begin
+                    ft_ans[ft_rsp_idx] <= 1'b1;
+                end else begin
+                    ft_valid[ft_rsp_idx] <= 1'b0;
+                end
+            end
+            if (ft_evt_fire) begin
+                ft_valid[ft_ev] <= 1'b0;
+                ft_ans[ft_ev]   <= 1'b0;
+            end
+        end
+    end
+
+    `RUNTIME_ASSERT (~(ft_rsp_fire && (~ft_valid[ft_rsp_idx] || ft_ans[ft_rsp_idx])),
+        ("%t: *** %s DXA store fence answer without its fence: entry=%0d", $time, INSTANCE_ID, ft_rsp_idx))
+
+    assign bg_evt_valid    = st_evt_valid || ft_evt_valid;
+    assign bg_evt_core     = st_evt_valid ? active_core_id : ft_core[ft_ev];
+    assign bg_evt.wid        = st_evt_valid ? active_wid : ft_wid[ft_ev];
+    assign bg_evt.seq        = st_evt_valid ? active_bg_seq : ft_seq[ft_ev];
+    assign bg_evt.read_done  = st_evt_valid && st_evt_rd;
+    assign bg_evt.write_done = st_evt_valid ? st_evt_wr : 1'b1;
+`else
     assign bg_evt_valid    = st_evt_valid;
     assign bg_evt_core     = active_core_id;
     assign bg_evt.wid        = active_wid;
     assign bg_evt.seq        = active_bg_seq;
     assign bg_evt.read_done  = st_evt_rd;
     assign bg_evt.write_done = st_evt_wr;
+`endif
 
 `endif
     // ════════════════════════════════════════════════════════════════════

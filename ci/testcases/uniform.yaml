@@ -1,0 +1,110 @@
+# Uniform registers of the H100 front end (VX_CFG_H100_FE_ENABLE): the per-warp UR file
+# in the operand stage, R2UR/UR2R, the uniform ALU, S2UR and the UPFX operand prefix
+# that lets any ALU or FPU source slot read a UR. Results against sw/common/uniform_ref.h
+# and the GPR form of the same instruction; latencies from the units' structure.
+category: uniform
+defaults:
+  xlen: [64]
+  configs: "-DVX_CFG_H100_FE_ENABLE"
+  tier: smoke
+  touches: [VX_config.toml, hw/rtl/VX_gpu_pkg.sv, hw/rtl/core/VX_decode.sv, hw/rtl/core/VX_scoreboard.sv,
+            hw/rtl/core/VX_operands.sv, hw/rtl/core/VX_opc_unit.sv, hw/rtl/core/VX_csr_unit.sv,
+            hw/rtl/core/VX_alu_uniform.sv, hw/rtl/core/VX_alu_unit.sv, sim/simx/decode.cpp,
+            sim/simx/scoreboard.cpp, sim/simx/opc_unit.cpp, sim/simx/operands.cpp, sim/simx/csr_unit.cpp,
+            sim/simx/uniform_ops.h, sim/simx/alu_unit.cpp, sim/simx/types.h, sim/simx/instr.h,
+            sw/common/uniform_ref.h, sw/common/vx_fe_isa.h, sw/kernel/include/vx_uniform.h,
+            tests/regression/uniform_regs]
+tests:
+  # Every U-ALU/U-CMP op, R2UR from divergent masks (the first active lane), UR2R, URZ,
+  # S2UR of every selector: bit-exact against the golden / the CSR of the first lane.
+  - id: ur-alu
+    app: uniform_regs
+    drivers: [simx, rtlsim]
+    args: "-m a -n 128"
+  - id: ur-alu-x32
+    app: uniform_regs
+    xlen: [32]
+    drivers: [simx]
+    args: "-m a -n 128"
+
+  # UPFX on every ALU, M and FPU class and every used slot: bit-exact with the GPR form,
+  # and the prefixed block retires as many instructions as the plain one.
+  - id: ur-operand
+    app: uniform_regs
+    drivers: [simx, rtlsim]
+    args: "-m o"
+  - id: ur-operand-x32
+    app: uniform_regs
+    xlen: [32]
+    drivers: [simx]
+    args: "-m o"
+
+  # Dependent U-ALU chain, S2UR -> consumer, back-to-back S2URs of one and of two warps:
+  # every step at least its structure (U-ALU = VX_alu_int's one register, S2UR = the CSR
+  # read); independent S2URs closer than the dependent step (no per-warp interval).
+  # H100 values printed as H100REF lines.
+  - id: ur-latency
+    app: uniform_regs
+    drivers: [simx, rtlsim]
+    args: "-m l -i 16"
+  - id: ur-latency-2w
+    app: uniform_regs
+    drivers: [simx, rtlsim]
+    args: "-m l -i 16 -w 2"
+
+  - id: parity-ur
+    check: model_parity
+    app: uniform_regs
+    xlen: [64]
+    args: "-m x"
+
+  # Configurations the front end refuses: a UR count other than 64 (one register per 6-bit index),
+  # more than one ALU packet per warp, a warp-op sharing mode other than 0 or 1.
+  - id: cfg-ureg-count
+    via: script
+    driver: simx
+    configs+: "-DVX_CFG_UREG_COUNT=48"
+    env: {EXPECT: "UREG_COUNT_RANGE"}
+    run: &cfg_run |
+      set -u
+      tmp=$(mktemp -d)
+      read -r vh xl <<< "$(printf 'include config.mk\nall:\n\t@echo $(VORTEX_HOME) $(XLEN)\n' | make -s -f -)"
+      python3 "$vh/ci/gen_config.py" --config="$vh/VX_config.toml" --format=cpp --resolved \
+        --cflags="${CONFIGS:-} -DVX_CFG_XLEN=$xl" -o "$tmp/VX_config.h" > "$tmp/gen.log" 2>&1; gen_rc=$?
+      fail=0
+      if [ $gen_rc -ne 0 ]; then
+        if grep -qF "$EXPECT" "$tmp/gen.log"; then
+          echo "OK: the configuration is refused: $(grep -F -m1 "$EXPECT" "$tmp/gen.log")"
+        else
+          echo "FAIL: the configuration was refused without '$EXPECT':"; tail -n 20 "$tmp/gen.log"; fail=1
+        fi
+      else
+        make -C sim/simx DESTDIR="$tmp" "$tmp/obj/${SIMX_OBJ:-processor}.o" > "$tmp/simx.log" 2>&1; simx_rc=$?
+        if [ $simx_rc -eq 0 ]; then
+          echo "FAIL: the configuration and the SimX build accepted CONFIGS=${CONFIGS:-}"; fail=1
+        elif ! grep -qF "$EXPECT" "$tmp/simx.log"; then
+          echo "FAIL: the SimX build failed without '$EXPECT':"; tail -n 20 "$tmp/simx.log"; fail=1
+        else
+          echo "OK: the SimX build refuses it: $(grep -F -m1 "$EXPECT" "$tmp/simx.log")"
+        fi
+      fi
+      rm -rf "$tmp"
+      exit $fail
+  - id: cfg-ureg-count-32
+    via: script
+    driver: simx
+    configs+: "-DVX_CFG_UREG_COUNT=32"
+    env: {EXPECT: "UREG_COUNT_RANGE"}
+    run: *cfg_run
+  - id: cfg-one-packet
+    via: script
+    driver: simx
+    configs+: "-DVX_CFG_NUM_THREADS=8 -DVX_CFG_SIMD_WIDTH=4"
+    env: {EXPECT: "FE_ONE_PACKET"}
+    run: *cfg_run
+  - id: cfg-warp-op-shared
+    via: script
+    driver: simx
+    configs+: "-DVX_CFG_WARP_OP_SHARED=2"
+    env: {EXPECT: "WARP_OP_SHARED_RANGE"}
+    run: *cfg_run

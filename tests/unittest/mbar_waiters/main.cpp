@@ -188,7 +188,7 @@ private:
 class Bench {
 public:
   Bench()
-    : table_(MbarWaiterTable::Create("mbar_waiters", NUM_BANKS, NUM_RETIRES, SUSPEND)) {
+    : table_(MbarWaiterTable::Create("mbar_waiters", NUM_BANKS, NUM_RETIRES, SUSPEND VX_FE_ONLY(, false))) {
     SimPlatform::instance().reset();
   }
 

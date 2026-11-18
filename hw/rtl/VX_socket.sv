@@ -68,6 +68,11 @@ module VX_socket import VX_gpu_pkg::*, VX_tlb_pkg::*;
     VX_dlmem_bus_if.master  dlmem_rsp_up_if,
     VX_dlmem_bus_if.slave   dlmem_rsp_down_if,
 `endif
+`ifdef DXA_TMAP_L2_ENABLE
+    // The cluster's level-2 tensor-map cache.
+    VX_tmap_l2_bus_if.master tmap_l2_bus_if,
+`endif
+`line 71 "VX_socket.sv" 0
 
     // Status
     output wire             busy
@@ -767,6 +772,10 @@ module VX_socket import VX_gpu_pkg::*, VX_tlb_pkg::*;
         .slot_stride      (per_core_slot_stride),
         .bg_compl_valid   (per_core_bg_compl_valid),
         .bg_compl         (per_core_bg_compl),
+    `ifdef DXA_TMAP_L2_ENABLE
+        .tmap_l2_bus_if   (tmap_l2_bus_if),
+    `endif
+`line 819 "VX_socket.sv" 0
     `endif
         `UNUSED_PIN (busy)
     );

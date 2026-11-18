@@ -1,0 +1,95 @@
+# mbarrier try_wait of the H100 front end (12/spec.md §4.2, §4.4): a pending try_wait holds a full
+# warp MBAR_SUSPEND_CYCLES (7762), a partial warp is not suspended; suspendTimeHint sleeps like
+# __nanosleep; a phase completion releases the waiters the next cycle. The H100's times are printed
+# as H100REF lines. RV64, the front-end switch on.
+category: mbarsuspend
+defaults:
+  xlen: [64]
+  tier: smoke
+  configs: "-DVX_CFG_H100_FE_ENABLE"
+  touches: [VX_config.toml, hw/rtl/dlmem/VX_mbar_waiters.sv, sim/simx/mbar_waiters.cpp, sim/simx/mbar_waiters.h,
+            sw/kernel/include/vx_mbar.h, tests/regression/mbar_suspend]
+tests:
+  - id: limit
+    via: script
+    driver: simx
+    env: {DRIVER: simx}
+    run: &sus_limit |
+      vh=$(printf 'include config.mk\nall:\n\t@echo $(VORTEX_HOME)\n' | make -s -f -)
+      python3 "$vh/tests/regression/mbar_suspend/mbar_suspend_check.py" limit
+  - id: limit
+    via: script
+    driver: rtlsim
+    env: {DRIVER: rtlsim}
+    run: *sus_limit
+  - id: hint
+    via: script
+    driver: simx
+    env: {DRIVER: simx}
+    run: &sus_hint |
+      vh=$(printf 'include config.mk\nall:\n\t@echo $(VORTEX_HOME)\n' | make -s -f -)
+      python3 "$vh/tests/regression/mbar_suspend/mbar_suspend_check.py" hint
+  - id: wake
+    via: script
+    driver: simx
+    env: {DRIVER: simx}
+    run: &sus_wake |
+      vh=$(printf 'include config.mk\nall:\n\t@echo $(VORTEX_HOME)\n' | make -s -f -)
+      python3 "$vh/tests/regression/mbar_suspend/mbar_suspend_check.py" wake
+  - id: wake
+    via: script
+    driver: rtlsim
+    env: {DRIVER: rtlsim}
+    run: *sus_wake
+
+  # The same on the H100 SM array, where an mbarrier op's lanes ride one pass and the waiter table counts
+  # 1 + its followers per insert: a converged full warp is suspended, a one-lane warp released.
+  - id: limit-sm
+    via: script
+    driver: simx
+    configs+: &sus_sm_configs "-DVX_CFG_H100_SM_ENABLE -DVX_CFG_L2_ENABLE -DVX_CFG_NUM_THREADS=16"
+    touches: &sus_sm_touches [VX_config.toml, hw/rtl/dlmem/VX_mbar_waiters.sv, hw/rtl/mem/VX_sm_sram.sv,
+                              sim/simx/mbar_waiters.cpp, sim/simx/mbar_waiters.h, sim/simx/mem/sm_sram.cpp,
+                              sw/kernel/include/vx_mbar.h, tests/regression/mbar_suspend]
+    env: {DRIVER: simx}
+    run: *sus_limit
+  - id: limit-sm
+    via: script
+    driver: rtlsim
+    configs+: *sus_sm_configs
+    touches: *sus_sm_touches
+    env: {DRIVER: rtlsim}
+    run: *sus_limit
+  - id: wake-sm
+    via: script
+    driver: simx
+    configs+: *sus_sm_configs
+    touches: *sus_sm_touches
+    env: {DRIVER: simx}
+    run: *sus_wake
+  - id: wake-sm
+    via: script
+    driver: rtlsim
+    configs+: *sus_sm_configs
+    touches: *sus_sm_touches
+    env: {DRIVER: rtlsim}
+    run: *sus_wake
+
+  # SimX/RTL parity of a partial warp's return (one waiting lane) and of the wake-up.
+  - id: parity-limit
+    check: model_parity
+    xlen: [64]
+    app: mbar_suspend
+    args: "-m0 -r3 -l1"
+  - id: parity-wake
+    check: model_parity
+    xlen: [64]
+    app: mbar_suspend
+    args: "-m2 -r5"
+  - id: parity-limit-sm
+    check: model_parity
+    xlen: [64]
+    app: mbar_suspend
+    configs+: *sus_sm_configs
+    touches: *sus_sm_touches
+    args: "-m0 -r3 -l0"

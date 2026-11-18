@@ -1,0 +1,163 @@
+# Tensor-map cache of the H100 front end (12/spec.md, E13 item 4): level 1 in each socket's
+# DXA lookup (TMAP_L1_ENTRIES, LRU or round robin), level 2 one per cluster (= GPC) shared by
+# its sockets in 128-B lines (TMAP_L2_ENTRIES x TMAP_L2_WAYS, tree-PLRU), invalidate from both
+# levels, prefetch into level 1, both levels emptied at every launch. A level-2 hit costs its
+# FSM's passes over a level-1 hit (4 cycles per L1-line beat + 3, the same in both models); a
+# parameter-window map's first use is such a hit; level 3 is a read through the memory path.
+# The H100's +43, +34 and +215 are printed as H100REF lines, not judged.
+category: tmapcache
+defaults:
+  xlen: [64]
+  tier: smoke
+  # The H100 SM memory path: the copy's line hits the L2 as on the H100, so a hop is the
+  # map's level plus a fixed copy (without it, every copy reads DRAM and its noise hides the level).
+  configs: "-DVX_CFG_EXT_DXA_ENABLE -DVX_CFG_H100_FE_ENABLE -DVX_CFG_H100_SM_ENABLE -DVX_CFG_L2_ENABLE -DVX_CFG_NUM_THREADS=32"
+  touches: [VX_config.toml, hw/rtl/dxa/VX_dxa_core.sv, hw/rtl/dxa/VX_dxa_pkg.sv, hw/rtl/dxa/VX_tmap_l2.sv,
+            hw/rtl/VX_cluster.sv, hw/rtl/VX_cpc.sv, sim/simx/dxa/dxa_core.cpp, sim/simx/dxa/dxa_core.h,
+            sim/simx/dxa/tmap_l2.h, sim/simx/cluster.cpp, sw/common/dxa_meta.h, tests/regression/tmap_cache]
+tests:
+  # Capacity: 8 maps stay in level 1, a 9th sends every use to level 2, 1024 maps fit level 2,
+  # 2048 maps go to level 3.
+  - id: rr-l1
+    app: tmap_cache
+    drivers: [simx, rtlsim]
+    args: "-t rr -M 8 -e 1"
+  - id: rr-l2
+    app: tmap_cache
+    drivers: [simx, rtlsim]
+    args: "-t rr -M 9 -e 2"
+  - id: rr-l2cap
+    app: tmap_cache
+    drivers: [simx]
+    args: "-t rr -M 1024 -R 2 -e 2"
+  - id: rr-l3
+    app: tmap_cache
+    drivers: [simx]
+    args: "-t rr -M 2048 -R 2 -e 3"
+  # Replacement: LRU in level 1 keeps a reused map; tree-PLRU in level 2 keeps a probe map.
+  - id: lru
+    app: tmap_cache
+    drivers: [simx, rtlsim]
+    args: "-t lru"
+  - id: plru
+    app: tmap_cache
+    drivers: [simx]
+    args: "-t plru -M 2048 -R 16"
+  # Invalidate (fence.proxy.tensormap acquire) from both levels; prefetch into level 1.
+  - id: inval
+    app: tmap_cache
+    drivers: [simx, rtlsim]
+    args: "-t inval"
+  - id: prefetch
+    app: tmap_cache
+    drivers: [simx, rtlsim]
+    args: "-t prefetch"
+  # The launch's parameter window: a map there is a level-2 hit at its first use.
+  - id: param
+    app: tmap_cache
+    drivers: [simx, rtlsim]
+    args: "-t param"
+  # The argument map after a launch that made no copy and whose argument named
+  # another tensor (window lines still in flight at the next launch): data and a level-2 hit.
+  - id: relaunch
+    app: tmap_cache
+    drivers: [simx, rtlsim]
+    args: "-t relaunch"
+  # Every launch empties both levels.
+  - id: launch-4
+    app: tmap_cache
+    drivers: [simx, rtlsim]
+    args: "-t launch -M 4"
+  - id: launch-64
+    app: tmap_cache
+    drivers: [simx]
+    args: "-t launch -M 64"
+  # Level 2 is the cluster's: another socket of the cluster hits it, another cluster does not.
+  - id: share
+    app: tmap_cache
+    drivers: [simx, rtlsim]
+    shape: {cores: 2, l2cache: true}
+    args: "-t share -M 64 -e 2"
+  - id: share-xcluster
+    app: tmap_cache
+    drivers: [simx]
+    shape: {clusters: 2, l3cache: true}
+    args: "-t share -M 64 -e 3"
+  # Knob moves: the expectations follow the knobs the kernel reads back.
+  - id: knobs-l1
+    app: tmap_cache
+    drivers: [simx]
+    configs+: "-DVX_CFG_TMAP_L1_ENTRIES=4"
+    args: "-t rr -M 5 -e 2"
+  - id: knobs-l1-fit
+    app: tmap_cache
+    drivers: [simx]
+    configs+: "-DVX_CFG_TMAP_L1_ENTRIES=4"
+    args: "-t rr -M 4 -e 1"
+  - id: knobs-rr
+    app: tmap_cache
+    drivers: [simx]
+    configs+: "-DVX_CFG_TMAP_L1_REPL=0"
+    args: "-t lru"
+  - id: knobs-l2-fit
+    app: tmap_cache
+    drivers: [simx]
+    configs+: "-DVX_CFG_TMAP_L2_ENTRIES=256 -DVX_CFG_TMAP_PARAM_BYTES=128"
+    args: "-t rr -M 255 -R 2 -e 2"
+  - id: knobs-l2-over
+    app: tmap_cache
+    drivers: [simx]
+    configs+: "-DVX_CFG_TMAP_L2_ENTRIES=256 -DVX_CFG_TMAP_PARAM_BYTES=128"
+    args: "-t rr -M 512 -R 2 -e 3"
+  # The same levels at the micro H100 organization (two GPCs of one TPC of two SMs, an L3).
+  - id: micro-rr-l1
+    app: tmap_cache
+    drivers: [simx]
+    shape: {l3cache: true}
+    configs: &micro "-DVX_CFG_EXT_DXA_ENABLE -DVX_CFG_H100_FE_ENABLE -DVX_CFG_H100_ORG_ENABLE -DVX_CFG_NUM_PARTITIONS=2 -DVX_CFG_GPCS_PER_PARTITION=1 -DVX_CFG_CPCS_PER_GPC=1 -DVX_CFG_TPCS_PER_CPC=1 -DVX_CFG_SMS_PER_TPC=2 -DVX_CFG_NUM_THREADS=32 -DVX_CFG_L3_ENABLE"
+    args: "-t rr -M 8 -e 1"
+  - id: micro-rr-l2
+    app: tmap_cache
+    drivers: [simx]
+    shape: {l3cache: true}
+    configs: *micro
+    args: "-t rr -M 9 -e 2"
+  - id: micro-rr-l3
+    app: tmap_cache
+    drivers: [simx]
+    shape: {l3cache: true}
+    configs: *micro
+    args: "-t rr -M 2048 -R 2 -e 3"
+  - id: micro-inval
+    app: tmap_cache
+    drivers: [simx]
+    shape: {l3cache: true}
+    configs: *micro
+    args: "-t inval"
+  - id: micro-prefetch
+    app: tmap_cache
+    drivers: [simx]
+    shape: {l3cache: true}
+    configs: *micro
+    args: "-t prefetch"
+  - id: micro-param
+    app: tmap_cache
+    drivers: [simx]
+    shape: {l3cache: true}
+    configs: *micro
+    args: "-t param"
+
+  # SimX/RTL parity of a level-2 hit on the micro SM shape and of level 2 shared by two sockets.
+  - id: parity-rr-l2
+    check: model_parity
+    xlen: [64]
+    app: tmap_cache
+    shape: {l3cache: true}
+    configs: *micro
+    args: "-t rr -M 9 -e 2"
+  - id: parity-share
+    check: model_parity
+    xlen: [64]
+    app: tmap_cache
+    shape: {cores: 2, l2cache: true}
+    args: "-t share -M 64 -e 2"

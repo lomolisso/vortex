@@ -247,6 +247,26 @@ static inline __attribute__((always_inline)) bool vx_mbar_try_wait_parity_relaxe
   return vx_mbar_try_wait_parity(p, parity);
 }
 
+#if VX_CFG_H100_FE_ENABLED
+// try_wait with PTX's suspendTimeHint (ns): on the H100 a call whose phase stays
+// incomplete also sleeps about hint_ns, as __nanosleep (12/spec.md §4.4), and a
+// phase completion during the sleep ends it (§4.2); one cycle is one nanosecond
+// of %globaltimer.
+static inline __attribute__((always_inline)) bool vx_mbar_try_wait_hint(uint64_t* p, uint64_t token, uint32_t hint_ns) {
+  if (vx_mbar_try_wait(p, token))
+    return true;
+  const uint64_t t0 = vx_globaltimer();
+  do {
+    if (vx_mbar_test_wait(p, token))
+      return true;
+  } while (vx_globaltimer() - t0 < hint_ns);
+  return false;
+}
+
+static inline __attribute__((always_inline)) bool vx_mbar_try_wait_parity_hint(uint64_t* p, uint32_t parity, uint32_t hint_ns) {
+  return vx_mbar_try_wait_hint(p, (uint64_t)(parity & 1) << 63, hint_ns);
+}
+#else
 // try_wait with PTX's suspendTimeHint (ns), which is ignored, as on the H100:
 // the time limit stays VX_CFG_MBAR_SUSPEND_CYCLES.
 static inline __attribute__((always_inline)) bool vx_mbar_try_wait_hint(uint64_t* p, uint64_t token, uint32_t hint_ns) {
@@ -258,6 +278,7 @@ static inline __attribute__((always_inline)) bool vx_mbar_try_wait_parity_hint(u
   (void)hint_ns;
   return vx_mbar_try_wait_parity(p, parity);
 }
+#endif
 
 // PTX fence.mbarrier_init.release.cluster: orders the warp's earlier
 // vx_mbar_init() stores before its later window and global accesses, so a peer

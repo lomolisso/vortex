@@ -46,6 +46,15 @@ module VX_decode import
     reg [NUM_XREGS-1:0] wr_xregs;
     reg [BYTESEL_BITS-1:0] bytesel;
     reg is_wstall;
+`ifdef VX_CFG_H100_FE_ENABLE
+    reg [UR_SLOTS-1:0] ur_rs;
+    reg [UR_QUAD_SLOTS-1:0] ur_quad;
+    // A UPFX is consumed here: it names the UR that replaces one source slot of the warp's next instruction.
+    reg [`VX_CFG_NUM_WARPS-1:0] upfx_valid;
+    reg [`VX_CFG_NUM_WARPS-1:0][1:0] upfx_slot;
+    reg [`VX_CFG_NUM_WARPS-1:0][UREG_BITS-1:0] upfx_ur;
+    reg upfx_slot_used;
+`endif
 
     wire [31:0] instr = fetch_if.data.instr;
     wire [6:0] opcode = instr[6:0];
@@ -241,6 +250,13 @@ module VX_decode import
     wire decode_is_rvc = 1'b0;
 `endif
 
+`ifdef VX_CFG_H100_FE_ENABLE
+    wire is_upfx = (opcode == INST_EXT1) && (funct7 == 7'h05);
+    wire upfx_pend = upfx_valid[fetch_if.data.wid];
+    wire [1:0] upfx_cur_slot = upfx_slot[fetch_if.data.wid];
+    wire [UREG_BITS-1:0] upfx_cur_ur = upfx_ur[fetch_if.data.wid];
+`endif
+
     always @(*) begin
 
         ex_type   = 'x;
@@ -252,6 +268,13 @@ module VX_decode import
         wr_xregs  = '0;
         bytesel   = BYTESEL_DEFAULT;
         is_wstall = 0;
+    `ifdef VX_CFG_H100_FE_ENABLE
+        ur_rs     = '0;
+        ur_quad   = '0;
+    `ifdef DXA_MBAR_ENABLE
+        op_args.dxa.ur_form = 1'b0;
+    `endif
+    `endif
 
     `ifdef VX_CFG_EXT_A_ENABLE
         // Default the LSU amo sideband to "not an AMO" so plain
@@ -1021,6 +1044,117 @@ module VX_decode import
                             default:;
                         endcase
                     end
+                `ifdef VX_CFG_H100_FE_ENABLE
+                    7'h06: begin
+                        case (funct3)
+                            3'h0: begin // R2UR: URd <- rs1 of the first active lane
+                                ex_type = EX_ALU;
+                                op_type = INST_OP_BITS'(INST_ALU_FE_UNIFORM);
+                                op_args.alu = '0;
+                                op_args.alu.xtype = ALU_TYPE_OTHER;
+                                op_args.alu.imm20 = 20'(INST_UOP_R2UR);
+                                reg_ids[RV_RD] = NUM_REGS_BITS'({rs2[0], rd});
+                                wr_xregs[XREG_UR] = 1'b1;
+                                `USED_IREG (rs1);
+                            end
+                            3'h1: begin // UR2R: rd <- URs in every active lane
+                                ex_type = EX_ALU;
+                                op_type = INST_OP_BITS'(INST_ALU_FE_UNIFORM);
+                                op_args.alu = '0;
+                                op_args.alu.xtype = ALU_TYPE_OTHER;
+                                op_args.alu.imm20 = 20'(INST_UOP_UR2R);
+                                `USED_IREG (rd);
+                                reg_ids[RV_RS1] = NUM_REGS_BITS'({rs2[0], rs1});
+                                ur_rs[0] = 1'b1;
+                            end
+                            3'h2: begin // S2UR: URd <- the special register rs1 selects
+                                ex_type = EX_SFU;
+                                op_type = INST_OP_BITS'(INST_SFU_CSRRS);
+                                op_args.csr = '0;
+                                op_args.csr.use_imm = 1'b1;
+                                op_args.csr.addr = `VX_CSR_ADDR_BITS'(fe_s2ur_csr(rs1));
+                                reg_ids[RV_RD] = NUM_REGS_BITS'({rs2[0], rd});
+                                wr_xregs[XREG_UR] = 1'b1;
+                            end
+                            default:;
+                        endcase
+                    end
+                    7'h08, 7'h09, 7'h0A, 7'h0B, 7'h0C, 7'h0D, 7'h0E, 7'h0F,
+                    7'h10, 7'h11, 7'h12, 7'h13, 7'h14, 7'h15, 7'h16, 7'h17: begin // U-ALU, U-CMP
+                        ex_type = EX_ALU;
+                        op_type = INST_OP_BITS'(INST_ALU_FE_UNIFORM);
+                        op_args.alu = '0;
+                        op_args.alu.xtype = ALU_TYPE_OTHER;
+                        op_args.alu.imm20 = funct7[4] ? 20'(INST_UOP_SLT + 4'(funct3)) : 20'(funct3);
+                        reg_ids[RV_RD]  = NUM_REGS_BITS'({funct7[2], rd});
+                        reg_ids[RV_RS1] = NUM_REGS_BITS'({funct7[1], rs1});
+                        reg_ids[RV_RS2] = NUM_REGS_BITS'({funct7[0], rs2});
+                        ur_rs[1:0] = 2'b11;
+                        wr_xregs[XREG_UR] = 1'b1;
+                    end
+                    7'h18, 7'h19: begin // REDUX: URd <- reduce(rs1) over the active lanes
+                        ex_type = EX_ALU;
+                        op_type = INST_OP_BITS'(INST_ALU_FE_WARP);
+                        op_args.alu = '0;
+                        op_args.alu.xtype = ALU_TYPE_OTHER;
+                        op_args.alu.imm20 = 20'(INST_WOP_REDUX | 5'(funct3));
+                        reg_ids[RV_RD] = NUM_REGS_BITS'({funct7[0], rd});
+                        wr_xregs[XREG_UR] = 1'b1;
+                        `USED_IREG (rs1);
+                    end
+                    7'h1A: begin // ELECT.P: rd = (lane == leader); ELECT.L: URd = leader lane
+                        ex_type = EX_ALU;
+                        op_type = INST_OP_BITS'(INST_ALU_FE_WARP);
+                        op_args.alu = '0;
+                        op_args.alu.xtype = ALU_TYPE_OTHER;
+                        op_args.alu.imm20 = funct3[0] ? 20'(INST_WOP_ELECT_L) : 20'(INST_WOP_ELECT_P);
+                        if (funct3[0]) begin
+                            reg_ids[RV_RD] = NUM_REGS_BITS'({rs2[0], rd});
+                            wr_xregs[XREG_UR] = 1'b1;
+                        end else begin
+                            `USED_IREG (rd);
+                        end
+                        `USED_IREG (rs1);
+                    end
+                    7'h1B: begin // MATCH.{ANY,ALL}.{B32,B64}
+                        ex_type = EX_ALU;
+                        op_type = INST_OP_BITS'(INST_ALU_FE_WARP);
+                        op_args.alu = '0;
+                        op_args.alu.xtype = ALU_TYPE_OTHER;
+                        op_args.alu.imm20 = 20'(INST_WOP_MATCH_ANY | 5'(funct3[1:0]));
+                        `USED_IREG (rd);
+                        `USED_IREG (rs1);
+                        if ((`VX_CFG_XLEN == 32) && funct3[0]) begin
+                            `USED_IREG (rs2);
+                        end
+                    end
+                `ifdef DXA_MBAR_ENABLE
+                    7'h1C: begin // UR-form DXA op
+                        ex_type = EX_SFU;
+                        op_type = INST_OP_BITS'(INST_SFU_DXA);
+                        op_args.dxa = '0;
+                        op_args.dxa.ur_form   = 1'b1;
+                        op_args.dxa.bulk      = (funct3 == 3'd1);
+                        op_args.dxa.tload     = (funct3 == 3'd2);
+                        op_args.dxa.bload     = (funct3 == 3'd3);
+                        op_args.dxa.bprefetch = (funct3 == 3'd4);
+                        op_args.dxa.store     = (funct3 == 3'd5);
+                        op_args.dxa.tmop      = (funct3 == 3'd7);
+                        op_args.dxa.bg_n      = rs2;
+                        is_wstall = 1'b1;
+                        if (funct3 == 3'd7) begin
+                            // rs1 is the UR holding the tensor map; the rs2 field is the op.
+                            reg_ids[RV_RS1] = NUM_REGS_BITS'(rs1);
+                            ur_rs[0] = 1'b1;
+                        end else begin
+                            // Two UR quads: rs1 lanes 0-3 = UR[b..b+3], rs2 lanes 0-3 = UR[b+4..b+7].
+                            reg_ids[RV_RS1] = NUM_REGS_BITS'({rs2[0], rs1});
+                            reg_ids[RV_RS2] = NUM_REGS_BITS'({rs2[0], rs1} + 6'd4);
+                            ur_quad = 2'b11;
+                        end
+                    end
+                `endif
+                `endif
                     default:;
                 endcase
             end
@@ -1147,11 +1281,59 @@ module VX_decode import
             end
             default:;
         endcase
+    `ifdef VX_CFG_H100_FE_ENABLE
+        upfx_slot_used = 1'b0;
+        if (upfx_pend && ~is_upfx) begin
+            case (upfx_cur_slot)
+            2'd0: begin
+                upfx_slot_used  = use_regs[RV_RS1];
+                use_regs[RV_RS1] = 1'b0;
+                reg_ids[RV_RS1] = NUM_REGS_BITS'(upfx_cur_ur);
+                ur_rs[0]        = 1'b1;
+            end
+            2'd1: begin
+                upfx_slot_used  = use_regs[RV_RS2];
+                use_regs[RV_RS2] = 1'b0;
+                reg_ids[RV_RS2] = NUM_REGS_BITS'(upfx_cur_ur);
+                ur_rs[1]        = 1'b1;
+            end
+            2'd2: begin
+                upfx_slot_used  = use_regs[RV_RS3];
+                use_regs[RV_RS3] = 1'b0;
+                reg_ids[RV_RS3] = NUM_REGS_BITS'(upfx_cur_ur);
+                ur_rs[2]        = 1'b1;
+            end
+            default:;
+            endcase
+        end
+        // A write to URZ has no destination.
+        if (wr_xregs[XREG_UR] && reg_ids[RV_RD][UREG_BITS-1:0] == UREG_BITS'(UREG_ZERO)) begin
+            wr_xregs[XREG_UR] = 1'b0;
+        end
+    `endif
     end
 
     // disable writes to x0
     wire wb = use_regs[RV_RD] && (reg_ids[RV_RD] != 0);
 
+`ifdef VX_CFG_H100_FE_ENABLE
+    wire req_ready_in;
+    assign fetch_if.ready = req_ready_in || is_upfx;
+
+    VX_elastic_buffer #(
+        .DATAW (OUT_DATAW),
+        .SIZE  (0)
+    ) req_buf (
+        .clk       (clk),
+        .reset     (reset),
+        .valid_in  (fetch_if.valid && ~is_upfx),
+        .ready_in  (req_ready_in),
+        .data_in   ({fetch_if.data.uuid,  fetch_if.data.wid,  fetch_if.data.cta_id,  fetch_if.data.tmask,  fetch_if.data.PC,  ex_type,                op_type,                op_args,                wb,                rd_xregs,                wr_xregs,                use_regs[3:1],          reg_ids[RV_RD],    bytesel,                  reg_ids[RV_RS1],    reg_ids[RV_RS2],    reg_ids[RV_RS3], ur_rs, ur_quad}),
+        .data_out  ({decode_if.data.uuid, decode_if.data.wid, decode_if.data.cta_id, decode_if.data.tmask, decode_if.data.PC, decode_if.data.ex_type, decode_if.data.op_type, decode_if.data.op_args, decode_if.data.wb, decode_if.data.rd_xregs, decode_if.data.wr_xregs, decode_if.data.used_rs, decode_if.data.rd, decode_if.data.bytesel,   decode_if.data.rs1, decode_if.data.rs2, decode_if.data.rs3, decode_if.data.ur_rs, decode_if.data.ur_quad}),
+        .valid_out (decode_if.valid),
+        .ready_out (decode_if.ready)
+    );
+`else
     VX_elastic_buffer #(
         .DATAW (OUT_DATAW),
         .SIZE  (0)
@@ -1165,6 +1347,7 @@ module VX_decode import
         .valid_out (decode_if.valid),
         .ready_out (decode_if.ready)
     );
+`endif
 
     ///////////////////////////////////////////////////////////////////////////
 
@@ -1197,6 +1380,28 @@ module VX_decode import
             $time, INSTANCE_ID, fetch_if.data.wid, to_fullPC(fetch_if.data.PC), instr, fetch_if.data.uuid))
 `endif
 
+`ifdef VX_CFG_H100_FE_ENABLE
+    wire fe_fire = fetch_fire && (opcode == INST_EXT1);
+    wire fe_illegal = (funct7 == 7'h07)
+                   || ((funct7 == 7'h06) && (funct3 > 3'd2))
+                   || ((funct7 == 7'h06) && (funct3 == 3'd2) && (rs1 >= 5'(S2UR_NUM_SELECTORS)))
+                   || ((funct7[6:3] == 4'b0010) && (funct3 > 3'd2))
+                   || ((funct7 == 7'h1A) && ((funct3 > 3'd1) || (rs2[4:1] != 0) || (~funct3[0] && rs2[0])))
+                   || ((funct7 == 7'h1B) && (funct3 > 3'd3))
+                   || ((funct7 == 7'h18 || funct7 == 7'h19) && (rs2 != 0))
+                `ifdef DXA_MBAR_ENABLE
+                   || ((funct7 == 7'h1C) && (funct3 == 3'd6))
+                   || ((funct7 == 7'h1C) && (funct3 == 3'd7) && (rs2 > 5'd1))
+                   || ((funct7 == 7'h1C) && (funct3 < 3'd6) && ((rs1[2:0] != 0) || (rs2[4:1] != 0)))
+                `else
+                   || (funct7 == 7'h1C)
+                `endif
+                   || ((funct7 > 7'h1C) && (funct7 < 7'h20));
+    `RUNTIME_ASSERT (~(fe_fire && fe_illegal),
+        ("%t: %s invalid uniform/warp-op encoding: wid=%0d PC=0x%0h instr=0x%h (#%0d)",
+            $time, INSTANCE_ID, fetch_if.data.wid, to_fullPC(fetch_if.data.PC), instr, fetch_if.data.uuid))
+`endif
+
     // Register decode_sched_if to break the long combinational path.
     reg                  decode_sched_valid_r;
     reg                  decode_sched_unlock_r;
@@ -1225,7 +1430,47 @@ module VX_decode import
     assign decode_sched_if.is_rvc = decode_sched_is_rvc_r;
 `endif
 
+`ifdef VX_CFG_H100_FE_ENABLE
+    // A consumed UPFX holds a fetch credit the ibuffer never returns; give it back in a cycle
+    // the ibuffer does not pop that warp (the scheduler counts one pop per warp and cycle).
+    localparam UPFX_CW = $clog2(`VX_CFG_IBUF_SIZE + 1);
+    wire [`VX_CFG_NUM_WARPS-1:0] upfx_pop;
+    for (genvar w = 0; w < `VX_CFG_NUM_WARPS; ++w) begin : g_upfx_credit
+        reg [UPFX_CW-1:0] credits;
+        wire add = fetch_fire && is_upfx && (fetch_if.data.wid == NW_WIDTH'(w));
+        assign upfx_pop[w] = (credits != 0) && ~decode_if.ibuf_pop[w];
+        always @(posedge clk) begin
+            if (reset) begin
+                credits <= '0;
+            end else begin
+                credits <= credits + UPFX_CW'(add) - UPFX_CW'(upfx_pop[w]);
+            end
+        end
+    end
+
+    always @(posedge clk) begin
+        if (reset) begin
+            upfx_valid <= '0;
+        end else if (fetch_fire) begin
+            upfx_valid[fetch_if.data.wid] <= is_upfx;
+        end
+        if (fetch_fire && is_upfx) begin
+            upfx_slot[fetch_if.data.wid] <= funct3[1:0];
+            upfx_ur[fetch_if.data.wid]   <= {rs2[0], rs1};
+        end
+    end
+
+    `RUNTIME_ASSERT (~(fetch_fire && upfx_pend && (is_upfx || ~upfx_slot_used || ((ex_type != EX_ALU) && (ex_type != EX_FPU)))),
+        ("%t: %s UPFX not followed by an ALU/FPU instruction reading its slot: wid=%0d PC=0x%0h instr=0x%h (#%0d)",
+            $time, INSTANCE_ID, fetch_if.data.wid, to_fullPC(fetch_if.data.PC), instr, fetch_if.data.uuid))
+    `RUNTIME_ASSERT (~(fetch_fire && is_upfx && ((funct3 > 3'd2) || (rd != 0) || (rs2[4:1] != 0))),
+        ("%t: %s invalid UPFX encoding: wid=%0d PC=0x%0h instr=0x%h (#%0d)",
+            $time, INSTANCE_ID, fetch_if.data.wid, to_fullPC(fetch_if.data.PC), instr, fetch_if.data.uuid))
+
+    assign fetch_if.ibuf_pop = decode_if.ibuf_pop | upfx_pop;
+`else
     assign fetch_if.ibuf_pop = decode_if.ibuf_pop;
+`endif
 
 `ifdef DBG_TRACE_PIPELINE
     always @(posedge clk) begin

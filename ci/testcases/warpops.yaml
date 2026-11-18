@@ -1,0 +1,84 @@
+# ELECT, MATCH and REDUX as single warp instructions of the H100 front end
+# (VX_CFG_H100_FE_ENABLE): the warp-op PE of the ALU, lane results against the
+# golden sw/common/warp_ops_ref.h; timing from the unit's structure (an operand
+# stage with one comparator row, a reduction tree of log2(threads) stages, one
+# unit per core shared by the ALU blocks or one per block). H100 numbers are
+# printed as H100REF lines. Rate shape: 32 threads x 32 warps (2 ALU blocks).
+category: warpops
+defaults:
+  xlen: [64]
+  configs: "-DVX_CFG_H100_FE_ENABLE"
+  tier: smoke
+  touches: [VX_config.toml, hw/rtl/VX_gpu_pkg.sv, hw/rtl/core/VX_alu_unit.sv, hw/rtl/core/VX_alu_warp.sv,
+            hw/rtl/core/VX_alu_uniform.sv, hw/rtl/core/VX_decode.sv, hw/rtl/core/VX_opc_unit.sv,
+            hw/rtl/core/VX_operands.sv, hw/rtl/core/VX_scoreboard.sv, sim/simx/alu_unit.cpp,
+            sim/simx/alu_unit.h, sim/simx/warp_ops.h, sim/simx/uniform_ops.h, sim/simx/decode.cpp,
+            sim/simx/opc_unit.cpp, sim/simx/scoreboard.cpp, sim/simx/types.h, sim/simx/instr.h,
+            sw/common/warp_ops_ref.h, sw/common/vx_fe_isa.h, sw/kernel/include/vx_warp_ops.h,
+            tests/regression/warp_ops, tests/unittest/warp_ops/stream.h]
+tests:
+  # Every ELECT/MATCH/REDUX form on seeded random active masks (full, single
+  # lane, partial), MATCH values from pools giving every k: each active lane
+  # equals the golden, each inactive lane keeps its sentinel.
+  - id: bitexact
+    app: warp_ops
+    drivers: [simx, rtlsim]
+    shape: {threads: 32, warps: 4}
+    args: "-m b -n 256"
+  - id: bitexact-x32
+    app: warp_ops
+    xlen: [32]
+    drivers: [simx]
+    shape: {threads: 32, warps: 4}
+    args: "-m b -n 256"
+
+  # Dependent chains of one warp: MATCH.ANY b32/b64 at k = 1, 2, 4, 8, 16, 32
+  # (slope exactly one cycle per value: one comparator-row pass), MATCH.ALL,
+  # REDUX + UR2R, ELECT.P, ELECT.L; every other op steps as MATCH.ANY at k = its
+  # unit latency (+ the UR2R hop, ELECT.L over ELECT.P, for a UR result).
+  - id: latency
+    app: warp_ops
+    drivers: [simx, rtlsim]
+    shape: {threads: 32, warps: 4}
+    args: "-m l -i 32"
+
+  # WOP_ILP independent ops per warp, one warp and 32 warps: never above the
+  # units' width (one warp op per cycle per unit); MATCH.ANY at k = 4 and 8
+  # within 5% of one op per k cycles per unit.
+  # 64 iterations amortize the warps' start skew after the barrier and their uneven
+  # finish (about 1000 cycles at 32 warps: 8 % of the window at 16 iterations).
+  - id: rate
+    app: warp_ops
+    drivers: [simx, rtlsim]
+    shape: {threads: 32, warps: 32}
+    args: "-m r -i 64"
+  # One unit per ALU block (2 at this shape): twice the width; MATCH.ANY at most
+  # k + 1 cycles per op (the block's result port, round robin with its ALU results).
+  - id: rate-per-slice
+    app: warp_ops
+    drivers: [simx, rtlsim]
+    configs+: "-DVX_CFG_WARP_OP_SHARED=0"
+    shape: {threads: 32, warps: 32}
+    args: "-m r -i 64"
+
+  # The CUDA warp intrinsics (__reduce_*_sync, __match_*_sync, elect.sync) of
+  # the cuda_api warp and ptx modes mapped onto the hardware ops.
+  - id: cuda-api-warp
+    app: cuda_api
+    drivers: [simx]
+    configs+: "-DVX_CFG_EXT_DLMEM_ENABLE -DVX_CFG_EXT_A_ENABLE -DVX_CFG_EXT_MBAR_ENABLE -DVX_CFG_EXT_DXA_ENABLE -DVX_CFG_EXT_ZACAS_ENABLE -DVX_CFG_EXT_FPAMO_ENABLE"
+    shape: {cores: 2, threads: 32, l2cache: true}
+    args: "-m warp"
+  - id: cuda-api-ptx
+    app: cuda_api
+    drivers: [simx]
+    configs+: "-DVX_CFG_EXT_DLMEM_ENABLE -DVX_CFG_EXT_A_ENABLE -DVX_CFG_EXT_MBAR_ENABLE -DVX_CFG_EXT_DXA_ENABLE -DVX_CFG_EXT_ZACAS_ENABLE -DVX_CFG_EXT_FPAMO_ENABLE"
+    shape: {cores: 2, threads: 32, l2cache: true}
+    args: "-m ptx"
+
+  - id: parity-ops
+    check: model_parity
+    app: warp_ops
+    xlen: [64]
+    shape: {threads: 32, warps: 4}
+    args: "-m b -n 64"

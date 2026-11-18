@@ -19,6 +19,10 @@
 #ifdef DXA_MBAR_ENABLE
 #include "dlmem/dlmem_types.h"
 #include "dxa_bg.h"
+#ifdef VX_CFG_H100_FE_ENABLE
+#include "tmap_l2.h"
+#endif
+#line 22
 #else
 #line 18
 #endif
@@ -118,6 +122,13 @@ public:
   // Per core: the progress of its warps' bulk_group operations, at most one
   // event a cycle, to the core's bulk-group unit.
   std::vector<SimChannel<DxaBgCompl>> BgComplOut;
+#ifdef DXA_TMAP_L2_ENABLE
+
+  // The cluster's level-2 tensor-map cache.
+  SimChannel<TmapL2Req> tmap_l2_req_out;
+  SimChannel<TmapL2Rsp> tmap_l2_rsp_in;
+#endif
+#line 121
 #else
 #line 81
 #endif

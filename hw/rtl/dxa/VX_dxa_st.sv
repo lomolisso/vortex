@@ -75,6 +75,13 @@ module VX_dxa_st import VX_gpu_pkg::*, VX_dxa_pkg::*, VX_dlmem_pkg::*; #(
 
     // Global writes, atomics and the fence.
     VX_mem_bus_if.master               gmem_bus_if,
+`ifdef VX_CFG_H100_FE_ENABLE
+    // A store's fence goes once the worker's fence table has room, tagged with
+    // its entry; its answer reaches the table, not this engine.
+    input  wire                        fence_room,
+    input  wire [GMEM_TAG_WIDTH-UUID_WIDTH-1:0] fence_tag,
+    output wire                        fence_sent,
+`endif
 
     // Cluster-reduction packets to the row egress.
     output wire                        amo_valid,
@@ -403,7 +410,11 @@ module VX_dxa_st import VX_gpu_pkg::*, VX_dxa_pkg::*, VX_dlmem_pkg::*; #(
 
     wire pipes_empty = info_empty && ~slot_valid_r;
     wire all_emitted = walk_done_r && pipes_empty;
+`ifdef VX_CFG_H100_FE_ENABLE
+    wire fence_valid = active && is_store && all_emitted && wrote_r && ~fence_sent_r && fence_room;
+`else
     wire fence_valid = active && is_store && all_emitted && wrote_r && ~fence_sent_r;
+`endif
 
     wire emit_g = slot_valid_r && ~is_red_c;
 
@@ -429,10 +440,17 @@ module VX_dxa_st import VX_gpu_pkg::*, VX_dxa_pkg::*, VX_dlmem_pkg::*; #(
     assign mem_bus_w.req_data.byteen = emit_g ? (is_store ? slot_be_r : (w_mask & slot_be_r)) : {CL_SIZE{1'b1}};
     assign mem_bus_w.req_data.attr   = g_attr;
     assign mem_bus_w.req_data.tag.uuid  = uuid;
+`ifdef VX_CFG_H100_FE_ENABLE
+    assign mem_bus_w.req_data.tag.value = fence_valid ? fence_tag : TAG_VALUE_W'(0);
+`else
     assign mem_bus_w.req_data.tag.value = TAG_VALUE_W'(0);
+`endif
     assign gmem_req_ready_w = mem_bus_w.req_ready;
     wire g_fire = mem_bus_w.req_valid && mem_bus_w.req_ready;
     wire fence_fire = g_fire && ~emit_g;
+`ifdef VX_CFG_H100_FE_ENABLE
+    assign fence_sent = fence_fire;
+`endif
     wire amo_req_fire = g_fire && emit_g && is_red_g;
 
     assign mem_bus_w.rsp_ready = 1'b1;
@@ -500,7 +518,14 @@ module VX_dxa_st import VX_gpu_pkg::*, VX_dxa_pkg::*, VX_dlmem_pkg::*; #(
     // ════════════════════════════════════════════════════════════════════
     reg rd_seen_r, wr_seen_r, evt_rd_r, evt_wr_r, done_r;
     wire rd_cond = active && walk_done_r && info_empty && ~rd_seen_r;
+`ifdef VX_CFG_H100_FE_ENABLE
+    // A store's writes are the worker's no longer once its fence is sent.
+    `UNUSED_VAR (fence_rsp_r)
+    wire fenced  = is_store && wrote_r;
+    wire wr_ok   = is_store ? (wrote_r ? fence_sent_r : all_emitted)
+`else
     wire wr_ok   = is_store ? (wrote_r ? fence_rsp_r : all_emitted)
+`endif
                  : is_red_g ? (all_emitted && (amo_cnt_r == '0))
                  : all_emitted;
     wire wr_cond = active && wr_ok && ~wr_seen_r;
@@ -517,7 +542,11 @@ module VX_dxa_st import VX_gpu_pkg::*, VX_dxa_pkg::*, VX_dlmem_pkg::*; #(
             if (rd_cond) rd_seen_r <= 1'b1;
             if (wr_cond) wr_seen_r <= 1'b1;
             evt_rd_r <= (evt_rd_r && ~evt_fire) || (rd_cond && bg);
+`ifdef VX_CFG_H100_FE_ENABLE
+            evt_wr_r <= (evt_wr_r && ~evt_fire) || (wr_cond && bg && ~fenced);
+`else
             evt_wr_r <= (evt_wr_r && ~evt_fire) || (wr_cond && bg);
+`endif
             if (done) done_r <= 1'b1;
         end
     end

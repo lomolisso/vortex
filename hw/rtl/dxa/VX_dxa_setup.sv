@@ -38,6 +38,14 @@ module VX_dxa_setup import VX_gpu_pkg::*, VX_dxa_pkg::*; (
 
     // Transfer done (from smem_wr).
     input  wire                        transfer_done,
+`ifdef DXA_FE_PIPE
+    // A pipelined copy's front ends when the AGU accepts its last line; the
+    // next one needs a free copy context, any other request every copy drained.
+    input  wire                        front_done,
+    input  wire                        ctx_free,
+    input  wire                        ctx_idle,
+    output wire                        active_pipe,
+`endif
 
     // State outputs.
     output wire                        transfer_active,
@@ -90,7 +98,9 @@ module VX_dxa_setup import VX_gpu_pkg::*, VX_dxa_pkg::*; (
 
     // Accept a new request whenever the setup engine has capacity (i.e.,
     // not currently computing nor holding a staged result).
+`ifndef DXA_FE_PIPE
     assign req_ready = (setup_state_r == SS_IDLE);
+`endif
 
     wire launch_accept = req_valid && req_ready;
 
@@ -752,8 +762,20 @@ module VX_dxa_setup import VX_gpu_pkg::*, VX_dxa_pkg::*; (
     // (either idle, or completing this cycle via transfer_done).
     // ════════════════════════════════════════════════════════════════════
 
+`ifdef DXA_FE_PIPE
+    reg s_pipe, r_pipe;
+    assign active_pipe = r_pipe;
+    wire active_end = r_pipe ? front_done : transfer_done;
+    wire promote_now = (setup_state_r == SS_STAGED)
+                    && (state_r == TS_IDLE || active_end)
+                    && (s_pipe ? ctx_free : ctx_idle);
+    // The next request is taken in the promote cycle: r_* read the old staged values.
+    assign req_ready = (setup_state_r == SS_IDLE) || promote_now;
+    wire [1:0] setup_state_cur = promote_now ? SS_IDLE : setup_state_r;
+`else
     wire promote_now = (setup_state_r == SS_STAGED)
                     && (state_r == TS_IDLE || transfer_done);
+`endif
 
     reg pipeline_start_r;
     assign pipeline_start = pipeline_start_r;
@@ -770,6 +792,10 @@ module VX_dxa_setup import VX_gpu_pkg::*, VX_dxa_pkg::*; (
         if (reset) begin
             state_r            <= TS_IDLE;
             setup_state_r      <= SS_IDLE;
+        `ifdef DXA_FE_PIPE
+            s_pipe             <= 1'b0;
+            r_pipe             <= 1'b0;
+        `endif
             ctr_r              <= '0;
             pipeline_start_r   <= 1'b0;
             r_core_id          <= '0;
@@ -840,18 +866,36 @@ module VX_dxa_setup import VX_gpu_pkg::*, VX_dxa_pkg::*; (
                 r_bg                <= s_bg;
                 r_bg_seq            <= s_bg_seq;
             `endif
+            `ifdef DXA_FE_PIPE
+                r_pipe              <= s_pipe;
+            `endif
                 state_r             <= TS_ACTIVE;
                 pipeline_start_r    <= 1'b1;
                 setup_state_r       <= SS_IDLE;
+`ifdef DXA_FE_PIPE
+            end else if (state_r == TS_ACTIVE && active_end) begin
+`else
             end else if (state_r == TS_ACTIVE && transfer_done) begin
+`endif
                 // Active drain complete, no staged result waiting.
                 state_r <= TS_IDLE;
             end
 
             // ── Setup engine ─────────────────────────────────────────────
+`ifdef DXA_FE_PIPE
+            case (setup_state_cur)
+`else
             case (setup_state_r)
+`endif
             SS_IDLE: begin
                 if (launch_accept) begin
+                `ifdef DXA_FE_PIPE
+                    // As the SimX engine's pipelined copies: G->S loads of the PTX walk to the issuer's block.
+                    s_pipe              <= (req_data.tload || req_data.bload) && ~dec_pf
+                                        && (req_data.bload || (dec_tma && (dec_swz != 2'd0 || dec_es0 != 4'd1 || dec_im2col)))
+                                        && ~req_data.mc_cluster && ~req_data.remote && ($countones(req_data.cta_mask) <= 1)
+                                        && ~req_data.st.en && ~req_data.bulk;
+                `endif
                     // Latch metadata directly into staged_*.
                     s_core_id           <= req_data.core_id;
                     s_uuid              <= req_data.uuid;

@@ -31,7 +31,7 @@ VX_HDRS := $(KERNEL_HDRS) $(SW_COMMON_DIR)/vx_cuda_fp.h $(SW_COMMON_DIR)/dxa_tma
 
 # vx_cuda.h builds the DXA operands in x30/x31 (t5/t6): the wgather that
 # broadcasts them also writes the parked lanes' destination register.
-VX_CFLAGS += -ffixed-x30 -ffixed-x31 -DVX_CUDA_FIXED_TEMPS
+VX_CFLAGS += $(VX_CUDA_FIXED_FLAGS)
 
 # Barriers, shuffles and votes are inline asm. Unless every call is convergent,
 # the compiler may copy one into both arms of a divergent branch (seen: a

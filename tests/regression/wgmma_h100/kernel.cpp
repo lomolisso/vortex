@@ -124,6 +124,9 @@ __attribute__((noinline)) void run(const kernel_arg_t* arg, char* lm) {
         ;
       if (warp != 0)
         spin_cycles(arg->skew);
+#if VX_CFG_H100_FE_ENABLED
+      __asm__ volatile ("li a0, -1\n\tli a1, -1" ::: "a0", "a1");
+#endif
       h::wgmma<N, Dt, At, At, TA, TB>(desc_a(i), desc_b(i), d, !(arg->zero_first && i == 0));
       wgmma_commit_group();
       wgmma_wait_group<0>();
@@ -134,6 +137,9 @@ __attribute__((noinline)) void run(const kernel_arg_t* arg, char* lm) {
       // wait on a phase parity that has already come round again.
       bar_sync(1, 128);
     } else {
+#if VX_CFG_H100_FE_ENABLED
+      __asm__ volatile ("li a0, -1\n\tli a1, -1" ::: "a0", "a1");
+#endif
       h::wgmma<N, Dt, At, At, TA, TB>(desc_a(i), desc_b(i), d, !(arg->zero_first && i == 0));
       wgmma_commit_group();
       if (i != 0)

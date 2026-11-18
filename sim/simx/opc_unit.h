@@ -44,6 +44,10 @@ public:
                 uint32_t src_index,
                 const RegOpd& reg) const;
 
+#ifdef VX_CFG_H100_FE_ENABLE
+  // UR `idx` (quad: UR[idx..idx+3] into lanes 0..3, other lanes 0); URZ reads 0.
+  void read_ur(std::vector<reg_data_t>& out, uint32_t wid, uint32_t idx, bool quad) const;
+#endif
   uint32_t total_stalls() const {
     return total_stalls_;
   }
@@ -67,7 +71,13 @@ private:
     warp_regs_t(uint32_t num_threads)
       : ireg_file(MAX_NUM_REGS, std::vector<Word>(num_threads, 0))
       , freg_file(MAX_NUM_REGS, std::vector<uint64_t>(num_threads, 0))
+#ifdef VX_CFG_H100_FE_ENABLE
+      , ureg_file(VX_CFG_UREG_COUNT, 0)
+#endif
     {}
+#ifdef VX_CFG_H100_FE_ENABLE
+    std::vector<Word> ureg_file;
+#endif
   };
 
   std::vector<warp_regs_t> regs_;     // indexed by warp_slot

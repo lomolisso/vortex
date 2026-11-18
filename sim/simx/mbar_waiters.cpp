@@ -20,14 +20,28 @@
 using namespace vortex;
 
 MbarWaiterTable::MbarWaiterTable(const SimContext& ctx, const char* name, uint32_t num_banks,
+#ifdef VX_CFG_H100_FE_ENABLE
+                                 uint32_t num_blocks, uint32_t suspend_cycles,
+                                 bool partial_return)
+#else
+#line 23
                                  uint32_t num_blocks, uint32_t suspend_cycles)
+#endif
+#line 24
   : SimObject<MbarWaiterTable>(ctx, name)
   , BankEvtIn(num_banks, SimChannel<MbarBankEvt>(this))
   , RetireIn(num_blocks, SimChannel<uint32_t>(this))
   , UnlockOut(this)
   , entries_(VX_CFG_NUM_WARPS)
   , suspend_cycles_(suspend_cycles)
+#ifdef VX_CFG_H100_FE_ENABLE
+  , partial_return_(partial_return)
 {}
+#else
+#line 30
+{}
+#endif
+#line 31
 
 void MbarWaiterTable::on_reset() {
   std::fill(entries_.begin(), entries_.end(), entry_t{});
@@ -56,7 +70,13 @@ void MbarWaiterTable::on_tick() {
       retiring.set(wid);
       auto& e = entries_.at(wid);
       __assert(!e.retired, this->name() << " mbarrier waiter retired twice: wid=" << wid);
+#ifdef VX_CFG_H100_FE_ENABLE
+      if (!e.valid || e.woke || (partial_return_ && e.inserts < VX_CFG_NUM_THREADS)) {
+#else
+#line 59
       if (!e.valid || e.woke) {
+#endif
+#line 60
         this->release(wid);
         continue;
       }
@@ -89,7 +109,7 @@ void MbarWaiterTable::on_tick() {
     __assert(!e.retired, this->name() << " mbarrier waiter insert after retire: wid=" << evt.wid);
     e.valid = true;
     e.bank = b;
-    e.row = evt.row;
+    e.row = evt.row; VX_FE_ONLY(e.inserts += evt.lanes;)
     in.pop();
   }
   for (uint32_t b = 0; b < BankEvtIn.size(); ++b) {

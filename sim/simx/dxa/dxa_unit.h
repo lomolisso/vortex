@@ -20,6 +20,11 @@
 #else
 #line 17
 #endif
+#ifdef VX_CFG_H100_FE_ENABLE
+#include "bg_unit.h"
+#else
+#line 22
+#endif
 
 namespace vortex {
 
@@ -143,6 +148,13 @@ public:
 
   void bg_state(const DxaBgState& s);
   void bg_reset();
+#ifdef VX_CFG_H100_FE_ENABLE
+  // A UR-form op's warp is released through the bulk-group unit when the op is accepted.
+  SimChannel<DxaBgRel>   BgRelOut{req_out_.module()};
+  void ur_issue(const instr_trace_t* trace);
+#else
+#line 145
+#endif
 
 private:
   bool issue_store(instr_trace_t* trace);

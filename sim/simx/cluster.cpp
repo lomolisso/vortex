@@ -59,6 +59,28 @@ public:
     for (uint32_t i = 0; i < sockets_per_cluster; ++i) {
       sockets_.at(i) = cpcs_.at(i % VX_CFG_CPCS_PER_GPC)->socket(i / VX_CFG_CPCS_PER_GPC);
     }
+#ifdef DXA_TMAP_L2_ENABLE
+
+    // The cluster's level-2 tensor-map cache, one port per socket's DXA core.
+    snprintf(sname, 100, "%s-tmap-l2", name.c_str());
+    tmap_l2_ = TmapL2::Create(sname, sockets_per_cluster);
+    for (uint32_t i = 0; i < sockets_per_cluster; ++i) {
+      auto& dxa = sockets_.at(i)->dxa_core();
+      RegSlice<TmapL2Req>::Ptr req_slice;
+      {
+        SimPlatform::DomainScope dxa_scope(dxa.get());
+        snprintf(sname, 100, "%s-tmap-l2-req%d", name.c_str(), i);
+        req_slice = RegSlice<TmapL2Req>::Create(sname, 1);
+      }
+      snprintf(sname, 100, "%s-tmap-l2-rsp%d", name.c_str(), i);
+      auto rsp_slice = RegSlice<TmapL2Rsp>::Create(sname, 1);
+      dxa->tmap_l2_req_out.bind(&req_slice->In);
+      req_slice->Out.bind(&tmap_l2_->ReqIn.at(i));
+      tmap_l2_->RspOut.at(i).bind(&rsp_slice->In);
+      rsp_slice->Out.bind(&dxa->tmap_l2_rsp_in);
+    }
+#endif
+#line 62
 
     // Global-barrier event links: each core's arrive end fans into the
     // cluster's handler; one resume link fans back out per core.
@@ -686,6 +708,10 @@ private:
   std::vector<core_barrier_t> gbarriers_;
   Cache::Ptr                  l2cache_;
   uint32_t                    cores_per_socket_;
+#ifdef DXA_TMAP_L2_ENABLE
+  TmapL2::Ptr                 tmap_l2_;
+#endif
+#line 689
 #ifdef VX_CFG_VM_ENABLE
   L2Tlb::Ptr                  l2tlb_;
 #endif

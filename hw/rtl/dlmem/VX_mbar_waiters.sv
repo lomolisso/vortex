@@ -21,13 +21,21 @@
 // one bank, which orders every op on it: a phase flip either precedes a lane's
 // read (which then sees the phase complete) or follows that lane's insert, so no
 // wake-up is lost. A warp's retire comes after all of its lanes' inserts.
+// An insert counts the waiting lanes it covers, so a warp with fewer than its lanes is a
+// partial warp, which the H100 does not suspend: with PARTIAL_RETURN its retire
+// releases it at once.
 
 module VX_mbar_waiters import VX_gpu_pkg::*; #(
     parameter `STRING INSTANCE_ID = "",
     parameter NUM_BANKS      = `VX_CFG_LMEM_NUM_BANKS,
     parameter NUM_RETIRES    = `VX_CFG_NUM_LSU_BLOCKS,
     parameter ROW_WIDTH      = 1,
+`ifdef VX_CFG_H100_FE_ENABLE
+    parameter SUSPEND_CYCLES = `VX_CFG_MBAR_SUSPEND_CYCLES,
+    parameter PARTIAL_RETURN = 1
+`else
     parameter SUSPEND_CYCLES = `VX_CFG_MBAR_SUSPEND_CYCLES
+`endif
 ) (
     input wire                                  clk,
     input wire                                  reset,
@@ -37,6 +45,10 @@ module VX_mbar_waiters import VX_gpu_pkg::*; #(
     input wire [NUM_BANKS-1:0]                  evt_flip,
     input wire [NUM_BANKS-1:0][NW_WIDTH-1:0]    evt_wid,
     input wire [NUM_BANKS-1:0][ROW_WIDTH-1:0]   evt_row,
+`ifdef VX_CFG_H100_FE_ENABLE
+    // An insert's waiting lanes
+    input wire [NUM_BANKS-1:0][`CLOG2(`VX_CFG_NUM_THREADS + 1)-1:0] evt_lanes,
+`endif
 
     // Per LSU block, the last response of a try_wait has left the block
     input wire [NUM_RETIRES-1:0]                retire_valid,
@@ -49,6 +61,9 @@ module VX_mbar_waiters import VX_gpu_pkg::*; #(
 
     localparam BANK_WIDTH  = `UP(`CLOG2(NUM_BANKS));
     localparam TIMER_WIDTH = `UP(`CLOG2(SUSPEND_CYCLES + 1));
+`ifdef VX_CFG_H100_FE_ENABLE
+    localparam CNT_WIDTH   = `CLOG2(`VX_CFG_NUM_THREADS + 1);
+`endif
 
     `STATIC_ASSERT (`VX_CFG_MBAR_SUSPEND_CYCLES < STALL_TIMEOUT / 4,
         ("VX_CFG_MBAR_SUSPEND_CYCLES must stay well below the scheduler stall timeout"))
@@ -85,6 +100,30 @@ module VX_mbar_waiters import VX_gpu_pkg::*; #(
         end
 
         wire valid_i = valid_r[w] || ins;
+`ifdef VX_CFG_H100_FE_ENABLE
+        wire [CNT_WIDTH-1:0] cnt_i;
+        if (PARTIAL_RETURN != 0) begin : g_cnt
+            reg [CNT_WIDTH-1:0] cnt_r;
+            reg [CNT_WIDTH-1:0] cnt_add;
+            always @(*) begin
+                cnt_add = '0;
+                for (integer b = 0; b < NUM_BANKS; ++b) begin
+                    cnt_add += (evt_valid[b] && ~evt_flip[b] && (evt_wid[b] == NW_WIDTH'(w))) ? evt_lanes[b] : '0;
+                end
+            end
+            assign cnt_i = (cnt_r > (CNT_WIDTH'(`VX_CFG_NUM_THREADS) - cnt_add)) ? CNT_WIDTH'(`VX_CFG_NUM_THREADS) : (cnt_r + cnt_add);
+            always @(posedge clk) begin
+                if (reset || release_n[w]) begin
+                    cnt_r <= '0;
+                end else begin
+                    cnt_r <= cnt_i;
+                end
+            end
+        end else begin : g_no_cnt
+            assign cnt_i = CNT_WIDTH'(`VX_CFG_NUM_THREADS);
+        end
+        wire partial = (cnt_i < CNT_WIDTH'(`VX_CFG_NUM_THREADS));
+`endif
 
         reg flip_hit;
         always @(*) begin
@@ -104,8 +143,13 @@ module VX_mbar_waiters import VX_gpu_pkg::*; #(
         end
         wire ret = (| ret_hit);
 
+`ifdef VX_CFG_H100_FE_ENABLE
+        // A retire releases its warp at once when no lane is waiting, a flip already came or the warp is partial.
+        wire ret_release = ret && (~valid_i || woke_f || partial);
+`else
         // A retire releases its warp at once when no lane is waiting or a flip already came.
         wire ret_release = ret && (~valid_i || woke_f);
+`endif
         wire retired_n   = retired_r[w] || (ret && ~ret_release);
         wire [TIMER_WIDTH-1:0] timer_n = (ret && ~ret_release) ? TIMER_WIDTH'(SUSPEND_CYCLES) : timer_r[w];
 

@@ -37,6 +37,9 @@
 #include "instr.h"
 #include "debug.h"
 #include "tcu_desc_ref.h"
+#ifdef VX_CFG_H100_FE_ENABLE
+#include <vx_fe_isa.h>
+#endif
 
 namespace vortex {
 
@@ -407,8 +410,13 @@ inline void uop_fill(Instr& uop, const IntrTcuArgs& args, uint32_t ctr, uint32_t
                            h, 2 * j + e, k, first ? 1u : 0u, last ? 1u : 0u, 0});
   uop.set_dest_reg(r, RegType::Float);
   if (first) {
+#ifdef VX_CFG_H100_FE_ENABLE
+    uop.set_src_reg(0, VX_FE_UR_WG_DESC, RegType::Uniform);
+    uop.set_src_reg(1, VX_FE_UR_WG_DESC + 1, RegType::Uniform);
+#else
     uop.set_src_reg(0, 10, RegType::Integer);
     uop.set_src_reg(1, 11, RegType::Integer);
+#endif
   }
   uop.set_src_reg(2, r, RegType::Float);
   if (packed(args.fmt_d)) {

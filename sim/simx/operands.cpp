@@ -173,6 +173,22 @@ void Operands::fetch_operands(instr_trace_t* trace) {
   for (uint32_t i = 0; i < NUM_SRC_REGS; ++i) {
     if (trace->src_regs[i].type == RegType::None)
       continue;
+#ifdef VX_CFG_H100_FE_ENABLE
+    if (trace->src_regs[i].type == RegType::Uniform) {
+      opc->read_ur(trace->src_data[i], trace->wid, trace->src_regs[i].idx, (trace->instr_ptr->get_ur_quad() >> i) & 1);
+#if (VX_CFG_FLEN == 32)
+      // SimX holds an F32 register NaN-boxed; the hardware FPU at FLEN 32 takes the raw bits.
+      if (trace->fu_type == FUType::FPU) {
+        for (auto& d : trace->src_data[i])
+          d.u64 |= 0xffffffff00000000ull;
+      }
+#endif
+      DP(2, "Src" << i << " Reg: " << trace->src_regs[i] << "=0x" << std::hex << trace->src_data[i][0].u64
+            << std::dec << " (#" << trace->uuid << ")");
+      continue;
+    }
+#endif
+#line 176
     opc->read_src(trace->src_data[i], trace->wid, i, trace->src_regs[i]);
     // Per-instruction trace line consumed by ci/trace_csv.py to match
     // each Src to its uuid.

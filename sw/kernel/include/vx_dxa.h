@@ -25,6 +25,9 @@
 #include <dxa_tmap.h>
 #endif
 #endif
+#if VX_CFG_H100_FE_ENABLED
+#include <vx_uniform.h>
+#endif
 
 #ifdef __cplusplus
 extern "C" {
@@ -32,6 +35,31 @@ extern "C" {
 
 #define VX_DXA_EXT_OPCODE RISCV_CUSTOM0
 #define VX_DXA_FUNCT7     0x3
+
+// The UR-form opcode exists only on devices whose DXA completes on mbarriers;
+// a barrier-id-only DXA keeps the vector-operand form under the front end.
+#if VX_CFG_H100_FE_ENABLED && defined(VX_CFG_EXT_MBAR_ENABLE)
+#define __VX_DXA_UR_FORM 1
+#else
+#define __VX_DXA_UR_FORM 0
+#endif
+
+#if VX_CFG_H100_FE_ENABLED
+// One UR-form op (funct7 VX_FE_F7_DXA_UR) issued by any non-empty set of active
+// threads: the first active thread's operands go to UR0-UR3 (the 0x03 form's rs1
+// lanes 0-3) and UR4-UR7 (its rs2 lanes 0-3) in the op's own asm block.
+#define __VX_DXA_UR(f3, r0, r1, r2, r3, s0, s1, s2, s3) __asm__ volatile (                    \
+    VX_UASM_R2UR(0, "%0") VX_UASM_R2UR(1, "%1") VX_UASM_R2UR(2, "%2") VX_UASM_R2UR(3, "%3")   \
+    VX_UASM_R2UR(4, "%4") VX_UASM_R2UR(5, "%5") VX_UASM_R2UR(6, "%6") VX_UASM_R2UR(7, "%7")   \
+    ".insn r 0x0b, %8, " VX_UASM_STR(VX_FE_F7_DXA_UR) ", x0, x0, x0\n\t"                     \
+    :: "r"((size_t)(r0)), "r"((size_t)(r1)), "r"((size_t)(r2)), "r"((size_t)(r3)),             \
+       "r"((size_t)(s0)), "r"((size_t)(s1)), "r"((size_t)(s2)), "r"((size_t)(s3)), "i"(f3)      \
+    : "memory")
+// funct3 7: the map in UR0, the op in the rs2 field.
+#define __VX_DXA_UR_TMAP(op, map) __asm__ volatile (                                           \
+    VX_UASM_R2UR(0, "%0") ".insn r 0x0b, 7, " VX_UASM_STR(VX_FE_F7_DXA_UR) ", x0, x0, x" #op "\n\t" \
+    :: "r"(map) : "memory")
+#endif
 
 // Packed launch metadata:
 // meta[3:0]   = descriptor slot (up to 16 descriptors)
@@ -74,6 +102,10 @@ inline void vx_dxa_issue_1d_wg(uint32_t desc_slot,
                                 const void* smem_addr,
                                 uint32_t coord0) {
   const uint32_t meta = vx_dxa_pack_meta(desc_slot, barrier_id);
+#if __VX_DXA_UR_FORM
+  __VX_DXA_UR(0, (uint32_t)(uintptr_t)smem_addr, (size_t)meta, (size_t)coord0, (size_t)0u,
+              0, 0, 0, 0);
+#else
   const uint32_t a0 = (uint32_t)vx_wgather((size_t)(uintptr_t)smem_addr,
                                             (size_t)meta,
                                             (size_t)coord0,
@@ -83,6 +115,7 @@ inline void vx_dxa_issue_1d_wg(uint32_t desc_slot,
       :
       : "i"(VX_DXA_EXT_OPCODE), "i"(VX_DXA_FUNCT7), "r"(a0)
       : "memory");
+#endif
 }
 
 // 2D: rs1 = wgather(smem_addr, meta, coord0, coord1), rs2 = x0
@@ -92,6 +125,10 @@ inline void vx_dxa_issue_2d_wg(uint32_t desc_slot,
                                 uint32_t coord0,
                                 uint32_t coord1) {
   const uint32_t meta = vx_dxa_pack_meta(desc_slot, barrier_id);
+#if __VX_DXA_UR_FORM
+  __VX_DXA_UR(0, (uint32_t)(uintptr_t)smem_addr, (size_t)meta, (size_t)coord0, (size_t)coord1,
+              0, 0, 0, 0);
+#else
   const uint32_t a0 = (uint32_t)vx_wgather((size_t)(uintptr_t)smem_addr,
                                             (size_t)meta,
                                             (size_t)coord0,
@@ -101,6 +138,7 @@ inline void vx_dxa_issue_2d_wg(uint32_t desc_slot,
       :
       : "i"(VX_DXA_EXT_OPCODE), "i"(VX_DXA_FUNCT7), "r"(a0)
       : "memory");
+#endif
 }
 
 // 3D–5D: rs2 = wgather(coord2, coord3, coord4, 0)
@@ -111,6 +149,10 @@ inline void vx_dxa_issue_3d_wg(uint32_t desc_slot,
                                 uint32_t coord1,
                                 uint32_t coord2) {
   const uint32_t meta = vx_dxa_pack_meta(desc_slot, barrier_id);
+#if __VX_DXA_UR_FORM
+  __VX_DXA_UR(0, (uint32_t)(uintptr_t)smem_addr, (size_t)meta, (size_t)coord0, (size_t)coord1,
+              (size_t)coord2, (size_t)0u, (size_t)0u, (size_t)0u);
+#else
   const uint32_t a0 = (uint32_t)vx_wgather((size_t)(uintptr_t)smem_addr,
                                             (size_t)meta,
                                             (size_t)coord0,
@@ -124,6 +166,7 @@ inline void vx_dxa_issue_3d_wg(uint32_t desc_slot,
       :
       : "i"(VX_DXA_EXT_OPCODE), "i"(VX_DXA_FUNCT7), "r"(a0), "r"(a1)
       : "memory");
+#endif
 }
 
 inline void vx_dxa_issue_4d_wg(uint32_t desc_slot,
@@ -134,6 +177,10 @@ inline void vx_dxa_issue_4d_wg(uint32_t desc_slot,
                                 uint32_t coord2,
                                 uint32_t coord3) {
   const uint32_t meta = vx_dxa_pack_meta(desc_slot, barrier_id);
+#if __VX_DXA_UR_FORM
+  __VX_DXA_UR(0, (uint32_t)(uintptr_t)smem_addr, (size_t)meta, (size_t)coord0, (size_t)coord1,
+              (size_t)coord2, (size_t)coord3, (size_t)0u, (size_t)0u);
+#else
   const uint32_t a0 = (uint32_t)vx_wgather((size_t)(uintptr_t)smem_addr,
                                             (size_t)meta,
                                             (size_t)coord0,
@@ -147,6 +194,7 @@ inline void vx_dxa_issue_4d_wg(uint32_t desc_slot,
       :
       : "i"(VX_DXA_EXT_OPCODE), "i"(VX_DXA_FUNCT7), "r"(a0), "r"(a1)
       : "memory");
+#endif
 }
 
 inline void vx_dxa_issue_5d_wg(uint32_t desc_slot,
@@ -158,6 +206,10 @@ inline void vx_dxa_issue_5d_wg(uint32_t desc_slot,
                                 uint32_t coord3,
                                 uint32_t coord4) {
   const uint32_t meta = vx_dxa_pack_meta(desc_slot, barrier_id);
+#if __VX_DXA_UR_FORM
+  __VX_DXA_UR(0, (uint32_t)(uintptr_t)smem_addr, (size_t)meta, (size_t)coord0, (size_t)coord1,
+              (size_t)coord2, (size_t)coord3, (size_t)coord4, (size_t)0u);
+#else
   const uint32_t a0 = (uint32_t)vx_wgather((size_t)(uintptr_t)smem_addr,
                                             (size_t)meta,
                                             (size_t)coord0,
@@ -171,6 +223,7 @@ inline void vx_dxa_issue_5d_wg(uint32_t desc_slot,
       :
       : "i"(VX_DXA_EXT_OPCODE), "i"(VX_DXA_FUNCT7), "r"(a0), "r"(a1)
       : "memory");
+#endif
 }
 
 #ifdef VX_CFG_EXT_MBAR_ENABLE
@@ -273,6 +326,10 @@ inline void vx_dxa_issue_5d_mbar_cluster(uint32_t desc_slot, uint64_t* mbar, voi
 // order earlier stores to it with vx_fence_proxy_async(). Same issue rules as
 // the tensor issue: rs1 = wgather(dst, mbar, src, size), funct3 = 1.
 inline void vx_dxa_bulk_copy(void* dst, const void* src, uint32_t size, uint64_t* mbar) {
+#if VX_CFG_H100_FE_ENABLED
+  __VX_DXA_UR(1, (size_t)(uintptr_t)dst, (size_t)(uintptr_t)mbar, (size_t)(uintptr_t)src, (size_t)size,
+              0, 0, 0, 0);
+#else
   const size_t a0 = vx_wgather((size_t)(uintptr_t)dst,
                                (size_t)(uintptr_t)mbar,
                                (size_t)(uintptr_t)src,
@@ -282,6 +339,7 @@ inline void vx_dxa_bulk_copy(void* dst, const void* src, uint32_t size, uint64_t
       :
       : "i"(VX_DXA_EXT_OPCODE), "i"(VX_DXA_FUNCT7), "r"(a0)
       : "memory");
+#endif
 }
 
 // fence.proxy.async: holds the warp until its earlier stores to local memory
@@ -314,6 +372,10 @@ inline size_t __vx_dxa_pair(int32_t lo, int32_t hi) {
 inline void __vx_dxa_tload(uint32_t ctl, void* dst, uint64_t* mbar,
                            int32_t c0, int32_t c1, int32_t c2, int32_t c3, int32_t c4,
                            uint32_t o1, uint32_t o2, uint32_t o3, uint32_t cta_mask) {
+#if VX_CFG_H100_FE_ENABLED
+  __VX_DXA_UR(2, (size_t)(uintptr_t)dst, (size_t)(uintptr_t)mbar, __vx_dxa_pair(c0, c1), __vx_dxa_pair(c2, c3),
+              ((size_t)ctl << 32) | (size_t)(uint32_t)c4, ((size_t)(o3 & 0xFFFFu) << 48) | ((size_t)(o2 & 0xFFFFu) << 32) | ((size_t)(o1 & 0xFFFFu) << 16) | (size_t)(cta_mask & 0xFFFFu), (size_t)0, (size_t)0);
+#else
   const size_t a0 = vx_wgather((size_t)(uintptr_t)dst,
                                (size_t)(uintptr_t)mbar,
                                __vx_dxa_pair(c0, c1),
@@ -328,6 +390,7 @@ inline void __vx_dxa_tload(uint32_t ctl, void* dst, uint64_t* mbar,
       :
       : "i"(VX_DXA_EXT_OPCODE), "i"(VX_DXA_FUNCT7), "r"(a0), "r"(a1)
       : "memory");
+#endif
 }
 
 inline void vx_dxa_load_1d(uint32_t slot, void* dst, uint64_t* mbar, int32_t c0) {
@@ -521,6 +584,10 @@ inline void vx_dxa_prefetch_im2col_5d(uint32_t slot, int32_t c0, int32_t c1, int
 // of 16 and `gsrc` and `dst` are 16-byte aligned.
 // funct3 = 3: rs1 = wgather(dst, mbar, gsrc, size), rs2 = x0 or wgather(0, cta_mask, 0, 0).
 inline void vx_dxa_bulk_load(void* dst, const void* gsrc, uint32_t size, uint64_t* mbar) {
+#if VX_CFG_H100_FE_ENABLED
+  __VX_DXA_UR(3, (size_t)(uintptr_t)dst, (size_t)(uintptr_t)mbar, (size_t)(uintptr_t)gsrc, (size_t)size,
+              0, 0, 0, 0);
+#else
   const size_t a0 = vx_wgather((size_t)(uintptr_t)dst,
                                (size_t)(uintptr_t)mbar,
                                (size_t)(uintptr_t)gsrc,
@@ -530,12 +597,17 @@ inline void vx_dxa_bulk_load(void* dst, const void* gsrc, uint32_t size, uint64_
       :
       : "i"(VX_DXA_EXT_OPCODE), "i"(VX_DXA_FUNCT7), "r"(a0)
       : "memory");
+#endif
 }
 
 // .multicast::cluster: lands in every rank set in `cta_mask` at the
 // block-relative offsets of the issuer's local `dst` and `mbar`.
 inline void vx_dxa_bulk_load_multicast(void* dst, const void* gsrc, uint32_t size, uint64_t* mbar,
                                        uint16_t cta_mask) {
+#if VX_CFG_H100_FE_ENABLED
+  __VX_DXA_UR(3, (size_t)(uintptr_t)dst, (size_t)(uintptr_t)mbar, (size_t)(uintptr_t)gsrc, (size_t)size,
+              (size_t)0, (size_t)cta_mask, (size_t)0, (size_t)0);
+#else
   const size_t a0 = vx_wgather((size_t)(uintptr_t)dst,
                                (size_t)(uintptr_t)mbar,
                                (size_t)(uintptr_t)gsrc,
@@ -546,17 +618,23 @@ inline void vx_dxa_bulk_load_multicast(void* dst, const void* gsrc, uint32_t siz
       :
       : "i"(VX_DXA_EXT_OPCODE), "i"(VX_DXA_FUNCT7), "r"(a0), "r"(a1)
       : "memory");
+#endif
 }
 
 // cp.async.bulk.prefetch.L2.global: reads [gsrc, gsrc + size) into the L2.
 // funct3 = 4: rs1 = wgather(0, 0, gsrc, size), rs2 = x0.
 inline void vx_dxa_prefetch_l2(const void* gsrc, uint32_t size) {
+#if VX_CFG_H100_FE_ENABLED
+  __VX_DXA_UR(4, (size_t)0, (size_t)0, (size_t)(uintptr_t)gsrc, (size_t)size,
+              0, 0, 0, 0);
+#else
   const size_t a0 = vx_wgather((size_t)0, (size_t)0, (size_t)(uintptr_t)gsrc, (size_t)size);
   __asm__ volatile (
       ".insn r %0, 4, %1, x0, %2, x0\n\t"
       :
       : "i"(VX_DXA_EXT_OPCODE), "i"(VX_DXA_FUNCT7), "r"(a0)
       : "memory");
+#endif
 }
 
 // TMA stores and reductions, PTX cp.async.bulk{,.tensor}.global.shared::cta,
@@ -582,6 +660,10 @@ inline uint32_t vx_dxa_st_ctl(uint32_t kind, uint32_t op, uint32_t type, uint32_
 }
 
 inline void __vx_dxa_store(uint32_t ctl, const void* src, size_t a1, size_t a2, size_t a3, int32_t c4) {
+#if VX_CFG_H100_FE_ENABLED
+  __VX_DXA_UR(5, (size_t)(uintptr_t)src, a1, a2, a3,
+              ((size_t)ctl << 32) | (size_t)(uint32_t)c4, (size_t)0, (size_t)0, (size_t)0);
+#else
   const size_t r1 = vx_wgather((size_t)(uintptr_t)src, a1, a2, a3);
   const size_t r2 = vx_wgather(((size_t)ctl << 32) | (size_t)(uint32_t)c4, (size_t)0, (size_t)0, (size_t)0);
   __asm__ volatile (
@@ -589,6 +671,7 @@ inline void __vx_dxa_store(uint32_t ctl, const void* src, size_t a1, size_t a2, 
       :
       : "i"(VX_DXA_EXT_OPCODE), "i"(VX_DXA_FUNCT7), "r"(r1), "r"(r2)
       : "memory");
+#endif
 }
 
 inline void __vx_dxa_store_tensor(uint32_t ctl, const void* src, int32_t c0, int32_t c1, int32_t c2, int32_t c3,
@@ -784,6 +867,10 @@ inline void vx_dxa_issue_1d_multicast_wg(uint32_t desc_slot,
                                           uint32_t coord0,
                                           uint32_t cta_mask) {
   const uint32_t meta = vx_dxa_pack_meta(desc_slot, barrier_id);
+#if __VX_DXA_UR_FORM
+  __VX_DXA_UR(0, (uint32_t)(uintptr_t)smem_addr, (size_t)meta, (size_t)coord0, (size_t)0u,
+              (size_t)0, (size_t)0, (size_t)0, (size_t)cta_mask);
+#else
   const uint32_t a0 = (uint32_t)vx_wgather((size_t)(uintptr_t)smem_addr,
                                             (size_t)meta,
                                             (size_t)coord0,
@@ -797,6 +884,7 @@ inline void vx_dxa_issue_1d_multicast_wg(uint32_t desc_slot,
       :
       : "i"(VX_DXA_EXT_OPCODE), "i"(VX_DXA_FUNCT7), "r"(a0), "r"(a1)
       : "memory");
+#endif
 }
 
 // 2D multicast: rs2 = wgather(0, 0, 0, cta_mask)
@@ -807,6 +895,10 @@ inline void vx_dxa_issue_2d_multicast_wg(uint32_t desc_slot,
                                           uint32_t coord1,
                                           uint32_t cta_mask) {
   const uint32_t meta = vx_dxa_pack_meta(desc_slot, barrier_id);
+#if __VX_DXA_UR_FORM
+  __VX_DXA_UR(0, (uint32_t)(uintptr_t)smem_addr, (size_t)meta, (size_t)coord0, (size_t)coord1,
+              (size_t)0, (size_t)0, (size_t)0, (size_t)cta_mask);
+#else
   const uint32_t a0 = (uint32_t)vx_wgather((size_t)(uintptr_t)smem_addr,
                                             (size_t)meta,
                                             (size_t)coord0,
@@ -820,6 +912,7 @@ inline void vx_dxa_issue_2d_multicast_wg(uint32_t desc_slot,
       :
       : "i"(VX_DXA_EXT_OPCODE), "i"(VX_DXA_FUNCT7), "r"(a0), "r"(a1)
       : "memory");
+#endif
 }
 
 // 3D multicast: rs2 = wgather(coord2, 0, 0, cta_mask)
@@ -831,6 +924,10 @@ inline void vx_dxa_issue_3d_multicast_wg(uint32_t desc_slot,
                                           uint32_t coord2,
                                           uint32_t cta_mask) {
   const uint32_t meta = vx_dxa_pack_meta(desc_slot, barrier_id);
+#if __VX_DXA_UR_FORM
+  __VX_DXA_UR(0, (uint32_t)(uintptr_t)smem_addr, (size_t)meta, (size_t)coord0, (size_t)coord1,
+              (size_t)coord2, (size_t)0, (size_t)0, (size_t)cta_mask);
+#else
   const uint32_t a0 = (uint32_t)vx_wgather((size_t)(uintptr_t)smem_addr,
                                             (size_t)meta,
                                             (size_t)coord0,
@@ -844,6 +941,7 @@ inline void vx_dxa_issue_3d_multicast_wg(uint32_t desc_slot,
       :
       : "i"(VX_DXA_EXT_OPCODE), "i"(VX_DXA_FUNCT7), "r"(a0), "r"(a1)
       : "memory");
+#endif
 }
 
 // 4D multicast: rs2 = wgather(coord2, coord3, 0, cta_mask)
@@ -856,6 +954,10 @@ inline void vx_dxa_issue_4d_multicast_wg(uint32_t desc_slot,
                                           uint32_t coord3,
                                           uint32_t cta_mask) {
   const uint32_t meta = vx_dxa_pack_meta(desc_slot, barrier_id);
+#if __VX_DXA_UR_FORM
+  __VX_DXA_UR(0, (uint32_t)(uintptr_t)smem_addr, (size_t)meta, (size_t)coord0, (size_t)coord1,
+              (size_t)coord2, (size_t)coord3, (size_t)0, (size_t)cta_mask);
+#else
   const uint32_t a0 = (uint32_t)vx_wgather((size_t)(uintptr_t)smem_addr,
                                             (size_t)meta,
                                             (size_t)coord0,
@@ -869,6 +971,7 @@ inline void vx_dxa_issue_4d_multicast_wg(uint32_t desc_slot,
       :
       : "i"(VX_DXA_EXT_OPCODE), "i"(VX_DXA_FUNCT7), "r"(a0), "r"(a1)
       : "memory");
+#endif
 }
 
 // 5D multicast: rs2 = wgather(coord2, coord3, coord4, cta_mask)
@@ -882,6 +985,10 @@ inline void vx_dxa_issue_5d_multicast_wg(uint32_t desc_slot,
                                           uint32_t coord4,
                                           uint32_t cta_mask) {
   const uint32_t meta = vx_dxa_pack_meta(desc_slot, barrier_id);
+#if __VX_DXA_UR_FORM
+  __VX_DXA_UR(0, (uint32_t)(uintptr_t)smem_addr, (size_t)meta, (size_t)coord0, (size_t)coord1,
+              (size_t)coord2, (size_t)coord3, (size_t)coord4, (size_t)cta_mask);
+#else
   const uint32_t a0 = (uint32_t)vx_wgather((size_t)(uintptr_t)smem_addr,
                                             (size_t)meta,
                                             (size_t)coord0,
@@ -895,6 +1002,7 @@ inline void vx_dxa_issue_5d_multicast_wg(uint32_t desc_slot,
       :
       : "i"(VX_DXA_EXT_OPCODE), "i"(VX_DXA_FUNCT7), "r"(a0), "r"(a1)
       : "memory");
+#endif
 }
 
 #ifdef VX_CFG_EXT_MBAR_ENABLE
@@ -1254,6 +1362,10 @@ inline void vx_bulk_wait_group_read() {
 inline void __vx_dxa_tload_map(uint32_t ctl, const vx_tensor_map_t* map, void* dst, uint64_t* mbar,
                                int32_t c0, int32_t c1, int32_t c2, int32_t c3, int32_t c4,
                                uint32_t o1, uint32_t o2, uint32_t o3, uint32_t cta_mask) {
+#if VX_CFG_H100_FE_ENABLED
+  __VX_DXA_UR(2, (size_t)(uintptr_t)dst, (size_t)(uintptr_t)mbar, __vx_dxa_pair(c0, c1), __vx_dxa_pair(c2, c3),
+              ((size_t)(ctl | (1u << DXA_TL_CTL_MAP_LSB)) << 32) | (size_t)(uint32_t)c4, ((size_t)(o3 & 0xFFFFu) << 48) | ((size_t)(o2 & 0xFFFFu) << 32) | ((size_t)(o1 & 0xFFFFu) << 16) | (size_t)(cta_mask & 0xFFFFu), (size_t)(uintptr_t)map, (size_t)0);
+#else
   const size_t a0 = vx_wgather((size_t)(uintptr_t)dst,
                                (size_t)(uintptr_t)mbar,
                                __vx_dxa_pair(c0, c1),
@@ -1268,6 +1380,7 @@ inline void __vx_dxa_tload_map(uint32_t ctl, const vx_tensor_map_t* map, void* d
       :
       : "i"(VX_DXA_EXT_OPCODE), "i"(VX_DXA_FUNCT7), "r"(a0), "r"(a1)
       : "memory");
+#endif
 }
 
 inline void vx_dxa_load_1d(const vx_tensor_map_t* map, void* dst, uint64_t* mbar, int32_t c0) {
@@ -1460,6 +1573,10 @@ inline void vx_dxa_prefetch_im2col_5d(const vx_tensor_map_t* map, int32_t c0, in
 
 inline void __vx_dxa_store_tensor_map(uint32_t ctl, const vx_tensor_map_t* map, const void* src, int32_t c0,
                                       int32_t c1, int32_t c2, int32_t c3, int32_t c4) {
+#if VX_CFG_H100_FE_ENABLED
+  __VX_DXA_UR(5, (size_t)(uintptr_t)src, __vx_dxa_pair(c0, c1), __vx_dxa_pair(c2, c3), (size_t)0,
+              ((size_t)(ctl | (1u << DXA_ST_CTL_MAP_LSB)) << 32) | (size_t)(uint32_t)c4, (size_t)(uintptr_t)map, (size_t)0, (size_t)0);
+#else
   const size_t r1 = vx_wgather((size_t)(uintptr_t)src, __vx_dxa_pair(c0, c1), __vx_dxa_pair(c2, c3), (size_t)0);
   const size_t r2 = vx_wgather(((size_t)(ctl | (1u << DXA_ST_CTL_MAP_LSB)) << 32) | (size_t)(uint32_t)c4,
                                (size_t)(uintptr_t)map, (size_t)0, (size_t)0);
@@ -1468,6 +1585,7 @@ inline void __vx_dxa_store_tensor_map(uint32_t ctl, const vx_tensor_map_t* map, 
       :
       : "i"(VX_DXA_EXT_OPCODE), "i"(VX_DXA_FUNCT7), "r"(r1), "r"(r2)
       : "memory");
+#endif
 }
 
 inline void vx_dxa_store_1d(const vx_tensor_map_t* map, const void* src, int32_t c0) {
@@ -1536,8 +1654,12 @@ inline void vx_dxa_reduce_im2col_5d(const vx_tensor_map_t* map, const void* src,
 // prefetch{.param,.const,.global}.tensormap [map]: brings the map into the
 // descriptor cache; the warp does not wait. funct3 7, rs1 = map, rs2 field 0.
 inline void vx_prefetch_tensormap(const vx_tensor_map_t* map) {
+#if VX_CFG_H100_FE_ENABLED
+  __VX_DXA_UR_TMAP(0, map);
+#else
   __asm__ volatile (".insn r %0, 7, %1, x0, %2, x0"
                     :: "i"(VX_DXA_EXT_OPCODE), "i"(VX_DXA_FUNCT7), "r"(map) : "memory");
+#endif
 }
 
 // fence.proxy.tensormap::generic.acquire.{cta,cluster,gpu,sys} [map], 128:
@@ -1545,8 +1667,12 @@ inline void vx_prefetch_tensormap(const vx_tensor_map_t* map) {
 // operations (and its block's, after a block barrier) read it again. Each
 // block that uses a rewritten map acquires it itself. rs2 field 1.
 inline void vx_fence_proxy_tensormap_acquire(const vx_tensor_map_t* map) {
+#if VX_CFG_H100_FE_ENABLED
+  __VX_DXA_UR_TMAP(1, map);
+#else
   __asm__ volatile (".insn r %0, 7, %1, x0, %2, x1"
                     :: "i"(VX_DXA_EXT_OPCODE), "i"(VX_DXA_FUNCT7), "r"(map) : "memory");
+#endif
 }
 
 // fence.proxy.tensormap::generic.release.{cta,cluster,gpu,sys}: the warp's

@@ -52,6 +52,10 @@ module VX_cpc import VX_gpu_pkg::*, VX_tlb_pkg::*; #(
     VX_dlmem_bus_if.master      dlmem_rsp_up_if [TPCS_PER_CPC],
     VX_dlmem_bus_if.slave       dlmem_rsp_down_if [TPCS_PER_CPC],
 `endif
+`ifdef DXA_TMAP_L2_ENABLE
+    VX_tmap_l2_bus_if.master    tmap_l2_bus_if [TPCS_PER_CPC],
+`endif
+`line 55 "VX_cpc.sv" 0
 
     output wire [TPCS_PER_CPC-1:0] busy
 );
@@ -123,6 +127,10 @@ module VX_cpc import VX_gpu_pkg::*, VX_tlb_pkg::*; #(
             .dlmem_rsp_up_if   (dlmem_rsp_up_if[t]),
             .dlmem_rsp_down_if (dlmem_rsp_down_if[t]),
         `endif
+        `ifdef DXA_TMAP_L2_ENABLE
+            .tmap_l2_bus_if    (tmap_l2_bus_if[t]),
+        `endif
+`line 104 "VX_cpc.sv" 0
 
             .busy           (busy[t])
         );

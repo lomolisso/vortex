@@ -66,6 +66,10 @@ module VX_bg_unit_top import VX_gpu_pkg::*, VX_dxa_pkg::*; (
         .seq          (seq_w),
         .rd_pending   (rd_pending),
         .wr_pending   (wr_pending),
+    `ifdef VX_CFG_H100_FE_ENABLE
+        .rel_valid    (1'b0),
+        .rel_wid      ('0),
+    `endif
         .unlock_if    (unlock_if)
     );
 

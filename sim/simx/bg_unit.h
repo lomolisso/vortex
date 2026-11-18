@@ -22,6 +22,18 @@
 
 namespace vortex {
 
+#ifdef VX_CFG_H100_FE_ENABLE
+struct DxaBgRel {
+  uint32_t wid = 0;
+};
+
+inline std::ostream& operator<<(std::ostream& os, const DxaBgRel& r) {
+  return os << "wid=" << r.wid;
+}
+
+#else
+#line 24
+#endif
 // The bulk async-groups of one core, per warp. Each group slot, indexed by
 // its sequence number, counts the operations whose local-memory reads and
 // whose global writes are still pending; the open group is the slot after the
@@ -38,6 +50,11 @@ public:
   SimChannel<DxaBgCompl> ComplIn;    // from the socket's engine, always accepted
   SimChannel<DxaBgState> StateOut;   // a warp's registered state, when it changes
   SimChannel<uint32_t>   UnlockOut;  // a warp whose wait is satisfied
+#ifdef VX_CFG_H100_FE_ENABLE
+  SimChannel<DxaBgRel>   RelIn;      // from the DXA unit: a UR-form op's warp, released at the op's accept
+#else
+#line 40
+#endif
 
   BgUnit(const SimContext& ctx, const char* name);
 

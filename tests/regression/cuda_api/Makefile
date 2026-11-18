@@ -26,7 +26,7 @@ VX_HDRS := $(SRC_DIR)/common.h $(SW_COMMON_DIR)/vx_cuda_fp.h $(SW_COMMON_DIR)/dx
 
 # vx_cuda.h builds the DXA operands in x30/x31 (t5/t6): the wgather that
 # broadcasts them also writes the parked lanes' destination register.
-VX_CFLAGS += -ffixed-x30 -ffixed-x31 -DVX_CUDA_FIXED_TEMPS
+VX_CFLAGS += $(VX_CUDA_FIXED_FLAGS)
 
 # vortex2 = the KMU kernel runtime, providing _start and __vx_cta_entry.
 KERNEL_LIB := vortex2

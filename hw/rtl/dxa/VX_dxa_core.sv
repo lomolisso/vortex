@@ -35,6 +35,11 @@ module VX_dxa_core import VX_gpu_pkg::*, VX_dxa_pkg::*; #(
     // Bulk-group completion events, per requesting core, never refused.
     output wire [`VX_CFG_SOCKET_SIZE-1:0] bg_compl_valid,
     output dxa_bg_compl_t [`VX_CFG_SOCKET_SIZE-1:0] bg_compl,
+`ifdef DXA_TMAP_L2_ENABLE
+    // The cluster's level-2 tensor-map cache.
+    VX_tmap_l2_bus_if.master tmap_l2_bus_if,
+`endif
+`line 38 "VX_dxa_core.sv" 0
 `endif
     output wire busy
 );
@@ -167,6 +172,12 @@ module VX_dxa_core import VX_gpu_pkg::*, VX_dxa_pkg::*; #(
     // returns, then looks the head up again as a hit. A tensormap prefetch pops
     // on a hit, an invalidate in its IDLE cycle; neither reaches dispatch.
     localparam FETCH_IDLE = 2'd0, FETCH_PRESENT = 2'd1, FETCH_MAP = 2'd2;
+`ifdef DXA_TMAP_L2_ENABLE
+    // A level-1 miss asks level 2 first (L2), and reads the lines (MAP) only
+    // on its miss.
+    localparam FETCH_L2 = 2'd3;
+`endif
+`line 170 "VX_dxa_core.sv" 0
     reg [1:0] fetch_state_r;
 
     VX_dxa_worker_req_if dispatch_in_if[1]();
@@ -208,7 +219,24 @@ module VX_dxa_core import VX_gpu_pkg::*, VX_dxa_pkg::*; #(
         `UNUSED_PIN (onehot_out),
         .valid_out  (tm_has_free)
     );
+`ifdef DXA_TMAP_L2_ENABLE
+    // LRU: an entry's age is the number of entries used since it was; the
+    // oldest has age ENTRIES - 1.
+    reg [DXA_TMAP_ENTRIES-1:0][DXA_TMAP_IDX_W-1:0] tm_age_r;
+    reg [DXA_TMAP_IDX_W-1:0] tm_lru_idx;
+    always @(*) begin
+        tm_lru_idx = '0;
+        for (integer e = 0; e < DXA_TMAP_ENTRIES; ++e) begin
+            if (tm_age_r[e] == DXA_TMAP_IDX_W'(DXA_TMAP_ENTRIES - 1))
+                tm_lru_idx = DXA_TMAP_IDX_W'(e);
+        end
+    end
+    wire [DXA_TMAP_IDX_W-1:0] tm_victim = tm_has_free ? tm_free_idx
+                                        : ((`VX_CFG_TMAP_L1_REPL == 0) ? tm_rr_r : tm_lru_idx);
+`else
     wire [DXA_TMAP_IDX_W-1:0] tm_victim = tm_has_free ? tm_free_idx : tm_rr_r;
+`endif
+`line 212 "VX_dxa_core.sv" 0
 
     // Every launch writes the KMU state: maps are reread per launch and the
     // victim order restarts.
@@ -222,7 +250,14 @@ module VX_dxa_core import VX_gpu_pkg::*, VX_dxa_pkg::*; #(
     reg tm_kill_r;
 
     wire idle_q     = (fetch_state_r == FETCH_IDLE) && q_valid;
+`ifdef DXA_TMAP_L2_ENABLE
+    // An invalidate pops once level 2 has taken it too.
+    wire l2_inv_ready;
+    wire tm_inv_pop = idle_q && q_map && q_inv && l2_inv_ready;
+`else
     wire tm_inv_pop = idle_q && q_map && q_inv;
+`endif
+`line 226 "VX_dxa_core.sv" 0
     wire tm_pf_pop  = idle_q && q_map && q_pf && (tm_hit || tm_kill_r);
     wire tm_miss    = idle_q && q_map && ~q_inv && ~tm_hit && ~(q_pf && tm_kill_r);
     wire tm_present = idle_q && (~q_map || (~q_inv && ~q_pf && tm_hit));
@@ -275,6 +310,180 @@ module VX_dxa_core import VX_gpu_pkg::*, VX_dxa_pkg::*; #(
     wire tm_req_ready;
     wire tm_req_fire  = tm_req_valid && tm_req_ready;
 
+`ifdef DXA_TMAP_L2_ENABLE
+    // A level-2 hit enters level 1 when its last beat arrives; MISS reads the
+    // lines on the GMEM port and fills level 2 with each.
+    reg                 l2_sent_r;
+    reg [TM_LINE_W-1:0] l2_beat_r;
+    wire l2_state   = (fetch_state_r == FETCH_L2);
+    wire l2_rsp_pre = (tmap_l2_bus_if.rsp_data.kind == TMAP_L2_PRELOAD_K);
+    wire l2_rsp_mis = (tmap_l2_bus_if.rsp_data.kind == TMAP_L2_MISS_K);
+    wire l2_beat_v  = l2_state && tmap_l2_bus_if.rsp_valid && ~l2_rsp_pre && ~l2_rsp_mis;
+    wire l2_beat    = l2_beat_v && tm_fill_ready;
+    wire l2_miss    = l2_state && tmap_l2_bus_if.rsp_valid && l2_rsp_mis && tm_fill_ready;
+    wire l2_preload = tmap_l2_bus_if.rsp_valid && l2_rsp_pre && tm_fill_ready;
+    wire l2_enter   = l2_beat && tmap_l2_bus_if.rsp_data.last;
+    wire l2_look_fire;
+    wire l2_mfill_ready;
+    assign tmap_l2_bus_if.rsp_ready = tm_fill_ready;
+
+    wire                     tm_rsp_valid;
+    wire [TM_CL*8-1:0]       tm_rsp_data;
+    wire [TM_LINE_W-1:0]     tm_rsp_line;
+    // A fetched line leaves once level 2 has it too (unless the fetch is dead).
+    wire tm_rsp_fire = tm_rsp_valid && tm_fill_ready && (tm_kill_r || l2_mfill_ready);
+    wire tm_rsp_last = tm_rsp_fire && ((tm_rsp_cnt_r + TM_CNT_W'(1)) == tm_nlines);
+    wire tm_fill_last = tm_rsp_last || l2_enter;
+
+    // Word j of the map sits in line (off + 4j) / CL of the fetch or of the
+    // level-2 answer, whose beats are the same lines in order.
+    wire [TM_LINE_W-1:0] tm_wr_line = l2_beat_v ? l2_beat_r : tm_rsp_line;
+    wire [TM_CL*8-1:0]   tm_wr_data = l2_beat_v ? tmap_l2_bus_if.rsp_data.data : tm_rsp_data;
+    assign tm_fill_valid = tm_rsp_valid || l2_beat_v;
+    assign tm_fill_entry = tm_vict_r;
+    for (genvar j = 0; j < TM_STRIDE; ++j) begin : g_tm_fill
+        wire [31:0] pos = 32'(tm_off) + 32'(j * 4);
+        assign tm_fill_wren[j] = tm_fill_valid && (TM_LINE_W'(pos >> TM_LG_CL) == tm_wr_line);
+        assign tm_fill_wdata[j*32 +: 32] = tm_wr_data[((pos % TM_CL) / 4) * 32 +: 32];
+    end
+
+    wire tm_touch = (idle_q && q_map && ~q_inv && tm_hit) || (tm_fill_last && ~tm_kill_r);
+    wire [DXA_TMAP_IDX_W-1:0] tm_touch_idx = (fetch_state_r == FETCH_IDLE) ? tm_hit_idx : tm_vict_r;
+
+    always @(posedge clk) begin
+        if (reset) begin
+            fetch_state_r <= FETCH_IDLE;
+            tm_valid_r    <= '0;
+            tm_rr_r       <= '0;
+            tm_kill_r     <= 1'b0;
+            for (integer e = 0; e < DXA_TMAP_ENTRIES; ++e)
+                tm_age_r[e] <= DXA_TMAP_IDX_W'(e);
+        end else begin
+            case (fetch_state_r)
+                FETCH_IDLE: begin
+                    if (tm_present) fetch_state_r <= FETCH_PRESENT;
+                    if (tm_miss)    fetch_state_r <= FETCH_L2;
+                end
+                FETCH_PRESENT: if (head_go) fetch_state_r <= FETCH_IDLE;
+                FETCH_L2: begin
+                    if (l2_enter) fetch_state_r <= FETCH_IDLE;
+                    if (l2_miss)  fetch_state_r <= FETCH_MAP;
+                end
+                default: if (tm_rsp_last) fetch_state_r <= FETCH_IDLE;
+            endcase
+            if (tm_miss) begin
+                tm_valid_r[tm_victim] <= 1'b0;
+                if (~tm_has_free)
+                    tm_rr_r <= tm_rr_r + DXA_TMAP_IDX_W'(1);
+            end
+            if (tm_inv_pop)
+                tm_valid_r <= tm_valid_r & ~tm_match;
+            if (tm_fill_last && ~tm_kill_r)
+                tm_valid_r[tm_vict_r] <= 1'b1;
+            if (tm_launch) begin
+                tm_valid_r <= '0;
+                tm_rr_r    <= '0;
+            end
+            if (tm_launch && (tm_miss || fetch_state_r[1]))
+                tm_kill_r <= 1'b1;
+            else if (fetch_state_r == FETCH_IDLE)
+                tm_kill_r <= 1'b0;
+            if (tm_touch) begin
+                for (integer e = 0; e < DXA_TMAP_ENTRIES; ++e) begin
+                    if (tm_age_r[e] < tm_age_r[tm_touch_idx])
+                        tm_age_r[e] <= tm_age_r[e] + DXA_TMAP_IDX_W'(1);
+                end
+                tm_age_r[tm_touch_idx] <= '0;
+            end
+        end
+        if (tm_present)
+            tm_cur_r <= tm_hit_idx;
+        if (tm_miss) begin
+            tm_vict_r    <= tm_victim;
+            tm_req_cnt_r <= '0;
+            tm_rsp_cnt_r <= '0;
+            l2_sent_r    <= 1'b0;
+            l2_beat_r    <= '0;
+        end else if (l2_state) begin
+            if (l2_look_fire)
+                l2_sent_r <= 1'b1;
+            if (l2_beat)
+                l2_beat_r <= l2_beat_r + TM_LINE_W'(1);
+        end
+        if (tm_req_fire)
+            tm_req_cnt_r <= tm_req_cnt_r + TM_CNT_W'(1);
+        if (tm_rsp_fire)
+            tm_rsp_cnt_r <= tm_rsp_cnt_r + TM_CNT_W'(1);
+        if (tm_fill_last)
+            tm_tag_r[tm_vict_r] <= q_tm.addr;
+    end
+
+    // ---- The launch's parameter window, read by port 0's core into level 2 ----
+    localparam PRE_W  = `CLOG2(`VX_CFG_TMAP_PARAM_BYTES / TM_CL + 2);
+    // The port tag has no room for a window line's index: a read carries its
+    // slot (index mod TMAP_PARAM_READS), and a slot is reused once answered.
+    localparam PRE_K  = `VX_CFG_TMAP_PARAM_READS;
+    localparam PRE_SW = `CLOG2(PRE_K);
+    `STATIC_ASSERT (PRE_K >= 2 && `IS_POW2(PRE_K), ("TMAP_PARAM_READS must be a power of two >= 2"))
+    reg                   pre_active_r;
+    reg [TM_LADDR_W-1:0]  pre_first_r;
+    reg [PRE_W-1:0]       pre_lines_r, pre_sent_r;
+    reg [PRE_K-1:0]       pre_busy_r;
+    // Reads issued before the latest PRELOAD: a launch's window replaces the
+    // last one's, so their answers free the slot and fill nothing.
+    reg [PRE_K-1:0]       pre_stale_r;
+    reg [PRE_K-1:0][PRE_W-1:0] pre_idx_r;
+    wire [PRE_SW-1:0]     pre_slot      = PRE_SW'(pre_sent_r);
+    wire                  pre_req_valid = pre_active_r && ~tm_req_valid && ~pre_busy_r[pre_slot];
+    wire                  pre_req_ready;
+    wire [TM_LADDR_W-1:0] pre_req_addr  = pre_first_r + TM_LADDR_W'(pre_sent_r);
+    wire                  pre_req_fire  = pre_req_valid && pre_req_ready;
+    wire                  tm_pre_rsp_valid;
+    wire [TM_CL*8-1:0]    tm_pre_rsp_data;
+    wire [PRE_SW-1:0]     tm_pre_rsp_slot;
+    wire [PRE_W-1:0]      tm_pre_rsp_idx = pre_idx_r[tm_pre_rsp_slot];
+    wire                  tm_pre_rsp_ready;
+    wire                  tm_pre_rsp_stale = pre_stale_r[tm_pre_rsp_slot];
+    wire [PRE_K-1:0]      pre_fire_m = pre_req_fire ? (PRE_K'(1) << pre_slot) : '0;
+    wire [PRE_K-1:0]      pre_rsp_m  = (tm_pre_rsp_valid && tm_pre_rsp_ready) ? (PRE_K'(1) << tm_pre_rsp_slot) : '0;
+    wire [`VX_CFG_MEM_ADDR_WIDTH-1:0] l2_pre_win = tmap_l2_bus_if.rsp_data.addr;
+
+    always @(posedge clk) begin
+        if (reset) begin
+            pre_active_r <= 1'b0;
+        end else if (l2_preload) begin
+            pre_active_r <= 1'b1;
+        end else if (pre_req_fire && ((pre_sent_r + PRE_W'(1)) == pre_lines_r)) begin
+            pre_active_r <= 1'b0;
+        end
+        if (reset) begin
+            pre_stale_r <= '0;
+        end else begin
+            pre_stale_r <= (l2_preload ? (pre_busy_r | pre_fire_m) : pre_stale_r) & ~pre_rsp_m;
+        end
+        if (reset) begin
+            pre_busy_r <= '0;
+        end else begin
+            if (pre_req_fire)
+                pre_busy_r[pre_slot] <= 1'b1;
+            if (tm_pre_rsp_valid && tm_pre_rsp_ready)
+                pre_busy_r[tm_pre_rsp_slot] <= 1'b0;
+        end
+        if (pre_req_fire)
+            pre_idx_r[pre_slot] <= pre_sent_r;
+        if (l2_preload) begin
+            pre_first_r <= l2_pre_win[`VX_CFG_MEM_ADDR_WIDTH-1:TM_LG_CL];
+            pre_lines_r <= PRE_W'((32'(l2_pre_win[TM_LG_CL-1:0]) + `VX_CFG_TMAP_PARAM_BYTES + TM_CL - 1) / TM_CL);
+            pre_sent_r  <= '0;
+        end else if (pre_req_fire) begin
+            pre_sent_r  <= pre_sent_r + PRE_W'(1);
+        end
+    end
+
+    // The fetch port carries the map's line reads, then the window's.
+    wire                  tm_port_valid = tm_req_valid || pre_req_valid;
+    wire [TM_LADDR_W-1:0] tm_port_addr  = tm_req_valid ? (tm_first + TM_LADDR_W'(tm_req_cnt_r)) : pre_req_addr;
+`else
     wire                     tm_rsp_valid;
     wire [TM_CL*8-1:0]       tm_rsp_data;
     wire [TM_LINE_W-1:0]     tm_rsp_line;
@@ -337,6 +546,8 @@ module VX_dxa_core import VX_gpu_pkg::*, VX_dxa_pkg::*; #(
         if (tm_rsp_last)
             tm_tag_r[tm_vict_r] <= q_tm.addr;
     end
+`endif
+`line 340 "VX_dxa_core.sv" 0
 
     // ---- Map decode at the head ----
     // A map's rank, its 40-bit strides and, for a map-typed reduction, its
@@ -679,6 +890,54 @@ module VX_dxa_core import VX_gpu_pkg::*, VX_dxa_pkg::*; #(
         .TAG_WIDTH (TM_PORT_TAG_W)
     ) tm_bus_if();
 
+`ifdef DXA_TMAP_L2_ENABLE
+    assign tm_bus_if.req_valid            = tm_port_valid;
+    assign tm_bus_if.req_data.rw          = 1'b0;
+    assign tm_bus_if.req_data.addr        = tm_port_addr;
+    assign tm_bus_if.req_data.data        = '0;
+    assign tm_bus_if.req_data.byteen      = {`VX_CFG_L1_LINE_SIZE{1'b1}};
+    assign tm_bus_if.req_data.attr        = '0;
+    assign tm_bus_if.req_data.tag.uuid    = '0;
+    localparam TM_CW = TM_VAL_W - 1 - TM_ARB_SEL_BITS;
+    // A window read sets the count field's top bit; a map read's line index
+    // never reaches it.
+    `STATIC_ASSERT (TM_CW > PRE_SW, ("DXA GMEM tag has no room for the parameter-window read slots"))
+    wire [TM_CW-1:0] tm_port_cnt = tm_req_valid ? TM_CW'(tm_req_cnt_r) : {1'b1, (TM_CW-1)'(pre_slot)};
+    wire tm_rsp_pre = tm_bus_if.rsp_data.tag.value[TM_VAL_W-2];
+    if (TM_ARB_SEL_BITS != 0) begin : g_tm_tag_core
+        assign tm_bus_if.req_data.tag.value = {1'b1, tm_port_cnt, TM_ARB_SEL_BITS'(0)};
+        assign tm_rsp_line    = TM_LINE_W'(tm_bus_if.rsp_data.tag.value[TM_VAL_W-2:TM_ARB_SEL_BITS]);
+        assign tm_pre_rsp_slot = PRE_SW'(tm_bus_if.rsp_data.tag.value[TM_VAL_W-3:TM_ARB_SEL_BITS]);
+    end else begin : g_tm_tag
+        assign tm_bus_if.req_data.tag.value = {1'b1, tm_port_cnt};
+        assign tm_rsp_line    = TM_LINE_W'(tm_bus_if.rsp_data.tag.value);
+        assign tm_pre_rsp_slot = PRE_SW'(tm_bus_if.rsp_data.tag.value[TM_VAL_W-3:0]);
+    end
+    // A worker's store fence sets the fetch bit with the count field's top bit
+    // clear and the next one set, above any map line count: it goes back to the workers.
+    `STATIC_ASSERT (TM_CNT_W <= TM_CW - 2, ("DXA GMEM tag has no room for the store fences"))
+    wire [TM_VAL_W-1:0] gmem_rsp_v = gmem_blk_if[0].rsp_data.tag.value;
+    wire gmem_rsp_tm = gmem_rsp_v[TM_VAL_W-1] && (gmem_rsp_v[TM_VAL_W-2] || ~gmem_rsp_v[TM_VAL_W-3]);
+
+    assign gmem_blk_if[0].req_valid = tm_port_valid || gmem_arb_out_if[0].req_valid;
+    assign gmem_blk_if[0].req_data  = tm_port_valid ? tm_bus_if.req_data : gmem_arb_out_if[0].req_data;
+    assign gmem_arb_out_if[0].req_ready = gmem_blk_if[0].req_ready && ~tm_port_valid;
+    assign tm_bus_if.req_ready = gmem_blk_if[0].req_ready;
+    assign gmem_arb_out_if[0].rsp_valid = gmem_blk_if[0].rsp_valid && ~gmem_rsp_tm;
+    assign gmem_arb_out_if[0].rsp_data  = gmem_blk_if[0].rsp_data;
+    assign tm_bus_if.rsp_valid = gmem_blk_if[0].rsp_valid && gmem_rsp_tm;
+    assign tm_bus_if.rsp_data  = gmem_blk_if[0].rsp_data;
+    assign tm_bus_if.rsp_ready = tm_rsp_pre ? tm_pre_rsp_ready : (tm_fill_ready && (tm_kill_r || l2_mfill_ready));
+    assign gmem_blk_if[0].rsp_ready = gmem_rsp_tm ? tm_bus_if.rsp_ready : gmem_arb_out_if[0].rsp_ready;
+
+    assign tm_req_ready     = tm_bus_if.req_ready;
+    assign pre_req_ready    = tm_bus_if.req_ready && ~tm_req_valid;
+    assign tm_rsp_valid     = tm_bus_if.rsp_valid && ~tm_rsp_pre;
+    assign tm_rsp_data      = tm_bus_if.rsp_data.data;
+    assign tm_pre_rsp_valid = tm_bus_if.rsp_valid && tm_rsp_pre;
+    assign tm_pre_rsp_data  = tm_bus_if.rsp_data.data;
+    `UNUSED_VAR (tm_bus_if.rsp_data.tag)
+`else
     assign tm_bus_if.req_valid            = tm_req_valid;
     assign tm_bus_if.req_data.rw          = 1'b0;
     assign tm_bus_if.req_data.addr        = tm_first + TM_LADDR_W'(tm_req_cnt_r);
@@ -712,6 +971,8 @@ module VX_dxa_core import VX_gpu_pkg::*, VX_dxa_pkg::*; #(
     assign tm_rsp_valid = tm_bus_if.rsp_valid;
     assign tm_rsp_data  = tm_bus_if.rsp_data.data;
     `UNUSED_VAR (tm_bus_if.rsp_data.tag)
+`endif
+`line 715 "VX_dxa_core.sv" 0
 
     for (genvar i = 1; i < GMEM_OUT_PORTS; ++i) begin : g_gmem_pass
         assign gmem_blk_if[i].req_valid     = gmem_arb_out_if[i].req_valid;
@@ -757,6 +1018,48 @@ module VX_dxa_core import VX_gpu_pkg::*, VX_dxa_pkg::*; #(
         .TAG_WIDTH (TM_PORT_TAG_W)
     ) tm_bus_if();
 
+`ifdef DXA_TMAP_L2_ENABLE
+    assign tm_bus_if.req_valid            = tm_port_valid;
+    assign tm_bus_if.req_data.rw          = 1'b0;
+    assign tm_bus_if.req_data.addr        = tm_port_addr;
+    assign tm_bus_if.req_data.data        = '0;
+    assign tm_bus_if.req_data.byteen      = {`VX_CFG_L1_LINE_SIZE{1'b1}};
+    assign tm_bus_if.req_data.attr        = '0;
+    assign tm_bus_if.req_data.tag.uuid    = '0;
+    localparam TM_CW = TM_VAL_W - 1;
+    // A window read sets the count field's top bit; a map read's line index
+    // never reaches it.
+    `STATIC_ASSERT (TM_CW > PRE_SW, ("DXA GMEM tag has no room for the parameter-window read slots"))
+    wire [TM_CW-1:0] tm_port_cnt = tm_req_valid ? TM_CW'(tm_req_cnt_r) : {1'b1, (TM_CW-1)'(pre_slot)};
+    wire tm_rsp_pre = tm_bus_if.rsp_data.tag.value[TM_VAL_W-2];
+    assign tm_bus_if.req_data.tag.value = {1'b1, tm_port_cnt};
+    assign tm_rsp_line    = TM_LINE_W'(tm_bus_if.rsp_data.tag.value);
+    assign tm_pre_rsp_slot = PRE_SW'(tm_bus_if.rsp_data.tag.value[TM_VAL_W-3:0]);
+    // A worker's store fence sets the fetch bit with the count field's top bit
+    // clear and the next one set, above any map line count: it goes back to the workers.
+    `STATIC_ASSERT (TM_CNT_W <= TM_CW - 2, ("DXA GMEM tag has no room for the store fences"))
+    wire [TM_VAL_W-1:0] gmem_rsp_v = gmem_bus_if[0].rsp_data.tag.value;
+    wire gmem_rsp_tm = gmem_rsp_v[TM_VAL_W-1] && (gmem_rsp_v[TM_VAL_W-2] || ~gmem_rsp_v[TM_VAL_W-3]);
+
+    assign gmem_bus_if[0].req_valid = tm_port_valid || gmem_arb_out_if[0].req_valid;
+    assign gmem_bus_if[0].req_data  = tm_port_valid ? tm_bus_if.req_data : gmem_arb_out_if[0].req_data;
+    assign gmem_arb_out_if[0].req_ready = gmem_bus_if[0].req_ready && ~tm_port_valid;
+    assign tm_bus_if.req_ready = gmem_bus_if[0].req_ready;
+    assign gmem_arb_out_if[0].rsp_valid = gmem_bus_if[0].rsp_valid && ~gmem_rsp_tm;
+    assign gmem_arb_out_if[0].rsp_data  = gmem_bus_if[0].rsp_data;
+    assign tm_bus_if.rsp_valid = gmem_bus_if[0].rsp_valid && gmem_rsp_tm;
+    assign tm_bus_if.rsp_data  = gmem_bus_if[0].rsp_data;
+    assign tm_bus_if.rsp_ready = tm_rsp_pre ? tm_pre_rsp_ready : (tm_fill_ready && (tm_kill_r || l2_mfill_ready));
+    assign gmem_bus_if[0].rsp_ready = gmem_rsp_tm ? tm_bus_if.rsp_ready : gmem_arb_out_if[0].rsp_ready;
+
+    assign tm_req_ready     = tm_bus_if.req_ready;
+    assign pre_req_ready    = tm_bus_if.req_ready && ~tm_req_valid;
+    assign tm_rsp_valid     = tm_bus_if.rsp_valid && ~tm_rsp_pre;
+    assign tm_rsp_data      = tm_bus_if.rsp_data.data;
+    assign tm_pre_rsp_valid = tm_bus_if.rsp_valid && tm_rsp_pre;
+    assign tm_pre_rsp_data  = tm_bus_if.rsp_data.data;
+    `UNUSED_VAR (tm_bus_if.rsp_data.tag)
+`else
     assign tm_bus_if.req_valid            = tm_req_valid;
     assign tm_bus_if.req_data.rw          = 1'b0;
     assign tm_bus_if.req_data.addr        = tm_first + TM_LADDR_W'(tm_req_cnt_r);
@@ -784,6 +1087,8 @@ module VX_dxa_core import VX_gpu_pkg::*, VX_dxa_pkg::*; #(
     assign tm_rsp_data  = tm_bus_if.rsp_data.data;
     assign tm_rsp_line  = TM_LINE_W'(tm_bus_if.rsp_data.tag.value);
     `UNUSED_VAR (tm_bus_if.rsp_data.tag)
+`endif
+`line 787 "VX_dxa_core.sv" 0
 
     for (genvar i = 1; i < GMEM_OUT_PORTS; ++i) begin : g_gmem_pass
         assign gmem_bus_if[i].req_valid     = gmem_arb_out_if[i].req_valid;
@@ -894,7 +1199,12 @@ module VX_dxa_core import VX_gpu_pkg::*, VX_dxa_pkg::*; #(
     end
     wire [NUM_REQS-1:0] core_admit_fire;
     for (genvar i = 0; i < NUM_REQS; ++i) begin : g_core_admit
+    `ifdef DXA_FE_PIPE
+        // One request per core waits ahead of the setup, which takes it while the previous copy's front runs.
+        wire admit = ~core_pend_r[i];
+    `else
         wire admit = ~core_pend_r[i] && worker_idle[i];
+    `endif
         assign arb_in_bus_if[i].req_valid = core_q_bus_if[i].req_valid && admit;
         assign arb_in_bus_if[i].req_data  = core_q_bus_if[i].req_data;
         assign core_q_bus_if[i].req_ready = arb_in_bus_if[i].req_ready && admit;
@@ -981,4 +1291,89 @@ module VX_dxa_core import VX_gpu_pkg::*, VX_dxa_pkg::*; #(
     end
 `endif
 
+`ifdef DXA_TMAP_L2_ENABLE
+
+    // ================================================================
+    // Level-2 requests: a launch's flush, then window lines, then the head's
+    // invalidate, lookup or fetched lines (the fetch state allows one of them)
+    // ================================================================
+    wire dcr_wr = dcr_bus_if.req_valid && dcr_bus_if.req_data.rw;
+    wire dcr_arg0 = dcr_wr && (dcr_bus_if.req_data.addr == VX_DCR_ADDR_WIDTH'(`VX_DCR_KMU_STARTUP_ARG0));
+    wire dcr_arg1 = dcr_wr && (dcr_bus_if.req_data.addr == VX_DCR_ADDR_WIDTH'(`VX_DCR_KMU_STARTUP_ARG1));
+    reg [31:0] l2_arg_lo_r;
+    reg [`VX_CFG_MEM_ADDR_WIDTH-1:0] l2_window_r;
+    reg l2_flush_r;
+    wire l2_flush_go;
+
+    always @(posedge clk) begin
+        if (reset) begin
+            l2_flush_r <= 1'b0;
+        end else if (dcr_arg1) begin
+            l2_flush_r <= 1'b1;
+        end else if (l2_flush_go) begin
+            l2_flush_r <= 1'b0;
+        end
+        if (dcr_arg0)
+            l2_arg_lo_r <= dcr_bus_if.req_data.data;
+        if (dcr_arg1)
+            l2_window_r <= `VX_CFG_MEM_ADDR_WIDTH'({dcr_bus_if.req_data.data, l2_arg_lo_r});
+    end
+
+    wire s_flush = l2_flush_r;
+    wire s_pfill = tm_pre_rsp_valid && ~tm_pre_rsp_stale;
+    wire s_inval = idle_q && q_map && q_inv;
+    wire s_look  = l2_state && ~l2_sent_r;
+    wire s_mfill = tm_rsp_valid && tm_fill_ready && ~tm_kill_r;
+
+    tmap_l2_req_t l2_req;
+    always @(*) begin
+        l2_req = '0;
+        if (s_flush) begin
+            l2_req.op   = TMAP_L2_FLUSH;
+            l2_req.addr = l2_window_r;
+        end else if (s_pfill) begin
+            l2_req.op    = TMAP_L2_FILL;
+            l2_req.addr  = {pre_first_r + TM_LADDR_W'(tm_pre_rsp_idx), TM_LG_CL'(0)};
+            l2_req.param = 1'b1;
+            l2_req.data  = tm_pre_rsp_data;
+        end else if (s_inval || s_look) begin
+            l2_req.op   = s_inval ? TMAP_L2_INVAL : TMAP_L2_LOOKUP;
+            l2_req.addr = tm_byte;
+        end else begin
+            l2_req.op   = TMAP_L2_FILL;
+            l2_req.addr = {tm_first + TM_LADDR_W'(tm_rsp_line), TM_LG_CL'(0)};
+            l2_req.data = tm_rsp_data;
+        end
+    end
+
+    assign tmap_l2_bus_if.req_valid = s_flush || s_pfill || s_inval || s_look || s_mfill;
+    assign tmap_l2_bus_if.req_data  = l2_req;
+
+    wire l2_head_ready = ~s_flush && ~s_pfill && tmap_l2_bus_if.req_ready;
+    assign l2_flush_go      = s_flush && tmap_l2_bus_if.req_ready;
+    assign tm_pre_rsp_ready = tm_pre_rsp_stale || (~s_flush && tmap_l2_bus_if.req_ready);
+    assign l2_inv_ready     = l2_head_ready;
+    assign l2_look_fire     = s_look && l2_head_ready;
+    assign l2_mfill_ready   = l2_head_ready;
+
+`ifdef DBG_TRACE_DXA
+    always @(posedge clk) begin
+        if (~reset) begin
+            if (tm_miss)
+                `TRACE(1, ("%t: %s tmap miss: map=0x%0h\n", $time, INSTANCE_ID, tm_byte))
+            if (tm_present && q_map)
+                `TRACE(1, ("%t: %s tmap present: map=0x%0h\n", $time, INSTANCE_ID, tm_byte))
+            if (head_go && q_map)
+                `TRACE(1, ("%t: %s tmap head-go: map=0x%0h\n", $time, INSTANCE_ID, tm_byte))
+            if (l2_look_fire)
+                `TRACE(1, ("%t: %s tmap l2 lookup: map=0x%0h\n", $time, INSTANCE_ID, tm_byte))
+            if (l2_beat)
+                `TRACE(1, ("%t: %s tmap l2 beat: line=%0d, last=%b\n", $time, INSTANCE_ID, l2_beat_r,
+                    tmap_l2_bus_if.rsp_data.last))
+            if (l2_miss)
+                `TRACE(1, ("%t: %s tmap l2 miss: map=0x%0h\n", $time, INSTANCE_ID, tm_byte))
+        end
+    end
+`endif
+`endif
 endmodule

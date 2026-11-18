@@ -74,7 +74,13 @@ package VX_gpu_pkg;
     // these bits.
     localparam XREG_0      = 0;
     localparam XREG_1      = 1;
+`ifdef VX_CFG_H100_FE_ENABLE
+    // Not a shadow register: on wr_xregs it marks rd as a uniform register (UR) index.
+    localparam XREG_UR     = 2;
+    localparam NUM_XREGS   = 3;
+`else
     localparam NUM_XREGS   = 2;
+`endif
 
     localparam DV_STACK_SIZE = `UP(`VX_CFG_NUM_THREADS-1);
     localparam DV_STACK_SIZEW = `LOG2UP(DV_STACK_SIZE);
@@ -536,6 +542,105 @@ package VX_gpu_pkg;
 
     // Warp-Level Lane Gather Extension
     localparam INST_WGATHER =    4'h8; // ALU_TYPE_OTHER, alu_op[3]=1
+
+`ifdef VX_CFG_H100_FE_ENABLE
+    ///////////////////////////////////////////////////////////////////////////
+    // H100 front end: uniform registers, UR operands, warp ops.
+
+    localparam UREG_COUNT     = `VX_CFG_UREG_COUNT;
+    localparam UREG_BITS      = 6;
+    localparam UREG_ZERO      = UREG_COUNT - 1;
+    // wgmma descriptor A in this UR, B in the next.
+    localparam TCU_WG_DESC_UR = 8;
+
+    // Source slots of ur_rs; ur_quad covers rs1 and rs2.
+    localparam UR_SLOTS       = 3;
+    localparam UR_QUAD_SLOTS  = 2;
+
+    // ALU_TYPE_OTHER op_types routed to the uniform and warp-op PEs; the operation is in
+    // imm20 (alu_uniform_code, alu_warp_code). alu_op[3] is set, as for WGATHER.
+    localparam INST_ALU_FE_UNIFORM = 4'hE;
+    localparam INST_ALU_FE_WARP    = 4'hF;
+
+    localparam INST_UOP_ADD  = 4'h0;
+    localparam INST_UOP_SUB  = 4'h1;
+    localparam INST_UOP_AND  = 4'h2;
+    localparam INST_UOP_OR   = 4'h3;
+    localparam INST_UOP_XOR  = 4'h4;
+    localparam INST_UOP_SLL  = 4'h5;
+    localparam INST_UOP_SRL  = 4'h6;
+    localparam INST_UOP_SRA  = 4'h7;
+    localparam INST_UOP_SLT  = 4'h8;
+    localparam INST_UOP_SLTU = 4'h9;
+    localparam INST_UOP_SEQ  = 4'hA;
+    localparam INST_UOP_R2UR = 4'hB;
+    localparam INST_UOP_UR2R = 4'hC;
+    localparam INST_UOP_BITS = 4;
+
+    // Warp-op code {kind, funct3} (sw/common/warp_ops_ref.h): kind = funct7[1:0] for ELECT and
+    // MATCH, 0 for REDUX (whose funct7[0] is URd[5]); REDUX funct3 in vx_fe_isa.h order.
+    localparam INST_WOP_REDUX     = 5'h00;   // 5'b00xxx
+    localparam INST_WOP_ELECT_P   = 5'h10;
+    localparam INST_WOP_ELECT_L   = 5'h11;
+    localparam INST_WOP_MATCH_ANY = 5'h18;   // 5'b1100x: x = b64
+    localparam INST_WOP_MATCH_ALL = 5'h1A;   // 5'b1101x: x = b64
+    localparam INST_WOP_BITS      = 5;
+
+    function automatic logic alu_is_uniform(input logic [ALU_TYPE_BITS-1:0] xtype, input logic [INST_OP_BITS-1:0] op);
+        return (xtype == ALU_TYPE_OTHER) && (op == INST_OP_BITS'(INST_ALU_FE_UNIFORM));
+    endfunction
+
+    function automatic logic alu_is_warp(input logic [ALU_TYPE_BITS-1:0] xtype, input logic [INST_OP_BITS-1:0] op);
+        return (xtype == ALU_TYPE_OTHER) && (op == INST_OP_BITS'(INST_ALU_FE_WARP));
+    endfunction
+
+    function automatic logic inst_wop_is_redux(input logic [INST_WOP_BITS-1:0] op);
+        return ~op[4];
+    endfunction
+
+    function automatic logic inst_wop_is_elect(input logic [INST_WOP_BITS-1:0] op);
+        return op[4] & ~op[3];
+    endfunction
+
+    function automatic logic inst_wop_is_match(input logic [INST_WOP_BITS-1:0] op);
+        return op[4] & op[3];
+    endfunction
+
+    // S2UR selector -> CSR address; sw/common/vx_fe_isa.h S2UR_CSR holds the same table.
+    localparam S2UR_NUM_SELECTORS = 27;
+    function automatic logic [11:0] fe_s2ur_csr(input logic [4:0] sel);
+        case (sel)
+        5'd0:  return 12'hB00;
+        5'd1:  return 12'hB80;
+        5'd2:  return 12'hCC2;
+        5'd3:  return 12'hFC2;
+        5'd4:  return 12'hCC1;
+        5'd5:  return 12'hCD0;
+        5'd6:  return 12'hCD1;
+        5'd7:  return 12'hCD2;
+        5'd8:  return 12'hCD6;
+        5'd9:  return 12'hCD7;
+        5'd10: return 12'hCD8;
+        5'd11: return 12'hCD9;
+        5'd12: return 12'hCDA;
+        5'd13: return 12'hCDB;
+        5'd14: return 12'hCDC;
+        5'd15: return 12'hCDD;
+        5'd16: return 12'hCDE;
+        5'd17: return 12'hCDF;
+        5'd18: return 12'hCE0;
+        5'd19: return 12'hCE4;
+        5'd20: return 12'hCE5;
+        5'd21: return 12'hCE6;
+        5'd22: return 12'hCE7;
+        5'd23: return 12'hCE8;
+        5'd24: return 12'hFC0;
+        5'd25: return 12'hFC1;
+        5'd26: return 12'hFC3;
+        default: return 12'h000;
+        endcase
+    endfunction
+`endif
 
     ///////////////////////////////////////////////////////////////////////////
 
@@ -1211,7 +1316,12 @@ package VX_gpu_pkg;
 `ifdef VX_CFG_EXT_DXA_ENABLE
 `ifdef DXA_MBAR_ENABLE
     typedef struct packed {
+    `ifdef VX_CFG_H100_FE_ENABLE
+        logic [INST_ARGS_BITS-16:0] __padding;
+        logic ur_form;   // funct7 0x1C: operands from URs, issued by any one thread
+    `else
         logic [INST_ARGS_BITS-15:0] __padding;
+    `endif
         logic tmop;      // a tensormap op (funct3 = 7): the rs2 register field (bg_n) is the op
         logic [4:0] bg_n;    // a bulk wait_group's N: the rs2 register field
         logic [1:0] bg_kind; // the rs1 register field: 0 commit_group, 1 wait_group, 2 wait_group.read
@@ -1326,6 +1436,16 @@ package VX_gpu_pkg;
     `endif
     } op_args_t;
     `PACKAGE_ASSERT($bits(op_args_t) == INST_ARGS_BITS)
+`ifdef VX_CFG_H100_FE_ENABLE
+
+    function automatic logic [INST_WOP_BITS-1:0] alu_warp_code(input op_args_t args);
+        return args.alu.imm20[INST_WOP_BITS-1:0];
+    endfunction
+
+    function automatic logic [INST_UOP_BITS-1:0] alu_uniform_code(input op_args_t args);
+        return args.alu.imm20[INST_UOP_BITS-1:0];
+    endfunction
+`endif
 
     //////////////////////////// Pipeline Data Types //////////////////////////
 
@@ -1353,6 +1473,11 @@ package VX_gpu_pkg;
         logic                       wb;
         logic [NUM_XREGS-1:0]       rd_xregs;
         logic [NUM_XREGS-1:0]       wr_xregs;
+    `ifdef VX_CFG_H100_FE_ENABLE
+        // A flagged slot's register field holds a UR index; used_rs is clear for it.
+        logic [UR_SLOTS-1:0]        ur_rs;
+        logic [UR_QUAD_SLOTS-1:0]   ur_quad;
+    `endif
         logic [NUM_SRC_OPDS-1:0]    used_rs;
         logic [NUM_REGS_BITS-1:0]   rd;
         logic [BYTESEL_BITS-1:0]    bytesel;
@@ -1373,6 +1498,11 @@ package VX_gpu_pkg;
         logic                       wb;
         logic [NUM_XREGS-1:0]       rd_xregs;
         logic [NUM_XREGS-1:0]       wr_xregs;
+    `ifdef VX_CFG_H100_FE_ENABLE
+        // A flagged slot's register field holds a UR index; used_rs is clear for it.
+        logic [UR_SLOTS-1:0]        ur_rs;
+        logic [UR_QUAD_SLOTS-1:0]   ur_quad;
+    `endif
         logic [NUM_SRC_OPDS-1:0]    used_rs;
         logic [NUM_REGS_BITS-1:0]   rd;
         logic [BYTESEL_BITS-1:0]    bytesel;
@@ -1394,6 +1524,11 @@ package VX_gpu_pkg;
         op_args_t                   op_args;
         logic                       wb;
         logic [NUM_XREGS-1:0]       wr_xregs;
+    `ifdef VX_CFG_H100_FE_ENABLE
+        // A flagged slot's register field holds a UR index; used_rs is clear for it.
+        logic [UR_SLOTS-1:0]        ur_rs;
+        logic [UR_QUAD_SLOTS-1:0]   ur_quad;
+    `endif
         logic [NUM_SRC_OPDS-1:0]    used_rs;
         logic [NUM_REGS_BITS-1:0]   rd;
         logic [BYTESEL_BITS-1:0]    bytesel;

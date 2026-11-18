@@ -52,11 +52,11 @@
 #define VX_SM_ONLY(...)
 #line 46
 #endif
+#include "fe_types.h"
 
-// Worker-thread count for the lockstep executor, set by the build system
-// (e.g. CONFIGS="-DSIMX_MT=4"); 0 or 1 selects serial execution. Resolved
-// here into a typed constant and handed to the kernel at platform setup —
-// the kernel headers themselves are knob-free.
+// Worker-thread count for the lockstep executor (CONFIGS="-DSIMX_MT=4"; 0 or 1
+// selects serial execution), resolved here into a typed constant handed to the
+// kernel at platform setup; the kernel headers themselves are knob-free.
 #ifndef SIMX_MT
 #define SIMX_MT 0
 #endif
@@ -184,7 +184,7 @@ struct op_string_t {
 enum class RegType {
   None,
   Integer,
-  Float,
+  Float, VX_FE_ONLY(Uniform,)
   Count
 };
 
@@ -192,7 +192,7 @@ inline std::ostream &operator<<(std::ostream &os, const RegType& type) {
   switch (type) {
   case RegType::None: break;
   case RegType::Integer: os << "x"; break;
-  case RegType::Float:   os << "f"; break;
+  case RegType::Float:   os << "f"; break; VX_FE_ONLY(case RegType::Uniform: os << "u"; break;)
   default: assert(false);
   }
   return os;
@@ -809,7 +809,7 @@ enum class DxaType {
 // rs2 field), only rs1 read.
 struct IntrDxaArgs {
   uint32_t bg_op = 0;
-  uint32_t bg_n  = 0;
+  uint32_t bg_n  = 0; VX_FE_ONLY(uint32_t ur_form = 0;)
 };
 #else
 #line 640
@@ -1065,7 +1065,7 @@ using OpType = std::variant<
 #ifdef VX_CFG_EXT_RTU_ENABLE
 , GfxwType
 #endif
->;
+VX_FE_ONLY(, UniformType, WarpOpType)>;
 
 using IntrArgs = std::variant<
   IntrAluArgs

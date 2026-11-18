@@ -1,0 +1,194 @@
+# TMA engine of the H100 front end (14/spec.md §3, §5, §10), checked by structure: the DXA unit
+# takes at most one op a cycle, the TMA queue holds TMA_QUEUE copies, the backlog drains within a
+# queue's worth, bulk stores leave at the SM egress port's width, wait_group and wait_group.read
+# return in order. H100 numbers (intake, pending stores, completion, reduce rate) are printed as
+# H100REF lines. RV64, the front-end switch on; the store checks need the SM's egress port (the
+# H100 organization).
+category: tmaengine
+defaults:
+  xlen: [64]
+  tier: smoke
+  configs: "-DVX_CFG_EXT_DXA_ENABLE -DVX_CFG_H100_FE_ENABLE"
+  touches: [VX_config.toml, hw/rtl/dxa/VX_dxa_unit.sv, hw/rtl/dxa/VX_dxa_st.sv, hw/rtl/dxa/VX_dxa_core.sv,
+            hw/rtl/dxa/VX_dxa_worker.sv, hw/rtl/dxa/VX_dxa_setup.sv, sim/simx/dxa/dxa_core.cpp, hw/rtl/core/VX_bg_unit.sv,
+            sim/simx/dxa/dxa_unit.cpp, sim/simx/dxa/dxa_unit.h, sim/simx/bg_unit.cpp, sim/simx/bg_unit.h,
+            sim/simx/dxa/dxa_bg.h, tests/regression/tma_engine]
+tests:
+  - id: intake
+    via: script
+    driver: simx
+    env: {DRIVER: simx}
+    run: &eng_intake |
+      vh=$(printf 'include config.mk\nall:\n\t@echo $(VORTEX_HOME)\n' | make -s -f -)
+      python3 "$vh/tests/regression/tma_engine/engine_check.py" intake
+  - id: intake
+    via: script
+    driver: rtlsim
+    env: {DRIVER: rtlsim}
+    run: *eng_intake
+  - id: queue
+    via: script
+    driver: simx
+    env: {DRIVER: simx}
+    run: &eng_queue |
+      vh=$(printf 'include config.mk\nall:\n\t@echo $(VORTEX_HOME)\n' | make -s -f -)
+      python3 "$vh/tests/regression/tma_engine/engine_check.py" queue
+  - id: queue
+    via: script
+    driver: rtlsim
+    env: {DRIVER: rtlsim}
+    run: *eng_queue
+  - id: read
+    via: script
+    driver: simx
+    env: {DRIVER: simx}
+    run: &eng_read |
+      vh=$(printf 'include config.mk\nall:\n\t@echo $(VORTEX_HOME)\n' | make -s -f -)
+      python3 "$vh/tests/regression/tma_engine/engine_check.py" read
+  - id: read
+    via: script
+    driver: rtlsim
+    env: {DRIVER: rtlsim}
+    run: *eng_read
+  - id: drain
+    via: script
+    driver: simx
+    env: {DRIVER: simx}
+    run: &eng_drain |
+      vh=$(printf 'include config.mk\nall:\n\t@echo $(VORTEX_HOME)\n' | make -s -f -)
+      python3 "$vh/tests/regression/tma_engine/engine_check.py" drain
+  - id: drain
+    via: script
+    driver: rtlsim
+    env: {DRIVER: rtlsim}
+    run: *eng_drain
+  - id: drain-org
+    via: script
+    driver: simx
+    configs: "-DVX_CFG_EXT_DXA_ENABLE -DVX_CFG_H100_ORG_ENABLE -DVX_CFG_NUM_THREADS=16"
+    env: {DRIVER: simx}
+    run: *eng_drain
+  - id: drain-org
+    via: script
+    driver: rtlsim
+    configs: "-DVX_CFG_EXT_DXA_ENABLE -DVX_CFG_H100_ORG_ENABLE -DVX_CFG_NUM_THREADS=16"
+    env: {DRIVER: rtlsim}
+    run: *eng_drain
+  - id: store-org
+    via: script
+    driver: simx
+    configs: "-DVX_CFG_EXT_DXA_ENABLE -DVX_CFG_H100_ORG_ENABLE -DVX_CFG_NUM_THREADS=16"
+    env: {DRIVER: simx, STORE_BYTES: "4096"}
+    run: &eng_store |
+      vh=$(printf 'include config.mk\nall:\n\t@echo $(VORTEX_HOME)\n' | make -s -f -)
+      python3 "$vh/tests/regression/tma_engine/engine_check.py" store
+  - id: store-org
+    via: script
+    driver: rtlsim
+    configs: "-DVX_CFG_EXT_DXA_ENABLE -DVX_CFG_H100_ORG_ENABLE -DVX_CFG_NUM_THREADS=16"
+    env: {DRIVER: rtlsim, STORE_BYTES: "4096"}
+    run: *eng_store
+  # 16-KiB stores: the issue loop outpaces the egress, which then binds at its width.
+  - id: store-16k-org
+    via: script
+    driver: simx
+    configs: "-DVX_CFG_EXT_DXA_ENABLE -DVX_CFG_H100_ORG_ENABLE -DVX_CFG_NUM_THREADS=16"
+    env: {DRIVER: simx, STORE_BYTES: "16384"}
+    run: *eng_store
+  - id: store-16k-org
+    via: script
+    driver: rtlsim
+    configs: "-DVX_CFG_EXT_DXA_ENABLE -DVX_CFG_H100_ORG_ENABLE -DVX_CFG_NUM_THREADS=16"
+    env: {DRIVER: rtlsim, STORE_BYTES: "16384"}
+    run: *eng_store
+  # A 16-B bulk store's issue -> wait_group 0, L2-resident and to cold lines (a cold one no
+  # faster); the H100's 108 cycles (14 §5) are printed, not judged.
+  - id: complete-org
+    via: script
+    driver: simx
+    configs: "-DVX_CFG_EXT_DXA_ENABLE -DVX_CFG_H100_ORG_ENABLE -DVX_CFG_NUM_THREADS=16"
+    env: {DRIVER: simx}
+    run: &eng_complete |
+      vh=$(printf 'include config.mk\nall:\n\t@echo $(VORTEX_HOME)\n' | make -s -f -)
+      python3 "$vh/tests/regression/tma_engine/engine_check.py" complete
+  - id: complete-org
+    via: script
+    driver: rtlsim
+    configs: "-DVX_CFG_EXT_DXA_ENABLE -DVX_CFG_H100_ORG_ENABLE -DVX_CFG_NUM_THREADS=16"
+    env: {DRIVER: rtlsim}
+    run: *eng_complete
+  - id: complete-cold-org
+    via: script
+    driver: simx
+    configs: "-DVX_CFG_EXT_DXA_ENABLE -DVX_CFG_H100_ORG_ENABLE -DVX_CFG_NUM_THREADS=16"
+    env: {DRIVER: simx}
+    run: &eng_cold |
+      vh=$(printf 'include config.mk\nall:\n\t@echo $(VORTEX_HOME)\n' | make -s -f -)
+      python3 "$vh/tests/regression/tma_engine/engine_check.py" cold
+  - id: complete-cold-org
+    via: script
+    driver: rtlsim
+    configs: "-DVX_CFG_EXT_DXA_ENABLE -DVX_CFG_H100_ORG_ENABLE -DVX_CFG_NUM_THREADS=16"
+    env: {DRIVER: rtlsim}
+    run: *eng_cold
+  - id: reduce-org
+    via: script
+    driver: simx
+    configs: "-DVX_CFG_EXT_DXA_ENABLE -DVX_CFG_H100_ORG_ENABLE -DVX_CFG_NUM_THREADS=16"
+    env: {DRIVER: simx}
+    run: &eng_reduce |
+      vh=$(printf 'include config.mk\nall:\n\t@echo $(VORTEX_HOME)\n' | make -s -f -)
+      python3 "$vh/tests/regression/tma_engine/engine_check.py" reduce
+  - id: reduce-org
+    via: script
+    driver: rtlsim
+    configs: "-DVX_CFG_EXT_DXA_ENABLE -DVX_CFG_H100_ORG_ENABLE -DVX_CFG_NUM_THREADS=16"
+    env: {DRIVER: rtlsim}
+    run: *eng_reduce
+
+  # Bulk-group counts that are not a power of two from 2 to 64 are refused.
+  - id: cfg-bulk-groups
+    via: script
+    driver: simx
+    configs+: "-DVX_CFG_BULK_GROUPS=48"
+    env: {EXPECT: "BULK_GROUPS_POW2", SIMX_OBJ: bg_unit}
+    run: &cfg_run |
+      set -u
+      tmp=$(mktemp -d)
+      read -r vh xl <<< "$(printf 'include config.mk\nall:\n\t@echo $(VORTEX_HOME) $(XLEN)\n' | make -s -f -)"
+      python3 "$vh/ci/gen_config.py" --config="$vh/VX_config.toml" --format=cpp --resolved \
+        --cflags="${CONFIGS:-} -DVX_CFG_XLEN=$xl" -o "$tmp/VX_config.h" > "$tmp/gen.log" 2>&1; gen_rc=$?
+      fail=0
+      if [ $gen_rc -ne 0 ]; then
+        if grep -qF "$EXPECT" "$tmp/gen.log"; then
+          echo "OK: the configuration is refused: $(grep -F -m1 "$EXPECT" "$tmp/gen.log")"
+        else
+          echo "FAIL: the configuration was refused without '$EXPECT':"; tail -n 20 "$tmp/gen.log"; fail=1
+        fi
+      else
+        make -C sim/simx DESTDIR="$tmp" "$tmp/obj/${SIMX_OBJ:-processor}.o" > "$tmp/simx.log" 2>&1; simx_rc=$?
+        if [ $simx_rc -eq 0 ]; then
+          echo "FAIL: the configuration and the SimX build accepted CONFIGS=${CONFIGS:-}"; fail=1
+        elif ! grep -qF "$EXPECT" "$tmp/simx.log"; then
+          echo "FAIL: the SimX build failed without '$EXPECT':"; tail -n 20 "$tmp/simx.log"; fail=1
+        else
+          echo "OK: the SimX build refuses it: $(grep -F -m1 "$EXPECT" "$tmp/simx.log")"
+        fi
+      fi
+      rm -rf "$tmp"
+      exit $fail
+  # SimX/RTL parity of the SM intake (one queue's worth of copies from 32 warps) and of the
+  # bulk-store queue with its egress drain (4-KiB stores, the H100 organization).
+  - id: parity-intake
+    check: model_parity
+    xlen: [64]
+    app: tma_engine
+    shape: {warps: 32, l2cache: true}
+    args: "-m0 -w32 -p4 -b16"
+  - id: parity-store
+    check: model_parity
+    xlen: [64]
+    app: tma_engine
+    configs: "-DVX_CFG_EXT_DXA_ENABLE -DVX_CFG_H100_ORG_ENABLE -DVX_CFG_NUM_THREADS=16"
+    shape: {warps: 32, l2cache: true}
+    args: "-m1 -g8 -p1 -b4096 -k31"

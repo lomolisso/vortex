@@ -65,6 +65,12 @@ module VX_bg_unit import VX_gpu_pkg::*, VX_dxa_pkg::*; #(
     output wire [`VX_CFG_NUM_WARPS-1:0]     rd_pending,
     output wire                             wr_pending,
 
+`ifdef VX_CFG_H100_FE_ENABLE
+    // a UR-form DXA op's warp, released when the DXA unit accepts the op
+    input  wire                             rel_valid,
+    input  wire [NW_WIDTH-1:0]              rel_wid,
+`endif
+
     VX_sched_unlock_if.master               unlock_if
 );
     `UNUSED_SPARAM (INSTANCE_ID)
@@ -114,7 +120,11 @@ module VX_bg_unit import VX_gpu_pkg::*, VX_dxa_pkg::*; #(
             logic [SEQ_W-1:0] s;
             s = seq_r[w] - SEQ_W'(ncommit_r[w]) + SEQ_W'(i);
             if ((32'(i) + 32'(n)) < 32'(ncommit_r[w])) begin
+`ifdef VX_CFG_H100_FE_ENABLE
+                if ((rd_cnt_r[w][s] != '0) || (~rd && (wr_cnt_r[w][s] != '0))) begin
+`else
                 if ((rd ? rd_cnt_r[w][s] : wr_cnt_r[w][s]) != '0) begin
+`endif
                     groups_done = 1'b0;
                 end
             end
@@ -138,6 +148,11 @@ module VX_bg_unit import VX_gpu_pkg::*, VX_dxa_pkg::*; #(
                 waiting_n[evt.wid] = 1'b1;
             end
         end
+    `ifdef VX_CFG_H100_FE_ENABLE
+        if (rel_valid) begin
+            ready_n[rel_wid] = 1'b1;
+        end
+    `endif
         pick = '0;
         for (integer w = NW-1; w >= 0; --w) begin
             if (ready_n[w]) pick = NW'(1) << w;
@@ -230,6 +245,10 @@ module VX_bg_unit import VX_gpu_pkg::*, VX_dxa_pkg::*; #(
         ("%t: *** %s bulk group read completion underflow: wid=%0d seq=%0d", $time, INSTANCE_ID, compl.wid, compl.seq))
     `RUNTIME_ASSERT (~(compl_valid && compl.write_done && (wr_cnt_r[compl.wid][compl.seq] == '0)),
         ("%t: *** %s bulk group write completion underflow: wid=%0d seq=%0d", $time, INSTANCE_ID, compl.wid, compl.seq))
+`ifdef VX_CFG_H100_FE_ENABLE
+    `RUNTIME_ASSERT (~(rel_valid && (ready_r[rel_wid] || waiting_r[rel_wid])),
+        ("%t: *** %s second release of a warp: wid=%0d", $time, INSTANCE_ID, rel_wid))
+`endif
     `RUNTIME_ASSERT (~(compl_valid && ~compl.read_done && ~compl.write_done),
         ("%t: *** %s empty bulk group completion: wid=%0d seq=%0d", $time, INSTANCE_ID, compl.wid, compl.seq))
 

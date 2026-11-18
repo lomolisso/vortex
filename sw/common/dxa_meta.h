@@ -81,7 +81,12 @@
 #define DXA_BG_WAIT_READ 2
 
 // Per warp: committed groups not yet complete, operations in the open group.
+#ifdef VX_CFG_H100_FE_ENABLE
+#define DXA_BG_GROUPS  VX_CFG_BULK_GROUPS
+#else
 #define DXA_BG_GROUPS  8
+#endif
+#line 85
 #define DXA_BG_MAX_OPS 63
 
 // custom-2 funct3 7 funct7 1 (fence.proxy.async): the rs1 register field.
@@ -91,7 +96,12 @@
 
 // Tensor maps in memory (DXA with mbarriers, XLEN 64; layout in dxa_tmap.h).
 // Address-tagged descriptor-cache entries beside the VX_DCR_DXA_DESC_COUNT slots.
+#ifdef VX_CFG_H100_FE_ENABLE
+#define DXA_TMAP_ENTRIES VX_CFG_TMAP_L1_ENTRIES
+#else
 #define DXA_TMAP_ENTRIES 8
+#endif
+#line 95
 
 // TLOAD ctl word (funct3 2, rs2 lane 0 bits [63:32]): bit 5 = the map form,
 // with the map address in rs2 lane 2 and the slot bits [3:0] zero.

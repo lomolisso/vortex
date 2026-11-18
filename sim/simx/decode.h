@@ -16,6 +16,9 @@
 #include <mempool.h>
 #include "types.h"
 #include "instr.h"
+#ifdef VX_CFG_H100_FE_ENABLE
+#include <array>
+#endif
 
 namespace vortex {
 
@@ -31,8 +34,33 @@ public:
   // stamps IntrBrArgs.is_rvc accordingly.
   Instr::Ptr decode(uint32_t code, uint64_t uuid);
 
+#ifdef VX_CFG_H100_FE_ENABLE
+  // Called for every instruction of warp `wid` before decode(): true when `code` is a UPFX,
+  // which is held and applied to the warp's next instruction (it issues nothing itself).
+  bool fe_prefix(uint32_t wid, uint32_t code);
+
+  // The H100 front-end encodings, and the held UPFX of the current warp; nullptr otherwise.
+  Instr::Ptr decode_fe(uint32_t code, uint64_t uuid);
+#endif
+
 private:
   PoolAllocator<Instr, 64>& instr_pool_;
+#ifdef VX_CFG_H100_FE_ENABLE
+  struct Prefix {
+    bool     valid = false;
+    uint32_t slot  = 0;
+    uint32_t ur    = 0;
+  };
+  std::array<Prefix, VX_CFG_NUM_WARPS> prefix_{};
+  uint32_t cur_wid_ = 0;
+#endif
 };
 
 }
+
+// Decoder::decode() starts with this hook; it expands to nothing with the switch off.
+#ifdef VX_CFG_H100_FE_ENABLE
+#define VX_FE_DECODE_HOOK if (auto fe_instr = this->decode_fe(code, uuid)) return fe_instr;
+#else
+#define VX_FE_DECODE_HOOK
+#endif

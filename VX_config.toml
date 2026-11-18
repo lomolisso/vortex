@@ -256,9 +256,6 @@ VX_CFG_EXT_DLMEM_ENABLE = false
 # mbarriers: 64-bit local-memory synchronization objects updated by the local
 # memory banks' atomic unit. Requires DLMEM and the A extension.
 VX_CFG_EXT_MBAR_ENABLE = false
-# Longest an mbarrier try_wait keeps its warp suspended before returning false;
-# must stay well below the scheduler's stall timeout.
-VX_CFG_MBAR_SUSPEND_CYCLES = 1024
 VX_CFG_EXT_TEX_ENABLE = false
 VX_CFG_EXT_RASTER_ENABLE = false
 VX_CFG_EXT_OM_ENABLE = false
@@ -662,8 +659,16 @@ VX_CFG_TCU_H100_ENABLE = false
 # Cluster-level DXA engine count, decoupled from cores/socket size.
 VX_CFG_NUM_DXA_CORES = "expr: $VX_CFG_SOCKET_SIZE if $VX_CFG_H100_SM_ENABLE else max(1, up($VX_CFG_NUM_CORES / 8))"
 VX_CFG_DXA_MEM_PORTS = "expr: $VX_CFG_NUM_DXA_CORES if $VX_CFG_H100_SM_ENABLE else min($VX_CFG_NUM_DXA_CORES, up($VX_CFG_NUM_CORES / $VX_CFG_SOCKET_SIZE) * $VX_CFG_L1_MEM_PORTS)"
-VX_CFG_DXA_QUEUE_SIZE = 16
-VX_CFG_DXA_MAX_INFLIGHT = 8
+# TMA engine of the H100 front end (14/spec.md §3, §5, §10). Requests queued per SM (a lower bound).
+VX_CFG_TMA_QUEUE = 128
+# Store fences per DXA worker: bulk stores whose writes are not yet acknowledged.
+VX_CFG_TMA_STORE_QUEUE_OPS = 8
+
+[[check]]
+TMA_QUEUE_MIN = ["expr: (not $VX_CFG_H100_FE_ENABLED) or (is_pow2($VX_CFG_TMA_QUEUE) and $VX_CFG_TMA_QUEUE >= 2)", "VX_CFG_TMA_QUEUE must be a power of two of at least 2"]
+DXA_MAX_INFLIGHT_POW2 = ["expr: is_pow2($VX_CFG_DXA_MAX_INFLIGHT) and ((not $VX_CFG_H100_FE_ENABLED) or $VX_CFG_DXA_MAX_INFLIGHT <= 64)", "VX_CFG_DXA_MAX_INFLIGHT must be a power of two, at most 64 with the front end"]
+BULK_GROUPS_POW2 = ["expr: is_pow2($VX_CFG_BULK_GROUPS) and $VX_CFG_BULK_GROUPS >= 2 and $VX_CFG_BULK_GROUPS <= 64", "VX_CFG_BULK_GROUPS must be a power of two from 2 to 64"]
+TMA_STORE_QUEUE_MIN = ["expr: (not $VX_CFG_H100_FE_ENABLED) or $VX_CFG_TMA_STORE_QUEUE_OPS >= 1", "VX_CFG_TMA_STORE_QUEUE_OPS must be at least 1"]
 
 [dlmem]
 # Largest thread-block cluster a distributed launch may place across the
@@ -807,6 +812,59 @@ VX_CFG_OCACHE_MSHR_SIZE = 16
 VX_CFG_OCACHE_MRSQ_SIZE = 0
 VX_CFG_OCACHE_MREQ_SIZE = 0
 VX_CFG_NUM_OCACHES      = "expr: max(1, up($VX_CFG_NUM_OM_CORES / 4))"
+
+[frontend]
+# SM front end as on the H100: per-warp uniform registers (URs) and UR operands, one-thread
+# TMA issue from URs, ELECT/MATCH/REDUX in hardware. Every value is per warp or per SM.
+VX_CFG_H100_FE_ENABLE = "expr: $VX_CFG_H100_ORG_ENABLE"
+
+# mbarrier and TMA engine knobs that select on the switch: the unresolved headers
+# test it with #ifdef, so they follow its definition.
+# Longest an mbarrier try_wait keeps its warp suspended before returning false;
+# must stay well below the scheduler's stall timeout. With the front end, a warp
+# with an inactive lane is not suspended (12/spec.md §4.4).
+VX_CFG_MBAR_SUSPEND_CYCLES = "expr: 7762 if $VX_CFG_H100_FE_ENABLE else 1024"
+VX_CFG_DXA_QUEUE_SIZE = "expr: $VX_CFG_TMA_QUEUE if $VX_CFG_H100_FE_ENABLE else 16"
+# Bulk async-groups pending per warp: a 6-bit counter, wait_group N clamped to BULK_GROUPS - 1.
+VX_CFG_BULK_GROUPS = "expr: 64 if $VX_CFG_H100_FE_ENABLE else 8"
+# Line slots per DXA worker, the line reader's memory window (a capacity; the H100 keeps ~50-60
+# 16-B copies in flight per SM, 14 M7): a power of two, the response tag's slot field; at most 64
+# with the front end, whose drain marks held slots in a 64-bit mask.
+VX_CFG_DXA_MAX_INFLIGHT = "expr: 64 if $VX_CFG_H100_FE_ENABLE else 8"
+
+# URs per warp, URZ = UR63, the last index of the 6-bit UR field.
+VX_CFG_UREG_COUNT = 64
+# A UR source takes no GPR bank port.
+VX_CFG_UREG_BANK_EXEMPT = 1
+
+# Warp-op unit (ELECT, MATCH, REDUX): 1 = one unit per core shared by the ALU blocks, 0 = one per
+# ALU block (issue slice).
+VX_CFG_WARP_OP_SHARED = 1
+
+# Tensor-map cache: level 1 in each socket's DXA lookup, level 2 one per cluster (= GPC) shared
+# by its SMs, in 128-B lines; both emptied at every launch. REPL: L1 0 = round robin, 1 = LRU;
+# L2 0 = FIFO, 1 = tree-PLRU.
+VX_CFG_TMAP_L1_ENTRIES = 8
+VX_CFG_TMAP_L1_REPL = 1
+VX_CFG_TMAP_L2_ENTRIES = 1024
+VX_CFG_TMAP_L2_WAYS = 8
+VX_CFG_TMAP_L2_REPL = 1
+# The kernel argument bytes level 2 loads at launch (the CUDA parameter space).
+VX_CFG_TMAP_PARAM_BYTES = 4096
+# Parameter-window reads in flight per engine: a read carries its slot in the memory tag.
+VX_CFG_TMAP_PARAM_READS = 8
+
+[[check]]
+FE_ONE_PACKET = ["expr: (not $VX_CFG_H100_FE_ENABLED) or $VX_CFG_NUM_ALU_LANES == $VX_CFG_NUM_THREADS", "the H100 front end needs one ALU packet per warp (NUM_ALU_LANES == NUM_THREADS)"]
+FE_REG_FIELD = ["expr: (not $VX_CFG_H100_FE_ENABLED) or $VX_CFG_EXT_F_ENABLED", "the H100 front end carries a 6-bit UR index in the register field, which needs the F extension"]
+UREG_COUNT_RANGE = ["expr: (not $VX_CFG_H100_FE_ENABLED) or $VX_CFG_UREG_COUNT == 64", "VX_CFG_UREG_COUNT must be 64: every 6-bit UR index names a register, URZ = UR63"]
+UREG_BANK_EXEMPT_ONE = ["expr: (not $VX_CFG_H100_FE_ENABLED) or $VX_CFG_UREG_BANK_EXEMPT == 1", "VX_CFG_UREG_BANK_EXEMPT must be 1: a UR operand is not a vector-register read"]
+WARP_OP_SHARED_RANGE = ["expr: (not $VX_CFG_H100_FE_ENABLED) or ($VX_CFG_WARP_OP_SHARED >= 0 and $VX_CFG_WARP_OP_SHARED <= 1)", "VX_CFG_WARP_OP_SHARED must be 0 (one warp-op unit per ALU block) or 1 (one per core)"]
+WARP_OP_LANES_MIN = ["expr: (not $VX_CFG_H100_FE_ENABLED) or $VX_CFG_NUM_THREADS >= 2", "the warp-op reduction tree needs at least 2 threads"]
+TMAP_L1_SHAPE = ["expr: (not $VX_CFG_H100_FE_ENABLED) or (is_pow2($VX_CFG_TMAP_L1_ENTRIES) and $VX_CFG_TMAP_L1_ENTRIES >= 2 and $VX_CFG_TMAP_L1_REPL >= 0 and $VX_CFG_TMAP_L1_REPL <= 1)", "VX_CFG_TMAP_L1_ENTRIES must be a power of two >= 2 and VX_CFG_TMAP_L1_REPL 0 (round robin) or 1 (LRU)"]
+TMAP_L2_SHAPE = ["expr: (not $VX_CFG_H100_FE_ENABLED) or (is_pow2($VX_CFG_TMAP_L2_ENTRIES) and is_pow2($VX_CFG_TMAP_L2_WAYS) and $VX_CFG_TMAP_L2_WAYS >= 2 and $VX_CFG_TMAP_L2_WAYS <= $VX_CFG_TMAP_L2_ENTRIES and $VX_CFG_TMAP_L2_REPL >= 0 and $VX_CFG_TMAP_L2_REPL <= 1)", "VX_CFG_TMAP_L2_ENTRIES and VX_CFG_TMAP_L2_WAYS must be powers of two with 2 <= ways <= entries, VX_CFG_TMAP_L2_REPL 0 (FIFO) or 1 (tree-PLRU)"]
+TMAP_PARAM_WINDOW = ["expr: (not $VX_CFG_H100_FE_ENABLED) or (is_pow2($VX_CFG_TMAP_PARAM_BYTES) and $VX_CFG_TMAP_PARAM_BYTES >= 128 and $VX_CFG_TMAP_PARAM_BYTES * 2 <= $VX_CFG_TMAP_L2_ENTRIES * 128)", "VX_CFG_TMAP_PARAM_BYTES must be a power of two >= 128 and at most half of level 2 (128-B lines)"]
+TMAP_PARAM_READS = ["expr: (not $VX_CFG_H100_FE_ENABLED) or (is_pow2($VX_CFG_TMAP_PARAM_READS) and $VX_CFG_TMAP_PARAM_READS >= 2 and $VX_CFG_TMAP_PARAM_READS <= 64)", "VX_CFG_TMAP_PARAM_READS must be a power of two from 2 to 64"]
 
 [isa_signatures]
 

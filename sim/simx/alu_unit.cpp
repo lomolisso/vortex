@@ -21,6 +21,10 @@
 #include "core.h"
 #include "scheduler.h"
 #include "constants.h"
+#ifdef VX_CFG_H100_FE_ENABLE
+#include "uniform_ops.h"
+#endif
+#line 24
 
 using namespace vortex;
 
@@ -29,6 +33,12 @@ AluUnit::AluUnit(const SimContext& ctx, const char* name, Core* core)
 {}
 
 uint32_t AluUnit::latency_of(const instr_trace_t* trace) const {
+#ifdef VX_CFG_H100_FE_ENABLE
+	// VX_alu_uniform has VX_alu_int's single output register.
+	if (std::get_if<UniformType>(&trace->op_type))
+		return 2;
+#endif
+#line 32
 	if (std::get_if<AluType>(&trace->op_type)) {
 		auto alu_type = std::get<AluType>(trace->op_type);
 		switch (alu_type) {
@@ -125,6 +135,19 @@ void AluUnit::execute(instr_trace_t* trace) {
 	// commit_writeback gates regfile actual write on wb (skipped for x0 dst).
 	trace->dst_data.assign(num_threads, reg_data_t{});
 	auto& rd_data = trace->dst_data;
+#ifdef VX_CFG_H100_FE_ENABLE
+	if (auto ut = std::get_if<UniformType>(&trace->op_type)) {
+		uniform_execute(uint32_t(*ut), VX_CFG_XLEN, num_threads, tmask, rs1_data, rs2_data, rd_data);
+		DT(3, this->name() << " execute: op=" << *ut << ", " << *trace);
+		return;
+	}
+	if (auto wt = std::get_if<WarpOpType>(&trace->op_type)) {
+		warp_op_execute(uint32_t(*wt), VX_CFG_XLEN, num_threads, tmask, rs1_data, rs2_data, rd_data);
+		DT(3, this->name() << " execute: op=" << *wt << ", " << *trace);
+		return;
+	}
+#endif
+#line 128
 
 	if (std::get_if<AluType>(&trace->op_type)) {
 		auto alu_type = std::get<AluType>(trace->op_type);
@@ -605,23 +628,119 @@ void AluUnit::wgather_split(instr_trace_t* trace, uint32_t src_offset) {
 }
 
 void AluUnit::on_tick() {
-  bool idle = true;
+  bool idle = true; VX_FE_ONLY(BlockFlags issued = {}; const uint64_t now = SimPlatform::instance().cycles();)
   for (uint32_t b = 0; b < VX_CFG_NUM_ALU_BLOCKS; ++b) {
     auto& input = Inputs.at(b);
     if (!input.empty()) {
       auto& output = Outputs.at(b);
       if (!output.full()) {
         auto trace = input.peek();
+#ifdef VX_CFG_H100_FE_ENABLE
+        if (is_warp_op(trace)) {
+          idle = false;
+          continue;
+        }
+#endif
+#line 615
         this->execute(trace);
         uint32_t delay = this->latency_of(trace);
+#ifdef VX_CFG_H100_FE_ENABLE
+        alu_rsp_.at(b).push_back(AluRsp{now + delay - 1, trace});
+        input.pop();
+        issued.at(b) = true;
+        idle &= (input.size() == 0);
+        continue;
+#endif
+#line 617
         output.send(trace, delay);
         input.pop();
       }
     }
     idle &= (input.size() == 0);
   }
+#ifdef VX_CFG_H100_FE_ENABLE
+  BlockFlags granted = {};
+  idle &= !this->warp_op_tick(issued, granted);
+  for (uint32_t b = 0; b < VX_CFG_NUM_ALU_BLOCKS; ++b) {
+    auto& q = alu_rsp_.at(b);
+    const int i = this->alu_rsp_ready(b, now);
+    if (!granted.at(b) && i >= 0 && !Outputs.at(b).full()) {
+      Outputs.at(b).send(q.at(i).trace, 1);
+      q.erase(q.begin() + i);
+      port_last_wop_.at(b) = false;
+    }
+    idle &= q.empty();
+  }
+#endif
+#line 623
   // no cross-tick state: sleep until a new trace is reserved toward an input.
   if (idle) {
     this->tick_sleep();
   }
 }
+
+#ifdef VX_CFG_H100_FE_ENABLE
+
+void AluUnit::on_reset() {
+  for (auto& u : wop_units_)
+    u.reset();
+  std::fill(wop_rr_.begin(), wop_rr_.end(), kWopPorts - 1);
+  for (auto& q : alu_rsp_)
+    q.clear();
+  port_last_wop_.fill(true);
+}
+
+int AluUnit::alu_rsp_ready(uint32_t b, uint64_t now) const {
+  const auto& q = alu_rsp_.at(b);
+  int best = -1;
+  for (size_t i = 0; i < q.size(); ++i) {
+    if (q[i].at <= now && (best < 0 || q[i].at < q[best].at))
+      best = int(i);
+  }
+  return best;
+}
+
+bool AluUnit::warp_op_tick(const BlockFlags& issued, BlockFlags& granted) {
+  const uint64_t now = SimPlatform::instance().cycles();
+  bool busy = false;
+  for (uint32_t u = 0; u < kWopUnits; ++u) {
+    auto& pipe = wop_units_.at(u);
+    const auto out = pipe.offered();
+    const uint32_t ob = out.tag.block;
+    const bool out_ready = out.valid && !Outputs.at(ob).full()
+                        && (port_last_wop_.at(ob) == false || this->alu_rsp_ready(ob, now) < 0);
+    if (out_ready) {
+      Outputs.at(ob).send(out.tag.trace, 1);
+      granted.at(ob) = true;
+      port_last_wop_.at(ob) = true;
+    }
+
+    WopTag in;
+    uint32_t sel = 0;
+    bool offer = false;
+    for (uint32_t i = 1; i <= kWopPorts && !offer; ++i) {
+      sel = (wop_rr_.at(u) + i) % kWopPorts;
+      auto& input = Inputs.at(u * kWopPorts + sel);
+      if (!issued.at(u * kWopPorts + sel) && !input.empty() && is_warp_op(input.peek())) {
+        in = WopTag{input.peek(), u * kWopPorts + sel};
+        offer = true;
+      }
+    }
+    uint32_t code = 0, k = 1;
+    if (offer) {
+      code = uint32_t(std::get<WarpOpType>(in.trace->op_type));
+      if (warp_ops_ref::is_match_any(code))
+        k = warp_op_distinct(code, VX_CFG_XLEN, VX_CFG_NUM_THREADS, in.trace->tmask,
+                             in.trace->src_data[0], in.trace->src_data[1]);
+    }
+    if (pipe.step(out_ready, offer ? &in : nullptr, code, k)) {
+      this->execute(in.trace);
+      Inputs.at(in.block).pop();
+      wop_rr_.at(u) = sel;
+    }
+    busy |= offer || !pipe.empty();
+  }
+  return busy;
+}
+
+#endif

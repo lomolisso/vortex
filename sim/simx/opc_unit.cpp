@@ -56,6 +56,11 @@ static uint32_t compute_bank_conflicts(const instr_trace_t* trace) {
       if ((trace->src_regs[i].type == RegType::None)
        || (trace->src_regs[j].type == RegType::None))
         continue;
+#ifdef VX_CFG_H100_FE_ENABLE
+      if (trace->src_regs[i].type == RegType::Uniform || trace->src_regs[j].type == RegType::Uniform)
+        continue; // a UR source takes no GPR bank port
+#endif
+#line 59
       if ((trace->src_regs[i].type == RegType::Integer && trace->src_regs[i].id() == 0)
        || (trace->src_regs[j].type == RegType::Integer && trace->src_regs[j].id() == 0))
         continue; // skip x0
@@ -68,6 +73,18 @@ static uint32_t compute_bank_conflicts(const instr_trace_t* trace) {
   return stalls;
 }
 
+#ifdef VX_CFG_H100_FE_ENABLE
+#include <uniform_ref.h>
+static uint32_t ur_read_slots(const instr_trace_t* trace) {
+  uint32_t n = 0;
+  for (uint32_t i = 0; i < NUM_SRC_REGS; ++i) {
+    if (trace->src_regs[i].type == RegType::Uniform)
+      ++n;
+  }
+  return n;
+}
+#endif
+#line 71
 void OpcUnit::on_tick() {
   auto cur_cycle = SimPlatform::instance().cycles();
 
@@ -85,6 +102,10 @@ void OpcUnit::on_tick() {
     uint32_t stalls = compute_bank_conflicts(trace);
     total_stalls_ += stalls;
     cur_trace_ = trace;
+#ifdef VX_CFG_H100_FE_ENABLE
+    stalls = uniform_ref::collect_stalls(stalls, ur_read_slots(trace));
+#endif
+#line 88
     release_cycle_ = cur_cycle + 1 + stalls;
     Input.pop();
   }
@@ -174,9 +195,34 @@ void OpcUnit::writeback(instr_trace_t* trace, uint32_t wid) {
     }
     DPN(2, "} (#" << std::dec << trace->uuid << ")" << std::endl);
   } break;
+#ifdef VX_CFG_H100_FE_ENABLE
+  case RegType::Uniform: {
+    uint32_t t = 0;
+    while (t < num_threads && !trace->tmask.test(t))
+      ++t;
+    if (t < num_threads && rdest.idx != VX_CFG_UREG_COUNT - 1) {
+      regs_.at(warp_slot).ureg_file.at(rdest.idx) = trace->dst_data[t].i;
+      DPH(2, "Dest Reg: " << rdest << "=0x" << std::hex << trace->dst_data[t].u << std::dec
+             << " (#" << trace->uuid << ")" << std::endl);
+    }
+  } break;
+#endif
+#line 177
   default:
     std::cout << "Unrecognized register write back type: " << rdest.type << std::endl;
     std::abort();
     break;
   }
 }
+
+#ifdef VX_CFG_H100_FE_ENABLE
+void OpcUnit::read_ur(std::vector<reg_data_t>& out, uint32_t wid, uint32_t idx, bool quad) const {
+  const auto& urf = regs_[wid_to_opc_slot(wid)].ureg_file;
+  auto ur = [&](uint32_t i) -> uint64_t {
+    return (i >= VX_CFG_UREG_COUNT - 1) ? 0 : uint64_t(urf.at(i));
+  };
+  for (uint32_t t = 0; t < num_threads_; ++t) {
+    out[t].u64 = quad ? ((t < 4) ? ur(idx + t) : 0) : ur(idx);
+  }
+}
+#endif

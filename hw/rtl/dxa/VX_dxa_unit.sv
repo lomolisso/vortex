@@ -37,6 +37,11 @@ module VX_dxa_unit import VX_gpu_pkg::*, VX_dxa_pkg::*; #(
     input wire [`VX_CFG_NUM_WARPS-1:0]               bg_stall_op,
     input wire [`VX_CFG_NUM_WARPS-1:0]               bg_stall_commit,
     input wire [`VX_CFG_NUM_WARPS-1:0][DXA_BG_SEQ_W-1:0] bg_seq,
+`ifdef VX_CFG_H100_FE_ENABLE
+    // A UR-form op's warp, released at the op's accept.
+    output wire                                      rel_valid,
+    output wire [NW_WIDTH-1:0]                       rel_wid,
+`endif
 `endif
     VX_dxa_req_bus_if.master dxa_req_bus_if
 );
@@ -483,6 +488,14 @@ module VX_dxa_unit import VX_gpu_pkg::*, VX_dxa_pkg::*; #(
     assign bg_evt.wid   = execute_if.data.header.wid;
     assign bg_evt.kind  = is_bgop ? (execute_if.data.op_args.dxa.bg_kind + 2'd1) : DXA_BG_KIND_OP;
     assign bg_evt.n     = is_bgop ? execute_if.data.op_args.dxa.bg_n : 5'd0;
+`endif
+
+`ifdef DXA_MBAR_ENABLE
+`ifdef VX_CFG_H100_FE_ENABLE
+    wire ur_fire = fire && is_send && execute_if.data.op_args.dxa.ur_form;
+    assign rel_valid = ur_fire;
+    assign rel_wid   = execute_if.data.header.wid;
+`endif
 `endif
 
 `ifdef DXA_MBAR_ENABLE

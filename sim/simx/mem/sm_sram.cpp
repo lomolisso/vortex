@@ -1053,7 +1053,13 @@ private:
 #ifdef VX_CFG_EXT_MBAR_ENABLE
         const bool evt_v = fin && ((at.op == MemOp::MBAR_TRY_WAIT && !wait_done) || flip);
         if (evt_v)
+#ifdef VX_CFG_H100_FE_ENABLE
+          simobject_->MbarEvtOut.at(bk).send(MbarBankEvt{flip, at.wid, c.row, (c.cl == A_MBAR && c.ln == cfol_ln_) ? 1 + uint32_t(__builtin_popcount(cfol_)) : 1}, 0);
+#else
+#line 1056
           simobject_->MbarEvtOut.at(bk).send(MbarBankEvt{flip, at.wid, c.row}, 0);
+#endif
+#line 1057
 #else
         (void)flip;
 #endif

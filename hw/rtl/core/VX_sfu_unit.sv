@@ -226,6 +226,10 @@ import VX_raster_pkg::*;
     VX_dxa_pkg::dxa_bg_evt_t          bg_evt;
     wire [`VX_CFG_NUM_WARPS-1:0]      bg_stall_op, bg_stall_commit;
     wire [`VX_CFG_NUM_WARPS-1:0][VX_dxa_pkg::DXA_BG_SEQ_W-1:0] bg_seq;
+`ifdef VX_CFG_H100_FE_ENABLE
+    wire                              bg_rel_valid;
+    wire [NW_WIDTH-1:0]               bg_rel_wid;
+`endif
 
     VX_bg_unit #(
         .INSTANCE_ID (`SFORMATF(("%s-bg", INSTANCE_ID)))
@@ -241,6 +245,10 @@ import VX_raster_pkg::*;
         .seq          (bg_seq),
         .rd_pending   (bg_rd_pending),
         .wr_pending   (bg_wr_pending),
+    `ifdef VX_CFG_H100_FE_ENABLE
+        .rel_valid    (bg_rel_valid),
+        .rel_wid      (bg_rel_wid),
+    `endif
         .unlock_if    (bg_unlock_if)
     );
 `endif
@@ -265,6 +273,10 @@ import VX_raster_pkg::*;
         .bg_stall_op   (bg_stall_op),
         .bg_stall_commit (bg_stall_commit),
         .bg_seq        (bg_seq),
+    `ifdef VX_CFG_H100_FE_ENABLE
+        .rel_valid     (bg_rel_valid),
+        .rel_wid       (bg_rel_wid),
+    `endif
     `endif
         .dxa_req_bus_if (dxa_req_bus_if)
     );

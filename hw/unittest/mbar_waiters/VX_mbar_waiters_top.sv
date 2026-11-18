@@ -49,6 +49,10 @@ module VX_mbar_waiters_top import VX_gpu_pkg::*; #(
     `UNUSED_VAR (retire_wid)
 
     VX_mbar_waiters #(
+`ifdef VX_CFG_H100_FE_ENABLE
+        // The model has no partial warps.
+        .PARTIAL_RETURN (0),
+`endif
         .INSTANCE_ID ("mbar_waiters"),
         .NUM_BANKS   (NUM_BANKS),
         .NUM_RETIRES (NUM_RETIRES),
@@ -60,6 +64,9 @@ module VX_mbar_waiters_top import VX_gpu_pkg::*; #(
         .evt_flip     (evt_flip),
         .evt_wid      (evt_wid_w),
         .evt_row      (evt_row),
+    `ifdef VX_CFG_H100_FE_ENABLE
+        .evt_lanes    ({NUM_BANKS{(`CLOG2(`VX_CFG_NUM_THREADS + 1))'(1)}}),
+    `endif
         .retire_valid (retire_valid),
         .retire_wid   (retire_wid_w),
         .unlock_valid (unlock_valid),

@@ -546,7 +546,7 @@ public:
       // their cycle.
       snprintf(sname, 100, "%s-bg_unit", name.c_str());
       bg_unit_ = BgUnit::Create(sname);
-      sfu->dxa_unit().BgEvtOut.bind(&bg_unit_->EvtIn);
+      sfu->dxa_unit().BgEvtOut.bind(&bg_unit_->EvtIn); VX_FE_ONLY(sfu->dxa_unit().BgRelOut.bind(&bg_unit_->RelIn);)
       bg_unit_->StateOut.bind(&sfu->dxa_unit().BgStateIn);
       bg_unit_->UnlockOut.bind(&scheduler_->UnlockIn.at(Scheduler::BG_UNLOCK));
       simobject_->BgComplIn.bind(&bg_unit_->ComplIn);
@@ -773,9 +773,9 @@ public:
       trace->log_once(false);
     }
 
-    // Decode: fill trace metadata from instruction bits. The decoder
-    // recognises RVC encoding (low 2 bits != 11), expands internally, and
-    // stamps IntrBrArgs.is_rvc.
+#ifdef VX_CFG_H100_FE_ENABLE
+    if (decoder_->fe_prefix(trace->wid, trace->code)) { scheduler_->advance_pc(trace, 4); scheduler_->resume(trace->wid); if (ibuf_inflight_.at(trace->wid) > 0) { --ibuf_inflight_.at(trace->wid); } pending_instrs_.remove(trace); trace->~instr_trace_t(); trace_pool_.deallocate(trace, 1); decode_latch_.pop(); return; }
+#endif // Decode fills the trace from the instruction bits; RVC (low 2 bits != 11) is expanded and stamped in IntrBrArgs.is_rvc.
     auto instr = decoder_->decode(trace->code, trace->uuid);
     DP(1, "Instr: " << *instr << " (#" << trace->uuid << ")");
     trace->instr_ptr   = instr;

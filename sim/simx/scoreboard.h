@@ -58,7 +58,12 @@ private:
     return (wid << RegOpd::ID_BITS) | reg.id();
   }
 
+#ifdef VX_CFG_H100_FE_ENABLE
+  static_assert(VX_CFG_UREG_COUNT >= MAX_NUM_REGS, "one mask width for GPRs and URs");
+  std::vector<std::vector<std::bitset<VX_CFG_UREG_COUNT>>> in_use_regs_;
+#else
   std::vector<std::vector<RegMask>> in_use_regs_;
+#endif
   std::unordered_map<uint32_t, instr_trace_t*> owners_;
   std::unordered_map<uint32_t, uint32_t> commit_counts_;
 

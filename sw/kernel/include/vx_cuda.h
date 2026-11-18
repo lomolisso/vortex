@@ -62,8 +62,10 @@
 #endif
 // The DXA operands are packed in t5/t6 (see __vxc_issue1); the build keeps
 // them out of register allocation.
+#if !VX_CFG_H100_FE_ENABLED
 #ifndef VX_CUDA_FIXED_TEMPS
 #error "vx_cuda.h: build the kernel with -ffixed-x30 -ffixed-x31 -DVX_CUDA_FIXED_TEMPS"
+#endif
 #endif
 
 #include <vx_spawn2.h>
@@ -77,6 +79,9 @@
 #include <vx_cuda_fp.h>
 #if VX_CFG_TCU_H100_ENABLED
 #include <vx_tensor.h>
+#endif
+#if VX_CFG_H100_FE_ENABLED
+#include <vx_warp_ops.h>
 #endif
 #include <stddef.h>
 #include <stdint.h>
@@ -395,6 +400,18 @@ __VX_CUDA_INL T __vx_cuda_reduce(unsigned mask, T v, Op op) {
   return acc;
 }
 
+#if VX_CFG_H100_FE_ENABLED
+// redux.sync over the active lanes: for legal PTX they are mask & __activemask().
+__VX_WARP unsigned __reduce_add_sync(unsigned mask, unsigned value) { __VX_WARP_ASSERT(); __VX_CUDA_MASK_CHECK(mask); (void)mask; return vx_redux_add(value); }
+__VX_WARP int      __reduce_add_sync(unsigned mask, int value)      { __VX_WARP_ASSERT(); __VX_CUDA_MASK_CHECK(mask); (void)mask; return (int)vx_redux_add((unsigned)value); }
+__VX_WARP unsigned __reduce_min_sync(unsigned mask, unsigned value) { __VX_WARP_ASSERT(); __VX_CUDA_MASK_CHECK(mask); (void)mask; return vx_redux_min_u(value); }
+__VX_WARP int      __reduce_min_sync(unsigned mask, int value)      { __VX_WARP_ASSERT(); __VX_CUDA_MASK_CHECK(mask); (void)mask; return vx_redux_min_s(value); }
+__VX_WARP unsigned __reduce_max_sync(unsigned mask, unsigned value) { __VX_WARP_ASSERT(); __VX_CUDA_MASK_CHECK(mask); (void)mask; return vx_redux_max_u(value); }
+__VX_WARP int      __reduce_max_sync(unsigned mask, int value)      { __VX_WARP_ASSERT(); __VX_CUDA_MASK_CHECK(mask); (void)mask; return vx_redux_max_s(value); }
+__VX_WARP unsigned __reduce_and_sync(unsigned mask, unsigned value) { __VX_WARP_ASSERT(); __VX_CUDA_MASK_CHECK(mask); (void)mask; return vx_redux_and(value); }
+__VX_WARP unsigned __reduce_or_sync(unsigned mask, unsigned value)  { __VX_WARP_ASSERT(); __VX_CUDA_MASK_CHECK(mask); (void)mask; return vx_redux_or(value); }
+__VX_WARP unsigned __reduce_xor_sync(unsigned mask, unsigned value) { __VX_WARP_ASSERT(); __VX_CUDA_MASK_CHECK(mask); (void)mask; return vx_redux_xor(value); }
+#else
 __VX_WARP unsigned __reduce_add_sync(unsigned mask, unsigned value) {
   __VX_WARP_ASSERT();
   return __vx_cuda_reduce(mask, value, [](unsigned a, unsigned b) { return a + b; });
@@ -431,9 +448,25 @@ __VX_WARP unsigned __reduce_xor_sync(unsigned mask, unsigned value) {
   __VX_WARP_ASSERT();
   return __vx_cuda_reduce(mask, value, [](unsigned a, unsigned b) { return a ^ b; });
 }
+#endif
 
 // match.sync compares bit patterns over the non-exited lanes of the mask; each
 // round's leader is such a lane, so it resolves at least itself.
+#if VX_CFG_H100_FE_ENABLED
+// match.sync over the active lanes: for legal PTX they are mask & __activemask().
+template <typename T>
+__VX_CUDA_INL unsigned __vx_cuda_match_any(unsigned mask, T value) {
+  const size_t v = __vx_cuda_to_word(value);
+  return (sizeof(T) == 8 ? vx_match_any_b64((uint64_t)v) : vx_match_any_b32((uint32_t)v)) & mask;
+}
+template <typename T>
+__VX_CUDA_INL unsigned __vx_cuda_match_all(unsigned mask, T value, int* pred) {
+  const size_t v = __vx_cuda_to_word(value);
+  const unsigned r = (sizeof(T) == 8 ? vx_match_all_b64((uint64_t)v) : vx_match_all_b32((uint32_t)v)) & mask;
+  *pred = r != 0;
+  return r;
+}
+#else
 template <typename T>
 __VX_CUDA_INL unsigned __vx_cuda_match_any(unsigned mask, T value) {
   mask &= __activemask();
@@ -458,6 +491,7 @@ __VX_CUDA_INL unsigned __vx_cuda_match_all(unsigned mask, T value, int* pred) {
   *pred = all;
   return all ? mask : 0u;
 }
+#endif
 
 #define __VX_MATCH_OVERLOADS(T)                                                    \
   __VX_WARP unsigned __match_any_sync(unsigned mask, T value) {                     \
@@ -949,17 +983,24 @@ __VX_CUDA_INL size_t __vxc_pair(int32_t lo, int32_t hi) { return ((size_t)(uint3
 
 template <uint32_t F3>
 __VX_CUDA_INL void __vxc_issue1(size_t a0, size_t a1, size_t a2, size_t a3) {
+#if VX_CFG_H100_FE_ENABLED
+  __VX_DXA_UR(F3, a0, a1, a2, a3, 0, 0, 0, 0);
+#else
   __asm__ volatile ("mv t5, %[a0]\n\t"
                     ".insn r4 %[wg], 0, 0, t5, %[a1], %[a2], %[a3]\n\t"
                     ".insn r %[op], %[f3], %[f7], x0, t5, x0"
                     :: [a0] "r"(a0), [a1] "r"(a1), [a2] "r"(a2), [a3] "r"(a3), [wg] "i"(RISCV_CUSTOM1),
                        [op] "i"(VX_DXA_EXT_OPCODE), [f3] "i"(F3), [f7] "i"(VX_DXA_FUNCT7)
                     : "memory");
+#endif
 }
 
 template <uint32_t F3>
 __VX_CUDA_INL void __vxc_issue2(size_t a0, size_t a1, size_t a2, size_t a3, size_t b0, size_t b1, size_t b2,
                                 size_t b3) {
+#if VX_CFG_H100_FE_ENABLED
+  __VX_DXA_UR(F3, a0, a1, a2, a3, b0, b1, b2, b3);
+#else
   __asm__ volatile ("mv t5, %[a0]\n\t"
                     ".insn r4 %[wg], 0, 0, t5, %[a1], %[a2], %[a3]\n\t"
                     "mv t6, %[b0]\n\t"
@@ -969,6 +1010,7 @@ __VX_CUDA_INL void __vxc_issue2(size_t a0, size_t a1, size_t a2, size_t a3, size
                        [b2] "r"(b2), [b3] "r"(b3), [wg] "i"(RISCV_CUSTOM1), [op] "i"(VX_DXA_EXT_OPCODE),
                        [f3] "i"(F3), [f7] "i"(VX_DXA_FUNCT7)
                     : "memory");
+#endif
 }
 
 #define __VXC_P(x) ((size_t)(uintptr_t)(x))
@@ -1825,8 +1867,12 @@ __VX_CUDA_INL void barrier_cluster_wait(sem_acquire_t) { vx_cluster_wait(__vx_cl
 // elect.sync: the lowest active lane of the mask, deterministically.
 __VX_WARP bool elect_sync(const uint32_t& membermask) {
   __VX_WARP_ASSERT();
+#if VX_CFG_H100_FE_ENABLED
+  return vx_elect_p(membermask) != 0;
+#else
   const uint32_t m = membermask & __activemask();
   return m != 0 && __laneid() == (unsigned)__builtin_ctz(m);
+#endif
 }
 
 // tensormap.replace and tensormap.cp_fenceproxy

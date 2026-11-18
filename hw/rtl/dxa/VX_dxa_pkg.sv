@@ -41,7 +41,11 @@ package VX_dxa_pkg;
 `ifdef DXA_MBAR_ENABLE
     // Tensor maps in global memory, cached beside the DCR slots: map entry e
     // is descriptor RAM index COUNT + e, tagged by the map's 64-byte line.
+`ifdef VX_CFG_H100_FE_ENABLE
+    localparam DXA_TMAP_ENTRIES   = `VX_CFG_TMAP_L1_ENTRIES;
+`else
     localparam DXA_TMAP_ENTRIES   = 8;
+`endif
     localparam DXA_TMAP_IDX_W     = `CLOG2(DXA_TMAP_ENTRIES);
     localparam DXA_TMAP_BYTES     = 128;
     localparam DXA_TMAP_ALIGN     = 6;
@@ -98,7 +102,7 @@ package VX_dxa_pkg;
 
     // Bulk async-groups: committed groups tracked per warp, and the open
     // group's sequence number that tags each operation.
-    localparam DXA_BG_GROUPS = 8;
+    localparam DXA_BG_GROUPS = `VX_CFG_BULK_GROUPS;
     localparam DXA_BG_SEQ_W  = `CLOG2(DXA_BG_GROUPS);
 
     localparam DXA_BG_KIND_OP        = 2'd0;
@@ -148,6 +152,28 @@ package VX_dxa_pkg;
         logic                            rt;        // a tensor reduction typed by the map
         logic [3:0]                      rop;       // and its op
     } dxa_tm_req_t;
+`ifdef DXA_TMAP_L2_ENABLE
+
+    // Tensor-map level 2 (VX_tmap_l2): one per cluster, 128-B lines in L1-line sectors.
+    localparam TMAP_L2_LOOKUP = 2'd0, TMAP_L2_FILL = 2'd1, TMAP_L2_INVAL = 2'd2, TMAP_L2_FLUSH = 2'd3;
+    localparam TMAP_L2_HIT_K  = 2'd0, TMAP_L2_MISS_K = 2'd2, TMAP_L2_PRELOAD_K = 2'd3;
+
+    typedef struct packed {
+        logic [1:0]                          op;
+        logic [`VX_CFG_MEM_ADDR_WIDTH-1:0]   addr;   // LOOKUP/INVAL: the map; FILL: an L1 line; FLUSH: the window
+        logic                                param;  // FILL from the parameter window
+        logic [`VX_CFG_L1_LINE_SIZE*8-1:0]   data;
+    } tmap_l2_req_t;
+
+    // A lookup answers one beat per L1 line of the map, in order: HIT/PARAM
+    // with the line, or MISS (last). PRELOAD tells port 0 to read the window.
+    typedef struct packed {
+        logic [1:0]                          kind;
+        logic                                last;
+        logic [`VX_CFG_MEM_ADDR_WIDTH-1:0]   addr;   // PRELOAD: the window
+        logic [`VX_CFG_L1_LINE_SIZE*8-1:0]   data;
+    } tmap_l2_rsp_t;
+`endif
 
     // A reduction's op (0 add, 1 min, 2 max, 3 inc, 4 dec, 5 and, 6 or, 7 xor)
     // and type (0 b32/u32, 1 s32, 2 b64/u64, 3 s64, 4 f32, 5 f64, 6 f16, 7 bf16)

@@ -26,6 +26,9 @@
 
 module VX_dxa_gmem_req import VX_gpu_pkg::*, VX_dxa_pkg::*; #(
     parameter MAX_OUTSTANDING = 8,
+`ifdef DXA_FE_PIPE
+    parameter CTX_TAG_W       = 1,
+`endif
     parameter GMEM_ADDR_WIDTH = `VX_CFG_MEM_ADDR_WIDTH - `CLOG2(`VX_CFG_L1_LINE_SIZE),
     parameter GMEM_TAG_WIDTH  = SOCKET_MEM_TAG_WIDTH,
     parameter CL_OFF_BITS     = `CLOG2(`VX_CFG_L1_LINE_SIZE),
@@ -88,6 +91,11 @@ module VX_dxa_gmem_req import VX_gpu_pkg::*, VX_dxa_pkg::*; #(
     // Resource release (from smem_wr) — per-tag, OOO.
     input  wire                        release_en,
     input  wire [TAG_W-1:0]            release_tag,
+`ifdef DXA_FE_PIPE
+    // The copy context of an accepted line, and of the presented one.
+    input  wire [CTX_TAG_W-1:0]        ag_ctx,
+    output wire [CTX_TAG_W-1:0]        sw_ctx,
+`endif
 
     // Progress events.
     output wire                        gmem_req_fire,
@@ -122,6 +130,9 @@ module VX_dxa_gmem_req import VX_gpu_pkg::*, VX_dxa_pkg::*; #(
         logic                     last;
         logic [15:0]              k_row;     // tiled scatter
         logic [15:0]              n_base;    // tiled scatter
+    `ifdef DXA_FE_PIPE
+        logic [CTX_TAG_W-1:0]     ctx;
+    `endif
     } slot_t;
 
     slot_t slot_table_r [MAX_OUTSTANDING];
@@ -215,6 +226,9 @@ module VX_dxa_gmem_req import VX_gpu_pkg::*, VX_dxa_pkg::*; #(
     assign sw_k_row          = present_slot.k_row;
     assign sw_n_base         = present_slot.n_base;
     assign sw_outstanding    = outstanding_count_r;
+`ifdef DXA_FE_PIPE
+    assign sw_ctx            = present_slot.ctx;
+`endif
 
     // The bus is accepted by smem_wr (via sw_ready) only when we present
     // a real rsp; OOB presentations don't touch the bus port.
@@ -267,6 +281,9 @@ module VX_dxa_gmem_req import VX_gpu_pkg::*, VX_dxa_pkg::*; #(
                 slot_table_r[alloc_tag].last           <= ag_last;
                 slot_table_r[alloc_tag].k_row          <= ag_k_row;
                 slot_table_r[alloc_tag].n_base         <= ag_n_base;
+            `ifdef DXA_FE_PIPE
+                slot_table_r[alloc_tag].ctx            <= ag_ctx;
+            `endif
             end
 
             busy_r        <= (busy_r        | busy_set       ) & ~busy_clr;

@@ -228,6 +228,12 @@ public:
   void set_dst_bytesel(uint8_t value) { dst_bytesel_ = value; }
   uint8_t get_dst_bytesel() const { return dst_bytesel_; }
 
+#ifdef VX_CFG_H100_FE_ENABLE
+  // Bit i: source i is an aligned UR quad (lanes 0-3 = UR[idx..idx+3]).
+  void set_ur_quad(uint8_t mask) { ur_quad_ = mask; }
+  uint8_t get_ur_quad() const { return ur_quad_; }
+#endif
+
 private:
 
   uint64_t uuid_;
@@ -245,6 +251,9 @@ private:
   bool     has_tmask_;
   bool     fu_lock_;
   bool     fu_unlock_;
+#ifdef VX_CFG_H100_FE_ENABLE
+  uint8_t  ur_quad_ = 0;
+#endif
 
   friend std::ostream &operator<<(std::ostream &, const Instr &);
 };

@@ -93,6 +93,10 @@ module VX_sm_sram import VX_gpu_pkg::*; #(
     output wire [`VX_CFG_LMEM_NUM_BANKS-1:0]                    mbar_evt_flip,
     output wire [`VX_CFG_LMEM_NUM_BANKS-1:0][NW_WIDTH-1:0]      mbar_evt_wid,
     output wire [`VX_CFG_LMEM_NUM_BANKS-1:0][SM_SRAM_ROW_W-1:0] mbar_evt_row
+`ifdef VX_CFG_H100_FE_ENABLE
+    ,
+    output wire [`VX_CFG_LMEM_NUM_BANKS-1:0][`CLOG2(`VX_CFG_NUM_THREADS + 1)-1:0] mbar_evt_lanes
+`endif
 `endif
 );
     `UNUSED_SPARAM (INSTANCE_ID)
@@ -1166,6 +1170,16 @@ module VX_sm_sram import VX_gpu_pkg::*; #(
             end
         end
     end
+`ifdef VX_CFG_EXT_MBAR_ENABLE
+`ifdef VX_CFG_H100_FE_ENABLE
+    // A phase check's insert also covers the checks riding on its pass.
+    for (genvar bk = 0; bk < BANKS; ++bk) begin : g_mbar_evt_lanes
+        assign mbar_evt_lanes[bk] = (c_cl[bk] == 2'd2 && c_ln[bk] == c_fol_ln)
+            ? (`CLOG2(`VX_CFG_NUM_THREADS + 1))'($countones(c_fol)) + 1'b1
+            : (`CLOG2(`VX_CFG_NUM_THREADS + 1))'(1);
+    end
+`endif
+`endif
     // The op whose last lane was granted at G answers at C.
     reg              lsu_fin_r, mbq_fin_r;
     reg [BLK_W-1:0]  lsu_fin_blk, mbq_fin_blk;

@@ -824,3 +824,11 @@ void DxaUnit::decode_store(const instr_trace_t* trace, DxaReq& req) const {
   req.size = uint32_t(l2);
 }
 #endif
+
+#if defined(VX_CFG_H100_FE_ENABLE) && defined(DXA_MBAR_ENABLE)
+void DxaUnit::ur_issue(const instr_trace_t* trace) {
+  DT(2, "dxa-unit issue: core=" << core_->id() << ", wid=" << trace->wid << ", form="
+     << std::get<DxaType>(trace->op_type));
+  BgRelOut.send(DxaBgRel{trace->wid}, 0);
+}
+#endif

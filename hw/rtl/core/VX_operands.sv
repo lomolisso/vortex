@@ -63,7 +63,11 @@ module VX_operands import VX_gpu_pkg::*; #(
 
         // select writeback interface
         VX_writeback_if opc_writeback_if();
+    `ifdef VX_CFG_H100_FE_ENABLE
+        assign opc_writeback_if.valid = writeback_if.valid && (writeback_if.data.wb || writeback_if.data.wr_xregs[XREG_UR]) && (wb_opc == i);
+    `else
         assign opc_writeback_if.valid = writeback_if.valid && writeback_if.data.wb && (wb_opc == i);
+    `endif
         assign opc_writeback_if.data  = writeback_if.data;
 
         VX_opc_unit #(

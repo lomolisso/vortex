@@ -25,6 +25,12 @@ namespace vortex {
 // An object lives in one bank, which orders every op on it, so its flip either
 // precedes a lane's read (which then reads the phase complete) or follows that
 // lane's insert: no wake-up is lost. A retire follows all of its warp's inserts.
+#ifdef VX_CFG_H100_FE_ENABLE
+// An insert counts the waiting lanes it covers, so a warp with fewer than its lanes is a
+// partial warp, which the H100 does not suspend: with partial_return its
+// retire releases it at once.
+#endif
+#line 28
 class MbarWaiterTable : public SimObject<MbarWaiterTable> {
 public:
   using Ptr = std::shared_ptr<MbarWaiterTable>;
@@ -39,7 +45,14 @@ public:
   SimChannel<WarpMask> UnlockOut;
 
   MbarWaiterTable(const SimContext& ctx, const char* name, uint32_t num_banks,
+#ifdef VX_CFG_H100_FE_ENABLE
+                  uint32_t num_blocks, uint32_t suspend_cycles,
+                  bool partial_return = true);
+#else
+#line 42
                   uint32_t num_blocks, uint32_t suspend_cycles);
+#endif
+#line 43
 
 protected:
   void on_reset();
@@ -53,6 +66,10 @@ private:
     uint32_t bank    = 0;
     uint32_t row     = 0;
     uint32_t timer   = 0;
+#ifdef VX_CFG_H100_FE_ENABLE
+    uint32_t inserts = 0;
+#endif
+#line 56
   };
 
   void release(uint32_t wid);
@@ -60,7 +77,7 @@ private:
   std::vector<entry_t> entries_;
   // Released in the cycle being completed, on the unlock port next cycle.
   WarpMask released_;
-  uint32_t suspend_cycles_;
+  uint32_t suspend_cycles_; VX_FE_ONLY(bool partial_return_;)
 
   friend class SimObject<MbarWaiterTable>;
 };

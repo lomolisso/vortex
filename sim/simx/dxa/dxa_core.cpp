@@ -244,6 +244,10 @@ public:
     };
     bool                    store = false;
     StWork                  st;
+#ifdef VX_CFG_H100_FE_ENABLE
+    bool                    pipe = false;        // drains as a copy context of its own
+#endif
+#line 247
 #else
 #line 137
 #endif
@@ -264,6 +268,10 @@ public:
     cycle_ = 0;
     queue_.clear();
 #ifdef DXA_MBAR_ENABLE
+#ifdef VX_CFG_H100_FE_ENABLE
+    this->fe_reset();
+#endif
+#line 267
     stream_.clear();
     row_flits_.clear();
     for (auto& w : workers_) {
@@ -282,6 +290,12 @@ public:
       w.store = false;
       w.st = Worker::StWork();
     }
+#ifdef VX_CFG_H100_FE_ENABLE
+    for (auto& t : st_fences_) {
+      std::fill(t.begin(), t.end(), StFence{});
+    }
+#endif
+#line 285
     lmem_rr_ = 0;
     red_buf_.clear();
     red_rr_ = 0;
@@ -293,6 +307,12 @@ public:
     fetch_port_ = false;
     head_entry_ = 0;
     head_hit_   = false;
+#ifdef DXA_TMAP_L2_ENABLE
+    preload_ = Preload();
+    map_use_ = 0;
+    map_used_.fill(0);
+#endif
+#line 296
 #else
 #line 153
 #endif
@@ -321,6 +341,15 @@ public:
 #ifdef DXA_MBAR_ENABLE
     // A launch's KMU writes drop every cached map and restart the victim
     // order; a fetch in flight still lands, but is not kept. The slots stay.
+#ifdef DXA_TMAP_L2_ENABLE
+    if (addr == VX_DCR_KMU_STARTUP_ARG0) {
+      arg_lo_ = value;
+    } else if (addr == VX_DCR_KMU_STARTUP_ARG1) {
+      l2_window_ = (uint64_t(value) << 32) | arg_lo_;
+      l2_flush_  = true;
+    }
+#endif
+#line 324
     if (addr >= VX_DCR_KMU_STATE_BEGIN && addr < VX_DCR_KMU_STATE_END) {
       for (auto& m : maps_) {
         m.valid = false;
@@ -410,12 +439,23 @@ public:
         uint32_t slot_id = uint32_t(rsp.tag) & (VX_CFG_DXA_MAX_INFLIGHT - 1);
         auto& w = workers_[worker_id];
 #ifdef DXA_MBAR_ENABLE
+#ifdef VX_CFG_H100_FE_ENABLE
+        if (uint64_t(rsp.tag) >= kStFenceTag) {
+          this->store_fence_rsp(worker_id, uint32_t(uint64_t(rsp.tag) - kStFenceTag));
+        } else
+#endif
+#line 256
         if (worker_id == 0 && uint64_t(rsp.tag) >= kFetchTag) {
           this->fetch_rsp(rsp);
         } else
         if (w.store) {
           this->store_gmem_rsp(w);
         } else
+#ifdef VX_CFG_H100_FE_ENABLE
+        if (this->fe_rsp(w, slot_id, rsp)) {
+        } else
+#endif
+#line 262
 #else
 #line 254
 #endif
@@ -431,6 +471,10 @@ public:
     // The map fetch's line reads take the GMEM port ahead of the workers.
     fetch_port_ = false;
     this->tick_fetch_send();
+#ifdef DXA_TMAP_L2_ENABLE
+    this->tick_tmap_l2();
+#endif
+#line 277
     this->drain_lmem_rsp();
     this->tick_bg_events();
     this->tick_core_switch();
@@ -444,6 +488,10 @@ public:
     if (lmem_arb_) {
       this->tick_lmem_arb();
     }
+#ifdef VX_CFG_H100_FE_ENABLE
+    this->fe_idle_drains();
+#endif
+#line 290
 #else
 #line 241
 #endif
@@ -452,6 +500,11 @@ public:
       if (w.state == WState::RUNNING) {
 #ifdef DXA_MBAR_ENABLE
         const uint32_t writes = w.writes_emitted;
+#ifdef VX_CFG_H100_FE_ENABLE
+        if (!lmem_arb_ && this->fe_smem_wr(w)) {
+        } else
+#endif
+#line 298
         if (!lmem_arb_)
 #else
 #line 244
@@ -473,15 +526,31 @@ public:
 #if defined(VX_CFG_H100_SM_ENABLE)
     // One engine per SM: the head waits for its issuing core's worker.
 #ifdef DXA_MBAR_ENABLE
+#ifdef VX_CFG_H100_FE_ENABLE
+    this->fe_fronts();
+#endif
+#line 319
     if (this->head_ready()) {
       auto& w = workers_.at(queue_.front().core->id() % kCoresPerSocket);
+#ifdef VX_CFG_H100_FE_ENABLE
+      if (w.state == WState::IDLE && this->fe_may_start(w, queue_.front())) {
+#else
+#line 321
       if (w.state == WState::IDLE) {
+#endif
+#line 322
         const bool fetched = queue_.front().fetched;
         start_worker(w, queue_.front()), queue_.pop_front();
+#ifdef VX_CFG_H100_FE_ENABLE
+        this->fe_started(w);
+#endif
+#line 324
         this->head_popped(fetched);
       }
     }
+#line 326
 #else
+#line 263
     if (!queue_.empty()) {
       auto& w = workers_.at(queue_.front().core->id() % kCoresPerSocket);
       if (w.state == WState::IDLE)
@@ -494,7 +563,21 @@ public:
     for (uint32_t i = 0; i < kCoresPerSocket && queue_.size() < VX_CFG_DXA_QUEUE_SIZE; ++i) {
       const uint32_t c = (rr_req_ + i) % kCoresPerSocket;
       auto& q = core_q_.at(c);
+#if defined(VX_CFG_H100_FE_ENABLE) && defined(DXA_MBAR_ENABLE)
+      if (q.empty() || !this->fe_may_enter(workers_.at(c), q.front()))
+#else
+#ifdef DXA_MBAR_ENABLE
+#line 337
+#else
+#line 274
+#endif
       if (q.empty() || workers_.at(c).state != WState::IDLE)
+#endif
+#ifdef DXA_MBAR_ENABLE
+#line 338
+#else
+#line 275
+#endif
         continue;
       if (std::any_of(queue_.begin(), queue_.end(),
                       [c](const DxaReq& r) { return r.core->id() % kCoresPerSocket == c; }))
@@ -515,15 +598,34 @@ public:
       }
     }
     return;
+#ifdef DXA_MBAR_ENABLE
+#line 344
+#else
+#line 281
+#endif
 #elif defined(DXA_MBAR_ENABLE)
 #line 467
     // A map operand at the queue head is looked up first; a miss blocks the
     // head until its map is fetched, and the tensormap ops end there.
+#ifdef VX_CFG_H100_FE_ENABLE
+    this->fe_fronts();
+#endif
+#line 469
     bool ready = this->head_ready();
     for (auto& w : workers_) {
+#ifdef VX_CFG_H100_FE_ENABLE
+      if (w.state == WState::IDLE && ready && this->fe_may_start(w, queue_.front())) {
+#else
+#line 471
       if (w.state == WState::IDLE && ready) {
+#endif
+#line 472
         const bool fetched = queue_.front().fetched;
         start_worker(w, queue_.front()), queue_.pop_front();
+#ifdef VX_CFG_H100_FE_ENABLE
+        this->fe_started(w);
+#endif
+#line 474
         this->head_popped(fetched);
         // A map operand behind is looked up from the next cycle.
         ready = !queue_.empty() && !queue_.front().map && !queue_.front().tmop && !queue_.front().held;
@@ -924,6 +1026,16 @@ private:
     if (w.req.bulk || w.store) {
       return;
     }
+#ifdef VX_CFG_H100_FE_ENABLE
+    if (!w.pipe && !drains_.at(w.worker_id).empty()) {
+      return;
+    }
+#endif
+#ifdef VX_CFG_H100_SM_ENABLE
+#line 767
+#else
+#line 873
+#endif
     if (w.first_line != 0 && SimPlatform::instance().cycles() < w.first_line) {
       return;
     }
@@ -1573,7 +1685,14 @@ private:
       }
     }
 
+#ifdef VX_CFG_H100_FE_ENABLE
+    const bool copy_end = w.pipe ? (w.ag_idx == w.work_list.size() && w.issued_order.size() == 1 && e == num_elems)
+                                 : (lw.last && (e == num_elems));
+#else
+#line 1202
     const bool copy_end = lw.last && (e == num_elems);
+#endif
+#line 1203
     for (uint32_t k = 0; k < n; ++k) {
       auto& req = beat.at(k);
       req.dxa.xfer     = w.xfer_base + rcv_idx;
@@ -2234,7 +2353,13 @@ private:
     const uint32_t n = uint32_t(workers_.size());
     for (uint32_t k = 0; k < n; ++k) {
       auto& w = workers_.at((lmem_rr_ + k) % n);
+#ifdef VX_CFG_H100_FE_ENABLE
+      if (w.state != WState::RUNNING && drains_.at(w.worker_id).empty())
+#else
+#line 1855
       if (w.state != WState::RUNNING)
+#endif
+#line 1856
         continue;
       const uint32_t writes = w.writes_emitted;
       lmem_sent_ = false;
@@ -2243,6 +2368,10 @@ private:
       } else if (w.req.bulk) {
         this->bulk_bus_op(w);
       } else {
+#ifdef VX_CFG_H100_FE_ENABLE
+        if (!this->fe_smem_wr(w))
+#endif
+#line 1864
         this->tick_worker_smem_wr(w);
       }
       if (lmem_sent_ || w.writes_emitted != writes) {
@@ -2469,7 +2598,14 @@ private:
     fetch_.addr    = req.map_addr;
     const uint64_t first = req.map_addr & kGmemLineMask;
     fetch_.lines   = uint32_t((req.map_addr + kMapBytes - first + kGmemLineSize - 1) / kGmemLineSize);
+#ifdef DXA_TMAP_L2_ENABLE
+    fetch_.send_at = UINT64_MAX;
+    this->l2_send(TmapL2Req::LOOKUP, req.map_addr);
+#else
+#line 2090
     fetch_.send_at = cycle_ + kFetchFirst;
+#endif
+#line 2091
     fetch_.hart_id = req.core->id();
     fetch_.uuid    = req.uuid;
     DT(3, simobject_->name() << " tmap miss: map=0x" << std::hex << req.map_addr << std::dec << ", lines="
@@ -2496,6 +2632,16 @@ private:
   // The map's bytes of a line; the last response fills the victim entry,
   // unless a launch killed the fetch.
   void fetch_rsp(const MemRsp& rsp) {
+#ifdef DXA_TMAP_L2_ENABLE
+    if (uint64_t(rsp.tag) >= kFetchTag + kPreloadOff) {
+      const uint32_t slot = uint32_t(uint64_t(rsp.tag) - kFetchTag - kPreloadOff);
+      const uint64_t i = pre_idx_.at(slot);
+      this->l2_send(TmapL2Req::FILL, (l2_window_ & kGmemLineMask) + i * kGmemLineSize, rsp.data->data(), true);
+      pre_freed_ |= 1ull << slot;
+      return;
+    }
+#endif
+#line 2117
     __assert(fetch_.active && rsp.data, simobject_->name() << " DXA map line response without a fetch");
     const uint32_t i = uint32_t(uint64_t(rsp.tag) - kFetchTag);
     const uint64_t line = (fetch_.addr & kGmemLineMask) + uint64_t(i) * kGmemLineSize;
@@ -2507,9 +2653,20 @@ private:
         fetch_.w[off / 4] |= uint32_t(rsp.data->data()[b]) << (8 * (off % 4));
       }
     }
+#ifdef DXA_TMAP_L2_ENABLE
+    if (!fetch_.killed) {
+      this->l2_send(TmapL2Req::FILL, line, rsp.data->data());
+    }
+#endif
+#line 2128
     if (++fetch_.got < fetch_.lines)
       return;
     fetch_.hit_at = cycle_ + kFetchHit;
+#ifdef DXA_TMAP_L2_ENABLE
+    this->map_fill(fetch_.w);
+    return;
+#endif
+#line 2131
     if (fetch_.killed) {
       DT(3, simobject_->name() << " tmap fill killed: map=0x" << std::hex << fetch_.addr << std::dec << " (#"
          << fetch_.uuid << ")");
@@ -2554,6 +2711,10 @@ private:
           if (e >= 0) {
             maps_[e].valid = false;
           }
+#ifdef DXA_TMAP_L2_ENABLE
+          this->l2_send(TmapL2Req::INVAL, h.map_addr);
+#endif
+#line 2175
           DT(3, simobject_->name() << " tmap inval: map=0x" << std::hex << h.map_addr << std::dec << ", entry="
              << e << " (#" << h.uuid << ")");
           this->head_pop();
@@ -2588,6 +2749,10 @@ private:
         this->fetch_start(h);
         return false;
       }
+#ifdef DXA_TMAP_L2_ENABLE
+      map_used_[e] = ++map_use_;
+#endif
+#line 2209
       if (h.tmop) {
         DT(3, simobject_->name() << " tmap prefetch: map=0x" << std::hex << h.map_addr << std::dec << ", entry="
            << e << " (#" << h.uuid << ")");
@@ -2599,6 +2764,11 @@ private:
       }
       head_entry_ = uint32_t(e);
       head_hit_   = true;
+#ifdef DXA_TMAP_L2_ENABLE
+      DT(3, simobject_->name() << " tmap present: map=0x" << std::hex << h.map_addr << std::dec << " (#" << h.uuid
+         << ")");
+#endif
+#line 2220
       return true;
     }
     return false;
@@ -2620,6 +2790,107 @@ private:
       queue_.front().held = true;
     }
   }
+#ifdef DXA_TMAP_L2_ENABLE
+
+  // ── Tensor-map level 2 (tmap_l2.h) ───────────────────────────────────
+  static constexpr uint64_t kPreloadOff = 4;  // past the map fetch's line tags
+  static_assert(VX_CFG_TMAP_PARAM_READS >= 2 && VX_CFG_TMAP_PARAM_READS <= 64 && (VX_CFG_TMAP_PARAM_READS & (VX_CFG_TMAP_PARAM_READS - 1)) == 0,
+                "the window reads need TMAP_PARAM_READS a power of two from 2 to 64");
+
+  void l2_send(TmapL2Req::Op op, uint64_t addr, const uint8_t* data = nullptr, bool param = false) {
+    TmapL2Req r;
+    r.op    = op;
+    r.addr  = addr;
+    r.param = param;
+    if (data) {
+      std::copy(data, data + kGmemLineSize, r.data.begin());
+    }
+    // The request crossing's register is VX_dxa_core's request cycle to VX_tmap_l2.
+    simobject_->tmap_l2_req_out.send(r, 0);
+  }
+
+  // The fetched map into level 1: an empty entry, else the round-robin or
+  // least recently used one.
+  void map_fill(const std::array<uint32_t, TMAP_WORDS>& w) {
+    if (fetch_.killed) {
+      DT(3, simobject_->name() << " tmap fill killed: map=0x" << std::hex << fetch_.addr << std::dec << " (#"
+         << fetch_.uuid << ")");
+      return;
+    }
+    uint32_t e = 0;
+    while (e < maps_.size() && maps_[e].valid) {
+      ++e;
+    }
+    if (e == maps_.size()) {
+      if (VX_CFG_TMAP_L1_REPL == 0) {
+        e = map_rr_;
+        map_rr_ = (map_rr_ + 1) % uint32_t(maps_.size());
+      } else {
+        e = 0;
+        for (uint32_t k = 1; k < maps_.size(); ++k) {
+          if (map_used_[k] < map_used_[e])
+            e = k;
+        }
+      }
+    }
+    auto& m = maps_[e];
+    m.valid = true;
+    m.tag   = map_tag(fetch_.addr);
+    std::copy(w.begin(), w.begin() + TMAP_FETCH_WORDS, m.w.begin());
+    m.desc  = map_desc(m.w.data());
+    map_used_[e] = ++map_use_;
+    DT(3, simobject_->name() << " tmap fill: map=0x" << std::hex << fetch_.addr << std::dec << ", entry=" << e
+       << " (#" << fetch_.uuid << ")");
+  }
+
+  // Level 2's answers: a hit fills level 1 as a fetch's last line does; a
+  // miss reads the map's lines; port 0 loads the window.
+  void tick_tmap_l2() {
+    if (l2_flush_) {
+      l2_flush_ = false;
+      this->l2_send(TmapL2Req::FLUSH, l2_window_);
+    }
+    auto& ch = simobject_->tmap_l2_rsp_in;
+    while (!ch.empty()) {
+      const auto& r = ch.peek();
+      if (r.kind == TmapL2Rsp::PRELOAD) {
+        preload_ = Preload();
+        preload_.active = true;
+        preload_.first  = r.addr & kGmemLineMask;
+        preload_.lines  = uint32_t((r.addr + VX_CFG_TMAP_PARAM_BYTES - preload_.first + kGmemLineSize - 1) / kGmemLineSize);
+      } else if (r.kind == TmapL2Rsp::MISS) {
+        __assert(fetch_.active, simobject_->name() << " tensor-map level-2 miss without a fetch");
+        fetch_.send_at = cycle_ + kFetchFirst;
+        DT(3, simobject_->name() << " tmap l2 miss: map=0x" << std::hex << fetch_.addr << std::dec << " (#"
+           << fetch_.uuid << ")");
+      } else {
+        __assert(fetch_.active && fetch_.got == 0, simobject_->name() << " tensor-map level-2 hit without a fetch");
+        fetch_.got    = fetch_.lines;
+        fetch_.hit_at = cycle_ + kFetchHit;
+        DT(3, simobject_->name() << " tmap l2 hit: map=0x"
+           << std::hex << fetch_.addr << std::dec << ", at=" << fetch_.hit_at << " (#" << fetch_.uuid << ")");
+        this->map_fill(r.w);
+      }
+      ch.pop();
+    }
+    const uint32_t slot = preload_.sent % VX_CFG_TMAP_PARAM_READS;
+    if (preload_.active && !fetch_port_ && !(pre_busy_ & (1ull << slot))) {
+      fetch_port_ = true;
+      MemReq mreq;
+      mreq.addr = preload_.first + uint64_t(preload_.sent) * kGmemLineSize;
+      mreq.tag  = (kFetchTag + kPreloadOff + slot) << log2ceil(VX_CFG_NUM_DXA_CORES);
+      if (simobject_->gmem_req_out.at(0).try_send(mreq, 0)) {
+        DT(3, simobject_->name() << " tmap param rd: addr=0x" << std::hex << mreq.addr << std::dec);
+        pre_busy_ |= 1ull << slot;
+        pre_idx_.at(slot) = preload_.sent;
+        preload_.active = (++preload_.sent < preload_.lines);
+      }
+    }
+    pre_busy_ &= ~pre_freed_;
+    pre_freed_ = 0;
+  }
+#endif
+#line 2241
 
   // ── The store family (LMEM → global memory, or a cluster block) ──────
   static MemOp red_memop(uint32_t code) {
@@ -2958,6 +3229,11 @@ private:
       }
       return;
     }
+#ifdef VX_CFG_H100_FE_ENABLE
+    if (this->store_fence_fe(w, ch))
+      return;
+#endif
+#line 2579
     const bool stores = (st.kind == dxa_ref::ST_BULK || st.kind == dxa_ref::ST_TENSOR);
     if (stores && st.writes != 0 && !st.fence_sent && this->store_drained(w) && cycle_ > st.last_wr) {
       MemReq f;
@@ -2999,6 +3275,59 @@ private:
     }
   }
 
+#ifdef VX_CFG_H100_FE_ENABLE
+  // A bulk or tensor store's trailing fence (14 M6: stores drain at the
+  // egress rate, so no store waits for the one before to be performed): the
+  // worker ends once its fence goes, and the fence's answer, in an entry of
+  // the worker's fence table, carries the group's write_done.
+  template <typename Ch>
+  bool store_fence_fe(Worker& w, Ch& ch) {
+    auto& st = w.st;
+    const bool stores = (st.kind == dxa_ref::ST_BULK || st.kind == dxa_ref::ST_TENSOR);
+    if (!stores || st.writes == 0 || st.fence_sent || !this->store_drained(w) || cycle_ <= st.last_wr)
+      return false;
+    auto& tbl = st_fences_.at(w.worker_id);
+    uint32_t idx = 0;
+    while (idx < kStFences && tbl.at(idx).valid) {
+      ++idx;
+    }
+    if (idx == kStFences)
+      return true;
+    MemReq f;
+    f.op          = MemOp::LD;
+    f.addr        = st.last_line;
+    f.tag         = kStFenceTag + idx;
+    f.hart_id     = w.req.core->id();
+    f.uuid        = w.req.uuid;
+    f.flags.fence = 1;
+    if (!ch.try_send(f, kGmemReqDelay))
+      return true;
+    st.fence_sent = true;
+    auto& e = tbl.at(idx);
+    e.valid        = true;
+    e.c.wid        = w.req.wid;
+    e.c.seq        = w.req.bg_seq;
+    e.c.read_done  = false;
+    e.c.write_done = true;
+    e.core         = w.req.core->id() % kCoresPerSocket;
+    e.uuid         = w.req.uuid;
+    st.end_at = cycle_ + kStEndDelay;
+    DT(3, simobject_->name() << "[" << w.worker_id << "] store fence: line=0x" << std::hex << f.addr
+       << std::dec << ", entry=" << idx << " (#" << w.req.uuid << ")");
+    return true;
+  }
+
+  void store_fence_rsp(uint32_t worker_id, uint32_t idx) {
+    __assert(idx < kStFences && st_fences_.at(worker_id).at(idx).valid,
+             simobject_->name() << " DXA store fence response without its fence: entry=" << idx);
+    auto& e = st_fences_.at(worker_id).at(idx);
+    bg_evq_.at(worker_id).push_back({e.c, cycle_ + kBgEvtDelay, e.core});
+    DT(3, simobject_->name() << "[" << worker_id << "] bg-compl " << e.c << " (#" << e.uuid << ")");
+    e.valid = false;
+  }
+
+#endif
+#line 2620
   // The cycle's end for a store worker: assembly of the oldest landed
   // response, then the operation's completions.
   void store_post(Worker& w) {
@@ -3183,6 +3512,229 @@ private:
   // the cycle after the condition.
   static constexpr uint64_t kBgEvtDelay = 3;
   static constexpr uint64_t kStEndDelay = 2;
+#ifdef VX_CFG_H100_FE_ENABLE
+  // Copy pipelining (14 M7: 16-B copies leave the engine at the intake rate,
+  // ~50 in flight per SM). Once the address generator has issued the last
+  // line of a G->S copy to its own SM, the worker takes the next request and
+  // the copy drains as a context of its own; its lines keep their slots, held
+  // in the front as placeholders. smem_wr drains the lines of all contexts in
+  // arrival order, and a copy ends on the beat that drains its last
+  // outstanding line.
+  bool req_pipe(const DxaReq& r) const {
+    return (r.tload || r.bload) && !r.prefetch && !r.cluster && !r.remote
+        && __builtin_popcount(r.cta_mask) <= 1 && !r.store && !r.bulk && !r.tmop;
+  }
+
+  // A request that cannot pipeline waits until the worker's copies drained.
+  bool fe_may_start(const Worker& w, const DxaReq& r) const {
+    return drains_.at(w.worker_id).empty() || this->req_pipe(r);
+  }
+
+  // A core's next request is set up while its worker's pipelining front runs,
+  // and waits at the head for the front to end (14 M7: one copy per intake).
+  bool fe_may_enter(const Worker& w, const DxaReq& r) const {
+    if (w.state == WState::IDLE)
+      return this->fe_may_start(w, r);
+    return w.state == WState::RUNNING && w.pipe && this->req_pipe(r);
+  }
+
+  void fe_started(Worker& w) {
+    w.pipe = (w.state == WState::RUNNING) && w.ptx && !w.prefetch && (w.req.tload || w.req.bload)
+          && !w.req.cluster && !w.is_multicast && w.rcvs.size() == 1 && !w.rcvs.at(0).remote
+          && !w.store && !w.req.bulk;
+    DT(3, simobject_->name() << "[" << w.worker_id << "] pipe=" << w.pipe << ": ptx=" << w.ptx << ", prefetch="
+       << w.prefetch << ", tload=" << w.req.tload << ", bload=" << w.req.bload << ", cluster=" << w.req.cluster
+       << ", multicast=" << w.is_multicast << ", rcvs=" << w.rcvs.size()
+       << ", remote=" << (w.rcvs.empty() ? 0 : int(w.rcvs.at(0).remote)) << ", drains="
+       << drains_.at(w.worker_id).size() << " (#" << w.req.uuid << ")");
+    const uint64_t held = held_.at(w.worker_id);
+    for (uint32_t s = 0; s < VX_CFG_DXA_MAX_INFLIGHT; ++s) {
+      if ((held >> s) & 1) {
+        w.inflight[s].allocated = true;
+      }
+    }
+    ag_seen_.at(w.worker_id) = 0;
+  }
+
+  bool fe_held(uint32_t id, uint32_t slot) const {
+    return (held_.at(id) >> slot) & 1;
+  }
+
+  Worker& fe_owner(Worker& w, uint32_t slot) {
+    if (this->fe_held(w.worker_id, slot)) {
+      for (auto& c : drains_.at(w.worker_id)) {
+        if (c.inflight[slot].allocated)
+          return c;
+      }
+    }
+    return w;
+  }
+
+  // A read response; true when it belongs to a draining copy.
+  bool fe_rsp(Worker& w, uint32_t slot, const MemRsp& rsp) {
+    const uint32_t id = w.worker_id;
+    if (!this->fe_held(id, slot)) {
+      if (w.pipe && w.state == WState::RUNNING && w.inflight[slot].allocated) {
+        arrivals_.at(id).push_back(slot);
+      }
+      return false;
+    }
+    auto& c = this->fe_owner(w, slot);
+    c.inflight[slot].rsp_arrived = true;
+    c.inflight[slot].rsp_data    = rsp.data;
+    arrivals_.at(id).push_back(slot);
+    return true;
+  }
+
+  // After the workers' tick: an out-of-bounds line arrives as it is issued,
+  // and a front whose address generator is done becomes a draining copy.
+  void fe_fronts() {
+    for (auto& w : workers_) {
+      const uint32_t id = w.worker_id;
+      if (w.state != WState::RUNNING || !w.pipe)
+        continue;
+      if (w.ag_idx != ag_seen_.at(id)) {
+        ag_seen_.at(id) = w.ag_idx;
+        const uint32_t s = w.issued_order.back();
+        if (w.inflight[s].rsp_arrived) {
+          arrivals_.at(id).push_back(s);
+        }
+      }
+      if (w.ag_idx < w.work_list.size() || w.issued_order.empty())
+        continue;
+      auto& dq = drains_.at(id);
+      dq.push_back(w);
+      auto& c = dq.back();
+      for (uint32_t s = 0; s < VX_CFG_DXA_MAX_INFLIGHT; ++s) {
+        if (this->fe_held(id, s)) {
+          c.inflight[s].allocated = false;
+        }
+      }
+      for (uint32_t s : c.issued_order) {
+        held_.at(id) |= uint64_t(1) << s;
+      }
+      w.state = WState::IDLE;
+      w.pipe  = false;
+      w.work_list.clear();
+      w.cta_indices.clear();
+      w.issued_order.clear();
+      w.drain_slot  = UINT32_MAX;
+      w.ag_idx      = 0;
+      w.mc_cta_idx  = 0;
+      w.km_elem_idx = 0;
+      w.km_byte_off = 0;
+      w.writes_emitted = 0;
+      for (uint32_t s = 0; s < VX_CFG_DXA_MAX_INFLIGHT; ++s) {
+        w.inflight[s].allocated   = this->fe_held(id, s);
+        w.inflight[s].rsp_arrived = false;
+        w.inflight[s].rsp_data.reset();
+      }
+    }
+  }
+
+  // smem_wr of a pipelining worker; false when it does not pipeline.
+  bool fe_smem_wr(Worker& w) {
+    const uint32_t id = w.worker_id;
+    auto& dq = drains_.at(id);
+    const bool front = (w.state == WState::RUNNING && w.pipe);
+    if (dq.empty() && !front)
+      return false;
+    Worker* ctx = nullptr;
+    for (auto& c : dq) {
+      if (c.drain_slot != UINT32_MAX) {
+        ctx = &c;
+        break;
+      }
+    }
+    if (ctx == nullptr && front && w.drain_slot != UINT32_MAX) {
+      ctx = &w;
+    }
+    auto& arr = arrivals_.at(id);
+    if (ctx == nullptr) {
+      if (arr.empty())
+        return true;
+      const uint32_t s = arr.front();
+      arr.pop_front();
+      ctx = &this->fe_owner(w, s);
+      ctx->drain_slot = s;
+    }
+    const uint32_t slot   = ctx->drain_slot;
+    const uint32_t writes = ctx->writes_emitted;
+    ctx->tok_start = tok_start_.at(id);
+    this->tick_worker_smem_wr(*ctx);
+    tok_start_.at(id) = ctx->tok_start;
+    if (ctx == &w)
+      return true;
+    if (ctx->writes_emitted != writes) {
+      lmem_sent_ = true;
+      if (!lmem_arb_) {
+        lmem_rr_ = (id + 1) % uint32_t(workers_.size());
+      }
+    }
+    if (!ctx->inflight[slot].allocated) {
+      held_.at(id) &= ~(uint64_t(1) << slot);
+      w.inflight[slot].allocated = false;
+    }
+    if (ctx->issued_order.empty()) {
+      this->finish_worker(*ctx);
+      for (auto it = dq.begin(); it != dq.end(); ++it) {
+        if (&*it == ctx) {
+          dq.erase(it);
+          break;
+        }
+      }
+    }
+    return true;
+  }
+
+  // The workers whose front is idle drain their copies outside the tick loop.
+  void fe_idle_drains() {
+    if (lmem_arb_)
+      return;
+    for (auto& w : workers_) {
+      if (w.state != WState::RUNNING && !drains_.at(w.worker_id).empty()) {
+        this->fe_smem_wr(w);
+      }
+    }
+  }
+
+  void fe_reset() {
+    for (auto& d : drains_) {
+      d.clear();
+    }
+    for (auto& a : arrivals_) {
+      a.clear();
+    }
+    std::fill(held_.begin(), held_.end(), 0);
+    std::fill(ag_seen_.begin(), ag_seen_.end(), 0);
+    std::fill(tok_start_.begin(), tok_start_.end(), 0);
+    for (auto& w : workers_) {
+      w.pipe = false;
+    }
+  }
+
+  // Per worker: its draining copies (oldest first), the slots they hold, the
+  // lines arrived and not yet drained (in arrival order), the front's lines
+  // seen issued, and smem_wr's last line start.
+  std::vector<std::deque<Worker>> drains_ = std::vector<std::deque<Worker>>(VX_CFG_NUM_DXA_CORES);
+  std::vector<uint64_t>             held_ = std::vector<uint64_t>(VX_CFG_NUM_DXA_CORES, 0);
+  std::vector<std::deque<uint32_t>> arrivals_ = std::vector<std::deque<uint32_t>>(VX_CFG_NUM_DXA_CORES);
+  std::vector<size_t>               ag_seen_ = std::vector<size_t>(VX_CFG_NUM_DXA_CORES, 0);
+  std::vector<uint64_t>             tok_start_ = std::vector<uint64_t>(VX_CFG_NUM_DXA_CORES, 0);
+  // A worker's store fences in flight: one per queued store at most, tagged
+  // past the map fetch's and the level-2 preload's tags.
+  static constexpr uint32_t kStFences = VX_CFG_TMA_STORE_QUEUE_OPS;
+  static constexpr uint64_t kStFenceTag = kFetchTag + kPreloadOff + VX_CFG_TMAP_PARAM_READS;
+  struct StFence {
+    bool       valid = false;
+    DxaBgCompl c;
+    uint32_t   core = 0;
+    uint64_t   uuid = 0;
+  };
+  std::vector<std::vector<StFence>> st_fences_ =
+      std::vector<std::vector<StFence>>(VX_CFG_NUM_DXA_CORES, std::vector<StFence>(kStFences));
+#endif
+#line 2804
 #else
 #line 1194
 #endif
@@ -3290,6 +3842,27 @@ private:
   };
   Fetch fetch_;
   bool  fetch_port_ = false;    // the fetch holds the GMEM port this cycle
+#ifdef DXA_TMAP_L2_ENABLE
+  // The launch's parameter-window reads into level 2, after the map fetch's.
+  struct Preload {
+    bool     active = false;
+    uint64_t first  = 0;
+    uint32_t lines  = 0;
+    uint32_t sent   = 0;
+  };
+  Preload  preload_;
+  // A window read's slot (index mod TMAP_PARAM_READS) rides its tag; a slot
+  // answered this cycle is free from the next.
+  uint64_t pre_busy_  = 0;
+  uint64_t pre_freed_ = 0;
+  std::array<uint32_t, VX_CFG_TMAP_PARAM_READS> pre_idx_{};
+  uint64_t arg_lo_        = 0;
+  uint64_t l2_window_     = 0;
+  bool     l2_flush_      = false;  // a launch named its argument: empty level 2, load the window
+  uint64_t map_use_       = 0;
+  std::array<uint64_t, DXA_TMAP_ENTRIES> map_used_{};
+#endif
+#line 1292
 #else
 #line 935
 #endif
@@ -3312,6 +3885,11 @@ DxaCore::DxaCore(const SimContext& ctx, const char* name, Socket* socket)
   , row_out(this)
   , lmem_rsp_in(kCoresPerSocket * LMEM_PORTS_PER_CORE, this)
   , BgComplOut(kCoresPerSocket, this)
+#ifdef DXA_TMAP_L2_ENABLE
+  , tmap_l2_req_out(this)
+  , tmap_l2_rsp_in(this)
+#endif
+#line 1314
 #else
 #line 950
 #endif

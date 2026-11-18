@@ -501,6 +501,20 @@ module VX_cluster import VX_gpu_pkg::*, VX_tlb_pkg::*;
         `UNUSED_VAR ({per_socket_dlmem_rsp_up_if[0].valid, per_socket_dlmem_rsp_up_if[0].data, per_socket_dlmem_rsp_up_if[0].dst})
     end
 `endif
+`ifdef DXA_TMAP_L2_ENABLE
+
+    VX_tmap_l2_bus_if tmap_l2_bus_if[NUM_SOCKETS]();
+
+    VX_tmap_l2 #(
+        .INSTANCE_ID (`SFORMATF(("%s-tmap-l2", INSTANCE_ID))),
+        .NUM_PORTS   (NUM_SOCKETS)
+    ) tmap_l2 (
+        .clk    (clk),
+        .reset  (reset),
+        .bus_if (tmap_l2_bus_if)
+    );
+`endif
+`line 504 "VX_cluster.sv" 0
 
     // CPC c holds the GPC's sockets t * CPCS_PER_GPC + c; its port arrays are
     // pure wire joins onto the GPC's per-socket buses.
@@ -536,6 +550,10 @@ module VX_cluster import VX_gpu_pkg::*, VX_tlb_pkg::*;
             .DST_W (DLMEM_CORE_W)
         ) cpc_dlmem_rsp_up_if[TPCS_PER_CPC](), cpc_dlmem_rsp_down_if[TPCS_PER_CPC]();
     `endif
+    `ifdef DXA_TMAP_L2_ENABLE
+        VX_tmap_l2_bus_if cpc_tmap_l2_bus_if[TPCS_PER_CPC]();
+    `endif
+`line 539 "VX_cluster.sv" 0
 
         for (genvar t = 0; t < TPCS_PER_CPC; ++t) begin : g_tpc_links
             localparam j = t * CPCS_PER_GPC + c;
@@ -591,6 +609,15 @@ module VX_cluster import VX_gpu_pkg::*, VX_tlb_pkg::*;
             assign cpc_dlmem_rsp_down_if[t].dst        = per_socket_dlmem_rsp_down_if[j].dst;
             assign per_socket_dlmem_rsp_down_if[j].ready = cpc_dlmem_rsp_down_if[t].ready;
         `endif
+        `ifdef DXA_TMAP_L2_ENABLE
+            assign tmap_l2_bus_if[j].req_valid  = cpc_tmap_l2_bus_if[t].req_valid;
+            assign tmap_l2_bus_if[j].req_data   = cpc_tmap_l2_bus_if[t].req_data;
+            assign cpc_tmap_l2_bus_if[t].req_ready = tmap_l2_bus_if[j].req_ready;
+            assign cpc_tmap_l2_bus_if[t].rsp_valid = tmap_l2_bus_if[j].rsp_valid;
+            assign cpc_tmap_l2_bus_if[t].rsp_data  = tmap_l2_bus_if[j].rsp_data;
+            assign tmap_l2_bus_if[j].rsp_ready  = cpc_tmap_l2_bus_if[t].rsp_ready;
+        `endif
+`line 594 "VX_cluster.sv" 0
         end
 
         wire [TPCS_PER_CPC-1:0] cpc_busy;
@@ -634,6 +661,10 @@ module VX_cluster import VX_gpu_pkg::*, VX_tlb_pkg::*;
             .dlmem_rsp_up_if   (cpc_dlmem_rsp_up_if),
             .dlmem_rsp_down_if (cpc_dlmem_rsp_down_if),
         `endif
+        `ifdef DXA_TMAP_L2_ENABLE
+            .tmap_l2_bus_if    (cpc_tmap_l2_bus_if),
+        `endif
+`line 637 "VX_cluster.sv" 0
 
             .busy           (cpc_busy)
         );

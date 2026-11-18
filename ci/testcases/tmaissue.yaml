@@ -1,0 +1,109 @@
+# One-thread TMA issue from uniform registers: every DXA form issued by one
+# lane with the rest of the warp inactive (a 2-block cluster on 2 cores for the
+# shared::cta -> shared::cluster copy; global reductions need the L2), the per-warp issue cost of each
+# form (structural), kernels built without the reserved x30/x31, and wgmma descriptors read
+# from UR8/UR9. RV64 (DXA builds are RV64 only); the front-end switch on.
+category: tmaissue
+defaults:
+  xlen: [64]
+  tier: smoke
+  configs: "-DVX_CFG_EXT_DXA_ENABLE -DVX_CFG_H100_FE_ENABLE"
+  touches: [VX_config.toml, hw/rtl/VX_gpu_pkg.sv, hw/rtl/core/VX_decode.sv, hw/rtl/core/VX_opc_unit.sv,
+            hw/rtl/core/VX_operands.sv, hw/rtl/core/VX_scoreboard.sv, hw/rtl/core/VX_bg_unit.sv,
+            hw/rtl/core/VX_sfu_unit.sv, hw/rtl/dxa/VX_dxa_unit.sv, sim/simx/decode.cpp, sim/simx/opc_unit.cpp,
+            sim/simx/bg_unit.cpp, sim/simx/sfu_unit.cpp, sim/simx/dxa/dxa_unit.cpp, sim/simx/dxa/dxa_unit.h,
+            sw/common/vx_fe_isa.h, sw/kernel/include/vx_dxa.h, sw/kernel/include/vx_uniform.h,
+            tests/regression/tma_issue]
+tests:
+  # Every form from one random non-zero lane: local memory, global results and
+  # every thread's live register equal the host golden.
+  - id: forms
+    app: tma_issue
+    drivers: [simx, rtlsim]
+    shape: {cores: 2, l2cache: true}
+    args: "-k0 -s7"
+  - id: forms-s2
+    app: tma_issue
+    drivers: [simx]
+    shape: {cores: 2, l2cache: true}
+    args: "-k0 -s2"
+  # The issuing thread's loads right after vx_bulk_wait_all() see a 4-KiB bulk
+  # store's and a 4-KiB bulk reduce's values, last word first; also on the H100 SM path.
+  - id: visible
+    app: tma_issue
+    drivers: [simx, rtlsim]
+    shape: {cores: 2, l2cache: true}
+    args: "-k2 -s7"
+  - id: visible-org
+    app: tma_issue
+    drivers: [simx, rtlsim]
+    configs: "-DVX_CFG_EXT_DXA_ENABLE -DVX_CFG_H100_ORG_ENABLE -DVX_CFG_NUM_THREADS=16"
+    shape: {warps: 32, l2cache: true}
+    args: "-k2 -s7"
+  # The issue cost is the header's own instructions: no warp of 4 issues faster
+  # than one warp alone, and 4 warps issue no fewer copies per cycle; the H100's
+  # per-form costs are printed (H100REF).
+  - id: cost
+    via: script
+    driver: simx
+    env: {DRIVER: simx}
+    run: &cost_run |
+      vh=$(printf 'include config.mk\nall:\n\t@echo $(VORTEX_HOME)\n' | make -s -f -)
+      python3 "$vh/tests/regression/tma_issue/cost_check.py"
+  - id: cost
+    via: script
+    driver: rtlsim
+    env: {DRIVER: rtlsim}
+    run: *cost_run
+  # Ports built without -ffixed-x30/-x31 when the switch is on.
+  - id: nofixed-cuda_api
+    via: script
+    driver: simx
+    configs+: "-DVX_CFG_EXT_DLMEM_ENABLE -DVX_CFG_EXT_A_ENABLE -DVX_CFG_EXT_MBAR_ENABLE -DVX_CFG_EXT_ZACAS_ENABLE -DVX_CFG_EXT_FPAMO_ENABLE"
+    touches: [tests/regression/common.mk, tests/regression/cuda_api, sw/kernel/include/vx_cuda.h]
+    run: &nofixed_run |
+      set -u
+      app=tests/regression/$APP
+      make -C "$app" clean > /dev/null
+      # The checked build must see the run's shape (the warp intrinsics need 32 threads).
+      CONFIGS="${CONFIGS:-} $SHAPE" make -C "$app" > "$app/build.log" 2>&1 || { tail -n 30 "$app/build.log"; exit 1; }
+      if grep -q -- '-ffixed-x3[01]' "$app/build.log"; then
+        echo "FAIL: $APP compiled with -ffixed-x30/x31"; exit 1
+      fi
+      ./ci/blackbox.sh --driver=simx --app=$APP $BB_FLAGS --args="$ARGS"
+    env: {APP: cuda_api, BB_FLAGS: "--cores=2 --threads=32 --l2cache", ARGS: "-m cg",
+          SHAPE: "-DVX_CFG_NUM_CORES=2 -DVX_CFG_NUM_THREADS=32 -DVX_CFG_L2_ENABLE"}
+  - id: nofixed-wgmma_h100
+    via: script
+    driver: simx
+    configs: &h100_fe_cfg "-DVX_CFG_ISSUE_WIDTH=4 -DVX_CFG_LMEM_LOG_SIZE=18 -DVX_CFG_EXT_DLMEM_ENABLE -DVX_CFG_EXT_A_ENABLE -DVX_CFG_EXT_ZACAS_ENABLE -DVX_CFG_EXT_MBAR_ENABLE -DVX_CFG_EXT_DXA_ENABLE -DVX_CFG_EXT_FPAMO_ENABLE -DVX_CFG_EXT_TCU_ENABLE -DVX_CFG_TCU_WGMMA_ENABLE -DVX_CFG_TCU_FP8_ENABLE -DVX_CFG_TCU_H100_ENABLE -DWGMMA_SS -DVX_CFG_H100_FE_ENABLE"
+    touches: [tests/regression/common.mk, tests/regression/wgmma_h100, sw/kernel/include/vx_tensor.h]
+    run: *nofixed_run
+    env: {APP: wgmma_h100, BB_FLAGS: "--cores=1 --warps=4 --threads=32", ARGS: "-l 128 -t f16f32 -n 64 -c 2 -r 2",
+          SHAPE: "-DVX_CFG_NUM_CORES=1 -DVX_CFG_NUM_WARPS=4 -DVX_CFG_NUM_THREADS=32"}
+  # wgmma descriptors from UR8/UR9 (x10/x11 overwritten between the descriptor
+  # setup and the wgmma): results bit-exact.
+  - id: wgmma-ur
+    app: wgmma_h100
+    drivers: [simx, rtlsim]
+    configs: *h100_fe_cfg
+    shape: {cores: 1, warps: 4, threads: 32}
+    touches: [hw/rtl/tcu/VX_tcu_uops.sv, hw/rtl/tcu/VX_tcu_wgmma.sv, sim/simx/tcu/tcu_h100.h,
+              sim/simx/tcu/tcu_h100_impl.h, sw/kernel/include/vx_tensor.h, tests/regression/wgmma_h100]
+    args: "-l 128 -t f16f32 -n 64 -c 2 -r 2"
+  - id: parity-forms
+    check: model_parity
+    app: tma_issue
+    xlen: [64]
+    shape: {cores: 2, l2cache: true}
+    args: "-k0 -s7"
+  # The UR8/UR9 descriptor read, its scoreboard wait and the operand path, SimX vs RTL.
+  - id: parity-wgmma-ur
+    check: model_parity
+    app: wgmma_h100
+    xlen: [64]
+    configs: *h100_fe_cfg
+    shape: {cores: 1, warps: 4, threads: 32}
+    touches: [hw/rtl/tcu/VX_tcu_uops.sv, hw/rtl/tcu/VX_tcu_wgmma.sv, sim/simx/tcu/tcu_h100.h,
+              sim/simx/tcu/tcu_h100_impl.h, sw/kernel/include/vx_tensor.h, tests/regression/wgmma_h100]
+    args: "-l 128 -t f16f32 -n 64 -c 2 -r 2"

@@ -633,6 +633,9 @@ module VX_mem_unit import VX_gpu_pkg::*; #(
     wire [`VX_CFG_LMEM_NUM_BANKS-1:0][NW_WIDTH-1:0]       mbar_evt_wid;
     wire [`VX_CFG_LMEM_NUM_BANKS-1:0][LMEM_ROW_WIDTH-1:0] mbar_evt_row;
     wire [`VX_CFG_LMEM_NUM_BANKS-1:0][SM_SRAM_ROW_W-1:0]  mbar_evt_arow;
+`ifdef VX_CFG_H100_FE_ENABLE
+    wire [`VX_CFG_LMEM_NUM_BANKS-1:0][`CLOG2(`VX_CFG_NUM_THREADS + 1)-1:0] mbar_evt_lanes;
+`endif
     for (genvar i = 0; i < `VX_CFG_LMEM_NUM_BANKS; ++i) begin : g_mbar_evt_row
         // mbarrier words are shared-memory words: their rows are below the window's top.
         assign mbar_evt_row[i] = LMEM_ROW_WIDTH'(mbar_evt_arow[i]);
@@ -708,6 +711,10 @@ module VX_mem_unit import VX_gpu_pkg::*; #(
         .mbar_evt_flip    (mbar_evt_flip),
         .mbar_evt_wid     (mbar_evt_wid),
         .mbar_evt_row     (mbar_evt_arow)
+    `ifdef VX_CFG_H100_FE_ENABLE
+        ,
+        .mbar_evt_lanes   (mbar_evt_lanes)
+    `endif
     `endif
     );
 
@@ -1012,6 +1019,10 @@ module VX_mem_unit import VX_gpu_pkg::*; #(
     wire [`VX_CFG_LMEM_NUM_BANKS-1:0]                     mbar_evt_flip;
     wire [`VX_CFG_LMEM_NUM_BANKS-1:0][NW_WIDTH-1:0]       mbar_evt_wid;
     wire [`VX_CFG_LMEM_NUM_BANKS-1:0][LMEM_ROW_WIDTH-1:0] mbar_evt_row;
+`ifdef VX_CFG_H100_FE_ENABLE
+    // Each lane's check inserts on its own.
+    wire [`VX_CFG_LMEM_NUM_BANKS-1:0][`CLOG2(`VX_CFG_NUM_THREADS + 1)-1:0] mbar_evt_lanes = {`VX_CFG_LMEM_NUM_BANKS{(`CLOG2(`VX_CFG_NUM_THREADS + 1))'(1)}};
+`endif
 `endif
 
 
@@ -1074,6 +1085,9 @@ module VX_mem_unit import VX_gpu_pkg::*; #(
         .evt_flip     (mbar_evt_flip),
         .evt_wid      (mbar_evt_wid),
         .evt_row      (mbar_evt_row),
+    `ifdef VX_CFG_H100_FE_ENABLE
+        .evt_lanes    (mbar_evt_lanes),
+    `endif
         .retire_valid (mbar_retire_valid),
         .retire_wid   (mbar_retire_wid),
         .unlock_valid (mbar_unlock_valid),

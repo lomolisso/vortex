@@ -51,6 +51,17 @@ bool Scoreboard::in_use(instr_trace_t* trace) const {
       }
     }
   }
+#ifdef VX_CFG_H100_FE_ENABLE
+  for (uint32_t i = 0; i < 2; ++i) {
+    if (!((trace->instr_ptr->get_ur_quad() >> i) & 1))
+      continue;
+    for (uint32_t j = 1; j < 4; ++j) {
+      if (in_use_regs_.at(trace->wid).at((int)RegType::Uniform).test(trace->src_regs[i].idx + j))
+        return true;
+    }
+  }
+#endif
+#line 54
   return false;
 }
 
@@ -73,6 +84,20 @@ std::vector<Scoreboard::reg_use_t> Scoreboard::get_uses(instr_trace_t* trace) co
       }
     }
   }
+#ifdef VX_CFG_H100_FE_ENABLE
+  for (uint32_t i = 0; i < 2; ++i) {
+    if (!((trace->instr_ptr->get_ur_quad() >> i) & 1))
+      continue;
+    for (uint32_t j = 1; j < 4; ++j) {
+      RegOpd r{RegType::Uniform, trace->src_regs[i].idx + j};
+      if (in_use_regs_.at(trace->wid).at((int)RegType::Uniform).test(r.idx)) {
+        auto owner = owners_.at(get_reg_id(r, trace->wid));
+        out.push_back({r.type, r.idx, owner->fu_type, owner->op_type, owner->uuid});
+      }
+    }
+  }
+#endif
+#line 76
   return out;
 }
 

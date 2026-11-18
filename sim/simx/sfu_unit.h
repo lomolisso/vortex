@@ -124,7 +124,7 @@ public:
 
 protected:
 	void on_tick() override;
-#ifdef DXA_MBAR_ENABLE
+#if defined(DXA_MBAR_ENABLE) || defined(VX_CFG_H100_FE_ENABLE)
 	void on_reset() override;
 #else
 #line 117

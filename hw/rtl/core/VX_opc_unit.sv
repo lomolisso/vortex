@@ -137,7 +137,24 @@ module VX_opc_unit import VX_gpu_pkg::*; #(
         end
     end
 
+`ifdef VX_CFG_H100_FE_ENABLE
+    // One UR or one UR quad per cycle, overlapped with the GPR reads; counted once per instruction.
+    wire [UR_SLOTS-1:0] ur_slots = scoreboard_if.data.ur_rs | UR_SLOTS'(scoreboard_if.data.ur_quad);
+    wire [1:0] ur_reads = 2'(ur_slots[0]) + 2'(ur_slots[1]) + 2'(ur_slots[2]);
+    reg [1:0] ur_cycles;
+    wire ur_done = ~simd_sop || (ur_reads <= 2'd1) || (ur_cycles >= (ur_reads - 2'd1));
+    wire opd_more = has_collision || ~ur_done;
+    wire opd_last_fetch = pipe_ready_in && ~opd_more;
+    always @(posedge clk) begin
+        if (reset || opd_last_fetch) begin
+            ur_cycles <= '0;
+        end else if (scoreboard_if.valid && pipe_ready_in) begin
+            ur_cycles <= ur_cycles + 2'd1;
+        end
+    end
+`else
     wire opd_last_fetch = pipe_ready_in && ~has_collision;
+`endif
 
     // A packet narrower than 4 lanes splits a group of 4 threads, which
     // WGATHER and DXA combine: their packets are all issued, active or not.
@@ -216,7 +233,11 @@ module VX_opc_unit import VX_gpu_pkg::*; #(
         .reset    (reset),
         .valid_in (scoreboard_if.valid),
         .ready_in (pipe_ready_in),
+    `ifdef VX_CFG_H100_FE_ENABLE
+        .data_in  ({gpr_rd_valid,     pipe_mdata,     opd_more,          gpr_rd_reg,     gpr_rd_opd}),
+    `else
         .data_in  ({gpr_rd_valid,     pipe_mdata,     has_collision,     gpr_rd_reg,     gpr_rd_opd}),
+    `endif
         .data_out ({gpr_rd_valid_st1, pipe_mdata_st1, has_collision_st1, gpr_rd_reg_st1, gpr_rd_opd_st1}),
         .valid_out(pipe_valid_st1),
         .ready_out(pipe_ready_st1)
@@ -292,9 +313,17 @@ module VX_opc_unit import VX_gpu_pkg::*; #(
     for (genvar b = 0; b < NUM_BANKS; ++b) begin : g_gpr_rams
         wire gpr_wr_enabled;
         if (BANK_SEL_BITS != 0) begin : g_gpr_wr_enabled_bn
+        `ifdef VX_CFG_H100_FE_ENABLE
+            assign gpr_wr_enabled = writeback_if.valid && writeback_if.data.wb && (gpr_wr_bank_idx == BANK_SEL_BITS'(b));
+        `else
             assign gpr_wr_enabled = writeback_if.valid && (gpr_wr_bank_idx == BANK_SEL_BITS'(b));
+        `endif
         end else begin : g_gpr_wr_enabled_b1
+        `ifdef VX_CFG_H100_FE_ENABLE
+            assign gpr_wr_enabled = writeback_if.valid && writeback_if.data.wb;
+        `else
             assign gpr_wr_enabled = writeback_if.valid;
+        `endif
         end
 
         wire [BANK_ADDR_WIDTH-1:0] gpr_rd_addr;
@@ -332,6 +361,102 @@ module VX_opc_unit import VX_gpu_pkg::*; #(
         );
     end
 
+`ifdef VX_CFG_H100_FE_ENABLE
+    localparam UR_META_W = UR_SLOTS + UR_QUAD_SLOTS + UR_SLOTS * UREG_BITS;
+    wire [UR_META_W-1:0] ur_meta, ur_meta_st1, ur_meta_st2;
+    assign ur_meta = {scoreboard_if.data.ur_rs, scoreboard_if.data.ur_quad,
+                      scoreboard_if.data.rs3[UREG_BITS-1:0], scoreboard_if.data.rs2[UREG_BITS-1:0], scoreboard_if.data.rs1[UREG_BITS-1:0]};
+
+    // Same control as pipe_reg1/pipe_reg2, so the UR fields stay with their packet.
+    VX_pipe_buffer #(
+        .DATAW (UR_META_W)
+    ) ur_pipe1 (
+        .clk      (clk),
+        .reset    (reset),
+        .valid_in (scoreboard_if.valid),
+        `UNUSED_PIN (ready_in),
+        .data_in  (ur_meta),
+        .data_out (ur_meta_st1),
+        `UNUSED_PIN (valid_out),
+        .ready_out(pipe_ready_st1)
+    );
+    VX_pipe_buffer #(
+        .DATAW (UR_META_W)
+    ) ur_pipe2 (
+        .clk      (clk),
+        .reset    (reset),
+        .valid_in (pipe_valid2_st1),
+        `UNUSED_PIN (ready_in),
+        .data_in  (ur_meta_st1),
+        .data_out (ur_meta_st2),
+        `UNUSED_PIN (valid_out),
+        .ready_out(pipe_ready_st2)
+    );
+
+    wire [UR_SLOTS-1:0] ur_rs_st2;
+    wire [UR_QUAD_SLOTS-1:0] ur_quad_st2;
+    wire [UR_SLOTS-1:0][UREG_BITS-1:0] ur_idx_st2;
+    assign {ur_rs_st2, ur_quad_st2, ur_idx_st2} = ur_meta_st2;
+
+    wire [PER_OPC_NW_W-1:0] ur_rd_slot, ur_wr_slot;
+    if (PER_OPC_WARPS != 1) begin : g_ur_slot
+        assign ur_rd_slot = pipe_mdata_st2[META_DATAW-UUID_WIDTH-1 -: PER_OPC_NW_W];
+        assign ur_wr_slot = writeback_if.data.wis[ISSUE_WIS_W-1 -: PER_OPC_NW_W];
+    end else begin : g_ur_slot1
+        assign ur_rd_slot = '0;
+        assign ur_wr_slot = '0;
+    end
+    wire [SIMD_IDX_W-1:0] ur_pid_st2 = pipe_mdata_st2[META_DATAW-UUID_WIDTH-ISSUE_WIS_W-NCTA_WIDTH-1 -: SIMD_IDX_W];
+
+    // UR file: the first active lane's value is written; URZ and above read 0.
+    reg [PER_OPC_WARPS-1:0][UREG_COUNT-1:0][`VX_CFG_XLEN-1:0] ur_file;
+    reg [`VX_CFG_XLEN-1:0] ur_wr_data;
+    reg ur_wr_any;
+    always @(*) begin
+        ur_wr_data = '0;
+        ur_wr_any  = 1'b0;
+        for (integer l = `VX_CFG_SIMD_WIDTH-1; l >= 0; --l) begin
+            if (writeback_if.data.tmask[l]) begin
+                ur_wr_data = writeback_if.data.data[l];
+                ur_wr_any  = 1'b1;
+            end
+        end
+    end
+    wire ur_wr_en = writeback_if.valid && writeback_if.data.wr_xregs[XREG_UR] && ur_wr_any;
+    always @(posedge clk) begin
+        if (reset) begin
+            for (integer w = 0; w < PER_OPC_WARPS; ++w) begin
+                for (integer r = 0; r < UREG_COUNT; ++r) begin
+                    ur_file[w][r] <= '0;
+                end
+            end
+        end else if (ur_wr_en) begin
+            ur_file[ur_wr_slot][writeback_if.data.rd[UREG_BITS-1:0]] <= ur_wr_data;
+        end
+    end
+
+    function automatic logic [`VX_CFG_XLEN-1:0] ur_read(input logic [UREG_COUNT-1:0][`VX_CFG_XLEN-1:0] urf, input logic [UREG_BITS:0] idx);
+        return (idx >= (UREG_BITS+1)'(UREG_ZERO)) ? '0 : urf[idx[UREG_BITS-1:0]];
+    endfunction
+
+    // A UR source is broadcast; a quad source fills the warp's lanes 0..3, other lanes 0.
+    reg [NUM_SRC_OPDS-1:0][(`VX_CFG_SIMD_WIDTH * `VX_CFG_XLEN)-1:0] opd_data_st2;
+    always @(*) begin
+        opd_data_st2 = opd_buffer_n_st2;
+        for (integer i = 0; i < NUM_SRC_OPDS; ++i) begin
+            for (integer l = 0; l < `VX_CFG_SIMD_WIDTH; ++l) begin
+                if (ur_rs_st2[i]) begin
+                    opd_data_st2[i][l * `VX_CFG_XLEN +: `VX_CFG_XLEN] = ur_read(ur_file[ur_rd_slot], {1'b0, ur_idx_st2[i]});
+                end else if (i < UR_QUAD_SLOTS && ur_quad_st2[i % UR_QUAD_SLOTS]) begin
+                    opd_data_st2[i][l * `VX_CFG_XLEN +: `VX_CFG_XLEN] = ((32'(ur_pid_st2) * `VX_CFG_SIMD_WIDTH + l) < 4)
+                        ? ur_read(ur_file[ur_rd_slot], {1'b0, ur_idx_st2[i]} + (UREG_BITS+1)'(32'(ur_pid_st2) * `VX_CFG_SIMD_WIDTH + l))
+                        : '0;
+                end
+            end
+        end
+    end
+`endif
+
     // output buffer
     VX_elastic_buffer #(
         .DATAW   (OUT_DATAW),
@@ -343,7 +468,11 @@ module VX_opc_unit import VX_gpu_pkg::*; #(
         .valid_in (pipe_valid_st2),
         .ready_in (pipe_ready_st2),
         .data_in  ({pipe_mdata_st2[META_DATAW-1:2], // remove sop/eop
+                `ifdef VX_CFG_H100_FE_ENABLE
+                    opd_data_st2,
+                `else
                     opd_buffer_n_st2, // operand data
+                `endif
                     pipe_mdata_st2[1:0]}), // sop/eop
         .data_out ({
             operands_if.data.uuid,

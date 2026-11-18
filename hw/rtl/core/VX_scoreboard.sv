@@ -37,6 +37,14 @@ module VX_scoreboard import VX_gpu_pkg::*; #(
     localparam IN_DATAW  = $bits(ibuffer_t);
     localparam OUT_DATAW = $bits(scoreboard_t) - ISSUE_WIS_W;
     localparam OUT_BUF   = 3; // Use skid buffer (SIZE=2, OUT_REG=1)
+`ifdef VX_CFG_H100_FE_ENABLE
+    localparam [NUM_XREGS-1:0] XREGS_NO_UR = ~(NUM_XREGS'(1) << XREG_UR);
+
+    // A quad source covers UR[idx..idx+3].
+    function automatic logic [UREG_COUNT-1:0] ur_bits(input logic [NUM_REGS_BITS-1:0] idx, input logic quad);
+        return UREG_COUNT'(quad ? 4'hF : 4'h1) << idx[UREG_BITS-1:0];
+    endfunction
+`endif
 
     // Per-FU dispatch credits: spent at issue, reclaimed on FU accept, so a
     // credit covers ops still in operand collection (not yet at the queue).
@@ -114,8 +122,48 @@ module VX_scoreboard import VX_gpu_pkg::*; #(
         wire [NUM_OPDS-1:0] stg_used_rs = {staging_if[w].data.used_rs, staging_if[w].data.wb};
 
         // Special-register dependency masks
+    `ifdef VX_CFG_H100_FE_ENABLE
+        // wr_xregs[XREG_UR] marks rd as a UR, tracked per UR below.
+        wire [NUM_XREGS-1:0] ibf_xregs_mask = (ibuffer_if[w].data.rd_xregs | ibuffer_if[w].data.wr_xregs) & XREGS_NO_UR;
+        wire [NUM_XREGS-1:0] stg_xregs_mask = (staging_if[w].data.rd_xregs | staging_if[w].data.wr_xregs) & XREGS_NO_UR;
+
+        wire [UREG_COUNT-1:0] ibf_ur_wr = {UREG_COUNT{ibuffer_if[w].data.wr_xregs[XREG_UR]}} & ur_bits(ibuffer_if[w].data.rd, 1'b0);
+        wire [UREG_COUNT-1:0] stg_ur_wr = {UREG_COUNT{staging_if[w].data.wr_xregs[XREG_UR]}} & ur_bits(staging_if[w].data.rd, 1'b0);
+        wire [UREG_COUNT-1:0] ibf_ur_mask = ibf_ur_wr
+            | ({UREG_COUNT{ibuffer_if[w].data.ur_rs[0] | ibuffer_if[w].data.ur_quad[0]}} & ur_bits(ibuffer_if[w].data.rs1, ibuffer_if[w].data.ur_quad[0]))
+            | ({UREG_COUNT{ibuffer_if[w].data.ur_rs[1] | ibuffer_if[w].data.ur_quad[1]}} & ur_bits(ibuffer_if[w].data.rs2, ibuffer_if[w].data.ur_quad[1]))
+            | ({UREG_COUNT{ibuffer_if[w].data.ur_rs[2]}} & ur_bits(ibuffer_if[w].data.rs3, 1'b0));
+        wire [UREG_COUNT-1:0] stg_ur_mask = stg_ur_wr
+            | ({UREG_COUNT{staging_if[w].data.ur_rs[0] | staging_if[w].data.ur_quad[0]}} & ur_bits(staging_if[w].data.rs1, staging_if[w].data.ur_quad[0]))
+            | ({UREG_COUNT{staging_if[w].data.ur_rs[1] | staging_if[w].data.ur_quad[1]}} & ur_bits(staging_if[w].data.rs2, staging_if[w].data.ur_quad[1]))
+            | ({UREG_COUNT{staging_if[w].data.ur_rs[2]}} & ur_bits(staging_if[w].data.rs3, 1'b0));
+
+        reg [UREG_COUNT-1:0] inuse_urs, wb_inuse_urs, inuse_urs_n;
+        always @(*) begin
+            wb_inuse_urs = inuse_urs;
+            if (writeback_fire && writeback_if.data.wr_xregs[XREG_UR]) begin
+                wb_inuse_urs &= ~ur_bits(writeback_if.data.rd, 1'b0);
+            end
+            inuse_urs_n = wb_inuse_urs;
+            if (staging_fire) begin
+                inuse_urs_n |= stg_ur_wr;
+            end
+        end
+        always @(posedge clk) begin
+            if (reset) begin
+                inuse_urs <= '0;
+            end else begin
+                inuse_urs <= inuse_urs_n;
+            end
+        end
+        wire ibf_ubusy = | (wb_inuse_urs & ibf_ur_mask);
+        wire stg_ubusy = | (wb_inuse_urs & stg_ur_mask);
+        wire ibf_ursv  = | (stg_ur_wr & ibf_ur_mask);
+        wire stg_ursv  = | stg_ur_wr;
+    `else
         wire [NUM_XREGS-1:0] ibf_xregs_mask = ibuffer_if[w].data.rd_xregs | ibuffer_if[w].data.wr_xregs;
         wire [NUM_XREGS-1:0] stg_xregs_mask = staging_if[w].data.rd_xregs | staging_if[w].data.wr_xregs;
+    `endif
 
         wire [NUM_OPDS-1:0][REG_TYPES-1:0][RV_REGS-1:0] ibf_opd_mask, stg_opd_mask;
 
@@ -148,7 +196,11 @@ module VX_scoreboard import VX_gpu_pkg::*; #(
                 if (staging_if[w].data.wb) begin
                     inuse_regs_n |= stg_opd_mask[0]; // reserve rd
                 end
+            `ifdef VX_CFG_H100_FE_ENABLE
+                inuse_xregs_n |= staging_if[w].data.wr_xregs & XREGS_NO_UR;
+            `else
                 inuse_xregs_n |= staging_if[w].data.wr_xregs; // reserve special regs
+            `endif
             end
         end
 
@@ -189,10 +241,17 @@ module VX_scoreboard import VX_gpu_pkg::*; #(
         wire hold_ibf = ibuffer_if[w].valid && ~staging_if[w].valid;
         wire fire_ibf = ibuffer_if[w].valid;
 
+    `ifdef VX_CFG_H100_FE_ENABLE
+        wire hold_busy = hold_ibf ? (ibf_busy || ibf_xbusy || ibf_ubusy)
+                                  : (stg_busy || stg_xbusy || stg_ubusy);
+        wire fire_busy = fire_ibf ? (ibf_busy || ibf_xbusy || ibf_ubusy || ibf_rsv || ibf_ursv)
+                                  : (stg_busy || stg_xbusy || stg_ubusy || stg_rsv || stg_ursv);
+    `else
         wire hold_busy = hold_ibf ? (ibf_busy || ibf_xbusy)
                                   : (stg_busy || stg_xbusy);
         wire fire_busy = fire_ibf ? (ibf_busy || ibf_xbusy || ibf_rsv)
                                   : (stg_busy || stg_xbusy || stg_rsv);
+    `endif
 
         wire ibf_goingfull = fu_goingfull[ibuffer_if[w].data.ex_type];
         wire stg_goingfull = fu_goingfull[staging_if[w].data.ex_type];
@@ -260,9 +319,18 @@ module VX_scoreboard import VX_gpu_pkg::*; #(
             ("invalid writeback register: wid=%0d, PC=0x%0h, tmask=%b, rd=%0d (#%0d)",
                 w, to_fullPC(writeback_if.data.PC), writeback_if.data.tmask, writeback_if.data.rd, writeback_if.data.uuid))
 
+    `ifdef VX_CFG_H100_FE_ENABLE
+        `RUNTIME_ASSERT(~writeback_fire || ((writeback_if.data.wr_xregs & XREGS_NO_UR & ~inuse_xregs) == '0),
+            ("invalid writeback special register: wid=%0d, PC=0x%0h, tmask=%b, xregs=%b (#%0d)",
+                w, to_fullPC(writeback_if.data.PC), writeback_if.data.tmask, writeback_if.data.wr_xregs, writeback_if.data.uuid))
+        `RUNTIME_ASSERT(~(writeback_fire && writeback_if.data.wr_xregs[XREG_UR]) || ((ur_bits(writeback_if.data.rd, 1'b0) & ~inuse_urs) == '0),
+            ("invalid writeback uniform register: wid=%0d, PC=0x%0h, ur=%0d (#%0d)",
+                w, to_fullPC(writeback_if.data.PC), writeback_if.data.rd, writeback_if.data.uuid))
+    `else
         `RUNTIME_ASSERT(~writeback_fire || ((writeback_if.data.wr_xregs & ~inuse_xregs) == '0),
             ("invalid writeback special register: wid=%0d, PC=0x%0h, tmask=%b, xregs=%b (#%0d)",
                 w, to_fullPC(writeback_if.data.PC), writeback_if.data.tmask, writeback_if.data.wr_xregs, writeback_if.data.uuid))
+    `endif
     `endif
 
     end
@@ -291,6 +359,10 @@ module VX_scoreboard import VX_gpu_pkg::*; #(
             staging_if[w].data.op_args,
             staging_if[w].data.wb,
             staging_if[w].data.wr_xregs,
+`ifdef VX_CFG_H100_FE_ENABLE
+            staging_if[w].data.ur_rs,
+            staging_if[w].data.ur_quad,
+`endif
             staging_if[w].data.used_rs,
             staging_if[w].data.rd,
             staging_if[w].data.bytesel,
@@ -395,6 +467,10 @@ module VX_scoreboard import VX_gpu_pkg::*; #(
             scoreboard_if.data.op_args,
             scoreboard_if.data.wb,
             scoreboard_if.data.wr_xregs,
+`ifdef VX_CFG_H100_FE_ENABLE
+            scoreboard_if.data.ur_rs,
+            scoreboard_if.data.ur_quad,
+`endif
             scoreboard_if.data.used_rs,
             scoreboard_if.data.rd,
             scoreboard_if.data.bytesel,

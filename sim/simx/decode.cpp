@@ -145,7 +145,7 @@ static op_string_t op_string(const Instr &instr) {
     },
     [&](WgatherType)-> op_string_t {
       return {"WGATHER", ""};
-    },
+    }, VX_FE_ONLY(VX_FE_OP_STRING_CASES)
     [&](BrType br_type)-> op_string_t {
       auto brArgs = std::get<IntrBrArgs>(instrArgs);
       switch (br_type) {
@@ -582,7 +582,7 @@ Decoder::~Decoder() {}
 
 Instr::Ptr Decoder::decode(uint32_t code, uint64_t uuid) {
   // Detect RVC from the raw bits and expand to a 32-bit instruction.
-  const bool is_rvc = (code & 0x3u) != 0x3u;
+  VX_FE_DECODE_HOOK const bool is_rvc = (code & 0x3u) != 0x3u;
   if (is_rvc) {
     auto r = rvc_decompress(code & 0xFFFFu);
     assert(!r.illegal && "illegal RVC encoding");
@@ -1495,3 +1495,166 @@ Instr::Ptr Decoder::decode(uint32_t code, uint64_t uuid) {
 
   return instr;
 }
+
+#ifdef VX_CFG_H100_FE_ENABLE
+#include <vx_fe_isa.h>
+
+[[noreturn]] static void fe_illegal(const char* name, const char* what, uint32_t code, uint64_t uuid) {
+  std::cerr << SimPlatform::instance().cycles() << ": " << name << " " << what
+            << ": code=0x" << std::hex << code << std::dec << " (#" << uuid << ")" << std::endl;
+  std::abort();
+}
+
+static bool fe_is_upfx(uint32_t code) {
+  return ((code & 0x7f) == fe::OPCODE_EXT1) && ((code >> 25) == fe::F7_UPFX);
+}
+
+bool Decoder::fe_prefix(uint32_t wid, uint32_t code) {
+  cur_wid_ = wid;
+  if (!fe_is_upfx(code))
+    return false;
+  auto& pf = prefix_.at(wid);
+  uint32_t funct3 = (code >> 12) & 0x7;
+  uint32_t rd  = (code >> 7) & 0x1f;
+  uint32_t rs1 = (code >> 15) & 0x1f;
+  uint32_t rs2 = (code >> 20) & 0x1f;
+  if (pf.valid || funct3 > fe::UPFX_RS3 || rd != 0 || (rs2 >> 1) != 0)
+    fe_illegal(this->name().c_str(), "invalid UPFX", code, 0);
+  pf.valid = true;
+  pf.slot  = funct3;
+  pf.ur    = ((rs2 & 1) << 5) | rs1;
+  return true;
+}
+
+// A write to URZ is dropped: no destination, so no scoreboard reservation either.
+static void fe_set_ur_dest(Instr& instr, uint32_t ur) {
+  if (ur != VX_CFG_UREG_COUNT - 1)
+    instr.set_dest_reg(ur, RegType::Uniform);
+}
+
+Instr::Ptr Decoder::decode_fe(uint32_t code, uint64_t uuid) {
+  auto& pf = prefix_.at(cur_wid_);
+  if (pf.valid) {
+    pf.valid = false;
+    auto instr = this->decode(code, uuid);
+    auto fu = instr->get_fu_type();
+    auto src = instr->get_src_reg(pf.slot);
+    if ((fu != FUType::ALU && fu != FUType::FPU)
+     || (src.type != RegType::Integer && src.type != RegType::Float))
+      fe_illegal(this->name().c_str(), "UPFX not followed by an ALU/FPU instruction reading its slot", code, uuid);
+    instr->set_src_reg(pf.slot, pf.ur, RegType::Uniform);
+    return instr;
+  }
+
+  if ((code & 0x7f) != fe::OPCODE_EXT1)
+    return nullptr;
+  uint32_t funct7 = code >> 25;
+  if (funct7 < fe::F7_UMOVE || funct7 == 0x07 || funct7 > fe::F7_DXA_UR)
+    return nullptr;
+  uint32_t funct3 = (code >> 12) & 0x7;
+  uint32_t rd  = (code >> 7) & 0x1f;
+  uint32_t rs1 = (code >> 15) & 0x1f;
+  uint32_t rs2 = (code >> 20) & 0x1f;
+  auto instr = std::allocate_shared<Instr>(instr_pool_, uuid, FUType::ALU);
+  auto bad = [&]() { fe_illegal(this->name().c_str(), "invalid uniform/warp-op encoding", code, uuid); };
+
+  if (funct7 == fe::F7_UMOVE) {
+    switch (funct3) {
+    case fe::UMOVE_R2UR:
+      instr->set_op_type(UniformType::R2UR);
+      fe_set_ur_dest(*instr, ((rs2 & 1) << 5) | rd);
+      instr->set_src_reg(0, rs1, RegType::Integer);
+      break;
+    case fe::UMOVE_UR2R:
+      instr->set_op_type(UniformType::UR2R);
+      instr->set_dest_reg(rd, RegType::Integer);
+      instr->set_src_reg(0, ((rs2 & 1) << 5) | rs1, RegType::Uniform);
+      break;
+    case fe::UMOVE_S2UR:
+      if (rs1 >= fe::S2UR_NUM_SELECTORS)
+        bad();
+      instr->set_fu_type(FUType::SFU);
+      instr->set_op_type(CsrType::CSRRS);
+      instr->set_args(IntrCsrArgs{1, 0, fe::S2UR_CSR[rs1]});
+      fe_set_ur_dest(*instr, ((rs2 & 1) << 5) | rd);
+      break;
+    default:
+      bad();
+    }
+    return instr;
+  }
+
+  if (funct7 >= fe::F7_UALU && funct7 < fe::F7_REDUX) {
+    bool is_cmp = (funct7 >= fe::F7_UCMP);
+    if (is_cmp && funct3 > fe::UCMP_SEQ)
+      bad();
+    instr->set_op_type(UniformType(is_cmp ? (uint32_t(UniformType::SLT) + funct3) : funct3));
+    fe_set_ur_dest(*instr, (((funct7 >> 2) & 1) << 5) | rd);
+    instr->set_src_reg(0, (((funct7 >> 1) & 1) << 5) | rs1, RegType::Uniform);
+    instr->set_src_reg(1, ((funct7 & 1) << 5) | rs2, RegType::Uniform);
+    return instr;
+  }
+
+  if (funct7 == fe::F7_REDUX || funct7 == fe::F7_REDUX + 1) {
+    if (rs2 != 0)
+      bad();
+    instr->set_op_type(WarpOpType(funct3));
+    fe_set_ur_dest(*instr, ((funct7 & 1) << 5) | rd);
+    instr->set_src_reg(0, rs1, RegType::Integer);
+    return instr;
+  }
+
+  if (funct7 == fe::F7_ELECT) {
+    if (funct3 > fe::ELECT_L || (rs2 >> 1) != 0 || (funct3 == fe::ELECT_P && rs2 != 0))
+      bad();
+    if (funct3 == fe::ELECT_L) {
+      instr->set_op_type(WarpOpType::ELECT_L);
+      fe_set_ur_dest(*instr, ((rs2 & 1) << 5) | rd);
+    } else {
+      instr->set_op_type(WarpOpType::ELECT_P);
+      instr->set_dest_reg(rd, RegType::Integer);
+    }
+    instr->set_src_reg(0, rs1, RegType::Integer);
+    return instr;
+  }
+
+  if (funct7 == fe::F7_MATCH) {
+    if (funct3 > fe::MATCH_ALL_B64)
+      bad();
+    instr->set_op_type(WarpOpType(uint32_t(WarpOpType::MATCH_ANY_B32) + funct3));
+    instr->set_dest_reg(rd, RegType::Integer);
+    instr->set_src_reg(0, rs1, RegType::Integer);
+    if (VX_CFG_XLEN == 32 && (funct3 & 1))
+      instr->set_src_reg(1, rs2, RegType::Integer);
+    return instr;
+  }
+
+#ifdef DXA_MBAR_ENABLE
+  if (funct7 == fe::F7_DXA_UR) {
+    static const DxaType forms[] = {DxaType::ISSUE, DxaType::BULK, DxaType::TLOAD, DxaType::BLOAD,
+                                    DxaType::BPREFETCH, DxaType::STORE};
+    instr->set_fu_type(FUType::SFU);
+    instr->set_wstall(true);
+    if (funct3 == fe::DXA_UR_TMAP) {
+      if (rs2 > 1)
+        bad();
+      instr->set_op_type(DxaType::TMAP);
+      instr->set_args(IntrDxaArgs{0, rs2, 1});
+      instr->set_src_reg(0, rs1, RegType::Uniform);
+      return instr;
+    }
+    uint32_t base = ((rs2 & 1) << 5) | rs1;
+    if (funct3 == fe::DXA_UR_RESERVED || (base % fe::DXA_UR_QUAD_ALIGN) != 0 || (rs2 >> 1) != 0)
+      bad();
+    instr->set_op_type(forms[funct3]);
+    instr->set_args(IntrDxaArgs{0, rs2, 1});
+    instr->set_src_reg(0, base, RegType::Uniform);
+    instr->set_src_reg(1, base + 4, RegType::Uniform);
+    instr->set_ur_quad(0x3);
+    return instr;
+  }
+#endif
+  bad();
+  return nullptr;
+}
+#endif

@@ -87,7 +87,14 @@ bool SfuUnit::rtu_trace2_reserve_slot(uint32_t wid) {
 #endif
 
 
+#if defined(VX_CFG_H100_FE_ENABLE)
+void SfuUnit::on_reset() {
 #ifdef DXA_MBAR_ENABLE
+	dxa_unit_->bg_reset();
+#endif
+}
+#elif defined(DXA_MBAR_ENABLE)
+#line 91
 void SfuUnit::on_reset() {
 	dxa_unit_->bg_reset();
 }
@@ -482,7 +489,7 @@ void SfuUnit::on_tick() {
 			if (std::get<DxaType>(trace->op_type) == DxaType::BGOP
 			 && std::get<IntrDxaArgs>(trace->instr_ptr->get_args()).bg_op != 0) {
 				release_warp = false;
-			}
+			} VX_FE_ONLY(if (std::get<IntrDxaArgs>(trace->instr_ptr->get_args()).ur_form) { release_warp = false; if (trace->pid < 0 || trace->pid == int(3 / VX_CFG_NUM_SFU_LANES)) dxa_unit_->ur_issue(trace); })
 #endif
 #endif
 #if defined(DXA_MBAR_ENABLE)
@@ -504,3 +511,4 @@ void SfuUnit::on_tick() {
 		input.pop();
 	}
 }
+

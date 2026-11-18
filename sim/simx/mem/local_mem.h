@@ -24,7 +24,7 @@ namespace vortex {
 struct MbarBankEvt {
   bool     flip;
   uint32_t wid;
-  uint32_t row;
+  uint32_t row; VX_FE_ONLY(uint32_t lanes = 1;)  // an insert's waiting lanes
 };
 #endif
 #ifdef VX_CFG_H100_SM_ENABLE

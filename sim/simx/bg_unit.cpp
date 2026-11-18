@@ -23,7 +23,7 @@ BgUnit::BgUnit(const SimContext& ctx, const char* name)
   , EvtIn(this, 4)
   , ComplIn(this, 4)
   , StateOut(this)
-  , UnlockOut(this)
+  , UnlockOut(this) VX_FE_ONLY(, RelIn(this, 4))
   , warps_(VX_CFG_NUM_WARPS)
   , sent_(VX_CFG_NUM_WARPS)
 {}
@@ -43,6 +43,13 @@ bool BgUnit::satisfied(const Warp& w, bool rd, uint32_t n) {
   const uint32_t head = (w.seq - w.ncommit) & SEQ_MASK;
   for (uint32_t i = 0; i < w.ncommit - n; ++i) {
     const auto& g = w.groups[(head + i) & SEQ_MASK];
+#ifdef VX_CFG_H100_FE_ENABLE
+    if ((rd ? g.rd : g.rd + g.wr) != 0)
+      return false;
+    continue;
+#else
+#line 45
+#endif
     if ((rd ? g.rd : g.wr) != 0)
       return false;
   }
@@ -110,6 +117,19 @@ void BgUnit::on_tick() {
       wp.wait_n  = evt.n;
     }
   }
+#ifdef VX_CFG_H100_FE_ENABLE
+  while (!RelIn.empty()) {
+    const auto& r = RelIn.peek();
+    auto& wp = warps_.at(r.wid);
+    __assert(!wp.ready && !wp.waiting, this->name() << ": second release of a warp: " << r);
+    DT(3, this->name() << " ur-release: " << r);
+    wp.ready = true;
+    RelIn.pop();
+  }
+
+#else
+#line 112
+#endif
 
   // One release a cycle, lowest warp first: the pulse register, then the
   // scheduler's stall register.
@@ -152,7 +172,7 @@ void BgUnit::on_tick() {
     }
   }
 
-  bool idle = EvtIn.empty() && ComplIn.empty();
+  bool idle = EvtIn.empty() && ComplIn.empty(); VX_FE_ONLY(idle &= RelIn.empty();)
   for (auto& wp : warps_) {
     idle &= !wp.waiting && !wp.ready && (wp.ncommit == 0);
     for (auto& g : wp.groups) {

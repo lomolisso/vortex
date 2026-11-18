@@ -23,6 +23,14 @@ endif
 
 XCONFIGS := $(shell python3 $(ROOT_DIR)/ci/gen_config.py --config=$(VORTEX_HOME)/VX_config.toml --cflags='$(CONFIGS) -DVX_CFG_XLEN=$(XLEN)')
 
+# The DXA issue headers keep their packed operands in t5/t6 unless the front end
+# issues them from uniform registers.
+ifneq (,$(filter -DVX_CFG_H100_FE_ENABLE, $(XCONFIGS)))
+	VX_CUDA_FIXED_FLAGS :=
+else
+	VX_CUDA_FIXED_FLAGS := -ffixed-x30 -ffixed-x31 -DVX_CUDA_FIXED_TEMPS
+endif
+
 ifneq (,$(filter -DVX_CFG_EXT_C_ENABLE, $(XCONFIGS)))
 	C_EXT := c
 else

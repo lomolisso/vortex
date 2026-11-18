@@ -61,6 +61,10 @@ module VX_ibuffer import VX_gpu_pkg::*; #(
                 decode_if.data.wb,
                 decode_if.data.rd_xregs,
                 decode_if.data.wr_xregs,
+`ifdef VX_CFG_H100_FE_ENABLE
+                decode_if.data.ur_rs,
+                decode_if.data.ur_quad,
+`endif
                 decode_if.data.used_rs,
                 decode_if.data.rd,
                 decode_if.data.bytesel,

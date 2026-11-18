@@ -412,3 +412,29 @@ tests:
     xlen: [64]
     run: "make -C tests/unittest/sm_port run CONFIGS='-DVX_CFG_H100_SM_ENABLE -DVX_CFG_NUM_THREADS=32 -DVX_CFG_EXT_DLMEM_ENABLE'"
     touches: *e12_port_touches
+  # The front end's PEs (benches and twins build with VX_CFG_H100_FE_ENABLE): the uniform
+  # datapath (UR file, scoreboard UR mask, operand substitution, uniform PE) and the warp-op
+  # unit, each bench's CSV equal to its SimX twin's, the twins equal to their goldens.
+  - id: hw-uniform
+    via: script
+    run: "make -C hw/unittest run-uniform"
+    touches: &fe_uniform_touches
+             [hw/rtl/core/VX_alu_uniform.sv, hw/rtl/core/VX_scoreboard.sv, hw/rtl/core/VX_operands.sv,
+              hw/rtl/core/VX_opc_unit.sv, hw/rtl/VX_gpu_pkg.sv, hw/unittest/uniform, hw/unittest/Makefile,
+              sim/simx/uniform_ops.h, sim/simx/scoreboard.h, sim/simx/opc_unit.cpp,
+              sw/common/uniform_ref.h, tests/unittest/uniform, tests/unittest/Makefile, VX_config.toml]
+  - id: sw-uniform
+    via: script
+    run: "make -C tests/unittest run-uniform"
+    touches: *fe_uniform_touches
+  - id: hw-warp-ops
+    via: script
+    run: "make -C hw/unittest run-warp-ops"
+    touches: &fe_warp_touches
+             [hw/rtl/core/VX_alu_warp.sv, hw/rtl/VX_gpu_pkg.sv, hw/unittest/warp_ops, hw/unittest/Makefile,
+              sim/simx/warp_ops.h, sw/common/warp_ops_ref.h, tests/unittest/warp_ops,
+              tests/unittest/Makefile, VX_config.toml]
+  - id: sw-warp-ops
+    via: script
+    run: "make -C tests/unittest run-warp-ops"
+    touches: *fe_warp_touches

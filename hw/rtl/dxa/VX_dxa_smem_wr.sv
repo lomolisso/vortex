@@ -75,6 +75,13 @@ module VX_dxa_smem_wr import VX_gpu_pkg::*, VX_dxa_pkg::*; #(
     // Resource release to gmem_req (per-tag, OOO).
     output wire                        release_en,
     output wire [TAG_W-1:0]            release_tag,
+`ifdef DXA_FE_PIPE
+    // The lines inside belong to one pipelined copy, which ends on the beat
+    // draining its last outstanding line; idle: no line inside.
+    input  wire                        pipe,
+    input  wire                        pipe_last,
+    output wire                        idle,
+`endif
 
     // SMEM bus interface (writes only).
     VX_mem_bus_if.master               smem_bus_if,
@@ -386,7 +393,11 @@ module VX_dxa_smem_wr import VX_gpu_pkg::*, VX_dxa_pkg::*; #(
     // Promotion from defer_*_r to fb fires when the last drain leaves only the
     // deferred CL outstanding.
 
+`ifdef DXA_FE_PIPE
+    wire sw_is_last_defer = sw_valid && sw_last && ~pipe && (sw_outstanding > SEQ_W'(1));
+`else
     wire sw_is_last_defer = sw_valid && sw_last && (sw_outstanding > SEQ_W'(1));
+`endif
     wire can_defer        = sw_is_last_defer && ~defer_valid_r;
 
     wire can_capture_pend = ~pend_valid_r;
@@ -914,7 +925,11 @@ module VX_dxa_smem_wr import VX_gpu_pkg::*, VX_dxa_pkg::*; #(
 `endif
     assign smem_req_fire   = mc_write_fire;
 
+`ifdef DXA_FE_PIPE
+    wire is_last_drain = (pipe ? pipe_last : fb_last_r) && drain_will_empty;
+`else
     wire is_last_drain = fb_last_r && drain_will_empty;
+`endif
     assign smem_wr_last_pkt = is_last_drain && (!is_multicast || replay_is_last);
 
     // Completion attr: bar_stride hardcoded to 1.
@@ -980,6 +995,10 @@ module VX_dxa_smem_wr import VX_gpu_pkg::*, VX_dxa_pkg::*; #(
     end
 
     assign wr_done_count = wr_count_r;
+`ifdef DXA_FE_PIPE
+    // Idle from the final beat on: the line's attributes are already on the bus.
+    assign idle = ~pend_valid_r && ~defer_valid_r && (~fb_active_r || drain_complete);
+`endif
 `ifdef DXA_MBAR_ENABLE
     assign transfer_done = transfer_active && (pf_q ? pf_done : (smem_req_fire && smem_wr_last_pkt));
 `else

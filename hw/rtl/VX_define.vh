@@ -205,6 +205,20 @@
 `endif
 `endif
 
+// A TMA engine worker takes the next G->S copy once the AGU issued the last
+// line of the one in flight; the copies' lines drain under their own contexts.
+`ifdef DXA_MBAR_ENABLE
+`ifdef VX_CFG_H100_FE_ENABLE
+    `define DXA_FE_PIPE
+`endif
+`endif
+`ifdef DXA_MBAR_ENABLE
+`ifdef VX_CFG_H100_FE_ENABLE
+    `define DXA_TMAP_L2_ENABLE
+`endif
+`endif
+`line 207 "VX_define.vh" 0
+
 // Integer mul/div via DPI: simulation only (not synthesis) with DPI enabled.
 // Internal derived macros — not VX_CFG_* knobs.
 `ifndef SYNTHESIS
