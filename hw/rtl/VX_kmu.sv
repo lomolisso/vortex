@@ -434,27 +434,7 @@ module VX_kmu import VX_gpu_pkg::*; import VX_trace_pkg::*; #(
     // it, so clusters -- not CTAs -- are what round-robin across the machine.
     // `kind` is a tap of the payload tag so the arbiter routes without unpacking
     // `data`.
-    // A message starts no sooner than CTA_DISPATCH_CYCLES after the last one did.
-    localparam ISSUE_GAP = `VX_CFG_CTA_DISPATCH_CYCLES;
-    wire issue_ok;
-    if (ISSUE_GAP > 1) begin : g_issue_gap
-        localparam GAP_W = `CLOG2(ISSUE_GAP + 1);
-        reg [GAP_W-1:0] gap_r;
-        always @(posedge clk) begin
-            if (reset) begin
-                gap_r <= GAP_W'(ISSUE_GAP);
-            end else if (kmu_bus_if_fire && is_first_r) begin
-                gap_r <= GAP_W'(1);
-            end else if (gap_r != GAP_W'(ISSUE_GAP)) begin
-                gap_r <= gap_r + GAP_W'(1);
-            end
-        end
-        assign issue_ok = ~is_first_r || (gap_r == GAP_W'(ISSUE_GAP));
-    end else begin : g_no_issue_gap
-        assign issue_ok = 1'b1;
-    end
-
-    assign kmu_bus_if.valid = running && issue_ok;
+    assign kmu_bus_if.valid = running;
     assign kmu_bus_if.data  = KMU_DATAW'(kmu_req);
     assign kmu_bus_if.kind  = kmu_req.kind;
     assign kmu_bus_if.eop   = is_last_r;

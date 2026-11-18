@@ -286,8 +286,8 @@ endif
 # policy, and the dispatcher takes pinned blocks into their forced slots, writes
 # every block's peer row, and reports each pinned block's CTA_DONE event once,
 # holding its slot until the event leaves. The H100 builds cap the slots at
-# MAX_CTAS_PER_SM (SM_MAX_BLOCKS 4 of 8 warps) and pad each freed slot by the
-# refill gap of its CTA's launch kind (plain, cluster of 1, larger cluster).
+# MAX_CTAS_PER_SM (SM_MAX_BLOCKS 4 of 8 warps). The refill gap of every launch
+# kind is the retirement path's own, and the KMU walk issues a block per cycle.
 define cta_case
 	$(MAKE) -C cta_dispatcher clean
 	$(MAKE) -C cta_dispatcher CONFIGS="$(1)"

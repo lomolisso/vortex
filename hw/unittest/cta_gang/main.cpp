@@ -139,7 +139,8 @@ constexpr uint32_t BLOCK_ALIGN = VX_CFG_MEM_BLOCK_SIZE;
 #line 129
 #endif
 constexpr uint32_t NUM_GANGS   = VX_CFG_DLMEM_NUM_GANGS;
-constexpr uint32_t ISSUE_GAP   = VX_CFG_CLUSTER_DISPATCH_CYCLES;
+// shortest interval between two committed placements of clusters of 1 in one launch
+static uint64_t g_min_place_gap = ~0ull;
 // the GPC boundary between the admission and the gang table, as Vortex.sv composes them
 constexpr uint32_t BD          = VX_CFG_H100_ORG_ENABLED ? VX_CFG_DOMAIN_BOUNDARY_DELAY : 0;
 constexpr uint32_t CORE_W      = c_up(c_clog2(NCC));
@@ -423,8 +424,7 @@ public:
           for (size_t i = 0; i < a_.live.size(); ++i) {
             id_free = id_free || (!a_.live[i] && !a_.rel_pend[i]);
           }
-          bool gap_ok = (gap_ + 1 > ISSUE_GAP) || is_new;
-          if (id_free && (!failed_ || dirty_) && gap_ok) {
+          if (id_free && (!failed_ || dirty_)) {
             start = true;
             uint32_t W = warps_of(head->block_size, NT);
 #ifdef VX_CFG_H100_SM_ENABLE
@@ -482,6 +482,12 @@ public:
           cur_epoch_ = 0;
         }
         failed_ = false;
+        if (k_ == 1 && last_k_ == 1 && last_ctx_ == ctx_ && last_commit_ != ~0ull) {
+          g_min_place_gap = std::min(g_min_place_gap, cycle - last_commit_);
+        }
+        last_commit_ = cycle;
+        last_k_ = k_;
+        last_ctx_ = ctx_;
         commit_cycle_ = cycle;
         idx_n_ = 0;
         phase_n_ = EMIT;
@@ -515,11 +521,6 @@ public:
       idx_n_ = 0;
     }
     dirty_ = start ? false : (dirty_ || a_done);
-    if (start) {
-      gap_ = 1;
-    } else if (gap_ + 1 <= ISSUE_GAP) {
-      ++gap_;
-    }
     if (rel >= 0 && rel_ready) {
       g_.rel_pend[rel] = false;
     }
@@ -625,7 +626,8 @@ private:
   bool     policy_ = false;
   uint32_t k_ = 1, w_ = 1;
   bool     failed_ = false, dirty_ = false;
-  uint32_t gap_ = 0;   // cycles since the last cluster placement started, saturating at ISSUE_GAP
+  uint64_t last_commit_ = ~0ull;
+  uint32_t last_k_ = 0, last_ctx_ = 0;
   bool     ok_ = false;
   uint32_t fail_step_ = 0;
   std::vector<Peer> members_;
@@ -1760,6 +1762,16 @@ int main(int argc, char** argv) {
   ok = t_cbar_exit_random(sim, tick, seed, launches) && ok;
   ok = t_cbarx_schedule(sim, tick, cbarx_csv) && ok;
 
+  if (g_min_place_gap != ~0ull) {
+    // H100: 2.5 ns per cluster (03/spec.md §5) at the SM clock
+    std::printf("H100REF metric=cluster_place_interval_cycles h100=%.1f vortex=%lu\n",
+                VX_CFG_H100_CLUSTER_DISPATCH_PS * 1e-6 * VX_CFG_H100_SM_CLOCK_MHZ, (unsigned long)g_min_place_gap);
+    // start, K place and K emit cycles: 2K + 1 for K = 1
+    if (g_min_place_gap < 3) {
+      std::printf("FAIL placement pace: clusters of 1 committed %lu cycles apart, want >= 3\n", (unsigned long)g_min_place_gap);
+      ok = false;
+    }
+  }
   if (!ok) {
     std::cout << "FAILED!" << std::endl;
     return 1;

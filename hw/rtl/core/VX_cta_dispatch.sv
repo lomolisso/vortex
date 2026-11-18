@@ -88,8 +88,6 @@ module VX_cta_dispatch import VX_gpu_pkg::*; #(
     output wire [`VX_CFG_NUM_WARPS-1:0] wg_rank_ok,
 `endif
 
-    // a freed slot is still inside its refill pad
-    output wire                     refill_hold,
     output wire                     busy
 );
     `UNUSED_SPARAM (INSTANCE_ID)
@@ -188,15 +186,13 @@ module VX_cta_dispatch import VX_gpu_pkg::*; #(
     // Free-warp selection
     // -------------------------------------------------------------------------
     reg  [`VX_CFG_NUM_WARPS-1:0] dispatched_warps;
-    // warps of a finished CTA held until its slot frees (refill gap)
-    wire [`VX_CFG_NUM_WARPS-1:0] held_warps;
     wire [NW_WIDTH-1:0] warp_id_n;
     wire                warp_ready;
     VX_priority_encoder #(
         .N       (`VX_CFG_NUM_WARPS),
         .REVERSE (0)
     ) priority_enc (
-        .data_in   (~(active_warps | dispatched_warps | held_warps)),
+        .data_in   (~(active_warps | dispatched_warps)),
         `UNUSED_PIN(onehot_out),
         .index_out (warp_id_n),
         .valid_out (warp_ready)
@@ -483,13 +479,6 @@ module VX_cta_dispatch import VX_gpu_pkg::*; #(
     wire [NUM_CTA_SLOTS-1:0] window_ones = (NUM_CTA_SLOTS'(1) << cluster_k) - NUM_CTA_SLOTS'(1);
     wire [NUM_CTA_SLOTS-1:0] cluster_window = window_ones << base_slot;
     wire cluster_window_free = ((slot_valid_r & cluster_window) == '0);
-    // CTA refill gap: a freed slot takes its next CTA no earlier than the
-    // refill knob after the old CTA's last warp exited (03/spec.md §5); the
-    // retirement path already spends REFILL_BASE of it.
-    localparam REFILL_BASE = 3;
-    localparam REFILL_MAX  = `MAX(`MAX(`VX_CFG_CTA_REFILL_CYCLES, `VX_CFG_CTA_REFILL_CLUSTER1_CYCLES),
-                                  `VX_CFG_CTA_REFILL_CLUSTER_CYCLES);
-    wire [NUM_CTA_SLOTS-1:0] hold_busy;
 
 `ifdef VX_CFG_EXT_DLMEM_ENABLE
     // A slot whose CTA_DONE event has not left yet is still taken: its record
@@ -498,15 +487,12 @@ module VX_cta_dispatch import VX_gpu_pkg::*; #(
     wire [NUM_CTA_SLOTS-1:0] base_onehot  = NUM_CTA_SLOTS'(1) << base_slot;
     wire [NUM_CTA_SLOTS-1:0] needed_slots = (is_first_of_cluster && ~is_pinned) ? cluster_window : base_onehot;
     wire admit_ok = ((is_first_of_cluster && ~is_pinned) ? cluster_window_free : ~slot_valid_r[base_slot])
-                 && ((done_pend_r & needed_slots) == '0)
-                 && ((hold_busy & needed_slots) == '0);
+                 && ((done_pend_r & needed_slots) == '0);
     // the gang unit frees a slot only after its done event has reached it
     `RUNTIME_ASSERT (~(kmu_bus_if.valid && (state == IDLE) && is_pinned) || (~slot_valid_r[base_slot] && ~done_pend_r[base_slot]),
         ("%t: %s pinned block forced into busy slot %0d", $time, INSTANCE_ID, base_slot))
 `else
-    wire [NUM_CTA_SLOTS-1:0] needed_slots = is_first_of_cluster ? cluster_window : (NUM_CTA_SLOTS'(1) << base_slot);
-    wire admit_ok = (is_first_of_cluster ? cluster_window_free : ~slot_valid_r[base_slot])
-                 && ((hold_busy & needed_slots) == '0);
+    wire admit_ok = is_first_of_cluster ? cluster_window_free : ~slot_valid_r[base_slot];
 `endif
     // A fragment launch's stamps land in the warp record TID_STAGES cycles after the
     // warp fires (the thread-index ripple), but frag_stamps_r is a single bank. So a
@@ -732,68 +718,6 @@ module VX_cta_dispatch import VX_gpu_pkg::*; #(
 `else
     assign busy = (state == DISPATCH) || kmu_bus_if_fire;
 `endif
-
-    if (REFILL_MAX > REFILL_BASE) begin : g_refill
-        localparam HOLD_W = `CLOG2(REFILL_MAX + 1);
-        // the CTA in each slot: a plain launch, a cluster of 1, or a larger cluster
-        reg [NUM_CTA_SLOTS-1:0][HOLD_W-1:0] pad_r;
-        reg [NUM_CTA_SLOTS-1:0][HOLD_W-1:0] hold_r;
-    `ifdef VX_CFG_EXT_DLMEM_ENABLE
-        wire placed = is_pinned;
-    `else
-        wire placed = 1'b0;
-    `endif
-        wire [HOLD_W-1:0] pad_in = ~placed ? HOLD_W'(`MAX(`VX_CFG_CTA_REFILL_CYCLES - REFILL_BASE, 0))
-                                 : (32'(eff_cluster_size) == 1) ? HOLD_W'(`MAX(`VX_CFG_CTA_REFILL_CLUSTER1_CYCLES - REFILL_BASE, 0))
-                                 : HOLD_W'(`MAX(`VX_CFG_CTA_REFILL_CLUSTER_CYCLES - REFILL_BASE, 0));
-        for (genvar i = 0; i < NUM_CTA_SLOTS; ++i) begin : g_hold
-            assign hold_busy[i] = (hold_r[i] != '0);
-        end
-        // A CTA's warps stay taken from their exit until its slot is free again.
-        // The exiting warp is held in its exit cycle too: its active bit may
-        // already be clear while held_r is not yet set.
-        reg [`VX_CFG_NUM_WARPS-1:0] held_r;
-    `ifdef VX_CFG_EXT_DLMEM_ENABLE
-        // a vx_wspawn warp's stale slot index names some other CTA's slot
-        wire hold_exit = warp_done_cta && slot_valid_r[done_slot];
-    `else
-        wire hold_exit = warp_done && slot_valid_r[done_slot];
-    `endif
-        for (genvar w = 0; w < `VX_CFG_NUM_WARPS; ++w) begin : g_held
-            wire [CS_BITS-1:0] ws = cta_slot_per_warp_r[w];
-            assign held_warps[w] = (held_r[w] && (slot_valid_r[ws] || hold_busy[ws]))
-                                || (hold_exit && (warp_done_wid == NW_WIDTH'(w)));
-        end
-        always @(posedge clk) begin
-            if (reset) begin
-                held_r <= '0;
-            end else begin
-                held_r <= held_warps;
-            end
-        end
-        always @(posedge clk) begin
-            if (reset) begin
-                pad_r  <= '0;
-                hold_r <= '0;
-            end else begin
-                for (integer i = 0; i < NUM_CTA_SLOTS; ++i) begin
-                    if (hold_r[i] != '0) begin
-                        hold_r[i] <= hold_r[i] - HOLD_W'(1);
-                    end
-                end
-                if (warp_done_r_dly && slot_valid_r[done_slot_r_dly] && cta_done) begin
-                    hold_r[done_slot_r_dly] <= pad_r[done_slot_r_dly];
-                end
-                if (kmu_bus_if_fire && (state == IDLE)) begin
-                    pad_r[base_slot] <= pad_in;
-                end
-            end
-        end
-    end else begin : g_no_refill
-        assign hold_busy  = '0;
-        assign held_warps = '0;
-    end
-    assign refill_hold = (| hold_busy);
 
 `ifdef VX_CFG_EXT_DLMEM_ENABLE
     // -------------------------------------------------------------------------

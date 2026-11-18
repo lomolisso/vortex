@@ -150,6 +150,9 @@ static bool same_beat(const Beat& a, const Beat& b) {
 // The policy register resets to DEFAULT and holds its value across launches.
 static uint32_t policy_r = 0;
 
+// first-to-last accepted beat of the always-ready launches: cycles and block intervals
+static uint64_t g_issue_cycles = 0, g_issue_intervals = 0;
+
 // Programs one launch, pulses start, and takes its beats under random
 // back-pressure; every beat must match the reference walk, and a stalled beat
 // must hold until it is taken.
@@ -195,9 +198,12 @@ static bool run_launch(Sim& sim, uint64_t& tick, std::mt19937& rng, const Launch
   size_t got = 0;
   uint32_t errors = 0;
   uint32_t idle = 0;
+  uint32_t bubbles = 0;
   bool held = false;
   Beat held_beat{};
+  uint64_t cyc = 0, first_cyc = 0, last_cyc = 0;
   while (got < want.size()) {
+    ++cyc;
     bool ready = (rng() % 100) < ready_pct;
     sim->bus_ready = ready;
     sim->eval();
@@ -206,6 +212,7 @@ static bool run_launch(Sim& sim, uint64_t& tick, std::mt19937& rng, const Launch
         std::printf("FAIL %s: a stalled beat was withdrawn at beat %zu\n", name, got);
       }
       held = false;
+      bubbles += (got != 0);
       if (++idle > 1000) {
         std::printf("FAIL %s: no beat for 1000 cycles after %zu of %zu\n", name, got, want.size());
         return false;
@@ -226,6 +233,10 @@ static bool run_launch(Sim& sim, uint64_t& tick, std::mt19937& rng, const Launch
                     name, k, got, b.idx[0], b.idx[1], b.idx[2], b.size, b.rank, b.first, b.eop, b.ctx_id, b.policy,
                     w.idx[0], w.idx[1], w.idx[2], w.size, w.rank, w.first, w.eop, w.ctx_id, w.policy);
       }
+      if (got == 0) {
+        first_cyc = cyc;
+      }
+      last_cyc = cyc;
       ++got;
       held = false;
     } else {
@@ -250,6 +261,14 @@ static bool run_launch(Sim& sim, uint64_t& tick, std::mt19937& rng, const Launch
   }
   sim->bus_ready = 0;
 
+  // The walk issues one block per cycle: never a bubble while the bus takes every beat.
+  if (ready_pct >= 100 && bubbles != 0 && ++errors <= 10) {
+    std::printf("FAIL %s: %u idle cycles between beats with the bus always ready\n", name, bubbles);
+  }
+  if (ready_pct >= 100) {
+    g_issue_cycles += last_cyc - first_cyc;
+    g_issue_intervals += got - 1;
+  }
   std::printf("%s (K=%u, ready %u%%, policy %u): %zu beats %s\n", name, k, ready_pct, policy_r, want.size(),
               errors ? "FAILED" : "ok");
   return errors == 0;
@@ -318,6 +337,10 @@ int main(int argc, char **argv) {
     ok = run_launch(sim, tick, rng, l, 40, ctx_id) && ok;
   }
 
+  // H100 (03/spec.md §5): a plain block every 0.55 ns at the SM clock
+  std::printf("H100REF metric=kmu_cta_issue_cycles h100=%.2f vortex=%.2f\n",
+              VX_CFG_H100_CTA_DISPATCH_PS * 1e-6 * VX_CFG_H100_SM_CLOCK_MHZ,
+              g_issue_intervals ? double(g_issue_cycles) / g_issue_intervals : 0.0);
   if (!ok) {
     std::cout << "FAILED!" << std::endl;
     return 1;

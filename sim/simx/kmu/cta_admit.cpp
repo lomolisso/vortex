@@ -38,7 +38,6 @@ uint32_t popcount64(uint64_t x) {
 } // namespace
 
 namespace {
-constexpr uint32_t kIssueGap = VX_CFG_CLUSTER_DISPATCH_CYCLES;
 constexpr uint32_t kSkidSize = 2;
 } // namespace
 
@@ -77,7 +76,6 @@ void CtaAdmit::reset() {
   cur_epoch_ = 0;
   failed_    = false;
   dirty_     = false;
-  gap_       = 0;
   placed_    = false;
   k_         = 1;
   w_         = 0;
@@ -242,11 +240,9 @@ CtaAdmit::Outputs CtaAdmit::tick(const Inputs& in) {
   bool idle   = (state_ == State::IDLE);
   bool emit   = (state_ == State::EMIT);
   bool is_new = idle && head_valid && in_new;
-  bool gap_ok = (kIssueGap == 0) || (gap_ >= kIssueGap) || is_new;
   bool start  = idle && head_valid && in_placed
              && ((in_k == 1) || any_id_free)
-             && (!(failed_ && !is_new) || dirty_)
-             && gap_ok;
+             && (!(failed_ && !is_new) || dirty_);
   bool fwd = (idle && !in_placed) || emit;
 
   out.in_ready = head_valid && fwd && next_ready;
@@ -299,13 +295,6 @@ CtaAdmit::Outputs CtaAdmit::tick(const Inputs& in) {
     gpc_[g].cnt  = nx[g].cnt;
   }
   bool dirty_n = !start && (dirty_ || any_done);
-  if (kIssueGap != 0) {
-    if (start) {
-      gap_ = 1;
-    } else if (gap_ < kIssueGap) {
-      ++gap_;
-    }
-  }
 
   switch (state_) {
   case State::IDLE:

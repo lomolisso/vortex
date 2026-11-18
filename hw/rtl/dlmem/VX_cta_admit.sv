@@ -30,8 +30,7 @@
 // id its GPC's gang table has free, which the table learns from `alloc`.
 //
 // Timing: a head beat visible in cycle t is placed in cycles t+1..t+K; beat e
-// is taken at the earliest in cycle t+K+1+e and leaves one cycle later. Two
-// cluster placements start at least CLUSTER_DISPATCH_CYCLES apart.
+// is taken at the earliest in cycle t+K+1+e and leaves one cycle later.
 module VX_cta_admit import VX_gpu_pkg::*; #(
     parameter `STRING INSTANCE_ID = "",
     parameter NUM_GPCS = 1,
@@ -85,8 +84,6 @@ module VX_cta_admit import VX_gpu_pkg::*; #(
 `else
     localparam POLICY_H100 = 0;
 `endif
-    localparam ISSUE_GAP = `VX_CFG_CLUSTER_DISPATCH_CYCLES;
-    localparam GAP_W     = `UP(`CLOG2(ISSUE_GAP + 1));
     // packed beat: {pin, kind, eop, dest, data}
     localparam PW       = 3 + KMU_DEST_W + KMU_DATAW;
 
@@ -314,11 +311,9 @@ module VX_cta_admit import VX_gpu_pkg::*; #(
     wire idle   = (state == S_IDLE);
     wire emit   = (state == S_EMIT);
     wire is_new = idle && head_valid && in_new;
-    wire gap_ok;
     wire start  = idle && head_valid && in_placed
                && ((in_k == CLUSTER_SIZE_W'(1)) || (|id_free))
-               && (~(failed_r && ~is_new) || dirty_r)
-               && gap_ok;
+               && (~(failed_r && ~is_new) || dirty_r);
 
     // Plain beats pass through; cluster beats leave only once placed.
     wire fwd          = (idle && ~in_placed) || emit;
@@ -326,23 +321,6 @@ module VX_cta_admit import VX_gpu_pkg::*; #(
     wire buf_ready_in;
     assign bus_in_if.ready = buf_ready_in && fwd;
     wire in_fire = head_valid && bus_in_if.ready;
-
-    // Two cluster placements start at least ISSUE_GAP cycles apart.
-    if (ISSUE_GAP != 0) begin : g_gap
-        reg [GAP_W-1:0] gap_r;
-        always @(posedge clk) begin
-            if (reset) begin
-                gap_r <= '0;
-            end else if (start) begin
-                gap_r <= GAP_W'(1);
-            end else if (gap_r != GAP_W'(ISSUE_GAP)) begin
-                gap_r <= gap_r + GAP_W'(1);
-            end
-        end
-        assign gap_ok = (gap_r == GAP_W'(ISSUE_GAP)) || is_new;
-    end else begin : g_no_gap
-        assign gap_ok = 1'b1;
-    end
 
     // ---- output beat -------------------------------------------------------
 

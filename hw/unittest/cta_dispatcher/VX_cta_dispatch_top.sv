@@ -275,7 +275,6 @@ module VX_cta_dispatch_top import VX_gpu_pkg::*;
         .warp_done_cta  (warp_done_cta),
         .warp_done_slot (warp_done_slot),
     `endif
-        `UNUSED_PIN (refill_hold),
         .busy          (busy)
     );
 

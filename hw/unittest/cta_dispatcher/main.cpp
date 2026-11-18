@@ -367,6 +367,7 @@ public:
   std::vector<uint64_t> accept_cycle;
   std::vector<uint64_t> done_cycle;   // per CTA: the cycle its last warp's exit reached the dispatcher
   std::vector<uint64_t> fire_cycle;   // per CTA: the cycle its first warp launched
+  std::vector<uint64_t> exit0_cycle;  // per CTA: the cycle its first warp's exit reached the dispatcher
   std::map<uint32_t, uint64_t> last_event_cycle;   // slot -> cycle its last event left
 
   // Runs the CTAs in order, the host waiting for the device to drain between
@@ -389,6 +390,7 @@ public:
     accept_cycle.assign(ctas.size(), 0);
     done_cycle.assign(ctas.size(), 0);
     fire_cycle.assign(ctas.size(), ~0ull);
+    exit0_cycle.assign(ctas.size(), ~0ull);
     last_event_cycle.clear();
     warp_cta_.assign(NUM_WARPS, -1);
     left_.assign(ctas.size(), 0);
@@ -778,6 +780,9 @@ private:
       // block's slot frees in the dispatcher two cycles later, so the bench's
       // gang reuses it only after that.
       int c = warp_cta_[w];
+      if (c >= 0) {
+        exit0_cycle[c] = std::min(exit0_cycle[c], cycle_);
+      }
       if (c >= 0 && left_[c] > 0 && --left_[c] == 0) {
         done_cycle[c] = cycle_;
         if (pinned_cta(c)) {
@@ -1043,14 +1048,23 @@ static bool pinned_keeps_tail(Sim& sim, uint64_t& tick) {
 #line 966
 #endif
 
-// CTA refill gap (03/spec.md §5): CTAs of one kind follow each other on the
-// core, each needing what the one before frees. Slot-bound (the local memory
-// fits one CTA): the next one is taken exactly the kind's refill knob after the
-// last warp of the one before exited. Warp-bound (every warp, no local memory):
-// another slot is free at once, but the next CTA's first warp launches no
-// sooner than the knob after that exit, and within a few cycles of it.
-static bool refill_case(Sim& sim, uint64_t& tick, const char* name, uint32_t knob, uint32_t k, bool pinned,
-                        bool warp_bound) {
+// CTA refill: CTAs of one kind follow each other on the core, each needing what
+// the one before frees, and nothing but the retirement path stands between them.
+// A warp's exit frees its slot RETIRE_STAGES cycles later (the exit register, the
+// warp-count read, the count compare); the count write-back then holds the count
+// RAM's write port, which admission also writes, one more cycle. Slot-bound (the
+// local memory fits one CTA): the next CTA is taken RETIRE_STAGES + 1 cycles after
+// the last exit; a pinned block's done event leaves as the slot frees and the
+// gang forces the next block into it as the write-back ends, so the same gap.
+// Warp-bound (every warp, no local memory): another slot is free at once and a
+// warp is free as soon as its own exit arrives; the free-warp pick is registered,
+// so the next CTA's first warp launches one cycle after the later of the old
+// CTA's first exit and the first cycle of its own dispatch, not after the old
+// CTA is done.
+static constexpr int64_t RETIRE_STAGES = 3;
+
+static bool refill_case(Sim& sim, uint64_t& tick, const char* name, uint32_t k, bool pinned, bool warp_bound,
+                        int64_t& slot_gap) {
   std::vector<Cta> ctas;
   add_launch(ctas, 0, 1, k, 3 * k, warp_bound ? 0 : LMEM_SIZE, warp_bound ? NUM_WARPS * NUM_THREADS : NUM_THREADS,
              pinned);
@@ -1063,13 +1077,20 @@ static bool refill_case(Sim& sim, uint64_t& tick, const char* name, uint32_t kno
   std::vector<int> slots;
   bool ok = bench.run(ctas, slots);
   tick = bench.tick();
-  std::printf("refill %s, %s-bound (knob %u):", name, warp_bound ? "warp" : "slot", knob);
+  std::printf("refill %s, %s-bound (%s):", name, warp_bound ? "warp" : "slot",
+              warp_bound ? "first warp at max(first exit, dispatch start) + 1, gap from the first exit"
+                         : "accept after the last exit, want RETIRE_STAGES + 1");
   for (size_t i = 1; ok && i < ctas.size(); ++i) {
-    uint64_t at = warp_bound ? bench.fire_cycle[i] : (bench.accept_cycle[i] - 1);
-    int64_t gap = int64_t(at) - int64_t(bench.done_cycle[i - 1]);
-    std::printf(" %ld", (long)gap);
-    if (knob != 0 && (warp_bound ? (gap < int64_t(knob) || gap > int64_t(knob) + 4) : (gap != int64_t(knob)))) {
-      ok = false;
+    if (warp_bound) {
+      int64_t gap  = int64_t(bench.fire_cycle[i]) - int64_t(bench.exit0_cycle[i - 1]);
+      int64_t want = std::max(int64_t(bench.exit0_cycle[i - 1]), int64_t(bench.accept_cycle[i])) + 1;
+      std::printf(" %ld", (long)gap);
+      ok = (int64_t(bench.fire_cycle[i]) == want);
+    } else {
+      int64_t gap = int64_t(bench.accept_cycle[i] - 1) - int64_t(bench.done_cycle[i - 1]);
+      std::printf(" %ld", (long)gap);
+      ok = (gap == RETIRE_STAGES + 1);
+      slot_gap = gap;
     }
   }
   std::printf(": %s\n", ok ? "ok" : "FAILED");
@@ -1078,15 +1099,20 @@ static bool refill_case(Sim& sim, uint64_t& tick, const char* name, uint32_t kno
 
 static bool refill_gap(Sim& sim, uint64_t& tick) {
   bool ok = true;
+  int64_t gap[3] = {-1, -1, -1};
   for (bool warp_bound : {false, true}) {
-    ok = refill_case(sim, tick, "plain", VX_CFG_CTA_REFILL_CYCLES, 1, false, warp_bound) && ok;
+    int64_t g = -1;
+    ok = refill_case(sim, tick, "plain", 1, false, warp_bound, warp_bound ? g : gap[0]) && ok;
 #if VX_CFG_EXT_DLMEM_ENABLED
-    ok = refill_case(sim, tick, "cluster of 1", VX_CFG_CTA_REFILL_CLUSTER1_CYCLES, 1, true, warp_bound) && ok;
+    ok = refill_case(sim, tick, "cluster of 1", 1, true, warp_bound, warp_bound ? g : gap[1]) && ok;
     if (MAXC >= 2) {
-      ok = refill_case(sim, tick, "cluster of 2", VX_CFG_CTA_REFILL_CLUSTER_CYCLES, 2, true, warp_bound) && ok;
+      ok = refill_case(sim, tick, "cluster of 2", 2, true, warp_bound, warp_bound ? g : gap[2]) && ok;
     }
 #endif
   }
+  // last exit to the next CTA's acceptance; the H100's block-to-block refill is compared by tests/regression/cta_refill
+  std::printf("refill slot-bound gaps (plain / cluster of 1 / cluster of 2): %ld/%ld/%ld cycles\n", (long)gap[0],
+              (long)gap[1], (long)gap[2]);
   return ok;
 }
 

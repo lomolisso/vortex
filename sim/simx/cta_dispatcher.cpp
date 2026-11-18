@@ -47,9 +47,6 @@ CtaDispatcher::CtaDispatcher(const SimContext& ctx, const char* name, Core* core
   , wid_to_slot_(num_warps_, num_warps_)  // num_warps_ = invalid/unassigned
   , tail_slot_(0)
   , slot_free_at_(num_warps_, 0)
-  , refill_(num_warps_, 0)
-  , warp_free_at_(num_warps_, 0)
-  , held_slot_(num_warps_, 0)
   , fire_valid_(false)
   , fire_last_(false)
   , fire_wid_(0)
@@ -100,7 +97,6 @@ void CtaDispatcher::on_reset() {
     slot_rem_warps_[i] = 0;
     slot_free_at_[i]   = 0;
     wid_to_slot_[i]    = num_warps_;  // invalid
-    warp_free_at_[i]   = 0;
   }
   done_cycle_.fill(0);
   cur_kernel_pc_ = 0;
@@ -173,7 +169,7 @@ bool CtaDispatcher::step(const WarpMask& active_warps, uint32_t* wid_out, cta_wa
     // Lowest warp slot not active, not given a rank, not exited this cycle (registered in the RTL).
     int free_wid = -1;
     for (int wid = 0; wid < (int)num_warps_; ++wid) {
-      if (!active_warps.test(wid) && !dispatched_.test(wid) && !exited_.test(wid) && now >= warp_free_at_[wid]) {
+      if (!active_warps.test(wid) && !dispatched_.test(wid) && !exited_.test(wid)) {
         free_wid = wid;
         break;
       }
@@ -267,8 +263,8 @@ void CtaDispatcher::admit(uint64_t now) {
 #ifdef VX_CFG_EXT_DLMEM_ENABLE
   if (is_pinned) {
     base = next.forced_slot;
-    // The admission's mirror frees a slot only after its done event left, so
-    // only the refill gap can still hold it.
+    // The admission's mirror frees a slot only after its done event left; the
+    // count write-back may still hold it, as the RTL's admit check does.
     __assert(base < num_warps_ && slot_rem_warps_[base] == 0, "a pinned block's forced slot is not free");
     if (slot_busy(base)) {
       return;
@@ -321,17 +317,6 @@ void CtaDispatcher::admit(uint64_t now) {
   cur_slot_  = base;
   lmem_addr_ = lmem_base_ + uint64_t(base) * stride;
   slot_rem_warps_[base] = cta_size_;
-  {
-    // the refill gap of the launch kind (03/spec.md §5), counted from the last warp's exit
-    uint32_t k = cta_.cluster_dim[0] * cta_.cluster_dim[1] * cta_.cluster_dim[2];
-#ifdef VX_CFG_EXT_DLMEM_ENABLE
-    bool placed = (cta_.policy == KMU_POLICY_SPREAD);
-#else
-    bool placed = false;
-#endif
-    refill_[base] = !placed ? VX_CFG_CTA_REFILL_CYCLES
-                  : (k <= 1) ? VX_CFG_CTA_REFILL_CLUSTER1_CYCLES : VX_CFG_CTA_REFILL_CLUSTER_CYCLES;
-  }
 #ifdef VX_CFG_EXT_DLMEM_ENABLE
   if (!is_pinned) {
     tail_slot_ = (base + 1) % max_slots;
@@ -396,19 +381,8 @@ void CtaDispatcher::warp_done(uint32_t wid) {
   // slot × stride) frees for reuse — no in-order reclaim.
   uint64_t now = SimPlatform::instance().cycles();
   done_cycle_[now % done_cycle_.size()] = now + 1;
-  if (kRefill) {
-    warp_free_at_[wid] = UINT64_MAX;
-    held_slot_[wid] = slot;
-  }
   if (--slot_rem_warps_[slot] == 0) {
-    slot_free_at_[slot] = now + std::max<uint64_t>(RETIRE_DELAY, refill_[slot]);
-    if (kRefill) {
-      for (uint32_t w = 0; w < num_warps_; ++w) {
-        if (warp_free_at_[w] == UINT64_MAX && held_slot_[w] == slot) {
-          warp_free_at_[w] = slot_free_at_[slot];
-        }
-      }
-    }
+    slot_free_at_[slot] = now + RETIRE_DELAY;
   }
 #ifdef DXA_MBAR_ENABLE
   if (slot_rem_warps_[slot] == 0) {
@@ -424,7 +398,7 @@ void CtaDispatcher::warp_done(uint32_t wid) {
   }
   // The slot stays taken until its done event leaves, a cycle later.
   evt_[slot] = false;
-  slot_free_at_[slot] = now + std::max<uint64_t>(RETIRE_DELAY + 1, refill_[slot]);
+  slot_free_at_[slot] = now + RETIRE_DELAY + 1;
   return CtaDone{slot, gang_[slot], epoch_[slot]};
 #endif
 }

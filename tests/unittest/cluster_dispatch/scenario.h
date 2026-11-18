@@ -233,6 +233,9 @@ private:
     return L.life_base + (L.life_span ? mix(seed_ * 0x9e3779b9U ^ (msg << 8) ^ rank) % L.life_span : 0);
   }
 
+  // Admission FSM: the start cycle, K place cycles, K emit cycles.
+  static uint64_t place_pace(uint32_t k) { return 2 * uint64_t(k) + 1; }
+
   // the back-pressure pattern counts from the launch start, so identical launches see the same one
   bool ready_at(const Launch& L, uint64_t rel) const {
     return L.ready == Ready::Always || ((rel * 13 + 5) % 16) != 0;
@@ -250,7 +253,7 @@ private:
     std::vector<ref::Peer> msg_peers;
     uint32_t msg_gpc = 0, next_msg = 0, next_rank = 0, last_first_out = 0;
     bool have_first_out = false;
-    uint64_t last_first_cycle = 0;
+    uint64_t last_first_cycle = 0, min_gap = ~0ull;
     ref::reset(cfg_, chip_);
     ref::new_launch(cfg_, chip_);
     rows_.emplace_back();
@@ -298,11 +301,10 @@ private:
             msg_peers.clear();
             if (L.ready == Ready::Always && have_first_out) {
               const uint64_t gap = cycle_ - last_first_cycle;
-              const uint64_t want = std::max<uint64_t>(VX_CFG_CLUSTER_DISPATCH_CYCLES,
-                                                       uint64_t(L.k) * VX_CFG_CTA_DISPATCH_CYCLES);
-              if (gap < want)
-                this->fail("%s: message %u issued %llu cycles after message %u, below %llu", L.name, msg,
-                           (unsigned long long)gap, last_first_out, (unsigned long long)want);
+              if (gap < place_pace(L.k))
+                this->fail("%s: message %u issued %llu cycles after message %u, below the FSM's %llu", L.name, msg,
+                           (unsigned long long)gap, last_first_out, (unsigned long long)place_pace(L.k));
+              min_gap = std::min(min_gap, gap);
             }
             have_first_out = true;
             last_first_cycle = cycle_;
@@ -341,6 +343,15 @@ private:
         return;
       if (beats.empty() && delivered == L.msgs * L.k && outstanding == 0 && !o.busy)
         break;
+    }
+    if (L.cluster() && L.ready == Ready::Always && min_gap != ~0ull) {
+      // nothing but the FSM paces back-to-back placements
+      if (min_gap != place_pace(L.k))
+        this->fail("%s: closest placements %llu cycles apart, the FSM's pace is %llu", L.name,
+                   (unsigned long long)min_gap, (unsigned long long)place_pace(L.k));
+      if (L.k == 1)
+        std::printf("H100REF metric=cluster_place_interval_cycles h100=%.1f vortex=%llu\n",
+                    VX_CFG_H100_CLUSTER_DISPATCH_PS * 1e-6 * VX_CFG_H100_SM_CLOCK_MHZ, (unsigned long long)min_gap);
     }
     // Drained: every done reached the mirror, so the next launch meets an idle chip.
     for (const auto& d : pending)

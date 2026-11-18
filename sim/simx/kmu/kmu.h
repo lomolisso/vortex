@@ -131,7 +131,6 @@ private:
   bool     explicit_;
 #endif
   bool     running_;
-  uint64_t next_issue_ = 0;
   uint32_t cta_id_;
   uint8_t  ctx_id_;
   // Nested counter: group_origin advances by cluster_dim per axis;

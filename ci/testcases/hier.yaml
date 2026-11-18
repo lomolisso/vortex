@@ -287,35 +287,35 @@ tests:
     args: "-M"
 
   # Refill: one whole-SM block per SM, several waves, as plain blocks and as
-  # clusters of 1 and 2. On every SM the gap from a block's last clock read to
-  # the next block's first is at least the launch kind's refill knob, and after
-  # the SM's first block at most the knob plus the tail measured with the three
-  # knobs at 0 (-t: the largest such knob-0 gap per kind over the cell's
-  # drivers). The first block's gap is left out of the upper bound: a launch
-  # starts with cold caches, so that block's exit path misses in the I-cache and
-  # waits on DRAM, which moves with the memory model, not with the dispatcher.
-  # Plain blocks take the cluster-1 tail: at knob 0 a plain block starts on a
-  # warp the old block frees while its warp 0 still exits, so its knob-0 gap
-  # misses that exit.
+  # clusters of 1 and 2. Nothing holds a freed slot: the gap from a block's last
+  # clock read to the next block's first is its exit, retirement, dispatch (and
+  # for a cluster the done event's trip to the admission and the placement), and
+  # after the SM's first block it stays within the tail of that path (-t: the
+  # largest warm gap per kind measured over the cell's drivers, as the H100REF
+  # lines print it; a delay on the path fails it).
+  # The H100's 220/260/290 ns are printed as H100REF lines, not judged. The first
+  # block's gap is left out of the bound: a launch starts with cold caches, so
+  # that block's exit path misses in the I-cache and waits on DRAM, which moves
+  # with the memory model, not with the dispatcher.
   - id: refill-micro
     app: cta_refill
     drivers: [simx, rtlsim]
     configs+: *micro
     shape: {l3cache: true}
-    args: "-R -t 463,463,465"
+    args: "-R -t 160,462,464"
   - id: refill-pocket
     app: cta_refill
     drivers: [simx]
     configs+: *pocket
     shape: {l3cache: true}
-    args: "-R -t 555,555,512"
+    args: "-R -t 155,446,448"
   - id: parity-refill-micro
     check: model_parity
     app: cta_refill
     xlen: [64]
     configs+: *micro
     shape: {l3cache: true}
-    args: "-R -t 463,463,465"
+    args: "-R -t 160,462,464"
 
   # 128 SMs run; SIMX_MT gives serial's cycles; every channel between two
   # execution domains is a registered boundary stage.

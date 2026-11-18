@@ -9,14 +9,15 @@
 //            a cluster that waits for cluster 0's GPC must not hold back the
 //            clusters behind it that another GPC can take now.
 //   -R       refill gaps: waves of one whole-SM block per SM, as plain blocks,
-//            clusters of 1 and clusters of 2. On every SM the gap from a block's
-//            last clock read to the next block's first is at least the refill
-//            knob of its launch kind (VX_CFG_CTA_REFILL_*CYCLES, anchored at the
-//            CTA-done event, which comes after the last read); with -t the gaps
-//            after an SM's first block are at most the knob plus that kind's
-//            tail measured the same way with the knobs at 0. A launch starts
-//            with cold caches, so the first block's exit path fetches its code
-//            from DRAM and its gap carries a DRAM latency the refill does not.
+//            clusters of 1 and clusters of 2. The gap from a block's last clock
+//            read to the next block's first on its SM is the old block's exit,
+//            the retirement, the dispatch (for a cluster also the done event's
+//            trip to the admission and the placement) and the new block's start;
+//            nothing holds a freed slot. With -t the gaps after an SM's first
+//            block are at most that kind's tail. A launch starts with cold caches,
+//            so the first block's exit path fetches its code from DRAM and its gap
+//            carries a DRAM latency the refill does not. Each kind prints its gap
+//            next to the H100's block-to-block refill (H100REF).
 //   -M       first wave: 1.5 x M1 + 1 long clusters of one-warp blocks for K = 1,
 //            2 and the largest K; the clusters that start before the first one
 //            ends must number M1 = vx_occupancy_max_active_clusters = the sum
@@ -283,13 +284,14 @@ Gaps gaps_of(const Caps& caps, const Run& run) {
 }
 
 int run_refill(vx_device_h dev, vx_queue_h q, vx_kernel_h kernel, const Caps& caps) {
-  struct Kind { const char* name; bool cluster; uint32_t k; uint64_t knob, tail; };
+  // H100 block-to-block refill per launch kind (03/spec.md §5), in ns
+  struct Kind { const char* name; bool cluster; uint32_t k; uint64_t h100_ns, tail; };
   std::vector<Kind> kinds = {
-    {"plain", false, 1, VX_CFG_CTA_REFILL_CYCLES, tails[0]},
-    {"cluster-1", true, 1, VX_CFG_CTA_REFILL_CLUSTER1_CYCLES, tails[1]},
+    {"plain", false, 1, VX_CFG_H100_CTA_REFILL_NS, tails[0]},
+    {"cluster-1", true, 1, VX_CFG_H100_CTA_REFILL_CLUSTER1_NS, tails[1]},
   };
   if (caps.dlmem() && caps.sms_per_gpc() >= 2 && caps.max_cluster >= 2)
-    kinds.push_back({"cluster-2", true, 2, VX_CFG_CTA_REFILL_CLUSTER_CYCLES, tails[2]});
+    kinds.push_back({"cluster-2", true, 2, VX_CFG_H100_CTA_REFILL_CLUSTER_NS, tails[2]});
   int errors = 0;
   for (const Kind& kd : kinds) {
     Run run;
@@ -305,11 +307,13 @@ int run_refill(vx_device_h dev, vx_queue_h q, vx_kernel_h kernel, const Caps& ca
     if (e)
       continue;
     const Gaps g = gaps_of(caps, run);
-    bool ok = g.warm_count != 0 && g.min >= kd.knob && (kd.tail == 0 || g.warm_max <= kd.knob + kd.tail);
-    std::printf("%s refill: %s, %llu gaps of %llu..%llu cycles, %llu warm up to %llu, knob %llu, tail %llu\n",
+    bool ok = g.warm_count != 0 && (kd.tail == 0 || g.warm_max <= kd.tail);
+    std::printf("%s refill: %s, %llu gaps of %llu..%llu cycles, %llu warm up to %llu, tail %llu\n",
                 ok ? "" : "***", kd.name, (unsigned long long)g.count, (unsigned long long)g.min,
                 (unsigned long long)g.max, (unsigned long long)g.warm_count, (unsigned long long)g.warm_max,
-                (unsigned long long)kd.knob, (unsigned long long)kd.tail);
+                (unsigned long long)kd.tail);
+    std::printf("H100REF metric=cta_refill_%s_cycles h100=%.0f vortex=%llu\n", kd.name,
+                kd.h100_ns * 1e-3 * VX_CFG_H100_SM_CLOCK_MHZ, (unsigned long long)g.warm_max);
     errors += ok ? 0 : 1;
   }
   return errors;

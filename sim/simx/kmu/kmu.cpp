@@ -87,8 +87,6 @@ void Kmu::on_reset() {
   cta_id_          = 0;
   group_origin_[0] = group_origin_[1] = group_origin_[2] = 0;
   intra_offset_[0] = intra_offset_[1] = intra_offset_[2] = 0;
-  // the platform's cycle count restarts at 0 each run; the RTL's gap counter is saturated by then
-  next_issue_      = 0;
   tree_->reset();
 }
 
@@ -167,13 +165,7 @@ void Kmu::on_tick() {
     beat.eop = ((intra_offset_[0] + 1) == cluster_dim_[0])
             && ((intra_offset_[1] + 1) == cluster_dim_[1])
             && ((intra_offset_[2] + 1) == cluster_dim_[2]);
-    bool first = (intra_offset_[0] == 0) && (intra_offset_[1] == 0) && (intra_offset_[2] == 0);
-    // a message starts no sooner than CTA_DISPATCH_CYCLES after the last one did
-    bool issue_ok = !first || (now >= next_issue_);
-    if (issue_ok && tree_->ready(beat)) {
-      if (first) {
-        next_issue_ = now + VX_CFG_CTA_DISPATCH_CYCLES;
-      }
+    if (tree_->ready(beat)) {
       this->next_cta(&beat.req);
       DT(1, this->name() << " cta-fire: cta_id=" << beat.req.cta_id << ", block_idx=["
             << beat.req.block_idx[0] << "," << beat.req.block_idx[1] << "," << beat.req.block_idx[2] << "]");

@@ -106,7 +106,6 @@ module VX_scheduler import VX_gpu_pkg::*; #(
     wire [`VX_CFG_NUM_THREADS-1:0] cta_tmask;
     wire [`VX_CFG_MEM_ADDR_WIDTH-1:0] cta_param;
     wire cta_dispatcher_busy;
-    wire cta_refill_hold;
     wire cta_init;
 
     // CTA-CSR read-back from the dispatcher (it owns the per-CTA/per-warp tables).
@@ -178,7 +177,6 @@ module VX_scheduler import VX_gpu_pkg::*; #(
     `ifdef VX_CFG_TCU_H100_ENABLE
         .wg_rank_ok     (wg_rank_ok),
     `endif
-        .refill_hold (cta_refill_hold),
         .busy       (cta_dispatcher_busy)
     );
 
@@ -537,9 +535,7 @@ module VX_scheduler import VX_gpu_pkg::*; #(
                 end
             end
 
-            // An SM idle inside a CTA refill pad is still running the kernel:
-            // the clock a kernel reads counts it, as the H100's does.
-            if (busy || cta_refill_hold) begin
+            if (busy) begin
                 cycles <= cycles + 1;
             end
         end

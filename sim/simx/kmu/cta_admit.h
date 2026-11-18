@@ -112,7 +112,6 @@ private:
   uint32_t         cur_epoch_;
   bool             failed_;
   bool             dirty_;
-  uint32_t         gap_;
   // per-launch latches
   uint8_t          ctx_;
   bool             placed_;
