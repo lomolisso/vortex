@@ -226,9 +226,7 @@ module VX_sm_port_top import VX_gpu_pkg::*;
         .INSTANCE_ID   ("sm_port"),
         .NUM_SRCS      (NUM_SRCS),
         .SRC_TAG_WIDTH (SRC_TAG_WIDTH),
-        .LINE_SIZE     (LINE_SIZE),
-        .EGRESS_DELAY  (0),
-        .INGRESS_DELAY (0)
+        .LINE_SIZE     (LINE_SIZE)
     ) port (
         .clk            (clk),
         .reset          (reset),

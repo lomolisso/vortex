@@ -219,15 +219,59 @@ public:
 
     // connect lmem switch to per-block adapters
 #ifdef VX_CFG_H100_SM_ENABLE
-    snprintf(sname, 100, "%s-smem_gate", name.c_str());
-    smem_gate_ = SmemGate::Create(sname, VX_CFG_NUM_LSU_BLOCKS);
-    local_mem_->ExtOut.bind(&smem_gate_->ExtIn);
-    for (uint32_t b = 0; b < VX_CFG_NUM_LSU_BLOCKS; ++b) {
-      lmem_switch_.at(b)->ReqOutLmem.bind(&smem_gate_->ReqIn.at(b));
-      smem_gate_->RspOut.at(b).bind(&lmem_switch_.at(b)->RspInLmem);
-      smem_gate_->ReqOut.at(b).bind(&lsu_lmem_adapter.at(b)->ReqIn);
-      lsu_lmem_adapter.at(b)->RspOut.bind(&smem_gate_->RspIn.at(b));
+    // The SM's one array, after the local memory's client ports and the LSU
+    // switches, so it takes their accesses in the cycle they present them.
+    snprintf(sname, 100, "%s-sm_sram", name.c_str());
+    sm_sram_ = SmSram::Create(sname, SmSram::Config{VX_CFG_NUM_LSU_BLOCKS});
+    {
+      auto& ap = local_mem_->ArrayPorts;
+      for (uint32_t c = 0; c < SmSram::RD_ROWS; ++c) {
+        ap.RowRdOut.at(c).bind(&sm_sram_->RowRdIn.at(c));
+        sm_sram_->RowRspOut.at(c).bind(&ap.RowRspIn.at(c));
+      }
+      for (uint32_t w = 0; w < 2; ++w) {
+        ap.WrOut.at(w).bind(&sm_sram_->WrIn.at(1 + w));
+      }
+      for (uint32_t a = 0; a < 2; ++a) {
+        ap.AmoOut.at(a).bind(&sm_sram_->AmoIn.at(a));
+        sm_sram_->AmoRspOut.at(a).bind(&ap.AmoRspIn.at(a));
+      }
+      sm_sram_->DsmemBusyOut.bind(&ap.DsmemBusyIn);
     }
+  #ifdef VX_CFG_EXT_DLMEM_ENABLE
+    for (uint32_t k = 0; k < 3; ++k) {
+      sm_sram_->CommitOut.at(k).bind(&local_mem_->CommitOut.at(k));
+    }
+  #endif
+  #ifdef VX_CFG_EXT_MBAR_ENABLE
+    for (uint32_t i = 0; i < SmSram::BANKS; ++i) {
+      sm_sram_->MbarEvtOut.at(i).bind(&local_mem_->MbarEvtOut.at(i));
+    }
+  #endif
+    smem_cfg_out_ = std::make_unique<SimChannel<SmSramCfg>>(simobject_);
+    smem_cfg_out_->bind(&sm_sram_->CfgIn);
+    for (uint32_t b = 0; b < VX_CFG_NUM_LSU_BLOCKS; ++b) {
+      lmem_switch_.at(b)->ReqOutLmem.bind(&sm_sram_->LsuReqIn.at(b));
+      sm_sram_->LsuRspOut.at(b).bind(&lmem_switch_.at(b)->RspInLmem);
+    }
+
+    // The SM's L1 on the array: the switches' global legs in, the core's one
+    // dcache port out. It ticks after the array, whose same-cycle outputs it takes.
+    snprintf(sname, 100, "%s-sm_l1", name.c_str());
+    sm_l1_ = SmL1::Create(sname, SmL1::Config{VX_CFG_NUM_LSU_BLOCKS});
+    smem_l1_cfg_out_ = std::make_unique<SimChannel<SmSramCfg>>(simobject_);
+    smem_l1_cfg_out_->bind(&sm_l1_->CfgIn);
+    for (uint32_t b = 0; b < VX_CFG_NUM_LSU_BLOCKS; ++b) {
+      lmem_switch_.at(b)->ReqOutDC.bind(&sm_l1_->LsuReqIn.at(b));
+      sm_l1_->LsuRspOut.at(b).bind(&lmem_switch_.at(b)->RspInDC);
+    }
+    sm_l1_->GlReqOut.bind(&sm_sram_->GlReqIn);
+    sm_sram_->GlRspOut.bind(&sm_l1_->GlRspIn);
+    sm_sram_->WfRetiredOut.bind(&sm_l1_->WfRetiredIn);
+    sm_l1_->FillOut.bind(&sm_sram_->WrIn.at(0));
+    sm_sram_->FillDoneOut.bind(&sm_l1_->FillDoneIn);
+    sm_l1_->MemReqOut.bind(&simobject_->dcache_req_out.at(0));
+    simobject_->dcache_rsp_in.at(0).bind(&sm_l1_->MemRspIn);
 #else
 #line 209
     for (uint32_t b = 0; b < VX_CFG_NUM_LSU_BLOCKS; ++b) {
@@ -245,6 +289,8 @@ public:
       }
     }
 
+#ifndef VX_CFG_H100_SM_ENABLE
+#line 222
     // Per-channel request/response endpoints facing the dcache ports.
     std::vector<SimChannel<MemReq>*> dc_req_out(VX_CFG_NUM_LSU_BLOCKS * DCACHE_CHANNELS);
     std::vector<SimChannel<MemRsp>*> dc_rsp_in(VX_CFG_NUM_LSU_BLOCKS * DCACHE_CHANNELS);
@@ -312,6 +358,8 @@ public:
       simobject_->dcache_rsp_in.at(p).bind(dc_rsp_in.at(p));
     }
   #endif
+#endif
+#line 289
 
     // initialize dispatchers
     dispatchers_.at((int)FUType::ALU) = SimPlatform::instance().create_object<Dispatcher>(name.c_str(), simobject_, VX_CFG_DISPATCH_QUEUE_SIZE, VX_CFG_NUM_ALU_BLOCKS, VX_CFG_NUM_ALU_LANES);
@@ -388,12 +436,8 @@ public:
     // after them for the same reason.
     snprintf(sname, 100, "%s-lmem_acc_track", name.c_str());
     lmem_acc_track_ = DlmemWTrack::Create(sname, VX_CFG_NUM_LSU_BLOCKS, VX_CFG_NUM_WARPS, DLMEM_LACC_LIMIT,
-#ifdef VX_CFG_H100_SM_ENABLE
-                                          VX_CFG_LMEM_NUM_BANKS + VX_CFG_NUM_LSU_BLOCKS);
-#else
 #line 357
                                           VX_CFG_LMEM_NUM_BANKS);
-#endif
 #line 358
   #ifdef VX_CFG_EXT_MBAR_ENABLE
     snprintf(sname, 100, "%s-mbar_waiters", name.c_str());
@@ -418,11 +462,6 @@ public:
       for (uint32_t i = 0; i < VX_CFG_LMEM_NUM_BANKS; ++i) {
         local_mem_->CommitOut.at(i).bind(&lmem_acc_track_->CommitIn.at(i));
       }
-#ifdef VX_CFG_H100_SM_ENABLE
-      for (uint32_t b = 0; b < VX_CFG_NUM_LSU_BLOCKS; ++b) {
-        smem_gate_->FoldOut.at(b).bind(&lmem_acc_track_->CommitIn.at(VX_CFG_LMEM_NUM_BANKS + b));
-      }
-#endif
 #line 381
     #ifdef VX_CFG_EXT_MBAR_ENABLE
       for (uint32_t i = 0; i < VX_CFG_LMEM_NUM_BANKS; ++i) {
@@ -438,6 +477,16 @@ public:
         snprintf(sname, 100, "%s-cpa%d", name.c_str(), b);
         auto cpa = CpaUnit::Create(sname, b);
         cpa_units_.push_back(cpa);
+#ifdef VX_CFG_H100_SM_ENABLE
+        // cp.async lanes go to the array's fill class.
+        lsu->CpaIssueOut.at(b).bind(&cpa->IssueIn);
+        lsu->CpaRspOut.at(b).bind(&cpa->RspIn);
+        cpa->StatusOut.bind(&lsu->CpaStatusIn.at(b));
+        cpa->UnlockOut.bind(&scheduler_->UnlockIn.at(Scheduler::CPA_UNLOCK_BASE + b));
+        cpa->ReqOut.bind(&sm_sram_->CpaReqIn.at(b));
+        sm_sram_->CpaRspOut.at(b).bind(&cpa->AckIn);
+#else
+#line 395
         snprintf(sname, 100, "%s-cpa_adapter%d", name.c_str(), b);
         auto adapter = LsuMemAdapter::Create(sname, LSU_CHANNELS, 1);
         lsu->CpaIssueOut.at(b).bind(&cpa->IssueIn);
@@ -451,6 +500,8 @@ public:
           adapter->ReqOut.at(c).bind(&local_mem_->Inputs.at(port));
           local_mem_->Outputs.at(port).bind(&adapter->RspIn.at(c));
         }
+#endif
+#line 408
       }
     #endif
     #ifdef DXA_MBAR_ENABLE
@@ -514,7 +565,7 @@ public:
     this->reset();
   }
 
-  void reset() {
+  void reset() { LMEM_SMEM_CFG_RESET
     for (auto& arb : ibuffer_arbs_) {
       arb.reset();
     }
@@ -548,7 +599,7 @@ public:
     // per-launch counts where the device reports a running total.
   }
 
-  void tick() {
+  void tick() { LMEM_SMEM_CFG_TICK
     this->commit();
     this->execute();
     this->issue();
@@ -1084,7 +1135,7 @@ public:
 
   // ----- Public-facing API (called from outer Core trampolines) -----
 
-  bool running() const {
+  bool running() const { LMEM_SM_L1_RUNNING
     if (scheduler_->running() || !pending_instrs_.empty()) {
       return true;
     }
@@ -1447,7 +1498,36 @@ private:
   Mmu::Ptr icache_mmu_;
 #endif
 #ifdef VX_CFG_H100_SM_ENABLE
-  SmemGate::Ptr smem_gate_;
+  SmSram::Ptr sm_sram_;
+  std::unique_ptr<SimChannel<SmSramCfg>> smem_cfg_out_;
+  SmL1::Ptr sm_l1_;
+  std::unique_ptr<SimChannel<SmSramCfg>> smem_l1_cfg_out_;
+
+  uint32_t smem_bytes_ = VX_CFG_SMEM_PER_SM_MAX;
+  bool smem_cfg_dirty_ = true;
+
+public:
+  // A launch's carve-out (VX_DCR_KMU_SMEM_CONFIG), latched as VX_dcr_data
+  // does. A DCR write is a host call that a reset follows, and a reset drops
+  // undelivered packets, so the array is sent the latch from the core's tick.
+  void smem_config(uint32_t smem_bytes) {
+    smem_bytes_ = smem_bytes;
+    smem_cfg_dirty_ = true;
+  }
+
+  void smem_cfg_send() {
+    if (smem_cfg_dirty_) {
+      smem_cfg_out_->send(SmSram::cfg_of(smem_bytes_), 1);
+      smem_l1_cfg_out_->send(SmSram::cfg_of(smem_bytes_), 1);
+      smem_cfg_dirty_ = false;
+    }
+  }
+
+  const SmL1::Ptr& sm_l1() const {
+    return sm_l1_;
+  }
+
+private:
 #endif
 #line 1403
 #ifdef VX_CFG_EXT_DLMEM_ENABLE
@@ -1494,8 +1574,8 @@ Core::Core(const SimContext& ctx,
   : SimObject(ctx, name)
   , icache_req_out(1, this)
   , icache_rsp_in(1, this)
-  , dcache_req_out(VX_CFG_DCACHE_NUM_REQS, this)
-  , dcache_rsp_in(VX_CFG_DCACHE_NUM_REQS, this)
+  , dcache_req_out(CORE_DCACHE_PORTS, this)
+  , dcache_rsp_in(CORE_DCACHE_PORTS, this)
   , gbar_arrive_out(this)
   , gbar_resume_in(this)
 #ifdef VX_CFG_EXT_DLMEM_ENABLE
@@ -1591,7 +1671,7 @@ bool Core::setTmask(uint32_t wid, const ThreadMask& tmask) {
   return impl_->scheduler()->setTmask(wid, tmask);
 }
 
-int Core::dcr_write(uint32_t addr, uint32_t value) {
+int Core::dcr_write(uint32_t addr, uint32_t value) { LMEM_SMEM_CONFIG_HOOK(addr, value)
 #ifdef VX_CFG_EXT_DLMEM_ENABLE
   // The KMU's launch DCRs also reach every core, for its identity CSRs.
   impl_->csr_unit().dcr_write(addr, value);
@@ -1713,5 +1793,19 @@ void Core::set_satp(uint64_t satp) { impl_->set_satp(satp); }
 #ifdef VX_CFG_EXT_DXA_ENABLE
 const std::shared_ptr<DxaCompl>& Core::dxa_compl() const {
   return impl_->dxa_compl();
+}
+#endif
+#ifdef VX_CFG_H100_SM_ENABLE
+
+const SmL1::PerfStats& Core::l1_perf_stats() const {
+  return impl_->sm_l1()->perf_stats();
+}
+
+void Core::l1_flush_begin() {
+  impl_->sm_l1()->flush_begin();
+}
+
+bool Core::l1_flush_done() const {
+  return impl_->sm_l1()->flush_done();
 }
 #endif

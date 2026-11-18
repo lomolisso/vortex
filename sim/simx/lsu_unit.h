@@ -125,7 +125,13 @@ public:
 	std::vector<SimChannel<CpaStatus>> CpaStatusIn;
 
 	// A cp.async read's memory tag, past the pending table's: its copy slot and packet.
+#ifdef VX_CFG_H100_SM_ENABLE
+	static constexpr uint32_t CPA_TAG_BASE = 2 * VX_CFG_LSU_PENDING_SIZE;
+#else
+#line 128
 	static constexpr uint32_t CPA_TAG_BASE = VX_CFG_LSU_PENDING_SIZE;
+#endif
+#line 129
 #endif
 #ifdef DXA_MBAR_ENABLE
 	// Per block: a proxy fence's answer from the translation stage, which
@@ -156,21 +162,59 @@ private:
 	// Per-cycle handlers.
 	void process_response_step(uint32_t b);
 	void process_request_step(uint32_t b);
-#ifdef VX_CFG_H100_SM_ENABLE
-	// The response this cycle's step takes: a held completion whose hit time
-	// has come, else the port's head; nullptr when there is none to take.
-	SimChannel<LsuRsp>* h100_rsp_source(uint32_t b);
-#else
 #if (defined(DXA_MBAR_ENABLE) && defined(TCU_META_ENABLE)) || (defined(DXA_MBAR_ENABLE))
-#line 155
+#line 156
 #else
-#line 133
-#endif
+#line 134
 #endif
 
 	// Drain Inputs[b] into req_queue.
 	void ingest_inputs(uint32_t b);
 
+#ifdef VX_CFG_H100_SM_ENABLE
+	// Reads whose active lanes all stay on the shared-memory side (local memory,
+	// the DSMEM window) hold their own LSU_PENDING_SIZE credits, so they never wait
+	// for the entries global misses hold; the rest keep the global credit, which
+	// size() and full() report, so the global-class checks read as before.
+	template <typename T>
+	class PendTable {
+	public:
+		bool     empty() const { return t_.empty(); }
+		uint32_t size() const { return t_.size() - shm_; }
+		bool     full() const { return this->size() >= VX_CFG_LSU_PENDING_SIZE; }
+		bool     shm_full() const { return shm_ >= VX_CFG_LSU_PENDING_SIZE; }
+		T&       at(uint32_t i) { return t_.at(i); }
+		uint32_t allocate(const T& v) {
+			const bool shm = !v.is_fence && !v.is_tcu && LsuUnit::lanes_shared(v.lanes.data(), v.lanes.size());
+			uint32_t i = t_.allocate(v);
+			shm_of_.at(i) = shm;
+			shm_ += shm;
+			return i;
+		}
+		void release(uint32_t i) {
+			shm_ -= shm_of_.at(i);
+			shm_of_.at(i) = false;
+			t_.release(i);
+		}
+		void clear() {
+			t_.clear();
+			shm_of_.assign(shm_of_.size(), false);
+			shm_ = 0;
+		}
+	private:
+		HashTable<T>      t_{2 * VX_CFG_LSU_PENDING_SIZE};
+		std::vector<bool> shm_of_ = std::vector<bool>(2 * VX_CFG_LSU_PENDING_SIZE, false);
+		uint32_t          shm_ = 0;
+	};
+
+	// A packet's lanes (size 0 = inactive): at least one active, none leaving the shared-memory side.
+	template <typename L>
+	static bool lanes_shared(const L* lanes, uint32_t n);
+	static bool lane_shared(uint64_t addr);
+
+	// Whether the next packet of the trace at the head of block b finds its class's credit spent.
+	bool class_full(uint32_t b, instr_trace_t* trace);
+#endif
 #ifdef VX_CFG_EXT_DLMEM_ENABLE
 	static bool is_acquire_amo(const instr_trace_t* trace);
 #ifdef VX_CFG_EXT_MBAR_ENABLE
@@ -223,12 +267,7 @@ private:
 	#ifdef VX_CFG_EXT_DLMEM_ENABLE
 		bool        gload      = false;  // a global read packet, counted in gload_
 	#endif
-#ifdef VX_CFG_H100_SM_ENABLE
-		// a global load's response leaves no earlier than this cycle (its L1 hit time)
-		uint64_t    h100_release = 0;
-#else
-#line 177
-#endif
+#line 178
 	};
 
 	// Per-block LSU state. Each member is a named hardware sub-block.
@@ -240,7 +279,13 @@ private:
 		// (Not a miss-status table — the cache has its own MSHR for that.)
 		// Sized by the outstanding pool (MLP depth), decoupled from the
 		// input staging queue above.
+#ifdef VX_CFG_H100_SM_ENABLE
+		PendTable<pending_req_t>  pending_reqs;
+#else
+#line 189
 		HashTable<pending_req_t>  pending_reqs{VX_CFG_LSU_PENDING_SIZE};
+#endif
+#line 190
 		FenceController           fence;
 		std::vector<mem_addr_size_t> addr_list;
 		uint32_t                  remain_addrs = 0;
@@ -256,14 +301,7 @@ private:
 
 	std::array<lsu_state_t, VX_CFG_NUM_LSU_BLOCKS> states_;
 	uint64_t pending_loads_;
-#ifdef VX_CFG_H100_SM_ENABLE
-	// Per block: the responses that complete a load before its L1 hit time,
-	// in arrival order, until that time.
-	std::vector<SimChannel<LsuRsp>> h100_held_ = std::vector<SimChannel<LsuRsp>>(
-		VX_CFG_NUM_LSU_BLOCKS, SimChannel<LsuRsp>(this, VX_CFG_L1_HIT_LATENCY));
-#else
-#line 204
-#endif
+#line 205
 
 #ifdef VX_CFG_EXT_DLMEM_ENABLE
 	// Packets of each warp's acquire AMO answered so far; a warp has at most one,

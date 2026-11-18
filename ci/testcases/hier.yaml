@@ -375,3 +375,18 @@ tests:
     configs+: *h100
     env: {APP: demo, ARGS: ""}
     run: *audit_run
+
+  # Resident blocks per SM under the per-launch shared-memory carve-out (E12b): the dispatcher's count
+  # equals smem_blocks_per_sm at the no-hint configuration, at both thread counts the H100 shapes allow.
+  - id: carveout-occupancy-pocket
+    app: carveout
+    drivers: [simx]
+    configs+: "-DVX_CFG_H100_ORG_ENABLE -DVX_CFG_NUM_PARTITIONS=2 -DVX_CFG_GPCS_PER_PARTITION=4 -DVX_CFG_CPCS_PER_GPC=2 -DVX_CFG_TPCS_PER_CPC=1 -DVX_CFG_SMS_PER_TPC=2 -DVX_CFG_NUM_WARPS=64 -DVX_CFG_NUM_THREADS=16"
+    shape: {l2cache: true, l3cache: true}
+    args: "-m 3"
+  - id: carveout-occupancy-pocket-t32
+    app: carveout
+    drivers: [simx]
+    configs+: "-DVX_CFG_H100_ORG_ENABLE -DVX_CFG_NUM_PARTITIONS=2 -DVX_CFG_GPCS_PER_PARTITION=4 -DVX_CFG_CPCS_PER_GPC=2 -DVX_CFG_TPCS_PER_CPC=1 -DVX_CFG_SMS_PER_TPC=2 -DVX_CFG_NUM_WARPS=64 -DVX_CFG_NUM_THREADS=32"
+    shape: {l2cache: true, l3cache: true}
+    args: "-m 3"

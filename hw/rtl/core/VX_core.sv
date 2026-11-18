@@ -33,7 +33,15 @@ module VX_core import VX_gpu_pkg::*, VX_tlb_pkg::*; #(
 
     VX_dcr_bus_if.slave     dcr_bus_if,
 
+`ifdef VX_CFG_H100_SM_ENABLE
+    // The SM's L1 is in the core: its one bus of line requests and refills.
+    VX_mem_bus_if.master    dcache_bus_if [1],
+`ifdef PERF_ENABLE
+    output cache_perf_t     dcache_perf,
+`endif
+`else
     VX_mem_bus_if.master    dcache_bus_if [DCACHE_NUM_REQS],
+`endif
 
     VX_mem_bus_if.master    icache_bus_if,
 
@@ -183,10 +191,17 @@ module VX_core import VX_gpu_pkg::*, VX_tlb_pkg::*; #(
     VX_lsu_sched_if tcu_mem_if();
 `endif
 
+`ifdef VX_CFG_H100_SM_ENABLE
+    VX_mem_bus_if #(
+        .DATA_SIZE (DCACHE_MEM_DATA_SIZE),
+        .TAG_WIDTH (SM_L1_MEM_TAG_WIDTH)
+    ) mmu_dcache_if[1]();
+`else
     VX_mem_bus_if #(
         .DATA_SIZE (DCACHE_WORD_SIZE),
         .TAG_WIDTH (DCACHE_TAG_WIDTH_BASE)
     ) mmu_dcache_if[DCACHE_NUM_REQS]();
+`endif
 
     // VX_fetch -> VX_dcr_flush -> mmu_icache_if -> (i)MMU -> icache_bus_if.
     // The flush wrapper consumes the dcr-triggered cache-flush request and
@@ -278,6 +293,10 @@ module VX_core import VX_gpu_pkg::*, VX_tlb_pkg::*; #(
     assign dcr_flush_if.done = dcr_flush_dcache_if.done & dcr_flush_icache_if.done;
 `endif
 
+`ifdef VX_CFG_H100_SM_ENABLE
+    smem_cfg_t smem_cfg;
+`endif
+
     VX_dcr_data #(
         .INSTANCE_ID (`SFORMATF(("%s-dcr_data", INSTANCE_ID))),
         .CORE_ID (CORE_ID)
@@ -286,6 +305,9 @@ module VX_core import VX_gpu_pkg::*, VX_tlb_pkg::*; #(
         .reset      (reset),
         .dcr_bus_if (dcr_bus_if),
         .dcr_csr_if (dcr_csr_if),
+    `ifdef VX_CFG_H100_SM_ENABLE
+        .smem_cfg   (smem_cfg),
+    `endif
         .dcr_flush_if(dcr_flush_if)
     );
 
@@ -665,12 +687,13 @@ module VX_core import VX_gpu_pkg::*, VX_tlb_pkg::*; #(
     ) dlmem_lmem_if();
 `endif
 
+`ifdef VX_CFG_H100_SM_ENABLE
+    wire [2:0]                                      lmem_commit_valid;
+    wire [2:0][NW_WIDTH-1:0]                        lmem_commit_wid;
+    wire [2:0][`CLOG2(`VX_CFG_NUM_LSU_LANES+1)-1:0] lmem_commit_cnt;
+`else
     wire [`VX_CFG_LMEM_NUM_BANKS-1:0]               lmem_commit_valid;
     wire [`VX_CFG_LMEM_NUM_BANKS-1:0][NW_WIDTH-1:0] lmem_commit_wid;
-`ifdef VX_CFG_H100_SM_ENABLE
-    wire [`VX_CFG_NUM_LSU_BLOCKS-1:0]               lmem_fold_valid;
-    wire [`VX_CFG_NUM_LSU_BLOCKS-1:0][NW_WIDTH-1:0] lmem_fold_wid;
-    wire [`VX_CFG_NUM_LSU_BLOCKS-1:0][`CLOG2(`VX_CFG_NUM_LSU_LANES+1)-1:0] lmem_fold_cnt;
 `endif
 `endif
 `ifdef DXA_MBAR_ENABLE
@@ -687,6 +710,9 @@ module VX_core import VX_gpu_pkg::*, VX_tlb_pkg::*; #(
     ) mem_unit (
         .clk           (clk),
         .reset         (reset),
+    `ifdef VX_CFG_H100_SM_ENABLE
+        .smem_cfg      (smem_cfg),
+    `endif
     `ifdef PERF_ENABLE
         .lmem_perf     (lmem_perf),
         .coalescer_perf(coalescer_perf),
@@ -704,9 +730,7 @@ module VX_core import VX_gpu_pkg::*, VX_tlb_pkg::*; #(
         .lmem_commit_valid (lmem_commit_valid),
         .lmem_commit_wid (lmem_commit_wid),
     `ifdef VX_CFG_H100_SM_ENABLE
-        .lmem_fold_valid (lmem_fold_valid),
-        .lmem_fold_wid (lmem_fold_wid),
-        .lmem_fold_cnt (lmem_fold_cnt),
+        .lmem_commit_cnt (lmem_commit_cnt),
     `endif
     `endif
     `ifdef VX_CFG_EXT_MBAR_ENABLE
@@ -725,6 +749,11 @@ module VX_core import VX_gpu_pkg::*, VX_tlb_pkg::*; #(
         .empty         (mem_unit_empty),
         .lsu_mem_if    (lsu_mem_if),
         .dcr_flush_if  (dcr_flush_dcache_if),
+    `ifdef VX_CFG_H100_SM_ENABLE
+    `ifdef PERF_ENABLE
+        .dcache_perf   (dcache_perf),
+    `endif
+    `endif
         .dcache_bus_if (mmu_dcache_if)
     );
 
@@ -792,7 +821,7 @@ module VX_core import VX_gpu_pkg::*, VX_tlb_pkg::*; #(
     VX_dlmem_wtrack #(
         .NUM_INC   (`VX_CFG_NUM_LSU_BLOCKS),
     `ifdef VX_CFG_H100_SM_ENABLE
-        .NUM_DEC   (`VX_CFG_LMEM_NUM_BANKS + `VX_CFG_NUM_LSU_BLOCKS),
+        .NUM_DEC   (3),
     `else
         .NUM_DEC   (`VX_CFG_LMEM_NUM_BANKS),
     `endif
@@ -804,9 +833,9 @@ module VX_core import VX_gpu_pkg::*, VX_tlb_pkg::*; #(
         .inc_wid   (xlate_lacc_inc_wid),
         .inc_cnt   (xlate_lacc_inc_cnt),
 `ifdef VX_CFG_H100_SM_ENABLE
-        .dec_valid ({lmem_fold_valid, lmem_commit_valid}),
-        .dec_wid   ({lmem_fold_wid, lmem_commit_wid}),
-        .dec_cnt   ({lmem_fold_cnt, {`VX_CFG_LMEM_NUM_BANKS{`CLOG2(`VX_CFG_NUM_LSU_LANES+1)'(1)}}}),
+        .dec_valid (lmem_commit_valid),
+        .dec_wid   (lmem_commit_wid),
+        .dec_cnt   (lmem_commit_cnt),
 `else
         .dec_valid (lmem_commit_valid),
         .dec_wid   (lmem_commit_wid),
@@ -822,9 +851,13 @@ module VX_core import VX_gpu_pkg::*, VX_tlb_pkg::*; #(
     // The core's dcache/icache buses carry the addresses the mem_unit and fetch
     // produce straight through — virtual under VM, physical otherwise. Same
     // widths on both sides (BASE == full for both L1s).
+`ifdef VX_CFG_H100_SM_ENABLE
+    `ASSIGN_VX_MEM_BUS_IF (dcache_bus_if[0], mmu_dcache_if[0]);
+`else
     for (genvar i = 0; i < DCACHE_NUM_REQS; ++i) begin : g_dcache_passthru
         `ASSIGN_VX_MEM_BUS_IF (dcache_bus_if[i], mmu_dcache_if[i]);
     end
+`endif
     `ASSIGN_VX_MEM_BUS_IF (icache_bus_if, mmu_icache_if[0]);
 
 `ifdef VX_CFG_VM_ENABLE

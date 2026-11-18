@@ -28,44 +28,13 @@
 
 using namespace vortex;
 #ifdef VX_CFG_H100_SM_ENABLE
-#include "cache.h"
-#include <l1_ref.h>
-
-// A lane the dcache serves: global memory outside the DLMEM window.
-static bool h100_dcache_lane(uint64_t addr) {
-	if (get_addr_type(addr) != AddrType::Global)
-		return false;
-#ifdef VX_CFG_EXT_DLMEM_ENABLE
-	uint32_t wl = VX_CFG_LMEM_LOG_SIZE + log2ceil(VX_CFG_DLMEM_MAX_CLUSTER);
-	return (addr >> wl) != (uint64_t(VX_MEM_DLMEM_BASE_ADDR) >> wl);
+#define LSU_CPA_SHARE_FULL(b) false
+#define LSU_READ_FULL(b, trace) this->class_full(b, trace)
 #else
-	return true;
+#define LSU_CPA_SHARE_FULL(b) cpa_reads_.at(b) != 0 && this->pending_full(b)
+#define LSU_READ_FULL(b, trace) state.pending_reqs.full()
 #endif
-}
-
-// A global load completes at the LSU no earlier than its L1 hit time,
-// l1_hit_latency(P) per dependent hop (05 sec 4.3), after its request: net of
-// L1_CORE_STAGES, the core's own stages outside that interval. A longer path
-// (a miss) is not held. 0 when no lane goes to the dcache.
-static uint64_t h100_release_cycle(const LsuReq& req) {
-	constexpr uint32_t N = VX_CFG_NUM_LSU_LANES;
-	static_assert(N == VX_CFG_NUM_THREADS && N <= 32, "the L1 address passes span one warp request");
-	uint64_t addrs[N];
-	uint32_t mask = 0;
-	for (uint32_t i = 0; i < N; ++i) {
-		addrs[i] = req.addrs.at(i);
-		if (req.mask.test(i) && h100_dcache_lane(addrs[i]))
-			mask |= 1u << i;
-	}
-	if (mask == 0)
-		return 0;
-	uint32_t P = l1_ref::l1_line_passes(addrs, mask, N, VX_CFG_L1_ADDR_PASSES, VX_CFG_DCACHE_LINE_SIZE);
-	uint32_t lat = l1_ref::l1_hit_latency(P, VX_CFG_L1_LINE_BASE_CENTICYCLES, VX_CFG_L1_LINE_STEP_CENTICYCLES);
-	return SimPlatform::instance().cycles() + lat - L1_CORE_STAGES;
-}
-#else
-#line 29
-#endif
+#line 30
 
 uint32_t LsuUopGen::uop_count(const Instr& instr) {
   // PACKLB.F: width=0 (LB), 4 byte-elements
@@ -713,12 +682,6 @@ void LsuUnit::process_response_step(uint32_t b) {
 #else
 #line 278
 #endif
-#ifdef VX_CFG_H100_SM_ENABLE
-	auto* h100_src = this->h100_rsp_source(b);
-	if (h100_src == nullptr)
-		return;
-	auto& lsu_rsp_in = *h100_src;
-#else
 #if (defined(DXA_MBAR_ENABLE) && defined(TCU_META_ENABLE)) || (defined(DXA_MBAR_ENABLE))
 #line 659
 #elif (defined(VX_CFG_EXT_MBAR_ENABLE) && defined(TCU_META_ENABLE)) || (defined(VX_CFG_EXT_MBAR_ENABLE))
@@ -729,7 +692,6 @@ void LsuUnit::process_response_step(uint32_t b) {
 #line 278
 #endif
 	auto& lsu_rsp_in = core_->lmem_switch(b)->RspOut;
-#endif
 #if (defined(DXA_MBAR_ENABLE) && defined(TCU_META_ENABLE)) || (defined(DXA_MBAR_ENABLE))
 #line 660
 #elif (defined(VX_CFG_EXT_MBAR_ENABLE) && defined(TCU_META_ENABLE)) || (defined(VX_CFG_EXT_MBAR_ENABLE))
@@ -888,47 +850,14 @@ void LsuUnit::process_response_step(uint32_t b) {
 // At most one transaction/cycle: the trace is not dispatchable until the next
 // cycle, so req_queue adds a real cycle of latency. A while-loop here would
 // fabricate write bandwidth and collapse that latency to zero.
-#ifdef VX_CFG_H100_SM_ENABLE
-// A response that completes a load before its L1 hit time waits in the
-// block's held queue, so it neither blocks the port nor the responses behind
-// it; it is taken once that time has come, ahead of the port.
-SimChannel<LsuRsp>* LsuUnit::h100_rsp_source(uint32_t b) {
-	auto& port  = core_->lmem_switch(b)->RspOut;
-	auto& held  = h100_held_.at(b);
-	auto& state = states_.at(b);
-	const uint64_t now = SimPlatform::instance().cycles();
-	auto early = [&](const LsuRsp& rsp) {
-	#ifdef VX_CFG_EXT_MBAR_ENABLE
-		if (rsp.tag >= CPA_TAG_BASE)
-			return false;
-	#endif
-		const auto& e = state.pending_reqs.at(rsp.tag);
-		return e.h100_release > now && rsp.mask.count() >= e.count;
-	};
-	// the port delivers one response a cycle, to the queue or to the step
-	bool moved = false;
-	if (!port.empty() && early(port.peek()) && !held.full()) {
-		held.send(port.peek(), 1);
-		port.pop();
-		moved = true;
-	}
-	if (!held.empty() && state.pending_reqs.at(held.peek().tag).h100_release <= now)
-		return &held;
-	if (moved || port.empty() || early(port.peek()))
-		return nullptr;
-	return &port;
-}
-
-#else
 #if (defined(DXA_MBAR_ENABLE) && defined(TCU_META_ENABLE)) || (defined(DXA_MBAR_ENABLE))
-#line 808
+#line 809
 #elif (defined(VX_CFG_EXT_MBAR_ENABLE) && defined(TCU_META_ENABLE)) || (defined(VX_CFG_EXT_MBAR_ENABLE))
-#line 516
+#line 517
 #elif (defined(VX_CFG_EXT_DLMEM_ENABLE) && defined(VX_CFG_EXT_DXA_ENABLE) && defined(TCU_META_ENABLE)) || (defined(VX_CFG_EXT_DLMEM_ENABLE) && defined(TCU_META_ENABLE)) || (defined(VX_CFG_EXT_DLMEM_ENABLE) && defined(VX_CFG_EXT_DXA_ENABLE)) || (defined(VX_CFG_EXT_DLMEM_ENABLE))
-#line 411
+#line 412
 #else
-#line 405
-#endif
+#line 406
 #endif
 void LsuUnit::ingest_inputs(uint32_t b) {
 	auto& state = states_.at(b);
@@ -1021,6 +950,22 @@ void LsuUnit::issue_fence(uint32_t b, instr_trace_t* trace) {
 		lsu_req.mask.set(i);
 		lsu_req.addrs.at(i) = 0;
 		lsu_req.tids.at(i) = t;
+#if defined(VX_CFG_H100_SM_ENABLE) && defined(VX_CFG_EXT_DLMEM_ENABLE)
+		// The L1 reads a CTA token as a load and fetches only enabled bytes; the
+		// hardware's LSU enables the token's op width (32 bits).
+		if (lsu_req.flags.fence_cta)
+			lsu_req.byteen.at(i) = 0xf;
+#else
+#if defined(DXA_MBAR_ENABLE)
+#line 899
+#elif defined(VX_CFG_EXT_MBAR_ENABLE)
+#line 566
+#elif defined(VX_CFG_EXT_DLMEM_ENABLE)
+#line 473
+#else
+#line 467
+#endif
+#endif
 	}
 	uint32_t count = lsu_req.mask.count();
 	pending_req_t entry{trace, count, true, std::vector<mem_addr_size_t>(VX_CFG_NUM_LSU_LANES), IntrLsuArgs{}, false};
@@ -1197,7 +1142,7 @@ void LsuUnit::process_request_step(uint32_t b) {
 		return;
 	}
 	// The cp.async reads in flight take their share of the pending table.
-	if ((!is_write || is_amo) && cpa_reads_.at(b) != 0 && this->pending_full(b))
+	if ((!is_write || is_amo) && LSU_CPA_SHARE_FULL(b))
 		return; // stall
 #elif defined(VX_CFG_EXT_DLMEM_ENABLE)
 #line 618
@@ -1207,7 +1152,7 @@ void LsuUnit::process_request_step(uint32_t b) {
 
 	// check pending queue capacity. AMO always needs a return → reserve
 	// like a load, even though it carries write-bearing semantics.
-	if ((!is_write || is_amo) && state.pending_reqs.full()) {
+	if ((!is_write || is_amo) && LSU_READ_FULL(b, trace)) {
 		if (!trace->log_once(true)) {
 			DT(4, this->name() << " queue-full: " << *trace);
 		}
@@ -1384,20 +1329,14 @@ void LsuUnit::process_request_step(uint32_t b) {
 			tag = state.pending_reqs.allocate({trace, count, is_eop, std::move(lane_entries), entry_args, true});
 		#endif
 		}
-#ifdef VX_CFG_H100_SM_ENABLE
-		if (!is_write && !is_amo) {
-			state.pending_reqs.at(tag).h100_release = h100_release_cycle(lsu_req);
-		}
-#else
 #if (defined(DXA_MBAR_ENABLE) && defined(TCU_META_ENABLE)) || (defined(DXA_MBAR_ENABLE))
-#line 1244
+#line 1245
 #elif (defined(VX_CFG_EXT_MBAR_ENABLE) && defined(TCU_META_ENABLE)) || (defined(VX_CFG_EXT_MBAR_ENABLE))
-#line 899
+#line 900
 #elif (defined(VX_CFG_EXT_DLMEM_ENABLE) && defined(VX_CFG_EXT_DXA_ENABLE) && defined(TCU_META_ENABLE)) || (defined(VX_CFG_EXT_DLMEM_ENABLE) && defined(TCU_META_ENABLE)) || (defined(VX_CFG_EXT_DLMEM_ENABLE) && defined(VX_CFG_EXT_DXA_ENABLE)) || (defined(VX_CFG_EXT_DLMEM_ENABLE))
-#line 762
+#line 763
 #else
-#line 756
-#endif
+#line 757
 #endif
 		lsu_req.tag  = tag;
 		lsu_req.cid  = trace->cid;
@@ -1464,3 +1403,53 @@ void LsuUnit::on_tick() {
 	}
 #endif
 }
+
+#ifdef VX_CFG_H100_SM_ENABLE
+bool LsuUnit::lane_shared(uint64_t addr) {
+	if (get_addr_type(addr) == AddrType::Shared)
+		return true;
+#ifdef VX_CFG_EXT_DLMEM_ENABLE
+	uint32_t wl = VX_CFG_LMEM_LOG_SIZE + log2ceil(VX_CFG_DLMEM_MAX_CLUSTER);
+	return (addr >> wl) == (uint64_t(VX_MEM_DLMEM_BASE_ADDR) >> wl);
+#else
+	return false;
+#endif
+}
+
+template <typename L>
+bool LsuUnit::lanes_shared(const L* lanes, uint32_t n) {
+	bool any = false;
+	for (uint32_t i = 0; i < n; ++i) {
+		if (lanes[i].size == 0)
+			continue;
+		if (!lane_shared(lanes[i].addr))
+			return false;
+		any = true;
+	}
+	return any;
+}
+
+bool LsuUnit::class_full(uint32_t b, instr_trace_t* trace) {
+	auto& state = states_.at(b);
+	if (state.remain_addrs == 0)
+		this->compute_addrs(b, trace);
+	const uint32_t total = state.addr_list.size();
+	for (uint32_t t0 = total - state.remain_addrs; t0 < total; t0 += VX_CFG_NUM_LSU_LANES) {
+		const uint32_t n = std::min<uint32_t>(VX_CFG_NUM_LSU_LANES, total - t0);
+		const auto* beat = state.addr_list.data() + t0;
+		bool active = false;
+		for (uint32_t i = 0; i < n; ++i)
+			active |= (beat[i].size != 0);
+		if (!active)
+			continue;
+		if (lanes_shared(beat, n))
+			return state.pending_reqs.shm_full();
+#ifdef VX_CFG_EXT_MBAR_ENABLE
+		return this->pending_full(b);
+#else
+		return state.pending_reqs.full();
+#endif
+	}
+	return false;
+}
+#endif

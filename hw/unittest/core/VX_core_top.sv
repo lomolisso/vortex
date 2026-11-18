@@ -28,6 +28,22 @@ module VX_core_top import VX_gpu_pkg::*;
     input wire                              clk,
     input wire                              reset,
 
+`ifdef VX_CFG_H100_SM_ENABLE
+    // The SM's one bus of line requests and refills, sized as VX_core's.
+    output wire                             dcache_req_valid,
+    output wire                             dcache_req_rw,
+    output wire [DCACHE_MEM_DATA_SIZE-1:0]  dcache_req_byteen,
+    output wire [`VX_CFG_MEM_ADDR_WIDTH-`CLOG2(DCACHE_MEM_DATA_SIZE)-1:0] dcache_req_addr,
+    output wire [MEM_ATTR_WIDTH-1:0]        dcache_req_attr,
+    output wire [DCACHE_MEM_DATA_SIZE*8-1:0] dcache_req_data,
+    output wire [SM_L1_MEM_TAG_WIDTH-1:0]   dcache_req_tag,
+    input  wire                             dcache_req_ready,
+
+    input wire                              dcache_rsp_valid,
+    input wire  [DCACHE_MEM_DATA_SIZE*8-1:0] dcache_rsp_data,
+    input wire  [SM_L1_MEM_TAG_WIDTH-1:0]   dcache_rsp_tag,
+    output wire                             dcache_rsp_ready,
+`else
     output wire [DCACHE_NUM_REQS-1:0]       dcache_req_valid,
     output wire [DCACHE_NUM_REQS-1:0]       dcache_req_rw,
     output wire [DCACHE_NUM_REQS-1:0][DCACHE_WORD_SIZE-1:0] dcache_req_byteen,
@@ -41,6 +57,7 @@ module VX_core_top import VX_gpu_pkg::*;
     input wire  [DCACHE_NUM_REQS-1:0][DCACHE_WORD_SIZE*8-1:0] dcache_rsp_data,
     input wire  [DCACHE_NUM_REQS-1:0][DCACHE_TAG_WIDTH-1:0] dcache_rsp_tag,
     output wire [DCACHE_NUM_REQS-1:0]       dcache_rsp_ready,
+`endif
 
     output wire                             icache_req_valid,
     output wire                             icache_req_rw,
@@ -120,6 +137,9 @@ module VX_core_top import VX_gpu_pkg::*;
     assign dxa_lmem_bus_if.req_valid = 1'b0;
     assign dxa_lmem_bus_if.req_data  = '0;
     assign dxa_lmem_bus_if.rsp_ready = 1'b1;
+`ifdef VX_CFG_H100_SM_ENABLE
+    `UNUSED_VAR ({dxa_lmem_bus_if.req_ready, dxa_lmem_bus_if.rsp_valid, dxa_lmem_bus_if.rsp_data})
+`endif
 `endif
 
     // Graphics cluster-bus tie-offs. VX_core exposes these interfaces to the
@@ -199,6 +219,26 @@ module VX_core_top import VX_gpu_pkg::*;
     assign dcr_rsp_valid = dcr_bus_if.rsp_valid;
     assign dcr_rsp_data  = dcr_bus_if.rsp_data.data;
 
+`ifdef VX_CFG_H100_SM_ENABLE
+    VX_mem_bus_if #(
+        .DATA_SIZE (DCACHE_MEM_DATA_SIZE),
+        .TAG_WIDTH (SM_L1_MEM_TAG_WIDTH)
+    ) dcache_bus_if[1]();
+
+    assign dcache_req_valid  = dcache_bus_if[0].req_valid;
+    assign dcache_req_rw     = dcache_bus_if[0].req_data.rw;
+    assign dcache_req_byteen = dcache_bus_if[0].req_data.byteen;
+    assign dcache_req_addr   = dcache_bus_if[0].req_data.addr;
+    assign dcache_req_attr   = dcache_bus_if[0].req_data.attr;
+    assign dcache_req_data   = dcache_bus_if[0].req_data.data;
+    assign dcache_req_tag    = dcache_bus_if[0].req_data.tag;
+    assign dcache_bus_if[0].req_ready = dcache_req_ready;
+
+    assign dcache_bus_if[0].rsp_valid = dcache_rsp_valid;
+    assign dcache_bus_if[0].rsp_data.tag = dcache_rsp_tag;
+    assign dcache_bus_if[0].rsp_data.data = dcache_rsp_data;
+    assign dcache_rsp_ready = dcache_bus_if[0].rsp_ready;
+`else
     VX_mem_bus_if #(
         .DATA_SIZE (DCACHE_WORD_SIZE),
         .TAG_WIDTH (DCACHE_TAG_WIDTH)
@@ -219,6 +259,7 @@ module VX_core_top import VX_gpu_pkg::*;
         assign dcache_bus_if[i].rsp_data.data = dcache_rsp_data[i];
         assign dcache_rsp_ready[i] = dcache_bus_if[i].rsp_ready;
     end
+`endif
 
     VX_mem_bus_if #(
         .DATA_SIZE (ICACHE_WORD_SIZE),

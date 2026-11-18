@@ -26,12 +26,9 @@
 // 2 * EGRESS_BYTES / BEAT half-beats to the two heads round robin; a half-beat
 // that starts a slot of an SM-to-SM item also takes an injection credit,
 // returned INJ_RETURN cycles later. A paid head leaves when its sink is ready;
-// a head that cannot leave holds its queue. L2-side items then wait
-// EGRESS_DELAY cycles beyond their output register (the SM side of an L2
-// access).
+// a head that cannot leave holds its queue.
 //
-// Ingress: L2 replies wait INGRESS_DELAY cycles beyond their input register,
-// then pass the ingress gate
+// Ingress: L2 replies pass their input register, then the ingress gate
 // with the SM-to-SM arrivals (VX_sm_ingress) and return to their source.
 module VX_sm_port import VX_gpu_pkg::*;
 `ifdef VX_CFG_EXT_DLMEM_ENABLE
@@ -41,9 +38,7 @@ module VX_sm_port import VX_gpu_pkg::*;
     parameter `STRING INSTANCE_ID = "",
     parameter NUM_SRCS      = 1,    // L1TEX sources: 0 the L1, 1 the TMA engine
     parameter SRC_TAG_WIDTH = UUID_WIDTH + 1,
-    parameter LINE_SIZE     = SM_PORT_LINE_SIZE,
-    parameter EGRESS_DELAY  = 0,
-    parameter INGRESS_DELAY = 0
+    parameter LINE_SIZE     = SM_PORT_LINE_SIZE
 ) (
     input wire              clk,
     input wire              reset,
@@ -106,7 +101,6 @@ module VX_sm_port import VX_gpu_pkg::*;
     localparam REQ_PAYLOAD = `MAX(L2_PAYLOAD, DSM_PAYLOAD);
     localparam REQ_META    = HB_W + SLOT_W + 1;
     localparam RSP_META    = HB_W + SLOT_W;
-    localparam TS_W        = 32;
 
 `ifndef DBG_TRACE_MEM
     `UNUSED_SPARAM (INSTANCE_ID)
@@ -371,7 +365,7 @@ module VX_sm_port import VX_gpu_pkg::*;
         end
     end
 
-    // Sinks: the egress delay line (L2 items) and the network buffers.
+    // Sinks: the output register (L2 items) and the network buffers.
     wire l2_sink_ready, dsm_sink_ready, rsp_sink_ready;
 
     assign req_pop = ~req_empty && (paid_q_n >= req_head_hb)
@@ -409,60 +403,27 @@ module VX_sm_port import VX_gpu_pkg::*;
     end
 
     ///////////////////////////////////////////////////////////////////////////
-    // Egress delay line toward the L2.
-
-    reg [TS_W-1:0] now_r;
-    always @(posedge clk) begin
-        if (reset) begin
-            now_r <= '0;
-        end else begin
-            now_r <= now_r + TS_W'(1);
-        end
-    end
+    // Output register toward the L2.
 
     wire                 l2_out_valid;
     wire [L2_PAYLOAD-1:0] l2_out_data;
     wire                 l2_out_ready;
     wire                 eg_empty;
 
-    if (EGRESS_DELAY != 0) begin : g_eg_delay
-        localparam DEPTH = 1 << `CLOG2(EGRESS_DELAY + 2);
-        wire [TS_W-1:0] rel;
-        wire full;
-        VX_fifo_queue #(
-            .DATAW (TS_W + L2_PAYLOAD),
-            .DEPTH (DEPTH)
-        ) delay_q (
-            .clk      (clk),
-            .reset    (reset),
-            .push     (req_pop && req_head_l2),
-            .pop      (l2_out_valid && l2_out_ready),
-            .data_in  ({now_r + TS_W'(1 + EGRESS_DELAY), req_head[L2_PAYLOAD-1:0]}),
-            .data_out ({rel, l2_out_data}),
-            .empty    (eg_empty),
-            `UNUSED_PIN (alm_empty),
-            .full     (full),
-            `UNUSED_PIN (alm_full),
-            `UNUSED_PIN (size)
-        );
-        assign l2_sink_ready = ~full;
-        assign l2_out_valid  = ~eg_empty && ($signed(now_r - rel) >= 0);
-    end else begin : g_eg_nodelay
-        VX_elastic_buffer #(
-            .DATAW (L2_PAYLOAD),
-            .SIZE  (2)
-        ) out_buf (
-            .clk       (clk),
-            .reset     (reset),
-            .valid_in  (req_pop && req_head_l2),
-            .ready_in  (l2_sink_ready),
-            .data_in   (req_head[L2_PAYLOAD-1:0]),
-            .data_out  (l2_out_data),
-            .ready_out (l2_out_ready),
-            .valid_out (l2_out_valid)
-        );
-        assign eg_empty = ~l2_out_valid;
-    end
+    VX_elastic_buffer #(
+        .DATAW (L2_PAYLOAD),
+        .SIZE  (2)
+    ) out_buf (
+        .clk       (clk),
+        .reset     (reset),
+        .valid_in  (req_pop && req_head_l2),
+        .ready_in  (l2_sink_ready),
+        .data_in   (req_head[L2_PAYLOAD-1:0]),
+        .data_out  (l2_out_data),
+        .ready_out (l2_out_ready),
+        .valid_out (l2_out_valid)
+    );
+    assign eg_empty = ~l2_out_valid;
 
     assign mem_bus_if.req_valid = l2_out_valid;
     assign {mem_bus_if.req_data.rw,
@@ -508,7 +469,7 @@ module VX_sm_port import VX_gpu_pkg::*;
 `endif
 
     ///////////////////////////////////////////////////////////////////////////
-    // Ingress: L2 replies after the delay line, the SM-to-SM arrivals.
+    // Ingress: L2 replies after their input register, the SM-to-SM arrivals.
 
     wire                     fill_valid;
     wire [LINE_SIZE*8-1:0]   fill_data;
@@ -516,44 +477,20 @@ module VX_sm_port import VX_gpu_pkg::*;
     wire                     fill_pass;
     wire                     ig_empty;
 
-    if (INGRESS_DELAY != 0) begin : g_ig_delay
-        localparam DEPTH = 1 << `CLOG2(INGRESS_DELAY + 2);
-        wire [TS_W-1:0] rel;
-        wire full;
-        VX_fifo_queue #(
-            .DATAW (TS_W + LINE_SIZE * 8 + MEM_TAG_W),
-            .DEPTH (DEPTH)
-        ) delay_q (
-            .clk      (clk),
-            .reset    (reset),
-            .push     (mem_bus_if.rsp_valid && ~full),
-            .pop      (fill_pass),
-            .data_in  ({now_r + TS_W'(1 + INGRESS_DELAY), mem_bus_if.rsp_data.data, mem_bus_if.rsp_data.tag}),
-            .data_out ({rel, fill_data, fill_tag}),
-            .empty    (ig_empty),
-            `UNUSED_PIN (alm_empty),
-            .full     (full),
-            `UNUSED_PIN (alm_full),
-            `UNUSED_PIN (size)
-        );
-        assign mem_bus_if.rsp_ready = ~full;
-        assign fill_valid = ~ig_empty && ($signed(now_r - rel) >= 0);
-    end else begin : g_ig_nodelay
-        VX_elastic_buffer #(
-            .DATAW (LINE_SIZE * 8 + MEM_TAG_W),
-            .SIZE  (2)
-        ) in_buf (
-            .clk       (clk),
-            .reset     (reset),
-            .valid_in  (mem_bus_if.rsp_valid),
-            .ready_in  (mem_bus_if.rsp_ready),
-            .data_in   ({mem_bus_if.rsp_data.data, mem_bus_if.rsp_data.tag}),
-            .data_out  ({fill_data, fill_tag}),
-            .ready_out (fill_pass),
-            .valid_out (fill_valid)
-        );
-        assign ig_empty = ~fill_valid;
-    end
+    VX_elastic_buffer #(
+        .DATAW (LINE_SIZE * 8 + MEM_TAG_W),
+        .SIZE  (2)
+    ) in_buf (
+        .clk       (clk),
+        .reset     (reset),
+        .valid_in  (mem_bus_if.rsp_valid),
+        .ready_in  (mem_bus_if.rsp_ready),
+        .data_in   ({mem_bus_if.rsp_data.data, mem_bus_if.rsp_data.tag}),
+        .data_out  ({fill_data, fill_tag}),
+        .ready_out (fill_pass),
+        .valid_out (fill_valid)
+    );
+    assign ig_empty = ~fill_valid;
 
     wire [SECT_W-1:0]        fill_sect = fill_tag[SRC_TAG_WIDTH - UUID_WIDTH + SRC_W +: SECT_W];
     wire [SRC_W-1:0]         fill_src  = fill_tag[SRC_TAG_WIDTH - UUID_WIDTH +: SRC_W];

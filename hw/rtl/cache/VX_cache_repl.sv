@@ -97,9 +97,6 @@ module VX_cache_repl #(
     input wire repl_valid,
     input wire [`CS_LINE_SEL_BITS-1:0] repl_line,
     input wire [`CS_LINE_SEL_BITS-1:0] repl_line_n, // look-ahead (next) line for sync-BRAM read
-`ifdef VX_CFG_H100_SM_ENABLE
-    input wire [NUM_WAYS-1:0] repl_valid_ways,     // ways holding a line (H100 policy: invalid ways first)
-`endif
     output wire [`CS_WAY_SEL_WIDTH-1:0] repl_way
 );
     localparam WAY_SEL_WIDTH = `CS_WAY_SEL_WIDTH;
@@ -107,120 +104,7 @@ module VX_cache_repl #(
     `UNUSED_VAR (init)
     `UNUSED_VAR (stall)
 
-`ifdef VX_CFG_H100_SM_ENABLE
-    if ((REPL_POLICY != `CS_REPL_H100) || (NUM_WAYS == 1)) begin : g_no_valid_ways
-        `UNUSED_VAR (repl_valid_ways)
-    end
-`endif
     if (NUM_WAYS > 1) begin : g_enable
-`ifdef VX_CFG_H100_SM_ENABLE
-        if (REPL_POLICY == `CS_REPL_H100) begin : g_h100
-            // Per set an insertion rank per way (0 = newest), updated only on
-            // an insertion. The victim is drawn by a per-bank LFSR among the
-            // ways older than the newest L1_REPL_PROTECTED ones (l1_ref.h).
-            `UNUSED_VAR (lookup_valid)
-            `UNUSED_VAR (lookup_hit)
-            `UNUSED_VAR (lookup_line)
-            `UNUSED_VAR (lookup_way)
-            localparam RANKW   = WAY_SEL_WIDTH;
-            localparam PROTECT = `VX_CFG_L1_REPL_PROTECTED;
-            localparam CANDS   = NUM_WAYS - PROTECT;
-            localparam [15:0] LFSR_SEED = 16'hACE1;
-            localparam [15:0] LFSR_TAPS = 16'hB400;
-            `STATIC_ASSERT(PROTECT >= 1 && PROTECT < NUM_WAYS, ("invalid parameter: protected ways"))
-
-            wire [NUM_WAYS-1:0][RANKW-1:0] rank_rdata;
-            reg  [NUM_WAYS-1:0][RANKW-1:0] rank_init;
-            reg  [NUM_WAYS-1:0][RANKW-1:0] rank_nxt;
-            reg                            byp_valid;
-            reg [`CS_LINE_SEL_BITS-1:0]    byp_line;
-            reg [NUM_WAYS-1:0][RANKW-1:0]  byp_rank;
-            reg [15:0]                     lfsr_r;
-
-            wire [NUM_WAYS-1:0][RANKW-1:0] rank_cur = (byp_valid && (byp_line == repl_line)) ? byp_rank : rank_rdata;
-            wire [15:0] lfsr_n = (lfsr_r >> 1) ^ (lfsr_r[0] ? LFSR_TAPS : 16'h0);
-            wire [RANKW:0] pick = (RANKW+1)'(lfsr_n % 16'(CANDS));
-
-            wire [WAY_SEL_WIDTH-1:0] free_way, cand_way;
-            wire has_free;
-            VX_priority_encoder #(
-                .N (NUM_WAYS)
-            ) free_sel (
-                .data_in   (~repl_valid_ways),
-                .index_out (free_way),
-                .valid_out (has_free),
-                `UNUSED_PIN (onehot_out)
-            );
-
-            wire [NUM_WAYS-1:0] is_cand, cand_hit;
-            wire [NUM_WAYS-1:0][RANKW:0] cand_pos;
-            for (genvar w = 0; w < NUM_WAYS; ++w) begin : g_cand
-                assign is_cand[w] = (rank_cur[w] >= RANKW'(PROTECT));
-                if (w == 0) begin : g_first
-                    assign cand_pos[w] = '0;
-                end else begin : g_next
-                    assign cand_pos[w] = cand_pos[w-1] + (RANKW+1)'(is_cand[w-1]);
-                end
-                assign cand_hit[w] = is_cand[w] && (cand_pos[w] == pick);
-            end
-            VX_onehot_encoder #(
-                .N (NUM_WAYS)
-            ) cand_enc (
-                .data_in  (cand_hit),
-                .data_out (cand_way),
-                `UNUSED_PIN (valid_out)
-            );
-            wire [WAY_SEL_WIDTH-1:0] victim = has_free ? free_way : cand_way;
-
-            always @(*) begin
-                for (integer w = 0; w < NUM_WAYS; ++w) begin
-                    rank_init[w] = RANKW'(w);
-                    rank_nxt[w]  = (rank_cur[w] < rank_cur[victim]) ? (rank_cur[w] + RANKW'(1)) : rank_cur[w];
-                end
-                rank_nxt[victim] = '0;
-            end
-
-            wire rank_write = init || repl_valid;
-            wire [NUM_WAYS-1:0][RANKW-1:0] rank_wdata = init ? rank_init : rank_nxt;
-
-            always @(posedge clk) begin
-                if (reset) begin
-                    lfsr_r    <= LFSR_SEED;
-                    byp_valid <= 1'b0;
-                end else begin
-                    if (repl_valid) begin
-                        lfsr_r <= lfsr_n;
-                    end
-                    if (~stall) begin
-                        byp_valid <= rank_write;
-                    end
-                end
-                if (~stall) begin
-                    byp_line <= repl_line;
-                    byp_rank <= rank_wdata;
-                end
-            end
-
-            VX_dp_ram #(
-                .DATAW (NUM_WAYS * RANKW),
-                .SIZE  (`CS_LINES_PER_BANK),
-                .OUT_REG (1),
-                .RDW_MODE ("R")
-            ) rank_store (
-                .clk   (clk),
-                .reset (1'b0),
-                .read  (~stall),
-                .write (rank_write),
-                .wren  (1'b1),
-                .waddr (repl_line),
-                .raddr (repl_line_n),
-                .wdata (rank_wdata),
-                .rdata (rank_rdata)
-            );
-
-            assign repl_way = victim;
-        end else
-`endif
         if (REPL_POLICY == `CS_REPL_PLRU) begin : g_plru
             // Pseudo Least Recently Used replacement policy
             `UNUSED_VAR (repl_line) // read uses repl_line_n (look-ahead)

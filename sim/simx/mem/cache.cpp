@@ -24,66 +24,7 @@
 #include <unordered_map>
 #include <util.h>
 #include <vector>
-#ifdef VX_CFG_H100_SM_ENABLE
-#include <l1_ref.h>
-#include <memory>
-#include "sm_port.h"
-
-// The H100 L1's one tag store. The model holds each line's blocks in separate
-// banks; all of them decide hits and victims on this store, so a line is
-// allocated, replaced and invalidated as one. gen tells a bank whether the
-// block it holds in a way still belongs to the way's current line.
-struct h100_dir_t {
-  uint32_t ways;
-  vortex::l1_ref::L1Lfsr lfsr;
-  uint64_t next_gen = 0;
-  std::vector<uint64_t> tag, gen;
-  std::vector<uint8_t> alloc, rank;
-  // Every bank's MSHR entries by line (one hardware MSHR): a line's requests
-  // in one bank hold the loads of its other blocks too.
-  uint32_t mshr_size;
-  std::vector<uint8_t> live;
-  std::vector<uint32_t> live_set;
-  std::vector<uint64_t> live_tag;
-  // The cycle a replay last took the L1's one input slot: the line's blocks
-  // enter one pipeline, so no bank admits a core request in that cycle.
-  uint64_t replay_cycle = ~0ull;
-
-  h100_dir_t(uint32_t sets, uint32_t ways, uint32_t banks, uint32_t mshr_size)
-      : ways(ways), tag(sets * ways), gen(sets * ways), alloc(sets * ways), rank(sets * ways), mshr_size(mshr_size),
-        live(banks * mshr_size), live_set(banks * mshr_size), live_tag(banks * mshr_size) {
-    this->reset();
-  }
-  void reset() {
-    lfsr = vortex::l1_ref::L1Lfsr{};
-    std::fill(alloc.begin(), alloc.end(), 0);
-    std::fill(live.begin(), live.end(), 0);
-    replay_cycle = ~0ull;
-    for (uint32_t i = 0; i < rank.size(); ++i)
-      rank.at(i) = uint8_t(i % ways);
-  }
-  int find(uint32_t set_id, uint64_t addr_tag) const {
-    for (uint32_t w = 0; w < ways; ++w) {
-      uint32_t i = set_id * ways + w;
-      if (alloc.at(i) && tag.at(i) == addr_tag)
-        return int(w);
-    }
-    return -1;
-  }
-  bool line_live(uint32_t set_id, uint64_t addr_tag) const {
-    for (uint32_t i = 0; i < live.size(); ++i) {
-      if (live.at(i) && live_set.at(i) == set_id && live_tag.at(i) == addr_tag)
-        return true;
-    }
-    return false;
-  }
-  void clear_set(uint32_t set_id) {
-    std::fill(alloc.begin() + set_id * ways, alloc.begin() + (set_id + 1) * ways, 0);
-  }
-};
-#else
-#line 26
-#endif
+#line 27
 
 using namespace vortex;
 
@@ -109,14 +50,7 @@ struct params_t {
   int32_t tag_select_addr_start;
   int32_t tag_select_addr_end;
 
-#ifdef VX_CFG_H100_SM_ENABLE
-  // The H100 L1 folds every line-address bit above the set field into it.
-  bool xor_index = false;
-  std::shared_ptr<h100_dir_t> h100_dir;
-
-#else
-#line 51
-#endif
+#line 52
   params_t(const Cache::Config &config) {
     int32_t offset_bits = config.L - config.W;
     int32_t index_bits = config.C - (config.L + config.A + config.B);
@@ -152,13 +86,7 @@ struct params_t {
     // Tag select
     this->tag_select_addr_start = (1 + this->set_select_addr_end);
     this->tag_select_addr_end = (config.addr_width - 1);
-#ifdef VX_CFG_H100_SM_ENABLE
-    this->xor_index = config.h100_l1;
-    if (config.h100_l1)
-      this->h100_dir = std::make_shared<h100_dir_t>(this->sets_per_bank, this->lines_per_set, 1u << config.B, config.mshr_size);
-#else
-#line 86
-#endif
+#line 87
   }
 
   uint32_t addr_bank_id(uint64_t addr) const {
@@ -169,12 +97,7 @@ struct params_t {
   }
 
   uint32_t addr_set_id(uint64_t addr) const {
-#ifdef VX_CFG_H100_SM_ENABLE
-    if (xor_index && set_select_addr_end >= set_select_addr_start)
-      return vortex::l1_ref::l1_set_index(addr >> set_select_addr_start, set_select_addr_end - set_select_addr_start + 1);
-#else
-#line 96
-#endif
+#line 97
     if (set_select_addr_end >= set_select_addr_start)
       return (uint32_t)bit_getw(addr, set_select_addr_start, set_select_addr_end);
     else
@@ -197,12 +120,7 @@ struct params_t {
 
   uint64_t mem_addr(uint32_t bank_id, uint32_t set_id, uint64_t tag) const {
     uint64_t addr(0);
-#ifdef VX_CFG_H100_SM_ENABLE
-    if (xor_index && set_select_addr_end >= set_select_addr_start)
-      set_id ^= vortex::l1_ref::l1_set_index(tag, set_select_addr_end - set_select_addr_start + 1);
-#else
-#line 118
-#endif
+#line 119
     if (bank_select_addr_end >= bank_select_addr_start)
       addr = bit_setw(addr, bank_select_addr_start, bank_select_addr_end, bank_id);
     if (set_select_addr_end >= set_select_addr_start)
@@ -473,13 +391,7 @@ struct bank_req_t {
   // still riding the pipe must not be ordered behind a younger request that
   // coalesced at admission).
   uint64_t adm_seq;
-#ifdef VX_CFG_H100_SM_ENABLE
-  // H100 L1: the action left for the pipeline's end, and a hit's data as looked up
-  uint8_t h100_fx = 0;
-  std::shared_ptr<mem_block_t> h100_data;
-#else
-#line 378
-#endif
+#line 379
 
   // AMO state. memop_is_atomic(op) classifies the request; the LSU
   // packs rs2 into data at byte_off, so the cache extracts rhs via
@@ -755,13 +667,9 @@ public:
             const Cache::Config &config,
             const params_t &params,
             uint32_t bank_id)
-#ifdef VX_CFG_H100_SM_ENABLE
-      // the H100 L1 bank is fully pipelined: one request per stage
-      : SimObject<CacheBank>(ctx, name), core_req_in(this), core_rsp_out(this), mem_req_out(this), mem_rsp_in(this, 2 * config.mshr_size), config_(config), params_(params), bank_id_(bank_id), sets_(params.sets_per_bank, set_t(params.lines_per_set, params.sectors_per_line)), mshr_(config.mshr_size), pipe_req_(TFifo<bank_req_t>::Create("", config.latency, config.h100_l1 ? config.latency + 1 : 2)), rand_ctr_(0), adm_seq_ctr_(0)
-#else
 #line 654
       : SimObject<CacheBank>(ctx, name), core_req_in(this), core_rsp_out(this), mem_req_out(this), mem_rsp_in(this, 2 * config.mshr_size), config_(config), params_(params), bank_id_(bank_id), sets_(params.sets_per_bank, set_t(params.lines_per_set, params.sectors_per_line)), mshr_(config.mshr_size), pipe_req_(TFifo<bank_req_t>::Create("", config.latency)), rand_ctr_(0), adm_seq_ctr_(0)
-#endif
+#line 656
 #line 655
 #if VX_CFG_EXT_A_ENABLED
       , amo_unit_(__MAX(2u, (uint32_t)VX_CFG_AMO_RS_SIZE))
@@ -908,12 +816,6 @@ protected:
     }
     amo_passthru_live_ = 0;
 #endif
-#ifdef VX_CFG_H100_SM_ENABLE
-    if (params_.h100_dir)
-      params_.h100_dir->reset();
-    std::fill(h100_gen_.begin(), h100_gen_.end(), ~0ull);
-    std::fill(h100_fill_bytes_.begin(), h100_fill_bytes_.end(), 0);
-#else
 #if (defined(DXA_MBAR_ENABLE) && defined(VX_CFG_EXT_FPAMO_ENABLE))
 #line 794
 #elif (defined(VX_CFG_EXT_DLMEM_ENABLE) && defined(VX_CFG_EXT_FPAMO_ENABLE)) || (defined(VX_CFG_EXT_FPAMO_ENABLE))
@@ -921,7 +823,7 @@ protected:
 #else
 #line 775
 #endif
-#endif
+
   }
 
   void on_tick() {
@@ -1021,13 +923,6 @@ private:
     if (mshr_.has_ready_reqs() && !fwd_consumed) {
       bank_req_t bank_req;
       mshr_.dequeue(&bank_req);
-#ifdef VX_CFG_H100_SM_ENABLE
-      if (config_.h100_l1) {
-        params_.h100_dir->replay_cycle = SimPlatform::instance().cycles();
-        this->h100Publish();
-        this->admitReplayH100(bank_req);
-      }
-#else
 #if (defined(DXA_MBAR_ENABLE) && defined(VX_CFG_EXT_FPAMO_ENABLE))
 #line 893
 #elif (defined(VX_CFG_EXT_DLMEM_ENABLE) && defined(VX_CFG_EXT_FPAMO_ENABLE)) || (defined(VX_CFG_EXT_FPAMO_ENABLE))
@@ -1035,7 +930,7 @@ private:
 #else
 #line 857
 #endif
-#endif
+
 #if VX_CFG_EXT_A_ENABLED
       // a storing atomic that replays after its fill commits like a hit
       if (config_.is_llc && memop_is_amo(bank_req.op) && bank_req.op != MemOp::AMO_LR) {
@@ -1101,11 +996,6 @@ private:
       bank_req.uuid    = root_peek.bank_req.uuid;
       bank_req.mshr_id = mshr_id;
       bank_req.data    = mem_rsp.data;
-#ifdef VX_CFG_H100_SM_ENABLE
-      if (config_.h100_l1) {
-        this->admitFillH100(bank_req);
-      }
-#else
 #if (defined(DXA_MBAR_ENABLE) && defined(VX_CFG_EXT_FPAMO_ENABLE))
 #line 958
 #elif (defined(VX_CFG_EXT_DLMEM_ENABLE) && defined(VX_CFG_EXT_FPAMO_ENABLE)) || (defined(VX_CFG_EXT_FPAMO_ENABLE))
@@ -1113,7 +1003,7 @@ private:
 #else
 #line 910
 #endif
-#endif
+
       pipe_req_->push(bank_req);
       ++pipe_fill_count_;
       DT(3, this->name() << " fill-rsp: " << mem_rsp);
@@ -1126,18 +1016,6 @@ private:
     // a committing atomic holds it
     if (!this->core_req_in.empty() && fw_state_ != FenceWalk::Walk && amo_hold_ == 0) {
       auto &core_req = this->core_req_in.peek();
-#ifdef VX_CFG_H100_SM_ENABLE
-      if (config_.h100_l1 && !memop_is_amo(core_req.op)) {
-        if (params_.h100_dir->replay_cycle == SimPlatform::instance().cycles()) {
-          ++perf_stats_.bank_stalls;
-          return;
-        }
-        if (this->admitCoreH100(core_req)) {
-          this->core_req_in.pop();
-        }
-        return;
-      }
-#else
 #if (defined(DXA_MBAR_ENABLE) && defined(VX_CFG_EXT_FPAMO_ENABLE))
 #line 968
 #elif defined(VX_CFG_EXT_FPAMO_ENABLE) && VX_CFG_EXT_A_ENABLED
@@ -1147,7 +1025,7 @@ private:
 #else
 #line 922
 #endif
-#endif
+
 #ifdef DXA_MBAR_ENABLE
       // Where atomics commit, the input holds a request while an atomic to its
       // line has not committed (it waits on its fill in the MSHR).
@@ -1312,11 +1190,6 @@ private:
       bank_req.flags   = core_req.flags;
       pipe_req_->push(bank_req);
       DT(3, this->name() << " core-req: " << core_req);
-#ifdef VX_CFG_H100_SM_ENABLE
-      if (config_.h100_l1 && is_amo_passthru) {
-        this->admitAmoH100(core_req.addr);
-      }
-#else
 #if (defined(DXA_MBAR_ENABLE) && defined(VX_CFG_EXT_FPAMO_ENABLE))
 #line 1134
 #elif (defined(VX_CFG_EXT_DLMEM_ENABLE) && defined(VX_CFG_EXT_FPAMO_ENABLE)) || (defined(VX_CFG_EXT_FPAMO_ENABLE))
@@ -1324,7 +1197,7 @@ private:
 #else
 #line 1068
 #endif
-#endif
+
       // pending_mshr_size_ tracks Core-typed in-flight requests so the
       // MSHR pre-reservation in processInputs is conservative. AmoProbe
       // takes a passthru-table slot instead (no fill on the response) and
@@ -1677,11 +1550,6 @@ private:
 
   void processRequests() {
     const bank_req_t &bank_req = pipe_req_->peek();
-#ifdef VX_CFG_H100_SM_ENABLE
-    if (config_.h100_l1 && this->processH100(bank_req)) {
-      return;
-    }
-#else
 #if (defined(DXA_MBAR_ENABLE) && defined(VX_CFG_EXT_FPAMO_ENABLE))
 #line 1484
 #elif defined(VX_CFG_EXT_FPAMO_ENABLE) && VX_CFG_EXT_A_ENABLED
@@ -1691,7 +1559,7 @@ private:
 #else
 #line 1373
 #endif
-#endif
+
 
     // Stores get a response when (a) the cache is configured to always emit
     // them (config_.write_reponse, global), or (b) the request opts in via
@@ -2212,10 +2080,6 @@ private:
         for (auto &line : set.lines) {
           line.reset();
         }
-#ifdef VX_CFG_H100_SM_ENABLE
-        if (params_.h100_dir)
-          params_.h100_dir->clear_set(set_id);
-#else
 #if (defined(DXA_MBAR_ENABLE) && defined(VX_CFG_EXT_FPAMO_ENABLE))
 #line 2004
 #elif defined(VX_CFG_EXT_FPAMO_ENABLE) && VX_CFG_EXT_A_ENABLED
@@ -2225,16 +2089,12 @@ private:
 #else
 #line 1893
 #endif
-#endif
+
       }
       if (++fw_ctr_ == steps) {
         // Bank 0 reports next cycle; the others first let the walk's last
         // operation leave their pipeline.
         fw_settle_ = config_.latency;
-#ifdef VX_CFG_H100_SM_ENABLE
-        // The H100 L1's slice banks are one hardware bank.
-        fw_state_ = (bank_id_ == 0 || config_.h100_l1) ? FenceWalk::End : FenceWalk::Settle;
-#else
 #if (defined(DXA_MBAR_ENABLE) && defined(VX_CFG_EXT_FPAMO_ENABLE))
 #line 2010
 #elif defined(VX_CFG_EXT_FPAMO_ENABLE) && VX_CFG_EXT_A_ENABLED
@@ -2245,7 +2105,7 @@ private:
 #line 1899
 #endif
         fw_state_ = (bank_id_ == 0) ? FenceWalk::End : FenceWalk::Settle;
-#endif
+
 #if (defined(DXA_MBAR_ENABLE) && defined(VX_CFG_EXT_FPAMO_ENABLE))
 #line 2011
 #elif defined(VX_CFG_EXT_FPAMO_ENABLE) && VX_CFG_EXT_A_ENABLED
@@ -2345,15 +2205,6 @@ private:
   // Every memory request leaves through here, so a drain can tell when the
   // ones queued at a given point have all left.
   void memReqSend(const MemReq &req) {
-#ifdef VX_CFG_H100_SM_ENABLE
-    // the H100 L1's line requests leave with its responses; the memory side's
-    // two registered stages sit on the way back (tickH100Mem)
-    if (config_.h100_l1) {
-      this->mem_req_out.send(req, 0);
-      ++mreq_sent_;
-      return;
-    }
-#else
 #if (defined(DXA_MBAR_ENABLE) && defined(VX_CFG_EXT_FPAMO_ENABLE))
 #line 2100
 #elif defined(VX_CFG_EXT_FPAMO_ENABLE) && VX_CFG_EXT_A_ENABLED
@@ -2363,7 +2214,7 @@ private:
 #else
 #line 1989
 #endif
-#endif
+
     this->mem_req_out.send(req, MEM_REQ_DELAY);
     ++mreq_sent_;
   }
@@ -2559,340 +2410,6 @@ private:
   uint32_t amo_passthru_tag_base() const { return mshr_.capacity(); }
 #endif
 
-#ifdef VX_CFG_H100_SM_ENABLE
-
-  // The H100 L1. A bank holds one MEM_BLOCK_SIZE slice of each line (one
-  // sector per line here); the L1's sectors are tracked per byte in the
-  // slice's write-back byte mask, which a write-through cache leaves unused:
-  // a load hits only if every byte it reads is valid, a miss requests only the
-  // sectors it lacks, a fill adds them without overwriting newer stored bytes,
-  // and a store allocates its line with only its bytes valid.
-  // As the hardware's tag stage, a request is looked up and the bank state
-  // updated when it enters the pipeline; the response, the fill request or the
-  // write-through leaves at the pipeline's end. A line has at most one fill in
-  // flight: a load whose sectors that fill brings joins it, any other load of
-  // the line waits at the input until the line's requests have retired, so a
-  // load never refetches behind a younger store's write-through.
-  enum H100Effect : uint8_t { H100_FX_NONE = 0, H100_FX_RSP, H100_FX_FILL, H100_FX_WT };
-
-  std::vector<uint64_t> h100_gen_ = std::vector<uint64_t>(params_.sets_per_bank * params_.lines_per_set, ~0ull);
-  std::vector<uint64_t> h100_fill_bytes_ = std::vector<uint64_t>(config_.mshr_size, 0);
-
-  static uint64_t h100SectorBytes(uint64_t bytes) {
-    constexpr uint32_t SB = VX_CFG_DCACHE_SECTOR_SIZE;
-    static_assert(SB < 64 && (VX_CFG_MEM_BLOCK_SIZE % SB) == 0, "an L1 sector must divide a memory block");
-    uint64_t r = 0;
-    for (uint32_t b = 0; b < VX_CFG_MEM_BLOCK_SIZE; b += SB) {
-      uint64_t m = ((1ull << SB) - 1) << b;
-      if (bytes & m)
-        r |= m;
-    }
-    return r;
-  }
-
-  // The bytes a load reads (none for a fence token).
-  static uint64_t h100Want(const bank_req_t &req) {
-    return req.byteen;
-  }
-
-  // Whether the line has a request in the MSHR, and the sectors its in-flight
-  // fill brings (the fill's root's request).
-  bool h100LineEntries(uint32_t set_id, uint64_t addr_tag, uint64_t *fill_bytes) const {
-    bool any = false;
-    *fill_bytes = 0;
-    for (uint32_t i = 0; i < mshr_.capacity(); ++i) {
-      const auto &e = mshr_.peek(i);
-      if (e.bank_req.type == bank_req_t::None || e.set_id != set_id || e.addr_tag != addr_tag)
-        continue;
-      any = true;
-      *fill_bytes |= h100_fill_bytes_.at(i);
-    }
-    return any || params_.h100_dir->line_live(set_id, addr_tag);
-  }
-
-  // Shows this bank's MSHR entries to the other banks of the L1.
-  void h100Publish() {
-    auto &dir = *params_.h100_dir;
-    for (uint32_t i = 0; i < mshr_.capacity(); ++i) {
-      const auto &e = mshr_.peek(i);
-      uint32_t k = bank_id_ * dir.mshr_size + i;
-      dir.live.at(k)     = (e.bank_req.type != bank_req_t::None);
-      dir.live_set.at(k) = e.set_id;
-      dir.live_tag.at(k) = e.addr_tag;
-    }
-  }
-
-  // The way holding the line, -1 if the L1 lacks it; this bank's block of the
-  // way is dropped when it belongs to the way's previous line.
-  int h100Find(set_t &set, uint32_t set_id, uint64_t addr_tag) {
-    const auto &dir = *params_.h100_dir;
-    int way = dir.find(set_id, addr_tag);
-    if (way >= 0) {
-      uint32_t i = set_id * params_.lines_per_set + uint32_t(way);
-      if (h100_gen_.at(i) != dir.gen.at(i)) {
-        auto &line = set.lines.at(way);
-        line.reset();
-        line.tag = addr_tag;
-        h100_gen_.at(i) = dir.gen.at(i);
-      }
-    }
-    return way;
-  }
-
-  // A line allocation: every one steps the L1's LFSR, invalid ways go first,
-  // else a random way among those older than the newest L1_REPL_PROTECTED
-  // insertions of the set.
-  int h100Insert(set_t &set, uint32_t set_id, uint64_t addr_tag) {
-    int way = this->h100Find(set, set_id, addr_tag);
-    if (way >= 0)
-      return way;
-    auto &dir = *params_.h100_dir;
-    const uint32_t ways = params_.lines_per_set;
-    uint32_t rnd = dir.lfsr.next();
-    for (uint32_t w = 0; w < ways; ++w) {
-      if (!dir.alloc.at(set_id * ways + w)) {
-        way = int(w);
-        break;
-      }
-    }
-    uint8_t *rank = &dir.rank.at(set_id * ways);
-    if (way < 0) {
-      way = int(l1_ref::l1_victim(rank, ways, VX_CFG_L1_REPL_PROTECTED, rnd));
-      ++perf_stats_.evictions;
-    }
-    l1_ref::l1_insert(rank, ways, uint32_t(way));
-    uint32_t i = set_id * ways + uint32_t(way);
-    dir.tag.at(i)   = addr_tag;
-    dir.alloc.at(i) = 1;
-    dir.gen.at(i)   = dir.next_gen++;
-    return this->h100Find(set, set_id, addr_tag);
-  }
-
-  void h100Write(uint32_t set_id, uint64_t addr_tag, const bank_req_t &req) {
-    auto &set = sets_.at(set_id);
-    int way = this->h100Find(set, set_id, addr_tag);
-    if (way < 0) {
-      way = this->h100Insert(set, set_id, addr_tag);
-    }
-    auto &sec = set.lines.at(way).sectors.at(0);
-    sector_merge(sec, req.data, req.byteen);
-    sec.valid = true;
-    sec.dirty_mask |= req.byteen;
-  }
-
-  // Joins the request to its line's MSHR entries: behind the in-flight fill,
-  // or, when the line's requests are only replaying, in their order.
-  void h100Chain(const bank_req_t &req, uint32_t set_id, uint64_t addr_tag) {
-    bool fill_pending = mshr_.has_pending_fill(set_id, addr_tag, 0, -1);
-    bank_req_t entry = req;
-    entry.type = bank_req_t::Core;
-    int id = mshr_.enqueue(entry, set_id, addr_tag, 0);
-    h100_fill_bytes_.at(id) = 0;
-    if (!fill_pending) {
-      mshr_.defer_to_replay(id);
-    }
-    this->h100Publish();
-  }
-
-  // A load that misses with no request of its line in flight becomes the
-  // root of its line's fill, for the sectors it lacks.
-  void h100Root(bank_req_t &req, uint32_t set_id, uint64_t addr_tag, uint64_t missing) {
-    bank_req_t entry = req;
-    entry.type = bank_req_t::Core;
-    int id = mshr_.enqueue(entry, set_id, addr_tag, 0);
-    h100_fill_bytes_.at(id) = h100SectorBytes(missing);
-    req.h100_fx = H100_FX_FILL;
-    req.mshr_id = id;
-    this->h100Publish();
-  }
-
-  // A core load or store entering the pipeline (atomics take the common
-  // path). False leaves it at the input.
-  bool admitCoreH100(const MemReq &core_req) {
-    uint32_t occupancy = mshr_.size() + pending_mshr_size_;
-#if VX_CFG_EXT_A_ENABLED
-    occupancy += amo_passthru_live_ + pending_amo_probes_;
-#endif
-    if (occupancy >= mshr_.capacity()) {
-      ++perf_stats_.mshr_stalls;
-      return false;
-    }
-    bank_req_t req;
-    req.reset();
-    req.adm_seq = adm_seq_ctr_;
-    req.type    = bank_req_t::Core;
-    req.addr    = core_req.addr;
-    req.hart_id = core_req.hart_id;
-    req.uuid    = core_req.uuid;
-    req.req_tag = core_req.tag;
-    req.write   = (core_req.op == MemOp::ST);
-    req.op      = core_req.op;
-    req.data    = core_req.data;
-    req.byteen  = core_req.byteen;
-    req.amo_cmp = core_req.amo_cmp;
-    req.flags   = core_req.flags;
-
-    uint32_t set_id   = params_.addr_set_id(req.addr);
-    uint64_t addr_tag = params_.addr_tag(req.addr);
-    auto &set         = sets_.at(set_id);
-    uint64_t fill_bytes = 0;
-    const bool entries = this->h100LineEntries(set_id, addr_tag, &fill_bytes);
-
-    if (req.write) {
-      if (this->h100Find(set, set_id, addr_tag) < 0)
-        ++perf_stats_.write_misses;
-      if (entries) {
-        // its bytes enter the line behind the line's requests, so older
-        // loads among them read the line as it was
-        bank_req_t merge_req = req;
-        merge_req.skip_core_rsp = true;
-        this->h100Chain(merge_req, set_id, addr_tag);
-      } else {
-        this->h100Write(set_id, addr_tag, req);
-      }
-      req.h100_fx = H100_FX_WT;
-      ++perf_stats_.writes;
-    } else {
-      uint64_t want = h100Want(req);
-      if (entries) {
-        if ((h100SectorBytes(want) & ~fill_bytes) != 0) {
-          ++perf_stats_.bank_stalls;
-          return false; // waits for the line's requests to retire
-        }
-        this->h100Chain(req, set_id, addr_tag);
-        req.h100_fx = H100_FX_NONE;
-        ++perf_stats_.read_misses;
-      } else {
-        int way = this->h100Find(set, set_id, addr_tag);
-        uint64_t valid = (way < 0) ? 0 : set.lines.at(way).sectors.at(0).dirty_mask;
-        if (way >= 0 && (want & ~valid) == 0) {
-          req.h100_fx   = H100_FX_RSP;
-          req.h100_data = set.lines.at(way).sectors.at(0).data;
-        } else {
-          this->h100Root(req, set_id, addr_tag, want & ~valid);
-          ++perf_stats_.read_misses;
-        }
-      }
-      ++perf_stats_.reads;
-    }
-    ++adm_seq_ctr_;
-    pipe_req_->push(req);
-    DT(3, this->name() << " core-req: " << core_req);
-    return true;
-  }
-
-  // A replay leaving the MSHR (in admission order).
-  void admitReplayH100(bank_req_t &req) {
-    uint32_t set_id   = params_.addr_set_id(req.addr);
-    uint64_t addr_tag = params_.addr_tag(req.addr);
-    auto &set         = sets_.at(set_id);
-    if (req.write) {
-      this->h100Write(set_id, addr_tag, req);
-      req.h100_fx = H100_FX_NONE;
-      return;
-    }
-    uint64_t want = h100Want(req);
-    int way = this->h100Find(set, set_id, addr_tag);
-    uint64_t valid = (way < 0) ? 0 : set.lines.at(way).sectors.at(0).dirty_mask;
-    // a request reading no byte (a fence) only waited for its fill's answer
-    if ((way >= 0 && (want & ~valid) == 0) || want == 0) {
-      req.h100_fx   = H100_FX_RSP;
-      req.h100_data = (way < 0) ? nullptr : set.lines.at(way).sectors.at(0).data;
-      return;
-    }
-    // its sectors left the line before it replayed (an invalidation): it
-    // misses again
-    if (mshr_.has_pending_fill(set_id, addr_tag, 0, -1)) {
-      this->h100Chain(req, set_id, addr_tag);
-      req.h100_fx = H100_FX_NONE;
-    } else {
-      this->h100Root(req, set_id, addr_tag, want & ~valid);
-    }
-  }
-
-  // A fill entering the pipeline installs its sectors and wakes its line's
-  // requests.
-  void admitFillH100(const bank_req_t &req) {
-    uint64_t bytes = h100_fill_bytes_.at(req.mshr_id);
-    if (bytes != 0) {
-      uint32_t set_id   = params_.addr_set_id(req.addr);
-      uint64_t addr_tag = params_.addr_tag(req.addr);
-      auto &set = sets_.at(set_id);
-      int way = this->h100Find(set, set_id, addr_tag);
-      if (way < 0) {
-        way = this->h100Insert(set, set_id, addr_tag);
-      }
-      auto &sec = set.lines.at(way).sectors.at(0);
-      sector_merge(sec, req.data, bytes & ~sec.dirty_mask);
-      sec.valid = true;
-      sec.dirty_mask |= bytes;
-    }
-    mshr_.replay(req.mshr_id);
-  }
-
-  // An atomic forwarded below drops the L1's copy of its line as it enters.
-  void admitAmoH100(uint64_t addr) {
-    uint32_t set_id = params_.addr_set_id(addr);
-    auto &set = sets_.at(set_id);
-    int way = this->h100Find(set, set_id, params_.addr_tag(addr));
-    if (way >= 0) {
-      set.lines.at(way).reset();
-      params_.h100_dir->alloc.at(set_id * params_.lines_per_set + uint32_t(way)) = 0;
-    }
-  }
-
-  // Core, Replay and Fill requests at the pipeline's end; false hands the
-  // rest to the common path.
-  bool processH100(const bank_req_t &req) {
-    if (req.type != bank_req_t::Core && req.type != bank_req_t::Replay && req.type != bank_req_t::Fill)
-      return false;
-    switch (req.h100_fx) {
-    case H100_FX_RSP: {
-      if (this->core_rsp_out.full())
-        return true; // stall
-      MemRsp rsp{req.req_tag, req.hart_id, req.uuid};
-      rsp.data = req.h100_data;
-      this->core_rsp_out.send(rsp);
-      crsp_sent_ = true;
-      DT(3, this->name() << " core-rsp: " << rsp);
-    } break;
-    case H100_FX_FILL: {
-      if (this->mem_req_out.full())
-        return true; // stall
-      uint32_t set_id   = params_.addr_set_id(req.addr);
-      uint64_t addr_tag = params_.addr_tag(req.addr);
-      MemReq fill;
-      fill.addr    = params_.mem_addr_sector(bank_id_, set_id, addr_tag, 0);
-      fill.tag     = req.mshr_id;
-      fill.hart_id = req.hart_id;
-      fill.uuid    = req.uuid;
-      fill.byteen  = h100_fill_bytes_.at(req.mshr_id);
-      fill.flags.fence = this->fence_fill(req);
-      this->memReqSend(fill);
-      DT(3, this->name() << " fill-req: " << fill);
-      ++pending_fill_reqs_;
-    } break;
-    case H100_FX_WT: {
-      const bool need_rsp = config_.write_reponse || req.flags.strsp;
-      uint32_t set_id   = params_.addr_set_id(req.addr);
-      uint64_t addr_tag = params_.addr_tag(req.addr);
-      if (!this->emitWritethrough(set_id, addr_tag, 0, req.addr, req.hart_id, req.uuid,
-                                  req.data, req.byteen, need_rsp, req.req_tag)) {
-        return true; // stall
-      }
-    } break;
-    default:
-      break;
-    }
-    if (req.type == bank_req_t::Fill) {
-      assert(pipe_fill_count_ != 0);
-      --pipe_fill_count_;
-    }
-    pipe_req_->pop();
-    return true;
-  }
-
-#else
 #if (defined(DXA_MBAR_ENABLE) && defined(VX_CFG_EXT_FPAMO_ENABLE))
 #line 2297
 #elif (defined(VX_CFG_EXT_DLMEM_ENABLE) && defined(VX_CFG_EXT_FPAMO_ENABLE)) || (defined(VX_CFG_EXT_FPAMO_ENABLE))
@@ -2900,7 +2417,7 @@ private:
 #else
 #line 2116
 #endif
-#endif
+
   friend class SimObject<CacheBank>;
 };
 
@@ -2946,10 +2463,6 @@ public:
 
     // Create bank's memory arbiter
     snprintf(sname, 100, "%s-mem_arb", simobject->name().c_str());
-#ifdef VX_CFG_H100_SM_ENABLE
-    // The H100 L1 sends its banks' memory requests itself (tickH100Mem).
-    auto bank_mem_arb = config_.h100_l1 ? MemArbiter::Ptr() : MemArbiter::Create(sname, ArbiterType::RoundRobin, num_banks, config_.mem_ports);
-#else
 #if (defined(DXA_MBAR_ENABLE) && defined(VX_CFG_EXT_FPAMO_ENABLE))
 #line 2343
 #elif (defined(VX_CFG_EXT_DLMEM_ENABLE) && defined(VX_CFG_EXT_FPAMO_ENABLE)) || (defined(VX_CFG_EXT_FPAMO_ENABLE))
@@ -2958,7 +2471,7 @@ public:
 #line 2162
 #endif
     auto bank_mem_arb = MemArbiter::Create(sname, ArbiterType::RoundRobin, num_banks, config_.mem_ports);
-#endif
+
 #if (defined(DXA_MBAR_ENABLE) && defined(VX_CFG_EXT_FPAMO_ENABLE))
 #line 2344
 #elif (defined(VX_CFG_EXT_DLMEM_ENABLE) && defined(VX_CFG_EXT_FPAMO_ENABLE)) || (defined(VX_CFG_EXT_FPAMO_ENABLE))
@@ -2968,10 +2481,6 @@ public:
 #endif
 
     // Connect bank's memory arbiter to non-cacheable arbiter's input port 0
-#ifdef VX_CFG_H100_SM_ENABLE
-    for (uint32_t i = 0; bank_mem_arb && i < config_.mem_ports; ++i) {
-      bank_mem_arb->ReqOut.at(i).bind(&nc_mem_arbs_.at(i)->ReqIn.at(0));
-#else
 #if (defined(DXA_MBAR_ENABLE) && defined(VX_CFG_EXT_FPAMO_ENABLE))
 #line 2346
 #elif (defined(VX_CFG_EXT_DLMEM_ENABLE) && defined(VX_CFG_EXT_FPAMO_ENABLE)) || (defined(VX_CFG_EXT_FPAMO_ENABLE))
@@ -2981,7 +2490,7 @@ public:
 #endif
     for (uint32_t i = 0; i < config_.mem_ports; ++i) {
       bank_mem_arb->ReqOut.at(i).bind(&nc_mem_arbs_.at(i)->ReqIn.at(0));
-#endif
+
 #if (defined(DXA_MBAR_ENABLE) && defined(VX_CFG_EXT_FPAMO_ENABLE))
 #line 2348
 #elif (defined(VX_CFG_EXT_DLMEM_ENABLE) && defined(VX_CFG_EXT_FPAMO_ENABLE)) || (defined(VX_CFG_EXT_FPAMO_ENABLE))
@@ -3000,13 +2509,6 @@ public:
                                             return params_.addr_bank_id(req.addr);
                                           });
 
-#ifdef VX_CFG_H100_SM_ENABLE
-    if (!bank_mem_arb) {
-      __assert(config_.mem_ports == 1, "the H100 L1 has one memory port");
-      h100_mreq_ = std::vector<SimChannel<MemReq>>(num_banks, SimChannel<MemReq>(simobject));
-    }
-
-#else
 #if (defined(DXA_MBAR_ENABLE) && defined(VX_CFG_EXT_FPAMO_ENABLE))
 #line 2358
 #elif (defined(VX_CFG_EXT_DLMEM_ENABLE) && defined(VX_CFG_EXT_FPAMO_ENABLE)) || (defined(VX_CFG_EXT_FPAMO_ENABLE))
@@ -3014,7 +2516,7 @@ public:
 #else
 #line 2177
 #endif
-#endif
+
     // Create cache banks
     for (uint32_t i = 0, n = num_banks; i < n; ++i) {
       snprintf(sname, 100, "%s-bank%d", simobject->name().c_str(), i);
@@ -3024,12 +2526,6 @@ public:
       bank_core_xbar_->ReqOut.at(i).bind(&banks_.at(i)->core_req_in);
       banks_.at(i)->core_rsp_out.bind(&bank_core_xbar_->RspIn.at(i));
 
-#ifdef VX_CFG_H100_SM_ENABLE
-      if (!bank_mem_arb) {
-        banks_.at(i)->mem_req_out.bind(&h100_mreq_.at(i));
-        continue;
-      }
-#else
 #if (defined(DXA_MBAR_ENABLE) && defined(VX_CFG_EXT_FPAMO_ENABLE))
 #line 2367
 #elif (defined(VX_CFG_EXT_DLMEM_ENABLE) && defined(VX_CFG_EXT_FPAMO_ENABLE)) || (defined(VX_CFG_EXT_FPAMO_ENABLE))
@@ -3037,7 +2533,7 @@ public:
 #else
 #line 2186
 #endif
-#endif
+
       // bind memory ports
       banks_.at(i)->mem_req_out.bind(&bank_mem_arb->ReqIn.at(i));
       bank_mem_arb->RspOut.at(i).bind(&banks_.at(i)->mem_rsp_in);
@@ -3095,10 +2591,6 @@ public:
       return;
     }
 
-#ifdef VX_CFG_H100_SM_ENABLE
-    this->tickH100Mem();
-
-#else
 #if (defined(DXA_MBAR_ENABLE) && defined(VX_CFG_EXT_FPAMO_ENABLE))
 #line 2424
 #elif (defined(VX_CFG_EXT_DLMEM_ENABLE) && defined(VX_CFG_EXT_FPAMO_ENABLE)) || (defined(VX_CFG_EXT_FPAMO_ENABLE))
@@ -3106,7 +2598,7 @@ public:
 #else
 #line 2216
 #endif
-#endif
+
     // handle cache bypasss responses
     for (uint32_t i = 0, n = config_.mem_ports; i < n; ++i) {
       // Forward non-cacheable arbiter's output (1) to core response ports
@@ -3462,68 +2954,6 @@ private:
     return true;
   }
 
-#ifdef VX_CFG_H100_SM_ENABLE
-  // The H100 L1's memory side. A bank holds one block of each line, so the
-  // blocks of one line request leave together: every bank's head on the same
-  // line and operation is sent in the same cycle, lowest block first, all but
-  // the last marked so the SM port charges them as the one line request the
-  // hardware sends. A response returns to its bank by the tag's low bits.
-  std::vector<SimChannel<MemReq>> h100_mreq_;
-  uint32_t h100_rr_ = 0;
-
-  void tickH100Mem() {
-    if (h100_mreq_.empty())
-      return;
-    const uint32_t nb = h100_mreq_.size();
-    const uint32_t lg = log2ceil(nb);
-    auto &rsp_in = nc_mem_arbs_.at(0)->RspOut.at(0);
-    while (!rsp_in.empty()) {
-      MemRsp rsp = rsp_in.peek();
-      auto &bank_in = banks_.at(rsp.tag & (nb - 1))->mem_rsp_in;
-      if (bank_in.full())
-        break;
-      rsp.tag >>= lg;
-      // the cache's memory response queue with its output register (2) and
-      // the response crossbar's buffer (1)
-      bank_in.send(rsp, 3);
-      rsp_in.pop();
-    }
-    auto &out = nc_mem_arbs_.at(0)->ReqIn.at(0);
-    uint32_t first = nb;
-    for (uint32_t k = 0; k < nb; ++k) {
-      uint32_t b = (h100_rr_ + k) % nb;
-      if (!h100_mreq_.at(b).empty()) {
-        first = b;
-        break;
-      }
-    }
-    if (first == nb)
-      return;
-    const auto &head = h100_mreq_.at(first).peek();
-    const uint64_t line = head.addr >> (config_.L + lg);
-    std::vector<uint32_t> group;
-    for (uint32_t b = 0; b < nb; ++b) {
-      if (h100_mreq_.at(b).empty())
-        continue;
-      const auto &r = h100_mreq_.at(b).peek();
-      if (b == first || ((r.addr >> (config_.L + lg)) == line && r.op == head.op))
-        group.push_back(b);
-    }
-    if (out.size() + group.size() > out.capacity())
-      return;
-    for (uint32_t k = 0; k < group.size(); ++k) {
-      MemReq r = h100_mreq_.at(group[k]).peek();
-      r.tag = (r.tag << lg) | group[k];
-      if (k + 1 < group.size())
-        sm_port_more(r);
-      DT(3, simobject_->name() << " mem-req: " << r);
-      out.send(r, 0);
-      h100_mreq_.at(group[k]).pop();
-    }
-    h100_rr_ = (group.back() + 1) % nb;
-  }
-
-#else
 #if (defined(DXA_MBAR_ENABLE) && defined(VX_CFG_EXT_FPAMO_ENABLE))
 #line 2779
 #elif (defined(VX_CFG_EXT_DLMEM_ENABLE) && defined(VX_CFG_EXT_FPAMO_ENABLE)) || (defined(VX_CFG_EXT_FPAMO_ENABLE))
@@ -3531,7 +2961,7 @@ private:
 #else
 #line 2531
 #endif
-#endif
+
   Cache *const simobject_;
   Config config_;
   params_t params_;
@@ -3577,32 +3007,6 @@ private:
 
 ///////////////////////////////////////////////////////////////////////////////
 
-#ifdef VX_CFG_H100_SM_ENABLE
-// The model's data path carries one MEM_BLOCK_SIZE block per request, so the
-// H100 L1's line is held as its blocks, one bank each: a request touches the
-// banks of the blocks it covers, and together they serve one line per cycle.
-static Cache::Config h100_impl_config(const Cache::Config &config) {
-  if (!config.h100_l1)
-    return config;
-  const uint8_t block_log2 = log2ceil(VX_CFG_MEM_BLOCK_SIZE);
-  __assert(config.B == 0, "the H100 L1 is one bank");
-  __assert(config.L == log2ceil(VX_CFG_SM_DATAPATH_BYTES), "the H100 L1 line is the SM datapath");
-  __assert(config.W == config.L, "the H100 L1 takes one line per request");
-  __assert(config.L >= block_log2, "the H100 L1 line holds whole memory blocks");
-  __assert(!config.write_back, "the H100 L1 is write-through");
-  __assert(!config.is_llc, "the H100 L1 needs a level below it");
-  __assert(config.repl_policy == Cache::H100, "the H100 L1 uses the H100 replacement");
-  __assert(VX_CFG_SM_MAX_READ_LINES >= (1u << config.B) * config.mshr_size, "the H100 L1 keeps SM_MAX_READ_LINES lines in flight");
-  __assert(VX_CFG_L1_REPL_PROTECTED >= 1 && VX_CFG_L1_REPL_PROTECTED < (1u << config.A), "the H100 replacement protects fewer ways than a set has");
-  Cache::Config impl_config = config;
-  impl_config.B = config.L - block_log2;
-  impl_config.L = block_log2;
-  impl_config.S = block_log2;
-  impl_config.W = block_log2;
-  return impl_config;
-}
-
-#else
 #if (defined(DXA_MBAR_ENABLE) && defined(VX_CFG_EXT_FPAMO_ENABLE))
 #line 2822
 #elif (defined(DXA_MBAR_ENABLE))
@@ -3612,11 +3016,8 @@ static Cache::Config h100_impl_config(const Cache::Config &config) {
 #else
 #line 2562
 #endif
-#endif
+
 Cache::Cache(const SimContext &ctx, const char *name, const Config &config)
-#ifdef VX_CFG_H100_SM_ENABLE
-    : SimObject<Cache>(ctx, name), core_req_in(config.num_inputs, this), core_rsp_out(config.num_inputs, this), mem_req_out(config.mem_ports, this), mem_rsp_in(config.mem_ports, this), impl_(new Impl(this, h100_impl_config(config))) {}
-#else
 #if (defined(DXA_MBAR_ENABLE) && defined(VX_CFG_EXT_FPAMO_ENABLE))
 #line 2824
 #elif (defined(DXA_MBAR_ENABLE))
@@ -3627,7 +3028,7 @@ Cache::Cache(const SimContext &ctx, const char *name, const Config &config)
 #line 2564
 #endif
     : SimObject<Cache>(ctx, name), core_req_in(config.num_inputs, this), core_rsp_out(config.num_inputs, this), mem_req_out(config.mem_ports, this), mem_rsp_in(config.mem_ports, this), impl_(new Impl(this, config)) {}
-#endif
+
 #if (defined(DXA_MBAR_ENABLE) && defined(VX_CFG_EXT_FPAMO_ENABLE))
 #line 2825
 #elif (defined(DXA_MBAR_ENABLE))

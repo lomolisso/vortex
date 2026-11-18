@@ -33,6 +33,11 @@ struct kmu_req_t {
   uint32_t block_dim[3];
   uint32_t grid_dim[3];
   uint32_t lmem_size;
+#ifdef VX_CFG_H100_SM_ENABLE
+  uint32_t smem_bytes;      // the launch's shared-memory carve-out S (DCR 0x025)
+#else
+#line 35
+#endif
   uint32_t block_size;
   uint32_t warp_step[3];
   uint32_t cluster_dim[3];
@@ -113,6 +118,11 @@ private:
   uint32_t block_dim_[3];
   uint32_t grid_dim_[3];
   uint32_t lmem_size_;
+#ifdef VX_CFG_H100_SM_ENABLE
+  uint32_t smem_bytes_;
+#else
+#line 115
+#endif
   uint32_t block_size_;
   uint32_t warp_step_[3];
   uint32_t cluster_dim_[3];

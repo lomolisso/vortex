@@ -299,16 +299,18 @@ tests:
   args: -traw -twar
 
 # E12: the H100 SM path (VX_CFG_H100_SM_ENABLE); expectations come from sw/common/{smem_bank,l1,sm_port}_ref.h.
+# The chase rows run at four issue slots, the H100's four schedulers per SM: at one slot the dependent
+# chase can lose an issue cycle per hop to the front end (the preset's issue width is E14's).
 - id: smem_bank-lds32
   via: blackbox
   drivers: [simx, rtlsim]
   xlen: [64]
   app: smem_bank
-  configs: "-DVX_CFG_H100_SM_ENABLE -DVX_CFG_L2_ENABLE"
+  configs: "-DVX_CFG_H100_SM_ENABLE -DVX_CFG_L2_ENABLE -DVX_CFG_ISSUE_WIDTH=4"
   shape: {cores: 1, warps: 4, threads: 32}
   touches: [VX_config.toml, hw/rtl/VX_gpu_pkg.sv, hw/rtl/VX_socket.sv, hw/rtl/mem, hw/rtl/cache, hw/rtl/core,
             hw/rtl/dlmem, hw/rtl/dxa, hw/rtl/libs/VX_mem_coalescer.sv, sim/simx, sw/common/smem_bank_ref.h,
-            sw/common/l1_ref.h, sw/common/sm_port_ref.h, tests/regression/smem_bank, tests/regression/l1_sector,
+            sw/common/l1_ref.h, sw/common/l1_slot_ref.h, sw/common/smem_carveout.h, sw/common/sm_port_ref.h, tests/regression/smem_bank, tests/regression/l1_sector,
             tests/regression/sm_port]
   args: "-m 0"
 - id: smem_bank-lds64
@@ -316,11 +318,11 @@ tests:
   drivers: [simx]
   xlen: [64]
   app: smem_bank
-  configs: "-DVX_CFG_H100_SM_ENABLE -DVX_CFG_L2_ENABLE"
+  configs: "-DVX_CFG_H100_SM_ENABLE -DVX_CFG_L2_ENABLE -DVX_CFG_ISSUE_WIDTH=4"
   shape: {cores: 1, warps: 4, threads: 32}
   touches: [VX_config.toml, hw/rtl/VX_gpu_pkg.sv, hw/rtl/VX_socket.sv, hw/rtl/mem, hw/rtl/cache, hw/rtl/core,
             hw/rtl/dlmem, hw/rtl/dxa, hw/rtl/libs/VX_mem_coalescer.sv, sim/simx, sw/common/smem_bank_ref.h,
-            sw/common/l1_ref.h, sw/common/sm_port_ref.h, tests/regression/smem_bank, tests/regression/l1_sector,
+            sw/common/l1_ref.h, sw/common/l1_slot_ref.h, sw/common/smem_carveout.h, sw/common/sm_port_ref.h, tests/regression/smem_bank, tests/regression/l1_sector,
             tests/regression/sm_port]
   args: "-m 1"
 - id: smem_bank-atom
@@ -328,11 +330,11 @@ tests:
   drivers: [simx]
   xlen: [64]
   app: smem_bank
-  configs: "-DVX_CFG_H100_SM_ENABLE -DVX_CFG_L2_ENABLE"
+  configs: "-DVX_CFG_H100_SM_ENABLE -DVX_CFG_L2_ENABLE -DVX_CFG_ISSUE_WIDTH=4"
   shape: {cores: 1, warps: 32, threads: 32}
   touches: [VX_config.toml, hw/rtl/VX_gpu_pkg.sv, hw/rtl/VX_socket.sv, hw/rtl/mem, hw/rtl/cache, hw/rtl/core,
             hw/rtl/dlmem, hw/rtl/dxa, hw/rtl/libs/VX_mem_coalescer.sv, sim/simx, sw/common/smem_bank_ref.h,
-            sw/common/l1_ref.h, sw/common/sm_port_ref.h, tests/regression/smem_bank, tests/regression/l1_sector,
+            sw/common/l1_ref.h, sw/common/l1_slot_ref.h, sw/common/smem_carveout.h, sw/common/sm_port_ref.h, tests/regression/smem_bank, tests/regression/l1_sector,
             tests/regression/sm_port]
   args: "-m 2"
 - id: smem_bank-bw
@@ -344,7 +346,7 @@ tests:
   shape: {cores: 1, warps: 32, threads: 32}
   touches: [VX_config.toml, hw/rtl/VX_gpu_pkg.sv, hw/rtl/VX_socket.sv, hw/rtl/mem, hw/rtl/cache, hw/rtl/core,
             hw/rtl/dlmem, hw/rtl/dxa, hw/rtl/libs/VX_mem_coalescer.sv, sim/simx, sw/common/smem_bank_ref.h,
-            sw/common/l1_ref.h, sw/common/sm_port_ref.h, tests/regression/smem_bank, tests/regression/l1_sector,
+            sw/common/l1_ref.h, sw/common/l1_slot_ref.h, sw/common/smem_carveout.h, sw/common/sm_port_ref.h, tests/regression/smem_bank, tests/regression/l1_sector,
             tests/regression/sm_port]
   args: "-m 3"
 - id: smem_bank-bw-iw4
@@ -356,7 +358,7 @@ tests:
   shape: {cores: 1, warps: 32, threads: 32}
   touches: [VX_config.toml, hw/rtl/VX_gpu_pkg.sv, hw/rtl/VX_socket.sv, hw/rtl/mem, hw/rtl/cache, hw/rtl/core,
             hw/rtl/dlmem, hw/rtl/dxa, hw/rtl/libs/VX_mem_coalescer.sv, sim/simx, sw/common/smem_bank_ref.h,
-            sw/common/l1_ref.h, sw/common/sm_port_ref.h, tests/regression/smem_bank, tests/regression/l1_sector,
+            sw/common/l1_ref.h, sw/common/l1_slot_ref.h, sw/common/smem_carveout.h, sw/common/sm_port_ref.h, tests/regression/smem_bank, tests/regression/l1_sector,
             tests/regression/sm_port]
   args: "-m 3 -b"
 - id: l1_sector-hitlat
@@ -368,7 +370,7 @@ tests:
   shape: {cores: 1, warps: 4, threads: 32}
   touches: [VX_config.toml, hw/rtl/VX_gpu_pkg.sv, hw/rtl/VX_socket.sv, hw/rtl/mem, hw/rtl/cache, hw/rtl/core,
             hw/rtl/dlmem, hw/rtl/dxa, hw/rtl/libs/VX_mem_coalescer.sv, sim/simx, sw/common/smem_bank_ref.h,
-            sw/common/l1_ref.h, sw/common/sm_port_ref.h, tests/regression/smem_bank, tests/regression/l1_sector,
+            sw/common/l1_ref.h, sw/common/l1_slot_ref.h, sw/common/smem_carveout.h, sw/common/sm_port_ref.h, tests/regression/smem_bank, tests/regression/l1_sector,
             tests/regression/sm_port]
   args: "-m 0"
 - id: l1_sector-l2hit
@@ -380,7 +382,7 @@ tests:
   shape: {cores: 1, warps: 4, threads: 32}
   touches: [VX_config.toml, hw/rtl/VX_gpu_pkg.sv, hw/rtl/VX_socket.sv, hw/rtl/mem, hw/rtl/cache, hw/rtl/core,
             hw/rtl/dlmem, hw/rtl/dxa, hw/rtl/libs/VX_mem_coalescer.sv, sim/simx, sw/common/smem_bank_ref.h,
-            sw/common/l1_ref.h, sw/common/sm_port_ref.h, tests/regression/smem_bank, tests/regression/l1_sector,
+            sw/common/l1_ref.h, sw/common/l1_slot_ref.h, sw/common/smem_carveout.h, sw/common/sm_port_ref.h, tests/regression/smem_bank, tests/regression/l1_sector,
             tests/regression/sm_port]
   args: "-m 1"
 - id: l1_sector-multiline
@@ -392,7 +394,7 @@ tests:
   shape: {cores: 1, warps: 4, threads: 32}
   touches: [VX_config.toml, hw/rtl/VX_gpu_pkg.sv, hw/rtl/VX_socket.sv, hw/rtl/mem, hw/rtl/cache, hw/rtl/core,
             hw/rtl/dlmem, hw/rtl/dxa, hw/rtl/libs/VX_mem_coalescer.sv, sim/simx, sw/common/smem_bank_ref.h,
-            sw/common/l1_ref.h, sw/common/sm_port_ref.h, tests/regression/smem_bank, tests/regression/l1_sector,
+            sw/common/l1_ref.h, sw/common/l1_slot_ref.h, sw/common/smem_carveout.h, sw/common/sm_port_ref.h, tests/regression/smem_bank, tests/regression/l1_sector,
             tests/regression/sm_port]
   args: "-m 2"
 - id: l1_sector-fill
@@ -404,9 +406,32 @@ tests:
   shape: {cores: 1, warps: 4, threads: 32}
   touches: [VX_config.toml, hw/rtl/VX_gpu_pkg.sv, hw/rtl/VX_socket.sv, hw/rtl/mem, hw/rtl/cache, hw/rtl/core,
             hw/rtl/dlmem, hw/rtl/dxa, hw/rtl/libs/VX_mem_coalescer.sv, sim/simx, sw/common/smem_bank_ref.h,
-            sw/common/l1_ref.h, sw/common/sm_port_ref.h, tests/regression/smem_bank, tests/regression/l1_sector,
+            sw/common/l1_ref.h, sw/common/l1_slot_ref.h, sw/common/smem_carveout.h, sw/common/sm_port_ref.h, tests/regression/smem_bank, tests/regression/l1_sector,
             tests/regression/sm_port]
   args: "-m 3"
+# One warp with every lane on its own line of one tag set (more lines than ways): completes, right data.
+- id: l1_setover
+  via: blackbox
+  drivers: [simx, rtlsim]
+  xlen: [64]
+  app: l1_setover
+  configs: "-DVX_CFG_H100_SM_ENABLE -DVX_CFG_L2_ENABLE"
+  shape: {cores: 1, warps: 4, threads: 32}
+  touches: [VX_config.toml, hw/rtl/VX_gpu_pkg.sv, hw/rtl/VX_socket.sv, hw/rtl/mem, hw/rtl/cache, hw/rtl/core,
+            hw/rtl/dlmem, hw/rtl/dxa, hw/rtl/libs/VX_mem_coalescer.sv, sim/simx, sw/common/smem_bank_ref.h,
+            sw/common/l1_ref.h, sw/common/l1_slot_ref.h, sw/common/smem_carveout.h, sw/common/sm_port_ref.h, tests/regression/smem_bank, tests/regression/l1_setover,
+            tests/regression/sm_port]
+- id: l1_setover-h0
+  via: blackbox
+  drivers: [simx, rtlsim]
+  xlen: [64]
+  app: l1_setover
+  configs: "-DVX_CFG_H100_SM_ENABLE -DVX_CFG_L2_ENABLE -DVX_CFG_L1_INDEX_HASH=0"
+  shape: {cores: 1, warps: 4, threads: 32}
+  touches: [VX_config.toml, hw/rtl/VX_gpu_pkg.sv, hw/rtl/VX_socket.sv, hw/rtl/mem, hw/rtl/cache, hw/rtl/core,
+            hw/rtl/dlmem, hw/rtl/dxa, hw/rtl/libs/VX_mem_coalescer.sv, sim/simx, sw/common/smem_bank_ref.h,
+            sw/common/l1_ref.h, sw/common/l1_slot_ref.h, sw/common/smem_carveout.h, sw/common/sm_port_ref.h, tests/regression/smem_bank, tests/regression/l1_setover,
+            tests/regression/sm_port]
 - id: l1_sector-wpolicy
   via: blackbox
   drivers: [simx]
@@ -416,7 +441,7 @@ tests:
   shape: {cores: 1, warps: 4, threads: 32}
   touches: [VX_config.toml, hw/rtl/VX_gpu_pkg.sv, hw/rtl/VX_socket.sv, hw/rtl/mem, hw/rtl/cache, hw/rtl/core,
             hw/rtl/dlmem, hw/rtl/dxa, hw/rtl/libs/VX_mem_coalescer.sv, sim/simx, sw/common/smem_bank_ref.h,
-            sw/common/l1_ref.h, sw/common/sm_port_ref.h, tests/regression/smem_bank, tests/regression/l1_sector,
+            sw/common/l1_ref.h, sw/common/l1_slot_ref.h, sw/common/smem_carveout.h, sw/common/sm_port_ref.h, tests/regression/smem_bank, tests/regression/l1_sector,
             tests/regression/sm_port]
   args: "-m 4"
 - id: l1_sector-assoc
@@ -428,7 +453,7 @@ tests:
   shape: {cores: 1, warps: 4, threads: 32}
   touches: [VX_config.toml, hw/rtl/VX_gpu_pkg.sv, hw/rtl/VX_socket.sv, hw/rtl/mem, hw/rtl/cache, hw/rtl/core,
             hw/rtl/dlmem, hw/rtl/dxa, hw/rtl/libs/VX_mem_coalescer.sv, sim/simx, sw/common/smem_bank_ref.h,
-            sw/common/l1_ref.h, sw/common/sm_port_ref.h, tests/regression/smem_bank, tests/regression/l1_sector,
+            sw/common/l1_ref.h, sw/common/l1_slot_ref.h, sw/common/smem_carveout.h, sw/common/sm_port_ref.h, tests/regression/smem_bank, tests/regression/l1_sector,
             tests/regression/sm_port]
   args: "-m 5"
 - id: l1_sector-repl
@@ -440,7 +465,7 @@ tests:
   shape: {cores: 1, warps: 4, threads: 32}
   touches: [VX_config.toml, hw/rtl/VX_gpu_pkg.sv, hw/rtl/VX_socket.sv, hw/rtl/mem, hw/rtl/cache, hw/rtl/core,
             hw/rtl/dlmem, hw/rtl/dxa, hw/rtl/libs/VX_mem_coalescer.sv, sim/simx, sw/common/smem_bank_ref.h,
-            sw/common/l1_ref.h, sw/common/sm_port_ref.h, tests/regression/smem_bank, tests/regression/l1_sector,
+            sw/common/l1_ref.h, sw/common/l1_slot_ref.h, sw/common/smem_carveout.h, sw/common/sm_port_ref.h, tests/regression/smem_bank, tests/regression/l1_sector,
             tests/regression/sm_port]
   args: "-m 6"
 - id: l1_sector-inval
@@ -452,7 +477,7 @@ tests:
   shape: {cores: 1, warps: 4, threads: 32}
   touches: [VX_config.toml, hw/rtl/VX_gpu_pkg.sv, hw/rtl/VX_socket.sv, hw/rtl/mem, hw/rtl/cache, hw/rtl/core,
             hw/rtl/dlmem, hw/rtl/dxa, hw/rtl/libs/VX_mem_coalescer.sv, sim/simx, sw/common/smem_bank_ref.h,
-            sw/common/l1_ref.h, sw/common/sm_port_ref.h, tests/regression/smem_bank, tests/regression/l1_sector,
+            sw/common/l1_ref.h, sw/common/l1_slot_ref.h, sw/common/smem_carveout.h, sw/common/sm_port_ref.h, tests/regression/smem_bank, tests/regression/l1_sector,
             tests/regression/sm_port]
   args: "-m 7"
 - id: l1_sector-bw
@@ -464,7 +489,7 @@ tests:
   shape: {cores: 1, warps: 32, threads: 32}
   touches: [VX_config.toml, hw/rtl/VX_gpu_pkg.sv, hw/rtl/VX_socket.sv, hw/rtl/mem, hw/rtl/cache, hw/rtl/core,
             hw/rtl/dlmem, hw/rtl/dxa, hw/rtl/libs/VX_mem_coalescer.sv, sim/simx, sw/common/smem_bank_ref.h,
-            sw/common/l1_ref.h, sw/common/sm_port_ref.h, tests/regression/smem_bank, tests/regression/l1_sector,
+            sw/common/l1_ref.h, sw/common/l1_slot_ref.h, sw/common/smem_carveout.h, sw/common/sm_port_ref.h, tests/regression/smem_bank, tests/regression/l1_sector,
             tests/regression/sm_port]
   args: "-m 8"
 - id: l1_sector-bw-iw4
@@ -476,9 +501,30 @@ tests:
   shape: {cores: 1, warps: 32, threads: 32}
   touches: [VX_config.toml, hw/rtl/VX_gpu_pkg.sv, hw/rtl/VX_socket.sv, hw/rtl/mem, hw/rtl/cache, hw/rtl/core,
             hw/rtl/dlmem, hw/rtl/dxa, hw/rtl/libs/VX_mem_coalescer.sv, sim/simx, sw/common/smem_bank_ref.h,
-            sw/common/l1_ref.h, sw/common/sm_port_ref.h, tests/regression/smem_bank, tests/regression/l1_sector,
+            sw/common/l1_ref.h, sw/common/l1_slot_ref.h, sw/common/smem_carveout.h, sw/common/sm_port_ref.h, tests/regression/smem_bank, tests/regression/l1_sector,
             tests/regression/sm_port]
   args: "-m 8"
+- id: l1_sector-banks
+  via: blackbox
+  drivers: [simx]
+  xlen: [64]
+  app: l1_sector
+  configs: "-DVX_CFG_H100_SM_ENABLE -DVX_CFG_L2_ENABLE"
+  shape: {cores: 1, warps: 4, threads: 32}
+  touches: [VX_config.toml, hw/rtl/VX_gpu_pkg.sv, hw/rtl/VX_socket.sv, hw/rtl/mem, hw/rtl/core, hw/rtl/dlmem,
+            sim/simx, sw/common/smem_bank_ref.h, sw/common/l1_slot_ref.h, sw/common/smem_carveout.h,
+            tests/regression/l1_sector]
+  args: "-m 9"
+- id: smem_l1-refill-rate
+  via: blackbox
+  drivers: [simx]
+  xlen: [64]
+  app: l1_sector
+  configs: "-DVX_CFG_H100_SM_ENABLE -DVX_CFG_L2_ENABLE"
+  shape: {cores: 1, warps: 32, threads: 32}
+  touches: [VX_config.toml, hw/rtl/VX_gpu_pkg.sv, hw/rtl/VX_socket.sv, hw/rtl/mem, hw/rtl/core, hw/rtl/dlmem,
+            sim/simx, sw/common/l1_slot_ref.h, sw/common/smem_carveout.h, tests/regression/l1_sector]
+  args: "-m 10"
 - id: sm_port-st
   via: blackbox
   drivers: [simx, rtlsim]
@@ -488,7 +534,7 @@ tests:
   shape: {cores: 1, warps: 32, threads: 32}
   touches: [VX_config.toml, hw/rtl/VX_gpu_pkg.sv, hw/rtl/VX_socket.sv, hw/rtl/mem, hw/rtl/cache, hw/rtl/core,
             hw/rtl/dlmem, hw/rtl/dxa, hw/rtl/libs/VX_mem_coalescer.sv, sim/simx, sw/common/smem_bank_ref.h,
-            sw/common/l1_ref.h, sw/common/sm_port_ref.h, tests/regression/smem_bank, tests/regression/l1_sector,
+            sw/common/l1_ref.h, sw/common/l1_slot_ref.h, sw/common/smem_carveout.h, sw/common/sm_port_ref.h, tests/regression/smem_bank, tests/regression/l1_sector,
             tests/regression/sm_port]
   args: "-m 0"
 - id: sm_port-st1s
@@ -500,7 +546,7 @@ tests:
   shape: {cores: 1, warps: 32, threads: 32}
   touches: [VX_config.toml, hw/rtl/VX_gpu_pkg.sv, hw/rtl/VX_socket.sv, hw/rtl/mem, hw/rtl/cache, hw/rtl/core,
             hw/rtl/dlmem, hw/rtl/dxa, hw/rtl/libs/VX_mem_coalescer.sv, sim/simx, sw/common/smem_bank_ref.h,
-            sw/common/l1_ref.h, sw/common/sm_port_ref.h, tests/regression/smem_bank, tests/regression/l1_sector,
+            sw/common/l1_ref.h, sw/common/l1_slot_ref.h, sw/common/smem_carveout.h, sw/common/sm_port_ref.h, tests/regression/smem_bank, tests/regression/l1_sector,
             tests/regression/sm_port]
   args: "-m 1"
 - id: sm_port-stmask
@@ -512,7 +558,7 @@ tests:
   shape: {cores: 1, warps: 32, threads: 32}
   touches: [VX_config.toml, hw/rtl/VX_gpu_pkg.sv, hw/rtl/VX_socket.sv, hw/rtl/mem, hw/rtl/cache, hw/rtl/core,
             hw/rtl/dlmem, hw/rtl/dxa, hw/rtl/libs/VX_mem_coalescer.sv, sim/simx, sw/common/smem_bank_ref.h,
-            sw/common/l1_ref.h, sw/common/sm_port_ref.h, tests/regression/smem_bank, tests/regression/l1_sector,
+            sw/common/l1_ref.h, sw/common/l1_slot_ref.h, sw/common/smem_carveout.h, sw/common/sm_port_ref.h, tests/regression/smem_bank, tests/regression/l1_sector,
             tests/regression/sm_port]
   args: "-m 2"
 - id: sm_port-rw
@@ -524,7 +570,7 @@ tests:
   shape: {cores: 1, warps: 32, threads: 32}
   touches: [VX_config.toml, hw/rtl/VX_gpu_pkg.sv, hw/rtl/VX_socket.sv, hw/rtl/mem, hw/rtl/cache, hw/rtl/core,
             hw/rtl/dlmem, hw/rtl/dxa, hw/rtl/libs/VX_mem_coalescer.sv, sim/simx, sw/common/smem_bank_ref.h,
-            sw/common/l1_ref.h, sw/common/sm_port_ref.h, tests/regression/smem_bank, tests/regression/l1_sector,
+            sw/common/l1_ref.h, sw/common/l1_slot_ref.h, sw/common/smem_carveout.h, sw/common/sm_port_ref.h, tests/regression/smem_bank, tests/regression/l1_sector,
             tests/regression/sm_port]
   args: "-m 3"
 - id: model_parity-smem-conflict
@@ -535,7 +581,7 @@ tests:
   shape: {cores: 1, warps: 4, threads: 32}
   touches: [VX_config.toml, hw/rtl/VX_gpu_pkg.sv, hw/rtl/VX_socket.sv, hw/rtl/mem, hw/rtl/cache, hw/rtl/core,
             hw/rtl/dlmem, hw/rtl/dxa, hw/rtl/libs/VX_mem_coalescer.sv, sim/simx, sw/common/smem_bank_ref.h,
-            sw/common/l1_ref.h, sw/common/sm_port_ref.h, tests/regression/smem_bank, tests/regression/l1_sector,
+            sw/common/l1_ref.h, sw/common/l1_slot_ref.h, sw/common/smem_carveout.h, sw/common/sm_port_ref.h, tests/regression/smem_bank, tests/regression/l1_sector,
             tests/regression/sm_port]
   args: "-m 0"
 - id: model_parity-smem-lds64
@@ -546,7 +592,7 @@ tests:
   shape: {cores: 1, warps: 4, threads: 32}
   touches: [VX_config.toml, hw/rtl/VX_gpu_pkg.sv, hw/rtl/VX_socket.sv, hw/rtl/mem, hw/rtl/cache, hw/rtl/core,
             hw/rtl/dlmem, hw/rtl/dxa, hw/rtl/libs/VX_mem_coalescer.sv, sim/simx, sw/common/smem_bank_ref.h,
-            sw/common/l1_ref.h, sw/common/sm_port_ref.h, tests/regression/smem_bank, tests/regression/l1_sector,
+            sw/common/l1_ref.h, sw/common/l1_slot_ref.h, sw/common/smem_carveout.h, sw/common/sm_port_ref.h, tests/regression/smem_bank, tests/regression/l1_sector,
             tests/regression/sm_port]
   args: "-m 1"
 - id: model_parity-smem-atom
@@ -557,7 +603,7 @@ tests:
   shape: {cores: 1, warps: 32, threads: 32}
   touches: [VX_config.toml, hw/rtl/VX_gpu_pkg.sv, hw/rtl/VX_socket.sv, hw/rtl/mem, hw/rtl/cache, hw/rtl/core,
             hw/rtl/dlmem, hw/rtl/dxa, hw/rtl/libs/VX_mem_coalescer.sv, sim/simx, sw/common/smem_bank_ref.h,
-            sw/common/l1_ref.h, sw/common/sm_port_ref.h, tests/regression/smem_bank, tests/regression/l1_sector,
+            sw/common/l1_ref.h, sw/common/l1_slot_ref.h, sw/common/smem_carveout.h, sw/common/sm_port_ref.h, tests/regression/smem_bank, tests/regression/l1_sector,
             tests/regression/sm_port]
   args: "-m 2"
 - id: model_parity-l1-sector
@@ -568,7 +614,7 @@ tests:
   shape: {cores: 1, warps: 4, threads: 32}
   touches: [VX_config.toml, hw/rtl/VX_gpu_pkg.sv, hw/rtl/VX_socket.sv, hw/rtl/mem, hw/rtl/cache, hw/rtl/core,
             hw/rtl/dlmem, hw/rtl/dxa, hw/rtl/libs/VX_mem_coalescer.sv, sim/simx, sw/common/smem_bank_ref.h,
-            sw/common/l1_ref.h, sw/common/sm_port_ref.h, tests/regression/smem_bank, tests/regression/l1_sector,
+            sw/common/l1_ref.h, sw/common/l1_slot_ref.h, sw/common/smem_carveout.h, sw/common/sm_port_ref.h, tests/regression/smem_bank, tests/regression/l1_sector,
             tests/regression/sm_port]
   args: "-m 3,2"
 - id: model_parity-l1-repl-inval
@@ -579,9 +625,19 @@ tests:
   shape: {cores: 1, warps: 4, threads: 32}
   touches: [VX_config.toml, hw/rtl/VX_gpu_pkg.sv, hw/rtl/VX_socket.sv, hw/rtl/mem, hw/rtl/cache, hw/rtl/core,
             hw/rtl/dlmem, hw/rtl/dxa, hw/rtl/libs/VX_mem_coalescer.sv, sim/simx, sw/common/smem_bank_ref.h,
-            sw/common/l1_ref.h, sw/common/sm_port_ref.h, tests/regression/smem_bank, tests/regression/l1_sector,
+            sw/common/l1_ref.h, sw/common/l1_slot_ref.h, sw/common/smem_carveout.h, sw/common/sm_port_ref.h, tests/regression/smem_bank, tests/regression/l1_sector,
             tests/regression/sm_port]
   args: "-q -m 6,7"
+- id: model_parity-l1-setover
+  check: model_parity
+  xlen: [64]
+  app: l1_setover
+  configs: "-DVX_CFG_H100_SM_ENABLE -DVX_CFG_L2_ENABLE"
+  shape: {cores: 1, warps: 4, threads: 32}
+  touches: [VX_config.toml, hw/rtl/VX_gpu_pkg.sv, hw/rtl/VX_socket.sv, hw/rtl/mem, hw/rtl/cache, hw/rtl/core,
+            hw/rtl/dlmem, hw/rtl/dxa, hw/rtl/libs/VX_mem_coalescer.sv, sim/simx, sw/common/smem_bank_ref.h,
+            sw/common/l1_ref.h, sw/common/l1_slot_ref.h, sw/common/smem_carveout.h, sw/common/sm_port_ref.h, tests/regression/smem_bank, tests/regression/l1_setover,
+            tests/regression/sm_port]
 - id: org-sgemm
   via: blackbox
   drivers: [simx]
@@ -591,7 +647,7 @@ tests:
   shape: {cores: 1, warps: 4, threads: 32, l2cache: true}
   touches: [VX_config.toml, hw/rtl/VX_gpu_pkg.sv, hw/rtl/VX_socket.sv, hw/rtl/mem, hw/rtl/cache, hw/rtl/core,
             hw/rtl/dlmem, hw/rtl/dxa, hw/rtl/libs/VX_mem_coalescer.sv, sim/simx, sw/common/smem_bank_ref.h,
-            sw/common/l1_ref.h, sw/common/sm_port_ref.h, tests/regression/smem_bank, tests/regression/l1_sector,
+            sw/common/l1_ref.h, sw/common/l1_slot_ref.h, sw/common/smem_carveout.h, sw/common/sm_port_ref.h, tests/regression/smem_bank, tests/regression/l1_sector,
             tests/regression/sm_port]
 - id: org-cache_order
   via: blackbox
@@ -602,7 +658,7 @@ tests:
   shape: {cores: 4, threads: 32, l2cache: true}
   touches: [VX_config.toml, hw/rtl/VX_gpu_pkg.sv, hw/rtl/VX_socket.sv, hw/rtl/mem, hw/rtl/cache, hw/rtl/core,
             hw/rtl/dlmem, hw/rtl/dxa, hw/rtl/libs/VX_mem_coalescer.sv, sim/simx, sw/common/smem_bank_ref.h,
-            sw/common/l1_ref.h, sw/common/sm_port_ref.h, tests/regression/smem_bank, tests/regression/l1_sector,
+            sw/common/l1_ref.h, sw/common/l1_slot_ref.h, sw/common/smem_carveout.h, sw/common/sm_port_ref.h, tests/regression/smem_bank, tests/regression/l1_sector,
             tests/regression/sm_port]
   args: "-traw -twar"
 - id: org-mstress
@@ -614,14 +670,14 @@ tests:
   shape: {cores: 2, clusters: 2, threads: 32, l2cache: true, l3cache: true}
   touches: [VX_config.toml, hw/rtl/VX_gpu_pkg.sv, hw/rtl/VX_socket.sv, hw/rtl/mem, hw/rtl/cache, hw/rtl/core,
             hw/rtl/dlmem, hw/rtl/dxa, hw/rtl/libs/VX_mem_coalescer.sv, sim/simx, sw/common/smem_bank_ref.h,
-            sw/common/l1_ref.h, sw/common/sm_port_ref.h, tests/regression/smem_bank, tests/regression/l1_sector,
+            sw/common/l1_ref.h, sw/common/l1_slot_ref.h, sw/common/smem_carveout.h, sw/common/sm_port_ref.h, tests/regression/smem_bank, tests/regression/l1_sector,
             tests/regression/sm_port]
 - id: reject-sm-l1-ways
   via: script
   driver: simx
   xlen: [64]
-  configs: "-DVX_CFG_H100_SM_ENABLE -DVX_CFG_DCACHE_NUM_WAYS=12"
-  env: {EXPECT: "L1_WAYS_POW2"}
+  configs: "-DVX_CFG_H100_SM_ENABLE -DVX_CFG_L1_TAG_WAYS=12"
+  env: {EXPECT: "L1_TAG_WAYS_POW2"}
   touches: [VX_config.toml, ci/gen_config.py]
   run: |
     set -u
@@ -672,3 +728,202 @@ tests:
     if [ $rc -eq 0 ]; then echo "FAIL: the simx build accepted CONFIGS=${CONFIGS:-}"; rm -rf "$tmp"; exit 1; fi
     if ! grep -qF "$EXPECT" "$tmp/simx.log"; then echo "FAIL: the build failed without '$EXPECT':"; tail -n 20 "$tmp/simx.log"; rm -rf "$tmp"; exit 1; fi
     echo "PASSED: the build stopped at $EXPECT"; rm -rf "$tmp"
+- id: reject-sm-sram-vm
+  via: script
+  driver: simx
+  xlen: [64]
+  configs: "-DVX_CFG_H100_SM_ENABLE -DVX_CFG_VM_ENABLE"
+  env: {EXPECT: "SM_SRAM_NO_VM"}
+  touches: [VX_config.toml, ci/gen_config.py]
+  run: |
+    set -u
+    tmp=$(mktemp -d)
+    make -C sim/simx DESTDIR="$tmp" "$tmp/obj/socket.o" > "$tmp/simx.log" 2>&1; rc=$?
+    if [ $rc -eq 0 ]; then echo "FAIL: the simx build accepted CONFIGS=${CONFIGS:-}"; rm -rf "$tmp"; exit 1; fi
+    if ! grep -qF "$EXPECT" "$tmp/simx.log"; then echo "FAIL: the build failed without '$EXPECT':"; tail -n 20 "$tmp/simx.log"; rm -rf "$tmp"; exit 1; fi
+    echo "PASSED: the build stopped at $EXPECT"; rm -rf "$tmp"
+- id: reject-sm-sram-configs
+  via: script
+  driver: simx
+  xlen: [64]
+  configs: "-DVX_CFG_H100_SM_ENABLE -DVX_CFG_SMEM_CONFIG_KB_1=4"
+  env: {EXPECT: "SMEM_CONFIGS_ASCENDING"}
+  touches: [VX_config.toml, ci/gen_config.py]
+  run: |
+    set -u
+    tmp=$(mktemp -d)
+    make -C sim/simx DESTDIR="$tmp" "$tmp/obj/socket.o" > "$tmp/simx.log" 2>&1; rc=$?
+    if [ $rc -eq 0 ]; then echo "FAIL: the simx build accepted CONFIGS=${CONFIGS:-}"; rm -rf "$tmp"; exit 1; fi
+    if ! grep -qF "$EXPECT" "$tmp/simx.log"; then echo "FAIL: the build failed without '$EXPECT':"; tail -n 20 "$tmp/simx.log"; rm -rf "$tmp"; exit 1; fi
+    echo "PASSED: the build stopped at $EXPECT"; rm -rf "$tmp"
+- id: reject-sm-sram-fits
+  via: script
+  driver: simx
+  xlen: [64]
+  configs: "-DVX_CFG_H100_SM_ENABLE -DVX_CFG_L1_RESERVE_BYTES=16384"
+  env: {EXPECT: "SM_SRAM_FITS"}
+  touches: [VX_config.toml, ci/gen_config.py]
+  run: |
+    set -u
+    tmp=$(mktemp -d)
+    make -C sim/simx DESTDIR="$tmp" "$tmp/obj/socket.o" > "$tmp/simx.log" 2>&1; rc=$?
+    if [ $rc -eq 0 ]; then echo "FAIL: the simx build accepted CONFIGS=${CONFIGS:-}"; rm -rf "$tmp"; exit 1; fi
+    if ! grep -qF "$EXPECT" "$tmp/simx.log"; then echo "FAIL: the build failed without '$EXPECT':"; tail -n 20 "$tmp/simx.log"; rm -rf "$tmp"; exit 1; fi
+    echo "PASSED: the build stopped at $EXPECT"; rm -rf "$tmp"
+
+# E12b: the per-launch carve-out of the unified L1 / shared-memory array; expectations from sw/common/smem_carveout.h.
+- id: carveout-capacity
+  via: blackbox
+  drivers: [simx]
+  xlen: [64]
+  app: carveout
+  configs: "-DVX_CFG_H100_SM_ENABLE -DVX_CFG_L2_ENABLE"
+  shape: {cores: 1, warps: 4, threads: 32}
+  touches: &carveout_touches
+    [VX_config.toml, VX_types.toml, hw/rtl/VX_gpu_pkg.sv, hw/rtl/VX_socket.sv, hw/rtl/VX_kmu.sv, hw/rtl/mem,
+     hw/rtl/core, hw/rtl/dlmem, hw/rtl/libs/VX_level_arbiter.sv, sim/simx, sw/common/smem_carveout.h,
+     sw/common/l1_slot_ref.h, sw/common/smem_bank_ref.h, sw/runtime/common, sw/runtime/include/vortex2.h,
+     tests/regression/carveout]
+  args: "-m 0"
+- id: carveout-capacity-rtl
+  via: blackbox
+  drivers: [rtlsim]
+  xlen: [64]
+  app: carveout
+  configs: "-DVX_CFG_H100_SM_ENABLE -DVX_CFG_L2_ENABLE"
+  shape: {cores: 1, warps: 4, threads: 32}
+  touches: *carveout_touches
+  args: "-m 0 -c 8,100,228"
+- id: carveout-regions
+  via: blackbox
+  drivers: [simx]
+  xlen: [64]
+  app: carveout
+  configs: "-DVX_CFG_H100_SM_ENABLE -DVX_CFG_L2_ENABLE"
+  shape: {cores: 1, warps: 4, threads: 32}
+  touches: *carveout_touches
+  args: "-m 1"
+# Launch gaps are printed, not asserted: they carry the DRAM bank history of the command fetch and crt0
+# accesses. The no-switch-cost claim is asserted where no DRAM is, by unittest:hw-cta's carve-out switch case.
+- id: carveout-switch
+  via: blackbox
+  drivers: [simx, rtlsim]
+  xlen: [64]
+  app: carveout
+  configs: "-DVX_CFG_H100_SM_ENABLE -DVX_CFG_L2_ENABLE"
+  shape: {cores: 1, warps: 4, threads: 32}
+  touches: *carveout_touches
+  args: "-m 2"
+# A launch that states no preference: a zero-initialised descriptor and the legacy vx_start.
+- id: carveout-default
+  via: blackbox
+  drivers: [simx]
+  xlen: [64]
+  app: carveout
+  configs: "-DVX_CFG_H100_SM_ENABLE -DVX_CFG_L2_ENABLE"
+  shape: {cores: 1, warps: 4, threads: 32}
+  touches: *carveout_touches
+  args: "-m 4"
+# The standalone simulator main never writes the carve-out DCR: the reset value holds.
+- id: carveout-default-standalone
+  via: script
+  driver: simx
+  xlen: [64]
+  configs: "-DVX_CFG_H100_SM_ENABLE -DVX_CFG_L2_ENABLE -DVX_CFG_NUM_CORES=1 -DVX_CFG_NUM_WARPS=4 -DVX_CFG_NUM_THREADS=32"
+  touches: *carveout_touches
+  run: |
+    set -u
+    make -C sim/simx > /dev/null || { echo "FAIL: simx build"; exit 1; }
+    make -C tests/regression/carveout/standalone clean > /dev/null
+    make -C tests/regression/carveout/standalone run-simx; rc=$?
+    if [ $rc -ne 0 ]; then echo "FAIL: exit code $rc"; exit 1; fi
+    echo "PASSED!"
+- id: carveout-dcr-route
+  via: blackbox
+  drivers: [simx, rtlsim]
+  xlen: [64]
+  app: carveout
+  configs: "-DVX_CFG_H100_SM_ENABLE -DVX_CFG_L2_ENABLE"
+  shape: {cores: 1, warps: 4, threads: 32}
+  touches: *carveout_touches
+  args: "-m 5 -c 32,228"
+- id: carveout-dcr-route-pocket
+  via: blackbox
+  drivers: [simx]
+  xlen: [64]
+  app: carveout
+  configs: "-DVX_CFG_EXT_DLMEM_ENABLE -DVX_CFG_EXT_A_ENABLE -DVX_CFG_H100_ORG_ENABLE -DVX_CFG_NUM_PARTITIONS=2 -DVX_CFG_GPCS_PER_PARTITION=4 -DVX_CFG_CPCS_PER_GPC=2 -DVX_CFG_TPCS_PER_CPC=1 -DVX_CFG_SMS_PER_TPC=2 -DVX_CFG_NUM_THREADS=16"
+  shape: {l2cache: true, l3cache: true}
+  touches: *carveout_touches
+  args: "-m 5 -c 32,228"
+# A v1 image's local memory beyond the smallest carve-out: 4 groups per core x 4 KiB each.
+- id: sgemm2_v1-h100sm-lmem
+  via: blackbox
+  drivers: [simx]
+  xlen: [64]
+  app: sgemm2_v1
+  configs: "-DVX_CFG_H100_SM_ENABLE -DVX_CFG_L2_ENABLE"
+  shape: {cores: 1, warps: 4, threads: 32}
+  touches: [VX_config.toml, VX_types.toml, sim/simx, sw/common/smem_carveout.h, sw/runtime/common,
+            sw/kernel, tests/regression/sgemm2_v1]
+  args: "-n128 -t4 -c128"
+# E12b: the shared path and the L1 on the SM's one array and data port.
+- id: smem_l1-port-share
+  via: blackbox
+  drivers: [simx]
+  xlen: [64]
+  app: smem_bank
+  configs: "-DVX_CFG_H100_SM_ENABLE -DVX_CFG_L2_ENABLE"
+  shape: {cores: 1, warps: 32, threads: 32}
+  touches: &smem_l1_touches
+    [VX_config.toml, hw/rtl/VX_gpu_pkg.sv, hw/rtl/VX_socket.sv, hw/rtl/mem, hw/rtl/core, hw/rtl/dlmem,
+     hw/rtl/libs/VX_level_arbiter.sv, sim/simx, sw/common/smem_bank_ref.h, sw/common/l1_slot_ref.h,
+     sw/common/smem_carveout.h, tests/regression/smem_bank]
+  args: "-m 4"
+# Four issue slots, the H100's four schedulers per SM: at one slot the chase's operand collection adds a cycle
+# per hop and the streams share one issue rate (the preset's issue width is a front-end trait, E14). The chase
+# runs in warp 0: the warp pick is fixed-priority (E14).
+- id: smem_l1-lds-under-miss
+  via: blackbox
+  drivers: [simx, rtlsim]
+  xlen: [64]
+  app: smem_bank
+  configs: "-DVX_CFG_H100_SM_ENABLE -DVX_CFG_L2_ENABLE -DVX_CFG_ISSUE_WIDTH=4"
+  shape: {cores: 1, warps: 32, threads: 32}
+  touches: *smem_l1_touches
+  args: "-m 5"
+- id: smem_l1-fill-write
+  via: blackbox
+  drivers: [simx]
+  xlen: [64]
+  app: sm_port
+  configs: "-DVX_CFG_H100_SM_ENABLE -DVX_CFG_L2_ENABLE -DVX_CFG_EXT_DLMEM_ENABLE -DVX_CFG_EXT_A_ENABLE -DVX_CFG_EXT_MBAR_ENABLE -DVX_CFG_EXT_DXA_ENABLE -DVX_CFG_SOCKET_SIZE=2"
+  shape: {cores: 2, warps: 16, threads: 32}
+  touches: [VX_config.toml, hw/rtl/VX_gpu_pkg.sv, hw/rtl/VX_socket.sv, hw/rtl/mem, hw/rtl/core, hw/rtl/dlmem,
+            hw/rtl/dxa, hw/rtl/libs/VX_level_arbiter.sv, sim/simx, sw/common/smem_bank_ref.h, sw/common/sm_port_ref.h,
+            tests/regression/sm_port]
+  args: "-m 11"
+- id: model_parity-smem-l1-under-miss
+  check: model_parity
+  xlen: [64]
+  app: smem_bank
+  configs: "-DVX_CFG_H100_SM_ENABLE -DVX_CFG_L2_ENABLE -DVX_CFG_ISSUE_WIDTH=4"
+  shape: {cores: 1, warps: 32, threads: 32}
+  touches: *smem_l1_touches
+  args: "-m 5"
+- id: model_parity-carveout-capacity
+  check: model_parity
+  xlen: [64]
+  app: carveout
+  configs: "-DVX_CFG_H100_SM_ENABLE -DVX_CFG_L2_ENABLE"
+  shape: {cores: 1, warps: 4, threads: 32}
+  touches: *carveout_touches
+  args: "-m 0 -c 100"
+- id: model_parity-carveout-route
+  check: model_parity
+  xlen: [64]
+  app: carveout
+  configs: "-DVX_CFG_H100_SM_ENABLE -DVX_CFG_L2_ENABLE"
+  shape: {cores: 1, warps: 4, threads: 32}
+  touches: *carveout_touches
+  args: "-m 5 -c 32,228"

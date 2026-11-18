@@ -4,7 +4,7 @@ include $(ROOT_DIR)/config.mk
 PROJECT := l1_sector
 
 # SimX twin of the H100 L1 bench (hw/unittest/l1h100): the same
-# cases (l1h100_cases.h) against Cache with h100_l1, linked with the simulator's
+# cases (l1h100_cases.h) against SmL1 on SmSram, linked with the simulator's
 # objects, which build in this directory.
 SIMX_DIR := $(ROOT_DIR)/sim/simx
 SRC_DIR  := $(VORTEX_HOME)/tests/unittest/$(PROJECT)

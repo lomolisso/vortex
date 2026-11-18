@@ -864,6 +864,13 @@ struct ClusterInfo {
 // for SPREAD on a device without DLMEM or SINGLE_CORE on a distinct-core one.
 vx_result_t cluster_info(vx_device_h dev, const vx_launch_info_t* info, ClusterInfo* out);
 
+#ifdef VX_CFG_H100_SM_ENABLE
+// The launch's shared-memory carve-out S in bytes (smem_config_choose);
+// VX_ERR_INVALID_VALUE when one block exceeds the largest configuration or the
+// hint is out of range.
+vx_result_t smem_carveout(const vx_launch_info_t* info, uint32_t* s_bytes);
+#endif
+
 // ============================================================================
 // Handle conversion helpers.
 // ============================================================================

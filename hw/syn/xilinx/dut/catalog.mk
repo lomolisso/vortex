@@ -11,7 +11,7 @@
 # directory, no dispatcher edit.
 
 DUTS := cache core cp cta_gang dlmem dlmem_ep dlmem_xlate dxa fpu gfx issue lmem \
-        mem_unit om raster rtu scope tcu tensor tex top unittest vm vortex
+        mem_unit om raster rtu scope sm_sram tcu tensor tex top unittest vm vortex
 
 # ---------------------------------------------------------------------------
 # shared include fragments
@@ -106,6 +106,10 @@ lmem_INC  = $(BASE_INC) -I$(RTL_DIR)/mem -I$(RTL_DIR)/vm -I$(RTL_DIR)/cache -I$(
 
 mem_unit_PRJ := VX_mem_unit_top
 mem_unit_INC  = $(BASE_INC) -I$(RTL_DIR)/mem -I$(RTL_DIR)/vm -I$(RTL_DIR)/core -I$(RTL_DIR)/fpu -I$(UNITTEST_DIR)/mem_unit
+
+sm_sram_PRJ := VX_sm_sram_top
+sm_sram_CFG := -DVX_CFG_H100_SM_ENABLE -DVX_CFG_NUM_THREADS=32 -DVX_CFG_EXT_A_ENABLE
+sm_sram_INC  = $(BASE_INC) -I$(RTL_DIR)/mem -I$(RTL_DIR)/vm -I$(RTL_DIR)/cache -I$(UNITTEST_DIR)/sm_sram
 
 om_PRJ := VX_om_core_top
 om_CFG := -DVX_CFG_EXT_OM_ENABLE

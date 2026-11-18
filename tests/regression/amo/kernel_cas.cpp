@@ -1,5 +1,5 @@
-// The opt-in compare-and-swap cases, in a kernel of their own (kernel_cas.vxbin)
-// so that kernel.vxbin, and the cycles of every default case, stay as they are.
+// The opt-in cases, in a kernel of their own (kernel_cas.vxbin) so that
+// kernel.vxbin, and the cycles of every default case, stay as they are.
 
 #include <vx_spawn2.h>
 #include <vx_intrinsics.h>
@@ -44,7 +44,67 @@ static void kernel_cas_local(kernel_arg_t* __UNIFORM__ arg) {
 }
 #endif
 
+#if __riscv_xlen == 64
+static const uint32_t LRSCW_MAX_RETRIES = 4096;
+
+// lrsc_wide_lmem: lr.d/sc.d increments of a doubleword's low word race with
+// writes to its high word only, so a reservation that misses a write to the
+// upper half lets the sc.d put back a stale high word. Roles go by warp, since
+// the lanes of one warp take a divergent branch one side at a time and never
+// race. Phase 0: the odd warps amoadd.w the high word. Phase 1: one lane of
+// warp 1 increments it with a plain load and store, the only writer of it, so
+// any write-back of a stale value loses an increment for good.
+static void kernel_lrsc_wide_lmem(kernel_arg_t* __UNIFORM__ arg) {
+  auto pair = (volatile uint64_t*)__local_mem();
+  auto out  = (uint32_t*)arg->shared_addr;
+  const uint32_t lane = threadIdx.x % vx_num_threads();
+  const uint32_t warp = threadIdx.x / vx_num_threads();
+
+  if (threadIdx.x == 0) {
+    pair[0] = 0;
+    pair[1] = 0;
+  }
+  __syncthreads();
+
+  for (uint32_t phase = 0; phase < 2; ++phase) {
+    auto dword = &pair[phase];
+    auto high  = (volatile uint32_t*)dword + 1;
+    if ((warp & 1) == 0) {
+      for (uint32_t i = 0; i < arg->iters; ++i) {
+        uint64_t old, sc_fail;
+        uint32_t guard = 0;
+        do {
+          asm volatile ("lr.d %0, (%1)" : "=r"(old) : "r"(dword) : "memory");
+          asm volatile ("sc.d %0, %2, (%1)" : "=r"(sc_fail) : "r"(dword), "r"(old + 1) : "memory");
+          ++guard;
+        } while (sc_fail && guard < LRSCW_MAX_RETRIES);
+      }
+    } else if (phase == 0) {
+      for (uint32_t i = 0; i < arg->iters; ++i) {
+        asm volatile ("amoadd.w zero, %1, (%0)" : : "r"(high), "r"(1) : "memory");
+      }
+    } else if (warp == 1 && lane == 0) {
+      for (uint32_t i = 0; i < arg->iters; ++i) {
+        *high = *high + 1;
+      }
+    }
+    __syncthreads();
+  }
+
+  if (threadIdx.x == 0) {
+    for (uint32_t i = 0; i < LRSCW_OUT_WORDS; ++i)
+      out[i] = ((volatile uint32_t*)pair)[i];
+  }
+}
+#endif
+
 __kernel void kernel_main(kernel_arg_t* __UNIFORM__ arg) {
+#if __riscv_xlen == 64
+  if (arg->testid == LRSCW_TEST) {
+    kernel_lrsc_wide_lmem(arg);
+    return;
+  }
+#endif
 #if VX_CFG_EXT_ZACAS_ENABLED
   if (arg->testid == CASG_TEST_GLOBAL)
     kernel_cas_global(arg);

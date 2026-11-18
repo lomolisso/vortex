@@ -21,6 +21,11 @@
 
 #include <dlmem_ref.h>
 #include <vx_hier.h>
+#ifdef VX_CFG_H100_SM_ENABLE
+#include <smem_carveout.h>
+#else
+#line 23
+#endif
 #include <algorithm>
 #include <cstdarg>
 #include <cstdint>
@@ -63,6 +68,15 @@ inline vortex::hier::Shape build_shape() {
   return vortex::hier::shape_of(VX_CFG_NUM_PARTITIONS, VX_CFG_NUM_CLUSTERS, VX_CFG_CPCS_PER_GPC,
                                 VX_CFG_NUM_CORES, VX_CFG_SOCKET_SIZE);
 }
+#ifdef VX_CFG_H100_SM_ENABLE
+
+// Slots a stride-0 launch opens at the KMU's reset carve-out S, as the admission computes them.
+inline uint32_t reset_usable_slots(const ref::Cfg& cfg) {
+  return smem_usable_slots(VX_CFG_SMEM_PER_SM_MAX, 0, ref::slots(cfg), smem_carve_cfg());
+}
+#else
+#line 65
+#endif
 
 constexpr uint32_t KMU_POLICY_DEFAULT = 0;
 constexpr uint32_t KMU_POLICY_SPREAD  = 1;
@@ -142,7 +156,13 @@ inline uint32_t first_wave(const ref::Cfg& cfg, uint32_t k, uint32_t w) {
   ref::reset(cfg, chip);
   ref::Placed p;
   uint32_t n = 0;
+#ifdef VX_CFG_H100_SM_ENABLE
+  while (ref::place_chip(cfg, chip, {k, w, reset_usable_slots(cfg)}, p))
+#else
+#line 145
   while (ref::place_chip(cfg, chip, {k, w, ref::slots(cfg)}, p))
+#line 145
+#endif
     ++n;
   return n;
 }
@@ -346,7 +366,13 @@ private:
       for (size_t i = 0; i < j; ++i)
         apply_done(trial, pending[i]);
       ref::Placed p;
+#ifdef VX_CFG_H100_SM_ENABLE
+      if (!ref::place_chip(cfg_, trial, {L.k, L.w, reset_usable_slots(cfg_)}, p))
+#else
+#line 349
       if (!ref::place_chip(cfg_, trial, {L.k, L.w, ref::slots(cfg_)}, p))
+#line 349
+#endif
         continue;
       bool same = (p.gpc == gpc) && (p.peers.size() == got.size());
       for (size_t r = 0; same && r < got.size(); ++r)

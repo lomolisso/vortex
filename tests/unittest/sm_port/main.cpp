@@ -95,7 +95,7 @@ private:
   Rates scenario(const Scenario& s) {
     auto& platform = SimPlatform::instance();
     std::printf("%s\n", s.name.c_str());
-    auto port = SmPort::Create(("sm_port_" + std::to_string(n_++)).c_str(), SmPort::Config{NSRC, LINE, 0, 0});
+    auto port = SmPort::Create(("sm_port_" + std::to_string(n_++)).c_str(), SmPort::Config{NSRC, LINE});
     platform.reset();
     Rates r;
     std::deque<std::pair<uint64_t, MemRsp>> mem_rsp;

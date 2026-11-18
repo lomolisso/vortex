@@ -54,6 +54,11 @@ module VX_kmu import VX_gpu_pkg::*; import VX_trace_pkg::*; #(
     reg [`VX_CFG_XLEN-1:0] dcr_param;
     reg [CTA_TID_WIDTH:0] dcr_block_size;
     reg [`VX_CFG_LMEM_LOG_SIZE:0] dcr_lmem_size;
+`ifdef VX_CFG_H100_SM_ENABLE
+    // The launch's shared-memory carve-out S, stamped on every CTA message.
+    reg [`VX_CFG_LMEM_LOG_SIZE:0] dcr_smem_r;
+    `STATIC_ASSERT(`VX_CFG_SMEM_PER_SM_MAX <= (1 << `VX_CFG_LMEM_LOG_SIZE), ("the shared-memory maximum exceeds the shared-memory window"))
+`endif
     reg [2:0][CTA_TID_WIDTH-1:0] dcr_warp_step;
     // Cluster shape: CTAs in the same cluster are guaranteed
     // co-resident on the same core. Default (1,1,1) reproduces the
@@ -110,7 +115,9 @@ module VX_kmu import VX_gpu_pkg::*; import VX_trace_pkg::*; #(
 `ifdef VX_CFG_EXT_DXA_ENABLE
     // A DXA multicast offsets its receivers by whole DMA words (a banked
     // local-memory row), so every slot must start on one.
+`ifndef VX_CFG_H100_SM_ENABLE
     localparam SLOT_ALIGN = `MAX(`VX_CFG_MEM_BLOCK_SIZE, `VX_CFG_LMEM_NUM_BANKS * (`VX_CFG_XLEN / 8));
+`endif
 `endif
     always_ff @(posedge clk) begin
         if (reset) begin
@@ -119,7 +126,11 @@ module VX_kmu import VX_gpu_pkg::*; import VX_trace_pkg::*; #(
         end else begin
             cluster_size_r <= (`KMU_CLUSTER_MSB+1)'(dcr_cluster_dim[0] * dcr_cluster_dim[1]
                                           * dcr_cluster_dim[2]);
-`ifdef VX_CFG_EXT_DXA_ENABLE
+`ifdef VX_CFG_H100_SM_ENABLE
+            aligned_lmem_size_r <=
+                ((`VX_CFG_LMEM_LOG_SIZE+1)'(dcr_lmem_size) + (`VX_CFG_LMEM_LOG_SIZE+1)'(`VX_CFG_LMEM_SLOT_ALIGN - 1))
+                & ~((`VX_CFG_LMEM_LOG_SIZE+1)'(`VX_CFG_LMEM_SLOT_ALIGN - 1));
+`elsif VX_CFG_EXT_DXA_ENABLE
             aligned_lmem_size_r <=
                 ((`VX_CFG_LMEM_LOG_SIZE+1)'(dcr_lmem_size) + (`VX_CFG_LMEM_LOG_SIZE+1)'(SLOT_ALIGN - 1))
                 & ~((`VX_CFG_LMEM_LOG_SIZE+1)'(SLOT_ALIGN - 1));
@@ -142,6 +153,9 @@ module VX_kmu import VX_gpu_pkg::*; import VX_trace_pkg::*; #(
         `ifdef VX_CFG_EXT_DLMEM_ENABLE
             dcr_policy_r    <= KMU_POLICY_DEFAULT;
             dcr_explicit_r  <= 1'b0;
+        `endif
+        `ifdef VX_CFG_H100_SM_ENABLE
+            dcr_smem_r      <= (`VX_CFG_LMEM_LOG_SIZE+1)'(`VX_CFG_SMEM_PER_SM_MAX);
         `endif
         end else if (dcr_req_valid && dcr_req_rw) begin
             case(dcr_req_addr)
@@ -168,6 +182,9 @@ module VX_kmu import VX_gpu_pkg::*; import VX_trace_pkg::*; #(
                 `VX_DCR_KMU_BLOCK_DIM_Z: dcr_block_dim[2] <= dcr_req_data[CTA_TID_WIDTH:0];
                 // Local memory size
                 `VX_DCR_KMU_LMEM_SIZE:   dcr_lmem_size  <= dcr_req_data[`VX_CFG_LMEM_LOG_SIZE:0];
+            `ifdef VX_CFG_H100_SM_ENABLE
+                `VX_DCR_KMU_SMEM_CONFIG: dcr_smem_r     <= dcr_req_data[`VX_CFG_LMEM_LOG_SIZE:0];
+            `endif
                 // Block size (total threads per CTA)
                 `VX_DCR_KMU_BLOCK_SIZE:  dcr_block_size <= dcr_req_data[CTA_TID_WIDTH:0];
                 // Warp steps
@@ -407,6 +424,9 @@ module VX_kmu import VX_gpu_pkg::*; import VX_trace_pkg::*; #(
     assign kmu_req.param     = `VX_CFG_MEM_ADDR_WIDTH'(dcr_param);
     assign kmu_req.ctx_id    = ctx_id_r;
     assign kmu_req.aligned_lmem_size = aligned_lmem_size_r;
+`ifdef VX_CFG_H100_SM_ENABLE
+    assign kmu_req.smem_bytes = dcr_smem_r;
+`endif
     assign kmu_req.args.compute = kmu_comp;
 
     // A compute message is one CLUSTER and carries no placement hint: the fan-out

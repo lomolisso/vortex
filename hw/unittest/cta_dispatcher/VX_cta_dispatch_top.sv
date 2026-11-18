@@ -44,6 +44,9 @@ module VX_cta_dispatch_top import VX_gpu_pkg::*;
     input  wire [CTA_TID_WIDTH-1:0]     in_warp_step_z,
     input  wire [7:0]                   in_ctx_id,
     input  wire [31:0]                  in_cluster_size,
+`ifdef VX_CFG_H100_SM_ENABLE
+    input  wire [`VX_CFG_LMEM_LOG_SIZE:0]      in_smem_bytes,
+`endif
 `ifdef VX_CFG_EXT_DLMEM_ENABLE
     input  wire [31:0]                  in_cluster_rank,
 `endif
@@ -117,9 +120,16 @@ module VX_cta_dispatch_top import VX_gpu_pkg::*;
     //   aligned_lmem_size  — in_lmem_size rounded up to MEM_BLOCK_SIZE.
     //   ctx_id, cluster_size, is_first_of_cluster — the KMU's launch id and
     //   cluster walk.
+`ifdef VX_CFG_H100_SM_ENABLE
+    // As the KMU: the pitch rounds to the slot alignment; S (in_smem_bytes) is the launch's carve-out.
+    wire [`VX_CFG_LMEM_LOG_SIZE:0] aligned_lmem_size_w =
+        ((`VX_CFG_LMEM_LOG_SIZE+1)'(in_lmem_size) + (`VX_CFG_LMEM_LOG_SIZE+1)'(`VX_CFG_LMEM_SLOT_ALIGN-1))
+        & ~((`VX_CFG_LMEM_LOG_SIZE+1)'(`VX_CFG_LMEM_SLOT_ALIGN-1));
+`else
     wire [`VX_CFG_LMEM_LOG_SIZE:0] aligned_lmem_size_w =
         ((`VX_CFG_LMEM_LOG_SIZE+1)'(in_lmem_size) + (`VX_CFG_LMEM_LOG_SIZE+1)'(`VX_CFG_MEM_BLOCK_SIZE-1))
         & ~((`VX_CFG_LMEM_LOG_SIZE+1)'(`VX_CFG_MEM_BLOCK_SIZE-1));
+`endif
 
     // The bus carries the launch as a flat data beat; the dispatcher casts it
     // back to kmu_req_t. CTA ids are allocated inside the dispatcher.
@@ -132,6 +142,9 @@ module VX_cta_dispatch_top import VX_gpu_pkg::*;
         kmu_req.param             = in_param;
         kmu_req.ctx_id            = in_ctx_id;
         kmu_req.aligned_lmem_size = aligned_lmem_size_w;
+    `ifdef VX_CFG_H100_SM_ENABLE
+        kmu_req.smem_bytes        = in_smem_bytes;
+    `endif
         kmu_req.args.compute.grid_dim[0]  = in_grid_dim_x;
         kmu_req.args.compute.grid_dim[1]  = in_grid_dim_y;
         kmu_req.args.compute.grid_dim[2]  = in_grid_dim_z;

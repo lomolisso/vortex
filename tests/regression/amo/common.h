@@ -115,6 +115,15 @@ constexpr uint32_t lrsc_bank_stations(uint32_t entries) {
 #define CASG_D_SEED(h)   (0x1234567800000001ull + ((uint64_t)(h) << 4))
 #define CASG_D_NEW(h)    (0x8765432100000000ull | (uint64_t)(h))
 
+// lrsc_wide_lmem (RV64, kernel_cas.vxbin): two doublewords in local memory;
+// the kernel copies them, as four words, to the start of the shared buffer.
+#if VX_CFG_EXT_ZACAS_ENABLED
+#define LRSCW_TEST       24
+#else
+#define LRSCW_TEST       20
+#endif
+#define LRSCW_OUT_WORDS  4
+
 // Args shared between host (main.cpp) and the GPU kernel (kernel.cpp).
 // Layout matches dogfood's, with `iters` added for the contention loops.
 typedef struct {

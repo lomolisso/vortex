@@ -452,6 +452,19 @@ bool ProcessorImpl::cycle() {
 }
 
 int ProcessorImpl::dcr_write(uint32_t addr, uint32_t value) {
+#ifdef VX_CFG_H100_SM_ENABLE
+  // The carve-out sits past the KMU state range; the KMU stamps it on every
+  // CTA message and every core latches it.
+  if (addr == VX_DCR_KMU_SMEM_CONFIG) {
+    kmu_->dcr_write(addr, value);
+    for (auto& cluster : clusters_) {
+      cluster->dcr_write(addr, value);
+    }
+    return 0;
+  }
+#else
+#line 413
+#endif
   // KMU DCRs route to the KMU; a DLMEM core also keeps a copy for its CSRs.
   bool is_kmu_dcr = (addr >= VX_DCR_KMU_STATE_BEGIN && addr < VX_DCR_KMU_STATE_END);
   if (is_kmu_dcr) {

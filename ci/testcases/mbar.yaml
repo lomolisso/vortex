@@ -127,8 +127,8 @@ tests:
 
   # SimX<->rtlsim parity at XLEN 64: no spin (the warps meet in a register
   # barrier where they would wait, then test_wait must pass at once), so the
-  # instruction count is exact; the arrive holds and the bank's atomic timing
-  # set the cycles.
+  # instruction count is exact; the arrives' AMO passes and the op queue's
+  # stage set the cycles.
   - id: parity-mbar-local
     check: model_parity
     app: mbar_local
@@ -1280,14 +1280,14 @@ tests:
     args: "-m groups"
   - id: h100sm-cp_async-bar
     app: cp_async
-    drivers: [simx]
+    drivers: [simx, rtlsim]
     configs+: *cpa_h100_configs
-    shape: {warps: 8, threads: 16}
+    shape: &cpa_h100_bar_shape {warps: 8, threads: 16}
     touches: *cpa_h100_touches
     args: "-m bar"
   - id: h100sm-cp_async-stream
     app: cp_async
-    drivers: [simx]
+    drivers: [simx, rtlsim]
     configs+: *cpa_h100_configs
     shape: {cores: 2, threads: 16}
     touches: *cpa_h100_touches
@@ -4004,3 +4004,55 @@ tests:
             sw/common/l1_ref.h, sw/common/sm_port_ref.h, tests/regression/smem_bank, tests/regression/l1_sector,
             tests/regression/sm_port]
     args: "-m all -d 0"
+
+  # mbarrier op costs (structure, sw/common/smem_bank_ref.h): every op kind answers after one AMO pass plus the op
+  # queue's stage, alike for every kind; complete_tx issues at expect_tx's rate; one update per bank pair per cycle;
+  # the H100's values (12/spec.md §4.1, 13/spec.md §9.5) are printed as H100REF lines. The chases check +-3 cycles, not +-1: their dependent AND + ADD on
+  # today's one-warp front end land at a phase that depends on the response, a limit of the method that both
+  # models share (the exact +-1 is unittest:hw-sm-sram / sw-sm-sram on the per-op response cycles).
+  - id: mbar_cost-lat
+    via: blackbox
+    drivers: [simx, rtlsim]
+    xlen: [64]
+    app: mbar_cost
+    configs: "-DVX_CFG_H100_SM_ENABLE -DVX_CFG_L2_ENABLE -DVX_CFG_EXT_DLMEM_ENABLE -DVX_CFG_EXT_A_ENABLE -DVX_CFG_EXT_MBAR_ENABLE"
+    shape: {cores: 1, warps: 4, threads: 32}
+    touches: &mbar_cost_touches
+      [VX_config.toml, hw/rtl/VX_gpu_pkg.sv, hw/rtl/mem, hw/rtl/core, hw/rtl/dlmem, hw/rtl/libs/VX_level_arbiter.sv,
+       sim/simx, sw/common/smem_bank_ref.h, sw/kernel/include/vx_mbar.h, tests/regression/mbar_cost]
+    args: "-m lat"
+  - id: mbar_cost-issue
+    via: blackbox
+    drivers: [simx]
+    xlen: [64]
+    app: mbar_cost
+    configs: "-DVX_CFG_H100_SM_ENABLE -DVX_CFG_L2_ENABLE -DVX_CFG_EXT_DLMEM_ENABLE -DVX_CFG_EXT_A_ENABLE -DVX_CFG_EXT_MBAR_ENABLE -DVX_CFG_EXT_DXA_ENABLE"
+    shape: {cores: 1, warps: 4, threads: 32}
+    touches: *mbar_cost_touches
+    args: "-m issue,bulk"
+  - id: mbar_cost-update
+    via: blackbox
+    drivers: [simx]
+    xlen: [64]
+    app: mbar_cost
+    configs: "-DVX_CFG_H100_SM_ENABLE -DVX_CFG_L2_ENABLE -DVX_CFG_EXT_DLMEM_ENABLE -DVX_CFG_EXT_A_ENABLE -DVX_CFG_EXT_MBAR_ENABLE"
+    shape: {cores: 1, warps: 32, threads: 32}
+    touches: *mbar_cost_touches
+    args: "-m update"
+  - id: model_parity-mbar-cost
+    check: model_parity
+    xlen: [64]
+    app: mbar_cost
+    configs: "-DVX_CFG_H100_SM_ENABLE -DVX_CFG_L2_ENABLE -DVX_CFG_EXT_DLMEM_ENABLE -DVX_CFG_EXT_A_ENABLE -DVX_CFG_EXT_MBAR_ENABLE"
+    shape: {cores: 1, warps: 4, threads: 32}
+    touches: *mbar_cost_touches
+    args: "-m lat,issue"
+  # cp.async landing in the H100 SM array's fill class, cycle for cycle on both models.
+  - id: model_parity-h100sm-cp_async
+    check: model_parity
+    xlen: [64]
+    app: cp_async
+    configs+: *cpa_h100_configs
+    shape: *cpa_h100_bar_shape
+    touches: *cpa_h100_touches
+    args: "-m bar"

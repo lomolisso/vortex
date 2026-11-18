@@ -234,6 +234,12 @@ void CtaDispatcher::admit(uint64_t now) {
   uint32_t stride = (next.lmem_size + VX_CFG_MEM_BLOCK_SIZE - 1u) & ~uint32_t(VX_CFG_MEM_BLOCK_SIZE - 1u);
 #endif
 #line 202
+#ifdef VX_CFG_H100_SM_ENABLE
+  stride = (next.lmem_size + VX_CFG_LMEM_SLOT_ALIGN - 1u) / VX_CFG_LMEM_SLOT_ALIGN * VX_CFG_LMEM_SLOT_ALIGN;
+  lmem_capacity_ = next.smem_bytes;
+#else
+#line 201
+#endif
   uint32_t max_slots = usable_slots(stride);
 
   // Round-robin slot allocation over the usable range. Normalize the tail in

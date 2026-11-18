@@ -48,6 +48,11 @@ public:
       req.block_dim[1]        = 1;
       req.block_dim[2]        = 1;
       req.lmem_size           = 0;
+#ifdef VX_CFG_H100_SM_ENABLE
+      req.smem_bytes          = VX_CFG_SMEM_PER_SM_MAX;
+#else
+#line 50
+#endif
       req.cluster_dim[0]      = b.k;
       req.cluster_dim[1]      = 1;
       req.cluster_dim[2]      = 1;

@@ -17,6 +17,9 @@
 #include "vortex2_internal.h"
 #include "caps.h"
 #include <dlmem_ref.h>
+#ifdef VX_CFG_H100_SM_ENABLE
+#include <smem_carveout.h>
+#endif
 
 #include <algorithm>
 #include <cstddef>
@@ -102,6 +105,14 @@ vx_result_t cluster_info(vx_device_h dev, const vx_launch_info_t* info, ClusterI
     ci.spread = ci.dlmem && (ci.policy == VX_CLUSTER_POLICY_SPREAD
                           || (ci.policy == VX_CLUSTER_POLICY_DEFAULT && ci.k > 1));
     ci.warps = std::max<uint64_t>((block_size + ci.nt - 1) / std::max<uint64_t>(ci.nt, 1), 1);
+#ifdef VX_CFG_H100_SM_ENABLE
+    // The dispatcher's bound: footprints in the launch's carve-out.
+    uint32_t s_bytes = 0;
+    r = vx::smem_carveout(info, &s_bytes);
+    if (r != VX_SUCCESS) return r;
+    const uint64_t fp = smem_cta_footprint(info->lmem_size, smem_carve_cfg());
+    ci.slots = (fp == 0) ? max_ctas_sm : std::min<uint64_t>(max_ctas_sm, s_bytes / fp);
+#else
     // The dispatcher's slot pitch: the request rounded up to a cache line, or
     // to a local-memory row in a DXA build.
     uint64_t align = line;
@@ -110,10 +121,31 @@ vx_result_t cluster_info(vx_device_h dev, const vx_launch_info_t* info, ClusterI
 #endif
     const uint64_t stride = (info->lmem_size + align - 1) / align * align;
     ci.slots = (stride == 0) ? max_ctas_sm : std::min(max_ctas_sm, ci.lmem_cap / stride);
+#endif
     ci.per_core = (ci.warps > ci.nw) ? 0 : std::min(ci.slots, ci.nw / ci.warps);
     *out = ci;
     return VX_SUCCESS;
 }
+
+#ifdef VX_CFG_H100_SM_ENABLE
+vx_result_t smem_carveout(const vx_launch_info_t* info, uint32_t* s_bytes) {
+    int32_t hint = -1;
+    if (info->struct_size >= offsetof(vx_launch_info_t, smem_carveout) + sizeof(info->smem_carveout)
+     && info->smem_carveout != 0) {
+        if (info->smem_carveout > 101) return VX_ERR_INVALID_VALUE;
+        hint = int32_t(info->smem_carveout) - 1;
+    }
+    uint32_t threads = 1, k = 1;
+    for (uint32_t i = 0; i < info->ndim && i < 3; ++i) {
+        threads *= std::max<uint32_t>(info->block_dim[i], 1);
+        k *= std::max<uint32_t>(info->cluster_dim[i], 1);
+    }
+    const int32_t s = smem_config_choose(info->lmem_size, threads, k > 1, hint, smem_carve_cfg());
+    if (s < 0) return VX_ERR_INVALID_VALUE;
+    *s_bytes = uint32_t(s);
+    return VX_SUCCESS;
+}
+#endif
 
 } // namespace vx
 

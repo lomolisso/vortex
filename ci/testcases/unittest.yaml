@@ -80,7 +80,7 @@ tests:
   - id: hw-cta
     via: script
     run: "make -C hw/unittest run-cta"
-    touches: [hw/rtl/core/VX_cta_dispatch.sv, hw/rtl/VX_kmu.sv, hw/rtl/VX_gpu_pkg.sv,
+    touches: [hw/rtl/core/VX_cta_dispatch.sv, hw/rtl/VX_kmu.sv, hw/rtl/VX_gpu_pkg.sv, sw/common/smem_carveout.h,
               hw/unittest/cta_dispatcher, hw/unittest/kmu, hw/unittest/Makefile]
   # Chip-wide cluster dispatch (RV64 only): the admission next to the KMU at the
   # hierarchy shapes and today's 2 x 2, against dlmem_ref::place_chip, its CSV
@@ -236,6 +236,28 @@ tests:
     run: "make -C tests/unittest/mbar_ref run"
     touches: [sw/common/mbar_ref.h, tests/unittest/mbar_ref, tests/regression/mbar_ops/scripts.h,
               tests/regression/mbar_ops/common.h]
+  # The unified L1 / shared-memory array's port golden: row wavefronts, the
+  # level arbiter, read/write/AMO-path grants, DSMEM write merging and the
+  # mbarrier op costs and issue intervals.
+  - id: sw-sram-port-ref
+    via: script
+    run: "make -C tests/unittest/sram_port_ref run"
+    touches: [sw/common/smem_bank_ref.h, tests/unittest/sram_port_ref]
+  # The per-launch carve-out rule: no-hint choice against a brute-force search
+  # (default list and a shorter one with repeats), the hint rule on 05 §2's
+  # method cells, the measured 32-/1024-thread rows, the L1 left over, 03 §3's
+  # occupancy and the refusal above the largest configuration.
+  - id: sw-smem-carveout
+    via: script
+    run: "make -C tests/unittest/smem_carveout run"
+    touches: [sw/common/smem_carveout.h, tests/unittest/smem_carveout]
+  # The L1 on slots: victim choice with a full L1 at every configuration and a
+  # 129-line one, allocation rate under fill latency, protected window, uniform
+  # old draws, pool invariants, stragglers, and the directed slot paths.
+  - id: sw-l1-victim
+    via: script
+    run: "make -C tests/unittest/l1_victim run"
+    touches: [sw/common/l1_slot_ref.h, sw/common/l1_ref.h, tests/unittest/l1_victim]
   # The DXA golden model: the PTX §5.5.7 swizzle tables cell for cell, the
   # three §5.5.4 im2col examples pixel for pixel, the complete_tx counts,
   # per-element fill with signed coordinates and element strides, the
@@ -320,37 +342,58 @@ tests:
               tests/unittest/Makefile, sw/common/mbar_ref.h]
   # The H100 SM path (RV64, VX_CFG_H100_SM_ENABLE). Each RTL bench runs its SimX
   # twin on the same cases; the shared-memory port and L1 timing CSVs must be
-  # identical. The shared-memory port: wavefronts over 4-B banks with
+  # identical. The SM array's shared class: wavefronts over 4-B banks with
   # broadcast, atomic passes and every read's latency against
-  # smem_bank_ref.h, the other clients ahead of the LSU, one wavefront a cycle
-  # over 4 LSU blocks, counted DLMEM loads, 16 threads.
+  # smem_bank_ref.h, TCU row reads ahead of the LSU on the read port, one
+  # wavefront a cycle over 4 LSU blocks, counted DLMEM lanes, 16 threads;
+  # mbarrier ops: response time, word and bank event of each op against
+  # smem_bank_ref.h / mbar_ref.h, one op a cycle through the op queue, a
+  # cp.async arrive from the copy unit's port beside an LSU op on one word.
   - id: hw-lmem-banks
     via: script
     xlen: [64]
     run: "make -C hw/unittest run-lmem-banks"
-    touches: &e12_smem_touches [hw/rtl/mem/VX_smem_gate.sv, hw/rtl/mem/VX_lsu_mem_if.sv, hw/rtl/VX_gpu_pkg.sv,
-              hw/rtl/libs, sw/common/smem_bank_ref.h, hw/unittest/smem_gate, hw/unittest/Makefile,
-              sim/simx/mem/smem_gate.h, sim/simx/types.h, tests/unittest/smem_bank, VX_config.toml]
+    touches: &e12_smem_touches [hw/rtl/mem/VX_sm_sram.sv, hw/rtl/mem/VX_lsu_mem_if.sv, hw/rtl/VX_gpu_pkg.sv,
+              hw/rtl/libs, sw/common/smem_bank_ref.h, sw/common/l1_slot_ref.h, hw/unittest/sm_sram, hw/unittest/Makefile,
+              sim/simx/mem/sm_sram.h, sim/simx/mem/sm_sram.cpp, sim/simx/types.h, tests/unittest/smem_bank, VX_config.toml,
+              sw/common/mbar_ref.h, hw/rtl/cache/VX_amo_alu.sv]
   - id: sw-smem-bank
     via: script
     xlen: [64]
     run: "make -C tests/unittest/smem_bank run CONFIGS='-DVX_CFG_H100_SM_ENABLE -DVX_CFG_NUM_THREADS=32 -DVX_CFG_EXT_A_ENABLE -DVX_CFG_EXT_ZACAS_ENABLE'"
     touches: *e12_smem_touches
-  # The SM's L1 (VX_cache with H100_L1): sector fills, byte-valid store
-  # allocate, the XOR set index, insertion-ordered replacement, whole-L1
-  # invalidation, one line request per miss with its sector mask, two misses
-  # to one line; every outcome against l1_ref.h, at 16 and 32 ways.
+  # Every client of the SM array's ports at once (row reads of TCU, DXA and
+  # DSMEM, DXA row writes, one-lane atomics of DXA and DSMEM, LSU loads,
+  # stores and atomics), cycle by cycle against SramPortRef's grants; again
+  # with non-default priority levels.
+  - id: hw-sm-sram
+    via: script
+    xlen: [64]
+    run: "make -C hw/unittest run-sm-sram"
+    touches: *e12_smem_touches
+  - id: sw-sm-sram
+    via: script
+    xlen: [64]
+    run: "make -C tests/unittest/smem_bank run CONFIGS='-DVX_CFG_H100_SM_ENABLE -DVX_CFG_NUM_THREADS=32 -DVX_CFG_EXT_A_ENABLE -DVX_CFG_EXT_ZACAS_ENABLE' OPTS='--unified --seed=11 --random=4000'"
+    touches: *e12_smem_touches
+  # The SM's L1 on the unified array (VX_sm_l1 + VX_sm_sram): sector fills,
+  # word-valid store allocate, in-set and age-list victims, atomic clears,
+  # borrowed non-cacheable slots, whole-L1 invalidation, one line request per
+  # miss with its sector mask, every sequential outcome against l1_slot_ref.h;
+  # overlapped store/evict/fill hazards against a flat memory; both index hashes.
   - id: hw-cache-l1h100
     via: script
     xlen: [64]
     run: "make -C hw/unittest run-l1h100"
-    touches: &e12_l1_touches [hw/rtl/cache, hw/rtl/VX_gpu_pkg.sv, hw/rtl/libs, sw/common/l1_ref.h,
-              hw/unittest/l1h100, hw/unittest/Makefile, sim/simx/mem/cache.h, sim/simx/mem/cache.cpp,
-              sim/simx/mem/sm_port.h, tests/unittest/l1_sector, VX_config.toml]
+    touches: &e12_l1_touches [hw/rtl/mem/VX_sm_l1.sv, hw/rtl/mem/VX_sm_l1_tags.sv, hw/rtl/mem/VX_sm_l1_slots.sv,
+              hw/rtl/mem/VX_sm_sram.sv, hw/rtl/VX_gpu_pkg.sv, hw/rtl/libs, sw/common/l1_slot_ref.h,
+              hw/unittest/l1h100, hw/unittest/sm_sram/VX_sm_sram_top.sv, hw/unittest/Makefile,
+              sim/simx/mem/sm_l1.h, sim/simx/mem/sm_l1.cpp, sim/simx/mem/sm_sram.h, sim/simx/mem/sm_sram.cpp,
+              tests/unittest/l1_sector, VX_config.toml]
   - id: sw-l1-sector
     via: script
     xlen: [64]
-    run: "make -C tests/unittest/l1_sector run CONFIGS='-DVX_CFG_H100_SM_ENABLE -DVX_CFG_NUM_THREADS=32'"
+    run: "make -C tests/unittest/l1_sector run CONFIGS='-DVX_CFG_H100_SM_ENABLE -DVX_CFG_NUM_THREADS=32 -DVX_CFG_EXT_A_ENABLE -DVX_CFG_EXT_ZACAS_ENABLE'"
     touches: *e12_l1_touches
   # The SM port: egress rates and every leave cycle against sm_port_ref.h's
   # SmEgressRef, the single-sector issue limits, the injection credit loop,

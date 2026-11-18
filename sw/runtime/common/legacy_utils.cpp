@@ -21,6 +21,10 @@
 #include <unordered_map>
 #include <vortex.h>
 #include <assert.h>
+#ifdef VX_CFG_H100_SM_ENABLE
+#include <smem_carveout.h>
+#endif
+#line 24
 
 extern int vx_upload_kernel_bytes(vx_device_h hdevice, const void* content, uint64_t size, vx_buffer_h* hbuffer) {
   if (nullptr == hdevice || nullptr == content || size <= 8 || nullptr == hbuffer)
@@ -166,6 +170,18 @@ int vx_check_occupancy(vx_device_h hdevice, uint32_t block_size, uint32_t max_lo
   // fail — it simply lowers co-residency. Match that here: the only hard limit
   // is a single block exceeding total LMEM. Requesting more than the
   // thread-limited share just trades occupancy for scratchpad.
+#ifdef VX_CFG_H100_SM_ENABLE
+  // One block must fit the largest carve-out; S, not the local-memory window, bounds co-residency.
+  {
+    const SmemCarveCfg carve = smem_carve_cfg();
+    if (smem_config_choose(max_localmem, block_size, false, -1, carve) < 0) {
+      printf("Error: kernel shared-memory request exceeds the largest carve-out (%u bytes)\n", max_localmem);
+      return -1;
+    }
+    blocks_per_core = (int)smem_occupancy(max_localmem, block_size, false, carve);
+  }
+#else
+#line 169
   if (max_localmem != 0) {
     uint64_t local_mem_size;
     CHECK_ERR(vx_dev_caps(hdevice, VX_CAPS_LOCAL_MEM_SIZE, &local_mem_size), {
@@ -185,6 +201,8 @@ int vx_check_occupancy(vx_device_h hdevice, uint32_t block_size, uint32_t max_lo
       blocks_per_core = blocks_by_lmem;
   }
 
+#endif
+#line 188
   (void)blocks_per_core;
   return 0;
 }

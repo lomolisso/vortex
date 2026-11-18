@@ -9,7 +9,7 @@
 # synthesizes, so both gates measure the same modules and a divergence between
 # them is meaningful rather than an artefact of two DUT lists.
 
-DUTS := cache core tcu gfx tex raster om rtu dxa vm tensor dlmem cta_gang dlmem_xlate dlmem_ep vortex
+DUTS := cache core tcu gfx tex raster om rtu dxa vm tensor dlmem cta_gang dlmem_xlate dlmem_ep sm_sram vortex
 
 UNITTEST_DIR ?= $(VORTEX_HOME)/hw/unittest
 
@@ -103,6 +103,11 @@ dlmem_xlate_CFG := -DVX_CFG_EXT_DLMEM_ENABLE -DVX_CFG_NUM_CORES=8 -DVX_CFG_SOCKE
 dlmem_ep_TOP := VX_dlmem_ep_top
 dlmem_ep_INC := -I$(VORTEX_HOME)/hw/rtl/dlmem -I$(UNITTEST_DIR)/dlmem_ep -I$(UNITTEST_DIR)/dlmem_noc
 dlmem_ep_CFG := -DVX_CFG_EXT_DLMEM_ENABLE -DVX_CFG_EXT_A_ENABLE -DVX_CFG_NUM_CORES=8 -DVX_CFG_SOCKET_SIZE=2
+
+# One SM's unified L1 / shared-memory array with the L1 tags, slots and MSHR.
+sm_sram_TOP := VX_sm_sram_top
+sm_sram_INC := -I$(UNITTEST_DIR)/sm_sram
+sm_sram_CFG := -DVX_CFG_H100_SM_ENABLE -DVX_CFG_NUM_THREADS=32 -DVX_CFG_EXT_A_ENABLE
 
 # The whole GPU. Hours-long; nightly only, never a PR gate.
 vortex_TOP := Vortex

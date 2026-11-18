@@ -329,8 +329,14 @@ int main(int argc, char** argv) {
   if (mode == MODE_BAR) lmem_bytes = 64 + BAR_MODES * 16 * T;
   if (mode == MODE_STREAM) lmem_bytes = 64 + 2 * 16 * T;
   if (mode == MODE_PIPE) lmem_bytes = 3 * 4 * D;
-  // All of it, so every block takes the one slot and the same bytes.
-  if (mode == MODE_ORPHAN) lmem_bytes = lmem_cap;
+  // All a block may request, so every block takes the one slot and the same
+  // bytes: the local-memory window can be larger than that (the H100 SM's
+  // 228 KiB in a 256 KiB window), and a launch past it is refused.
+  if (mode == MODE_ORPHAN) {
+    uint64_t optin = 0;
+    CHECK(vx_device_query(dev, VX_CAPS_SMEM_PER_BLOCK_OPTIN, &optin));
+    lmem_bytes = optin;
+  }
   if (mode == MODE_MIX) lmem_bytes = 2 * 16 * T;
   if (lmem_bytes > lmem_cap) {
     std::printf("Error: %zu bytes of local memory, the core has %lu\nFAILED!\n", lmem_bytes, (unsigned long)lmem_cap);

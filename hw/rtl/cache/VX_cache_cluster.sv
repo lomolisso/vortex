@@ -60,9 +60,6 @@ module VX_cache_cluster import VX_gpu_pkg::*; #(
 `ifdef VX_CFG_EXT_DLMEM_ENABLE
     parameter CTA_FENCE             = 0,      // A CTA-scope fence drains here, at any level, and goes no further.
 `endif
-`ifdef VX_CFG_H100_SM_ENABLE
-    parameter H100_L1               = 0,      // The H100 L1: byte-valid store allocate, XOR set index, line requests with a sector mask.
-`endif
 
     parameter AMO_ENABLE            = 0       // Enable atomic memory operations.
  ) (
@@ -156,9 +153,6 @@ module VX_cache_cluster import VX_gpu_pkg::*; #(
             .SHARED_LEVEL (SHARED_LEVEL),
         `ifdef VX_CFG_EXT_DLMEM_ENABLE
             .CTA_FENCE    (CTA_FENCE),
-        `endif
-        `ifdef VX_CFG_H100_SM_ENABLE
-            .H100_L1      (H100_L1),
         `endif
             .AMO_ENABLE   (AMO_ENABLE)
         ) cache_wrap (

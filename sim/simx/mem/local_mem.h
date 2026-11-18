@@ -27,6 +27,28 @@ struct MbarBankEvt {
   uint32_t row;
 };
 #endif
+#ifdef VX_CFG_H100_SM_ENABLE
+}
+#include "sm_sram.h"
+namespace vortex {
+// The core latches a launch's carve-out into its array; the hook shares a
+// line with Core::dcr_write, so a build without the H100 SM preprocesses to
+// the same text.
+#define LMEM_SMEM_CONFIG_HOOK(addr, value) if ((addr) == VX_DCR_KMU_SMEM_CONFIG) impl_->smem_config(value);
+#define LMEM_SMEM_CFG_RESET smem_cfg_dirty_ = true;
+#define LMEM_SMEM_CFG_TICK this->smem_cfg_send();
+// The L1's queued misses and write-throughs hold the core, as its busy does
+// in the RTL; the core has one dcache port, the L1's.
+#define LMEM_SM_L1_RUNNING if (sm_l1_->busy()) return true;
+#define CORE_DCACHE_PORTS 1
+#else
+#define LMEM_SMEM_CONFIG_HOOK(addr, value)
+#define LMEM_SMEM_CFG_RESET
+#define LMEM_SMEM_CFG_TICK
+#define LMEM_SM_L1_RUNNING
+#define CORE_DCACHE_PORTS VX_CFG_DCACHE_NUM_REQS
+#line 29
+#endif
 
 class LocalMem : public SimObject<LocalMem> {
 public:
@@ -115,38 +137,9 @@ protected:
   friend class SimObject<LocalMem>;
 #ifdef VX_CFG_H100_SM_ENABLE
 public:
-  // A client other than the LSU blocks presented an access, toward the shared-memory port.
-  SimChannel<bool> ExtOut{this};
+  // Toward the SM's one array: row reads, row writes, one-lane atomics, the DSMEM merge state.
+  SmSramClientPorts ArrayPorts{this};
 #endif
 };
 
 }
-
-#ifdef VX_CFG_H100_SM_ENABLE
-#include "smem_gate.h"
-#endif
-
-// The bytes a bank interleaves by inside LocalMem: the H100's 4-B banks (an 8-B
-// lane on the even bank of its pair), otherwise one lane word.
-#ifdef VX_CFG_H100_SM_ENABLE
-#define LMEM_BANK_GRAIN VX_CFG_LMEM_BANK_BYTES
-#else
-#define LMEM_BANK_GRAIN config_.line_size
-#endif
-
-// The H100's bank pairs (lmem_pair.h); each use shares a line with existing
-// code, so a build without the H100 SM preprocesses to the same text.
-#ifdef VX_CFG_H100_SM_ENABLE
-#include "lmem_pair.h"
-#define LMEM_PAIR_MEMBER LmemPairHold pair_hold_;
-#define LMEM_PAIR_RESET pair_hold_.reset(1u << config_.B);
-#define LMEM_PAIR_HELD(bank, req) \
-	if (pair_hold_.held(bank, (req).is_write() && !memop_is_atomic((req).op), (req).addr, (req).byteen, SimPlatform::instance().cycles())) \
-		continue;
-#define LMEM_PAIR_TAKE(bank, req) pair_hold_.take(bank, (req).addr, (req).byteen, SimPlatform::instance().cycles());
-#else
-#define LMEM_PAIR_MEMBER
-#define LMEM_PAIR_RESET
-#define LMEM_PAIR_HELD(bank, req)
-#define LMEM_PAIR_TAKE(bank, req)
-#endif

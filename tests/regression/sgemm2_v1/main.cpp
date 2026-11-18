@@ -170,8 +170,9 @@ int main(int argc, char *argv[]) {
   vx_queue_info_t qi = { sizeof(qi), nullptr, VX_QUEUE_PRIORITY_NORMAL, 0 };
   RT_CHECK(vx_queue_create(device, &qi, &queue));
 
-  uint64_t num_cores, num_threads;
+  uint64_t num_cores, num_warps, num_threads;
   RT_CHECK(vx_device_query(device, VX_CAPS_NUM_CORES, &num_cores));
+  RT_CHECK(vx_device_query(device, VX_CAPS_NUM_WARPS, &num_warps));
   RT_CHECK(vx_device_query(device, VX_CAPS_NUM_THREADS, &num_threads));
 
   uint32_t size_sq = size * size;
@@ -247,6 +248,9 @@ int main(int argc, char *argv[]) {
     li.ndim         = 1;
     li.grid_dim[0]  = (uint32_t)num_cores;
     li.block_dim[0] = (uint32_t)num_threads;
+    // vx_spawn_threads runs up to num_warps / warps_per_group groups per core, each at its own __local_mem slice.
+    uint32_t warps_per_group = (group_size + (uint32_t)num_threads - 1) / (uint32_t)num_threads;
+    li.lmem_size    = (uint32_t)num_warps / warps_per_group * local_mem;
     RT_CHECK(vx_enqueue_launch(queue, &li, 0, nullptr, &launch_ev));
   }
 

@@ -76,9 +76,9 @@ inline sm_port_ref::SmPortCfg sm_port_cfg() {
 // (the L1's and the TMA engine's line requests, this SM's SM-to-SM packets)
 // enter one in-order FIFO, one per cycle round robin over the sources; the
 // replies this SM serves wait in the response queue. A paid L2-side item
-// waits egress_delay cycles, then leaves as one memory block per cycle; its
-// reply blocks are gathered into one line, wait ingress_delay cycles and pass
-// the ingress gate with the SM-to-SM arrivals.
+// passes the output register, then leaves as one memory block per cycle; its
+// reply blocks are gathered into one line, pass the input register and the
+// ingress gate with the SM-to-SM arrivals.
 //
 // The memory tag carries what the reply needs on the way back: the source,
 // the blocks sent and the sectors the reply brings into the SM.
@@ -88,17 +88,9 @@ public:
 
   enum { SRC_L1 = 0, SRC_TMA = 1, MAX_SRCS = 2 };
 
-  // The port's own cycles on an L2 access besides its two delays: a request
-  // block reaches the memory side 3 cycles after it reached the port (push,
-  // payment, adapter) and a reply block its source 2 cycles after arriving
-  // (gather, ingress gate).
-  static constexpr uint32_t MISS_STAGES = 5;
-
   struct Config {
     uint32_t num_srcs;
     uint32_t line_bytes;
-    uint32_t egress_delay;
-    uint32_t ingress_delay;
   };
 
   std::vector<SimChannel<MemReq>> SrcReqIn;
@@ -137,9 +129,7 @@ public:
     , egress_(cfg_)
     , ingress_(cfg_)
     , sectors_(config.line_bytes / cfg_.beat_bytes)
-    , blocks_(config.line_bytes / VX_CFG_MEM_BLOCK_SIZE)
-    , eg_depth_(depth_of(config.egress_delay))
-    , ig_depth_(depth_of(config.ingress_delay)) {
+    , blocks_(config.line_bytes / VX_CFG_MEM_BLOCK_SIZE) {
     if (config.num_srcs < 1 || config.num_srcs > MAX_SRCS)
       throw std::runtime_error("sm port: one L1 and at most one TMA source");
     if (cfg_.beat_bytes != VX_CFG_DCACHE_SECTOR_SIZE)
@@ -168,8 +158,8 @@ public:
       if (!in.empty())
         return false;
     }
-    return egress_.empty() && req_items_.empty() && rsp_items_.empty() && eg_delay_.empty()
-        && ig_delay_.empty() && MemReqOut.size() == 0 && MemRspIn.empty()
+    return egress_.empty() && req_items_.empty() && rsp_items_.empty() && out_reg_.empty()
+        && in_reg_.empty() && MemReqOut.size() == 0 && MemRspIn.empty()
       #ifdef VX_CFG_EXT_DLMEM_ENABLE
         && DsmReqOut.size() == 0 && DsmRspOut.size() == 0
         && ArrReqOut.size() == 0 && ArrRspOut.size() == 0
@@ -186,10 +176,10 @@ protected:
       s.clear();
     req_items_.clear();
     rsp_items_.clear();
-    eg_delay_.clear();
+    out_reg_.clear();
     pend_.clear();
     pend_free_.clear();
-    ig_delay_.clear();
+    in_reg_.clear();
     adapter_blk_ = 0;
     rr_last_ = 0;
     idle_ = 0;
@@ -215,8 +205,8 @@ protected:
 private:
   enum { DSM = MAX_SRCS };
   static constexpr uint32_t TAG_BLK_BITS = 2;
-  // The RTL's output buffers hold two entries.
-  static constexpr uint32_t OUT_DEPTH = 2;
+  static constexpr uint32_t OUT_DEPTH = sm_port_ref::SM_PORT_REG_DEPTH;
+  static constexpr uint32_t IN_DEPTH  = sm_port_ref::SM_PORT_REG_DEPTH;
 
   struct Staged {
     MemReq req;
@@ -233,8 +223,8 @@ private:
   #endif
   };
 
-  struct Delayed {
-    uint64_t release;
+  struct RegItem {
+    uint64_t valid_at;
     Item item;
   };
 
@@ -247,18 +237,11 @@ private:
   };
 
   struct Reply {
-    uint64_t release;
+    uint64_t valid_at;
     uint32_t src;
     uint32_t sectors;
     std::vector<MemRsp> blocks;
   };
-
-  static uint32_t depth_of(uint32_t delay) {
-    uint32_t d = 1;
-    while (d < delay + 2)
-      d <<= 1;
-    return (delay == 0) ? 2 : d;
-  }
 
   void collect_blocks(uint64_t now) {
     for (uint32_t s = 0; s < SrcReqIn.size(); ++s) {
@@ -427,7 +410,7 @@ private:
   }
 
   void drain(uint64_t now) {
-    bool l2_ready = eg_delay_.size() < eg_depth_;
+    bool l2_ready = out_reg_.size() < OUT_DEPTH;
   #ifdef VX_CFG_EXT_DLMEM_ENABLE
     bool dsm_ready = room(DsmReqOut, 1);
     bool rsp_ready = room(DsmRspOut, 1);
@@ -440,7 +423,7 @@ private:
       Item it = std::move(req_items_.front());
       req_items_.pop_front();
       if (pops.req_item.l2) {
-        eg_delay_.push_back(Delayed{now + 1 + config_.egress_delay, std::move(it)});
+        out_reg_.push_back(RegItem{now + sm_port_ref::SM_PORT_OUT_STAGES, std::move(it)});
       } else {
       #ifdef VX_CFG_EXT_DLMEM_ENABLE
         DsmReqOut.send(it.dsm, 1);
@@ -457,14 +440,14 @@ private:
   #endif
   }
 
-  // One memory block per cycle from the head line once its delay has passed;
+  // One memory block per cycle from the output register's head line;
   // an item that answers holds a pending entry, named by the blocks' tags.
   void adapter_send(uint64_t now) {
-    if (eg_delay_.empty() || eg_delay_.front().release > now)
+    if (out_reg_.empty() || out_reg_.front().valid_at > now)
       return;
     if (MemReqOut.full())
       return;
-    auto& d = eg_delay_.front();
+    auto& d = out_reg_.front();
     uint32_t nblk = d.item.blocks.size();
     if (adapter_blk_ == 0 && d.item.expects) {
       if (pend_free_.empty()) {
@@ -491,12 +474,14 @@ private:
     MemReqOut.send(req, 1);
     if (++adapter_blk_ == nblk) {
       adapter_blk_ = 0;
-      eg_delay_.pop_front();
+      out_reg_.pop_front();
     }
   }
 
+  // The input register takes replies while it has room, as the RTL's in_buf
+  // drives the L2's response ready.
   void gather_replies(uint64_t now) {
-    while (!MemRspIn.empty()) {
+    while (!MemRspIn.empty() && in_reg_.size() < IN_DEPTH) {
       MemRsp rsp = MemRspIn.peek();
       MemRspIn.pop();
       uint32_t idx = uint32_t(rsp.tag >> TAG_BLK_BITS);
@@ -511,7 +496,7 @@ private:
       rsp.tag = tags_.at(idx).at(blk);
       p.blocks.at(blk) = rsp;
       if (++p.got == p.blocks.size()) {
-        ig_delay_.push_back(Reply{now + 1 + config_.ingress_delay, p.src, p.sect, std::move(p.blocks)});
+        in_reg_.push_back(Reply{now + sm_port_ref::SM_PORT_IN_STAGES, p.src, p.sect, std::move(p.blocks)});
         p.blocks.clear();
         pend_free_.push_back(idx);
       }
@@ -524,8 +509,8 @@ private:
     uint32_t sectors[G::NSRC] = {0, 0, 0};
     bool ready[G::NSRC] = {false, false, false};
     bool pass[G::NSRC];
-    if (!ig_delay_.empty() && ig_delay_.front().release <= now) {
-      auto& r = ig_delay_.front();
+    if (!in_reg_.empty() && in_reg_.front().valid_at <= now) {
+      auto& r = in_reg_.front();
       valid[G::FILL] = true;
       sectors[G::FILL] = r.sectors;
       ready[G::FILL] = room(SrcRspOut.at(r.src), r.blocks.size());
@@ -544,10 +529,10 @@ private:
   #endif
     ingress_.tick(valid, sectors, ready, pass);
     if (pass[G::FILL]) {
-      auto& r = ig_delay_.front();
+      auto& r = in_reg_.front();
       for (auto& b : r.blocks)
         SrcRspOut.at(r.src).send(b, 1);
-      ig_delay_.pop_front();
+      in_reg_.pop_front();
     }
   #ifdef VX_CFG_EXT_DLMEM_ENABLE
     if (pass[G::DSM_REQ]) {
@@ -567,8 +552,6 @@ private:
   sm_port_ref::SmIngressRef ingress_;
   uint32_t sectors_;
   uint32_t blocks_;
-  uint32_t eg_depth_;
-  uint32_t ig_depth_;
   std::deque<Staged> staged_[MAX_SRCS];
   std::deque<Item> req_items_;
 #ifdef VX_CFG_EXT_DLMEM_ENABLE
@@ -576,11 +559,11 @@ private:
 #else
   std::deque<int> rsp_items_;
 #endif
-  std::deque<Delayed> eg_delay_;
+  std::deque<RegItem> out_reg_;
   std::vector<Pending> pend_;
   std::vector<std::vector<uint32_t>> tags_;
   std::vector<uint32_t> pend_free_;
-  std::deque<Reply> ig_delay_;
+  std::deque<Reply> in_reg_;
   uint32_t adapter_blk_ = 0;
   uint32_t adapter_idx_ = 0;
   uint32_t rr_last_ = 0;

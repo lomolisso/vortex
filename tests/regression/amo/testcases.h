@@ -758,6 +758,48 @@ private:
 };
 #endif
 
+#if VX_CFG_XLEN == 64
+// lrsc_wide_lmem: lr.d/sc.d increments of the low word of a local doubleword
+// while other warps write only its high word, by amoadd.w (phase 0) and by one
+// lane's plain load and store (phase 1). Both words must count every update.
+class Test_LRSC_WIDE_LMEM : public ITestCase {
+public:
+  Test_LRSC_WIDE_LMEM(TestSuite* s, uint32_t num_threads)
+    : ITestCase(s, "lrsc_wide_lmem"), num_threads_(num_threads) {}
+  bool opt_in() const override { return true; }
+  uint32_t block_threads() const override { return suite_->num_warps() * num_threads_; }
+  const char* skip_reason() const override {
+    if (!(suite_->isa_flags() & VX_ISA_STD_A))
+      return "no atomics";
+    return (suite_->num_warps() > 1) ? nullptr : "one warp";
+  }
+  void setup(uint32_t, uint32_t* shared, uint32_t*) override {
+    for (uint32_t i = 0; i < LRSCW_OUT_WORDS; ++i) shared[i] = 0;
+  }
+  int verify(uint32_t, uint32_t iters, const uint32_t* shared, const uint32_t*) override {
+    const uint32_t warps = suite_->num_warps();
+    const uint32_t lr_lanes = ((warps + 1) / 2) * num_threads_;
+    const uint32_t want[LRSCW_OUT_WORDS] = {
+      lr_lanes * iters, (warps / 2) * num_threads_ * iters,  // amoadd.w phase
+      lr_lanes * iters, iters                                // store phase
+    };
+    static const char* what[LRSCW_OUT_WORDS] = {
+      "amoadd.w phase low (lr.d/sc.d)", "amoadd.w phase high",
+      "store phase low (lr.d/sc.d)", "store phase high"
+    };
+    int errors = 0;
+    for (uint32_t i = 0; i < LRSCW_OUT_WORDS; ++i) {
+      if (shared[i] == want[i]) continue;
+      std::cout << "  " << what[i] << "=" << shared[i] << " expected=" << want[i] << std::endl;
+      ++errors;
+    }
+    return errors;
+  }
+private:
+  uint32_t num_threads_;
+};
+#endif
+
 inline TestSuite::TestSuite(vx_device_h device) : device_(device) {
   uint64_t num_clusters, num_cores, num_warps, num_threads;
   RT_CHECK(vx_device_query(device, VX_CAPS_ISA_FLAGS, &isa_flags_));
@@ -811,6 +853,9 @@ inline TestSuite::TestSuite(vx_device_h device) : device_(device) {
 #if VX_CFG_EXT_ZACAS_ENABLED
   add_test(new Test_CAS_GLOBAL(this, "cas-global"));
   add_test(new Test_CAS_GLOBAL(this, "cas-local"));
+#endif
+#if VX_CFG_XLEN == 64
+  add_test(new Test_LRSC_WIDE_LMEM(this, (uint32_t)num_threads));
 #endif
 }
 

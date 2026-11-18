@@ -123,6 +123,26 @@ inline bool decode_caps(uint64_t dev_caps, uint64_t isa_caps, uint64_t org_caps,
   case CAPS_INTERNAL_CLUSTER_DISTINCT_SMS:
     *out = (org_caps >> 22) & 0x1;
     return true;
+#ifdef VX_CFG_H100_SM_ENABLE
+  // Build constants of the carve-out, as the runtime's carve-out choice reads them.
+  case VX_CAPS_SMEM_PER_SM:
+    *out = VX_CFG_SMEM_PER_SM_MAX;
+    return true;
+  case VX_CAPS_SMEM_PER_BLOCK_OPTIN:
+    *out = VX_CFG_SMEM_PER_CTA_MAX;
+    return true;
+  case VX_CAPS_SMEM_RESERVED_PER_BLOCK:
+    *out = 0;
+    return true;
+#else
+  case VX_CAPS_SMEM_PER_SM:
+  case VX_CAPS_SMEM_PER_BLOCK_OPTIN:
+    *out = 1ull << ((dev_caps >> 26) & 0xff);
+    return true;
+  case VX_CAPS_SMEM_RESERVED_PER_BLOCK:
+    *out = 0;
+    return true;
+#endif
   default:
     return false;
   }

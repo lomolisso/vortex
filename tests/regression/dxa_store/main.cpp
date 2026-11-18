@@ -952,7 +952,7 @@ int main(int argc, char** argv) {
   uint64_t nw = 0, nt = 0, lmem_cap = 0, isa = 0;
   CHECK(vx_device_query(dev, VX_CAPS_NUM_WARPS,      &nw));
   CHECK(vx_device_query(dev, VX_CAPS_NUM_THREADS,    &nt));
-  CHECK(vx_device_query(dev, VX_CAPS_LOCAL_MEM_SIZE, &lmem_cap));
+  CHECK(vx_device_query(dev, VX_CAPS_SMEM_PER_BLOCK_OPTIN, &lmem_cap));
   CHECK(vx_device_query(dev, VX_CAPS_ISA_FLAGS,      &isa));
 
   // Every host buffer stays alive until the queue has finished.

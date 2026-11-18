@@ -281,3 +281,72 @@ tests:
             hw/rtl/dlmem, hw/rtl/dxa, hw/rtl/libs/VX_mem_coalescer.sv, sim/simx, sw/common/smem_bank_ref.h,
             sw/common/l1_ref.h, sw/common/sm_port_ref.h, tests/regression/smem_bank, tests/regression/l1_sector,
             tests/regression/sm_port]
+  # The SM array's atomics and LR/SC on both models: every lane of four warps
+  # retries LR/SC on one word, so an SC outcome or a reservation rule that
+  # differs from RISC-V shows as a wrong count or a run of failed retries;
+  # lrsc_wide_lmem races lr.d/sc.d against writes to the reserved doubleword's
+  # upper word only (amoadd.w, then a plain store).
+  - id: org-amo-lmem
+    via: blackbox
+    drivers: [simx, rtlsim]
+    xlen: [64]
+    app: amo
+    configs: &amo_lmem_cfg "-DVX_CFG_H100_SM_ENABLE -DVX_CFG_EXT_A_ENABLE -DVX_CFG_EXT_ZACAS_ENABLE"
+    shape: &amo_lmem_shape {cores: 1, warps: 4, threads: 32, l2cache: true}
+    args: "-n8 -tamoadd_lmem -tlrsc_lmem -tcas_lmem -tlrsc_foreign_lmem -tamo_mixed_lmem -tld_mixed_lmem -tlrsc_wide_lmem"
+    touches: &amo_lmem_touches [VX_config.toml, hw/rtl/VX_gpu_pkg.sv, hw/rtl/mem/VX_sm_sram.sv,
+            hw/rtl/core/VX_lsu_slice.sv, hw/rtl/core/VX_mem_unit.sv, sim/simx/mem/sm_sram.h,
+            sim/simx/mem/sm_sram.cpp, sim/simx/amo, tests/regression/amo]
+  # The array's per-bank LR/SC stations (word and doubleword reservations) and
+  # its two-beat compare-and-swap, cycle for cycle on both models.
+  - id: model_parity-org-amo-lmem-rsv
+    check: model_parity
+    xlen: [64]
+    app: amo
+    configs: *amo_lmem_cfg
+    shape: *amo_lmem_shape
+    args: "-n8 -tlrsc_lmem -tcas_lmem -tlrsc_wide_lmem"
+    touches: *amo_lmem_touches
+  # Global LR/SC through the SM's L1 and the L2, each test alone (which warp wins
+  # follows the start state): every lane of four warps increments one word with
+  # LR/SC and a hart gives up after 4096 failed SCs in a row, so a path that lets
+  # one warp's atomics through at a time (the same warp then wins every round)
+  # shows as lost increments. rtlsim runs the same tests at 8 increments per hart.
+  - id: org-amo-lrsc
+    via: blackbox
+    drivers: [simx]
+    xlen: [64]
+    app: amo
+    configs: "-DVX_CFG_H100_SM_ENABLE -DVX_CFG_EXT_A_ENABLE -DVX_CFG_EXT_ZACAS_ENABLE"
+    shape: {cores: 1, warps: 4, threads: 32, l2cache: true}
+    args: "-tlrsc_counter"
+    touches: &org_amo_gl_touches [VX_config.toml, hw/rtl/VX_gpu_pkg.sv, hw/rtl/mem/VX_sm_l1.sv, hw/rtl/mem/VX_sm_port.sv,
+            hw/rtl/cache, hw/rtl/core/VX_lsu_slice.sv, sim/simx/mem/sm_l1.h, sim/simx/mem/sm_l1.cpp,
+            sim/simx/mem/sm_port.h, sim/simx/mem/cache.cpp, sim/simx/amo, sim/simx/lsu_unit.cpp, tests/regression/amo]
+  - id: org-amo-lrsc-aqrl
+    via: blackbox
+    drivers: [simx]
+    xlen: [64]
+    app: amo
+    configs: "-DVX_CFG_H100_SM_ENABLE -DVX_CFG_EXT_A_ENABLE -DVX_CFG_EXT_ZACAS_ENABLE"
+    shape: {cores: 1, warps: 4, threads: 32, l2cache: true}
+    args: "-tlrsc_counter_aqrl"
+    touches: *org_amo_gl_touches
+  - id: org-amo-lrsc-n8
+    via: blackbox
+    drivers: [simx, rtlsim]
+    xlen: [64]
+    app: amo
+    configs: "-DVX_CFG_H100_SM_ENABLE -DVX_CFG_EXT_A_ENABLE -DVX_CFG_EXT_ZACAS_ENABLE"
+    shape: {cores: 1, warps: 4, threads: 32, l2cache: true}
+    args: "-n8 -tlrsc_counter"
+    touches: *org_amo_gl_touches
+  - id: org-amo-lrsc-aqrl-n8
+    via: blackbox
+    drivers: [simx, rtlsim]
+    xlen: [64]
+    app: amo
+    configs: "-DVX_CFG_H100_SM_ENABLE -DVX_CFG_EXT_A_ENABLE -DVX_CFG_EXT_ZACAS_ENABLE"
+    shape: {cores: 1, warps: 4, threads: 32, l2cache: true}
+    args: "-n8 -tlrsc_counter_aqrl"
+    touches: *org_amo_gl_touches

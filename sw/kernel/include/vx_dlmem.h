@@ -136,7 +136,9 @@ static inline __attribute__((always_inline)) uint32_t vx_dynamic_smem_size(void)
 // rounded up as the dispatcher rounds it. No local memory is reserved for the
 // system, so PTX %reserved_smem_offset_* are 0.
 static inline __attribute__((always_inline)) uint32_t vx_total_smem_size(void) {
-#if VX_CFG_EXT_DXA_ENABLED && (VX_CFG_LMEM_NUM_BANKS * (VX_CFG_XLEN / 8) > VX_CFG_MEM_BLOCK_SIZE)
+#ifdef VX_CFG_H100_SM_ENABLE
+  const uint32_t align = VX_CFG_LMEM_SLOT_ALIGN;
+#elif VX_CFG_EXT_DXA_ENABLED && (VX_CFG_LMEM_NUM_BANKS * (VX_CFG_XLEN / 8) > VX_CFG_MEM_BLOCK_SIZE)
   const uint32_t align = VX_CFG_LMEM_NUM_BANKS * (VX_CFG_XLEN / 8);
 #else
   const uint32_t align = VX_CFG_MEM_BLOCK_SIZE;

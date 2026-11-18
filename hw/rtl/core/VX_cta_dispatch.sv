@@ -393,6 +393,32 @@ module VX_cta_dispatch import VX_gpu_pkg::*; #(
     // The product m*stride is a constant-times-variable (shift/add), so the
     // NUM_WARPS-wide comparator tree has no divider.
     localparam PROD_W = LMEM_LOG + NW_WIDTH + 2;
+`ifdef VX_CFG_H100_SM_ENABLE
+    // A compute slot is charged its addressed pitch `stride` against the
+    // launch's carve-out S; a fragment carries no shared memory.
+    wire is_compute = (kmu_req.kind == KMU_KIND_COMPUTE);
+    wire [PROD_W-1:0] slot_fp  = PROD_W'(stride);
+    wire [PROD_W-1:0] slot_cap = is_compute ? PROD_W'(kmu_req.smem_bytes) : PROD_W'(LMEM_SIZE);
+    always_ff @(posedge clk) begin
+        if (reset) begin
+            usable_slots_r <= (NW_WIDTH+1)'(NUM_CTA_MAX);
+        end else begin
+            if (slot_fp == 0) begin
+                usable_slots_r <= (NW_WIDTH+1)'(NUM_CTA_MAX);
+            end else begin
+                usable_slots_r <= (NW_WIDTH+1)'(1);
+                for (integer m = 1; m <= NUM_CTA_MAX; m = m + 1) begin
+                    if (PROD_W'(m) * slot_fp <= slot_cap) begin
+                        usable_slots_r <= (NW_WIDTH+1)'(m);
+                    end
+                end
+            end
+        end
+    end
+
+    `RUNTIME_ASSERT(~kmu_bus_if.valid || (slot_fp == 0) || (slot_fp <= slot_cap),
+        ("%t: %s CTA shared-memory footprint %0d exceeds the %0d-byte carve-out; the CTA overruns its slot", $time, INSTANCE_ID, slot_fp, slot_cap))
+`else
     always_ff @(posedge clk) begin
         if (reset) begin
             usable_slots_r <= (NW_WIDTH+1)'(NUM_CTA_MAX);
@@ -417,6 +443,7 @@ module VX_cta_dispatch import VX_gpu_pkg::*; #(
     // reset the valid bit alone, so an idle beat carries arbitrary bits.
     `RUNTIME_ASSERT(~kmu_bus_if.valid || (stride == 0) || (PROD_W'(stride) <= PROD_W'(LMEM_SIZE)),
         ("%t: %s CTA shared-memory footprint %0d exceeds the %0d-byte capacity; the CTA overruns its slot", $time, INSTANCE_ID, stride, LMEM_SIZE))
+`endif
 
     // A CTA whose ctx_id differs from the last accepted one opens a new launch.
     wire new_launch = (kmu_req.ctx_id != cur_ctx_id_r);

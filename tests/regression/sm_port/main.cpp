@@ -18,6 +18,11 @@
 //                and a DSMEM head waiting for credits holds the global stores behind it
 //   -m 10 tma    each rank's warp 0 bulk-loads L2-resident lines (TMA), rank 0 alone, then
 //                both ranks: each SM's rate equals the one-SM rate +-3 % (one engine per SM)
+//   -m 11 fillwr rank 0's warps 1.. stream LDS / L1-hit lw / STS beside fills of the SM's array (warp 0's TMA
+//                bulk loads, or rank 1's sd arrivals); fills share the write port only, ahead of STS:
+//                LDS and L1 hits next to TMA >= 15/16 of the datapath, STS next to TMA = datapath - TMA rate +-5 %,
+//                STS next to DSMEM = datapath x (1 - arrival rate / SM_SRAM_DSMEM_WR_BYTES) +-10 %,
+//                LDS next to DSMEM = datapath +-3 %
 
 #include <algorithm>
 #include <cmath>
@@ -69,7 +74,7 @@ uint32_t errors = 0;
 uint32_t warp_lanes = 0;  // the device's warp width
 
 static void show_usage() {
-  std::cout << "Usage: [-k kernel] [-m mode[,mode...] 0..10] [-h]" << std::endl;
+  std::cout << "Usage: [-k kernel] [-m mode[,mode...] 0..11] [-h]" << std::endl;
 }
 
 static void parse_args(int argc, char** argv) {
@@ -554,6 +559,79 @@ static void run_mode(int mode, const SmPortCfg& cfg) {
 #endif
     break;
   }
+  case 11: {
+#if !(VX_CFG_EXT_DXA_ENABLED && VX_CFG_EXT_MBAR_ENABLED)
+    std::cout << "Error: the fill-write mode needs DXA and MBAR" << std::endl;
+    ++errors;
+#else
+    const double D = VX_CFG_SM_DATAPATH_BYTES;
+    const double per_instr = warp_lanes * 8.0;
+    if (r.warps < 2) {
+      std::cout << "Error: the fill-write mode needs at least 2 warps" << std::endl;
+      ++errors;
+      break;
+    }
+    r.arg.kind = SP_FILLWR;
+    r.arg.extra = r.blocks * (uint32_t)num_warps * 2;
+    r.arg.iters = std::max<uint32_t>(16, (uint32_t)(12000 * D / ((r.warps - 1) * 16 * per_instr)));
+    auto stream_of = [&](const std::vector<uint64_t>& out) {
+      return measured_rate(out, r, r.arg.iters * 16.0 * per_instr, [](uint32_t b, uint32_t w) { return b == 0 && w != 0; });
+    };
+    auto run = [&](uint32_t cls, uint32_t bg, double* fill) {
+      r.arg.recv = cls;
+      r.arg.n = bg;
+      auto out = launch(r, pattern(warp_lanes, 4));
+      *fill = 0;
+      uint64_t w0 = UINT64_MAX, w1 = 0, s1 = UINT64_MAX, e0 = 0;
+      for (uint32_t w = 1; w < r.warps; ++w) {
+        w0 = std::min(w0, out[w * 2]);
+        s1 = std::min(s1, out[w * 2 + 1]);
+        e0 = std::max(e0, out[w * 2]);
+        w1 = std::max(w1, out[w * 2 + 1]);
+      }
+      printf("    stream warps start %llu..%llu, end %llu..%llu", (unsigned long long)w0, (unsigned long long)e0,
+             (unsigned long long)s1, (unsigned long long)w1);
+      if (bg == SP_BG_TMA)
+        printf("; TMA phases %llu, first done %llu, last done %llu", (unsigned long long)out[r.arg.extra + 3],
+               (unsigned long long)out[r.arg.extra + 4], (unsigned long long)out[r.arg.extra + 5]);
+      printf("\n");
+      if (bg == SP_BG_TMA && out[r.arg.extra + 2] != 0) {
+        *fill = (double)out[r.arg.extra + 1] / (double)out[r.arg.extra + 2];
+      } else if (bg == SP_BG_DSMEM) {
+        uint64_t t0 = UINT64_MAX, t1 = 0;
+        for (uint32_t w = 0; w < r.warps; ++w) {
+          t0 = std::min(t0, out[(num_warps + w) * 2]);
+          t1 = std::max(t1, out[(num_warps + w) * 2 + 1]);
+        }
+        *fill = (t1 > t0) ? (double)out[r.arg.extra] / (double)(t1 - t0) : 0;
+      }
+      return stream_of(out);
+    };
+    auto at_least = [&](const std::string& what, double got, double lo) {
+      bool ok = got >= lo - 1e-9;
+      printf("  %-48s measured %9.3f expected >= %.3f %s\n", what.c_str(), got, lo, ok ? "ok" : "MISMATCH");
+      if (!ok) ++errors;
+    };
+    double f = 0;
+    printf("  LDS stream alone: %.3f B/cycle\n", run(SP_FW_LDS, SP_BG_NONE, &f));
+    double lds = run(SP_FW_LDS, SP_BG_TMA, &f);
+    printf("  TMA fills beside LDS: %.3f B/cycle (H100: LDS 122.4 beside 82)\n", f);
+    at_least("LDS B/cycle beside TMA fills", lds, D * 15 / 16);
+    double l1 = run(SP_FW_L1, SP_BG_TMA, &f);
+    printf("  TMA fills beside L1 hits: %.3f B/cycle\n", f);
+    at_least("L1-hit B/cycle beside TMA fills", l1, D * 15 / 16);
+    double sts = run(SP_FW_STS, SP_BG_TMA, &f);
+    printf("  TMA fills beside STS: %.3f B/cycle (H100: STS 30, gap logged)\n", f);
+    verdict("STS B/cycle beside TMA fills", sts, D - f, 0.05);
+    sts = run(SP_FW_STS, SP_BG_DSMEM, &f);
+    printf("  DSMEM arrivals beside STS: %.3f B/cycle (H100: STS 66 beside 32)\n", f);
+    verdict("STS B/cycle beside DSMEM arrivals", sts, D * (1.0 - f / VX_CFG_SM_SRAM_DSMEM_WR_BYTES), 0.10);
+    lds = run(SP_FW_LDS, SP_BG_DSMEM, &f);
+    printf("  DSMEM arrivals beside LDS: %.3f B/cycle\n", f);
+    verdict("LDS B/cycle beside DSMEM arrivals", lds, D, 0.03);
+#endif
+    break;
+  }
   case 9: {
     // Even warps' DSMEM stores and odd warps' global stores share the one in-order FIFO.
     auto pat = pattern(warp_lanes, 8);
@@ -587,7 +665,7 @@ int main(int argc, char* argv[]) {
   parse_args(argc, argv);
   if (modes.empty()) modes.push_back(0);
   for (int m : modes) {
-    if (m < 0 || m > 10) {
+    if (m < 0 || m > 11) {
       show_usage();
       return -1;
     }

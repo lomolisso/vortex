@@ -53,9 +53,6 @@ module VX_cache_data import VX_gpu_pkg::*; #(
     input wire [`CS_WAY_SEL_WIDTH-1:0]  evict_way,
     input wire [NUM_WAYS-1:0]           tag_matches,
     input wire [`CS_WORDS_PER_LINE-1:0][`CS_WORD_WIDTH-1:0] fill_data,
-`ifdef VX_CFG_H100_SM_ENABLE
-    input wire [LINE_SIZE-1:0]          fill_byteen, // bytes a fill writes (the rest keep stored data)
-`endif
     input wire [`CS_WORD_WIDTH-1:0]     write_word,
     input wire [WORD_SIZE-1:0]          write_byteen,
     input wire [`UP(`CS_WORD_SEL_BITS)-1:0] word_idx,
@@ -173,20 +170,13 @@ module VX_cache_data import VX_gpu_pkg::*; #(
         if (WRITE_ENABLE) begin : g_wren
             // fill writes the fetched sector's slices; a store writes only the hit slice.
             assign slice_write = (fill && fill_sec_en) || (write && hit_any && word_en);
-`ifdef VX_CFG_H100_SM_ENABLE
-            assign slice_wren  = fill ? fill_byteen[s * WORD_SIZE +: WORD_SIZE] : write_byteen;
-`else
             assign slice_wren  = fill ? {WORD_SIZE{1'b1}} : write_byteen;
-`endif
             assign slice_wdata = fill ? fill_data[s] : write_word;
         end else begin : g_no_wren
             `UNUSED_VAR (write)
             `UNUSED_VAR (write_word)
             `UNUSED_VAR (write_byteen)
             `UNUSED_VAR (hit_any)
-`ifdef VX_CFG_H100_SM_ENABLE
-            `UNUSED_VAR (fill_byteen)
-`endif
             assign slice_write = fill && fill_sec_en;
             assign slice_wren  = 1'b1;
             assign slice_wdata = fill_data[s];

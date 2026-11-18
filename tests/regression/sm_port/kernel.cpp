@@ -116,6 +116,185 @@ INL void tma_run(const kernel_arg_t* arg, char* own, uint32_t rank, uint32_t* ph
 }
 #endif
 
+#if VX_CFG_EXT_DLMEM_ENABLED
+// Rank 0's shared memory in FILLWR: mbarrier, stop counters, stream windows,
+// TMA destination, stream rows, TMA completion cycles, DSMEM arrival window.
+#define FW_DONE_OFF 64
+#define FW_SENT_OFF 72
+#define FW_RDY_OFF 80
+#define FW_STOP_OFF 256
+#define FW_WIN_OFF  1024
+#define FW_TMA_OFF  2048
+#define FW_ROW_OFF  (FW_TMA_OFF + 4 * 4096)
+#define FW_TS_OFF   32768
+#define FW_TS_MAX   1024
+#define FW_DSM_OFF  49152
+#define FW_WARM     8
+// Chunks a DSMEM sender sends between polls of rank 0's done counter (one lane polls: each lane's remote
+// load is its own packet, served by one row read of rank 0's array).
+#define FW_POLL_CHUNKS 4
+
+// Waits for `n` warps with one poll per sixteen dependent divides: a waiting warp leaves the issue slots and
+// the shared-memory port to the warps still timed, and its fence and the cluster barrier (whose LSU drain
+// gate is SM-wide) come only when every timed warp is done.
+INL void idle_until(volatile uint32_t* cnt, uint32_t n) {
+  float x = 1.0f, y = 1.0f;
+  __asm__ volatile ("" : "+f"(y));
+  while (*cnt < n) {
+    __asm__ volatile (R4(R4("fdiv.s %0, %0, %1\n")) : "+f"(x) : "f"(y));
+  }
+}
+
+// A warm pass, then the timed pass, of 16 instructions per iteration; the end
+// time waits for the last load results.
+#define FW_TIMED(OP)                                                                                      \
+  __asm__ volatile ("li %[ph], 0\n mv %[cnt], %[warm]\n"                                                  \
+                    "1:\n" R4(OP) "addi %[cnt], %[cnt], -1\n bnez %[cnt], 1b\n"                           \
+                    "add %[s], %[r0], %[r1]\n add %[s], %[s], %[r2]\n add %[s], %[s], %[r3]\n"            \
+                    "csrr %[t1], %[mcycle]\n bnez %[ph], 2f\n"                                            \
+                    "li %[ph], 1\n mv %[cnt], %[n]\n csrr %[t0], %[mcycle]\n j 1b\n"                      \
+                    "2:\n"                                                                                \
+                    : [r0] "+&r"(r0), [r1] "+&r"(r1), [r2] "+&r"(r2), [r3] "+&r"(r3), [cnt] "=&r"(cnt),   \
+                      [ph] "=&r"(ph), [s] "=&r"(sink), [t0] "=&r"(t0), [t1] "=&r"(t1)                     \
+                    : [a] "r"(a), [one] "r"(one), [warm] "r"(warm), [n] "r"(n),                           \
+                      [mcycle] "i"(VX_CSR_MCYCLE)                                                         \
+                    : "memory")
+
+INL void fill_write(const kernel_arg_t* arg, char* own, uint32_t rank, uint32_t lane, uint32_t wid) {
+  auto out = reinterpret_cast<uint64_t*>(arg->out_addr);
+  const uint32_t nstream = vx_num_warps() - 1;
+  volatile uint32_t* done = reinterpret_cast<volatile uint32_t*>(own + FW_DONE_OFF);
+  volatile uint32_t* sent = reinterpret_cast<volatile uint32_t*>(own + FW_SENT_OFF);
+  volatile uint32_t* rdy = reinterpret_cast<volatile uint32_t*>(own + FW_RDY_OFF);
+  volatile uint64_t* win = reinterpret_cast<volatile uint64_t*>(own + FW_WIN_OFF);
+  if (wid == 0 && lane == 0) {
+    *done = 0;
+    *sent = 0;
+    *rdy = 0;
+#ifdef SP_HAS_TMA
+    vx_mbar_init(reinterpret_cast<uint64_t*>(own), 1);
+#endif
+  }
+#ifdef SP_HAS_TMA
+  // An untimed pass over the four source regions, so the timed fills read the L2.
+  if (rank == 0 && wid == 0 && arg->n == SP_BG_TMA) {
+    for (uint32_t k = 0; k < 4; ++k) {
+      if (lane == 0)
+        vx_mbar_arrive_tx(reinterpret_cast<uint64_t*>(own), TMA_CHUNKS * TMA_BYTES);
+      vx_fence_proxy_async();
+      const uint64_t s = arg->gmem_addr + (uint64_t)k * TMA_CHUNKS * TMA_BYTES;
+      for (uint32_t c = 0; c < TMA_CHUNKS; ++c)
+        vx_dxa_bulk_load(own + FW_TMA_OFF + c * TMA_BYTES, reinterpret_cast<const void*>(s + c * TMA_BYTES), TMA_BYTES,
+                         reinterpret_cast<uint64_t*>(own));
+      while (!vx_mbar_try_wait_parity(reinterpret_cast<uint64_t*>(own), k & 1)) {
+      }
+    }
+  }
+#endif
+  vx_fence_cluster();
+  vx_cluster_sync();
+  if (rank == 0 && wid != 0) {
+    // 8-B lanes: two wavefronts per instruction, so the port, not the issue rate, bounds the stream.
+    const uint64_t a = (arg->recv == SP_FW_L1) ? arg->gmem_addr + 3ull * arg->span + wid * 256 + lane * 8
+                                               : reinterpret_cast<uint64_t>(own + FW_ROW_OFF + wid * 256 + lane * 8);
+    const uint64_t one = opaque(1);
+    uint64_t warm = FW_WARM / 2, n = FW_WARM / 2;
+    uint64_t r0 = 0, r1 = 0, r2 = 0, r3 = 0, cnt, ph, sink, t0 = 0, t1 = 0;
+    // Stores never wait, so the warps drift apart: they meet after a short warm pass so no warp's warm stores land in the window.
+    for (uint32_t pass = 0; pass < 2; ++pass) {
+      if (pass == 1) {
+        if (lane == 0)
+          __atomic_fetch_add(const_cast<uint32_t*>(rdy), 1u, __ATOMIC_RELAXED);
+        while (*rdy < nstream) {
+        }
+        warm = 1;
+        n = arg->iters;
+      }
+      if (arg->recv == SP_FW_STS) {
+        FW_TIMED("sd %[one], 0(%[a])\n sd %[one], 0(%[a])\n sd %[one], 0(%[a])\n sd %[one], 0(%[a])\n");
+      } else {
+        FW_TIMED("ld %[r0], 0(%[a])\n ld %[r1], 0(%[a])\n ld %[r2], 0(%[a])\n ld %[r3], 0(%[a])\n");
+      }
+    }
+    __asm__ volatile ("" :: "r"(sink));
+    if (lane == 0) {
+      win[wid * 2 + 0] = t0;
+      win[wid * 2 + 1] = t1;
+      __atomic_fetch_add(const_cast<uint32_t*>(done), 1u, __ATOMIC_RELAXED);
+    }
+    record(arg, t0, t1);
+    idle_until(done, nstream);
+#ifdef SP_HAS_TMA
+  } else if (rank == 0 && arg->n == SP_BG_TMA) {
+    uint64_t* mbar = reinterpret_cast<uint64_t*>(own);
+    volatile uint64_t* ts = reinterpret_cast<volatile uint64_t*>(own + FW_TS_OFF);
+    uint32_t k = 0, phase = 0;
+    while (*done < nstream) {
+      if (lane == 0)
+        vx_mbar_arrive_tx(mbar, TMA_CHUNKS * TMA_BYTES);
+      vx_fence_proxy_async();
+      const uint64_t s = arg->gmem_addr + (uint64_t)(k % 4) * TMA_CHUNKS * TMA_BYTES;
+      for (uint32_t c = 0; c < TMA_CHUNKS; ++c)
+        vx_dxa_bulk_load(own + FW_TMA_OFF + c * TMA_BYTES, reinterpret_cast<const void*>(s + c * TMA_BYTES), TMA_BYTES, mbar);
+      while (!vx_mbar_try_wait_parity(mbar, phase & 1)) {
+      }
+      ++phase;
+      if (lane == 0 && k < FW_TS_MAX)
+        ts[k] = vx_rdcycle();
+      ++k;
+    }
+    if (lane == 0) {
+      uint64_t w0 = UINT64_MAX, w1 = 0;
+      for (uint32_t w = 1; w <= nstream; ++w) {
+        w0 = (win[w * 2] < w0) ? win[w * 2] : w0;
+        w1 = (win[w * 2 + 1] > w1) ? win[w * 2 + 1] : w1;
+      }
+      int32_t first = -1, last = -1;
+      for (uint32_t i = 0; i < k && i < FW_TS_MAX; ++i) {
+        if (ts[i] >= w0 && ts[i] <= w1) {
+          if (first < 0)
+            first = (int32_t)i;
+          last = (int32_t)i;
+        }
+      }
+      out[arg->extra + 1] = (first < last) ? (uint64_t)(last - first) * TMA_CHUNKS * TMA_BYTES : 0;
+      out[arg->extra + 2] = (first < last) ? ts[last] - ts[first] : 0;
+      out[arg->extra + 3] = k;
+      out[arg->extra + 4] = (k > 0) ? ts[0] : 0;
+      out[arg->extra + 5] = (k > 0 && k <= FW_TS_MAX) ? ts[k - 1] : 0;
+    }
+#endif
+  } else if (rank == 1 && arg->n == SP_BG_DSMEM) {
+    volatile uint32_t* rdone = reinterpret_cast<volatile uint32_t*>(vx_cluster_map_shared_rank(own + FW_DONE_OFF, 0));
+    const uint64_t dst = reinterpret_cast<uint64_t>(vx_cluster_map_shared_rank(own + FW_DSM_OFF, 0)) + lane * 8;
+    const uint64_t v = opaque(1);
+    volatile uint32_t* stop = reinterpret_cast<volatile uint32_t*>(own + FW_STOP_OFF) + wid;
+    uint32_t chunks = 0;
+    if (lane == 0)
+      *stop = 0;
+    const uint64_t t0 = vx_rdcycle();
+    do {
+      for (uint32_t c = 0; c < FW_POLL_CHUNKS; ++c) {
+        const uint64_t p = dst + (uint64_t)(chunks % 4) * 4096;
+        store_run<true, 0, 256, 16>(v, p, p + 2048);
+        ++chunks;
+      }
+      if (lane == 0)
+        *stop = (*rdone >= nstream);
+    } while (*stop == 0);
+    vx_fence_cluster();
+    const uint64_t t1 = vx_rdcycle();
+    if (lane == 0)
+      __atomic_fetch_add(const_cast<uint32_t*>(sent), chunks, __ATOMIC_RELAXED);
+    record(arg, t0, t1);
+  }
+  vx_fence_cluster();
+  vx_cluster_sync();
+  if (rank == 1 && wid == 0 && lane == 0 && arg->n == SP_BG_DSMEM)
+    out[arg->extra + 0] = (uint64_t)*sent * 16 * vx_num_threads() * 8;
+}
+#endif
+
 __kernel void kernel_main(kernel_arg_t* __UNIFORM__ arg) {
   const uint32_t lane = vx_thread_id();
   const uint32_t wid  = vx_warp_id();
@@ -253,6 +432,9 @@ __kernel void kernel_main(kernel_arg_t* __UNIFORM__ arg) {
     return;
   }
 #endif
+  case SP_FILLWR:
+    fill_write(arg, own, rank, lane, wid);
+    return;
   default:
     break;
   }

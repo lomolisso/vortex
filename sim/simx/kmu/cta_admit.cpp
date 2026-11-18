@@ -13,6 +13,11 @@
 
 #include "cta_admit.h"
 #include <VX_config.h>
+#ifdef VX_CFG_H100_SM_ENABLE
+#include <smem_carveout.h>
+#else
+#line 15
+#endif
 #include "debug.h"
 
 using namespace vortex;
@@ -175,7 +180,13 @@ CtaAdmit::Outputs CtaAdmit::tick(const Inputs& in) {
     in_new = (head->ctx_id != ctx_);
     in_k = cluster_size(*head);
     in_w = dlmem_ref::warps_of(head->block_size, cfg_.nt);
+#ifdef VX_CFG_H100_SM_ENABLE
+    in_u = smem_usable_slots(head->smem_bytes, slot_stride(*head), dlmem_ref::slots(cfg_), smem_carve_cfg());
+#else
+#line 178
     in_u = dlmem_ref::usable_slots(cfg_, slot_stride(*head));
+#line 178
+#endif
   }
 
   // ---- one greedy placement step per GPC on the scratch copies ----

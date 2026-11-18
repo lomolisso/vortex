@@ -16,6 +16,11 @@
 #include <iostream>
 #include "VX_config.h"
 #include "VX_types.h"
+#ifdef VX_CFG_H100_SM_ENABLE
+#include "smem_carveout.h"
+#else
+#line 18
+#endif
 #include <algorithm>
 #include <cassert>
 #include <cstdio>
@@ -61,8 +66,16 @@ using Sim = vl_simulator<VVX_cta_dispatch_top>;
 constexpr uint32_t NUM_WARPS   = VX_CFG_NUM_WARPS;
 constexpr uint32_t NUM_SLOTS   = VX_CFG_MAX_CTAS_PER_SM;
 constexpr uint32_t NUM_THREADS = VX_CFG_NUM_THREADS;
+#ifdef VX_CFG_H100_SM_ENABLE
+// A launch from the KMU's reset carve-out S: the largest block fills S with its reserve.
+constexpr uint32_t LMEM_SIZE   = VX_CFG_SMEM_PER_CTA_MAX;
+constexpr uint32_t BLOCK_ALIGN = VX_CFG_LMEM_SLOT_ALIGN;
+#else
+#line 64
 constexpr uint32_t LMEM_SIZE   = 1u << VX_CFG_LMEM_LOG_SIZE;
 constexpr uint32_t BLOCK_ALIGN = VX_CFG_MEM_BLOCK_SIZE;
+#line 65
+#endif
 
 #if !VX_CFG_EXT_DLMEM_ENABLED
 constexpr uint32_t MAX_K       = NUM_WARPS;
@@ -186,6 +199,11 @@ static uint64_t smoke(Sim& sim, uint64_t tick) {
   sim->in_warp_step_z = 0;
   sim->in_ctx_id      = 0;
   sim->in_cluster_size = 1;
+#ifdef VX_CFG_H100_SM_ENABLE
+  sim->in_smem_bytes  = VX_CFG_SMEM_PER_SM_MAX;
+#else
+#line 188
+#endif
 #if VX_CFG_EXT_DLMEM_ENABLED
   sim->in_cluster_rank = 0;
 #endif
@@ -252,12 +270,23 @@ struct Cta {
   uint32_t gang       = 0;
   uint32_t epoch      = 0;
   std::vector<uint32_t> row;
+#ifdef VX_CFG_H100_SM_ENABLE
+  uint32_t smem_bytes = VX_CFG_SMEM_PER_SM_MAX;
+#else
+#line 254
+#endif
 };
 
 static uint32_t stride_of(uint32_t lmem_size) {
   return (lmem_size + BLOCK_ALIGN - 1) & ~(BLOCK_ALIGN - 1);
 }
 
+#ifdef VX_CFG_H100_SM_ENABLE
+static uint32_t usable_slots(uint32_t stride, uint32_t s_bytes) {
+  return smem_usable_slots(s_bytes, stride, NUM_SLOTS, smem_carve_cfg());
+}
+#else
+#line 261
 static uint32_t usable_slots(uint32_t stride) {
   if (stride == 0) {
     return NUM_SLOTS;
@@ -268,6 +297,8 @@ static uint32_t usable_slots(uint32_t stride) {
   }
   return fit ? fit : 1;
 }
+#line 270
+#endif
 
 // Reference slot choice: the round-robin pointer restarts at 0 on every
 // launch, as in the C++ model. A pinned block takes its forced slot and leaves
@@ -283,7 +314,13 @@ public:
     if (is_new) {
       tail_ = 0;
     }
+#ifdef VX_CFG_H100_SM_ENABLE
+    uint32_t max_slots = usable_slots(stride_of(c.lmem_size), c.smem_bytes);
+#else
+#line 286
     uint32_t max_slots = usable_slots(stride_of(c.lmem_size));
+#line 286
+#endif
     if (tail_ >= max_slots) {
       tail_ = 0;
     }
@@ -498,7 +535,13 @@ private:
     if (pinned_ready_ == &c) {
       return true;
     }
+#ifdef VX_CFG_H100_SM_ENABLE
+    uint32_t usable = usable_slots(stride_of(c.lmem_size), c.smem_bytes);
+#else
+#line 501
     uint32_t usable = usable_slots(stride_of(c.lmem_size));
+#line 501
+#endif
     std::vector<uint32_t> free;
     for (uint32_t s = 0; s < usable; ++s) {
       if (taken_.count(s) == 0 && (c.want_slot < 0 || uint32_t(c.want_slot) == s)) {
@@ -550,7 +593,13 @@ private:
       uint32_t slot = model_.place(c);
       wr_slot = slot;
       std::vector<uint32_t> row = c.pinned ? c.row
+#ifdef VX_CFG_H100_SM_ENABLE
+          : legacy_row_words(model_.window(), std::min(c.k, usable_slots(stride_of(c.lmem_size), c.smem_bytes)));
+#else
+#line 553
           : legacy_row_words(model_.window(), std::min(c.k, usable_slots(stride_of(c.lmem_size))));
+#line 553
+#endif
       std::vector<uint32_t> got = words_of(sim_->peer_wr_row);
       if (sim_->peer_wr_slot != slot || sim_->peer_wr_stride != stride_of(c.lmem_size) || !same_bits(got, row, ROW_W)) {
         std::printf("FAIL: launch %u CTA %u (%s, K=%u): peer row slot %u stride %u, want slot %u stride %u%s\n",
@@ -570,7 +619,13 @@ private:
     if (want_wr) {
       const Cta& c = ctas[prev_accept_];
       uint32_t slot = wr_slot;
+#ifdef VX_CFG_H100_SM_ENABLE
+      uint32_t k = c.pinned ? std::min(c.k, MAXC) : std::min(c.k, usable_slots(stride_of(c.lmem_size), c.smem_bytes));
+#else
+#line 573
       uint32_t k = c.pinned ? std::min(c.k, MAXC) : std::min(c.k, usable_slots(stride_of(c.lmem_size)));
+#line 573
+#endif
       bool gang = c.pinned && k > 1;
       uint32_t base = c.pinned ? slot : model_.window();
       uint32_t warps = (c.block_size + NUM_THREADS - 1) / NUM_THREADS;
@@ -635,6 +690,9 @@ private:
     return true;
   }
 #endif
+#ifndef VX_CFG_H100_SM_ENABLE
+#line 637
+#endif
 
   // The CTA CSRs of the slot read last cycle must be the launching CTA's own.
   bool check_csrs(const Cta& c) {
@@ -685,6 +743,11 @@ private:
     sim_->in_warp_step_z = 0;
     sim_->in_ctx_id      = d.ctx_id;
     sim_->in_cluster_size = d.k;
+#ifdef VX_CFG_H100_SM_ENABLE
+    sim_->in_smem_bytes  = d.smem_bytes;
+#else
+#line 687
+#endif
 #if VX_CFG_EXT_DLMEM_ENABLED
     sim_->in_cluster_rank = d.rank;
 #endif
@@ -799,7 +862,13 @@ static bool check_slots(const char* name, const std::vector<Cta>& ctas, const st
   for (size_t i = 0; i < ctas.size(); ++i) {
     const Cta& c = ctas[i];
     int want = model.place(c);
+#ifdef VX_CFG_H100_SM_ENABLE
+    uint32_t usable = usable_slots(stride_of(c.lmem_size), c.smem_bytes);
+#else
+#line 802
     uint32_t usable = usable_slots(stride_of(c.lmem_size));
+#line 802
+#endif
     bool ok = (slots[i] == want);
     if (!c.pinned) {
       if (c.rank == 0) {
@@ -895,7 +964,13 @@ static bool multi_launch(Sim& sim, uint64_t& tick, uint32_t seed, uint32_t num_l
 // event after its last warp, carrying its gang id and epoch.
 static bool pinned_launch(Sim& sim, uint64_t& tick) {
   std::vector<Cta> ctas;
+#ifdef VX_CFG_H100_SM_ENABLE
+  uint32_t stride = stride_of(VX_CFG_SMEM_PER_SM_MAX / NUM_WARPS / BLOCK_ALIGN * BLOCK_ALIGN);
+#else
+#line 898
   uint32_t stride = stride_of(LMEM_SIZE / NUM_WARPS);
+#line 898
+#endif
   add_launch(ctas, 0, 1, std::min<uint32_t>(2, MAXC), 3 * NUM_WARPS, stride, NUM_THREADS + 1, true);
   PlacementBench bench(sim, tick, 7);
   bench.done_ready_pct = 30;
@@ -964,6 +1039,9 @@ static bool pinned_keeps_tail(Sim& sim, uint64_t& tick) {
   return ok;
 }
 #endif
+#ifndef VX_CFG_H100_SM_ENABLE
+#line 966
+#endif
 
 // CTA refill gap (03/spec.md §5): CTAs of one kind follow each other on the
 // core, each needing what the one before frees. Slot-bound (the local memory
@@ -1012,6 +1090,82 @@ static bool refill_gap(Sim& sim, uint64_t& tick) {
   return ok;
 }
 
+#ifdef VX_CFG_H100_SM_ENABLE
+// Carve-out switch: two blocks more than S's usable slots per launch at every
+// configured S, the list's ends first so S jumps both ways, each launch followed
+// by one at the same S. The block's footprint is half the smallest
+// configuration, so the usable slot count follows S: the blocks past it wrap to
+// slot 0 and no more than that many are ever resident. S must cost no cycles:
+// every launch's first block, whether its launch changes S or keeps it, takes the
+// same accept-to-first-warp time.
+static bool carve_switch(Sim& sim, uint64_t& tick) {
+  SmemCarveCfg cfg = smem_carve_cfg();
+  uint32_t reserve = smem_cta_footprint(0, cfg);
+  uint32_t half = cfg.configs_kb[0] * 1024 / 2;
+  uint32_t lmem = (half > reserve) ? (half - reserve) / BLOCK_ALIGN * BLOCK_ALIGN : 0;
+  std::vector<uint32_t> order;
+  for (int lo = 0, hi = SMEM_CARVE_NUM_CONFIGS - 1; lo <= hi; ++lo, --hi) {
+    order.push_back(cfg.configs_kb[lo] * 1024);
+    if (hi != lo) {
+      order.push_back(cfg.configs_kb[hi] * 1024);
+    }
+  }
+  std::vector<Cta> ctas;
+  std::vector<size_t> first;
+  for (uint32_t s : order) {
+    if (smem_cta_footprint(lmem, cfg) > s) {
+      continue;   // the runtime never launches this block at s
+    }
+    uint32_t n = usable_slots(stride_of(lmem), s) + 2;
+    for (int same = 0; same < 2; ++same) {
+      uint32_t launch = static_cast<uint32_t>(first.size());
+      first.push_back(ctas.size());
+      add_launch(ctas, launch, static_cast<uint8_t>(1 + launch), 1, n, lmem, NUM_THREADS);
+      for (size_t i = first.back(); i < ctas.size(); ++i) {
+        ctas[i].smem_bytes = s;
+      }
+    }
+  }
+  PlacementBench bench(sim, tick, 17);
+  std::vector<int> slots;
+  bool ran = bench.run(ctas, slots);
+  bool ok = ran;
+  tick = bench.tick();
+  std::printf("carve-out switch (lmem %u): launch,S,usable,blocks,peak_resident,accept_to_first_warp\n", lmem);
+  for (size_t l = 0; ran && l < first.size(); ++l) {
+    size_t b = first[l], e = (l + 1 < first.size()) ? first[l + 1] : ctas.size();
+    const Cta& c = ctas[b];
+    uint32_t usable = usable_slots(stride_of(c.lmem_size), c.smem_bytes);
+    uint32_t peak = 0;
+    for (size_t i = b; i < e; ++i) {
+      uint32_t live = 0;
+      for (size_t j = b; j < e; ++j) {
+        live += (bench.accept_cycle[j] <= bench.accept_cycle[i] && bench.done_cycle[j] > bench.accept_cycle[i]);
+      }
+      peak = std::max(peak, live);
+    }
+    uint64_t lat = bench.fire_cycle[b] - (bench.accept_cycle[b] - 1);
+    uint64_t lat0 = bench.fire_cycle[0] - (bench.accept_cycle[0] - 1);
+    std::printf("carve-out switch,%u,%u,%u,%u,%u,%lu\n", c.launch + 1, c.smem_bytes, usable,
+                static_cast<uint32_t>(e - b), peak, (unsigned long)lat);
+    if (peak > usable) {
+      std::printf("FAIL carve-out switch: launch %u at S %u has %u blocks resident at once, S allows %u\n",
+                  c.launch + 1, c.smem_bytes, peak, usable);
+      ok = false;
+    }
+    if (lat != lat0) {
+      std::printf("FAIL carve-out switch: launch %u at S %u (%s) takes %lu cycles from accept to its first warp,"
+                  " launch 1 at S %u took %lu\n", c.launch + 1, c.smem_bytes,
+                  (l % 2) ? "same S" : "new S", (unsigned long)lat, ctas[0].smem_bytes, (unsigned long)lat0);
+      ok = false;
+    }
+  }
+  return ok && check_slots("carve-out switch", ctas, slots);
+}
+
+#else
+#line 1014
+#endif
 int main(int argc, char **argv) {
   Verilated::commandArgs(argc, argv);
 
@@ -1049,6 +1203,11 @@ int main(int argc, char **argv) {
 #endif
   ok = refill_gap(sim, tick) && ok;
   ok = multi_launch(sim, tick, seed, launches) && ok;
+#ifdef VX_CFG_H100_SM_ENABLE
+  ok = carve_switch(sim, tick) && ok;
+#else
+#line 1051
+#endif
 
   if (!ok) {
     std::cout << "FAILED!" << std::endl;

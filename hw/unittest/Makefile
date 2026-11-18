@@ -6,7 +6,7 @@ include $(ROOT_DIR)/config.mk
 DLMEM_UNIT_DIRS := dlmem_noc cta_gang cluster_dispatch bar_unit dlmem_xlate dlmem_ep
 DLMEM_UNITS := $(if $(filter 64,$(XLEN)),$(patsubst %/Makefile,%,$(wildcard $(addsuffix /Makefile,$(DLMEM_UNIT_DIRS)))))
 # The H100 SM path's units: RV64 only, listed once their directory exists.
-H100_SM_UNIT_DIRS := smem_gate l1h100 sm_port
+H100_SM_UNIT_DIRS := sm_sram l1h100 sm_port
 H100_SM_UNITS := $(if $(filter 64,$(XLEN)),$(patsubst %/Makefile,%,$(wildcard $(addsuffix /Makefile,$(H100_SM_UNIT_DIRS)))))
 
 all:
@@ -461,9 +461,9 @@ ifeq ($(XLEN),64)
 	$(call cta_gang_case,4,2,16,4,17,11,-DVX_CFG_NUM_THREADS=8)
 	$(call cta_gang_case,16,4,4,16,14,12,)
 	$(call cta_gang_case,16,4,8,16,18,13,)
-	$(call cta_gang_h100_case,4,1,4,4,14,14,-DVX_CFG_CPCS_PER_GPC=2 -DVX_CFG_TPCS_PER_CPC=2)
-	$(call cta_gang_h100_case,4,2,4,4,14,15,-DVX_CFG_CPCS_PER_GPC=2 -DVX_CFG_SMS_PER_TPC=2)
-	$(call cta_gang_h100_case,16,2,16,16,14,16,-DVX_CFG_CPCS_PER_GPC=2 -DVX_CFG_TPCS_PER_CPC=4 -DVX_CFG_SMS_PER_TPC=2)
+	$(call cta_gang_h100_case,4,1,4,4,18,14,-DVX_CFG_CPCS_PER_GPC=2 -DVX_CFG_TPCS_PER_CPC=2)
+	$(call cta_gang_h100_case,4,2,4,4,18,15,-DVX_CFG_CPCS_PER_GPC=2 -DVX_CFG_SMS_PER_TPC=2)
+	$(call cta_gang_h100_case,16,2,16,16,18,16,-DVX_CFG_CPCS_PER_GPC=2 -DVX_CFG_TPCS_PER_CPC=4 -DVX_CFG_SMS_PER_TPC=2)
 	$(call bar_unit_case,-DVX_CFG_NUM_CORES=1 -DVX_CFG_SOCKET_SIZE=1,1)
 	! bar_unit/bar_unit --mode=twice > bar_unit/twice.log 2>&1
 	grep -q "warp arrived twice at the cluster barrier in one phase" bar_unit/twice.log
@@ -915,27 +915,54 @@ define h100_twin_case
 	$(MAKE) -C $(ROOT_DIR)/tests/unittest/$(2) run CONFIGS="$(3)" OPTS="$(4) --csv=$(CURDIR)/$(1)/simx.csv"
 	cmp $(1)/rtl.csv $(1)/simx.csv
 endef
-# The shared-memory port: wavefronts over 4-B banks, atomic passes, per-request
-# latency against smem_bank_ref.h, the other clients ahead of the LSU, one
-# wavefront a cycle over the LSU blocks (issue width 4), counted DLMEM loads.
+# The SM array's shared class: wavefronts over 4-B banks, atomic passes,
+# per-request latency against smem_bank_ref.h, TCU row reads ahead of the LSU
+# on the read port (SramPortRef), one wavefront a cycle over the LSU blocks
+# (issue width 4), counted DLMEM lanes, data held by the array itself; with
+# mbarriers, every op's response time, word and bank event against
+# smem_bank_ref.h / mbar_ref.h, the op queue's issue intervals and depth, and
+# one warp's phase checks over all lanes (one pass per word and token phase).
 run-lmem-banks:
 ifeq ($(XLEN),64)
-	$(call h100_twin_case,smem_gate,smem_bank,$(H100_SM_BASE),--seed=1)
-	$(call h100_twin_case,smem_gate,smem_bank,$(H100_SM_BASE) -DVX_CFG_ISSUE_WIDTH=4,--seed=2)
-	$(call h100_twin_case,smem_gate,smem_bank,$(H100_SM_BASE) -DVX_CFG_EXT_DLMEM_ENABLE,--seed=3)
-	$(call h100_twin_case,smem_gate,smem_bank,$(H100_SM_COMMON) -DVX_CFG_NUM_THREADS=16,--seed=4)
-	$(MAKE) -C smem_gate clean
+	$(call h100_twin_case,sm_sram,smem_bank,$(H100_SM_BASE),--seed=1)
+	$(call h100_twin_case,sm_sram,smem_bank,$(H100_SM_BASE) -DVX_CFG_ISSUE_WIDTH=4,--seed=2)
+	$(call h100_twin_case,sm_sram,smem_bank,$(H100_SM_BASE) -DVX_CFG_EXT_DLMEM_ENABLE,--seed=3)
+	$(call h100_twin_case,sm_sram,smem_bank,$(H100_SM_COMMON) -DVX_CFG_NUM_THREADS=16,--seed=4)
+	$(call h100_twin_case,sm_sram,smem_bank,$(H100_SM_BASE) -DVX_CFG_EXT_DLMEM_ENABLE -DVX_CFG_EXT_MBAR_ENABLE,--seed=5)
+	$(MAKE) -C sm_sram clean
 else
 	@echo "run-lmem-banks: the H100 SM path is RV64 only (skipped at XLEN $(XLEN))"
 endif
 
-# The SM's L1 (VX_cache with H100_L1): sector fills, byte-valid store allocate,
-# the XOR set index, the insertion-ordered replacement, whole-L1 invalidation
-# and line requests with sector masks, every outcome against l1_ref.h.
+# Every client of the SM array's ports at once (TCU, DXA and DSMEM row reads,
+# DXA row writes, merged DSMEM slots, cp.async warp writes, DXA and DSMEM
+# one-lane atomics, LSU loads, stores and atomics): per cycle the read, write
+# and AMO grants of SramPortRef, one RD_AMO grant over the bank pairs (with an
+# mbarrier op under MBAR), a split change taking effect at once; again with
+# non-default priority levels; directed global cases on a full L1 (same
+# old-table index drawn twice, the victim looked up as it is drawn, a
+# store-allocate beside another block's hit on its victim).
+run-sm-sram:
+ifeq ($(XLEN),64)
+	$(call h100_twin_case,sm_sram,smem_bank,$(H100_SM_BASE),--unified --seed=11 --random=4000)
+	$(call h100_twin_case,sm_sram,smem_bank,$(H100_SM_BASE) -DVX_CFG_SM_SRAM_RD_PRI_TCU=3 -DVX_CFG_SM_SRAM_WR_PRI_CPASYNC=0,--unified --seed=12 --random=4000)
+	$(call h100_twin_case,sm_sram,smem_bank,$(H100_SM_BASE) -DVX_CFG_EXT_DLMEM_ENABLE -DVX_CFG_EXT_MBAR_ENABLE,--unified --seed=13 --random=4000)
+	$(call h100_twin_case,sm_sram,smem_bank,$(H100_SM_BASE),--directed --seed=14)
+	$(call h100_twin_case,sm_sram,smem_bank,$(H100_SM_BASE) -DVX_CFG_ISSUE_WIDTH=4,--directed --seed=15)
+	$(MAKE) -C sm_sram clean
+else
+	@echo "run-sm-sram: the H100 SM path is RV64 only (skipped at XLEN $(XLEN))"
+endif
+
+# The SM's L1 on the unified array (VX_sm_l1 beside VX_sm_sram): sector fills,
+# word-valid store allocate, in-set and age-list victims, atomic clears,
+# non-cacheable borrowed slots, whole-L1 invalidation and line requests with
+# sector masks against l1_slot_ref.h; overlapped hazards against a flat memory
+# in program order; both index hashes.
 run-l1h100:
 ifeq ($(XLEN),64)
 	$(call h100_twin_case,l1h100,l1_sector,$(H100_SM_BASE),--seed=1)
-	$(call h100_twin_case,l1h100,l1_sector,$(H100_SM_BASE) -DVX_CFG_DCACHE_NUM_WAYS=32,--seed=2 --quick)
+	$(call h100_twin_case,l1h100,l1_sector,$(H100_SM_BASE) -DVX_CFG_L1_INDEX_HASH=0,--seed=2)
 	$(MAKE) -C l1h100 clean
 else
 	@echo "run-l1h100: the H100 SM path is RV64 only (skipped at XLEN $(XLEN))"

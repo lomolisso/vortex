@@ -186,6 +186,10 @@ extern "C" int vx_start(vx_device_h hdevice, vx_buffer_h hkernel,
     uint32_t full_grid[3]  = {(uint32_t)num_cores, 1, 1};
     uint32_t full_block[3] = {eff_block_dim[0], 1, 1};
     uint32_t lmem_size     = 0;
+#ifdef VX_CFG_H100_SM_ENABLE
+    // A vx_start kernel addresses local memory without declaring it, so its carve-out covers the whole window.
+    const uint32_t smem_bytes = VX_CFG_SMEM_PER_SM_MAX;
+#endif
 
     Queue* q = dev->legacy_default_queue();
     if (!q) return -1;
@@ -206,6 +210,9 @@ extern "C" int vx_start(vx_device_h hdevice, vx_buffer_h hkernel,
         { VX_DCR_KMU_GRID_DIM_Y,    full_grid[1]  },
         { VX_DCR_KMU_GRID_DIM_Z,    full_grid[2]  },
         { VX_DCR_KMU_LMEM_SIZE,     lmem_size     },
+#ifdef VX_CFG_H100_SM_ENABLE
+        { VX_DCR_KMU_SMEM_CONFIG,   smem_bytes },
+#endif
         { VX_DCR_KMU_BLOCK_SIZE,    block_size    },
         { VX_DCR_KMU_WARP_STEP_X,   warp_step_x   },
         { VX_DCR_KMU_WARP_STEP_Y,   warp_step_y   },

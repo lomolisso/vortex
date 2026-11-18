@@ -60,6 +60,11 @@
 #include "VVX_cta_gang_top.h"
 #include "VX_config.h"
 #include "dlmem_ref.h"
+#ifdef VX_CFG_H100_SM_ENABLE
+#include "smem_carveout.h"
+#else
+#line 62
+#endif
 #include <algorithm>
 #include <cstdint>
 #include <cstdio>
@@ -126,7 +131,13 @@ constexpr uint32_t NT          = VX_CFG_NUM_THREADS;
 constexpr uint32_t MAXC        = VX_CFG_DLMEM_MAX_CLUSTER;
 constexpr uint32_t LMEM_LOG    = VX_CFG_LMEM_LOG_SIZE;
 constexpr uint32_t LMEM_SIZE   = 1u << LMEM_LOG;
+#ifdef VX_CFG_H100_SM_ENABLE
+constexpr uint32_t BLOCK_ALIGN = VX_CFG_LMEM_SLOT_ALIGN;
+#else
+#line 129
 constexpr uint32_t BLOCK_ALIGN = VX_CFG_MEM_BLOCK_SIZE;
+#line 129
+#endif
 constexpr uint32_t NUM_GANGS   = VX_CFG_DLMEM_NUM_GANGS;
 constexpr uint32_t ISSUE_GAP   = VX_CFG_CLUSTER_DISPATCH_CYCLES;
 // the GPC boundary between the admission and the gang table, as Vortex.sv composes them
@@ -416,7 +427,13 @@ public:
           if (id_free && (!failed_ || dirty_) && gap_ok) {
             start = true;
             uint32_t W = warps_of(head->block_size, NT);
+#ifdef VX_CFG_H100_SM_ENABLE
+            uint32_t U = smem_usable_slots(VX_CFG_SMEM_PER_SM_MAX, head->stride, slots(CFG), smem_carve_cfg());
+#else
+#line 419
             uint32_t U = usable_slots(CFG, head->stride);
+#line 419
+#endif
             Mirror s = m_;
             ok_ = place_gpc(CFG, s, K, W, U, members_);
             fail_step_ = K;

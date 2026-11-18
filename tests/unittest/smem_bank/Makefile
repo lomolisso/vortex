@@ -3,8 +3,8 @@ include $(ROOT_DIR)/config.mk
 
 PROJECT := smem_bank
 
-# SimX twin of the shared-memory port bench (hw/unittest/smem_gate): the same
-# cases (smem_gate_cases.h) against SmemGate, linked with the simulator's
+# SimX twin of the SM array bench (hw/unittest/sm_sram): the same cases
+# (sm_sram_cases.h) against SmSram, linked with the simulator's
 # objects, which build in this directory.
 SIMX_DIR := $(ROOT_DIR)/sim/simx
 SRC_DIR  := $(VORTEX_HOME)/tests/unittest/$(PROJECT)
@@ -21,7 +21,7 @@ CXXFLAGS += -I$(SIMX_SRC) -I$(SIMX_SRC)/dxa -I$(SIMX_SRC)/tex -I$(SIMX_SRC)/om -
 CXXFLAGS += -I$(SW_COMMON_DIR) -I$(SIM_COMMON_DIR) -I$(ROOT_DIR)/sw -I$(ROOT_DIR)/hw -I$(THIRD_PARTY_DIR)
 CXXFLAGS += -I$(THIRD_PARTY_DIR)/softfloat/source/include -I$(THIRD_PARTY_DIR)/ramulator/ext/spdlog/include
 CXXFLAGS += -I$(THIRD_PARTY_DIR)/ramulator/ext/yaml-cpp/include -I$(THIRD_PARTY_DIR)/ramulator/src
-CXXFLAGS += -I$(VORTEX_HOME)/hw/unittest/smem_gate
+CXXFLAGS += -I$(VORTEX_HOME)/hw/unittest/sm_sram -I$(VORTEX_HOME)/hw/unittest/l1h100
 CXXFLAGS += -DVX_CFG_XLEN=$(XLEN) -DVX_CFG_XLEN_$(XLEN) $(CONFIGS)
 LDFLAGS  := $(THIRD_PARTY_DIR)/softfloat/build/Linux-x86_64-GCC/softfloat.a
 # SimX's DRAM model is its own archive (libvxdram.a), built by the SimX make under $(OUT).
@@ -34,7 +34,7 @@ all: $(PROJECT)
 
 obj: $(OUT)/$(PROJECT)_test.o
 
-$(OUT)/$(PROJECT)_test.o: $(SRC_DIR)/main.cpp $(VORTEX_HOME)/hw/unittest/smem_gate/smem_gate_cases.h
+$(OUT)/$(PROJECT)_test.o: $(SRC_DIR)/main.cpp $(VORTEX_HOME)/hw/unittest/sm_sram/sm_sram_cases.h $(VORTEX_HOME)/hw/unittest/l1h100/l1h100_cases.h
 	mkdir -p $(OUT)
 	$(CXX) $(CXXFLAGS) -c $(SRC_DIR)/main.cpp -o $@
 

@@ -76,6 +76,9 @@ module VX_cluster_dispatch_top import VX_gpu_pkg::*; #(
         in_req.kind                             = KMU_KIND_COMPUTE;
         in_req.ctx_id                           = in_ctx_id;
         in_req.aligned_lmem_size                = in_lmem_stride;
+    `ifdef VX_CFG_H100_SM_ENABLE
+        in_req.smem_bytes                       = (`VX_CFG_LMEM_LOG_SIZE+1)'(`VX_CFG_SMEM_PER_SM_MAX);
+    `endif
         in_req.args.compute.block_size          = in_block_size;
         in_req.args.compute.cluster_size        = in_cluster_size;
         in_req.args.compute.cluster_rank        = in_cluster_rank;

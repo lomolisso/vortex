@@ -113,6 +113,7 @@ VX_DCR_KMU_CLUSTER_DIM_Y= 0x022
 VX_DCR_KMU_CLUSTER_DIM_Z= 0x023
 VX_DCR_KMU_CLUSTER_POLICY= 0x024
 VX_DCR_KMU_STATE_END    = 0x025
+VX_DCR_KMU_SMEM_CONFIG  = 0x025  # S in bytes; outside KMU_STATE_END: only H100_SM builds decode it
 
 # DXA descriptor DCR mapping
 # access pattern:

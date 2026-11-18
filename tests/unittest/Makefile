@@ -13,6 +13,7 @@ H100_SM_UNITS := $(if $(filter 64,$(XLEN)),$(patsubst %/Makefile,%,$(wildcard $(
 DRAM_UNITS := dram_map $(if $(filter 64,$(XLEN)),dram_sim)
 
 PROJECTS := vx_malloc dxa_ooo rvc_decompress gfx_binsort gfx_tex_sw gfx_rast_sw gfx_msaa gfx_om_mrt launch_tree amo_ref mbar_ref dxa_ref cuda_fp tcu_desc $(DRAM_UNITS) $(DLMEM_UNITS) $(H100_SM_UNITS)
+PROJECTS += sram_port_ref smem_carveout l1_victim
 
 all:
 	$(foreach p,$(PROJECTS),$(MAKE) -C $(p) &&) true

@@ -206,6 +206,11 @@ module VX_lsu_scheduler import VX_gpu_pkg::*; #(
 
     wire                                       sched_req_queue_empty;
 
+`ifdef VX_CFG_H100_SM_ENABLE
+    // Both LSU credit classes hold entries; the memory tag's id field is sized by the pool.
+    `STATIC_ASSERT (`CLOG2(PENDING_SIZE + LSU_PEND_POOL - `VX_CFG_LSU_PENDING_SIZE) == `CLOG2(LSU_PEND_POOL),
+        ("the LSU scheduler's pending table must fill the two-class pool's tag range"))
+`endif
     VX_mem_scheduler #(
         .INSTANCE_ID (`SFORMATF(("%s-memsched", INSTANCE_ID))),
         .CORE_REQS   (NUM_LANES),
@@ -217,7 +222,11 @@ module VX_lsu_scheduler import VX_gpu_pkg::*; #(
         .TAG_WIDTH   (SCHED_TAG_WIDTH),
         .CORE_QUEUE_SIZE (CORE_QUEUE_SIZE),
         .MEM_QUEUE_SIZE (MEM_QUEUE_SIZE),
+    `ifdef VX_CFG_H100_SM_ENABLE
+        .PENDING_SIZE   (PENDING_SIZE + LSU_PEND_POOL - `VX_CFG_LSU_PENDING_SIZE),
+    `else
         .PENDING_SIZE   (PENDING_SIZE),
+    `endif
         .UUID_WIDTH  (UUID_WIDTH),
         .RSP_PARTIAL (1),
         .MEM_OUT_BUF (0),
@@ -267,132 +276,6 @@ module VX_lsu_scheduler import VX_gpu_pkg::*; #(
     // -----------------------------------------------------------------------
     // Drive the dcache port.
     // -----------------------------------------------------------------------
-`ifdef VX_CFG_H100_SM_ENABLE
-    // A global load completes no earlier than its L1 hit time after it left
-    // here: l1_hit_latency(P) per dependent hop (05 sec 4.3, l1_ref.h), net of
-    // the core stages before this point and after the response
-    // (L1_CORE_STAGES). A response that would complete it earlier waits in a
-    // queue, in arrival order, so it blocks neither the L1 nor the responses
-    // behind it; a longer path (a miss) is not delayed.
-    localparam HOLD_W      = 16;
-    localparam ID_BITS     = `LOG2UP(PENDING_SIZE);
-    localparam PASS_LANES  = NUM_LANES / `VX_CFG_L1_ADDR_PASSES;
-    localparam LINE_ASHIFT = `CLOG2(`VX_CFG_DCACHE_LINE_SIZE / LSU_WORD_SIZE);
-    localparam REQ_ASHIFT  = `CLOG2(LSU_WORD_SIZE);
-    `STATIC_ASSERT(NUM_LANES == `VX_CFG_NUM_THREADS, ("invalid parameter: the address passes span a warp"))
-    `STATIC_ASSERT(L1_PIPE_OVERHEAD <= `VX_CFG_L1_HIT_LATENCY, ("invalid parameter: L1_HIT_LATENCY below the pipeline's own hit time"))
-
-    wire [NUM_LANES-1:0] gload_lane;
-    wire [NUM_LANES-1:0][LSU_ADDR_WIDTH-LINE_ASHIFT-1:0] lane_line;
-    wire [NUM_LANES-1:0] lane_amo;
-    for (genvar i = 0; i < NUM_LANES; ++i) begin : g_gload_lane
-        mem_bus_attr_t lane_attr;
-        assign lane_attr = mem_bus_attr_t'(lsu_mem_req_attr[i]);
-        `UNUSED_VAR (lane_attr)
-        wire [`VX_CFG_XLEN-1:0] lane_baddr = `VX_CFG_XLEN'(lsu_mem_req_addr[i]) << REQ_ASHIFT;
-    `ifdef VX_CFG_EXT_DLMEM_ENABLE
-        localparam WIN_LSB = `VX_CFG_LMEM_LOG_SIZE + DLMEM_RANK_BITS;
-        wire lane_in_win = ((lane_baddr >> WIN_LSB) == (`VX_CFG_XLEN'(`VX_MEM_DLMEM_BASE_ADDR) >> WIN_LSB));
-    `else
-        wire lane_in_win = 1'b0;
-    `endif
-        assign gload_lane[i] = lsu_mem_req_mask[i] && ~lane_attr.is_addr_local && ~lane_attr.is_addr_io && ~lane_in_win;
-        assign lane_line[i]  = lsu_mem_req_addr[i][LSU_ADDR_WIDTH-1:LINE_ASHIFT];
-        assign lane_amo[i]   = lane_attr.amo.amo_valid || lane_attr.is_fence;
-    end
-
-    // P: per address pass, the distinct lines its lanes touch
-    wire [NUM_LANES-1:0] lane_first;
-    for (genvar i = 0; i < NUM_LANES; ++i) begin : g_lane_first
-        localparam PASS_LO = (i / PASS_LANES) * PASS_LANES;
-        wire [NUM_LANES-1:0] dup;
-        for (genvar j = 0; j < NUM_LANES; ++j) begin : g_j
-            if ((j >= PASS_LO) && (j < i)) begin : g_prev
-                assign dup[j] = gload_lane[j] && (lane_line[j] == lane_line[i]);
-            end else begin : g_none
-                assign dup[j] = 1'b0;
-            end
-        end
-        assign lane_first[i] = gload_lane[i] && ~(| dup);
-    end
-    wire [`CLOG2(NUM_LANES+1)-1:0] req_passes;
-    `POP_COUNT(req_passes, lane_first);
-
-    wire req_gload = ~lsu_mem_req_rw && (| gload_lane) && ~(| lane_amo);
-    wire [HOLD_W-1:0] req_hit_lat = HOLD_W'((`VX_CFG_L1_LINE_BASE_CENTICYCLES + `VX_CFG_L1_LINE_STEP_CENTICYCLES * 32'(req_passes) + 50) / 100);
-    wire [HOLD_W-1:0] req_hold = req_hit_lat - HOLD_W'(L1_CORE_STAGES);
-
-    reg [HOLD_W-1:0] now_r;
-    reg [PENDING_SIZE-1:0] hold_valid;
-    reg [HOLD_W-1:0] hold_until [PENDING_SIZE];
-    reg [NUM_LANES-1:0] hold_rem [PENDING_SIZE];
-
-    wire [ID_BITS-1:0] req_id = lsu_mem_req_tag[ID_BITS-1:0];
-    wire [ID_BITS-1:0] rsp_id = lsu_mem_if.rsp_data.tag[ID_BITS-1:0];
-    wire lsu_mem_req_fire = lsu_mem_req_valid && lsu_mem_req_ready;
-
-    always @(posedge clk) begin
-        if (reset) begin
-            now_r      <= '0;
-            hold_valid <= '0;
-        end else begin
-            now_r <= now_r + HOLD_W'(1);
-            if (lsu_mem_req_fire) begin
-                hold_valid[req_id] <= req_gload;
-            end
-        end
-        if (lsu_mem_req_fire) begin
-            hold_until[req_id] <= now_r + req_hold;
-            hold_rem[req_id]   <= lsu_mem_req_mask;
-        end
-        if (lsu_mem_if.rsp_valid && lsu_mem_if.rsp_ready) begin
-            hold_rem[rsp_id] <= hold_rem[rsp_id] & ~lsu_mem_if.rsp_data.mask;
-        end
-    end
-
-    wire [HOLD_W-1:0] rsp_wait = hold_until[rsp_id] - now_r;
-    wire rsp_last = ((hold_rem[rsp_id] & ~lsu_mem_if.rsp_data.mask) == '0);
-    wire rsp_early = hold_valid[rsp_id] && rsp_last && (rsp_wait != '0) && ~rsp_wait[HOLD_W-1];
-
-    localparam HQ_DATAW = NUM_LANES + (NUM_LANES * LSU_WORD_SIZE * 8) + LSU_TAG_WIDTH;
-    wire hq_empty, hq_full, hq_ready, hq_push, hq_pop;
-    wire [NUM_LANES-1:0] hq_mask;
-    wire [NUM_LANES-1:0][(LSU_WORD_SIZE*8)-1:0] hq_data;
-    wire [LSU_TAG_WIDTH-1:0] hq_tag;
-
-    VX_fifo_queue #(
-        .DATAW (HQ_DATAW),
-        .DEPTH (`VX_CFG_L1_HIT_LATENCY)
-    ) hold_queue (
-        .clk      (clk),
-        .reset    (reset),
-        .push     (hq_push),
-        .pop      (hq_pop),
-        .data_in  ({lsu_mem_if.rsp_data.mask, lsu_mem_if.rsp_data.data, lsu_mem_if.rsp_data.tag}),
-        .data_out ({hq_mask, hq_data, hq_tag}),
-        .empty    (hq_empty),
-        `UNUSED_PIN (alm_empty),
-        .full     (hq_full),
-        `UNUSED_PIN (alm_full),
-        `UNUSED_PIN (size)
-    );
-
-    wire [HOLD_W-1:0] hq_wait = hold_until[hq_tag[ID_BITS-1:0]] - now_r;
-    assign hq_ready = ~hq_empty && ((hq_wait == '0) || hq_wait[HOLD_W-1]);
-    assign hq_push  = lsu_mem_if.rsp_valid && rsp_early && ~hq_full;
-    assign hq_pop   = hq_ready && lsu_mem_rsp_ready;
-
-`ifdef DBG_TRACE_MEM
-    always @(posedge clk) begin
-        if (lsu_mem_req_fire && req_gload) begin
-            `TRACE(2, ("%t: %s l1-hold req: id=%0d, passes=%0d, until=%0d\n", $time, INSTANCE_ID, req_id, req_passes, now_r + req_hold))
-        end
-        if (lsu_mem_rsp_valid && lsu_mem_rsp_ready) begin
-            `TRACE(2, ("%t: %s l1-hold rsp: id=%0d, held=%b\n", $time, INSTANCE_ID, lsu_mem_rsp_tag[ID_BITS-1:0], hq_ready))
-        end
-    end
-`endif
-`endif
 
     assign lsu_mem_if.req_valid       = lsu_mem_req_valid;
     assign lsu_mem_if.req_data.mask   = lsu_mem_req_mask;
@@ -404,20 +287,11 @@ module VX_lsu_scheduler import VX_gpu_pkg::*; #(
     assign lsu_mem_if.req_data.tag    = lsu_mem_req_tag;
     assign lsu_mem_req_ready          = lsu_mem_if.req_ready;
 
-`ifdef VX_CFG_H100_SM_ENABLE
-    // the held response whose time has come goes first
-    assign lsu_mem_rsp_valid          = hq_ready || (lsu_mem_if.rsp_valid && ~rsp_early);
-    assign lsu_mem_rsp_mask           = hq_ready ? hq_mask : lsu_mem_if.rsp_data.mask;
-    assign lsu_mem_rsp_data           = hq_ready ? hq_data : lsu_mem_if.rsp_data.data;
-    assign lsu_mem_rsp_tag            = hq_ready ? hq_tag : lsu_mem_if.rsp_data.tag;
-    assign lsu_mem_if.rsp_ready       = rsp_early ? ~hq_full : (~hq_ready && lsu_mem_rsp_ready);
-`else
     assign lsu_mem_rsp_valid          = lsu_mem_if.rsp_valid;
     assign lsu_mem_rsp_mask           = lsu_mem_if.rsp_data.mask;
     assign lsu_mem_rsp_data           = lsu_mem_if.rsp_data.data;
     assign lsu_mem_rsp_tag            = lsu_mem_if.rsp_data.tag;
     assign lsu_mem_if.rsp_ready       = lsu_mem_rsp_ready;
-`endif
 
     assign empty = sched_req_queue_empty;
 

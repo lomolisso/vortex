@@ -185,6 +185,15 @@ module VX_socket import VX_gpu_pkg::*, VX_tlb_pkg::*;
 
     ///////////////////////////////////////////////////////////////////////////
 
+`ifdef VX_CFG_H100_SM_ENABLE
+    // The SM's L1 is in the core: its bus carries the L1's line requests,
+    // write-throughs, atomics and fences out and the refills back, straight
+    // to the SM's port (below).
+    VX_mem_bus_if #(
+        .DATA_SIZE (DCACHE_MEM_DATA_SIZE),
+        .TAG_WIDTH (SM_L1_MEM_TAG_WIDTH)
+    ) per_core_dcache_bus_if[`VX_CFG_SOCKET_SIZE]();
+`else
     // Core-side (virtual under VM) and cache-side (physical) dcache buses. The
     // socket dMMU translates between them; without VM they pass straight through.
     VX_mem_bus_if #(
@@ -197,21 +206,18 @@ module VX_socket import VX_gpu_pkg::*, VX_tlb_pkg::*;
         .TAG_WIDTH (DCACHE_TAG_WIDTH)
     ) dcache_phys_bus_if[`VX_CFG_SOCKET_SIZE * DCACHE_NUM_REQS]();
 
-`ifdef VX_CFG_H100_SM_ENABLE
-    // One L1 per SM, each with its own memory side: the SM's port (below).
-    localparam SM_DCACHE_MEM_TAG_WIDTH = `CACHE_CLUSTER_NC_MEM_TAG_WIDTH(`VX_CFG_DCACHE_MSHR_SIZE, DCACHE_NUM_BANKS,
-        DCACHE_NUM_REQS, 1, DCACHE_MEM_DATA_SIZE, DCACHE_WORD_SIZE, DCACHE_TAG_WIDTH, 1, 1, UUID_WIDTH);
-    VX_mem_bus_if #(
-        .DATA_SIZE (DCACHE_MEM_DATA_SIZE),
-        .TAG_WIDTH (SM_DCACHE_MEM_TAG_WIDTH)
-    ) sm_dcache_mem_bus_if[`VX_CFG_SOCKET_SIZE]();
-`else
     VX_mem_bus_if #(
         .DATA_SIZE (DCACHE_SECTOR_SIZE),
         .TAG_WIDTH (DCACHE_MEM_TAG_WIDTH)
     ) dcache_mem_bus_if[L1_MEM_PORTS]();
 `endif
 
+`ifdef VX_CFG_H100_SM_ENABLE
+`ifdef PERF_ENABLE
+    cache_perf_t sm_dcache_perf [`VX_CFG_SOCKET_SIZE];
+    `PERF_CACHE_ADD (dcache_perf, sm_dcache_perf, `VX_CFG_SOCKET_SIZE)
+`endif
+`else
     // The dcache is the device's shared level, where a fence drains, only when
     // no other cache or memory port could hold or read data behind it: no L2
     // or L3, one socket with one dcache, and no unit with a memory port below
@@ -224,63 +230,6 @@ module VX_socket import VX_gpu_pkg::*, VX_tlb_pkg::*;
                                   && (`VX_CFG_EXT_RTU_ENABLED == 0) && (`VX_CFG_EXT_RASTER_ENABLED == 0)
                                   && (`VX_CFG_EXT_OM_ENABLED == 0);
 
-`ifdef VX_CFG_H100_SM_ENABLE
-`ifdef PERF_ENABLE
-    cache_perf_t sm_dcache_perf [`VX_CFG_SOCKET_SIZE];
-    `PERF_CACHE_ADD (dcache_perf, sm_dcache_perf, `VX_CFG_SOCKET_SIZE)
-`endif
-    for (genvar c = 0; c < `VX_CFG_SOCKET_SIZE; ++c) begin : g_sm_dcache
-        VX_mem_bus_if #(
-            .DATA_SIZE (DCACHE_MEM_DATA_SIZE),
-            .TAG_WIDTH (SM_DCACHE_MEM_TAG_WIDTH)
-        ) mem_bus_tmp_if[1]();
-
-        VX_cache_cluster #(
-            .INSTANCE_ID    (`SFORMATF(("%s-dcache%0d", INSTANCE_ID, c))),
-            .NUM_UNITS      (1),
-            .NUM_INPUTS     (1),
-            .TAG_SEL_IDX    (0),
-            .CACHE_SIZE     (`VX_CFG_DCACHE_SIZE),
-            .LINE_SIZE      (DCACHE_LINE_SIZE),
-            .SECTOR_SIZE    (DCACHE_MEM_DATA_SIZE),
-            .H100_L1        (1),
-            .NUM_BANKS      (DCACHE_NUM_BANKS),
-            .NUM_WAYS       (`VX_CFG_DCACHE_NUM_WAYS),
-            .WORD_SIZE      (DCACHE_WORD_SIZE),
-            .NUM_REQS       (DCACHE_NUM_REQS),
-            .MEM_PORTS      (1),
-            .CRSQ_SIZE      (`VX_CFG_DCACHE_CRSQ_SIZE),
-            .MSHR_SIZE      (`VX_CFG_DCACHE_MSHR_SIZE),
-            .MRSQ_SIZE      (`VX_CFG_DCACHE_MRSQ_SIZE),
-            .MREQ_SIZE      (`VX_CFG_DCACHE_MREQ_SIZE),
-            .LATENCY        (`VX_CFG_DCACHE_LATENCY),
-            .TAG_WIDTH      (DCACHE_TAG_WIDTH),
-            .WRITE_ENABLE   (1),
-            .WRITEBACK      (`VX_CFG_DCACHE_WRITEBACK),
-            .DIRTY_BYTES    (`VX_CFG_DCACHE_DIRTYBYTES),
-            .REPL_POLICY    (`VX_CFG_DCACHE_REPL_POLICY),
-            .NC_ENABLE      (1),
-            .CORE_OUT_BUF   (3),
-            .MEM_OUT_BUF    (3),
-            .IS_LLC         (DCACHE_IS_LLC),
-            .SHARED_LEVEL   (DCACHE_SHARED_LEVEL),
-        `ifdef VX_CFG_EXT_DLMEM_ENABLE
-            .CTA_FENCE      (1),
-        `endif
-            .AMO_ENABLE     (`VX_CFG_EXT_A_ENABLED)
-        ) dcache (
-        `ifdef PERF_ENABLE
-            .cache_perf     (sm_dcache_perf[c]),
-        `endif
-            .clk            (clk),
-            .reset          (reset),
-            .core_bus_if    (dcache_phys_bus_if[c * DCACHE_NUM_REQS +: DCACHE_NUM_REQS]),
-            .mem_bus_if     (mem_bus_tmp_if)
-        );
-
-        `ASSIGN_VX_MEM_BUS_IF (sm_dcache_mem_bus_if[c], mem_bus_tmp_if[0]);
-    end
-`else
     VX_cache_cluster #(
         .INSTANCE_ID    (`SFORMATF(("%s-dcache", INSTANCE_ID))),
         .NUM_UNITS      (`VX_CFG_NUM_DCACHES),
@@ -443,9 +392,11 @@ module VX_socket import VX_gpu_pkg::*, VX_tlb_pkg::*;
 
 `else
     // No-VM passthrough: cache-side buses mirror the core-side buses.
+`ifndef VX_CFG_H100_SM_ENABLE
     for (genvar i = 0; i < `VX_CFG_SOCKET_SIZE * DCACHE_NUM_REQS; ++i) begin : g_dcache_phys_passthru
         `ASSIGN_VX_MEM_BUS_IF (dcache_phys_bus_if[i], per_core_dcache_bus_if[i]);
     end
+`endif
     for (genvar i = 0; i < `VX_CFG_SOCKET_SIZE; ++i) begin : g_icache_phys_passthru
         `ASSIGN_VX_MEM_BUS_IF (icache_phys_bus_if[i], per_core_icache_bus_if[i]);
     end
@@ -865,22 +816,12 @@ module VX_socket import VX_gpu_pkg::*, VX_tlb_pkg::*;
     // traffic: they join SM 0's memory port behind its adapter.
     localparam SM_DXA_SRCS    = `VX_CFG_EXT_DXA_ENABLED;
     localparam SM_NUM_SRCS    = 1 + SM_DXA_SRCS;
-    localparam SM_SRC_TAG_W   = `MAX(SM_DCACHE_MEM_TAG_WIDTH, SM_DXA_SRCS ? SOCKET_MEM_TAG_WIDTH : 0);
+    localparam SM_SRC_TAG_W   = `MAX(SM_L1_MEM_TAG_WIDTH, SM_DXA_SRCS ? SOCKET_MEM_TAG_WIDTH : 0);
     localparam SM_SECT_W      = `CLOG2(SM_PORT_LINE_SIZE / `VX_CFG_SM_EGRESS_BEAT + 1);
     localparam SM_PORT_TAG_W  = SM_SRC_TAG_W + SM_SECT_W + `LOG2UP(SM_NUM_SRCS);
     localparam SM_PENDING     = 2 * `VX_CFG_SM_MAX_READ_LINES;
     localparam SM_BLOCKS      = SM_PORT_LINE_SIZE / `VX_CFG_L1_LINE_SIZE;
     localparam SM_MEM_TAG_W   = UUID_WIDTH + `CLOG2(SM_PENDING) + ((SM_BLOCKS > 1) ? `CLOG2(SM_BLOCKS) : 0);
-    // The port's own stages on an L2 access: request FIFO and output register,
-    // the adapter's request buffer and reply queue, input register and reply
-    // buffer. The rest of the SM side beyond the core and L1 stages is a delay
-    // split over the two directions.
-    localparam SM_PORT_EG_STAGES   = 2;
-    localparam SM_ADAPTER_STAGES   = 2;
-    localparam SM_PORT_IG_STAGES   = 2;
-    localparam SM_PORT_MISS_STAGES = SM_PORT_EG_STAGES + SM_ADAPTER_STAGES + SM_PORT_IG_STAGES;
-    localparam SM_MISS_DELAY  = `VX_CFG_SM_L2_SIDE_LATENCY - L1_MISS_PIPE_OVERHEAD - SM_PORT_MISS_STAGES;
-    `STATIC_ASSERT (SM_MISS_DELAY >= 0, ("sm port: VX_CFG_SM_L2_SIDE_LATENCY below the pipeline's own stages"))
     `STATIC_ASSERT (SM_MEM_TAG_W <= SOCKET_MEM_TAG_WIDTH, ("sm port: adapter tag wider than the socket memory tag"))
     `STATIC_ASSERT (`VX_CFG_XLEN == 64, ("the H100 SM path requires XLEN 64"))
 
@@ -1167,7 +1108,7 @@ module VX_socket import VX_gpu_pkg::*, VX_tlb_pkg::*;
             .TAG_WIDTH (SM_PORT_TAG_W)
         ) line_bus_if();
 
-        `ASSIGN_VX_MEM_BUS_IF_EX (src_bus_if[0], sm_dcache_mem_bus_if[c], SM_SRC_TAG_W, SM_DCACHE_MEM_TAG_WIDTH, UUID_WIDTH);
+        `ASSIGN_VX_MEM_BUS_IF_EX (src_bus_if[0], per_core_dcache_bus_if[c], SM_SRC_TAG_W, SM_L1_MEM_TAG_WIDTH, UUID_WIDTH);
     `ifdef VX_CFG_EXT_DXA_ENABLE
         `ASSIGN_VX_MEM_BUS_IF_EX (src_bus_if[1], sm_dxa_gmem_bus_if[c], SM_SRC_TAG_W, SOCKET_MEM_TAG_WIDTH, UUID_WIDTH);
     `endif
@@ -1178,9 +1119,7 @@ module VX_socket import VX_gpu_pkg::*, VX_tlb_pkg::*;
             .INSTANCE_ID   (`SFORMATF(("%s-smport%0d", INSTANCE_ID, c))),
             .NUM_SRCS      (SM_NUM_SRCS),
             .SRC_TAG_WIDTH (SM_SRC_TAG_W),
-            .LINE_SIZE     (SM_PORT_LINE_SIZE),
-            .EGRESS_DELAY  ((SM_MISS_DELAY + 1) / 2),
-            .INGRESS_DELAY (SM_MISS_DELAY / 2)
+            .LINE_SIZE     (SM_PORT_LINE_SIZE)
         ) sm_port (
             .clk            (clk),
             .reset          (reset),
@@ -1247,7 +1186,14 @@ module VX_socket import VX_gpu_pkg::*, VX_tlb_pkg::*;
 
             .dcr_bus_if     (per_core_dcr_bus_if[core_id]),
 
+        `ifdef VX_CFG_H100_SM_ENABLE
+            .dcache_bus_if  (per_core_dcache_bus_if[core_id +: 1]),
+        `ifdef PERF_ENABLE
+            .dcache_perf    (sm_dcache_perf[core_id]),
+        `endif
+        `else
             .dcache_bus_if  (per_core_dcache_bus_if[core_id * DCACHE_NUM_REQS +: DCACHE_NUM_REQS]),
+        `endif
 
             .icache_bus_if  (per_core_icache_bus_if[core_id]),
 

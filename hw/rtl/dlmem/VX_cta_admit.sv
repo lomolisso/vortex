@@ -165,10 +165,19 @@ module VX_cta_admit import VX_gpu_pkg::*; #(
 
     // usable slots as a mask: the dispatcher's occupancy bound, slot 0 always
     wire [NS-1:0] in_umask;
+`ifdef VX_CFG_H100_SM_ENABLE
+    // Each slot is charged its pitch against the launch's carve-out S.
+    wire [PROD_W-1:0] in_fp = PROD_W'(in_stride);
+    for (genvar i = 0; i < NS; ++i) begin : g_umask
+        assign in_umask[i] = (in_fp == 0) || (i == 0)
+                          || ((PROD_W'(i + 1) * in_fp) <= PROD_W'(in_req.smem_bytes));
+    end
+`else
     for (genvar i = 0; i < NS; ++i) begin : g_umask
         assign in_umask[i] = (in_stride == 0) || (i == 0)
                           || ((PROD_W'(i + 1) * PROD_W'(in_stride)) <= PROD_W'(1 << LMEM_LOG));
     end
+`endif
 
     // ---- events: applied before this cycle's decision ---------------------
 

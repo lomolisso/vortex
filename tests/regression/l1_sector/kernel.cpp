@@ -65,6 +65,41 @@ __kernel void kernel_main(kernel_arg_t* __UNIFORM__ arg) {
     return;
   }
 
+  if (arg->kind == LS_STREAM) {
+    const uint32_t W = arg->warps, n = arg->n, step = W * LS_STREAM_UNROLL;
+    const uint64_t base = arg->start_addr + lane * 4;
+    uint64_t sink = 0, t0 = 0;
+    for (uint32_t l = 0; l < arg->laps; ++l) {
+      if (l + 1 == arg->laps) {
+        __syncthreads();
+        if (wid == 0 && lane == 0)
+          fence(arg->fence);
+        __syncthreads();
+        t0 = vx_rdcycle();
+      }
+      for (uint32_t i = wid; i + step - W < n; i += step) {
+        uint64_t a = base + (uint64_t)i * VX_CFG_DCACHE_LINE_SIZE, r[LS_STREAM_UNROLL];
+        const uint64_t d = (uint64_t)W * VX_CFG_DCACHE_LINE_SIZE;
+        __asm__ volatile ("lw %0, 0(%8)\n lw %1, 0(%9)\n lw %2, 0(%10)\n lw %3, 0(%11)\n"
+                          "lw %4, 0(%12)\n lw %5, 0(%13)\n lw %6, 0(%14)\n lw %7, 0(%15)\n"
+                          : "=&r"(r[0]), "=&r"(r[1]), "=&r"(r[2]), "=&r"(r[3]),
+                            "=&r"(r[4]), "=&r"(r[5]), "=&r"(r[6]), "=&r"(r[7])
+                          : "r"(a), "r"(a + d), "r"(a + 2 * d), "r"(a + 3 * d),
+                            "r"(a + 4 * d), "r"(a + 5 * d), "r"(a + 6 * d), "r"(a + 7 * d)
+                          : "memory");
+        for (uint32_t u = 0; u < LS_STREAM_UNROLL; ++u)
+          sink += r[u];
+      }
+    }
+    uint64_t t1 = vx_rdcycle();
+    if (lane == 0) {
+      out[wid * 2 + 0] = t0;
+      out[wid * 2 + 1] = t1;
+      out[64 + wid] = sink;
+    }
+    return;
+  }
+
   if (wid != 0) {
     return;
   }

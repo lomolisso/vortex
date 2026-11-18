@@ -341,6 +341,9 @@ vx_result_t Queue::enqueue_launch(const vx_launch_info_t* info,
     // kernel==NULL and args_host==NULL are the analogous PC / ARG hatches.
     const uint32_t ndim      = info->ndim;
     const uint32_t lmem_size = info->lmem_size;
+#ifdef VX_CFG_H100_SM_ENABLE
+    uint32_t smem_bytes = VX_CFG_SMEM_PER_SM_MAX;
+#endif
     std::array<uint32_t, 3> grid_in  = {1, 1, 1};
     std::array<uint32_t, 3> block_in = {1, 1, 1};
     for (uint32_t i = 0; i < ndim; ++i) {
@@ -393,11 +396,21 @@ vx_result_t Queue::enqueue_launch(const vx_launch_info_t* info,
             if (kernel) kernel->release();
             return VX_ERR_INVALID_VALUE;
         }
+#ifdef VX_CFG_H100_SM_ENABLE
+        r = vx::smem_carveout(info, &smem_bytes);
+        if (r != VX_SUCCESS) {
+            if (kernel) kernel->release();
+            return r;
+        }
+#endif
     }
 
     Command cmd;
     cmd.queued_ns = now_ns();
     cmd.work = [this, kernel, ndim, lmem_size, grid_in, block_in, lg_in,
+#ifdef VX_CFG_H100_SM_ENABLE
+                smem_bytes,
+#endif
                 policy, policy_dcr,
                 args_blob = std::move(args_blob)](uint64_t* s, uint64_t* e) {
         // Launch PCs, derived from the retained kernel handle. has_kernel is
@@ -496,6 +509,9 @@ vx_result_t Queue::enqueue_launch(const vx_launch_info_t* info,
                 WR(VX_DCR_KMU_GRID_DIM_Y,  ndim >= 2 ? grid_in[1] : 1);
                 WR(VX_DCR_KMU_GRID_DIM_Z,  ndim >= 3 ? grid_in[2] : 1);
                 WR(VX_DCR_KMU_LMEM_SIZE,   lmem_size);
+#ifdef VX_CFG_H100_SM_ENABLE
+                WR(VX_DCR_KMU_SMEM_CONFIG, smem_bytes);
+#endif
                 WR(VX_DCR_KMU_BLOCK_SIZE,  block_size);
                 WR(VX_DCR_KMU_WARP_STEP_X, ws_x);
                 WR(VX_DCR_KMU_WARP_STEP_Y, ws_y);
@@ -552,6 +568,9 @@ struct CmdRec {
     std::vector<uint8_t>   args;
     uint32_t               ndim      = 0;
     uint32_t               lmem_size = 0;
+#ifdef VX_CFG_H100_SM_ENABLE
+    uint32_t               smem_bytes = VX_CFG_SMEM_PER_SM_MAX;
+#endif
     std::array<uint32_t,3> grid      = {1, 1, 1};
     std::array<uint32_t,3> block     = {1, 1, 1};
     std::array<uint32_t,3> cluster   = {1, 1, 1};
@@ -596,6 +615,12 @@ vx_result_t cmd_build_recs(Device* device_, const vx_command_t* commands,
                 return fail(VX_ERR_INVALID_VALUE);
             auto rp = launch_policy(device_, info, &r.policy, &r.policy_dcr);
             if (rp != VX_SUCCESS) return fail(rp);
+#ifdef VX_CFG_H100_SM_ENABLE
+            if (info->ndim > 0) {
+                rp = vx::smem_carveout(info, &r.smem_bytes);
+                if (rp != VX_SUCCESS) return fail(rp);
+            }
+#endif
             r.is_launch = true;
             r.kernel = (info->kernel != nullptr) ? to_kernel(info->kernel) : nullptr;
             if (r.kernel) { r.kernel->retain(); retained.push_back(r.kernel); }
@@ -689,6 +714,9 @@ vx_result_t cmd_stage_qmds(Device* device_, const std::vector<CmdRec>& recs,
             put(VX_DCR_KMU_GRID_DIM_Y,  rec.ndim >= 2 ? rec.grid[1] : 1);
             put(VX_DCR_KMU_GRID_DIM_Z,  rec.ndim >= 3 ? rec.grid[2] : 1);
             put(VX_DCR_KMU_LMEM_SIZE,   rec.lmem_size);
+#ifdef VX_CFG_H100_SM_ENABLE
+            put(VX_DCR_KMU_SMEM_CONFIG, rec.smem_bytes);
+#endif
             put(VX_DCR_KMU_BLOCK_SIZE,  block_size);
             put(VX_DCR_KMU_WARP_STEP_X, ws_x);
             put(VX_DCR_KMU_WARP_STEP_Y, ws_y);

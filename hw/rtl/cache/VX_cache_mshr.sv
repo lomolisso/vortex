@@ -54,10 +54,6 @@ module VX_cache_mshr import VX_gpu_pkg::*; #(
     parameter AMO_ENABLE        = 0,          // Per-entry AMO tracking (probe outputs)
     parameter AMO_PASSTHRU      = 0,          // Non-LLC passthrough: AMO entries never coalesce
     parameter WORD_SEL_WIDTH    = 1,          // word-in-line select width (order-hazard granularity)
-`ifdef VX_CFG_H100_SM_ENABLE
-    parameter H100_L1           = 0,          // the H100 L1: per-entry requested sectors and a line probe at the input
-    parameter SEC_MASK_W        = 1,          // H100 L1: sectors per line
-`endif
 
     parameter MSHR_ADDR_WIDTH   = `LOG2UP(MSHR_SIZE)
 ) (
@@ -133,15 +129,6 @@ module VX_cache_mshr import VX_gpu_pkg::*; #(
     output wire                         empty,
     // per-entry occupancy, and the entries a dequeue or a release frees this cycle
     output wire [MSHR_SIZE-1:0]         valid_mask,
-`ifdef VX_CFG_H100_SM_ENABLE
-    // H100 L1: the sectors a root's fill requests, read back at its fill; the
-    // input request's line: whether it has a kept entry, and the sectors in flight
-    input wire [SEC_MASK_W-1:0]         allocate_sec_mask,
-    output wire [SEC_MASK_W-1:0]        fill_sec_mask,
-    input wire [`CS_LINE_ADDR_WIDTH-1:0] probe_line_addr,
-    output wire                         probe_line_pending,
-    output wire [SEC_MASK_W-1:0]        probe_line_mask,
-`endif
     output wire [MSHR_SIZE-1:0]         free_mask
 );
     `UNUSED_PARAM (BANK_ID)
@@ -361,60 +348,6 @@ module VX_cache_mshr import VX_gpu_pkg::*; #(
     assign fill_addr = addr_table[fill_id];
     assign fill_sector = sector_table[fill_id];
 
-`ifdef VX_CFG_H100_SM_ENABLE
-    if (H100_L1 != 0) begin : g_h100_probe
-        // An entry is probed once it is kept: a hit's entry lives only from its
-        // lookup to its release, and the bank checks those stages itself.
-        reg [SEC_MASK_W-1:0] sec_mask_table [MSHR_SIZE];
-        reg [MSHR_SIZE-1:0]  kept_table;
-        always @(posedge clk) begin
-            if (reset) begin
-                kept_table <= '0;
-            end else begin
-                if (allocate_fire) begin
-                    kept_table[allocate_id] <= 1'b0;
-                end
-                if (finalize_valid && ~finalize_is_release) begin
-                    kept_table[finalize_id] <= 1'b1;
-                end
-            end
-            if (allocate_fire) begin
-                sec_mask_table[allocate_id] <= allocate_sec_mask;
-            end
-        end
-        assign fill_sec_mask = sec_mask_table[fill_id];
-
-        wire [MSHR_SIZE-1:0] line_match;
-        wire [MSHR_SIZE-1:0][SEC_MASK_W-1:0] line_masks;
-        for (genvar i = 0; i < MSHR_SIZE; ++i) begin : g_line_match
-            assign line_match[i] = valid_table[i] && kept_table[i] && (addr_table[i] == probe_line_addr);
-            assign line_masks[i] = line_match[i] ? sec_mask_table[i] : '0;
-        end
-        VX_reduce_tree #(
-            .IN_W  (1),
-            .OUT_W (1),
-            .N     (MSHR_SIZE),
-            .OP    ("|")
-        ) line_pending_reduce (
-            .data_in  (line_match),
-            .data_out (probe_line_pending)
-        );
-        VX_reduce_tree #(
-            .IN_W  (SEC_MASK_W),
-            .OUT_W (SEC_MASK_W),
-            .N     (MSHR_SIZE),
-            .OP    ("|")
-        ) line_mask_reduce (
-            .data_in  (line_masks),
-            .data_out (probe_line_mask)
-        );
-    end else begin : g_no_h100_probe
-        assign fill_sec_mask = '0;
-        assign probe_line_pending = 1'b0;
-        assign probe_line_mask = '0;
-        `UNUSED_VAR ({allocate_sec_mask, probe_line_addr})
-    end
-`endif
 
     if (AMO_ENABLE != 0) begin : g_amo
         reg [MSHR_SIZE-1:0] amo_table;

@@ -48,11 +48,7 @@ void MemCoalescer::on_reset() {
   out_round_.valid = false;
   out_round_.lanes.reset();
   out_round_.reqs.clear();
-#ifdef VX_CFG_H100_SM_ENABLE
-  lane_ch_.clear();
-#else
-#line 50
-#endif
+#line 51
 }
 
 void MemCoalescer::on_tick() {
@@ -82,38 +78,7 @@ void MemCoalescer::on_tick() {
       lane_data.at(j) = r.data;
     }
 
-#ifdef VX_CFG_H100_SM_ENABLE
-    if (rsp0.tag < lane_ch_.size() && !lane_ch_.at(rsp0.tag).empty()) {
-      auto& lane_ch = lane_ch_.at(rsp0.tag);
-      LsuRsp out_rsp(input_size_);
-      for (uint32_t i = 0; i < input_size_; ++i) {
-        uint8_t ch = lane_ch.at(i);
-        if (ch != LANE_NO_CH && lane_mask.test(ch) && entry.mask.test(i)) {
-          out_rsp.mask.set(i);
-          out_rsp.data.at(i) = lane_data.at(ch);
-        }
-      }
-      out_rsp.tag  = entry.tag;
-      out_rsp.cid  = rsp0.hart_id;
-      out_rsp.uuid = rsp0.uuid;
-      RspOut.send(out_rsp, 1);
-      DT(4, this->name() << " mem-rsp: " << out_rsp);
-      assert(!out_rsp.mask.none());
-      entry.mask &= ~out_rsp.mask;
-      if (entry.mask.none()) {
-        lane_ch.clear();
-        pending_rd_reqs_.release(rsp0.tag);
-      }
-      for (uint32_t j = 0; j < output_size_; ++j) {
-        if (lane_mask.test(j)) {
-          RspIn.at(j).pop();
-        }
-      }
-      break;
-    }
-#else
-#line 79
-#endif
+#line 80
     BitVector<> rsp_mask(input_size_);
     for (uint32_t j = 0; j < output_size_; ++j) {
       if (!lane_mask.test(j)) {
@@ -197,15 +162,7 @@ void MemCoalescer::on_tick() {
     return;
   }
 
-#ifdef VX_CFG_H100_SM_ENABLE
-  if ((in_req.op == MemOp::LD || in_req.op == MemOp::ST) && !in_req.flags.fence) {
-    this->build_line_round(in_req);
-    this->flush_out_round();
-    return;
-  }
-#else
-#line 162
-#endif
+#line 163
   uint64_t addr_mask = ~uint64_t(line_size_-1);
 
   const bool in_is_amo = in_req.is_amo();
@@ -361,101 +318,7 @@ void MemCoalescer::flush_out_round() {
   }
 }
 
-#ifdef VX_CFG_H100_SM_ENABLE
-// The H100 SM's line coalescer: each round takes the line of the first lane
-// still to send, with every lane of the request on that line, so a warp
-// request costs one L1 access per distinct line. The line goes out as its
-// memory blocks (the model's data granule), one output channel each, sent
-// the cycle the round is built; blocks with no channel left wait for the
-// next round.
-void MemCoalescer::build_line_round(const LsuReq& in_req) {
-  constexpr uint32_t BLOCK = VX_CFG_MEM_BLOCK_SIZE;
-  static_assert(VX_CFG_DCACHE_LINE_SIZE % BLOCK == 0, "an L1 line holds whole memory blocks");
-  const uint32_t blocks = line_size_ / BLOCK;
-  const bool is_write = in_req.is_write();
-
-  uint32_t seed = input_size_;
-  for (uint32_t i = 0; i < input_size_; ++i) {
-    if (in_req.mask.test(i) && !sent_mask_.test(i)) {
-      seed = i;
-      break;
-    }
-  }
-  assert(seed < input_size_);
-  const uint64_t line = in_req.addrs.at(seed) / line_size_;
-
-  BitVector<> cur_mask(input_size_);
-  BitVector<> out_mask(output_size_);
-  std::vector<uint8_t> lane_ch(input_size_, LANE_NO_CH);
-  out_round_.reqs.assign(output_size_, MemReq{});
-  uint32_t o = 0;
-  for (uint32_t blk = 0; blk < blocks && o < output_size_; ++blk) {
-    std::shared_ptr<mem_block_t> merged;
-    uint64_t merged_byteen = 0;
-    bool any = false;
-    for (uint32_t i = 0; i < input_size_; ++i) {
-      if (!in_req.mask.test(i) || sent_mask_.test(i))
-        continue;
-      uint64_t a = in_req.addrs.at(i);
-      if (a / line_size_ != line || (a % line_size_) / BLOCK != blk)
-        continue;
-      any = true;
-      cur_mask.set(i);
-      lane_ch.at(i) = uint8_t(o);
-      uint64_t lane_be = in_req.byteen.at(i);
-      merged_byteen |= lane_be;
-      if (is_write && in_req.data.at(i)) {
-        if (!merged) {
-          merged = make_mem_block();
-          std::memset(merged->data(), 0, merged->size());
-        }
-        for (uint32_t b = 0; b < BLOCK; ++b) {
-          if (lane_be & (1ull << b)) {
-            (*merged)[b] = (*in_req.data.at(i))[b];
-          }
-        }
-      }
-    }
-    if (!any)
-      continue;
-    auto& mr   = out_round_.reqs.at(o);
-    mr.op      = in_req.op;
-    mr.addr    = line * line_size_ + blk * BLOCK;
-    mr.data    = std::move(merged);
-    mr.byteen  = merged_byteen;
-    mr.hart_id = make_hart_id(in_req.cid, in_req.wid, 0);
-    mr.uuid    = in_req.uuid;
-    mr.flags   = in_req.flags;
-    auto t = get_addr_type(mr.addr);
-    mr.flags.io    = (t == AddrType::IO);
-    mr.flags.local = (t == AddrType::Shared);
-    out_mask.set(o);
-    ++o;
-  }
-
-  uint32_t tag = 0;
-  if (!is_write) {
-    tag = pending_rd_reqs_.allocate(pending_req_t{in_req.tag, cur_mask});
-    if (lane_ch_.size() <= tag) {
-      lane_ch_.resize(tag + 1);
-    }
-    lane_ch_.at(tag) = std::move(lane_ch);
-  }
-  for (uint32_t c = 0; c < output_size_; ++c) {
-    if (out_mask.test(c)) {
-      out_round_.reqs.at(c).tag = tag;
-    }
-  }
-  out_round_.valid    = true;
-  out_round_.lanes    = out_mask;
-  out_round_.cur_mask = cur_mask;
-  DT(4, this->name() << " mem-req: line=0x" << std::hex << line << std::dec << ", coalesced=" << cur_mask.count() << ", blocks=" << out_mask.count() << " (#" << in_req.uuid << ")");
-  perf_stats_.misses += (cur_mask.count() != in_req.mask.count());
-}
-
-#else
-#line 317
-#endif
+#line 318
 const MemCoalescer::PerfStats& MemCoalescer::perf_stats() const {
   return perf_stats_;
 }

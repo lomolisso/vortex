@@ -18,6 +18,15 @@
 #include <mempool.h>
 #include "instr_trace.h"
 #include "VX_config.h"
+#ifdef VX_CFG_H100_SM_ENABLE
+#include "mem/sm_l1.h"
+// The SM's L1 is in the core on the H100 SM path; the declarations share a
+// line with dcache_rsp_in, so a build without it preprocesses to the same text.
+#define CORE_SM_L1_API const SmL1::PerfStats& l1_perf_stats() const; void l1_flush_begin(); bool l1_flush_done() const;
+#else
+#define CORE_SM_L1_API
+#line 20
+#endif
 #ifdef VX_CFG_VM_ENABLE
 #include "mem/tlb_types.h"
 #endif
@@ -91,7 +100,7 @@ public:
   std::vector<SimChannel<MemRsp>> icache_rsp_in;
 
   std::vector<SimChannel<MemReq>> dcache_req_out;
-  std::vector<SimChannel<MemRsp>> dcache_rsp_in;
+  std::vector<SimChannel<MemRsp>> dcache_rsp_in; CORE_SM_L1_API
 
   // Global-barrier event links, wired core <-> cluster at elaboration.
   SimEventLink<GbarArrive> gbar_arrive_out;

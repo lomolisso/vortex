@@ -46,6 +46,11 @@ dlmem_ref::Cfg vortex::dlmem_cfg() {
 }
 
 uint32_t vortex::slot_stride(const kmu_req_t& req) {
+#ifdef VX_CFG_H100_SM_ENABLE
+  return (req.lmem_size + VX_CFG_LMEM_SLOT_ALIGN - 1u) / VX_CFG_LMEM_SLOT_ALIGN * VX_CFG_LMEM_SLOT_ALIGN;
+#else
+#line 48
+#endif
 #if defined(VX_CFG_EXT_DXA_ENABLE) && (VX_CFG_LMEM_NUM_BANKS * (VX_CFG_XLEN / 8) > VX_CFG_MEM_BLOCK_SIZE)
   // A DXA build starts every slot on a DMA word, as the dispatcher does.
   constexpr uint32_t kSlotAlign = VX_CFG_LMEM_NUM_BANKS * (VX_CFG_XLEN / 8);

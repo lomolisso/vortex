@@ -69,6 +69,7 @@ struct launch_config_t {
 // cudaFuncAttribute, with CUDA's values.
 enum class func_attribute : int {
   max_dynamic_shared_memory_size   = 8,
+  preferred_shared_memory_carveout = 9,
   non_portable_cluster_size_allowed = 14,
 };
 
@@ -80,6 +81,7 @@ namespace detail {
 struct func_attrs {
   uint32_t max_dyn_smem = kDefaultMaxDynamicSharedMemorySize;
   bool     non_portable = false;
+  int      carveout     = -1;
 };
 
 // Keyed by the handle and the kernel's entry address: a handle the runtime
@@ -143,7 +145,7 @@ inline vx_result_t resolve_cluster(const launch_config_t& cfg, dim3* out) {
 }
 
 inline void fill_info(vx_launch_info_t* li, vx_kernel_h kernel, const launch_config_t& cfg, const dim3& cl,
-                      bool non_portable, const void* args, size_t args_size) {
+                      bool non_portable, int carveout, const void* args, size_t args_size) {
   *li = vx_launch_info_t();
   li->struct_size = sizeof(*li);
   li->kernel      = kernel;
@@ -164,6 +166,7 @@ inline void fill_info(vx_launch_info_t* li, vx_kernel_h kernel, const launch_con
   li->cluster_dim[2] = cl.z;
   li->cluster_policy = VX_CLUSTER_POLICY_DEFAULT;
   li->cluster_flags  = non_portable ? VX_CLUSTER_FLAG_NON_PORTABLE : 0;
+  li->smem_carveout  = (carveout < 0) ? 0 : uint32_t(carveout) + 1;
 }
 
 template <typename ClusterDims>
@@ -175,17 +178,18 @@ inline vx_result_t make_info(vx_launch_info_t* li, vx_kernel_h kernel, const lau
   if (vx_result_t r = resolve_cluster<ClusterDims>(cfg, &cl))
     return r;
   const func_attrs a = get_attrs(kernel);
-  fill_info(li, kernel, cfg, cl, cfg.non_portable || a.non_portable, args, args_size);
+  fill_info(li, kernel, cfg, cl, cfg.non_portable || a.non_portable, a.carveout, args, args_size);
   return VX_SUCCESS;
 }
 
 } // namespace detail
 
 // cudaFuncSetAttribute. max_dynamic_shared_memory_size records the kernel's
-// dynamic shared memory limit; a value past the device's local memory per
-// core (the most one block can hold) is refused at once.
-// non_portable_cluster_size_allowed (0 or 1) sets the launches' default
-// for launch_config_t::non_portable.
+// dynamic shared memory limit; a value past the most one block can hold is
+// refused at once. non_portable_cluster_size_allowed (0 or 1) sets the
+// launches' default for launch_config_t::non_portable.
+// preferred_shared_memory_carveout (-1 = no preference, else 0..100 % of the
+// largest shared-memory configuration) steers the device's carve-out choice.
 inline vx_result_t func_set_attribute(vx_device_h dev, vx_kernel_h kernel, func_attribute attr, int value) {
   if (!kernel)
     return VX_ERR_INVALID_HANDLE;
@@ -196,7 +200,7 @@ inline vx_result_t func_set_attribute(vx_device_h dev, vx_kernel_h kernel, func_
   switch (attr) {
   case func_attribute::max_dynamic_shared_memory_size: {
     uint64_t cap = 0;
-    if (vx_result_t r = vx_device_query(dev, VX_CAPS_LOCAL_MEM_SIZE, &cap))
+    if (vx_result_t r = vx_device_query(dev, VX_CAPS_SMEM_PER_BLOCK_OPTIN, &cap))
       return r;
     if (value < 0 || (uint64_t)value > cap)
       return VX_ERR_INVALID_VALUE;
@@ -211,6 +215,13 @@ inline vx_result_t func_set_attribute(vx_device_h dev, vx_kernel_h kernel, func_
     t.attrs[key].non_portable = (value != 0);
     return VX_SUCCESS;
   }
+  case func_attribute::preferred_shared_memory_carveout: {
+    if (value < -1 || value > 100)
+      return VX_ERR_INVALID_VALUE;
+    std::lock_guard<std::mutex> lock(t.mtx);
+    t.attrs[key].carveout = value;
+    return VX_SUCCESS;
+  }
   }
   return VX_ERR_INVALID_VALUE;
 }
@@ -223,8 +234,8 @@ enum class func_cache : int {
   prefer_equal  = 3,
 };
 
-// cudaFuncSetCacheConfig: accepted and ignored, because the split of the L1
-// between cache and shared memory is not modelled.
+// cudaFuncSetCacheConfig: accepted and ignored; the split of the L1 / shared
+// array follows the launch's shared memory and preferred_shared_memory_carveout.
 inline vx_result_t func_set_cache_config(vx_kernel_h kernel, func_cache config) {
   (void)config;
   return kernel ? VX_SUCCESS : VX_ERR_INVALID_HANDLE;

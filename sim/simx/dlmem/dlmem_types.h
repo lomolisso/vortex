@@ -17,11 +17,6 @@
 #include <iostream>
 #include <memory>
 #include "types.h"
-#ifdef VX_CFG_H100_SM_ENABLE
-#include "smem_gate.h"
-#else
-#line 19
-#endif
 
 namespace vortex {
 
@@ -59,16 +54,8 @@ constexpr uint32_t DLMEM_LACC_XB_IN = VX_CFG_NUM_LSU_BLOCKS * VX_CFG_NUM_LSU_LAN
 constexpr uint32_t DLMEM_LACC_XB_G1 = (DLMEM_LACC_XB_IN > 12) ? (DLMEM_LACC_XB_IN + 7) / 8 : 0;
 constexpr uint32_t DLMEM_LACC_XB_G2 = (DLMEM_LACC_XB_G1 > 12) ? (DLMEM_LACC_XB_G1 + 7) / 8 : 0;
 static_assert(DLMEM_LACC_XB_G2 <= 12, "the local-access bound covers at most three crossbar arbiter levels");
-#ifdef VX_CFG_H100_SM_ENABLE
-// The shared-memory port's held warp requests come on top.
-constexpr uint32_t DLMEM_LACC_MAX = (VX_CFG_LSU_QUEUE_IN_SIZE + 3 + SmemGate::REQ_STAGES) * VX_CFG_NUM_LSU_LANES
-                                  + (5 + 2 * (DLMEM_LACC_XB_G1 + DLMEM_LACC_XB_G2)) * VX_CFG_LMEM_NUM_BANKS;
-#else
-#line 47
 constexpr uint32_t DLMEM_LACC_MAX = (VX_CFG_LSU_QUEUE_IN_SIZE + 3) * VX_CFG_NUM_LSU_LANES
                                   + (5 + 2 * (DLMEM_LACC_XB_G1 + DLMEM_LACC_XB_G2)) * VX_CFG_LMEM_NUM_BANKS;
-#endif
-#line 49
 
 // The local-access tracker's largest count, 2^DLMEM_LACC_W - 1.
 constexpr uint32_t DLMEM_LACC_LIMIT = (1u << dlmem_clog2(uint64_t(DLMEM_LACC_MAX) + 1)) - 1;

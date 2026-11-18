@@ -34,6 +34,13 @@
 namespace vortex {
 namespace sm_port_ref {
 
+// The port's output register toward the L2 and its input register from it
+// (VX_sm_port out_buf / in_buf, two entries each): one stage each way on every
+// L2 access.
+constexpr uint32_t SM_PORT_OUT_STAGES = 1;
+constexpr uint32_t SM_PORT_IN_STAGES  = 1;
+constexpr uint32_t SM_PORT_REG_DEPTH  = 2;
+
 enum class SmItem {
   WriteLine,     // global write: the written bytes of one line
   ReadLine,      // global read request of one line (any sectors)

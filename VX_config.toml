@@ -52,22 +52,14 @@ SM_DATAPATH_POW2 = ["expr: not $VX_CFG_H100_SM_ENABLE or (is_pow2($VX_CFG_SM_DAT
 LMEM_BANK_BYTES_OK = ["expr: not $VX_CFG_H100_SM_ENABLE or (is_pow2($VX_CFG_LMEM_BANK_BYTES) and $VX_CFG_LMEM_BANK_BYTES <= $VX_CFG_XLEN / 8)", "VX_CFG_LMEM_BANK_BYTES must be a power of two <= XLEN/8"]
 LMEM_PORT_IS_DATAPATH = ["expr: not $VX_CFG_H100_SM_ENABLE or $VX_CFG_LMEM_NUM_BANKS * $VX_CFG_LMEM_BANK_BYTES == $VX_CFG_SM_DATAPATH_BYTES", "the shared-memory banks must span the SM datapath"]
 LMEM_PORT_SWIZZLE = ["expr: not $VX_CFG_H100_SM_ENABLE or not ($VX_CFG_EXT_DXA_ENABLE or $VX_CFG_TCU_H100_ENABLE) or $VX_CFG_LMEM_PORT_BYTES >= $lmem_swizzle_span", "with DXA or TCU_H100 the shared-memory port must cover a 128-B swizzle row"]
-LMEM_LAT64_GE = ["expr: not $VX_CFG_H100_SM_ENABLE or $VX_CFG_LMEM_LATENCY_64 >= $VX_CFG_LMEM_LATENCY", "VX_CFG_LMEM_LATENCY_64 must be >= VX_CFG_LMEM_LATENCY"]
-LMEM_CAS_GE_ATOM = ["expr: not $VX_CFG_H100_SM_ENABLE or $VX_CFG_LMEM_CAS_EXTRA >= $VX_CFG_LMEM_ATOM_EXTRA", "VX_CFG_LMEM_CAS_EXTRA must be >= VX_CFG_LMEM_ATOM_EXTRA"]
-LMEM_COUNTS_OK = ["expr: not $VX_CFG_H100_SM_ENABLE or ($VX_CFG_LMEM_CAS_PASSES >= 1 and $VX_CFG_LMEM_WAVEFRONT_PENALTY >= 0 and $VX_CFG_LMEM_WIDE_OFFSET_64 >= 0 and $VX_CFG_LMEM_ATOM_EXTRA >= 0)", "shared-memory pass and penalty knobs must be non-negative, CAS passes >= 1"]
 SMEM_FITS_DESC = ["expr: not $VX_CFG_H100_SM_ENABLE or $VX_CFG_SMEM_PER_SM_MAX <= $VX_CFG_LMEM_DESC_REACH_BYTES", "VX_CFG_SMEM_PER_SM_MAX must fit the wgmma descriptor reach"]
 SMEM_PER_CTA_POS = ["expr: not $VX_CFG_H100_SM_ENABLE or $VX_CFG_SMEM_PER_CTA_MAX > 0", "VX_CFG_SMEM_PER_CTA_MAX must be > 0"]
 LMEM_SLOT_ALIGN_POW2 = ["expr: not $VX_CFG_H100_SM_ENABLE or is_pow2($VX_CFG_LMEM_SLOT_ALIGN)", "VX_CFG_LMEM_SLOT_ALIGN must be a power of two"]
 LMEM_SLOT_ALIGN_MET = ["expr: not $VX_CFG_H100_SM_ENABLE or ($VX_CFG_LMEM_NUM_BANKS * ($VX_CFG_XLEN / 8)) % $VX_CFG_LMEM_SLOT_ALIGN == 0", "the CTA slot alignment must be a multiple of VX_CFG_LMEM_SLOT_ALIGN"]
-SMEM_RESERVED_ALIGNED = ["expr: not $VX_CFG_H100_SM_ENABLE or $VX_CFG_SMEM_RESERVED_PER_CTA % $VX_CFG_LMEM_SLOT_ALIGN == 0", "VX_CFG_SMEM_RESERVED_PER_CTA must be a multiple of VX_CFG_LMEM_SLOT_ALIGN"]
 L1_LINE_IS_DATAPATH = ["expr: not $VX_CFG_H100_SM_ENABLE or $VX_CFG_DCACHE_LINE_SIZE == $VX_CFG_SM_DATAPATH_BYTES", "the L1 line must equal the SM datapath"]
 L1_SECTOR_OK = ["expr: not $VX_CFG_H100_SM_ENABLE or (is_pow2($VX_CFG_DCACHE_SECTOR_SIZE) and $VX_CFG_DCACHE_LINE_SIZE % $VX_CFG_DCACHE_SECTOR_SIZE == 0 and $VX_CFG_SM_EGRESS_BEAT == $VX_CFG_DCACHE_SECTOR_SIZE)", "the L1 sector must be a power of two dividing the line and equal to the egress beat"]
-L1_SETS_POW2 = ["expr: not $VX_CFG_H100_SM_ENABLE or is_pow2($VX_CFG_DCACHE_SIZE / ($VX_CFG_DCACHE_NUM_WAYS * $VX_CFG_DCACHE_LINE_SIZE))", "the L1 set count must be a power of two"]
-L1_WAYS_POW2 = ["expr: not $VX_CFG_H100_SM_ENABLE or (is_pow2($VX_CFG_DCACHE_NUM_WAYS) and $VX_CFG_DCACHE_NUM_WAYS >= 16)", "VX_CFG_DCACHE_NUM_WAYS must be a power of two >= 16"]
 L1_PROTECT_LT_WAYS = ["expr: not $VX_CFG_H100_SM_ENABLE or ($VX_CFG_L1_REPL_PROTECT_PCT >= 0 and $VX_CFG_L1_REPL_PROTECT_PCT <= 99 and $VX_CFG_L1_REPL_PROTECTED >= 1 and $VX_CFG_L1_REPL_PROTECTED < $VX_CFG_DCACHE_NUM_WAYS)", "the protected newest ways must be >= 1 and fewer than the ways"]
 L1_WRITE_THROUGH = ["expr: not $VX_CFG_H100_SM_ENABLE or $VX_CFG_DCACHE_WRITEBACK == 0", "the H100 L1 is write-through"]
-L1_PASSES_DIVIDE = ["expr: not $VX_CFG_H100_SM_ENABLE or (is_pow2($VX_CFG_L1_ADDR_PASSES) and $VX_CFG_NUM_THREADS % $VX_CFG_L1_ADDR_PASSES == 0)", "VX_CFG_L1_ADDR_PASSES must be a power of two dividing VX_CFG_NUM_THREADS"]
-L1_LAT_STEP_OK = ["expr: not $VX_CFG_H100_SM_ENABLE or $VX_CFG_L1_LINE_STEP_CENTICYCLES >= 0", "VX_CFG_L1_LINE_STEP_CENTICYCLES must be >= 0"]
 SM_READ_LINES_POW2 = ["expr: not $VX_CFG_H100_SM_ENABLE or is_pow2($VX_CFG_SM_MAX_READ_LINES)", "VX_CFG_SM_MAX_READ_LINES must be a power of two"]
 SM_EGRESS_BEATS = ["expr: not $VX_CFG_H100_SM_ENABLE or ($VX_CFG_SM_EGRESS_BYTES >= $VX_CFG_SM_EGRESS_BEAT and $VX_CFG_SM_EGRESS_BYTES % $VX_CFG_SM_EGRESS_BEAT == 0)", "VX_CFG_SM_EGRESS_BYTES must be a multiple of the beat"]
 SM_HB_POSITIVE = ["expr: not $VX_CFG_H100_SM_ENABLE or ($VX_CFG_SM_HB_WRITE_SECTOR >= 1 and $VX_CFG_SM_HB_WRITE_MASKED >= 1 and $VX_CFG_SM_HB_READ_LINE >= 1 and $VX_CFG_SM_HB_PREFETCH_LINE >= 1 and $VX_CFG_SM_HB_ATOM_LANE >= 1 and $VX_CFG_SM_HB_DSMEM_SLOT >= 1 and $VX_CFG_SM_HB_DSMEM_LD_LINE >= 1 and $VX_CFG_SM_HB_TMA_ST_SECTOR >= 1 and $VX_CFG_SM_HB_MBAR >= 1)", "every egress item costs at least one half-beat"]
@@ -82,7 +74,6 @@ N5_MIN_SLOTS_OK = ["expr: not $VX_CFG_H100_SM_ENABLE or ($VX_CFG_N5_MIN_SLOTS >=
 N5_EXTRAS_HALFBEAT = ["expr: not $VX_CFG_H100_SM_ENABLE or ($VX_CFG_N5_ASYNC_EXTRA_BYTES_V4 % ($VX_CFG_SM_EGRESS_BEAT / 2) == 0 and $VX_CFG_N5_ASYNC_EXTRA_BYTES_B32 % ($VX_CFG_SM_EGRESS_BEAT / 2) == 0 and $VX_CFG_N5_REDASYNC_EXTRA_BYTES % ($VX_CFG_SM_EGRESS_BEAT / 2) == 0)", "async extra bytes must be whole half-beats"]
 DLMEM_INGRESS_SLOTS_POW2 = ["expr: not $VX_CFG_H100_SM_ENABLE or is_pow2($VX_CFG_DLMEM_INGRESS_SLOTS)", "VX_CFG_DLMEM_INGRESS_SLOTS must be a power of two"]
 DLMEM_STORE_WINDOW_LINE = ["expr: not $VX_CFG_H100_SM_ENABLE or $VX_CFG_DLMEM_STORE_WINDOW_BYTES >= $VX_CFG_DCACHE_LINE_SIZE", "the remote-store window must hold a line"]
-SM_L2_SIDE_GE_HIT = ["expr: not $VX_CFG_H100_SM_ENABLE or $VX_CFG_SM_L2_SIDE_LATENCY >= $VX_CFG_L1_HIT_LATENCY", "VX_CFG_SM_L2_SIDE_LATENCY must be >= VX_CFG_L1_HIT_LATENCY"]
 DXA_ONE_PER_SM = ["expr: not $VX_CFG_H100_SM_ENABLE or not $VX_CFG_EXT_DXA_ENABLE or $VX_CFG_NUM_DXA_CORES == $VX_CFG_SOCKET_SIZE", "the H100 SM path has one DXA engine per SM"]
 
 [h100_ref]
@@ -148,11 +139,6 @@ BOUNDARY_DELAY_MAX = ["expr: $VX_CFG_DOMAIN_BOUNDARY_DELAY <= 1", "VX_CFG_DOMAIN
 # The H100 SM memory path (L1, shared-memory banks, SM ports); on with the organization.
 VX_CFG_H100_SM_ENABLE = "expr: $VX_CFG_H100_ORG_ENABLE"
 VX_CFG_SM_DATAPATH_BYTES = 128                   # 05/spec.md §3.4, §4.4, §9.1
-# L1 hit chase time per hop over P distinct lines: (base + step * P) / 100.
-VX_CFG_L1_LINE_BASE_CENTICYCLES = 2960           # 05/spec.md §4.3
-VX_CFG_L1_LINE_STEP_CENTICYCLES = 223            # 05/spec.md §4.3
-VX_CFG_L1_HIT_LATENCY = "expr: ($VX_CFG_L1_LINE_BASE_CENTICYCLES + $VX_CFG_L1_LINE_STEP_CENTICYCLES + 50) / 100"  # 05/spec.md §4.1 (32.02)
-VX_CFG_L1_ADDR_PASSES = 2                        # 05/spec.md §4.3 (half-warps)
 VX_CFG_L1_REPL_PROTECT_PCT = 25                  # 05/spec.md §4.6
 VX_CFG_L1_REPL_PROTECTED = "expr: max(1, $VX_CFG_DCACHE_NUM_WAYS * $VX_CFG_L1_REPL_PROTECT_PCT / 100)"
 VX_CFG_SM_MAX_READ_LINES = 128                   # 18/spec.md §0.6 R2, §1.6
@@ -179,8 +165,69 @@ VX_CFG_SM_INGRESS_DSMEM_WEIGHT = 1               # 05/spec.md §9.3
 VX_CFG_SM2SM_INJ_CREDITS = 4                     # 18/spec.md §5.2, §A
 VX_CFG_SM2SM_INJ_RETURN = 6                      # 18/spec.md §5.2, §A
 VX_CFG_SM2SM_EJECT_BYTES = 32                    # 05/spec.md §9.1
-# SM side of an L2 hit (18/spec.md §1.8 A = 140..146), added to the lower levels' round trip.
-VX_CFG_SM_L2_SIDE_LATENCY = 143
+
+[sm_sram]
+# One SRAM array per SM: shared memory from row 0 up, L1 data slots from the top row down.
+VX_CFG_SM_SRAM_BYTES = 262144                    # 05/spec.md §1, §2
+# Shared-memory configurations a launch may pick (KiB, ascending; repeats allowed).
+VX_CFG_SMEM_CONFIG_KB_0 = 8                      # 05/spec.md §2
+VX_CFG_SMEM_CONFIG_KB_1 = 16
+VX_CFG_SMEM_CONFIG_KB_2 = 32
+VX_CFG_SMEM_CONFIG_KB_3 = 64
+VX_CFG_SMEM_CONFIG_KB_4 = 100
+VX_CFG_SMEM_CONFIG_KB_5 = 132
+VX_CFG_SMEM_CONFIG_KB_6 = 164
+VX_CFG_SMEM_CONFIG_KB_7 = 196
+VX_CFG_SMEM_CONFIG_KB_8 = 228
+# Rows between the shared region and the L1 that neither uses (the H100 leaves 8192).
+VX_CFG_L1_RESERVE_BYTES = 0
+VX_CFG_L1_MAX_LINES = "expr: ($VX_CFG_SM_SRAM_BYTES - $VX_CFG_L1_RESERVE_BYTES - $VX_CFG_SMEM_CONFIG_KB_0 * 1024) / $VX_CFG_DCACHE_LINE_SIZE"
+# L1 tags are decoupled from the data: each way points to a slot of the array.
+VX_CFG_L1_TAG_BANKS = 4                          # US 10,459,861; lookups per cycle
+VX_CFG_L1_TAG_WAYS = 16
+VX_CFG_L1_TAG_SETS = "expr: 1 << clog2(($VX_CFG_L1_MAX_LINES + $VX_CFG_L1_TAG_WAYS - 1) / $VX_CFG_L1_TAG_WAYS)"
+# 0: line mod sets; 1: XOR fold of every line-address bit.
+VX_CFG_L1_INDEX_HASH = 1                         # 05/spec.md §4.6
+VX_CFG_L1_VALID_BYTES = "expr: $VX_CFG_LMEM_BANK_BYTES"
+# Widest tag-side SRAM macro; tag and valid macros are split by ways to stay within it.
+VX_CFG_SRAM_MACRO_MAX_BITS = 256
+# Port priority levels 0..3: the highest level wins, equal levels share round robin.
+VX_CFG_SM_SRAM_RD_PRI_TCU = 1                    # 18/spec.md §1.2
+VX_CFG_SM_SRAM_RD_PRI_DXA = 1
+VX_CFG_SM_SRAM_RD_PRI_DSMEM = 1
+VX_CFG_SM_SRAM_RD_PRI_AMO = 1
+VX_CFG_SM_SRAM_RD_PRI_LSU = 0
+VX_CFG_SM_SRAM_WR_PRI_L1FILL = 1
+VX_CFG_SM_SRAM_WR_PRI_DXA = 1
+VX_CFG_SM_SRAM_WR_PRI_DSMEM = 1
+VX_CFG_SM_SRAM_WR_PRI_CPASYNC = 1
+VX_CFG_SM_SRAM_WR_PRI_LSU = 0
+VX_CFG_SM_SRAM_WF_PRI_SHARED = 0
+VX_CFG_SM_SRAM_WF_PRI_GLOBAL = 0
+VX_CFG_SM_SRAM_AMO_PRI_DXA = 0
+VX_CFG_SM_SRAM_AMO_PRI_DSMEM = 0
+VX_CFG_SM_SRAM_AMO_PRI_MBAR = 0
+VX_CFG_SM_SRAM_AMO_PRI_LSU = 0
+# DSMEM slots of one row merge into one row write.
+VX_CFG_SM_SRAM_DSMEM_WR_BYTES = "expr: $VX_CFG_LMEM_PORT_BYTES"
+
+[[check]]
+SM_SRAM_ROWS_POW2 = ["expr: not $VX_CFG_H100_SM_ENABLE or is_pow2($VX_CFG_SM_SRAM_BYTES / $VX_CFG_SM_DATAPATH_BYTES)", "VX_CFG_SM_SRAM_BYTES must be a power-of-two number of datapath rows"]
+SM_SRAM_IN_WINDOW = ["expr: not $VX_CFG_H100_SM_ENABLE or $VX_CFG_SM_SRAM_BYTES < 2 * $VX_CFG_SMEM_PER_SM_MAX", "the shared-memory window (VX_CFG_SMEM_PER_SM_MAX rounded up to a power of two) must cover the SM array (VX_CFG_SM_SRAM_BYTES)"]
+SM_SRAM_FITS = ["expr: not $VX_CFG_H100_SM_ENABLE or ($VX_CFG_SM_SRAM_BYTES - $VX_CFG_L1_RESERVE_BYTES - $VX_CFG_SMEM_CONFIG_KB_8 * 1024) / $VX_CFG_DCACHE_LINE_SIZE > $VX_CFG_SM_MAX_READ_LINES", "the smallest L1 must hold more lines than can be in flight (VX_CFG_SM_SRAM_BYTES - VX_CFG_L1_RESERVE_BYTES - the largest shared config)"]
+SMEM_CONFIGS_ASCENDING = ["expr: not $VX_CFG_H100_SM_ENABLE or ($VX_CFG_SMEM_CONFIG_KB_0 >= 1 and $VX_CFG_SMEM_CONFIG_KB_0 <= $VX_CFG_SMEM_CONFIG_KB_1 and $VX_CFG_SMEM_CONFIG_KB_1 <= $VX_CFG_SMEM_CONFIG_KB_2 and $VX_CFG_SMEM_CONFIG_KB_2 <= $VX_CFG_SMEM_CONFIG_KB_3 and $VX_CFG_SMEM_CONFIG_KB_3 <= $VX_CFG_SMEM_CONFIG_KB_4 and $VX_CFG_SMEM_CONFIG_KB_4 <= $VX_CFG_SMEM_CONFIG_KB_5 and $VX_CFG_SMEM_CONFIG_KB_5 <= $VX_CFG_SMEM_CONFIG_KB_6 and $VX_CFG_SMEM_CONFIG_KB_6 <= $VX_CFG_SMEM_CONFIG_KB_7 and $VX_CFG_SMEM_CONFIG_KB_7 <= $VX_CFG_SMEM_CONFIG_KB_8)", "VX_CFG_SMEM_CONFIG_KB_0..8 must be >= 1 and ascending"]
+SMEM_CONFIG_MAX = ["expr: not $VX_CFG_H100_SM_ENABLE or $VX_CFG_SMEM_CONFIG_KB_8 * 1024 == $VX_CFG_SMEM_PER_SM_MAX", "VX_CFG_SMEM_CONFIG_KB_8 must equal VX_CFG_SMEM_PER_SM_MAX"]
+SMEM_CONFIGS_ALIGNED = ["expr: not $VX_CFG_H100_SM_ENABLE or (($VX_CFG_SMEM_CONFIG_KB_0 * 1024) % $VX_CFG_LMEM_SLOT_ALIGN == 0 and ($VX_CFG_SMEM_CONFIG_KB_1 * 1024) % $VX_CFG_LMEM_SLOT_ALIGN == 0 and ($VX_CFG_SMEM_CONFIG_KB_2 * 1024) % $VX_CFG_LMEM_SLOT_ALIGN == 0 and ($VX_CFG_SMEM_CONFIG_KB_3 * 1024) % $VX_CFG_LMEM_SLOT_ALIGN == 0 and ($VX_CFG_SMEM_CONFIG_KB_4 * 1024) % $VX_CFG_LMEM_SLOT_ALIGN == 0 and ($VX_CFG_SMEM_CONFIG_KB_5 * 1024) % $VX_CFG_LMEM_SLOT_ALIGN == 0 and ($VX_CFG_SMEM_CONFIG_KB_6 * 1024) % $VX_CFG_LMEM_SLOT_ALIGN == 0 and ($VX_CFG_SMEM_CONFIG_KB_7 * 1024) % $VX_CFG_LMEM_SLOT_ALIGN == 0 and ($VX_CFG_SMEM_CONFIG_KB_8 * 1024) % $VX_CFG_LMEM_SLOT_ALIGN == 0)", "every shared-memory config must be a multiple of VX_CFG_LMEM_SLOT_ALIGN"]
+L1_RESERVE_ROWS_OK = ["expr: not $VX_CFG_H100_SM_ENABLE or ($VX_CFG_L1_RESERVE_BYTES >= 0 and $VX_CFG_L1_RESERVE_BYTES % $VX_CFG_SM_DATAPATH_BYTES == 0)", "VX_CFG_L1_RESERVE_BYTES must be a multiple of VX_CFG_SM_DATAPATH_BYTES"]
+L1_LFSR_RANGE = ["expr: not $VX_CFG_H100_SM_ENABLE or $VX_CFG_L1_MAX_LINES < 65536", "the L1 must hold fewer than 65536 lines (16-bit victim draw)"]
+L1_TAG_BANKS_OK = ["expr: not $VX_CFG_H100_SM_ENABLE or (is_pow2($VX_CFG_L1_TAG_BANKS) and $VX_CFG_L1_TAG_BANKS < 2 * (($VX_CFG_L1_MAX_LINES + $VX_CFG_L1_TAG_WAYS - 1) / $VX_CFG_L1_TAG_WAYS))", "VX_CFG_L1_TAG_BANKS must be a power of two no larger than VX_CFG_L1_TAG_SETS"]
+L1_TAG_WAYS_POW2 = ["expr: not $VX_CFG_H100_SM_ENABLE or is_pow2($VX_CFG_L1_TAG_WAYS)", "VX_CFG_L1_TAG_WAYS must be a power of two"]
+L1_INDEX_HASH_OK = ["expr: not $VX_CFG_H100_SM_ENABLE or ($VX_CFG_L1_INDEX_HASH >= 0 and $VX_CFG_L1_INDEX_HASH <= 1)", "VX_CFG_L1_INDEX_HASH must be 0 or 1"]
+L1_VALID_BYTES_OK = ["expr: not $VX_CFG_H100_SM_ENABLE or ($VX_CFG_L1_VALID_BYTES >= 1 and is_pow2($VX_CFG_L1_VALID_BYTES) and $VX_CFG_DCACHE_SECTOR_SIZE % $VX_CFG_L1_VALID_BYTES == 0)", "VX_CFG_L1_VALID_BYTES must be a power of two dividing the sector"]
+SRAM_MACRO_BITS_OK = ["expr: not $VX_CFG_H100_SM_ENABLE or $VX_CFG_SRAM_MACRO_MAX_BITS >= $VX_CFG_DCACHE_LINE_SIZE / $VX_CFG_L1_VALID_BYTES", "VX_CFG_SRAM_MACRO_MAX_BITS must hold one way's valid bits"]
+SM_SRAM_PRI_RANGE = ["expr: not $VX_CFG_H100_SM_ENABLE or ($VX_CFG_SM_SRAM_RD_PRI_TCU >= 0 and $VX_CFG_SM_SRAM_RD_PRI_TCU <= 3 and $VX_CFG_SM_SRAM_RD_PRI_DXA >= 0 and $VX_CFG_SM_SRAM_RD_PRI_DXA <= 3 and $VX_CFG_SM_SRAM_RD_PRI_DSMEM >= 0 and $VX_CFG_SM_SRAM_RD_PRI_DSMEM <= 3 and $VX_CFG_SM_SRAM_RD_PRI_AMO >= 0 and $VX_CFG_SM_SRAM_RD_PRI_AMO <= 3 and $VX_CFG_SM_SRAM_RD_PRI_LSU >= 0 and $VX_CFG_SM_SRAM_RD_PRI_LSU <= 3 and $VX_CFG_SM_SRAM_WR_PRI_L1FILL >= 0 and $VX_CFG_SM_SRAM_WR_PRI_L1FILL <= 3 and $VX_CFG_SM_SRAM_WR_PRI_DXA >= 0 and $VX_CFG_SM_SRAM_WR_PRI_DXA <= 3 and $VX_CFG_SM_SRAM_WR_PRI_DSMEM >= 0 and $VX_CFG_SM_SRAM_WR_PRI_DSMEM <= 3 and $VX_CFG_SM_SRAM_WR_PRI_CPASYNC >= 0 and $VX_CFG_SM_SRAM_WR_PRI_CPASYNC <= 3 and $VX_CFG_SM_SRAM_WR_PRI_LSU >= 0 and $VX_CFG_SM_SRAM_WR_PRI_LSU <= 3 and $VX_CFG_SM_SRAM_WF_PRI_SHARED >= 0 and $VX_CFG_SM_SRAM_WF_PRI_SHARED <= 3 and $VX_CFG_SM_SRAM_WF_PRI_GLOBAL >= 0 and $VX_CFG_SM_SRAM_WF_PRI_GLOBAL <= 3 and $VX_CFG_SM_SRAM_AMO_PRI_DXA >= 0 and $VX_CFG_SM_SRAM_AMO_PRI_DXA <= 3 and $VX_CFG_SM_SRAM_AMO_PRI_DSMEM >= 0 and $VX_CFG_SM_SRAM_AMO_PRI_DSMEM <= 3 and $VX_CFG_SM_SRAM_AMO_PRI_MBAR >= 0 and $VX_CFG_SM_SRAM_AMO_PRI_MBAR <= 3 and $VX_CFG_SM_SRAM_AMO_PRI_LSU >= 0 and $VX_CFG_SM_SRAM_AMO_PRI_LSU <= 3)", "every VX_CFG_SM_SRAM_*_PRI_* level must be 0..3"]
+DSMEM_WR_BYTES_OK = ["expr: not $VX_CFG_H100_SM_ENABLE or ($VX_CFG_SM_SRAM_DSMEM_WR_BYTES >= $VX_CFG_N5_SLOT_BYTES and $VX_CFG_SM_SRAM_DSMEM_WR_BYTES % $VX_CFG_N5_SLOT_BYTES == 0 and $VX_CFG_SM_SRAM_DSMEM_WR_BYTES <= $VX_CFG_SM_DATAPATH_BYTES)", "VX_CFG_SM_SRAM_DSMEM_WR_BYTES must be whole SM-to-SM slots within the datapath"]
+SM_SRAM_NO_VM = ["expr: not ($VX_CFG_H100_SM_ENABLE and $VX_CFG_VM_ENABLE)", "the H100 SM path keeps the L1 in the core, before the dMMU: VX_CFG_VM_ENABLE is not supported with it"]
 
 
 [isa]
@@ -389,7 +436,11 @@ VX_CFG_LSU_QUEUE_IN_SIZE = "expr: max(4, 2 * ($VX_CFG_SIMD_WIDTH // $VX_CFG_NUM_
 # Outstanding-load pool (MLP depth): decoupled from the input staging queue and
 # provisioned for miss-latency hiding (~2 in-flight loads per warp), clamped so
 # the slot id stays cheap in the dcache tag.
-VX_CFG_LSU_PENDING_SIZE = "expr: max(1, $VX_CFG_SM_MAX_READ_LINES * $VX_CFG_DCACHE_LINE_SIZE / ($VX_CFG_NUM_LSU_LANES * ($VX_CFG_XLEN / 8)) / $VX_CFG_NUM_LSU_BLOCKS) if $VX_CFG_H100_SM_ENABLE else min(32, max(8, 2 * $VX_CFG_NUM_WARPS * ($VX_CFG_SIMD_WIDTH // $VX_CFG_NUM_LSU_LANES)))"
+# H100 SM: one global tag per line the SM may have in flight when a warp reads a
+# 4-B word per lane, so the tags never run out before the L1's read lines: a
+# global load waiting for a tag holds the block's in-order queue, and the shared
+# accesses behind it.
+VX_CFG_LSU_PENDING_SIZE = "expr: max(1, $VX_CFG_SM_MAX_READ_LINES * $VX_CFG_DCACHE_LINE_SIZE / ($VX_CFG_NUM_LSU_LANES * 4) / $VX_CFG_NUM_LSU_BLOCKS) if $VX_CFG_H100_SM_ENABLE else min(32, max(8, 2 * $VX_CFG_NUM_WARPS * ($VX_CFG_SIMD_WIDTH // $VX_CFG_NUM_LSU_LANES)))"
 # The mem-side queue depth is not a knob: it sets the dcache-facing tag-id
 # width and must cover the outstanding pool, so each implementation derives
 # it internally from the pool size.
@@ -483,7 +534,7 @@ VX_CFG_ICACHE_CRSQ_SIZE = 0
 VX_CFG_ICACHE_MEM_PORTS = 1
 VX_CFG_ICACHE_LATENCY = "expr: 2 + max(0, clog2($VX_CFG_ICACHE_SIZE) - clog2(16384))"
 
-VX_CFG_DCACHE_SIZE = "expr: 262144 if $VX_CFG_H100_SM_ENABLE else 16384"
+VX_CFG_DCACHE_SIZE = "expr: $VX_CFG_L1_MAX_LINES * $VX_CFG_DCACHE_LINE_SIZE if $VX_CFG_H100_SM_ENABLE else 16384"
 VX_CFG_DCACHE_NUM_WAYS = "expr: 16 if $VX_CFG_H100_SM_ENABLE else 4"
 # Coalescer/bank granule (banks = footprint/word, NUM_BANKS = NUM_REQS). Word is
 # reduced ~sqrt(lanes) below the block so banks scale for MLP while the word/bus
@@ -558,23 +609,20 @@ VX_CFG_LMEM_LOG_SIZE = "expr: clog2($VX_CFG_SMEM_PER_SM_MAX) if $VX_CFG_H100_SM_
 # SM shared memory (H100 SM path): 4-B banks across the SM datapath, one wavefront per cycle.
 VX_CFG_LMEM_BANK_BYTES = "expr: 4 if $VX_CFG_H100_SM_ENABLE else ($VX_CFG_XLEN / 8)"     # 05/spec.md §3.2
 VX_CFG_LMEM_PORT_BYTES = "expr: $VX_CFG_LMEM_NUM_BANKS * $VX_CFG_LMEM_BANK_BYTES"
-# Dependent-chase time per hop (load issue to dependent issue), in SM cycles.
-VX_CFG_LMEM_LATENCY = 23                 # 05/spec.md §3.1 (LDS.32 23.02)
-VX_CFG_LMEM_LATENCY_64 = 24              # 05/spec.md §3.1 (LDS.64 23.77)
-VX_CFG_LMEM_WAVEFRONT_PENALTY = 2        # 05/spec.md §3.2, §3.3 (per extra wavefront)
-VX_CFG_LMEM_WIDE_OFFSET_64 = 1           # 05/spec.md §3.3 (LDS.64 over more than 2 distinct words)
-VX_CFG_LMEM_ATOM_EXTRA = 4               # 16/spec.md §4.1 (33 - 29)
-VX_CFG_LMEM_CAS_EXTRA = 11               # 16/spec.md §4.1 (40 - 29)
-VX_CFG_LMEM_CAS_PASSES = 2               # 16/spec.md §4.2
 VX_CFG_SMEM_PER_SM_MAX = 233472          # 05/spec.md §2 (228 KiB)
-# Defined only: the dispatcher reserve is a post-merge item.
-VX_CFG_SMEM_RESERVED_PER_CTA = "expr: 1024 if $VX_CFG_H100_SM_ENABLE else 0"  # 05/spec.md §2
-VX_CFG_SMEM_PER_CTA_MAX = "expr: $VX_CFG_SMEM_PER_SM_MAX - $VX_CFG_SMEM_RESERVED_PER_CTA"
+VX_CFG_SMEM_PER_CTA_MAX = "expr: $VX_CFG_SMEM_PER_SM_MAX"
 # PTX wgmma descriptor start address: 14 bits of 16 B.
 VX_CFG_LMEM_DESC_REACH_BYTES = 262144
-VX_CFG_LMEM_SLOT_ALIGN = "expr: max($VX_CFG_DCACHE_LINE_SIZE, $VX_CFG_LMEM_PORT_BYTES)"
+VX_CFG_LMEM_SLOT_ALIGN = "expr: max($VX_CFG_DCACHE_LINE_SIZE, $VX_CFG_LMEM_PORT_BYTES, $VX_CFG_LMEM_NUM_BANKS * ($VX_CFG_XLEN / 8)) if $VX_CFG_H100_SM_ENABLE else max($VX_CFG_DCACHE_LINE_SIZE, $VX_CFG_LMEM_PORT_BYTES)"
 # PTX shared-memory swizzle span (128B mode).
 lmem_swizzle_span = 128
+# mbarrier ops issued by instructions wait here for their AMO pass, so the
+# wavefront stage passes them on in one cycle. One entry per cycle of the
+# queue's push-to-pop turnaround (registered full flag) gives one op per cycle.
+VX_CFG_MBAR_OP_QUEUE = 2
+
+[[check]]
+MBAR_OP_QUEUE_OK = ["expr: not $VX_CFG_H100_SM_ENABLE or $VX_CFG_MBAR_OP_QUEUE >= 2", "VX_CFG_MBAR_OP_QUEUE must be >= 2 (one op per cycle through the registered full flag)"]
 
 [tcu]
 # string enum: 'DPI'|'DSP'|'BHF'|'TFR'|'FPNEW'; TFR is the universal default. On

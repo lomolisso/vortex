@@ -51,7 +51,11 @@ module VX_lsu_slice import VX_gpu_pkg::*; #(
 );
     localparam NUM_LANES    = `VX_CFG_NUM_LSU_LANES;
     localparam PID_BITS     = `CLOG2(`VX_CFG_NUM_THREADS / NUM_LANES);
+`ifdef VX_CFG_H100_SM_ENABLE
+    localparam LSUQ_SIZEW   = `LOG2UP(LSU_PEND_POOL);
+`else
     localparam LSUQ_SIZEW   = `LOG2UP(`VX_CFG_LSU_PENDING_SIZE);
+`endif
     localparam REQ_ASHIFT   = `CLOG2(LSU_WORD_SIZE);
     localparam MEM_ASHIFT   = `CLOG2(`VX_CFG_MEM_BLOCK_SIZE);
     localparam MEM_ADDRW    = `VX_CFG_MEM_ADDR_WIDTH - MEM_ASHIFT;
@@ -80,7 +84,12 @@ module VX_lsu_slice import VX_gpu_pkg::*; #(
     // tag_width = header + op_type + align + pkt_addr + fence
     localparam TAG_WIDTH = $bits(lsu_header_t) + INST_LSU_BITS + (NUM_LANES * REQ_ASHIFT) + LSUQ_SIZEW + 1;
 `endif
+`ifdef VX_CFG_H100_SM_ENABLE
+    // plus the credit-class bit appended below the slice's tag
+    `STATIC_ASSERT (TAG_WIDTH + 1 == LSU_CLIENT_TAG_WIDTH, ("LSU client tag width mismatch — pkg/slice out of sync"))
+`else
     `STATIC_ASSERT (TAG_WIDTH == LSU_CLIENT_TAG_WIDTH, ("LSU client tag width mismatch — pkg/slice out of sync"))
+`endif
 `ifdef VX_CFG_EXT_A_ENABLE
     `STATIC_ASSERT ((CORE_ID >> (HART_ID_BITS - NW_BITS - NT_BITS)) == 0, ("global core id does not fit the hart id core field"))
 `endif
@@ -173,6 +182,9 @@ module VX_lsu_slice import VX_gpu_pkg::*; #(
 `ifdef VX_CFG_EXT_DLMEM_ENABLE
     wire [NUM_LANES-1:0] lane_global;
 `endif
+`ifdef VX_CFG_H100_SM_ENABLE
+    wire [NUM_LANES-1:0] lane_l1;
+`endif
     wire [NUM_LANES-1:0][MEM_ATTR_WIDTH-1:0] mem_req_attr;
     for (genvar i = 0; i < NUM_LANES; ++i) begin : g_mem_req_attr
         wire [MEM_ADDRW-1:0] block_addr = full_addr[i][MEM_ASHIFT +: MEM_ADDRW];
@@ -221,6 +233,13 @@ module VX_lsu_slice import VX_gpu_pkg::*; #(
         wire lane_in_stack = (full_addr[i] >= STACK_WINDOW_BOTTOM) && (full_addr[i] < STACK_WINDOW_TOP);
         assign lane_global[i] = execute_if.data.header.tmask[i] && ~mem_req_attr_struct[i].is_addr_local
                              && ~lane_in_win && ~lane_in_stack;
+    `endif
+    `ifdef VX_CFG_H100_SM_ENABLE
+    `ifdef VX_CFG_EXT_DLMEM_ENABLE
+        assign lane_l1[i] = execute_if.data.header.tmask[i] && ~mem_req_attr_struct[i].is_addr_local && ~lane_in_win;
+    `else
+        assign lane_l1[i] = execute_if.data.header.tmask[i] && ~mem_req_attr_struct[i].is_addr_local;
+    `endif
     `endif
     `ifdef VX_CFG_EXT_A_ENABLE
         amo_req_t lane_amo;
@@ -567,8 +586,13 @@ module VX_lsu_slice import VX_gpu_pkg::*; #(
     // we should track and flag SOP and EOP responses.
 
     if (PID_BITS != 0) begin : g_pid
+    `ifdef VX_CFG_H100_SM_ENABLE
+        reg [LSU_PEND_POOL-1:0][PID_BITS:0] pkt_ctr;
+        reg [LSU_PEND_POOL-1:0] pkt_sop, pkt_eop;
+    `else
         reg [`VX_CFG_LSU_PENDING_SIZE-1:0][PID_BITS:0] pkt_ctr;
         reg [`VX_CFG_LSU_PENDING_SIZE-1:0] pkt_sop, pkt_eop;
+    `endif
 
     `ifdef VX_CFG_EXT_MBAR_ENABLE
         // A cp.async read holds a cp.async slot, not a packet slot.
@@ -588,7 +612,11 @@ module VX_lsu_slice import VX_gpu_pkg::*; #(
         wire full;
 
         VX_allocator #(
+        `ifdef VX_CFG_H100_SM_ENABLE
+            .SIZE (LSU_PEND_POOL)
+        `else
             .SIZE (`VX_CFG_LSU_PENDING_SIZE)
+        `endif
         ) pkt_allocator (
             .clk        (clk),
             .reset      (reset),
@@ -677,7 +705,14 @@ module VX_lsu_slice import VX_gpu_pkg::*; #(
     wire req_tw = execute_if.data.op_args.lsu.amo_valid
                && (amo_op_e'(execute_if.data.op_args.lsu.amo_op) == AMO_OP_MBAR_TRY_WAIT);
     // A copy's packet field names its cp.async slot.
+`ifdef VX_CFG_H100_SM_ENABLE
+    // The cp.async slots keep their count, so their field is narrower than the two-class packet field.
+    localparam CPA_SLOT_W = `LOG2UP(`VX_CFG_LSU_PENDING_SIZE);
+    wire [CPA_SLOT_W-1:0] cpa_slot_n;
+    wire [LSUQ_SIZEW-1:0] cpa_slot = LSUQ_SIZEW'(cpa_slot_n);
+`else
     wire [LSUQ_SIZEW-1:0] cpa_slot;
+`endif
     assign mem_req_tag = {
         execute_if.data.header,
         execute_if.data.op_type,
@@ -712,9 +747,41 @@ module VX_lsu_slice import VX_gpu_pkg::*; #(
     };
 `endif
 
+`ifdef VX_CFG_H100_SM_ENABLE
+    // Reads whose active lanes all stay on the shared-memory side (local memory, the DSMEM
+    // window) hold their own LSU_PENDING_SIZE credits, so they never wait for global misses.
+    localparam CLS_W = `CLOG2(`VX_CFG_LSU_PENDING_SIZE + 1);
+`ifdef VX_CFG_EXT_MBAR_ENABLE
+    wire req_shm = (| execute_if.data.header.tmask) && ~(| lane_l1) && ~req_is_fence && ~req_cpa;
+`else
+    wire req_shm = (| execute_if.data.header.tmask) && ~(| lane_l1) && ~req_is_fence;
+`endif
+    wire rsp_shm;
+    reg [CLS_W-1:0] shm_cnt, gbl_cnt;
+    wire cls_hold = ~mem_req_rw && (req_shm ? (shm_cnt == CLS_W'(`VX_CFG_LSU_PENDING_SIZE))
+                                            : (gbl_cnt == CLS_W'(`VX_CFG_LSU_PENDING_SIZE)));
+    wire cls_inc  = mem_req_fire && ~mem_req_rw;
+    wire cls_dec  = mem_rsp_fire && mem_rsp_eop;
+    always @(posedge clk) begin
+        if (reset) begin
+            shm_cnt <= '0;
+            gbl_cnt <= '0;
+        end else begin
+            shm_cnt <= shm_cnt + CLS_W'(cls_inc && req_shm) - CLS_W'(cls_dec && rsp_shm);
+            gbl_cnt <= gbl_cnt + CLS_W'(cls_inc && ~req_shm) - CLS_W'(cls_dec && ~rsp_shm);
+        end
+    end
+    `RUNTIME_ASSERT (~(cls_dec && (rsp_shm ? (shm_cnt == '0) : (gbl_cnt == '0))),
+        ("%t: *** %s LSU credit class underflow", $time, INSTANCE_ID))
+
+`endif
     // Pack per-lane mem_req signals into the client_if request payload;
     // unpack the response payload into per-lane mem_rsp signals.
+`ifdef VX_CFG_H100_SM_ENABLE
+    assign client_if.req_valid       = mem_req_valid && ~cls_hold;
+`else
     assign client_if.req_valid       = mem_req_valid;
+`endif
     assign client_if.req_data.rw     = mem_req_rw;
     assign client_if.req_data.mask   = mem_req_mask;
     assign client_if.req_data.byteen = mem_req_byteen;
@@ -728,13 +795,22 @@ module VX_lsu_slice import VX_gpu_pkg::*; #(
         assign client_if.req_data.mbar_addr[i] = execute_if.data.rs3_data[i][`VX_CFG_MEM_ADDR_WIDTH-1:REQ_ASHIFT];
     end
 `endif
+`ifdef VX_CFG_H100_SM_ENABLE
+    assign client_if.req_data.tag    = {mem_req_tag, req_shm};
+    assign mem_req_ready             = client_if.req_ready && ~cls_hold;
+`else
     assign client_if.req_data.tag    = mem_req_tag;
     assign mem_req_ready             = client_if.req_ready;
+`endif
 
     assign mem_rsp_valid             = client_if.rsp_valid;
     assign mem_rsp_mask              = client_if.rsp_data.mask;
     assign mem_rsp_data              = client_if.rsp_data.data;
+`ifdef VX_CFG_H100_SM_ENABLE
+    assign {mem_rsp_tag, rsp_shm}    = client_if.rsp_data.tag;
+`else
     assign mem_rsp_tag               = client_if.rsp_data.tag;
+`endif
     assign mem_rsp_sop               = client_if.rsp_data.sop;
     assign mem_rsp_eop               = client_if.rsp_data.eop;
     assign client_if.rsp_ready       = mem_rsp_ready;
@@ -1007,9 +1083,15 @@ module VX_lsu_slice import VX_gpu_pkg::*; #(
         .iss_addr  (cpa_iss_addr),
         .iss_ss    (cpa_ss),
         .iss_ready (cpa_iss_ready),
+    `ifdef VX_CFG_H100_SM_ENABLE
+        .iss_slot  (cpa_slot_n),
+        .rsp_valid (mem_rsp_valid && rsp_cpa),
+        .rsp_slot  (pkt_raddr[CPA_SLOT_W-1:0]),
+    `else
         .iss_slot  (cpa_slot),
         .rsp_valid (mem_rsp_valid && rsp_cpa),
         .rsp_slot  (pkt_raddr),
+    `endif
         .rsp_pid   (`UP(PID_BITS)'(rsp_hdr.pid)),
         .rsp_mask  (mem_rsp_mask),
         .rsp_data  (cpa_rsp_data),

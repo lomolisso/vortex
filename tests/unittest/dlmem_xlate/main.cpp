@@ -1259,8 +1259,15 @@ void run_fence_hold(MemOp op) {
   if (lacc->count(2) != 2) {
     fail(ctx, "the local load counted " + std::to_string(lacc->count(2)) + " lanes, expected 2");
   }
+#ifdef VX_CFG_H100_SM_ENABLE
+  lacc->CommitIn.at(0).send(WtInc{2, 1}, 1);
+  lacc->CommitIn.at(1).send(WtInc{2, 1}, 1);
+#else
+#line 1262
   lacc->CommitIn.at(0).send(2, 1);
   lacc->CommitIn.at(1).send(2, 1);
+#endif
+#line 1264
   for (uint32_t k = 0; k < 3; ++k) {
     platform.tick();
   }
@@ -1345,7 +1352,13 @@ void run_fence_hold_local(MemOp op) {
   };
   auto commit = [&](std::initializer_list<uint32_t> banks) {
     for (uint32_t bank : banks) {
+#ifdef VX_CFG_H100_SM_ENABLE
+      lacc->CommitIn.at(bank).send(WtInc{2, 1}, 1);
+#else
+#line 1348
       lacc->CommitIn.at(bank).send(2, 1);
+#endif
+#line 1349
     }
   };
   auto check_held = [&](uint64_t fence_id, uint64_t load_id) {
@@ -1522,7 +1535,13 @@ void run_rl_hold(MemOp first, MemOp rel) {
   // Commits one lane per bank for warp `wid`, then lets them land.
   auto commit_all = [&](uint32_t wid, uint32_t lanes) {
     for (uint32_t k = 0; k < lanes; ++k) {
+#ifdef VX_CFG_H100_SM_ENABLE
+      lacc->CommitIn.at(k % kBanks).send(WtInc{wid, 1}, 1 + k / kBanks);
+#else
+#line 1525
       lacc->CommitIn.at(k % kBanks).send(wid, 1 + k / kBanks);
+#endif
+#line 1526
     }
     step(3 + lanes / kBanks);
   };
@@ -1551,8 +1570,15 @@ void run_rl_hold(MemOp first, MemOp rel) {
   }
   // Both commit pulses sent at tick T: the tracker counts them at T+1, the op leaves at T+2.
   uint64_t T = cycle;
+#ifdef VX_CFG_H100_SM_ENABLE
+  lacc->CommitIn.at(0).send(WtInc{2, 1}, 1);
+  lacc->CommitIn.at(1).send(WtInc{2, 1}, 1);
+#else
+#line 1554
   lacc->CommitIn.at(0).send(2, 1);
   lacc->CommitIn.at(1).send(2, 1);
+#endif
+#line 1556
   step();
   check_held("local, in the tick of the commits", 3, 5);
   step();

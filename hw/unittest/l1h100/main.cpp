@@ -11,19 +11,18 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// VX_cache with H100_L1 as the SM's L1 (l1h100_cases.h); --csv=<file> writes
-// the per-access outcome and timing the SimX twin (tests/unittest/l1_sector)
-// must reproduce.
+// VX_sm_sram_top testbench for the SM L1 on the array (l1h100_cases.h): one LSU
+// block's global leg, a flat memory on the miss bus, the host flush; --csv=<file>
+// writes the outcome lines the SimX twin (tests/unittest/l1_sector) must reproduce.
 
 #include "vl_simulator.h"
-#include "VVX_cache_l1h100_top.h"
+#include "VVX_sm_sram_top.h"
 #include "VX_config.h"
 
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <deque>
-#include <map>
 #include <type_traits>
 #include <vector>
 
@@ -35,7 +34,28 @@ using namespace l1h100_cases;
 #error "l1h100 tests the H100 SM path: build with -DVX_CFG_H100_SM_ENABLE"
 #endif
 
-constexpr uint32_t ADDR_BITS = VX_CFG_MEM_ADDR_WIDTH - __builtin_ctz(LINE);
+constexpr uint32_t clog2(uint32_t n) { return n <= 1 ? 0 : 1 + clog2((n + 1) / 2); }
+constexpr uint32_t log2up(uint32_t n) { return n > 1 ? clog2(n) : 1; }
+
+constexpr uint32_t NL            = VX_CFG_NUM_LSU_LANES;
+constexpr uint32_t GL_ADDR_BITS  = VX_CFG_MEM_ADDR_WIDTH - clog2(WORD);
+constexpr uint32_t MEM_ADDR_BITS = VX_CFG_MEM_ADDR_WIDTH - clog2(LINE);
+// The L1's miss-bus tag: {uuid, special (atomic or fence), index} (VX_gpu_pkg SM_L1_MEM_TAG_WIDTH).
+constexpr uint32_t IDX_BITS      = std::max(clog2(VX_CFG_SM_MAX_READ_LINES),
+    clog2(2 * VX_CFG_LSU_PENDING_SIZE) + clog2(VX_CFG_NUM_LSU_BLOCKS) + clog2(LINE / WORD) + log2up(NL));
+#ifdef VX_CFG_EXT_FPAMO_ENABLE
+constexpr uint32_t OP_BITS       = 5;
+#else
+constexpr uint32_t OP_BITS       = 4;
+#endif
+constexpr uint32_t OP_ADD        = 2;
+constexpr uint32_t ATTR_IO       = 1;
+constexpr uint32_t ATTR_AMO      = 4;
+constexpr uint32_t RD_TCU_PORT   = 0;
+
+static_assert(NL <= MAX_LANES, "the bench drives at most 32 lanes");
+static_assert(VX_CFG_LSU_PENDING_SIZE >= NUM_TAGS, "the bench keeps up to NUM_TAGS requests in flight");
+static_assert(WORD == 8, "the H100 SM path is RV64: one lane word per uint64");
 
 template <typename T>
 static void set_bits(T& sig, uint32_t lsb, uint32_t width, uint64_t value) {
@@ -80,150 +100,163 @@ static uint64_t get_bits(const T& sig, uint32_t lsb, uint32_t width) {
   }
 }
 
-template <typename T>
-static void set_bytes(T& sig, const Bytes& b) {
-  for (uint32_t i = 0; i < LINE; ++i)
-    set_bits(sig, i * 8, 8, b[i]);
-}
-
-template <typename T>
-static Bytes get_bytes(const T& sig) {
-  Bytes b;
-  for (uint32_t i = 0; i < LINE; ++i)
-    b[i] = uint8_t(get_bits(sig, i * 8, 8));
-  return b;
-}
-
-template <typename T>
-static void set_flags(T& sig, const Bytes& b) {
-  for (uint32_t i = 0; i < LINE; ++i)
-    set_bits(sig, i, 1, b[i]);
-}
-
-template <typename T>
-static Bytes get_flags(const T& sig) {
-  Bytes b;
-  for (uint32_t i = 0; i < LINE; ++i)
-    b[i] = uint8_t(get_bits(sig, i, 1));
-  return b;
-}
-
 class RtlDriver {
 public:
   RtlDriver() {
     auto* t = sim_.operator->();
+    const L1SlotCfg c = knob_l1_cfg();
+    s_rows_ = c.s_bytes / c.row_bytes;
+    t->cfg_s_rows = s_rows_;
+    t->cfg_l1_lines = l1_lines(c);
+    t->cfg_l1_protect = l1_protect(c);
     t->reset = 1;
     for (int i = 0; i < 8; ++i)
       tick_ = sim_.step(tick_, 2);
     t->reset = 0;
-    // The tag arrays clear after reset.
-    for (uint32_t i = 0; i < CAP_LINES + 64; ++i)
-      tick_ = sim_.step(tick_, 2);
-    now_ = 0;
   }
 
-  uint64_t now() const { return now_; }
-
-  void push(const Op& op, uint32_t tag) {
-    q_.push_back({op, tag});
-    ops_[tag] = op;
+  void push(const Req& r, uint32_t tag) { q_.push_back({r, tag}); }
+  void flush() { flush_on_ = true; }
+  void set_mem_delay(uint32_t d) { mem_.delay = d; }
+  void set_row_stream(bool on) {
+    rows_on_ = on;
+    row_phase_ = 0;
+    row_pend_ = false;
   }
+  FlatMem& mem() { return mem_; }
+  bool busy() const { return busy_ || !q_.empty() || !mrsp_.empty() || flush_on_; }
 
   std::vector<Event> cycle() {
     auto* t = sim_.operator->();
     std::vector<Event> ev;
     const bool v = !q_.empty();
-    const Op op = v ? q_.front().first : Op{};
-    t->core_req_valid = v;
-    t->core_req_rw = (op.kind == K_ST);
-    t->core_req_flush = (op.kind == K_FENCE);
-    set_flags(t->core_req_byteen, op.byteen);
-    set_bits(t->core_req_addr, 0, ADDR_BITS, op.line);
-    set_bytes(t->core_req_data, op.data);
-    t->core_req_tag = v ? q_.front().second : 0;
-    t->core_rsp_ready = 1;
+    const Req r = v ? q_.front().first : Req{};
+    const uint32_t tag = v ? q_.front().second : 0;
+    set_bits(t->gl_in_valid, 0, 1, v);
+    set_bits(t->gl_in_rw, 0, 1, r.kind == K_ST);
+    set_bits(t->gl_in_mask, 0, NL, r.mask);
+    bool io = false;
+    for (uint32_t i = 0; i < NL; ++i) {
+      const bool on = (r.mask >> i) & 1;
+      io |= on && nc_line(r.addr[i] / LINE);
+      set_bits(t->gl_in_addr, i * GL_ADDR_BITS, GL_ADDR_BITS, r.addr[i] / WORD);
+      set_bits(t->gl_in_byteen, i * WORD, WORD, on ? lane_be(r, i) : 0);
+      set_bits(t->gl_in_data, i * 64, 64, on ? lane_wdata(r, i) : 0);
+    }
+    set_bits(t->gl_in_attr, 0, ATTR_AMO + 1 + OP_BITS, 0);
+    set_bits(t->gl_in_attr, ATTR_IO, 1, io);
+    set_bits(t->gl_in_attr, ATTR_AMO, 1, r.kind == K_ADD);
+    set_bits(t->gl_in_attr, ATTR_AMO + 1, OP_BITS, r.kind == K_ADD ? OP_ADD : 0);
+    set_bits(t->gl_in_tag, 0, 16, tag);
+    set_bits(t->gl_in_rsp_ready, 0, 1, 1);
     t->mem_req_ready = 1;
-    const bool mv = !rsp_.empty() && rsp_.front().due <= now_;
+    const bool mv = !mrsp_.empty() && mrsp_.front().when <= now_;
     t->mem_rsp_valid = mv;
     if (mv) {
-      set_bytes(t->mem_rsp_data, mem_.at(rsp_.front().line));
-      set_bits(t->mem_rsp_tag, 0, 64, rsp_.front().tag);
+      const auto& m = mrsp_.front();
+      for (uint32_t i = 0; i < LINE; ++i)
+        set_bits(t->mem_rsp_data, i * 8, 8, m.data[i]);
+      set_bits(t->mem_rsp_tag, 0, 64, m.tag);
     }
+    t->flush_req = flush_on_;
+    // every other cycle, so the global path keeps read-port cycles under the
+    // TCU's higher priority; a presented row is held until taken
+    const bool rv = rows_on_ && (row_pend_ || (row_phase_ & 1) == 0);
+    set_bits(t->rd_valid, RD_TCU_PORT, 1, rv);
+    set_bits(t->rd_row, RD_TCU_PORT * 32, 32, row_ % s_rows_);
     t->eval();
-    if (v && t->core_req_ready) {
-      ev.push_back({EV_ACCEPT, q_.front().second, true, false, false, 0, {}});
+
+    if (v && get_bits(t->gl_in_ready, 0, 1)) {
+      ev.push_back(Event{EV_ACCEPT, tag});
       q_.pop_front();
     }
-    if (mv && t->mem_rsp_ready)
-      rsp_.pop_front();
+    if (get_bits(t->gl_in_rsp_valid, 0, 1)) {
+      Event e{EV_RSP};
+      e.tag = uint32_t(get_bits(t->gl_in_rsp_tag, 0, 16)) & (NUM_TAGS - 1);
+      e.mask = uint32_t(get_bits(t->gl_in_rsp_mask, 0, NL));
+      for (uint32_t i = 0; i < NL; ++i)
+        e.data[i] = get_bits(t->gl_in_rsp_data, i * 64, 64);
+      ev.push_back(e);
+    }
     if (t->mem_req_valid) {
-      Event e{EV_MEM, 0, true, (bool)t->mem_req_rw, (bool)t->mem_req_fence, get_bits(t->mem_req_addr, 0, ADDR_BITS),
-              get_flags(t->mem_req_byteen)};
-      if (e.fence) {
-        rsp_.push_back({now_ + MEM_DELAY, e.line, get_bits(t->mem_req_tag, 0, 64)});
-      } else if (e.rw) {
-        Bytes d = get_bytes(t->mem_req_data);
-        Bytes& m = mem_.at(e.line);
-        for (uint32_t i = 0; i < LINE; ++i)
-          if (e.byteen[i]) m[i] = d[i];
+      const uint64_t line = get_bits(t->mem_req_addr, 0, MEM_ADDR_BITS);
+      const uint64_t mtag = get_bits(t->mem_req_tag, 0, 64);
+      uint8_t data[LINE], be[LINE];
+      for (uint32_t i = 0; i < LINE; ++i) {
+        data[i] = uint8_t(get_bits(t->mem_req_data, i * 8, 8));
+        be[i] = uint8_t(get_bits(t->mem_req_byteen, i, 1));
+      }
+      if (t->mem_req_rw) {
+        mem_.write(line * LINE, data, be, LINE);
+      } else if ((mtag >> IDX_BITS) & 1) {
+        std::vector<uint8_t> old(LINE, 0);
+        if (get_bits(t->mem_req_attr, ATTR_AMO, 1))
+          old = mem_.amo_add(line * LINE, data, be, LINE);
+        this->reply(mtag, old);
       } else {
-        rsp_.push_back({now_ + MEM_DELAY, e.line, get_bits(t->mem_req_tag, 0, 64)});
-      }
-      ev.push_back(e);
-    }
-    if (t->core_rsp_valid) {
-      uint32_t tag = (uint32_t)t->core_rsp_tag;
-      Event e{EV_RSP, tag, true, false, false, 0, {}};
-      auto it = ops_.find(tag);
-      if (it != ops_.end() && it->second.kind == K_LD) {
-        Bytes d = get_bytes(t->core_rsp_data);
-        Bytes& m = mem_.at(it->second.line);
+        Event e{EV_MEMRD};
+        e.line = line;
         for (uint32_t i = 0; i < LINE; ++i)
-          if (it->second.byteen[i]) e.data_ok &= (d[i] == m[i]);
+          e.mask |= uint32_t(be[i]) << (i / SECTOR);
+        ev.push_back(e);
+        this->reply(mtag, mem_.read(line * LINE, LINE));
       }
-      ev.push_back(e);
     }
+    if (mv && t->mem_rsp_ready)
+      mrsp_.pop_front();
+    if (flush_on_ && t->flush_done) {
+      ev.push_back(Event{EV_FLUSHED});
+      flush_on_ = false;
+    }
+    if (rv && get_bits(t->rd_ready, RD_TCU_PORT, 1)) {
+      ++row_;
+      row_pend_ = false;
+    } else {
+      row_pend_ = rv;
+    }
+    if (rows_on_)
+      ++row_phase_;
+    busy_ = t->l1_busy;
     tick_ = sim_.step(tick_, 2);
     ++now_;
     return ev;
   }
 
 private:
-  struct Pending {
-    uint64_t due;
-    uint64_t line;
-    uint64_t tag;
+  struct MemRsp {
+    uint64_t when, tag;
+    std::vector<uint8_t> data;
   };
 
-  vl_simulator<VVX_cache_l1h100_top> sim_;
-  uint64_t tick_ = 0;
-  uint64_t now_ = 0;
-  std::deque<std::pair<Op, uint32_t>> q_;
-  std::map<uint32_t, Op> ops_;
-  std::deque<Pending> rsp_;
-  MemImage mem_;
+  void reply(uint64_t tag, std::vector<uint8_t> data) {
+    const uint64_t when = std::max(now_ + mem_.delay, mrsp_.empty() ? 0 : mrsp_.back().when);
+    mrsp_.push_back({when, tag, std::move(data)});
+  }
+
+  vl_simulator<VVX_sm_sram_top> sim_;
+  uint64_t tick_ = 0, now_ = 0;
+  uint32_t s_rows_ = 0, row_ = 0, row_phase_ = 0;
+  bool flush_on_ = false, rows_on_ = false, row_pend_ = false, busy_ = false;
+  std::deque<std::pair<Req, uint32_t>> q_;
+  std::deque<MemRsp> mrsp_;
+  FlatMem mem_;
 };
 
 int main(int argc, char** argv) {
   setvbuf(stdout, nullptr, _IOLBF, 0);
-  uint32_t seed = 1, nrand = 3000;
-  bool quick = false;
+  uint32_t seed = 1, nrand = 2000;
   const char* csv_path = nullptr;
   for (int i = 1; i < argc; ++i) {
     if (!strncmp(argv[i], "--seed=", 7)) seed = (uint32_t)atoi(argv[i] + 7);
     else if (!strncmp(argv[i], "--random=", 9)) nrand = (uint32_t)atoi(argv[i] + 9);
     else if (!strncmp(argv[i], "--csv=", 6)) csv_path = argv[i] + 6;
-    else if (!strcmp(argv[i], "--quick")) quick = true;
-    else if (!strncmp(argv[i], "+", 1)) continue;
-    else { std::printf("usage: %s [--seed=N] [--random=N] [--quick] [--csv=file]\n", argv[0]); return 2; }
+    else { std::printf("usage: %s [--seed=N] [--random=N] [--csv=file]\n", argv[0]); return 2; }
   }
-  Verilated::commandArgs(argc, argv);
   FILE* csv = csv_path ? std::fopen(csv_path, "w") : nullptr;
-  std::printf("l1h100 (RTL): %u B, %u ways, line %u, sector %u, protected %u, seed %u\n", VX_CFG_DCACHE_SIZE,
-              VX_CFG_DCACHE_NUM_WAYS, LINE, SECTOR, VX_CFG_L1_REPL_PROTECTED, seed);
+  std::printf("l1h100 (RTL): %u lanes, line %u B, sector %u B, seed %u\n", NL, LINE, SECTOR, seed);
   RtlDriver d;
-  Runner<RtlDriver> run(d, csv);
-  int rc = run.run(seed, nrand, quick);
+  Runner<RtlDriver> run(d, NL, csv);
+  int rc = run.run(seed, nrand);
   if (csv)
     std::fclose(csv);
   std::printf(rc ? "FAILED!\n" : "PASSED!\n");

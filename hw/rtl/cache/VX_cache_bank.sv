@@ -38,9 +38,6 @@ module VX_cache_bank import VX_gpu_pkg::*; #(
     parameter AMO_ENABLE        = 0,        // synthesize atomic-op logic
     parameter SHARED_LEVEL      = 0,        // a fence drains this bank instead of walking it
     parameter LATENCY           = 2,        // pipeline depth; >2 defers the data array to break the tag->data path
-`ifdef VX_CFG_H100_SM_ENABLE
-    parameter H100_L1           = 0,        // H100 L1: byte-valid store allocate, XOR set index, line requests with a sector mask
-`endif
     parameter MSHR_ADDR_WIDTH   = `LOG2UP(MSHR_SIZE),
     parameter MEM_TAG_WIDTH     = UUID_WIDTH + MSHR_ADDR_WIDTH,
     parameter REQ_SEL_WIDTH     = `UP(`CS_REQ_SEL_BITS),
@@ -107,15 +104,6 @@ module VX_cache_bank import VX_gpu_pkg::*; #(
     localparam CRSQ_QUEUE_SIZE = 1 << `CLOG2(2 + CRSQ_SIZE);
     `STATIC_ASSERT(LATENCY >= 2, ("invalid parameter: cache bank LATENCY must be >= 2"))
     `UNUSED_PARAM (MRSQ_SIZE)
-`ifdef VX_CFG_H100_SM_ENABLE
-    localparam VSEC_SIZE = (H100_L1 != 0) ? `VX_CFG_DCACHE_SECTOR_SIZE : LINE_SIZE; // valid-sector (fill) granule
-    localparam VSECS     = LINE_SIZE / VSEC_SIZE;
-    `STATIC_ASSERT((H100_L1 == 0) || (WORD_SIZE == LINE_SIZE), ("invalid parameter: the H100 L1 takes one line per request"))
-    `STATIC_ASSERT((H100_L1 == 0) || (SECTOR_SIZE == LINE_SIZE), ("invalid parameter: the H100 L1 requests whole lines from memory"))
-    `STATIC_ASSERT((H100_L1 == 0) || (WRITEBACK == 0), ("invalid parameter: the H100 L1 is write-through"))
-    `STATIC_ASSERT((H100_L1 == 0) || (IS_LLC == 0), ("invalid parameter: the H100 L1 needs a level below it"))
-    `STATIC_ASSERT((H100_L1 == 0) || (REPL_POLICY == `CS_REPL_H100), ("invalid parameter: the H100 L1 uses the H100 replacement"))
-`endif
 
     // ========================================================================
     // Pipeline payload types
@@ -151,10 +139,6 @@ module VX_cache_bank import VX_gpu_pkg::*; #(
         logic [`CS_SECTORS_PER_LINE-1:0] evict_dirty_mask; // per-sector dirty of the evict way
         logic [`CS_TAG_SEL_BITS-1:0]   evict_tag;
         logic [MSHR_ADDR_WIDTH-1:0]    mshr_previd;
-`ifdef VX_CFG_H100_SM_ENABLE
-        logic [VSECS-1:0]              miss_sec; // sectors a read miss requests
-        logic                          realloc;  // a replay that missed again: a new MSHR root
-`endif
     } lookup_t;
 
     typedef struct packed {            // data-array drive (S0 -> stD)
@@ -240,12 +224,6 @@ module VX_cache_bank import VX_gpu_pkg::*; #(
     // data; it feeds the data-array fill port and the forward-response word.
     reg [`CS_SECTOR_WIDTH-1:0] fbuf_data_r;
     reg [`CS_LINE_ADDR_WIDTH-1:0] fbuf_addr_r;
-`ifdef VX_CFG_H100_SM_ENABLE
-    wire [LINE_SIZE-1:0] fill_bytes_sel; // the sectors an arriving fill carries
-    `UNUSED_VAR (fill_bytes_sel)
-    wire [VSECS-1:0] h100_alloc_mask, h100_fill_sec, h100_probe_mask;
-    wire h100_probe_pending, h100_hold;
-`endif
 
     // AMO sideband, extracted from the attr field (gated by AMO_ENABLE).
     amo_req_t core_req_amo;
@@ -275,37 +253,7 @@ module VX_cache_bank import VX_gpu_pkg::*; #(
     wire do_read_std  = stD.req.valid && stD.req.is_creq && ~stD.req.rw;
     wire do_write_std = stD.req.valid && stD.req.is_creq && stD.req.rw;
 
-`ifdef VX_CFG_H100_SM_ENABLE
-    // The H100 L1 set index folds every line-address bit above the set field
-    // into it (l1_ref.h), so no power-of-two stride maps to one set.
-    function automatic [`CS_LINE_SEL_BITS-1:0] set_index(input [`CS_LINE_ADDR_WIDTH-1:0] a);
-        reg [`CS_LINE_SEL_BITS-1:0] r;
-        r = a[`CS_LINE_SEL_BITS-1:0];
-        if (H100_L1 != 0) begin
-            for (integer b = `CS_LINE_SEL_BITS; b < `CS_LINE_ADDR_WIDTH; ++b) begin
-                r[b % `CS_LINE_SEL_BITS] = r[b % `CS_LINE_SEL_BITS] ^ a[b];
-            end
-        end
-        return r;
-    endfunction
-    function automatic [LINE_SIZE-1:0] sec_bytes(input [VSECS-1:0] m);
-        reg [LINE_SIZE-1:0] r;
-        for (integer b = 0; b < LINE_SIZE; ++b) begin
-            r[b] = m[b / VSEC_SIZE];
-        end
-        return r;
-    endfunction
-    function automatic [VSECS-1:0] bytes_sec(input [LINE_SIZE-1:0] m);
-        reg [VSECS-1:0] r;
-        for (integer v = 0; v < VSECS; ++v) begin
-            r[v] = (| m[v * VSEC_SIZE +: VSEC_SIZE]);
-        end
-        return r;
-    endfunction
-    wire [`CS_LINE_SEL_BITS-1:0] line_idx_st0 = set_index(st0.req.addr);
-`else
     wire [`CS_LINE_SEL_BITS-1:0] line_idx_st0 = st0.req.addr[`CS_LINE_SEL_BITS-1:0];
-`endif
     wire [`CS_TAG_SEL_BITS-1:0]  line_tag_st0 = `CS_LINE_ADDR_TAG(st0.req.addr);
     // Requested sector = top CS_SECTOR_SEL_BITS of the in-line word offset.
     wire [`UP(`CS_SECTOR_SEL_BITS)-1:0] sector_idx_st0;
@@ -438,24 +386,15 @@ module VX_cache_bank import VX_gpu_pkg::*; #(
     // req_input_defer is the engine's same-line input guard (both 0 for
     // non-AMO banks). Where atomics commit, per-word order does not rest on
     // the guard: the order hazard at S0 enforces it.
-`ifdef VX_CFG_H100_SM_ENABLE
-    wire amo_creq_path = core_req_valid && ~amo_commit_busy && ~req_input_defer && ~h100_hold;
-`else
     wire amo_creq_path = core_req_valid && ~amo_commit_busy && ~req_input_defer;
-`endif
     wire amo_wb_path   = amo_wb_pending && ~amo_hit_st1;
     wire creq_enable   = creq_grant && (amo_creq_path || amo_wb_path);
 
     assign replay_ready   = replay_grant && ~fwd_head && ~replay_link_hold && ~(!WRITEBACK && replay_rw && mreq_queue_alm_full) && ~pipe_stall;
     assign mem_rsp_ready  = fill_grant && ~fwd_pending && ~fill_inflight && ~replay_link_hold && ~(WRITEBACK && mreq_queue_alm_full) && ~pipe_stall;
     assign flush_ready    = flush_grant && ~(WRITEBACK && mreq_queue_alm_full) && ~pipe_stall;
-`ifdef VX_CFG_H100_SM_ENABLE
-    assign core_req_ready = creq_grant && ~mreq_queue_alm_full && ~mshr_alm_full && ~pipe_stall
-                         && ~amo_commit_busy && ~req_input_defer && ~h100_hold;
-`else
     assign core_req_ready = creq_grant && ~mreq_queue_alm_full && ~mshr_alm_full && ~pipe_stall
                          && ~amo_commit_busy && ~req_input_defer;
-`endif
 
     wire init_fire    = init_valid;
     wire replay_fire  = replay_valid && replay_ready;
@@ -566,11 +505,6 @@ module VX_cache_bank import VX_gpu_pkg::*; #(
                              : (core_req_valid ? core_req_amo : amo_req_t'('0)));
         sel_req.wdata        = wdata_sel;
         // tag_matches is computed at S0; left 0 here (overridden at the data bubble).
-`ifdef VX_CFG_H100_SM_ENABLE
-        if ((H100_L1 != 0) && fill_enable) begin
-            sel_req.req.byteen = WORD_SIZE'(fill_bytes_sel);
-        end
-`endif
     end
 
     // UUID extraction (debug + MSHR ordering): per stage, from the carried tag.
@@ -612,17 +546,7 @@ module VX_cache_bank import VX_gpu_pkg::*; #(
     // the resident way, not a fresh victim, so the new sector lands in the same
     // line copy. With 1 sector/line a fill's line is never already resident, so
     // this is gated off and the victim way is always used.
-`ifdef VX_CFG_H100_SM_ENABLE
-    wire [`CS_LINE_SEL_BITS-1:0] line_idx_sel = set_index(sel_req.req.addr);
-    // In the H100 L1 a line is resident before all its sectors are: a fill or
-    // a store merges into the resident way.
-    wire line_present_any_st0 = ((`CS_SECTORS_PER_LINE > 1) || (H100_L1 != 0)) && (| line_present_st0);
-    wire [NUM_WAYS-1:0] way_valid_st0;
-    wire [LINE_SIZE-1:0] present_bytes_st0;
-    wire h100_update_st0;
-`else
     wire line_present_any_st0 = (`CS_SECTORS_PER_LINE > 1) && (| line_present_st0);
-`endif
     wire [`CS_WAY_SEL_WIDTH-1:0] present_way_st0;
     VX_onehot_encoder #(
         .N (NUM_WAYS)
@@ -643,104 +567,6 @@ module VX_cache_bank import VX_gpu_pkg::*; #(
     wire [NUM_WAYS-1:0] victim_way_oh = NUM_WAYS'(1'b1) << victim_way;
     wire [NUM_WAYS-1:0] fill_way_oh_st0 = line_present_any_st0 ? line_present_st0 : victim_way_oh;
 
-`ifdef VX_CFG_H100_SM_ENABLE
-    VX_cache_repl #(
-        .CACHE_SIZE  (CACHE_SIZE),
-        .LINE_SIZE   (LINE_SIZE),
-        .NUM_BANKS   (NUM_BANKS),
-        .NUM_WAYS    (NUM_WAYS),
-        .REPL_POLICY (REPL_POLICY)
-    ) cache_repl (
-        .clk          (clk),
-        .reset        (reset),
-        .stall        (pipe_stall),
-        .init         (do_init_st0),
-        .lookup_valid (do_lookup_st1 && ~pipe_stall),
-        .lookup_hit   (st1.lk.is_hit),
-        .lookup_line  (set_index(st1.req.addr)),
-        .lookup_way   (st1.req.way_idx),
-        .repl_valid   ((H100_L1 != 0) ? (h100_update_st0 && ~line_present_any_st0)
-                                      : (do_fill_st0 && ~st0.req.is_passthru_fill && ~pipe_stall)),
-        .repl_line    (line_idx_st0),
-        .repl_line_n  (line_idx_sel),
-        .repl_valid_ways (way_valid_st0),
-        .repl_way     (victim_way)
-    );
-
-    if (H100_L1 != 0) begin : g_tags_h100
-        wire [NUM_WAYS-1:0] hit_oh;
-        VX_cache_tags_h100 #(
-            .CACHE_SIZE (CACHE_SIZE),
-            .LINE_SIZE  (LINE_SIZE),
-            .NUM_BANKS  (NUM_BANKS),
-            .NUM_WAYS   (NUM_WAYS),
-            .WORD_SIZE  (WORD_SIZE)
-        ) cache_tags (
-            .clk          (clk),
-            .reset        (reset),
-            .stall        (pipe_stall),
-            .init         (do_init_st0),
-            .flush        (do_flush_st0 && ~pipe_stall),
-            .line_idx     (line_idx_st0),
-            .line_idx_n   (line_idx_sel),
-            .line_tag     (line_tag_st0),
-            .req_bytes    (LINE_SIZE'(st0.req.byteen)),
-            .update       (h100_update_st0),
-            .upd_alloc    (~line_present_any_st0),
-            .upd_way_oh   (fill_way_oh_st0),
-            .upd_bytes    (LINE_SIZE'(st0.req.byteen)),
-            .inval        (is_amo_fwd_st0 && line_present_any_st0 && ~pipe_stall),
-            .tag_matches  (hit_oh),
-            .line_present (line_present_st0),
-            .way_valid    (way_valid_st0),
-            .present_bytes(present_bytes_st0)
-        );
-        // A store always completes in the L1: it merges into the resident
-        // line or allocates one.
-        // A replay reading no byte (a fence) only waited for its fill's answer.
-        wire no_bytes_replay = st0.req.is_replay && (st0.req.byteen == '0);
-        assign tag_matches_st0 = (do_write_st0 || no_bytes_replay) ? fill_way_oh_st0 : hit_oh;
-        assign evict_dirty_st0 = 1'b0;
-        assign evict_dirty_mask_st0 = '0;
-        assign evict_tag_st0 = '0;
-    end else begin : g_tags
-        VX_cache_tags #(
-            .CACHE_SIZE (CACHE_SIZE),
-            .LINE_SIZE  (LINE_SIZE),
-            .NUM_BANKS  (NUM_BANKS),
-            .NUM_WAYS   (NUM_WAYS),
-            .WORD_SIZE  (WORD_SIZE),
-            .SECTOR_SIZE(SECTOR_SIZE),
-            .WRITEBACK  (WRITEBACK),
-            .AMO_ENABLE ((AMO_ENABLE != 0) && (IS_LLC == 0))
-        ) cache_tags (
-            .clk         (clk),
-            .reset       (reset),
-            .stall       (pipe_stall),
-            .init        (do_init_st0),
-            .flush       (do_flush_st0 && ~pipe_stall),
-            .fill        (do_fill_st0 && ~st0.req.is_passthru_fill && ~pipe_stall),
-            .read        (do_read_st0 && ~pipe_stall),
-            .write       (do_write_st0 && ~pipe_stall),
-            // non-LLC AMO forwards downstream and invalidates its own copy so the
-            // issuer's later plain load refetches the new value.
-            .invalidate  (is_amo_fwd_st0 && lk_st0.is_hit && ~pipe_stall),
-            .line_idx    (line_idx_st0),
-            .line_idx_n  (line_idx_sel),
-            .line_tag    (line_tag_st0),
-            .sector_idx  (sector_idx_st0),
-            .evict_way   (evict_way_st0),
-            .fill_way_oh (fill_way_oh_st0),
-            .tag_matches (tag_matches_st0),
-            .line_present (line_present_st0),
-            .evict_dirty (evict_dirty_st0),
-            .evict_dirty_mask (evict_dirty_mask_st0),
-            .evict_tag   (evict_tag_st0)
-        );
-        assign way_valid_st0 = '0;
-        assign present_bytes_st0 = '0;
-    end
-`else
     VX_cache_repl #(
         .CACHE_SIZE  (CACHE_SIZE),
         .LINE_SIZE   (LINE_SIZE),
@@ -796,7 +622,6 @@ module VX_cache_bank import VX_gpu_pkg::*; #(
         .evict_tag   (evict_tag_st0)
     );
 
-`endif
     VX_onehot_encoder #(
         .N (NUM_WAYS)
     ) way_idx_enc (
@@ -826,33 +651,6 @@ module VX_cache_bank import VX_gpu_pkg::*; #(
                                   && (mshr_pending_wr_raw || (st0_modify && mshr_pending_ovl_raw))
                                   && ~is_amo_fwd_st0;
 
-`ifdef VX_CFG_H100_SM_ENABLE
-    // A replayed load whose bytes the fill did not bring missed again: it
-    // takes a new MSHR entry as a root and requests its own sectors.
-    wire realloc_st0 = (H100_L1 != 0) && do_read_st0 && st0.req.is_replay
-                    && ~(| tag_matches_st0) && ~st0.req.amo.amo_valid;
-    assign h100_update_st0 = ((do_write_st0 && ~creq_hit_order_hazard_st0)
-                           || (do_fill_st0 && ~st0.req.is_passthru_fill && (st0.req.byteen != '0))) && ~pipe_stall;
-    // A line has at most one fill in flight. A load joins it only when that
-    // fill brings its sectors; any other load of the line waits at the input
-    // until the line's requests have retired, so it never refetches behind a
-    // younger store's write-through. The fill's root is kept in the MSHR from
-    // S1 on; S0 and S1 are checked here.
-    wire h100_root_st0 = do_read_st0 && ~(| tag_matches_st0) && ~lk_st0.mshr_pending && ~st0.req.amo.amo_valid;
-    wire h100_root_st1 = do_read_st1 && ~st1.lk.is_hit && ~st1.lk.mshr_pending && ~st1.req.amo.amo_valid;
-    assign h100_alloc_mask = h100_root_st0 ? lk_st0.miss_sec : '0;
-    wire h100_same_st0 = h100_root_st0 && (st0.req.addr == core_req_addr);
-    wire h100_same_st1 = h100_root_st1 && (st1.req.addr == core_req_addr);
-    wire [VSECS-1:0] h100_line_mask = h100_probe_mask
-                                    | (h100_same_st0 ? lk_st0.miss_sec : '0)
-                                    | (h100_same_st1 ? st1.lk.miss_sec : '0);
-    assign h100_hold = (H100_L1 != 0) && core_req_valid && ~core_req_rw && ~core_req_amo.amo_valid
-                    && (h100_probe_pending || h100_same_st0 || h100_same_st1)
-                    && ((bytes_sec(LINE_SIZE'(core_req_byteen)) & ~h100_line_mask) != '0);
-    if (H100_L1 == 0) begin : g_no_h100_update
-        `UNUSED_VAR ({realloc_st0, h100_update_st0, way_valid_st0, present_bytes_st0, h100_line_mask})
-    end
-`endif
     // S0 lookup delta (single combinational driver). A forwarded AMO is forced
     // non-pending so it never coalesces onto a prior same-line entry. A demoted
     // hit is pending whatever the raw probe says: it must stay in the MSHR and
@@ -866,13 +664,6 @@ module VX_cache_bank import VX_gpu_pkg::*; #(
         lk_st0.evict_tag    = evict_tag_st0;
         lk_st0.mshr_previd  = mshr_previd;
         lk_st0.mshr_pending = (mshr_pending_raw || creq_hit_order_hazard_st0) && ~is_amo_fwd_st0;
-`ifdef VX_CFG_H100_SM_ENABLE
-        lk_st0.miss_sec     = bytes_sec(LINE_SIZE'(st0.req.byteen) & ~present_bytes_st0);
-        lk_st0.realloc      = realloc_st0;
-        if (realloc_st0) begin
-            lk_st0.mshr_pending = 1'b0;
-        end
-`endif
     end
 
 `ifdef SIMULATION
@@ -916,13 +707,6 @@ module VX_cache_bank import VX_gpu_pkg::*; #(
         dat_in.req.way_idx = evict_way_st0;
         dat_in.tag_matches = tag_matches_st0;
         dat_in.hit_demoted = creq_hit_order_hazard_st0;
-`ifdef VX_CFG_H100_SM_ENABLE
-        // a fill writes only the bytes not already valid (a store after the
-        // request went out is newer than the fill)
-        if ((H100_L1 != 0) && st0.req.is_fill) begin
-            dat_in.req.byteen = WORD_SIZE'(LINE_SIZE'(st0.req.byteen) & ~present_bytes_st0);
-        end
-`endif
     end
 
     // commit path: the request (with the resolved hit/victim way and MSHR id)
@@ -930,11 +714,7 @@ module VX_cache_bank import VX_gpu_pkg::*; #(
     always @(*) begin
         cmt_in.req = st0.req;
         cmt_in.req.way_idx = st0.req.is_creq ? hit_idx_st0 : evict_way_st0;
-`ifdef VX_CFG_H100_SM_ENABLE
-        cmt_in.req.mshr_id = (st0.req.is_replay && ~realloc_st0) ? st0.req.mshr_id : mshr_alloc_id;
-`else
         cmt_in.req.mshr_id = st0.req.is_replay ? st0.req.mshr_id : mshr_alloc_id;
-`endif
         cmt_in.lk = lk_st0;
     end
 
@@ -978,11 +758,7 @@ module VX_cache_bank import VX_gpu_pkg::*; #(
     // (is_amo_replay_st1) resolve at stC, so the replay-must-hit check is taken
     // there; with PIPE_EX>0 an st1-staged check would sample them a stage early.
     wire eff_hit_stc = stC.lk.is_hit || is_amo_replay_st1;
-`ifdef VX_CFG_H100_SM_ENABLE
-    `RUNTIME_ASSERT (~(stC.req.valid && stC.req.is_replay && ~eff_hit_stc && ~stC.lk.realloc), ("missed mshr replay"))
-`else
     `RUNTIME_ASSERT (~(stC.req.valid && stC.req.is_replay && ~eff_hit_stc), ("missed mshr replay"))
-`endif
 
     // ========================================================================
     // Data array (driven at stD; outputs land at stC)
@@ -1025,12 +801,7 @@ module VX_cache_bank import VX_gpu_pkg::*; #(
         .write        (do_write_std && ~stD.hit_demoted && ~pipe_stall),
         .evict_way    (stD.req.way_idx),
         .tag_matches  (stD.tag_matches),
-`ifdef VX_CFG_H100_SM_ENABLE
-        .line_idx     (set_index(stD.req.addr)),
-        .fill_byteen  ((H100_L1 != 0) ? LINE_SIZE'(stD.req.byteen) : {LINE_SIZE{1'b1}}),
-`else
         .line_idx     (stD.req.addr[`CS_LINE_SEL_BITS-1:0]),
-`endif
         .fill_data    (fbuf_line),
         .write_word   (stD.wdata),
         .word_idx     (stD.req.word_idx),
@@ -1063,13 +834,8 @@ module VX_cache_bank import VX_gpu_pkg::*; #(
     // ========================================================================
     // MSHR (allocate at S0, finalize at S1)
     // ========================================================================
-`ifdef VX_CFG_H100_SM_ENABLE
-    assign mshr_allocate_st0 = st0.req.valid && st0.req.is_creq && (~st0.req.is_replay || realloc_st0);
-    wire mshr_finalize_st1 = st1.req.valid && st1.req.is_creq && (~st1.req.is_replay || st1.lk.realloc);
-`else
     assign mshr_allocate_st0 = st0.req.valid && st0.req.is_creq && ~st0.req.is_replay;
     wire mshr_finalize_st1 = st1.req.valid && st1.req.is_creq && ~st1.req.is_replay;
-`endif
 
     // A forwarded (non-LLC passthru) AMO keeps its entry until its downstream
     // response returns (fill/dequeue frees it), so never release it. This is an
@@ -1095,45 +861,6 @@ module VX_cache_bank import VX_gpu_pkg::*; #(
     wire [1:0] mshr_dequeue;
     `POP_COUNT(mshr_dequeue, {(replay_fire || fwd_fire), mshr_release_fire});
 
-`ifdef VX_CFG_H100_SM_ENABLE
-    if (H100_L1 != 0) begin : g_mshr_size_h100
-        // a load that missed again at its replay re-takes an entry, so one
-        // entry stays free of new core requests for it
-        wire [1:0] mshr_alloc_cnt;
-        `POP_COUNT(mshr_alloc_cnt, {core_req_fire, (realloc_st0 && ~pipe_stall)});
-        VX_pending_size #(
-            .SIZE     (MSHR_SIZE),
-            .INCRW    (2),
-            .DECRW    (2),
-            .ALM_FULL (MSHR_SIZE - 1)
-        ) mshr_pending_size (
-            .clk      (clk),
-            .reset    (reset),
-            .incr     (mshr_alloc_cnt),
-            .decr     (mshr_dequeue),
-            `UNUSED_PIN (empty),
-            `UNUSED_PIN (alm_empty),
-            `UNUSED_PIN (full),
-            .alm_full (mshr_alm_full),
-            `UNUSED_PIN (size)
-        );
-    end else begin : g_mshr_size
-        VX_pending_size #(
-            .SIZE  (MSHR_SIZE),
-            .DECRW (2)
-        ) mshr_pending_size (
-            .clk   (clk),
-            .reset (reset),
-            .incr  (core_req_fire),
-            .decr  (mshr_dequeue),
-            `UNUSED_PIN (empty),
-            `UNUSED_PIN (alm_empty),
-            .full  (mshr_alm_full),
-            `UNUSED_PIN (alm_full),
-            `UNUSED_PIN (size)
-        );
-    end
-`else
     VX_pending_size #(
         .SIZE  (MSHR_SIZE),
         .DECRW (2)
@@ -1148,7 +875,6 @@ module VX_cache_bank import VX_gpu_pkg::*; #(
         `UNUSED_PIN (alm_full),
         `UNUSED_PIN (size)
     );
-`endif
 
     VX_cache_mshr #(
         .INSTANCE_ID (`SFORMATF(("%s-mshr", INSTANCE_ID))),
@@ -1161,10 +887,6 @@ module VX_cache_bank import VX_gpu_pkg::*; #(
         .AMO_ENABLE  (AMO_ENABLE != 0),
         .AMO_PASSTHRU ((AMO_ENABLE != 0) && (IS_LLC == 0)),
         .WORD_SEL_WIDTH (WORD_SEL_WIDTH),
-    `ifdef VX_CFG_H100_SM_ENABLE
-        .H100_L1     (H100_L1),
-        .SEC_MASK_W  (VSECS),
-    `endif
         .DATA_WIDTH  (WORD_SEL_WIDTH + WORD_SIZE + `CS_WORD_WIDTH + TAG_WIDTH + REQ_SEL_WIDTH + AMO_REQ_BITS)
     ) cache_mshr (
         .clk                 (clk),
@@ -1218,13 +940,6 @@ module VX_cache_bank import VX_gpu_pkg::*; #(
         .finalize_previd     (st1.lk.mshr_previd),
         .empty               (mshr_valid_empty),
         .valid_mask          (mshr_valid_mask),
-    `ifdef VX_CFG_H100_SM_ENABLE
-        .allocate_sec_mask   (h100_alloc_mask),
-        .fill_sec_mask       (h100_fill_sec),
-        .probe_line_addr     (core_req_addr),
-        .probe_line_pending  (h100_probe_pending),
-        .probe_line_mask     (h100_probe_mask),
-    `endif
         .free_mask           (mshr_free_mask)
     );
 
@@ -1414,22 +1129,10 @@ module VX_cache_bank import VX_gpu_pkg::*; #(
     // stream must not starve the chain. The ~pipe_stall gate keeps the
     // dequeue aligned with S1 finalize so a stalled late joiner cannot be
     // orphaned mid-link.
-`ifdef VX_CFG_H100_SM_ENABLE
-    // The H100 L1 replays its chain through the pipe: a chained load may need
-    // sectors the fill did not bring.
-    assign fwd_head    = (H100_L1 == 0) && fwd_active_r && replay_valid
-                      && ~replay_rw && ~replay_amo.amo_valid
-                      && ~crsp_queue_valid && ~pipe_stall;
-`else
     assign fwd_head    = fwd_active_r && replay_valid
                       && ~replay_rw && ~replay_amo.amo_valid
                       && ~crsp_queue_valid && ~pipe_stall;
-`endif
-`ifdef VX_CFG_H100_SM_ENABLE
-    assign fwd_pending = (H100_L1 == 0) && fwd_active_r && replay_valid;
-`else
     assign fwd_pending = fwd_active_r && replay_valid;
-`endif
     assign fwd_fire    = fwd_head && crsp_queue_ready;
 
     always @(posedge clk) begin
@@ -1601,13 +1304,7 @@ module VX_cache_bank import VX_gpu_pkg::*; #(
             assign mreq_queue_addr = rd_mreq_addr;
             assign mreq_queue_rw = stC.req.rw;
             assign mreq_queue_data = {`CS_WORDS_PER_SECTOR{word_stc}};
-`ifdef VX_CFG_H100_SM_ENABLE
-            // the H100 L1 reads one line with the mask of its missing sectors
-            assign mreq_queue_byteen = (stC.req.rw || is_amo_fwd_st1) ? sec_byteen
-                                     : ((H100_L1 != 0) ? SECTOR_SIZE'(sec_bytes(stC.lk.miss_sec)) : {SECTOR_SIZE{1'b1}});
-`else
             assign mreq_queue_byteen = (stC.req.rw || is_amo_fwd_st1) ? sec_byteen : {SECTOR_SIZE{1'b1}};
-`endif
             `UNUSED_VAR ({is_wb_beat, wb_beat_accept, wb_mreq_addr, wb_data_sec, wb_byteen_sec, wb_sector, evict_addr_stc, stC.lk.evict_tag, stC.lk.is_dirty, stC.lk.evict_dirty_mask})
         end
     end else begin : g_mreq_queue_ro
@@ -1626,9 +1323,6 @@ module VX_cache_bank import VX_gpu_pkg::*; #(
     end
 
     assign mreq_queue_pop = mem_req_valid && mem_req_ready;
-`ifdef VX_CFG_H100_SM_ENABLE
-    assign fill_bytes_sel = sec_bytes(h100_fill_sec);
-`endif
 
     VX_fifo_queue #(
         .DATAW    (1 + `CS_LINE_SECTOR_ADDR_WIDTH + SECTOR_SIZE + `CS_SECTOR_WIDTH + MEM_TAG_WIDTH + `UP(MEM_ATTR_WIDTH)),

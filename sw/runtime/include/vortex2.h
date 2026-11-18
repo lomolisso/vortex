@@ -82,6 +82,9 @@ typedef struct vx_kernel* vx_kernel_h;
 #define VX_CAPS_SMS_PER_TPC         0x17  // SMs (cores) per TPC, = VX_CAPS_SOCKET_SIZE
 #define VX_CAPS_MAX_CTAS_PER_SM     0x18  // resident blocks per core
 #define VX_CAPS_MAX_CTAS_PER_SM_CLUSTER 0x19  // resident blocks per core of a launch with a cluster shape
+#define VX_CAPS_SMEM_PER_SM         0x1A  // shared memory per core at the largest carve-out (bytes)
+#define VX_CAPS_SMEM_PER_BLOCK_OPTIN 0x1B // shared memory one block may request (bytes)
+#define VX_CAPS_SMEM_RESERVED_PER_BLOCK 0x1C  // shared memory the device reserves per resident block (bytes)
 
 // ============================================================================
 // Device ISA flags  (decode a VX_CAPS_ISA_FLAGS query result)
@@ -231,6 +234,11 @@ typedef struct {
     // Moves cluster_flags past the version-2 struct's tail padding, as reserved0 does.
     uint32_t     reserved1;
     uint32_t     cluster_flags;   // VX_CLUSTER_FLAG_*
+    // Moves smem_carveout past the version-3 struct's tail padding, as reserved0 does.
+    uint32_t     reserved2;
+    // Preferred shared-memory carve-out: 0 = no preference (zero-initialised
+    // structs keep the occupancy rule), 1..101 = 0..100 % of the largest config.
+    uint32_t     smem_carveout;
 } vx_launch_info_t;
 
 // 3D-strided DMA descriptor for the rect enqueue ops. Mirrors OpenCL 1.2's

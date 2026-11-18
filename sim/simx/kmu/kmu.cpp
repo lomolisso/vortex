@@ -44,6 +44,11 @@ Kmu::Kmu(const SimContext& ctx, const char* name, uint32_t num_lanes)
   , entry_(0)
   , param_(0)
   , lmem_size_(0)
+#ifdef VX_CFG_H100_SM_ENABLE
+  , smem_bytes_(VX_CFG_SMEM_PER_SM_MAX)
+#else
+#line 46
+#endif
   , block_size_(0)
 #ifdef VX_CFG_EXT_DLMEM_ENABLE
   , policy_(KMU_POLICY_DEFAULT)
@@ -102,6 +107,11 @@ void Kmu::dcr_write(uint32_t addr, uint32_t value) {
   case VX_DCR_KMU_GRID_DIM_Y:    grid_dim_[1]  = value; break;
   case VX_DCR_KMU_GRID_DIM_Z:    grid_dim_[2]  = value; break;
   case VX_DCR_KMU_LMEM_SIZE:     lmem_size_    = value; break;
+#ifdef VX_CFG_H100_SM_ENABLE
+  case VX_DCR_KMU_SMEM_CONFIG:  smem_bytes_   = value; break;
+#else
+#line 104
+#endif
   case VX_DCR_KMU_BLOCK_SIZE:    block_size_   = value; break;
   case VX_DCR_KMU_WARP_STEP_X:   warp_step_[0] = value; break;
   case VX_DCR_KMU_WARP_STEP_Y:   warp_step_[1] = value; break;
@@ -200,6 +210,11 @@ void Kmu::next_cta(kmu_req_t* req) {
   req->grid_dim[1]  = grid_dim_[1];
   req->grid_dim[2]  = grid_dim_[2];
   req->lmem_size    = lmem_size_;
+#ifdef VX_CFG_H100_SM_ENABLE
+  req->smem_bytes   = smem_bytes_;
+#else
+#line 202
+#endif
   req->block_size   = block_size_;
   req->warp_step[0] = warp_step_[0];
   req->warp_step[1] = warp_step_[1];

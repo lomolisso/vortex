@@ -29,6 +29,11 @@ module VX_lmem_switch import VX_gpu_pkg::*; #(
     parameter REMOTE_OUT_BUF = 0,
 `endif
     parameter RSP_OUT_BUF = 0,
+`ifdef VX_CFG_H100_SM_ENABLE
+    // Request queue depths per leg (0 = the leg's OUT_BUF); every queue has one stage.
+    parameter GLOBAL_DEPTH = 0,
+    parameter LOCAL_DEPTH = 0,
+`endif
     parameter `STRING ARBITER = "R"
 ) (
     input wire              clk,
@@ -104,8 +109,13 @@ module VX_lmem_switch import VX_gpu_pkg::*; #(
 
     VX_elastic_buffer #(
         .DATAW   (REQ_DATAW),
+    `ifdef VX_CFG_H100_SM_ENABLE
+        .SIZE    ((GLOBAL_DEPTH != 0) ? GLOBAL_DEPTH : `TO_OUT_BUF_SIZE(GLOBAL_OUT_BUF)),
+        .OUT_REG ((GLOBAL_DEPTH != 0) ? ((GLOBAL_DEPTH <= 2) ? 1 : 0) : `TO_OUT_BUF_REG(GLOBAL_OUT_BUF))
+    `else
         .SIZE    (`TO_OUT_BUF_SIZE(GLOBAL_OUT_BUF)),
         .OUT_REG (`TO_OUT_BUF_REG(GLOBAL_OUT_BUF))
+    `endif
     ) req_global_buf (
         .clk       (clk),
         .reset     (reset),
@@ -132,8 +142,13 @@ module VX_lmem_switch import VX_gpu_pkg::*; #(
 
     VX_elastic_buffer #(
         .DATAW   (REQ_DATAW),
+    `ifdef VX_CFG_H100_SM_ENABLE
+        .SIZE    ((LOCAL_DEPTH != 0) ? LOCAL_DEPTH : `TO_OUT_BUF_SIZE(LOCAL_OUT_BUF)),
+        .OUT_REG ((LOCAL_DEPTH != 0) ? ((LOCAL_DEPTH <= 2) ? 1 : 0) : `TO_OUT_BUF_REG(LOCAL_OUT_BUF))
+    `else
         .SIZE    (`TO_OUT_BUF_SIZE(LOCAL_OUT_BUF)),
         .OUT_REG (`TO_OUT_BUF_REG(LOCAL_OUT_BUF))
+    `endif
     ) req_local_buf (
         .clk       (clk),
         .reset     (reset),

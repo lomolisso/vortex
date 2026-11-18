@@ -1000,6 +1000,9 @@ package VX_gpu_pkg;
         logic [`VX_CFG_MEM_ADDR_WIDTH-1:0] param;
         logic [7:0]                        ctx_id;
         logic [`VX_CFG_LMEM_LOG_SIZE:0]    aligned_lmem_size;
+    `ifdef VX_CFG_H100_SM_ENABLE
+        logic [`VX_CFG_LMEM_LOG_SIZE:0]    smem_bytes;
+    `endif
         kmu_args_t                         args;   // .compute | .fragment
     } kmu_req_t;
 
@@ -1654,7 +1657,13 @@ package VX_gpu_pkg;
     localparam LSU_WORD_SIZE        = XLENB;
     localparam LSU_ADDR_WIDTH	    = (`VX_CFG_MEM_ADDR_WIDTH - `CLOG2(LSU_WORD_SIZE));
     localparam LSU_MEM_BATCHES      = 1;
+`ifdef VX_CFG_H100_SM_ENABLE
+    // Shared and global reads hold separate in-flight credits of LSU_PENDING_SIZE each.
+    localparam LSU_PEND_POOL        = 2 * `VX_CFG_LSU_PENDING_SIZE;
+    localparam LSU_TAG_ID_BITS      = (`CLOG2(LSU_PEND_POOL) + `CLOG2(LSU_MEM_BATCHES));
+`else
     localparam LSU_TAG_ID_BITS      = (`CLOG2(`VX_CFG_LSU_PENDING_SIZE) + `CLOG2(LSU_MEM_BATCHES));
+`endif
     localparam LSU_TAG_WIDTH        = (UUID_WIDTH + LSU_TAG_ID_BITS);
     localparam LSU_NUM_REQS	        = `VX_CFG_NUM_LSU_BLOCKS * `VX_CFG_NUM_LSU_LANES;
 
@@ -1663,7 +1672,11 @@ package VX_gpu_pkg;
     // slot count, so it must cover both the outstanding pool and one LSU
     // line's worth of words; sizing it below either would truncate slot ids
     // (response aliasing) or cap MLP at the coalescer.
+`ifdef VX_CFG_H100_SM_ENABLE
+    localparam LSU_QUEUE_OUT_SIZE   = `MAX(LSU_PEND_POOL, `VX_CFG_LSU_LINE_SIZE / LSU_WORD_SIZE);
+`else
     localparam LSU_QUEUE_OUT_SIZE   = `MAX(`VX_CFG_LSU_PENDING_SIZE, `VX_CFG_LSU_LINE_SIZE / LSU_WORD_SIZE);
+`endif
     localparam LMEM_TAG_WIDTH_BASE  = LSU_TAG_WIDTH + `CLOG2(`VX_CFG_NUM_LSU_BLOCKS);
     localparam LMEM_TAG_WIDTH       = LMEM_TAG_WIDTH_BASE;
 
@@ -1673,7 +1686,11 @@ package VX_gpu_pkg;
     // the local-memory write tags, the all-ones id left to arrives.
     localparam CPA_DEPTH     = 8;
     localparam CPA_GROUPS    = 8;
+`ifdef VX_CFG_H100_SM_ENABLE
+    localparam CPA_SLOTS     = `MIN(`VX_CFG_LSU_PENDING_SIZE, (1 << `CLOG2(`VX_CFG_LSU_PENDING_SIZE)) - 1);
+`else
     localparam CPA_SLOTS     = `MIN(`VX_CFG_LSU_PENDING_SIZE, (1 << LSU_TAG_ID_BITS) - 1);
+`endif
     localparam CPA_OP_BITS   = 2;
     localparam CPA_OP_COPY   = 2'd0;
     localparam CPA_OP_COMMIT = 2'd1;
@@ -1683,20 +1700,32 @@ package VX_gpu_pkg;
 
     // Width of the tag carried over VX_lsu_sched_if: lsu_header + op_type
     // + per-lane align + packet allocator addr (+ global-load mark, AMO aq, rl in DLMEM builds)
-    // + fence flag (matches the local TAG_WIDTH built inside VX_lsu_slice).
+    // + fence flag (+ shared/global credit class on the H100 SM path); matches VX_lsu_slice's TAG_WIDTH.
 `ifdef VX_CFG_EXT_MBAR_ENABLE
     // plus the try_wait and cp.async marks
     localparam LSU_CLIENT_TAG_WIDTH = $bits(lsu_header_t) + INST_LSU_BITS
                                     + (`VX_CFG_NUM_LSU_LANES * `CLOG2(LSU_WORD_SIZE))
+`ifdef VX_CFG_H100_SM_ENABLE
+                                    + `LOG2UP(LSU_PEND_POOL) + 1 + 1 + 1 + 2 + 1 + 1;
+`else
                                     + `LOG2UP(`VX_CFG_LSU_PENDING_SIZE) + 1 + 1 + 1 + 2 + 1;
+`endif
 `elsif VX_CFG_EXT_DLMEM_ENABLE
     localparam LSU_CLIENT_TAG_WIDTH = $bits(lsu_header_t) + INST_LSU_BITS
                                     + (`VX_CFG_NUM_LSU_LANES * `CLOG2(LSU_WORD_SIZE))
+`ifdef VX_CFG_H100_SM_ENABLE
+                                    + `LOG2UP(LSU_PEND_POOL) + 1 + 2 + 1 + 1;
+`else
                                     + `LOG2UP(`VX_CFG_LSU_PENDING_SIZE) + 1 + 2 + 1;
+`endif
 `else
     localparam LSU_CLIENT_TAG_WIDTH = $bits(lsu_header_t) + INST_LSU_BITS
                                     + (`VX_CFG_NUM_LSU_LANES * `CLOG2(LSU_WORD_SIZE))
+`ifdef VX_CFG_H100_SM_ENABLE
+                                    + `LOG2UP(LSU_PEND_POOL) + 1 + 1;
+`else
                                     + `LOG2UP(`VX_CFG_LSU_PENDING_SIZE) + 1;
+`endif
 `endif
 
     // Request/response payloads for VX_lsu_sched_if. Valid/ready live on
@@ -1781,11 +1810,6 @@ package VX_gpu_pkg;
     localparam OPC_ROUTE_STAGES       = (`VX_CFG_NUM_OPCS > 1) ? 1 : 0;
     localparam L1_CORE_PRE_STAGES     = 7 + OPC_ROUTE_STAGES;
     localparam L1_CORE_POST_STAGES    = 3;
-    localparam L1_HIT_STAGES          = 14;
-    localparam L1_MISS_STAGES         = 25;
-    localparam L1_CORE_STAGES         = L1_CORE_PRE_STAGES + L1_CORE_POST_STAGES;
-    localparam L1_PIPE_OVERHEAD       = L1_CORE_STAGES + L1_HIT_STAGES;
-    localparam L1_MISS_PIPE_OVERHEAD  = L1_CORE_STAGES + L1_MISS_STAGES;
     localparam LMEM_INGRESS_DATA_SIZE = `VX_CFG_N5_SLOT_BYTES;
     // A request on the SM port is at most one L1 line, its sectors selected by byteen.
     localparam DCACHE_MEM_DATA_SIZE   = `VX_CFG_DCACHE_LINE_SIZE;
@@ -1793,6 +1817,123 @@ package VX_gpu_pkg;
     localparam SM_PORT_LINE_SIZE      = `VX_CFG_DCACHE_LINE_SIZE;
     localparam LMEM_DMA_DATA_SIZE  = LMEM_PORT_BYTES;
     localparam LMEM_DMA_ADDR_WIDTH = `VX_CFG_LMEM_LOG_SIZE - `CLOG2(LMEM_PORT_BYTES);
+
+    // One SRAM array per SM, one datapath row per address: shared rows from row 0 up, L1 slots from the top row down.
+    localparam SM_SRAM_ROW_BYTES       = `VX_CFG_SM_DATAPATH_BYTES;
+    localparam SM_SRAM_ROWS            = `VX_CFG_SM_SRAM_BYTES / SM_SRAM_ROW_BYTES;
+    localparam SM_SRAM_ROW_W           = `CLOG2(SM_SRAM_ROWS);
+    localparam SM_SRAM_BOFF_W          = `CLOG2(SM_SRAM_ROW_BYTES);
+    localparam L1_RESERVE_ROWS         = `VX_CFG_L1_RESERVE_BYTES / SM_SRAM_ROW_BYTES;
+    localparam L1_SLOT_W               = `CLOG2(`VX_CFG_L1_MAX_LINES);
+    // The L1's miss-bus tag: {uuid, is_atomic, an entry id, a fence's lane, or an atomic lane's {LSU block + tag, word in the line, lane}}.
+    localparam SM_L1_MEM_TAG_WIDTH     = UUID_WIDTH + 1 + `MAX(`CLOG2(`VX_CFG_SM_MAX_READ_LINES), LMEM_TAG_WIDTH - UUID_WIDTH + `CLOG2(`VX_CFG_DCACHE_LINE_SIZE / LSU_WORD_SIZE) + `LOG2UP(`VX_CFG_NUM_LSU_LANES));
+    localparam L1_TAG_BANKS            = `VX_CFG_L1_TAG_BANKS;
+    localparam L1_TAG_SETS             = `VX_CFG_L1_TAG_SETS;
+    localparam L1_TAG_WAYS             = `VX_CFG_L1_TAG_WAYS;
+    localparam L1_SETS_PER_BANK        = L1_TAG_SETS / L1_TAG_BANKS;
+    localparam L1_VALID_BITS           = `VX_CFG_DCACHE_LINE_SIZE / `VX_CFG_L1_VALID_BYTES;
+    localparam L1_SECTOR_VALID_BITS    = `VX_CFG_DCACHE_SECTOR_SIZE / `VX_CFG_L1_VALID_BYTES;
+    localparam L1_TAG_W                = `VX_CFG_MEM_ADDR_WIDTH - `CLOG2(`VX_CFG_DCACHE_LINE_SIZE) - `CLOG2(L1_TAG_SETS);
+    localparam L1_TAG_WAY_BITS         = 1 + L1_TAG_W + L1_SLOT_W;
+    // Tag-side macros are L1_SETS_PER_BANK rows deep and at most SRAM_MACRO_MAX_BITS wide, split by ways.
+    localparam L1_TAG_WAYS_PER_MACRO   = 1 << `FLOG2(`MAX(1, `MIN(L1_TAG_WAYS, `VX_CFG_SRAM_MACRO_MAX_BITS / L1_TAG_WAY_BITS)));
+    localparam L1_VALID_WAYS_PER_MACRO = 1 << `FLOG2(`MAX(1, `MIN(L1_TAG_WAYS, `VX_CFG_SRAM_MACRO_MAX_BITS / L1_VALID_BITS)));
+    // The young FIFO holds L1_PROTECT_MAX + 1 entries: the largest protected window plus the line being pushed.
+    localparam L1_PROTECT_MAX          = `MAX(`VX_CFG_L1_REPL_PROTECT_PCT * `VX_CFG_L1_MAX_LINES / 100, `VX_CFG_SM_MAX_READ_LINES);
+    localparam L1_OLD_DEPTH            = 1 << `CLOG2(`VX_CFG_L1_MAX_LINES);
+    // Only non-cacheable reads borrow free slots, each held by its MSHR entry until its last replay.
+    localparam L1_FREE_DEPTH           = `VX_CFG_SM_MAX_READ_LINES;
+    // Per tag bank and cycle: one lookup update, one victim clear, one fill valid-set.
+    localparam L1_TAG_UPD_SRCS         = 3;
+    // One cycle's arrivals fit while the previous cycle's drain.
+    localparam L1_TAG_UPD_DEPTH        = 2 * L1_TAG_UPD_SRCS;
+    // Wrap-safe: twice the requests both LSU credit classes can hold between the tag stage and wavefront retirement.
+    localparam L1_SEQ_W                = `CLOG2(2 * LSU_PEND_POOL * `VX_CFG_NUM_LSU_BLOCKS);
+    // Covers the accept-to-wavefront-stage handoff plus one request in the stage.
+    localparam LMEM_SW_LOCAL_DEPTH     = 2;
+    localparam SM_SRAM_PRI_W           = 2;
+    localparam SM_SRAM_LANE_DATA_W     = LSU_WORD_SIZE * 8;
+
+    // Shared-memory access: the register stages outside the wavefront stage; the wavefront grant is the commit point.
+    localparam LMEM_CORE_STAGES        = 12 + OPC_ROUTE_STAGES;
+    localparam LMEM_SWITCH_STAGES      = 2;
+`ifdef VX_CFG_EXT_DLMEM_ENABLE
+    localparam LMEM_XLATE_STAGES       = 1;
+`else
+    localparam LMEM_XLATE_STAGES       = 0;
+`endif
+    localparam LMEM_PIPE_OVERHEAD      = LMEM_CORE_STAGES + LMEM_SWITCH_STAGES + LMEM_XLATE_STAGES;
+    localparam SM_SRAM_BANK_STAGES     = 1;
+    localparam SM_SRAM_RSP_STAGES      = 1;
+    // AMO read grant at t, ALU, write-back at t + SM_SRAM_AMO_STAGES.
+    localparam SM_SRAM_AMO_STAGES      = 2;
+    // The wavefront stage's read and write paths: one registered bank access each.
+    localparam SM_SRAM_RD_STAGES       = SM_SRAM_BANK_STAGES;
+    localparam SM_SRAM_WR_STAGES       = SM_SRAM_BANK_STAGES;
+    // The L1 on slots: global-leg head to tag stage, registered tag read + compare, commit FIFO to the wavefront
+    // stage, lane data to the LSU response; on a miss the MSHR allocate + egress register, fill to the write port.
+    localparam L1_IN_STAGES            = 1;
+    localparam L1_TAG_STAGES           = 2;
+    localparam L1_COMMIT_STAGES        = 1;
+    localparam L1_RSP_STAGES           = 1;
+    localparam L1_MISS_OUT_STAGES      = 2;
+    localparam L1_FILL_STAGES          = 1;
+    localparam L1_SLOT_MISS_STAGES     = L1_IN_STAGES + L1_TAG_STAGES + L1_MISS_OUT_STAGES + L1_FILL_STAGES
+                                       + SM_SRAM_WR_STAGES + SM_SRAM_RD_STAGES + L1_RSP_STAGES;
+    // Stages outside the wavefront stage, its bank read and the array's response register.
+    localparam L1_HIT_STAGES           = LMEM_SWITCH_STAGES + L1_IN_STAGES + L1_TAG_STAGES + L1_COMMIT_STAGES + L1_RSP_STAGES;
+    localparam L1_MISS_STAGES          = LMEM_SWITCH_STAGES + L1_SLOT_MISS_STAGES + SM_SRAM_RSP_STAGES;
+    localparam L1_CORE_STAGES          = L1_CORE_PRE_STAGES + L1_CORE_POST_STAGES;
+    localparam L1_PIPE_OVERHEAD        = L1_CORE_STAGES + L1_HIT_STAGES;
+    localparam L1_MISS_PIPE_OVERHEAD   = L1_CORE_STAGES + L1_MISS_STAGES;
+
+    localparam SM_SRAM_CLS_SHARED      = 1'b0;
+    localparam SM_SRAM_CLS_GLOBAL      = 1'b1;
+    localparam SM_SRAM_OP_READ         = 2'd0;
+    localparam SM_SRAM_OP_WRITE        = 2'd1;
+    localparam SM_SRAM_OP_AMO          = 2'd2;
+    localparam SM_SRAM_OP_MBAR         = 2'd3;
+    localparam SM_SRAM_SRC_L1          = 2'd0;
+    localparam SM_SRAM_SRC_TMA         = 2'd1;
+    localparam SM_SRAM_SRC_DSMEM       = 2'd2;
+    localparam SM_SRAM_SRC_CPA         = 2'd3;
+
+    typedef struct packed {
+        logic [SM_SRAM_ROW_W:0]                s_rows;
+        logic [L1_SLOT_W:0]                    l1_lines;
+        logic [`CLOG2(L1_PROTECT_MAX+1)-1:0]   l1_protect;
+    } smem_cfg_t;
+
+    typedef struct packed {
+        logic [SM_SRAM_ROW_W-1:0]              row;
+        logic [SM_SRAM_BOFF_W-1:0]             boff;
+        logic [LSU_WORD_SIZE-1:0]              byteen;
+        logic [SM_SRAM_LANE_DATA_W-1:0]        data;
+    } sm_sram_lane_t;
+
+    typedef struct packed {
+        logic                                  cls;
+        logic [1:0]                            op;
+        amo_req_t                              amo;
+        logic [`VX_CFG_NUM_LSU_LANES-1:0]      mask;
+        sm_sram_lane_t [`VX_CFG_NUM_LSU_LANES-1:0] lanes;
+        logic [LMEM_TAG_WIDTH-1:0]             tag;
+        logic [L1_SEQ_W-1:0]                   seq;
+    } sm_sram_req_t;
+
+    typedef struct packed {
+        logic [SM_SRAM_ROW_W-1:0]              row;
+        logic [SM_SRAM_ROW_BYTES-1:0]          byteen;
+        logic [SM_SRAM_ROW_BYTES*8-1:0]        data;
+        logic [1:0]                            src;
+    } sm_sram_fill_t;
+
+    typedef struct packed {
+        logic                                  cls;
+        logic [LMEM_TAG_WIDTH-1:0]             tag;
+        logic [`VX_CFG_NUM_LSU_LANES-1:0]      mask;
+        logic [`VX_CFG_NUM_LSU_LANES-1:0][SM_SRAM_LANE_DATA_W-1:0] data;
+    } sm_sram_rsp_t;
 `else
     localparam LMEM_DMA_DATA_SIZE  = `VX_CFG_LMEM_NUM_BANKS * LSU_WORD_SIZE;
     localparam LMEM_DMA_ADDR_WIDTH = `VX_CFG_LMEM_LOG_SIZE - `CLOG2(`VX_CFG_LMEM_NUM_BANKS * LSU_WORD_SIZE);

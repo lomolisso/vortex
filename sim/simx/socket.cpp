@@ -100,37 +100,7 @@ public:
       false,                  // is_llc (icache never carries AMO state)
     });
 
-#ifdef VX_CFG_H100_SM_ENABLE
-    // One L1 per SM, each with its own memory side: the SM's port.
-    for (uint32_t i = 0; i < cores_per_socket; ++i) {
-      snprintf(sname, 100, "%s-dcache%d", name.c_str(), i);
-      Cache::Config cfg{
-        !VX_CFG_DCACHE_ENABLED,
-        log2ceil(VX_CFG_DCACHE_SIZE),      // C
-        log2ceil(VX_CFG_DCACHE_LINE_SIZE), // L
-        log2ceil(VX_CFG_DCACHE_SECTOR_SIZE), // S
-        log2ceil(DCACHE_WORD_SIZE),        // W
-        log2ceil(VX_CFG_DCACHE_NUM_WAYS),  // A
-        log2ceil(VX_CFG_DCACHE_NUM_BANKS), // B
-        VX_CFG_XLEN,                       // address bits
-        VX_CFG_DCACHE_NUM_REQS,            // number of inputs
-        1,                                 // memory ports
-        VX_CFG_DCACHE_WRITEBACK,           // write-back
-        VX_CFG_DCACHE_DIRTYBYTES,          // dirty bytes
-        false,                             // write response
-        VX_CFG_DCACHE_MSHR_SIZE,           // mshr size
-        VX_CFG_DCACHE_LATENCY,             // pipeline latency
-        VX_CFG_DCACHE_REPL_POLICY,         // replacement policy
-        (VX_CFG_DCACHE_ENABLED != 0) && (VX_CFG_L2_ENABLED == 0) && (VX_CFG_L3_ENABLED == 0), // is_llc
-        DCACHE_FENCE_SHARED,               // fence_shared
-      #ifdef VX_CFG_EXT_DLMEM_ENABLE
-        true,                              // fence_cta
-      #endif
-      };
-      cfg.h100_l1 = true;
-      sm_dcaches_.push_back(CacheCluster::Create(sname, 1, 1, cfg));
-    }
-#else
+#ifndef VX_CFG_H100_SM_ENABLE
 #if !defined(VX_CFG_EXT_DXA_ENABLE)
 #line 76
 #elif !defined(DXA_MBAR_ENABLE)
@@ -291,21 +261,13 @@ public:
     // caches are not L1TEX traffic: they join SM 0's memory port.
     static_assert(VX_CFG_ICACHE_MEM_PORTS == 1, "the H100 SM path has one instruction-cache memory port");
     static_assert(VX_CFG_L1_MEM_PORTS == VX_CFG_SOCKET_SIZE, "the H100 SM path has one memory port per SM");
-    constexpr int32_t kMissDelay = int32_t(VX_CFG_SM_L2_SIDE_LATENCY) - int32_t(L1_MISS_PIPE_OVERHEAD)
-                                 - int32_t(SmPort::MISS_STAGES);
-    static_assert(kMissDelay >= 0, "VX_CFG_SM_L2_SIDE_LATENCY below the pipeline's own stages");
     {
       SmPort::Config pcfg;
       pcfg.num_srcs      = 1 + VX_CFG_EXT_DXA_ENABLED;
       pcfg.line_bytes    = VX_CFG_DCACHE_LINE_SIZE;
-      pcfg.egress_delay  = (kMissDelay + 1) / 2;
-      pcfg.ingress_delay = kMissDelay / 2;
       for (uint32_t i = 0; i < cores_per_socket; ++i) {
         snprintf(sname, 100, "%s-smport%d", name.c_str(), i);
-        auto port = SmPort::Create(sname, pcfg);
-        sm_dcaches_.at(i)->mem_req_out.at(0).bind(&port->SrcReqIn.at(SmPort::SRC_L1));
-        port->SrcRspOut.at(SmPort::SRC_L1).bind(&sm_dcaches_.at(i)->mem_rsp_in.at(0));
-        sm_ports_.push_back(port);
+        sm_ports_.push_back(SmPort::Create(sname, pcfg));
       }
     }
   #ifdef VX_CFG_EXT_DXA_ENABLE
@@ -524,8 +486,11 @@ public:
 
       for (uint32_t j = 0; j < VX_CFG_DCACHE_NUM_REQS; ++j) {
 #ifdef VX_CFG_H100_SM_ENABLE
-        cores_.at(i)->dcache_req_out.at(j).bind(&sm_dcaches_.at(i)->core_req_in.at(0).at(j));
-        sm_dcaches_.at(i)->core_rsp_out.at(0).at(j).bind(&cores_.at(i)->dcache_rsp_in.at(j));
+        // The SM's L1 is in the core: its one bus goes straight to the SM's port.
+        if (j != 0)
+          continue;
+        cores_.at(i)->dcache_req_out.at(0).bind(&sm_ports_.at(i)->SrcReqIn.at(SmPort::SRC_L1));
+        sm_ports_.at(i)->SrcRspOut.at(SmPort::SRC_L1).bind(&cores_.at(i)->dcache_rsp_in.at(0));
 #else
 #if !defined(VX_CFG_EXT_DXA_ENABLE)
 #line 328
@@ -688,8 +653,12 @@ public:
     Socket::PerfStats perf_stats;
     perf_stats.icache = icaches_->perf_stats();
 #ifdef VX_CFG_H100_SM_ENABLE
-    for (auto& dcache : sm_dcaches_) {
-      perf_stats.dcache += dcache->perf_stats();
+    for (auto& core : cores_) {
+      const auto& l1 = core->l1_perf_stats();
+      perf_stats.dcache.reads        += l1.reads;
+      perf_stats.dcache.writes       += l1.writes;
+      perf_stats.dcache.read_misses  += l1.misses;
+      perf_stats.dcache.mshr_stalls  += l1.mshr_stalls;
     }
 #else
 #if defined(VX_CFG_EXT_DXA_ENABLE) && !defined(DXA_MBAR_ENABLE)
@@ -770,12 +739,12 @@ public:
 
 #ifdef VX_CFG_H100_SM_ENABLE
   void dcache_flush_begin() {
-    for (auto& dcache : sm_dcaches_)
-      dcache->flush_begin();
+    for (auto& core : cores_)
+      core->l1_flush_begin();
   }
   bool dcache_flush_done() const {
-    for (auto& dcache : sm_dcaches_) {
-      if (!dcache->flush_done())
+    for (auto& core : cores_) {
+      if (!core->l1_flush_done())
         return false;
     }
     return true;
@@ -848,7 +817,6 @@ private:
   Socket::DlmemRspSwitch::Ptr    dlmem_rsp_switch_;
 #endif
 #ifdef VX_CFG_H100_SM_ENABLE
-  std::vector<CacheCluster::Ptr> sm_dcaches_;
   std::vector<SmPort::Ptr>       sm_ports_;
 #ifdef VX_CFG_EXT_DXA_ENABLE
   SmTmaSplit::Ptr                sm_tma_split_;

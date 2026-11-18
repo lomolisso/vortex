@@ -10,6 +10,7 @@
 
 TestSuite* testSuite = nullptr;
 const char* kernel_file = "kernel.vxbin";
+const char* opt_kernel_file = "kernel_cas.vxbin";
 uint32_t iters = 64;
 std::unordered_set<std::string> selected;
 std::unordered_set<std::string> excluded;
@@ -23,11 +24,12 @@ vx_buffer_h per_hart_buffer = nullptr;
 vx_queue_h  queue   = nullptr;
 vx_module_h module_ = nullptr;
 vx_kernel_h kernel  = nullptr;
+const char* loaded_file = nullptr;
 kernel_arg_t kernel_arg = {};
 
 static void show_usage() {
   std::cout << "Vortex AMO regression test." << std::endl;
-  std::cout << "Usage: [-t<name>: select test (opt-in: cas-global, cas-local) [-x<name>: exclude]] "
+  std::cout << "Usage: [-t<name>: select test (opt-in: cas-global, cas-local, lrsc_wide_lmem) [-x<name>: exclude]] "
             << "[-s<id>: start id] [-e<id>: end id] [-k<kernel>] "
             << "[-n<iters>: per-hart iters] [-c: continue on error] [-h]"
             << std::endl;
@@ -67,19 +69,7 @@ int main(int argc, char *argv[]) {
   parse_args(argc, argv);
   if (iters == 0) iters = 1;
 
-  // The opt-in cases live in kernel_cas.vxbin and run without the others.
-  const bool cas_opt_in = selected.count("cas-global") || selected.count("cas-local");
-  if (cas_opt_in) {
-    if (selected.size() != selected.count("cas-global") + selected.count("cas-local")) {
-      std::cout << "Error: cas-global and cas-local run apart from the other tests" << std::endl;
-      return -1;
-    }
-    if (!std::strcmp(kernel_file, "kernel.vxbin"))
-      kernel_file = "kernel_cas.vxbin";
-  }
-
   std::cout << "iters per hart: " << iters << std::endl;
-  std::cout << "kernel: " << kernel_file << std::endl;
 
   RT_CHECK(vx_device_open(0, &device));
 
@@ -122,19 +112,21 @@ int main(int argc, char *argv[]) {
 
   testSuite = new TestSuite(device);
   if (testid_e == 0) testid_e = (int)testSuite->size() - 1;
+  bool ids_moved = false;
 #if VX_CFG_EXT_ZACAS_ENABLED
-  if (std::strcmp(testSuite->get_test(CASG_TEST_GLOBAL)->name(), "cas-global")
-   || std::strcmp(testSuite->get_test(CASG_TEST_LOCAL)->name(), "cas-local")) {
-    std::cout << "Error: kernel_cas.vxbin's test ids moved" << std::endl;
+  ids_moved |= std::strcmp(testSuite->get_test(CASG_TEST_GLOBAL)->name(), "cas-global")
+            || std::strcmp(testSuite->get_test(CASG_TEST_LOCAL)->name(), "cas-local");
+#endif
+#if VX_CFG_XLEN == 64
+  ids_moved |= std::strcmp(testSuite->get_test(LRSCW_TEST)->name(), "lrsc_wide_lmem") != 0;
+#endif
+  if (ids_moved) {
+    std::cout << "Error: " << opt_kernel_file << "'s test ids moved" << std::endl;
     cleanup();
     return -1;
   }
-#endif
   kernel_arg.peer_core = testSuite->peer_core();
   kernel_arg.peer_warp = testSuite->peer_warp();
-
-  RT_CHECK(vx_module_load_file(device, kernel_file, &module_));
-  RT_CHECK(vx_module_get_kernel(module_, "main", &kernel));
 
   int errors = 0;
   for (int t = testid_s; t <= testid_e; ++t) {
@@ -151,6 +143,17 @@ int main(int argc, char *argv[]) {
     }
 
     std::cout << "Test" << t << ": " << name << std::endl;
+
+    // Both kernels link at the same startup address, so only one is loaded at a time.
+    const char* file = test->opt_in() ? opt_kernel_file : kernel_file;
+    if (loaded_file != file) {
+      if (kernel)  { vx_kernel_release(kernel);  kernel  = nullptr; }
+      if (module_) { vx_module_release(module_); module_ = nullptr; }
+      std::cout << "kernel: " << file << std::endl;
+      RT_CHECK(vx_module_load_file(device, file, &module_));
+      RT_CHECK(vx_module_get_kernel(module_, "main", &kernel));
+      loaded_file = file;
+    }
 
     // Initialize buffers per the test's setup.
     std::memset(shared_host.data(), 0, shared_bytes);

@@ -67,6 +67,11 @@
 #include "cta_gang.h"
 #include "cta_admit.h"
 #include "barrier_unit.h"
+#ifdef VX_CFG_H100_SM_ENABLE
+#include <smem_carveout.h>
+#else
+#line 69
+#endif
 
 using namespace vortex;
 namespace ref = vortex::dlmem_ref;
@@ -78,7 +83,13 @@ constexpr uint32_t kBD = VX_CFG_H100_ORG_ENABLED ? VX_CFG_DOMAIN_BOUNDARY_DELAY 
 
 namespace {
 
+#ifdef VX_CFG_H100_SM_ENABLE
+constexpr uint32_t BLOCK_ALIGN = VX_CFG_LMEM_SLOT_ALIGN;
+#else
+#line 81
 constexpr uint32_t BLOCK_ALIGN = VX_CFG_MEM_BLOCK_SIZE;
+#line 81
+#endif
 
 uint32_t align_up(uint32_t x) {
   return (x + BLOCK_ALIGN - 1) & ~(BLOCK_ALIGN - 1);
@@ -313,7 +324,13 @@ public:
           bool gap_ok = (gap_ + 1 > kIssueGap) || is_new;
           if (id_free && (!failed_ || dirty_) && gap_ok) {
             start = true;
+#ifdef VX_CFG_H100_SM_ENABLE
+            uint32_t U = smem_usable_slots(VX_CFG_SMEM_PER_SM_MAX, align_up(h.lmem_size), ref::slots(cfg_), smem_carve_cfg());
+#else
+#line 316
             uint32_t U = ref::usable_slots(cfg_, align_up(h.lmem_size));
+#line 316
+#endif
             ref::Mirror s = m_;
             ok_ = ref::place_gpc(cfg_, s, K, W, U, members_);
             fail_step_ = K;
@@ -659,6 +676,11 @@ private:
     r.cluster_dim[1] = 1;
     r.cluster_dim[2] = 1;
     r.lmem_size = L.stride;
+#ifdef VX_CFG_H100_SM_ENABLE
+    r.smem_bytes = VX_CFG_SMEM_PER_SM_MAX;
+#else
+#line 661
+#endif
     r.block_size = L.w * cfg_.nt;
     r.is_first_of_cluster = (rank == 0);
     r.ctx_id = uint8_t(launch + 1);

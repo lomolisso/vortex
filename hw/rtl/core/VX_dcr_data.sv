@@ -28,6 +28,11 @@ module VX_dcr_data import VX_gpu_pkg::*; #(
 
     // DCR-triggered cache flush
     VX_dcr_flush_if.master  dcr_flush_if
+`ifdef VX_CFG_H100_SM_ENABLE
+    ,
+    // The SM array's split for the current launch
+    output smem_cfg_t       smem_cfg
+`endif
 );
     `UNUSED_SPARAM (INSTANCE_ID)
 
@@ -147,6 +152,39 @@ module VX_dcr_data import VX_gpu_pkg::*; #(
     assign dcr_csr_if.cluster_dim      = cluster_dim_r;
     assign dcr_csr_if.lmem_size        = lmem_size_r;
     assign dcr_csr_if.cluster_explicit = cluster_explicit_r;
+`endif
+
+`ifdef VX_CFG_H100_SM_ENABLE
+    // A new split may only be written while the SM is idle and its L1 drained (the runtime writes it between launches).
+    localparam S_W = `CLOG2(`VX_CFG_SM_SRAM_BYTES + 1);
+    localparam L1_AVAIL_BYTES = `VX_CFG_SM_SRAM_BYTES - `VX_CFG_L1_RESERVE_BYTES;
+    `STATIC_ASSERT(`VX_CFG_SMEM_PER_SM_MAX <= L1_AVAIL_BYTES, ("the shared-memory maximum exceeds the array"))
+
+    function automatic smem_cfg_t smem_cfg_of(input [S_W-1:0] s_bytes);
+        logic [S_W-1:0] lines, prot;
+        smem_cfg_of.s_rows = (SM_SRAM_ROW_W+1)'(s_bytes / S_W'(SM_SRAM_ROW_BYTES));
+        lines = (S_W'(L1_AVAIL_BYTES) - s_bytes) / S_W'(SM_SRAM_ROW_BYTES);
+        prot  = S_W'((32'(lines) * 32'(`VX_CFG_L1_REPL_PROTECT_PCT)) / 32'd100);
+        smem_cfg_of.l1_lines   = (L1_SLOT_W+1)'(lines);
+        smem_cfg_of.l1_protect = $bits(smem_cfg_of.l1_protect)'((prot > S_W'(`VX_CFG_SM_MAX_READ_LINES)) ? prot : S_W'(`VX_CFG_SM_MAX_READ_LINES));
+    endfunction
+
+    wire smem_cfg_write = dcr_bus_if.req_valid && dcr_bus_if.req_data.rw
+                       && (dcr_bus_if.req_data.addr == `VX_DCR_KMU_SMEM_CONFIG);
+    wire [S_W-1:0] smem_cfg_s = S_W'(dcr_bus_if.req_data.data);
+
+    smem_cfg_t smem_cfg_r;
+    always @(posedge clk) begin
+        if (reset) begin
+            smem_cfg_r <= smem_cfg_of(S_W'(`VX_CFG_SMEM_PER_SM_MAX));
+        end else if (smem_cfg_write) begin
+            smem_cfg_r <= smem_cfg_of(smem_cfg_s);
+        end
+    end
+    `RUNTIME_ASSERT(~smem_cfg_write || (smem_cfg_s <= S_W'(`VX_CFG_SMEM_PER_SM_MAX)
+                                        && (smem_cfg_s % S_W'(SM_SRAM_ROW_BYTES)) == 0),
+                    ("%t: *** %s invalid shared-memory split 0x%0h", $time, INSTANCE_ID, dcr_bus_if.req_data.data))
+    assign smem_cfg = smem_cfg_r;
 `endif
 
 `ifdef DBG_TRACE_PIPELINE
