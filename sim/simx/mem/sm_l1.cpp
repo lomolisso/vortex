@@ -1130,7 +1130,8 @@ public:
     }
     if (mal_valid && mal_ready) {
       // an entry with no sector to fetch is never filled and never retires
-      assert(mal.sectors != 0);
+      if (mal.sectors == 0)
+        throw std::runtime_error(std::string(so->name()) + ": line read with no sector");
       mshr_[mal_id] = mal;
       m_valid_.set(mal_id);
       m_filled_.reset(mal_id);

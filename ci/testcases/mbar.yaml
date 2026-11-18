@@ -1155,6 +1155,15 @@ tests:
     drivers: [simx, rtlsim]
     touches: *e4_touches
     args: "-m hint"
+  # With an L2 a first-use instruction fetch is a DRAM trip; the probe's
+  # warm-up pass keeps it out of every timed window.
+  - id: mbar_ops-hint-sm
+    app: mbar_ops
+    drivers: [simx]
+    touches: *e4_touches
+    configs+: "-DVX_CFG_H100_SM_ENABLE -DVX_CFG_L2_ENABLE"
+    shape: {threads: 16}
+    args: "-m hint"
   # Parity of the remote scripts: a cluster sync after every step and no
   # spin, so the instruction count is exact; the remote ops, the network and
   # the cluster barrier set the cycles.

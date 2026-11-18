@@ -44,6 +44,14 @@
 #include <bitvector.h>
 #include <iostream>
 #include "debug.h"
+#ifdef VX_CFG_H100_SM_ENABLE
+// Text only the H100 SM path has, written at the end of a line that exists
+// without it, so knob-off line numbers (assert's __LINE__) are kept.
+#define VX_SM_ONLY(...) __VA_ARGS__
+#else
+#define VX_SM_ONLY(...)
+#line 46
+#endif
 
 // Worker-thread count for the lockstep executor, set by the build system
 // (e.g. CONFIGS="-DSIMX_MT=4"); 0 or 1 selects serial execution. Resolved

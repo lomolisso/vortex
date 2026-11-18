@@ -431,6 +431,25 @@ tests:
   shape:
     cores: 2
     l2cache: true
+# The H100 SM path's CTA slots start on VX_CFG_LMEM_SLOT_ALIGN; a barrier
+# multicast steps its receivers by the descriptor stride rounded the same way.
+- id: cta_cluster-sm
+  touches: [hw/rtl/dxa, sim/simx/dxa, hw/rtl/VX_kmu.sv, sim/simx/cta_dispatcher.cpp, VX_config.toml]
+  via: blackbox
+  drivers: [simx, rtlsim]
+  xlen: [64]
+  app: cta_cluster
+  configs: "-DVX_CFG_EXT_DXA_ENABLE -DVX_CFG_H100_SM_ENABLE -DVX_CFG_L2_ENABLE"
+  shape: {threads: 16}
+- id: sgemm2_dxa_mcast-sm
+  touches: [hw/rtl/dxa, sim/simx/dxa, hw/rtl/VX_kmu.sv, sim/simx/cta_dispatcher.cpp, VX_config.toml,
+            tests/regression/sgemm2_dxa_mcast]
+  via: blackbox
+  drivers: [simx, rtlsim]
+  xlen: [64]
+  app: sgemm2_dxa_mcast
+  configs: "-DVX_CFG_EXT_DXA_ENABLE -DVX_CFG_H100_SM_ENABLE -DVX_CFG_L2_ENABLE"
+  shape: {threads: 16}
 - id: sgemm_tcu_wg_dxa_mcast-1
   via: blackbox
   drivers:

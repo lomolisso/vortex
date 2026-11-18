@@ -691,9 +691,13 @@ module VX_dxa_smem_wr import VX_gpu_pkg::*, VX_dxa_pkg::*; #(
     // LOG2UP (not CLOG2): NUM_WARPS=1 would make CLOG2 0 and the index vector
     // [-1:0]. VX_priority_encoder.index_out is `LOG2UP(N)` wide — match it.
     localparam MC_NW_BITS = `LOG2UP(`VX_CFG_NUM_WARPS);
-    // The dispatcher starts every slot on a DMA word and a memory block, so a
-    // descriptor stride rounds up the same way.
+    // A descriptor stride rounds up to where the dispatcher starts a slot: the
+    // slot alignment on the H100 SM path, a DMA word and a memory block otherwise.
+`ifdef VX_CFG_H100_SM_ENABLE
+    localparam MC_STRIDE_ALIGN = `VX_CFG_LMEM_SLOT_ALIGN;
+`else
     localparam MC_STRIDE_ALIGN = `MAX(`VX_CFG_MEM_BLOCK_SIZE, SMEM_WORD_SIZE);
+`endif
     wire [31:0] desc_stride = (smem_stride + 32'(MC_STRIDE_ALIGN - 1)) & ~32'(MC_STRIDE_ALIGN - 1);
 `ifdef DXA_MBAR_ENABLE
     // A cluster multicast walks the ranks of its mask, a legacy one the

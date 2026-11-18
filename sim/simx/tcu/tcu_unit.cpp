@@ -470,7 +470,7 @@ public:
           }
           req.mask.set(i);
           req.addrs.at(i) = agu.addrs.at(idx);
-          req.tids.at(i)  = idx % VX_CFG_NUM_THREADS;
+          req.tids.at(i)  = idx % VX_CFG_NUM_THREADS; VX_SM_ONLY(req.byteen.at(i) = ((1ull << LSU_WORD_SIZE) - 1) << ((req.addrs.at(i) & ~uint64_t(LSU_WORD_SIZE - 1)) % VX_CFG_MEM_BLOCK_SIZE);) // SM path: the lane's whole LSU word, as the RTL AGU enables it; the SM's L1 fetches only enabled bytes
         }
         simobject_->agu_req_out.send(req);
         ++agu.next_beat;

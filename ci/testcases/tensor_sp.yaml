@@ -268,3 +268,22 @@ tests:
 
   # Not warp-width swept: the tensor-core fragment layout is defined over a fixed
   # lane count, which the configs pin.
+
+# Metadata loads (TCU_LD through the TCU's AGU) on the H100 SM path: the SM's L1
+# fetches only enabled bytes, so each AGU lane must enable its whole word.
+- id: sgemm_tcu_sp-sm
+  via: blackbox
+  drivers: [simx]
+  xlen: [64]
+  app: sgemm_tcu_sp
+  configs: -DVX_CFG_NUM_THREADS=16 -DVX_CFG_EXT_TCU_ENABLE -DVX_CFG_TCU_SPARSE_ENABLE -DITYPE=fp16 -DOTYPE=fp32
+    -DVX_CFG_H100_SM_ENABLE -DVX_CFG_L2_ENABLE
+  touches: [hw/rtl/tcu, sim/simx/tcu, sim/simx/mem/sm_l1.cpp, hw/rtl/mem/VX_sm_l1.sv, VX_config.toml]
+- id: sgemm_tcu_sp-sm-rtl
+  via: blackbox
+  drivers: [rtlsim]
+  xlen: [64]
+  app: sgemm_tcu_sp
+  configs: -DVX_CFG_NUM_THREADS=16 -DVX_CFG_EXT_TCU_ENABLE -DVX_CFG_TCU_SPARSE_ENABLE -DVX_CFG_TCU_TYPE_DPI -DITYPE=fp16 -DOTYPE=fp32
+    -DVX_CFG_H100_SM_ENABLE -DVX_CFG_L2_ENABLE
+  touches: [hw/rtl/tcu, sim/simx/tcu, sim/simx/mem/sm_l1.cpp, hw/rtl/mem/VX_sm_l1.sv, VX_config.toml]

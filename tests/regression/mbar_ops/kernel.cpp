@@ -62,11 +62,16 @@ INL uint64_t cycles() {
 }
 
 // try_wait on a phase that never completes, without a hint and with each
-// hint, then a test_wait: the duration of each and its result.
+// hint, then a test_wait: the duration of each and its result. Pass 0 is an
+// untimed warm-up on the same code (its record is overwritten), so no timed
+// window holds a first-use instruction fetch (with an L2 that alone is a DRAM trip).
 INL void hint_probe(uint64_t* bar, uint64_t* out) {
   vx_mbar_init(bar, 2);
-  for (uint32_t rep = 0; rep < HINT_REPS; ++rep) {
-    uint64_t* o = out + rep * (NUM_HINTS + 2);
+#pragma clang loop unroll(disable)
+  for (uint32_t pass = 0; pass <= HINT_REPS; ++pass) {
+    uint64_t* o = out + (pass ? pass - 1 : 0) * (NUM_HINTS + 2);
+    // The record address is computed before the timed windows, not inside the first.
+    __asm__ volatile ("" : : "r"(o));
     uint64_t t0 = cycles();
     uint64_t ok = vx_mbar_try_wait_parity(bar, 0) ? 1 : 0;
     o[0] = (cycles() - t0) | (ok << 63);

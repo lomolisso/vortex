@@ -52,7 +52,7 @@ SM_DATAPATH_POW2 = ["expr: not $VX_CFG_H100_SM_ENABLE or (is_pow2($VX_CFG_SM_DAT
 LMEM_BANK_BYTES_OK = ["expr: not $VX_CFG_H100_SM_ENABLE or (is_pow2($VX_CFG_LMEM_BANK_BYTES) and $VX_CFG_LMEM_BANK_BYTES <= $VX_CFG_XLEN / 8)", "VX_CFG_LMEM_BANK_BYTES must be a power of two <= XLEN/8"]
 LMEM_PORT_IS_DATAPATH = ["expr: not $VX_CFG_H100_SM_ENABLE or $VX_CFG_LMEM_NUM_BANKS * $VX_CFG_LMEM_BANK_BYTES == $VX_CFG_SM_DATAPATH_BYTES", "the shared-memory banks must span the SM datapath"]
 LMEM_PORT_SWIZZLE = ["expr: not $VX_CFG_H100_SM_ENABLE or not ($VX_CFG_EXT_DXA_ENABLE or $VX_CFG_TCU_H100_ENABLE) or $VX_CFG_LMEM_PORT_BYTES >= $lmem_swizzle_span", "with DXA or TCU_H100 the shared-memory port must cover a 128-B swizzle row"]
-SMEM_FITS_DESC = ["expr: not $VX_CFG_H100_SM_ENABLE or $VX_CFG_SMEM_PER_SM_MAX <= $VX_CFG_LMEM_DESC_REACH_BYTES", "VX_CFG_SMEM_PER_SM_MAX must fit the wgmma descriptor reach"]
+SMEM_FITS_DESC = ["expr: not $VX_CFG_H100_SM_ENABLE or $VX_CFG_SMEM_PER_SM_MAX <= $VX_CFG_LMEM_DESC_REACH_BYTES", "VX_CFG_SMEM_PER_SM_MAX must fit the wgmma descriptor reach (256 KiB in the H100 descriptor format, 64 KiB in the 16-bit byte offset of the non-H100 format; WGMMA on the H100 SM path needs VX_CFG_TCU_H100_ENABLE)"]
 SMEM_PER_CTA_POS = ["expr: not $VX_CFG_H100_SM_ENABLE or $VX_CFG_SMEM_PER_CTA_MAX > 0", "VX_CFG_SMEM_PER_CTA_MAX must be > 0"]
 LMEM_SLOT_ALIGN_POW2 = ["expr: not $VX_CFG_H100_SM_ENABLE or is_pow2($VX_CFG_LMEM_SLOT_ALIGN)", "VX_CFG_LMEM_SLOT_ALIGN must be a power of two"]
 LMEM_SLOT_ALIGN_MET = ["expr: not $VX_CFG_H100_SM_ENABLE or ($VX_CFG_LMEM_NUM_BANKS * ($VX_CFG_XLEN / 8)) % $VX_CFG_LMEM_SLOT_ALIGN == 0", "the CTA slot alignment must be a multiple of VX_CFG_LMEM_SLOT_ALIGN"]
@@ -605,8 +605,9 @@ VX_CFG_LMEM_BANK_BYTES = "expr: 4 if $VX_CFG_H100_SM_ENABLE else ($VX_CFG_XLEN /
 VX_CFG_LMEM_PORT_BYTES = "expr: $VX_CFG_LMEM_NUM_BANKS * $VX_CFG_LMEM_BANK_BYTES"
 VX_CFG_SMEM_PER_SM_MAX = 233472          # 05/spec.md §2 (228 KiB)
 VX_CFG_SMEM_PER_CTA_MAX = "expr: $VX_CFG_SMEM_PER_SM_MAX"
-# PTX wgmma descriptor start address: 14 bits of 16 B.
-VX_CFG_LMEM_DESC_REACH_BYTES = 262144
+# wgmma shared-memory descriptor reach: the H100 (PTX) format has a 14-bit start
+# address of 16 B, the non-H100 format a 16-bit byte offset.
+VX_CFG_LMEM_DESC_REACH_BYTES = "expr: 16384 * 16 if ($VX_CFG_TCU_H100_ENABLE or not $VX_CFG_TCU_WGMMA_ENABLE) else 65536"
 VX_CFG_LMEM_SLOT_ALIGN = "expr: max($VX_CFG_DCACHE_LINE_SIZE, $VX_CFG_LMEM_PORT_BYTES, $VX_CFG_LMEM_NUM_BANKS * ($VX_CFG_XLEN / 8)) if $VX_CFG_H100_SM_ENABLE else max($VX_CFG_DCACHE_LINE_SIZE, $VX_CFG_LMEM_PORT_BYTES)"
 # PTX shared-memory swizzle span (128B mode).
 lmem_swizzle_span = 128

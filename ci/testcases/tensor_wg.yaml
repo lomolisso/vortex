@@ -100,6 +100,24 @@ tests:
   app: sgemm_tcu_wg_sp
   configs: -DVX_CFG_NUM_THREADS=16 -DVX_CFG_NUM_WARPS=8 -DVX_CFG_ISSUE_WIDTH=4 -DVX_CFG_EXT_TCU_ENABLE -DVX_CFG_TCU_WGMMA_ENABLE
     -DVX_CFG_TCU_SPARSE_ENABLE -DWGMMA_NRC=8
+# The H100 SM path's shared-memory window is past the 64 KiB reach of the
+# non-H100 WGMMA descriptor's 16-bit offset (the RTL stops at VX_mem_unit's
+# assertion), so configure refuses non-H100 WGMMA there (SMEM_FITS_DESC).
+- id: reject-sm-wgmma-desc
+  via: script
+  driver: simx
+  xlen: [64]
+  configs: -DVX_CFG_NUM_THREADS=16 -DVX_CFG_NUM_WARPS=8 -DVX_CFG_ISSUE_WIDTH=4 -DVX_CFG_EXT_TCU_ENABLE -DVX_CFG_TCU_WGMMA_ENABLE
+    -DVX_CFG_TCU_SPARSE_ENABLE -DWGMMA_NRC=8 -DVX_CFG_H100_SM_ENABLE -DVX_CFG_L2_ENABLE
+  env: {EXPECT: "VX_CFG_LMEM_DESC_REACH_BYTES=65536"}
+  touches: [VX_config.toml, ci/gen_config.py, hw/rtl/core/VX_mem_unit.sv]
+  run: |
+    set -u
+    tmp=$(mktemp -d)
+    make -C sim/simx DESTDIR="$tmp" "$tmp/obj/tcu/tcu_unit.o" > "$tmp/simx.log" 2>&1; rc=$?
+    if [ $rc -eq 0 ]; then echo "FAIL: the simx build accepted CONFIGS=${CONFIGS:-}"; rm -rf "$tmp"; exit 1; fi
+    if ! grep -qF "$EXPECT" "$tmp/simx.log"; then echo "FAIL: the build failed without '$EXPECT':"; tail -n 20 "$tmp/simx.log"; rm -rf "$tmp"; exit 1; fi
+    echo "PASSED: the build stopped at $EXPECT"; rm -rf "$tmp"
 - id: sgemm_tcu_wg_sp-3
   via: blackbox
   drivers:
@@ -1086,15 +1104,22 @@ tests:
             sw/common/l1_ref.h, sw/common/sm_port_ref.h, tests/regression/smem_bank, tests/regression/l1_sector,
             tests/regression/sm_port]
   args: "-l 128 -t f16f32 -n 64 -c 2 -r 2"
+# The app uses wgmma_context, which has no H100-descriptor form; on the H100 SM
+# path configure refuses its non-H100 WGMMA (SMEM_FITS_DESC). Running it
+# there needs a port to vortex::h100::wgmma. The configs are the app's own
+# (its Makefile adds TCU_WGMMA, 16 warps, issue 4) plus the 2-core shape.
 - id: org-sgemm_tcu_wg_dxa_mcast
-  via: blackbox
-  drivers: [simx]
+  via: script
+  driver: simx
   xlen: [64]
-  app: sgemm_tcu_wg_dxa_mcast
-  configs: "-DVX_CFG_H100_SM_ENABLE -DVX_CFG_EXT_TCU_ENABLE -DVX_CFG_EXT_DXA_ENABLE -DVX_CFG_TCU_TYPE=DPI"
-  shape: {cores: 2, threads: 32, l2cache: true}
-  args: "-m 256"
-  touches: [VX_config.toml, hw/rtl/VX_gpu_pkg.sv, hw/rtl/VX_socket.sv, hw/rtl/mem, hw/rtl/cache, hw/rtl/core,
-            hw/rtl/dlmem, hw/rtl/dxa, hw/rtl/libs/VX_mem_coalescer.sv, sim/simx, sw/common/smem_bank_ref.h,
-            sw/common/l1_ref.h, sw/common/sm_port_ref.h, tests/regression/smem_bank, tests/regression/l1_sector,
-            tests/regression/sm_port]
+  configs: -DVX_CFG_H100_SM_ENABLE -DVX_CFG_EXT_TCU_ENABLE -DVX_CFG_EXT_DXA_ENABLE -DVX_CFG_TCU_TYPE=DPI -DVX_CFG_TCU_WGMMA_ENABLE
+    -DVX_CFG_NUM_WARPS=16 -DVX_CFG_ISSUE_WIDTH=4 -DVX_CFG_NUM_CORES=2 -DVX_CFG_NUM_THREADS=32 -DVX_CFG_L2_ENABLE
+  env: {EXPECT: "VX_CFG_LMEM_DESC_REACH_BYTES=65536"}
+  touches: [VX_config.toml, ci/gen_config.py, hw/rtl/core/VX_mem_unit.sv, tests/regression/sgemm_tcu_wg_dxa_mcast]
+  run: |
+    set -u
+    tmp=$(mktemp -d)
+    make -C sim/simx DESTDIR="$tmp" "$tmp/obj/tcu/tcu_unit.o" > "$tmp/simx.log" 2>&1; rc=$?
+    if [ $rc -eq 0 ]; then echo "FAIL: the simx build accepted CONFIGS=${CONFIGS:-}"; rm -rf "$tmp"; exit 1; fi
+    if ! grep -qF "$EXPECT" "$tmp/simx.log"; then echo "FAIL: the build failed without '$EXPECT':"; tail -n 20 "$tmp/simx.log"; rm -rf "$tmp"; exit 1; fi
+    echo "PASSED: the build stopped at $EXPECT"; rm -rf "$tmp"

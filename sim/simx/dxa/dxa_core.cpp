@@ -370,18 +370,20 @@ public:
     case VX_DCR_DXA_DESC_TILESIZE4_OFF: d.tile_sizes[4] = uint16_t(value & 0xffff); break;
     case VX_DCR_DXA_DESC_CFILL_OFF:     d.cfill = value; break;
     case VX_DCR_DXA_DESC_SMEM_STRIDE_OFF:
-      // Round up to the LMEM word size so multicast destination addresses
-      // `issuer_addr + r * smem_stride` stay block-aligned. The LMEM model
-      // treats requests as block-aligned with a byteen mask; a non-aligned
-      // stride would truncate the address and land writes in the wrong
-      // block. The dispatcher applies the same rounding to per-CTA LMEM
-      // allocations so the host-visible "same offset in receiver LMEM"
-      // contract holds end-to-end.
-#if VX_CFG_LMEM_NUM_BANKS * (VX_CFG_XLEN / 8) > VX_CFG_MEM_BLOCK_SIZE
+      // Round up to where the dispatcher starts a CTA's LMEM slot (an LMEM
+      // word or a DMA word; VX_CFG_LMEM_SLOT_ALIGN on the H100 SM path), so
+      // multicast destinations `issuer_addr + r * smem_stride` land on the
+      // receivers' slots and the host-visible "same offset in receiver LMEM"
+      // contract holds end to end. The LMEM model treats requests as
+      // block-aligned with a byteen mask; a non-aligned stride would
+      // truncate the address and land writes in the wrong block.
+#if !defined(VX_CFG_H100_SM_ENABLE) && VX_CFG_LMEM_NUM_BANKS * (VX_CFG_XLEN / 8) > VX_CFG_MEM_BLOCK_SIZE
       // The slots start on DMA words there, so the stride rounds to one too.
       d.smem_stride = (value + DxaCore::LMEM_ROW_SIZE - 1u) & ~uint32_t(DxaCore::LMEM_ROW_SIZE - 1u);
-#else
+#elif !defined(VX_CFG_H100_SM_ENABLE)
       d.smem_stride = (value + kLmemWordSize - 1u) & ~uint32_t(kLmemWordSize - 1u);
+#else
+      d.smem_stride = (value + VX_CFG_LMEM_SLOT_ALIGN - 1u) / VX_CFG_LMEM_SLOT_ALIGN * VX_CFG_LMEM_SLOT_ALIGN;
 #endif
 #line 232
       break;
