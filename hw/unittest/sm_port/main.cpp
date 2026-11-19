@@ -11,15 +11,18 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// VX_sm_port testbench: synthetic sources, ideal sinks. Every scenario is
-// checked against sw/common/sm_port_ref.h at the build's knobs:
-// - the egress: each cycle the port's admitted items are fed to SmEgressRef,
-//   and every item must leave the port a constant number of cycles after the
-//   golden pops it (cycle for cycle); the steady-state payload per cycle must
-//   equal the golden's on the same stream;
-// - the ingress: the gate's sectors per cycle per class against SmIngressRef's
-//   steady state on the same offered load;
-// - a DSMEM head that cannot leave holds the L2 request behind it.
+// VX_sm_port testbench: synthetic sources, ideal sinks.
+// - the egress: each cycle the port's admitted packets are fed to SmEgressRef
+//   (sw/common/sm_port_ref.h), and every packet must leave the port a constant
+//   number of cycles after the golden pops it (cycle for cycle); the
+//   steady-state rate of each scenario must equal its structural formula
+//   (sm_port_cases.h: one flit per cycle per FLIT bytes of link, a packet's
+//   flits by the port's format);
+// - the ingress: the gate's sectors and arrivals per cycle against SmIngressRef
+//   on the same offered load, arrivals within the ejection link;
+// - back-pressure: a blocked SM-to-SM sink holds the L2 request behind it; a
+//   blocked L2 sink stops admission once the FIFO and the output register are
+//   full, and every packet leaves in order once it is released.
 // --csv=<file> writes each item's leave cycle per scenario.
 
 #include "vl_simulator.h"
@@ -101,14 +104,15 @@ public:
   Bench(FILE* csv) : cfg_(knob_cfg()), csv_(csv) {}
 
   int run() {
-    std::printf("sm_port: egress %u B/cycle, beat %u B, line %u B, credits %u per %u, ingress %u, ejection %u, weights %u:%u%s\n",
-                cfg_.egress_bytes, cfg_.beat_bytes, LINE, cfg_.inj_credits, cfg_.inj_return, cfg_.ingress_bytes,
-                cfg_.eject_bytes, cfg_.w_fill, cfg_.w_dsmem, DLMEM ? ", DLMEM" : "");
-    for (const auto& s : scenarios(cfg_, DLMEM)) {
+    std::printf("sm_port: egress %u B/cycle, flit %u B, line %u B, ingress %u, ejection %u, weights %u:%u%s\n",
+                cfg_.egress_bytes, cfg_.flit_bytes, LINE, cfg_.ingress_bytes, cfg_.eject_bytes, cfg_.w_fill,
+                cfg_.w_dsmem, DLMEM ? ", DLMEM" : "");
+    for (const auto& s : scenarios(DLMEM)) {
       auto r = this->scenario(s);
       for (const auto& e : expectations(s, r, cfg_, 0))
         this->expect(e.what, e.got, e.exp, e.tol_rel, e.tol_abs);
     }
+    this->l2_back_pressure();
     if (DLMEM) {
       this->head_of_line();
     }
@@ -153,7 +157,6 @@ private:
     std::deque<std::pair<uint64_t, uint64_t>> mem_rsp;  // (due, tag)
     std::deque<uint64_t> gold_req, gold_rsp;             // golden pop cycles
     std::vector<uint64_t> rtl_req, rtl_rsp;               // RTL leave cycles
-    std::map<uint64_t, uint32_t> rtl_hb;
     for (uint64_t c = 0; c < WARM + WINDOW; ++c) {
       const LineReq l1 = s.l1.empty() ? LineReq{} : s.l1[i1 % s.l1.size()];
       const LineReq tm = s.tma.empty() ? LineReq{} : s.tma[i2 % s.tma.size()];
@@ -174,19 +177,15 @@ private:
       const bool mv = !mem_rsp.empty() && mem_rsp.front().first <= c;
       t->mem_rsp_valid = mv;
       set_bits(t->mem_rsp_tag, 0, 64, mv ? mem_rsp.front().second : 0);
-      t->dsm_req_in_valid = s.dsm_req_hb != 0;
-      t->dsm_req_in_hb = s.dsm_req_hb;
+      t->dsm_req_in_valid = s.dsm_req;
       t->dsm_req_in_tag = tag & 0xff;
       t->dsm_req_out_ready = s.dsm_out_ready(c);
-      t->dsm_rsp_in_valid = s.dsm_rsp_hb != 0;
-      t->dsm_rsp_in_hb = s.dsm_rsp_hb;
+      t->dsm_rsp_in_valid = s.dsm_rsp;
       t->dsm_rsp_in_tag = tag & 0xff;
       t->dsm_rsp_out_ready = 1;
-      t->arr_req_in_valid = s.arr_req_hb != 0;
-      t->arr_req_in_hb = s.arr_req_hb;
+      t->arr_req_in_valid = s.arr_req;
       t->arr_req_out_ready = 1;
       t->arr_rsp_in_valid = 0;
-      t->arr_rsp_in_hb = 0;
       t->arr_rsp_out_ready = 1;
       t->eval();
 
@@ -195,8 +194,8 @@ private:
       for (uint32_t i = 0; i < NSRC; ++i) {
         if (get_bits(t->src_valid, i, 1) && get_bits(t->src_ready, i, 1)) {
           this->check(admitted < 0, s.name + ": two admissions in one cycle");
-          SmEgressItem it = egress_item(i, i == 0 ? l1 : tm, cfg_);
-          this->check(eg.req_can_push(it), s.name + ": the port admitted an item the golden refuses at cycle " + std::to_string(c));
+          SmEgressItem it = egress_item(i == 0 ? l1 : tm, cfg_);
+          this->check(eg.req_can_push(), s.name + ": the port admitted an item the golden refuses at cycle " + std::to_string(c));
           eg.req_push(it);
           admitted = (int)i;
           if (i == 0) ++i1; else ++i2;
@@ -204,12 +203,12 @@ private:
       }
       if (t->dsm_req_in_valid && t->dsm_req_in_ready) {
         this->check(admitted < 0, s.name + ": two admissions in one cycle");
-        SmEgressItem it = dsm_item(s.dsm_req_hb);
-        this->check(eg.req_can_push(it), s.name + ": the port admitted a packet the golden refuses at cycle " + std::to_string(c));
+        SmEgressItem it = dsm_item();
+        this->check(eg.req_can_push(), s.name + ": the port admitted a packet the golden refuses at cycle " + std::to_string(c));
         eg.req_push(it);
       }
       if (t->dsm_rsp_in_valid && t->dsm_rsp_in_ready)
-        eg.rsp_push(dsm_item(s.dsm_rsp_hb));
+        eg.rsp_push(dsm_item());
       auto p = eg.tick(true, s.dsm_out_ready(c), true);
       if (p.req) gold_req.push_back(c);
       if (p.rsp) gold_rsp.push_back(c);
@@ -218,6 +217,7 @@ private:
       const bool win = (c >= WARM);
       if (t->mem_req_valid) {
         rtl_req.push_back(c);
+        this->check(t->mem_req_ok, s.name + ": an L2 request left with a wrong address or data byte at cycle " + std::to_string(c));
         uint32_t bytes = 0;
         for (uint32_t b = 0; b < LINE; ++b) bytes += (uint32_t)get_bits(t->mem_req_byteen, b, 1);
         if (win) {
@@ -232,20 +232,22 @@ private:
         mem_rsp.pop_front();
       if (t->dsm_req_out_valid && t->dsm_req_out_ready) {
         rtl_req.push_back(c);
+        this->check(t->dsm_req_out_ok, s.name + ": an SM-to-SM request left with wrong bits at cycle " + std::to_string(c));
         if (win) r.dsm_req += 1;
       }
       if (t->dsm_rsp_out_valid) {
         rtl_rsp.push_back(c);
+        this->check(t->dsm_rsp_out_ok, s.name + ": an SM-to-SM reply left with wrong bits at cycle " + std::to_string(c));
         if (win) r.dsm_rsp += 1;
       }
       for (uint32_t i = 0; i < NSRC; ++i)
         if (get_bits(t->src_rsp_valid, i, 1) && win) r.fill_sectors += SECTORS;
       if (t->arr_req_out_valid && win)
-        r.arr_sectors += (s.arr_req_hb + 1) / 2;
+        r.arr_msgs += 1;
       tick_ = sim_.step(tick_, 2);
       ++tag;
     }
-    for (double* v : {&r.l2_bytes, &r.l2_lines, &r.l2_reqs, &r.dsm_req, &r.dsm_rsp, &r.fill_sectors, &r.arr_sectors})
+    for (double* v : {&r.l2_bytes, &r.l2_lines, &r.l2_reqs, &r.dsm_req, &r.dsm_rsp, &r.fill_sectors, &r.arr_msgs})
       *v /= WINDOW;
 
     // Cycle for cycle: every leave a constant offset after its golden pop.
@@ -268,7 +270,58 @@ private:
     return r;
   }
 
-  // A DSMEM head that cannot leave holds the L2 read queued behind it.
+  // An L2 sink that is not ready: admission stops once the request FIFO and
+  // the output register are full; on release every packet leaves, in order.
+  void l2_back_pressure() {
+    auto* t = sim_.operator->();
+    this->reset(t);
+    std::printf("L2 back-pressure\n");
+    const uint64_t BLOCK = 100, END = 300;
+    const uint32_t cap = SM_REQ_FIFO_DEPTH + SM_PORT_REG_DEPTH;
+    uint32_t admitted = 0, admitted_blocked = 0, left = 0, order_bad = 0;
+    LineReq w = sectors_req(true, SECTORS, FLIT);
+    for (uint64_t c = 0; c < END; ++c) {
+      t->src_valid = 0;
+      set_bits(t->src_valid, 0, 1, 1);
+      set_bits(t->src_rw, 0, 1, 1);
+      set_bits(t->src_amo, 0, 1, 0);
+      for (uint32_t b = 0; b < LINE; ++b) set_bits(t->src_byteen, b, 1, w.be[b]);
+      set_bits(t->src_tag, 0, 8, admitted & 0xff);
+      set_bits(t->src_rsp_ready, 0, NSRC, 3);
+      t->mem_req_ready = (c >= BLOCK);
+      t->mem_rsp_valid = 0;
+      t->dsm_req_in_valid = 0;
+      t->dsm_rsp_in_valid = 0;
+      t->arr_req_in_valid = 0;
+      t->arr_rsp_in_valid = 0;
+      t->dsm_req_out_ready = 1;
+      t->dsm_rsp_out_ready = 1;
+      t->arr_req_out_ready = 1;
+      t->arr_rsp_out_ready = 1;
+      t->eval();
+      if (get_bits(t->src_ready, 0, 1)) {
+        ++admitted;
+        if (c < BLOCK) ++admitted_blocked;
+      }
+      if (t->mem_req_valid && t->mem_req_ready) {
+        order_bad += (get_bits(t->mem_req_tag, 0, 8) != (left & 0xff));
+        this->check(t->mem_req_ok, "L2 back-pressure: a held request left with a wrong address or data byte");
+        ++left;
+      }
+      tick_ = sim_.step(tick_, 2);
+    }
+    this->check(admitted_blocked >= SM_REQ_FIFO_DEPTH && admitted_blocked <= cap,
+                "L2 back-pressure: " + std::to_string(admitted_blocked) + " packets admitted while the L2 sink was blocked (FIFO "
+                + std::to_string(SM_REQ_FIFO_DEPTH) + " + output register " + std::to_string(SM_PORT_REG_DEPTH) + ")");
+    this->check(order_bad == 0, "L2 back-pressure: packets left out of order");
+    this->check(left + cap >= admitted && left > admitted_blocked,
+                "L2 back-pressure: packets lost or stuck after the release (" + std::to_string(left) + " of " + std::to_string(admitted) + ")");
+    double rate = double(left) * SECTORS / double(END - BLOCK);
+    std::printf("  admitted while blocked %u (bound %u), left after release %u of %u, %.3f flits/cycle\n", admitted_blocked, cap,
+                left, admitted, rate);
+  }
+
+  // An SM-to-SM head that cannot leave holds the L2 read queued behind it.
   void head_of_line() {
     auto* t = sim_.operator->();
     this->reset(t);
@@ -285,7 +338,6 @@ private:
       t->dsm_req_in_valid = 0;
       if (dsm_sent < NDSM) {
         t->dsm_req_in_valid = 1;
-        t->dsm_req_in_hb = 2 * cfg_.hb_dsmem_slot;
         t->dsm_req_in_tag = 1;
       } else if (!rd_sent) {
         set_bits(t->src_valid, 0, 1, 1);

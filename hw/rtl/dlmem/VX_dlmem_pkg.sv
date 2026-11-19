@@ -33,13 +33,6 @@ package VX_dlmem_pkg;
     localparam DLMEM_STORE_LANE_CREDITS = `VX_CFG_DLMEM_STORE_CREDITS * (`VX_CFG_N5_LINE_BYTES / LSU_WORD_SIZE);
     localparam DLMEM_WT_MAX        = DLMEM_STORE_LANE_CREDITS + `VX_CFG_DLMEM_PENDING_SIZE
                                    + (`VX_CFG_LSU_QUEUE_IN_SIZE + 3) * `VX_CFG_NUM_LSU_LANES;
-    // A packet's cost on the SM ports in half-beats, carried on its first message.
-    localparam DLMEM_PKT_SECTORS   = `VX_CFG_N5_LINE_BYTES / `VX_CFG_N5_SLOT_BYTES;
-    localparam DLMEM_EXTRA_HB      = 2 * `MAX(`MAX(`VX_CFG_N5_ASYNC_EXTRA_BYTES_V4, `VX_CFG_N5_ASYNC_EXTRA_BYTES_B32),
-                                              `VX_CFG_N5_REDASYNC_EXTRA_BYTES) / `VX_CFG_N5_SLOT_BYTES;
-    localparam DLMEM_HB_MAX        = `MAX(`MAX(DLMEM_PKT_SECTORS, `VX_CFG_N5_MIN_SLOTS) + `VX_CFG_DSMEM_ATOM_EXTRA_SLOTS, 1) * `VX_CFG_SM_HB_DSMEM_SLOT
-                                   + `MAX(`VX_CFG_SM_HB_DSMEM_LD_LINE, `VX_CFG_SM_HB_MBAR) + DLMEM_EXTRA_HB;
-    localparam DLMEM_HB_W          = `CLOG2(DLMEM_HB_MAX + 1);
 `else
     localparam DLMEM_INGRESS_SLOTS = 4;
     localparam DLMEM_SLOT_W        = `UP(`CLOG2(DLMEM_INGRESS_SLOTS));
@@ -105,19 +98,12 @@ package VX_dlmem_pkg;
         logic                      mbar_valid;
         logic [DLMEM_LMEM_AW-1:0]  mbar_addr;
     `endif
-    `ifdef VX_CFG_H100_SM_ENABLE
-        logic [DLMEM_HB_W-1:0]     pkt_hb;       // the packet's cost on the SM ports, on its first message
-        logic [DLMEM_HB_W-1:0]     rsp_hb;       // its reply packet's cost, on its first message
-    `endif
         logic [DLMEM_TAG_W-1:0]    tag;          // LD/AMO: source pending index; ST: source warp id
     } dlmem_req_pkt_t;
 
     // Response network packet; the fabric dst is the requesting core.
     typedef struct packed {
         logic                      ack;          // 1: store committed, data unused (with MBAR, bit 0 marks an async access); 0: LD/AMO data
-    `ifdef VX_CFG_H100_SM_ENABLE
-        logic [DLMEM_HB_W-1:0]     pkt_hb;       // the reply packet's cost on the SM ports, on its first message
-    `endif
         logic [DLMEM_TAG_W-1:0]    tag;
         logic [`VX_CFG_XLEN-1:0]   data;         // full bank word, as VX_local_mem returns it
     } dlmem_rsp_pkt_t;

@@ -168,11 +168,7 @@ void DlmemIngress::on_tick() {
       slot.ack  = (pkt.op == MemOp::ST);
       slot.data = nullptr;
       slot.uuid = pkt.uuid;
-    #ifdef VX_CFG_H100_SM_ENABLE
-      slot.rsp_hb = pkt.rsp_hb;
-    #else
     #line 158
-    #endif
       MemReq req(pkt.op, config_.lmem_base + pkt.lmem_addr, pkt.data, pkt.byteen,
                  uint32_t(s), pkt.hart_id, pkt.uuid);
       req.amo_cmp = pkt.amo_cmp;
@@ -242,9 +238,7 @@ void DlmemIngress::on_tick() {
   #else
   #line 189
   #endif
-  #ifdef VX_CFG_H100_SM_ENABLE
-    rsp.pkt_hb = slot.rsp_hb;
-  #elif defined(VX_CFG_EXT_MBAR_ENABLE)
+  #ifdef VX_CFG_EXT_MBAR_ENABLE
   #line 225
   #else
   #line 189

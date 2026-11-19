@@ -12,7 +12,7 @@
 // limitations under the License.
 
 // SimX twin of hw/unittest/sm_port: SmPort through the same scenarios and
-// golden expectations (sm_port_cases.h). A source sends a line request as its
+// structural expectations (sm_port_cases.h). A source sends a line request as its
 // touched memory blocks, every one but the last marked by sm_port_more(); the
 // memory answers all blocks of a request in one cycle. SmPort also splits
 // each item into memory blocks on its memory side (the RTL's adapter), one
@@ -52,9 +52,9 @@ public:
   Twin() : cfg_(knob_cfg()) {}
 
   int run() {
-    std::printf("sm_port (SimX): egress %u B/cycle, beat %u B, line %u B%s\n", cfg_.egress_bytes, cfg_.beat_bytes, LINE,
+    std::printf("sm_port (SimX): egress %u B/cycle, flit %u B, line %u B%s\n", cfg_.egress_bytes, cfg_.flit_bytes, LINE,
                 DLMEM ? ", DLMEM" : "");
-    for (const auto& s : scenarios(cfg_, DLMEM)) {
+    for (const auto& s : scenarios(DLMEM)) {
       auto r = this->scenario(s);
       for (const auto& e : expectations(s, r, cfg_, BLOCK))
         this->expect(e.what, e.got, e.exp, e.tol_rel, e.tol_abs);
@@ -82,11 +82,14 @@ private:
         be |= uint64_t(r.be[b * BLOCK + i]) << i;
       if (be == 0)
         continue;
-      MemReq q(r.rw ? MemOp::ST : (r.amo ? MemOp::AMO_ADD : MemOp::LD), uint64_t(b) * BLOCK, nullptr, be, tag);
+      MemReq q(r.amo ? MemOp::AMO_ADD : (r.rw ? MemOp::ST : MemOp::LD), uint64_t(b) * BLOCK, nullptr, be, tag);
       v.push_back(q);
     }
     if (v.empty())
       v.push_back(MemReq(r.rw ? MemOp::ST : MemOp::LD, 0, nullptr, 0, tag));
+    // The uuid names the request on every one of its blocks (the port renames tags).
+    for (auto& q : v)
+      q.uuid = tag;
     for (size_t i = 0; i + 1 < v.size(); ++i)
       sm_port_more(v[i]);
     return v;
@@ -103,14 +106,16 @@ private:
     #ifdef VX_CFG_EXT_DLMEM_ENABLE
     uint32_t rsp_tag = 0;
     #endif
-    uint32_t tag = 0;
+    uint32_t tag = 1;
+    uint64_t last_uuid = 0;
+    size_t next[NSRC] = {};
     for (uint64_t c = 0; c < WARM + WINDOW; ++c) {
       const bool win = (c >= WARM);
       for (uint32_t i = 0; i < NSRC; ++i) {
         const auto& src = i ? s.tma : s.l1;
         if (src.empty() || !port->SrcReqIn.at(i).empty())
           continue;
-        for (auto& b : blocks_of(src[0], tag++))
+        for (auto& b : blocks_of(src[next[i]++ % src.size()], tag++))
           port->SrcReqIn.at(i).send(b, 0);
       }
       while (!mem_rsp.empty() && mem_rsp.front().first <= c && !port->MemRspIn.full()) {
@@ -118,32 +123,27 @@ private:
         mem_rsp.pop_front();
       }
     #ifdef VX_CFG_EXT_DLMEM_ENABLE
-      if (s.dsm_req_hb && port->DsmReqIn.empty()) {
+      if (s.dsm_req && port->DsmReqIn.empty()) {
         DlmemReqPkt p;
-        p.pkt_hb = s.dsm_req_hb;
         p.tag = tag & 0xff;
         port->DsmReqIn.send(p, 0);
       }
-      // Each reply answers an arriving one-slot request this SM served.
-      if (s.dsm_rsp_hb && port->ArrReqIn.empty()) {
+      // Each reply answers an arriving request this SM served.
+      if (s.dsm_rsp && port->ArrReqIn.empty()) {
         DlmemReqPkt p;
-        p.pkt_hb = 1;
-        p.rsp_hb = s.dsm_rsp_hb;
         p.src = 0;
         p.tag = ++rsp_tag;
         port->ArrReqIn.send(p, 0);
       }
-      if (s.dsm_rsp_hb && port->DsmRspIn.empty() && !served.empty()) {
+      if (s.dsm_rsp && port->DsmRspIn.empty() && !served.empty()) {
         DlmemRspPkt p;
         p.dst = 0;
-        p.pkt_hb = s.dsm_rsp_hb;
         p.tag = served.front();
         port->DsmRspIn.send(p, 0);
         served.pop_front();
       }
-      if (s.arr_req_hb && port->ArrReqIn.empty()) {
+      if (s.arr_req && port->ArrReqIn.empty()) {
         DlmemReqPkt p;
-        p.pkt_hb = s.arr_req_hb;
         port->ArrReqIn.send(p, 0);
       }
     #endif
@@ -152,19 +152,24 @@ private:
         MemReq q = port->MemReqOut.peek();
         port->MemReqOut.pop();
         uint32_t bytes = (uint32_t)__builtin_popcountll(q.byteen);
+        const bool wr = q.is_write() && !memop_is_amo(q.op);
         if (win) {
-          if (q.is_write())
+          if (wr)
             r.l2_bytes += bytes;
           else
             r.l2_lines += double(BLOCK) / LINE;
+          // A request's blocks leave back to back: a new uuid starts the next request.
+          if (q.uuid != last_uuid)
+            r.l2_reqs += 1;
         }
-        if (!q.is_write())
+        last_uuid = q.uuid;
+        if (!q.is_write() || memop_is_amo(q.op))
           mem_rsp.push_back({c + s.mem_delay, MemRsp(q.tag, q.hart_id, 0, std::make_shared<mem_block_t>())});
       }
       for (uint32_t i = 0; i < NSRC; ++i) {
         while (!port->SrcRspOut.at(i).empty()) {
           if (win)
-            r.fill_sectors += double(BLOCK) / BEAT;
+            r.fill_sectors += double(BLOCK) / FLIT;
           port->SrcRspOut.at(i).pop();
         }
       }
@@ -178,17 +183,15 @@ private:
         port->DsmRspOut.pop();
       }
       while (!port->ArrReqOut.empty()) {
-        if (s.dsm_rsp_hb)
+        if (s.dsm_rsp)
           served.push_back(port->ArrReqOut.peek().tag);
         else if (win)
-          r.arr_sectors += (s.arr_req_hb + 1) / 2;
+          r.arr_msgs += 1;
         port->ArrReqOut.pop();
       }
     #endif
     }
-    // Requests: the single-sector scenarios' are one sector (one block) each.
-    r.l2_reqs = r.l2_lines * LINE / BLOCK + r.l2_bytes / BEAT;
-    for (double* v : {&r.l2_bytes, &r.l2_lines, &r.l2_reqs, &r.dsm_req, &r.dsm_rsp, &r.fill_sectors, &r.arr_sectors})
+    for (double* v : {&r.l2_bytes, &r.l2_lines, &r.l2_reqs, &r.dsm_req, &r.dsm_rsp, &r.fill_sectors, &r.arr_msgs})
       *v /= WINDOW;
     return r;
   }

@@ -63,12 +63,7 @@ constexpr uint32_t DLMEM_LACC_LIMIT = (1u << dlmem_clog2(uint64_t(DLMEM_LACC_MAX
 // Request network packet (VX_dlmem_pkg dlmem_req_pkt_t); the fabric routes it
 // to `dst`, the target core.
 struct DlmemReqPkt {
-#ifdef VX_CFG_H100_SM_ENABLE
-  uint32_t pkt_hb = 0;               // the packet's cost on the SM ports in half-beats, on its first message
-  uint32_t rsp_hb = 0;               // its reply packet's cost, on its first message
-#else
 #line 55
-#endif
   uint32_t dst = 0;
   uint32_t src = 0;                    // requesting core, the response's dst
   MemOp    op = MemOp::LD;             // LD, ST or a read-modify-write atomic
@@ -119,9 +114,7 @@ struct DlmemReqPkt {
 
 // Response network packet (dlmem_rsp_pkt_t); `dst` is the requesting core.
 struct DlmemRspPkt {
-#ifdef VX_CFG_H100_SM_ENABLE
-  uint32_t pkt_hb = 0;               // the reply packet's cost on the SM ports in half-beats, on its first message
-#elif defined(VX_CFG_EXT_MBAR_ENABLE)
+#ifdef VX_CFG_EXT_MBAR_ENABLE
 #line 103
 #else
 #line 89

@@ -1418,7 +1418,20 @@ private:
     if (hit_sec.data) {
       old_word = amo_load_word(hit_sec.data->data(), byte_off, width);
     }
+#ifdef VX_CFG_H100_SM_ENABLE
+    // An SM sends a compare-and-swap's comparand in the other 16-B half of
+    // the operand's 32-B sector, the flit that carries both operands.
+    const uint64_t cas_cmp = bank_req.data
+                           ? amo_load_word(bank_req.data->data(), byte_off ^ 16, width)
+                           : 0ull;
 #ifdef VX_CFG_EXT_FPAMO_ENABLE
+    auto rmw = amo_compute_ptx(op, width, old_word, rhs, unsigned_minmax,
+                               cas_cmp, amo_ref::SITE_LLC);
+#else
+    auto rmw = amo_unit_.compute(op, width, old_word, rhs, unsigned_minmax, cas_cmp);
+#endif
+#elif defined(VX_CFG_EXT_FPAMO_ENABLE)
+#line 1269
     auto rmw = amo_compute_ptx(op, width, old_word, rhs, unsigned_minmax,
                                bank_req.amo_cmp, amo_ref::SITE_LLC);
 #else

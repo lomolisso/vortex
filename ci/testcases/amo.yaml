@@ -323,6 +323,26 @@ tests:
     touches: &org_amo_gl_touches [VX_config.toml, hw/rtl/VX_gpu_pkg.sv, hw/rtl/mem/VX_sm_l1.sv, hw/rtl/mem/VX_sm_port.sv,
             hw/rtl/cache, hw/rtl/core/VX_lsu_slice.sv, sim/simx/mem/sm_l1.h, sim/simx/mem/sm_l1.cpp,
             sim/simx/mem/sm_port.h, sim/simx/mem/cache.cpp, sim/simx/amo, sim/simx/lsu_unit.cpp, tests/regression/amo]
+  # Global compare-and-swap on the H100 SM path: the comparand travels in the
+  # operand's sector at offset ^ 16 of the request data and the L2's AMO unit
+  # reads it there.
+  - id: org-amo-cas-global
+    via: blackbox
+    drivers: [simx, rtlsim]
+    xlen: [64]
+    app: amo
+    configs: "-DVX_CFG_H100_SM_ENABLE -DVX_CFG_EXT_A_ENABLE -DVX_CFG_EXT_ZACAS_ENABLE"
+    shape: {cores: 1, warps: 4, threads: 32, l2cache: true}
+    args: "-tcas-global -tcas_ladder"
+    touches: *org_amo_gl_touches
+  - id: model_parity-org-amo-cas-global
+    check: model_parity
+    xlen: [64]
+    app: amo
+    configs: "-DVX_CFG_H100_SM_ENABLE -DVX_CFG_EXT_A_ENABLE -DVX_CFG_EXT_ZACAS_ENABLE"
+    shape: {cores: 1, warps: 4, threads: 32, l2cache: true}
+    args: "-tcas-global -tcas_ladder"
+    touches: *org_amo_gl_touches
   - id: org-amo-lrsc-aqrl
     via: blackbox
     drivers: [simx]

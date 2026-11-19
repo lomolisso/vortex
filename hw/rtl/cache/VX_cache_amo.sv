@@ -518,6 +518,20 @@ module VX_cache_amo import VX_gpu_pkg::*; #(
         wire [63:0] rhs_st1 = (width_st1 == 2'd2)
                             ? 64'({32'h0, rhs_lane_shifted_st1[31:0]})
                             : 64'(rhs_lane_shifted_st1[AMO_OLD_BITS-1:0]);
+    `ifdef VX_CFG_EXT_ZACAS_ENABLE
+    `ifdef VX_CFG_H100_SM_ENABLE
+        // An SM sends a compare-and-swap's comparand in the other 16-B half of
+        // the operand's 32-B sector, the flit that carries both operands.
+        localparam CMP_LANE_XOR = 16 / LANE_SIZE;
+        `STATIC_ASSERT ((IS_LLC == 0) || (WORD_SIZE >= 32), ("cache amo: the comparand's half-sector must be in the word"))
+        wire [LANE_IDXW-1:0]  cmp_lane_idx_st1 = lane_st1 ^ LANE_IDXW'(CMP_LANE_XOR);
+        wire [LANE_WIDTH-1:0] cmp_lane_st1 = LANE_WIDTH'(write_word_st1 >> (cmp_lane_idx_st1 * LANE_WIDTH));
+        wire [LANE_WIDTH-1:0] cmp_lane_shifted_st1 = cmp_lane_st1 >> bit_off_st1;
+        wire [63:0] cas_cmp_st1 = (width_st1 == 2'd2)
+                                ? 64'({32'h0, cmp_lane_shifted_st1[31:0]})
+                                : 64'(cmp_lane_shifted_st1[AMO_OLD_BITS-1:0]);
+    `endif
+    `endif
         wire [63:0] old_st1 = (width_st1 == 2'd2)
                             ? 64'({32'h0, line_lane_shifted_st1[31:0]})
                             : 64'(line_lane_shifted_st1[AMO_OLD_BITS-1:0]);
@@ -713,7 +727,11 @@ module VX_cache_amo import VX_gpu_pkg::*; #(
                     cmp_old      <= old_st1;
                     cmp_rhs      <= rhs_st1;
                 `ifdef VX_CFG_EXT_ZACAS_ENABLE
+                `ifdef VX_CFG_H100_SM_ENABLE
+                    cmp_cmp      <= cas_cmp_st1;
+                `else
                     cmp_cmp      <= 64'(amo_st1.amo_cmp);
+                `endif
                 `endif
                     cmp_op       <= amo_st1.amo_op;
                     cmp_width    <= width_st1;

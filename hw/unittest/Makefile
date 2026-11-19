@@ -968,11 +968,11 @@ else
 	@echo "run-l1h100: the H100 SM path is RV64 only (skipped at XLEN $(XLEN))"
 endif
 
-# The SM port (VX_sm_port with its ingress gate): egress rates and every leave
-# cycle against sm_port_ref.h's SmEgressRef, the single-sector issue limits,
-# the injection credit loop, the 5 : 1 ingress gate, the ejection cap, a DSMEM
-# head holding the L2 request behind it; then a 64-B egress.
-# The SimX twin runs the same scenarios against the same golden; its port also
+# The SM port (VX_sm_port with its ingress gate): every leave cycle against
+# sm_port_ref.h's SmEgressRef, each stream's rate against its flit formula, the
+# 5 : 1 ingress gate, the ejection link, back-pressure from the L2 and
+# SM-to-SM sinks; then a 64-B egress.
+# The SimX twin runs the same scenarios against the same formulas; its port also
 # splits items into memory blocks (the RTL's adapter), so no CSV is compared.
 define sm_port_case
 	$(MAKE) -C sm_port clean

@@ -18,7 +18,8 @@
 // An SM's ingress gate, cycle for cycle sm_port_ref::SmIngressRef: each cycle
 // it deals UNITS sectors to the heads of three sources, fills (L2 and TMA
 // replies) against SM-to-SM arrivals by a weighted wheel, the two SM-to-SM
-// sources round robin between them and together at most EJECT sectors. A head
+// sources round robin between them over the one ejection link of EJECT flits
+// per cycle, a message being one flit. A head
 // leaves once paid and accepted; a fill head may be prepaid one cycle ahead.
 module VX_sm_ingress import VX_gpu_pkg::*; #(
     parameter SECT_W     = 1,

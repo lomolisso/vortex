@@ -1,21 +1,23 @@
-// sm_port: the H100 SM path's egress port, SM-to-SM packets and ingress.
+// sm_port: the H100 SM path's egress port, SM-to-SM messages and ingress.
 //
 // Every expected rate is the steady state of sw/common/sm_port_ref.h's
-// SmEgressRef fed the test's item stream at the build's knobs (the ejection
-// cap from the knob); nothing measured on Vortex is read back as a target.
+// SmEgressRef fed the test's packet stream at the build's knobs: one 32-B flit
+// per cycle per FLIT bytes of link, each packet its flits by the port's format
+// (a write line = touched sectors + 1 mask flit if any is partial; every SM-to-SM
+// message = 1 flit). H100 rates of the same streams are printed as H100REF lines
+// (SMPORT_flit_h100.md), never judged.
 //
-//   -m 0 st      full-line global stores (4 full sectors per item)           +-3 %
-//   -m 1 st1s    one full sector per line (the single-sector write limit)     +-3 %
+//   -m 0 st      full-line global stores (4 full sectors per line)            +-3 %
+//   -m 1 st1s    one full sector per line (1 flit per packet)                 +-3 %
 //   -m 2 stmask  one 4-B lane per sector: 4 masked sectors per line, then 1   +-5 %
-//   -m 3 rw      every warp's stores, then warp 0's load: usable no earlier than their drain (in-order FIFO)
+//   -m 3 rw      every warp's stores, then warp 0's load: usable no earlier than their drain (in-order path)
 //   (-m 0..3: a rate the levels below the port cannot take, measured with -m 1's stream, is reported, not counted)
-//   -m 4 inject  rank 0 sd's full lines into rank 1 (credit loop)              report
-//   -m 5 eject   ranks 1..3 sd into rank 0: the receiver's ejection cap        +-5 %
-//   -m 6 pkt1s   one sector per destination line (minimum packet slots)       report
-//   -m 7 ld      rank 0 ld's rank 1's lines: rank 1's reply rate              report
-//   -m 8 atom    rank 0 amoadd.w's one line of rank 1 per warp request        report
-//   -m 9 mix     rank 0 sd's into rank 1 and to global memory: the sum stays within the port,
-//                and a DSMEM head waiting for credits holds the global stores behind it
+//   -m 4 inject  rank 0 sd's into rank 1                 within the link; rate reported
+//   -m 5 eject   ranks 1..3 sd into rank 0              within the receiver's ejection link; rate reported
+//   -m 6 pkt1s   one sector per destination line         within the link; rate reported
+//   -m 7 ld      rank 0 ld's rank 1's lines              rank 1's replies within its link; rate reported
+//   -m 8 atom    rank 0 amoadd.w's rank 1's lines        within the link; rate reported
+//   -m 9 mix     rank 0 sd's into rank 1 and to global memory: the sum of their flits within the link
 //   -m 10 tma    each rank's warp 0 bulk-loads L2-resident lines (TMA), rank 0 alone, then
 //                both ranks: each SM's rate equals the one-SM rate +-3 % (one engine per SM)
 //   -m 11 fillwr rank 0's warps 1.. stream LDS / L1-hit lw / STS beside fills of the SM's array (warp 0's TMA
@@ -119,42 +121,41 @@ static void verdict(const std::string& what, double got, double exp, double tol_
   if (!ok) ++errors;
 }
 
-// The DSMEM transport moves one lane per message per cycle until the line-wide
-// network replaces it, so a TPC stream's rate is printed against the H100 rate
-// without counting.
-static void report(const std::string& what, double got, double exp) {
-  printf("  %-48s measured %9.3f H100 %9.3f (report: lane-per-message transport)\n", what.c_str(), got, exp);
+// An SM-to-SM stream's rate depends on more than this port (the sender's lane
+// serialiser, the network, the receiver's array), so it is printed beside the
+// golden and the H100's rate, and only its bound by the link is judged.
+static void report(const std::string& what, double got, double golden, const char* metric, double h100) {
+  printf("  %-48s measured %9.3f golden %9.3f (report)\n", what.c_str(), got, golden);
+  printf("H100REF metric=%s h100=%.3f vortex=%.3f\n", metric, h100, got);
+}
+
+static void within(const std::string& what, double got, double bound) {
+  // The kernel's end time can precede the drain of the stores still queued
+  // below the warp, hence the 5 % margin.
+  bool ok = got <= bound * 1.05;
+  printf("  %-48s %.3f <= %.3f %s\n", what.c_str(), got, bound, ok ? "ok" : "MISMATCH");
+  if (!ok) ++errors;
 }
 
 static SmPortCfg knob_cfg() {
-  SmPortCfg c;
-  c.egress_bytes     = VX_CFG_SM_EGRESS_BYTES;
-  c.beat_bytes       = VX_CFG_SM_EGRESS_BEAT;
-  c.hb_wr_sector     = VX_CFG_SM_HB_WRITE_SECTOR;
-  c.hb_wr_masked     = VX_CFG_SM_HB_WRITE_MASKED;
-  c.hb_rd_line       = VX_CFG_SM_HB_READ_LINE;
-  c.hb_pf_line       = VX_CFG_SM_HB_PREFETCH_LINE;
-  c.hb_atom_lane     = VX_CFG_SM_HB_ATOM_LANE;
-  c.hb_dsmem_slot    = VX_CFG_SM_HB_DSMEM_SLOT;
-  c.hb_dsmem_ld_line = VX_CFG_SM_HB_DSMEM_LD_LINE;
-  c.hb_tma_st_sector = VX_CFG_SM_HB_TMA_ST_SECTOR;
-  c.hb_mbar          = VX_CFG_SM_HB_MBAR;
-  c.min_slots        = VX_CFG_N5_MIN_SLOTS;
-  c.atom_extra_slots = VX_CFG_DSMEM_ATOM_EXTRA_SLOTS;
-  c.inj_credits      = VX_CFG_SM2SM_INJ_CREDITS;
-  c.inj_return       = VX_CFG_SM2SM_INJ_RETURN;
-  c.eject_bytes      = VX_CFG_SM2SM_EJECT_BYTES;
-  c.ingress_bytes    = VX_CFG_SM_INGRESS_BYTES;
-  c.w_fill           = VX_CFG_SM_INGRESS_FILL_WEIGHT;
-  c.w_dsmem          = VX_CFG_SM_INGRESS_DSMEM_WEIGHT;
-  c.issue_w_pm       = VX_CFG_SM_SECTOR_ISSUE_W_PERMILLE;
-  c.issue_r_pm       = VX_CFG_SM_SECTOR_ISSUE_R_PERMILLE;
-  c.req_fifo_bytes   = VX_CFG_SM_REQ_FIFO_BYTES;
-  c.rsp_slots        = VX_CFG_SM_RSP_QUEUE_SLOTS;
+  SmPortCfg c{};
+  c.egress_bytes  = VX_CFG_SM_EGRESS_BYTES;
+  c.flit_bytes    = VX_CFG_SM_EGRESS_BEAT;
+  c.eject_bytes   = VX_CFG_SM2SM_EJECT_BYTES;
+  c.ingress_bytes = VX_CFG_SM_INGRESS_BYTES;
+  c.w_fill        = VX_CFG_SM_INGRESS_FILL_WEIGHT;
+  c.w_dsmem       = VX_CFG_SM_INGRESS_DSMEM_WEIGHT;
+#if VX_CFG_EXT_DLMEM_ENABLED
+  c.rsp_slots     = VX_CFG_DLMEM_INGRESS_SLOTS;
+#else
+  c.rsp_slots     = 1;
+#endif
   return c;
 }
 
-// One egress item of the stream and the payload it carries.
+enum class Kind { GStore, DStore, DLoadRsp, DAtom };
+
+// One egress packet of the stream and the payload it carries.
 struct Item {
   SmEgressItem it;
   bool rsp;
@@ -170,23 +171,12 @@ static std::vector<uint8_t> line_bytes(const std::vector<uint32_t>& offs, uint32
   return be;
 }
 
-static Item make_item(SmItem kind, const std::vector<uint8_t>& be, uint32_t lanes, double payload, int cls,
-                      const SmPortCfg& cfg) {
+// A global write line: one packet. An SM-to-SM item: one message per lane.
+static Item make_item(Kind kind, const std::vector<uint8_t>& be, double payload, int cls, const SmPortCfg& cfg) {
   Item x;
-  x.it.hb = sm_item_halfbeats(kind, be.data(), LINE, lanes, 0, cfg);
-  uint32_t touched = 0, full = 0;
-  for (uint32_t s = 0; s < LINE / cfg.beat_bytes; ++s) {
-    uint32_t n = 0;
-    for (uint32_t i = 0; i < cfg.beat_bytes; ++i) n += be[s * cfg.beat_bytes + i];
-    touched += (n != 0);
-    full += (n == cfg.beat_bytes);
-  }
-  bool dsm = (kind == SmItem::DsmemStore || kind == SmItem::DsmemLoadReq || kind == SmItem::DsmemAtomic ||
-              kind == SmItem::DsmemResp || kind == SmItem::MbarRemote);
-  x.it.slots = dsm ? dsmem_packet_slots(touched, kind, cfg) : 0;
-  x.it.l2 = !dsm;
-  x.it.single = (kind == SmItem::WriteLine && touched == 1) ? 1 : (kind == SmItem::ReadLine && touched == 1) ? 2 : 0;
-  x.rsp = (kind == SmItem::DsmemResp);
+  x.it.l2 = (kind == Kind::GStore);
+  x.it.flits = x.it.l2 ? sm_packet_flits(SmItem::WriteLine, be.data(), LINE, cfg) : 1;
+  x.rsp = (kind == Kind::DLoadRsp);
   x.payload = payload;
   x.cls = cls;
   x.blocks = 0;
@@ -200,23 +190,35 @@ static Item make_item(SmItem kind, const std::vector<uint8_t>& be, uint32_t lane
   return x;
 }
 
-// One warp instruction's items: one per line its lanes touch, in line order,
-// each carrying the bytes it writes (or, for atomics, its lane-ops).
-static std::vector<Item> items_of(SmItem kind, const std::vector<uint32_t>& pat, uint32_t size, int cls,
+// One warp instruction's packets: a global write per line its lanes touch, in
+// line order, carrying its bytes; an SM-to-SM message per active lane,
+// carrying its bytes (an atomic: one lane-op).
+static std::vector<Item> items_of(Kind kind, const std::vector<uint32_t>& pat, uint32_t size, int cls,
                                   const SmPortCfg& cfg) {
+  std::vector<Item> v;
+  if (kind != Kind::GStore) {
+    for (auto o : pat) {
+      if (o != 0xFFFFFFFFu)
+        v.push_back(make_item(kind, line_bytes({o}, size), kind == Kind::DAtom ? 1.0 : size, cls, cfg));
+    }
+    return v;
+  }
   std::map<uint32_t, std::vector<uint32_t>> lines;
   for (auto o : pat)
     if (o != 0xFFFFFFFFu) lines[o / LINE].push_back(o % LINE);
-  std::vector<Item> v;
   for (auto& l : lines) {
     auto be = line_bytes(l.second, size);
     uint32_t bytes = 0;
     for (auto b : be) bytes += b;
-    bool atom = (kind == SmItem::DsmemAtomic || kind == SmItem::AtomicLanes);
-    uint32_t lanes = (uint32_t)l.second.size();
-    v.push_back(make_item(kind, be, lanes, atom ? lanes : bytes, cls, cfg));
+    v.push_back(make_item(kind, be, bytes, cls, cfg));
   }
   return v;
+}
+
+static double flits_of(const std::vector<Item>& items) {
+  double f = 0;
+  for (auto& x : items) f += x.it.flits;
+  return f;
 }
 
 // Payload of one instruction: the sum of its items'.
@@ -255,7 +257,7 @@ static std::vector<double> golden_rates(const std::vector<Item>& stream, const S
   size_t next = 0;
   for (uint32_t t = 0; t < warm + cycles; ++t) {
     const Item& x = stream[next];
-    if (x.rsp ? eg.rsp_can_push(x.it) : eg.req_can_push(x.it)) {
+    if (x.rsp ? eg.rsp_can_push() : eg.req_can_push()) {
       SmEgressItem it = x.it;
       it.id = next;
       if (x.rsp) eg.rsp_push(it); else eg.req_push(it);
@@ -358,7 +360,7 @@ static double lower_levels_accept(Run r, const SmPortCfg& cfg) {
   static double accept = -1.0;
   if (accept < 0) {
     auto pat = pattern(8, 4);
-    auto items = items_of(SmItem::WriteLine, pat, 4, 0, cfg);
+    auto items = items_of(Kind::GStore, pat, 4, 0, cfg);
     double payload = payload_of(items);
     r.arg.kind = SP_GSTORE;
     r.arg.step = store_step(pat, 4);
@@ -439,12 +441,12 @@ static void run_mode(int mode, const SmPortCfg& cfg) {
                        pattern(warp_lanes, 4)});
     if (mode == 1) cases.push_back({"one full sector per line B/cycle", pattern(8, 4)});
     if (mode == 2) {
-      cases.push_back({"4-B lane in each sector: payload B/cycle", pattern(LINE / cfg.beat_bytes, cfg.beat_bytes)});
+      cases.push_back({"4-B lane in each sector: payload B/cycle", pattern(LINE / cfg.flit_bytes, cfg.flit_bytes)});
       cases.push_back({"4-B lane in one sector: payload B/cycle", pattern(1, 4)});
     }
     const double accept = lower_levels_accept(r, cfg);
     for (auto& c : cases) {
-      auto items = items_of(SmItem::WriteLine, c.pat, 4, 0, cfg);
+      auto items = items_of(Kind::GStore, c.pat, 4, 0, cfg);
       double payload = payload_of(items);
       double exp = golden_rates(items, cfg)[0];
       double bound = golden_rates(items, cfg, accept)[0];
@@ -452,8 +454,13 @@ static void run_mode(int mode, const SmPortCfg& cfg) {
       r.arg.step = store_step(c.pat, 4);
       r.arg.iters = iters_for(exp, r.warps, payload);
       auto out = launch(r, c.pat);
-      rate_line(c.name, measured_rate(out, r, r.arg.iters * payload, all), exp, mode == 2 ? 0.05 : 0.03, bound, accept,
-                finish_spread(out, r));
+      double got = measured_rate(out, r, r.arg.iters * payload, all);
+      printf("  %u packet(s) of %.0f flits per instruction\n", (uint32_t)items.size(), flits_of(items) / items.size());
+      rate_line(c.name, got, exp, mode == 2 ? 0.05 : 0.03, bound, accept, finish_spread(out, r));
+      if (mode == 0)
+        printf("H100REF metric=sm_port_full_line_store_Bpc h100=31.92 vortex=%.3f\n", got);
+      if (mode == 1)
+        printf("H100REF metric=sm_port_1sector_store_rpc h100=0.617 vortex=%.3f\n", got / cfg.flit_bytes);
     }
     break;
   }
@@ -465,21 +472,21 @@ static void run_mode(int mode, const SmPortCfg& cfg) {
     auto out = launch(r, pattern(warp_lanes, 4));
     std::vector<uint32_t> offs;
     for (uint32_t i = 0; i < warp_lanes; ++i) offs.push_back(i * 4);
-    auto items = items_of(SmItem::WriteLine, offs, 4, 0, cfg);
-    double hb = 0, blocks = 0;
-    for (auto& x : items) { hb += x.it.hb; blocks += x.blocks; }
+    auto items = items_of(Kind::GStore, offs, 4, 0, cfg);
+    double flits = flits_of(items), blocks = 0;
+    for (auto& x : items) blocks += x.blocks;
     SmEgressRef eg(cfg);
-    double drain = (double)r.arg.n * hb / eg.units();
+    double drain = (double)r.arg.n * flits / eg.units();
     printf("  load alone %llu cycles; %u full-line stores issued in %llu cycles; the load behind them usable after %llu\n",
            (unsigned long long)out[0], r.arg.n, (unsigned long long)out[1], (unsigned long long)out[2]);
     // The stores leave at the port's rate, and the load waits for them (one in-order FIFO).
     double below = (double)r.arg.n * blocks / accept;
     if (below <= drain * 1.05) {
-      verdict("store issue cycles (the queued beats' drain)", (double)out[1], drain, 0.05);
+      verdict("store issue cycles (the queued flits' drain)", (double)out[1], drain, 0.05);
     } else {
       printf("  %-48s measured %9.0f golden %9.0f lower levels accept %.3f blocks/cycle: %.0f "
              "(report: lower-level bound; unit bench is the criterion)\n",
-             "store issue cycles (the queued beats' drain)", (double)out[1], drain, accept, below);
+             "store issue cycles (the queued flits' drain)", (double)out[1], drain, accept, below);
     }
     bool ok = out[2] >= 0.97 * drain;
     printf("  %-48s %llu >= %.0f %s\n", "load behind queued stores", (unsigned long long)out[2], 0.97 * drain,
@@ -489,13 +496,16 @@ static void run_mode(int mode, const SmPortCfg& cfg) {
   }
   case 4: case 5: case 6: {
     std::vector<uint32_t> pat = (mode == 6) ? pattern(warp_lanes, 8, 4, LINE) : pattern(warp_lanes, 8);
-    auto stream = items_of(SmItem::DsmemStore, pat, 8, 0, cfg);
+    auto stream = items_of(Kind::DStore, pat, 8, 0, cfg);
     double per_instr = payload_of(stream);
     double exp = golden_rates(stream, cfg)[0];
+    // One message of 8 B per flit: the link's bound, and the receiver's ejection link's.
+    double bound = 8.0 * cfg.egress_bytes / cfg.flit_bytes;
     uint32_t senders = 1;
     if (mode == 5) {
       senders = r.cluster - 1;
-      exp = std::min(exp * senders, (double)cfg.eject_bytes);
+      bound = 8.0 * cfg.eject_bytes / cfg.flit_bytes;
+      exp = std::min(exp * senders, bound);
     }
     r.arg.kind = SP_DSTORE;
     r.arg.recv = (mode == 5) ? 0 : 1;
@@ -506,13 +516,14 @@ static void run_mode(int mode, const SmPortCfg& cfg) {
     double got = measured_rate(out, r, r.arg.iters * per_instr, [&](uint32_t b, uint32_t) { return b != recv; });
     const char* name = (mode == 4) ? "rank 0 -> rank 1 full lines B/cycle"
                      : (mode == 5) ? "ranks 1..3 -> rank 0 B/cycle at the receiver" : "one sector per line: unique B/cycle";
-    report(name, got, exp);
+    report(name, got, exp, mode == 5 ? "sm_port_dsmem_eject_Bpc" : "sm_port_dsmem_store_Bpc", 21.3);
+    within(std::string(name) + " within the link", got, bound);
     break;
   }
   case 7: {
-    // The served replies: one per line of the requester's instruction, its sectors full.
+    // The served replies: one 8-B message per lane of the requester's instruction.
     auto pat = pattern(warp_lanes, 8);
-    auto stream = items_of(SmItem::DsmemResp, pat, 8, 0, cfg);
+    auto stream = items_of(Kind::DLoadRsp, pat, 8, 0, cfg);
     double per_instr = payload_of(stream);
     double exp = golden_rates(stream, cfg)[0];
     r.arg.kind = SP_DLOAD;
@@ -520,14 +531,14 @@ static void run_mode(int mode, const SmPortCfg& cfg) {
     r.arg.iters = remote_iters(exp, r.warps, per_instr);
     auto out = launch(r, pat);
     double got = measured_rate(out, r, r.arg.iters * per_instr, [](uint32_t b, uint32_t) { return b == 0; });
-    report("rank 1's replies to rank 0's ld, B/cycle", got, exp);
-    std::cout << "  request slots per line: " << dsmem_packet_slots(LINE / cfg.beat_bytes, SmItem::DsmemLoadReq, cfg)
-              << std::endl;
+    // H100: a reply is 1 slot per sector (32 B) at the sender's 2/3 slot per clock.
+    report("rank 1's replies to rank 0's ld, B/cycle", got, exp, "sm_port_dsmem_reply_Bpc", 21.3);
+    within("rank 1's replies within its link", got, 8.0 * cfg.egress_bytes / cfg.flit_bytes);
     break;
   }
   case 8: {
     auto pat = pattern(warp_lanes, 4);
-    auto stream = items_of(SmItem::DsmemAtomic, pat, 4, 0, cfg);
+    auto stream = items_of(Kind::DAtom, pat, 4, 0, cfg);
     double per_instr = payload_of(stream);
     double exp = golden_rates(stream, cfg)[0];
     r.arg.kind = SP_DATOM;
@@ -535,7 +546,9 @@ static void run_mode(int mode, const SmPortCfg& cfg) {
     r.arg.iters = remote_iters(exp, r.warps, per_instr);
     auto out = launch(r, pat);
     double got = measured_rate(out, r, r.arg.iters * per_instr, [](uint32_t b, uint32_t) { return b == 0; });
-    report("remote amoadd.w lane-ops/cycle", got, exp);
+    // H100: a 32-lane line is one 5-slot packet; single-op atomics 0.5 per clock.
+    report("remote amoadd.w lane-ops/cycle", got, exp, "sm_port_dsmem_atom_lane_ops_pc", 32.0 * 2 / 3 / 5);
+    within("remote amoadd.w lane-ops within the link", got, (double)cfg.egress_bytes / cfg.flit_bytes);
     break;
   }
   case 10: {
@@ -635,8 +648,8 @@ static void run_mode(int mode, const SmPortCfg& cfg) {
   case 9: {
     // Even warps' DSMEM stores and odd warps' global stores share the one in-order FIFO.
     auto pat = pattern(warp_lanes, 8);
-    auto dsm_items = items_of(SmItem::DsmemStore, pat, 8, 0, cfg);
-    auto l2_items = items_of(SmItem::WriteLine, pat, 8, 1, cfg);
+    auto dsm_items = items_of(Kind::DStore, pat, 8, 0, cfg);
+    auto l2_items = items_of(Kind::GStore, pat, 8, 1, cfg);
     std::vector<Item> stream = dsm_items;
     stream.insert(stream.end(), l2_items.begin(), l2_items.end());
     auto g = golden_rates(stream, cfg);
@@ -648,13 +661,11 @@ static void run_mode(int mode, const SmPortCfg& cfg) {
     double dsm = measured_rate(out, r, r.arg.iters * per_instr, [](uint32_t b, uint32_t w) { return b == 0 && (w & 1) == 0; });
     double l2  = measured_rate(out, r, r.arg.iters * per_instr, [](uint32_t b, uint32_t w) { return b == 0 && (w & 1) == 1; });
     printf("  DSMEM %.3f + global %.3f B/cycle (golden: %.3f + %.3f)\n", dsm, l2, g[0], g[1]);
-    report("DSMEM + global stores B/cycle", dsm + l2, g[0] + g[1]);
-    bool within = dsm + l2 <= cfg.egress_bytes * 1.05;
-    printf("  %-48s %.3f <= %u %s\n", "DSMEM + global stores within the port", dsm + l2, cfg.egress_bytes,
-           within ? "ok" : "MISMATCH");
-    if (!within) ++errors;
-    bool held = (g[0] + g[1]) < cfg.egress_bytes * 0.97;
-    printf("  %-48s %s\n", "golden: global stores held behind DSMEM heads", held ? "yes" : "no (the stream does not exercise it)");
+    // Flits per cycle: a DSMEM message is one flit for 8 B, a global line one flit per 32-B sector.
+    double fl = dsm / 8.0 + l2 * flits_of(l2_items) / payload_of(l2_items);
+    report("DSMEM + global flits/cycle", fl, g[0] / 8.0 + g[1] * flits_of(l2_items) / payload_of(l2_items),
+           "sm_port_mix_flits_pc", 1.0);
+    within("DSMEM + global flits within the link", fl, (double)cfg.egress_bytes / cfg.flit_bytes);
     break;
   }
   }
@@ -687,8 +698,8 @@ int main(int argc, char* argv[]) {
   RT_CHECK(vx_device_query(device, VX_CAPS_DLMEM_MAX_CLUSTER, &max_cluster));
 #endif
   const SmPortCfg cfg = knob_cfg();
-  std::cout << "egress " << cfg.egress_bytes << " B/cycle, beat " << cfg.beat_bytes << " B, credits " << cfg.inj_credits
-            << " per " << cfg.inj_return << " cycles, ejection " << cfg.eject_bytes << " B/cycle; " << num_cores
+  std::cout << "egress " << cfg.egress_bytes << " B/cycle, flit " << cfg.flit_bytes << " B, ejection "
+            << cfg.eject_bytes << " B/cycle; " << num_cores
             << " cores, " << num_warps << " warps" << std::endl;
 
   RT_CHECK(vx_buffer_create(device, SP_LANES * 4, VX_MEM_READ, &pat_buffer));

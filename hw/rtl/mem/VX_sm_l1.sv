@@ -1178,7 +1178,15 @@ module VX_sm_l1 import VX_gpu_pkg::*; #(
     assign req_end = t2_valid && t2_done && t2_last;
     wire [LWORD_W-1:0] e_wi = LWORD_W'(t2_r.addr[emit_lane]);
     wire [KEY_W-1:0] e_key = KEY_W'({t2_r.blk, t2_r.tag[LTID_W-1:0]});
+`ifdef VX_CFG_EXT_ZACAS_ENABLE
+    mem_bus_attr_t eg_cas;
+    reg [WORD*8-1:0] eg_cmp;
+`endif
     always @(*) begin
+    `ifdef VX_CFG_EXT_ZACAS_ENABLE
+        eg_cas    = '0;
+        eg_cmp    = '0;
+    `endif
         eg_push   = aeg_push;
         eg_rw     = aeg_rw;
         eg_addr   = MEM_ADDRW'(a_line);
@@ -1199,6 +1207,17 @@ module VX_sm_l1 import VX_gpu_pkg::*; #(
                 eg_data[e_wi * WORD * 8 +: WORD * 8] = t2_r.data[emit_lane];
                 eg_byteen = '0;
                 eg_byteen[e_wi * WORD +: WORD] = t2_r.byteen[emit_lane];
+            `ifdef VX_CFG_EXT_ZACAS_ENABLE
+                // The comparand travels in the other 16-B half of the operand's
+                // sector, at the operand's byte position in its word.
+                eg_cas = mem_bus_attr_t'(t2_r.attr[emit_lane]);
+                eg_cmp = (t2_r.byteen[emit_lane][WORD/2-1:0] == '0)
+                       ? {eg_cas.amo.amo_cmp[WORD*4-1:0], (WORD*4)'(0)}
+                       : (WORD*8)'(eg_cas.amo.amo_cmp);
+                eg_data[((e_wi * WORD) ^ 16) * 8 +: WORD * 8] = eg_cmp;
+                eg_cas.amo.amo_cmp = '0;
+                eg_attr = MEM_ATTR_WIDTH'(eg_cas);
+            `endif
             end
         end
     end

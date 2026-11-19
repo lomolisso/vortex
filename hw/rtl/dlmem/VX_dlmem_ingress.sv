@@ -81,7 +81,6 @@ module VX_dlmem_ingress import VX_gpu_pkg::*, VX_dlmem_pkg::*; #(
     reg [NUM_SLOTS-1:0][WORD_W-1:0]        data_r;
 `ifdef VX_CFG_H100_SM_ENABLE
     reg [NUM_SLOTS-1:0][OFF_W-1:0]         off_r;
-    reg [NUM_SLOTS-1:0][DLMEM_HB_W-1:0]    rsp_hb_r;
 `endif
 `ifdef VX_CFG_EXT_MBAR_ENABLE
     reg [NUM_SLOTS-1:0]                    async_r;
@@ -404,7 +403,6 @@ module VX_dlmem_ingress import VX_gpu_pkg::*, VX_dlmem_pkg::*; #(
                 tag_r[s] <= req_pkt.tag;
             `ifdef VX_CFG_H100_SM_ENABLE
                 off_r[s]    <= req_off;
-                rsp_hb_r[s] <= req_pkt.rsp_hb;
             `endif
             end
         `ifdef VX_CFG_EXT_MBAR_ENABLE
@@ -431,9 +429,6 @@ module VX_dlmem_ingress import VX_gpu_pkg::*, VX_dlmem_pkg::*; #(
         rsp_pkt      = '0;
         rsp_pkt.ack  = ack_r[head_slot];
         rsp_pkt.tag  = tag_r[head_slot];
-    `ifdef VX_CFG_H100_SM_ENABLE
-        rsp_pkt.pkt_hb = rsp_hb_r[head_slot];
-    `endif
     `ifdef VX_CFG_EXT_MBAR_ENABLE
         rsp_pkt.data = ack_r[head_slot] ? `VX_CFG_XLEN'(async_r[head_slot]) : data_r[head_slot];
     `else

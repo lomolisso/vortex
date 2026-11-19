@@ -2391,6 +2391,28 @@ tests:
             sw/common/l1_ref.h, sw/common/sm_port_ref.h, tests/regression/smem_bank, tests/regression/l1_sector,
             tests/regression/sm_port]
     args: "-m 7,8"
+  # The serialiser's mask flit and SM-to-SM messages beside global lines on one link.
+  - id: model_parity-sm-flit
+    check: model_parity
+    xlen: [64]
+    app: sm_port
+    configs: "-DVX_CFG_H100_SM_ENABLE -DVX_CFG_L2_ENABLE -DVX_CFG_SOCKET_SIZE=2 -DVX_CFG_EXT_DLMEM_ENABLE -DVX_CFG_EXT_A_ENABLE"
+    shape: {cores: 2, warps: 4, threads: 32}
+    touches: [VX_config.toml, hw/rtl/mem/VX_sm_port.sv, hw/rtl/mem/VX_sm_ingress.sv, hw/rtl/dlmem, sim/simx/mem/sm_port.h,
+            sim/simx/dlmem, sw/common/sm_port_ref.h, tests/regression/sm_port]
+    args: "-m 2,9"
+  # A store burst of one warp, then a DSMEM load and a shared load issued behind
+  # it in the same LSU block: cycles printed for comparison across builds.
+  - id: sm_hol
+    via: blackbox
+    drivers: [simx]
+    xlen: [64]
+    app: sm_hol
+    configs: "-DVX_CFG_H100_SM_ENABLE -DVX_CFG_L2_ENABLE -DVX_CFG_SOCKET_SIZE=2 -DVX_CFG_EXT_DLMEM_ENABLE"
+    shape: {cores: 2, warps: 4, threads: 32}
+    touches: [VX_config.toml, hw/rtl/mem/VX_sm_port.sv, hw/rtl/mem/VX_sm_l1.sv, sim/simx/mem/sm_port.h,
+            sim/simx/mem/sm_l1.cpp, sim/simx/lsu_unit.cpp, tests/regression/sm_hol]
+    args: "-n 256"
   - id: org-dlmem_store
     via: blackbox
     drivers: [simx]

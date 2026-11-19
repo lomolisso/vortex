@@ -45,40 +45,27 @@ inline bool sm_port_has_more(const MemReq& req) {
 
 inline sm_port_ref::SmPortCfg sm_port_cfg() {
   sm_port_ref::SmPortCfg c{};
-  c.egress_bytes     = VX_CFG_SM_EGRESS_BYTES;
-  c.beat_bytes       = VX_CFG_SM_EGRESS_BEAT;
-  c.hb_wr_sector     = VX_CFG_SM_HB_WRITE_SECTOR;
-  c.hb_wr_masked     = VX_CFG_SM_HB_WRITE_MASKED;
-  c.hb_rd_line       = VX_CFG_SM_HB_READ_LINE;
-  c.hb_pf_line       = VX_CFG_SM_HB_PREFETCH_LINE;
-  c.hb_atom_lane     = VX_CFG_SM_HB_ATOM_LANE;
-  c.hb_dsmem_slot    = VX_CFG_SM_HB_DSMEM_SLOT;
-  c.hb_dsmem_ld_line = VX_CFG_SM_HB_DSMEM_LD_LINE;
-  c.hb_tma_st_sector = VX_CFG_SM_HB_TMA_ST_SECTOR;
-  c.hb_mbar          = VX_CFG_SM_HB_MBAR;
-  c.min_slots        = VX_CFG_N5_MIN_SLOTS;
-  c.atom_extra_slots = VX_CFG_DSMEM_ATOM_EXTRA_SLOTS;
-  c.inj_credits      = VX_CFG_SM2SM_INJ_CREDITS;
-  c.inj_return       = VX_CFG_SM2SM_INJ_RETURN;
-  c.eject_bytes      = VX_CFG_SM2SM_EJECT_BYTES;
-  c.ingress_bytes    = VX_CFG_SM_INGRESS_BYTES;
-  c.w_fill           = VX_CFG_SM_INGRESS_FILL_WEIGHT;
-  c.w_dsmem          = VX_CFG_SM_INGRESS_DSMEM_WEIGHT;
-  c.issue_w_pm       = VX_CFG_SM_SECTOR_ISSUE_W_PERMILLE;
-  c.issue_r_pm       = VX_CFG_SM_SECTOR_ISSUE_R_PERMILLE;
-  c.req_fifo_bytes   = VX_CFG_SM_REQ_FIFO_BYTES;
-  c.rsp_slots        = VX_CFG_SM_RSP_QUEUE_SLOTS;
+  c.egress_bytes  = VX_CFG_SM_EGRESS_BYTES;
+  c.flit_bytes    = VX_CFG_SM_EGRESS_BEAT;
+  c.eject_bytes   = VX_CFG_SM2SM_EJECT_BYTES;
+  c.ingress_bytes = VX_CFG_SM_INGRESS_BYTES;
+  c.w_fill        = VX_CFG_SM_INGRESS_FILL_WEIGHT;
+  c.w_dsmem       = VX_CFG_SM_INGRESS_DSMEM_WEIGHT;
+  // A reply leaves its ingress slot when it enters this queue, so no more
+  // than the ingress slots can wait.
+  c.rsp_slots     = VX_CFG_DLMEM_INGRESS_SLOTS;
   return c;
 }
 
 // VX_sm_port + VX_sm_mem_adapter: one SM's ports to the GPC, its decisions
-// those of sm_port_ref's SmEgressRef and SmIngressRef. Request-class items
-// (the L1's and the TMA engine's line requests, this SM's SM-to-SM packets)
+// those of sm_port_ref's SmEgressRef and SmIngressRef. Request-class packets
+// (the L1's and the TMA engine's line requests, this SM's SM-to-SM messages)
 // enter one in-order FIFO, one per cycle round robin over the sources; the
-// replies this SM serves wait in the response queue. A paid L2-side item
-// passes the output register, then leaves as one memory block per cycle; its
-// reply blocks are gathered into one line, pass the input register and the
-// ingress gate with the SM-to-SM arrivals.
+// replies this SM serves wait in the response queue. Both share the egress
+// link flit by flit; an L2-side packet whose last flit is sent passes the
+// output register, then leaves as one memory block per cycle; its reply
+// blocks are gathered into one line, pass the input register and the ingress
+// gate with the SM-to-SM arrivals.
 //
 // The memory tag carries what the reply needs on the way back: the source,
 // the blocks sent and the sectors the reply brings into the SM.
@@ -128,18 +115,19 @@ public:
     , cfg_(sm_port_cfg())
     , egress_(cfg_)
     , ingress_(cfg_)
-    , sectors_(config.line_bytes / cfg_.beat_bytes)
+    , sectors_(config.line_bytes / cfg_.flit_bytes)
     , blocks_(config.line_bytes / VX_CFG_MEM_BLOCK_SIZE) {
     if (config.num_srcs < 1 || config.num_srcs > MAX_SRCS)
       throw std::runtime_error("sm port: one L1 and at most one TMA source");
-    if (cfg_.beat_bytes != VX_CFG_DCACHE_SECTOR_SIZE)
-      throw std::runtime_error("sm port: the egress beat must be the L1 sector");
-    if ((cfg_.egress_bytes % cfg_.beat_bytes) != 0 || (cfg_.ingress_bytes % cfg_.beat_bytes) != 0)
-      throw std::runtime_error("sm port: the egress and ingress must be whole beats");
-    if ((config.line_bytes % VX_CFG_MEM_BLOCK_SIZE) != 0 || (config.line_bytes % cfg_.beat_bytes) != 0)
+    if (cfg_.flit_bytes != VX_CFG_DCACHE_SECTOR_SIZE)
+      throw std::runtime_error("sm port: the flit must be the L1 sector");
+    if ((cfg_.egress_bytes % cfg_.flit_bytes) != 0 || (cfg_.ingress_bytes % cfg_.flit_bytes) != 0
+     || (cfg_.eject_bytes % cfg_.flit_bytes) != 0)
+      throw std::runtime_error("sm port: the egress, ejection and ingress must be whole flits");
+    if ((config.line_bytes % VX_CFG_MEM_BLOCK_SIZE) != 0 || (config.line_bytes % cfg_.flit_bytes) != 0)
       throw std::runtime_error("sm port: the line must be whole memory blocks and sectors");
-    if (cfg_.inj_credits < 1 || cfg_.inj_credits > cfg_.inj_return)
-      throw std::runtime_error("sm port: injection credits must be 1..return");
+    if (config.line_bytes > 8 * cfg_.flit_bytes)
+      throw std::runtime_error("sm port: a line's byte mask must fit one flit");
     if (cfg_.eject_bytes > cfg_.ingress_bytes)
       throw std::runtime_error("sm port: ejection above the ingress");
     if (blocks_ > (1u << TAG_BLK_BITS))
@@ -182,7 +170,6 @@ protected:
     in_reg_.clear();
     adapter_blk_ = 0;
     rr_last_ = 0;
-    idle_ = 0;
   }
 
   void on_tick() {
@@ -193,13 +180,8 @@ protected:
     this->adapter_send(now);
     this->gather_replies(now);
     this->ingress_pass(now);
-    if (this->empty() && egress_.credits() == cfg_.inj_credits) {
-      // Credits and issue tokens refill within inj_return cycles of idling.
-      if (++idle_ > cfg_.inj_return)
-        this->tick_sleep();
-    } else {
-      idle_ = 0;
-    }
+    if (this->empty())
+      this->tick_sleep();
   }
 
 private:
@@ -252,6 +234,17 @@ private:
         in.pop();
       }
     }
+  }
+
+  // The byte mask of a memory block widened to whole sectors.
+  uint64_t sector_mask(uint64_t be) const {
+    uint64_t out = 0;
+    uint64_t sect = (cfg_.flit_bytes >= 64) ? ~0ull : ((1ull << cfg_.flit_bytes) - 1);
+    for (uint32_t o = 0; o < VX_CFG_MEM_BLOCK_SIZE; o += cfg_.flit_bytes) {
+      if ((be >> o) & sect)
+        out |= sect << o;
+    }
+    return out;
   }
 
   uint32_t block_of(const MemReq& r) const {
@@ -316,28 +309,22 @@ private:
         be[off + i] = (b.byteen >> i) & 1;
     }
     const MemReq& h = it.blocks.front();
-    uint32_t touched = sm_port_ref::touched_sectors(be.data(), config_.line_bytes, cfg_.beat_bytes);
+    uint32_t touched = sm_port_ref::touched_sectors(be.data(), config_.line_bytes, cfg_.flit_bytes);
     bool is_amo = memop_is_amo(h.op);
     bool is_rd = !h.is_write() && !h.flags.fence && !is_amo;
     bool is_wr = h.is_write() && !is_amo;
     it.rsp_sect = is_rd ? (touched ? touched : sectors_) : (is_amo ? 1 : 0);
     it.expects = (h.op != MemOp::ST) || h.flags.fence || h.flags.strsp;
-    eit->slots = 0;
+    auto kind = h.flags.fence ? sm_port_ref::SmItem::Fence
+              : is_amo ? sm_port_ref::SmItem::Atomic
+              : is_wr ? sm_port_ref::SmItem::WriteLine
+              : sm_port_ref::SmItem::ReadLine;
+    eit->flits = sm_port_ref::sm_packet_flits(kind, be.data(), config_.line_bytes, cfg_);
     eit->l2 = true;
-    eit->single = 0;
-    if (h.flags.fence) {
-      eit->hb = cfg_.hb_rd_line;
-    } else if (is_amo) {
-      eit->hb = sm_port_ref::sm_item_halfbeats(sm_port_ref::SmItem::AtomicLanes, be.data(), config_.line_bytes, 1, 0, cfg_);
-    } else if (is_wr) {
-      auto kind = (s == SRC_L1) ? sm_port_ref::SmItem::WriteLine : sm_port_ref::SmItem::TmaStoreLine;
-      eit->hb = sm_port_ref::sm_item_halfbeats(kind, be.data(), config_.line_bytes, 0, 0, cfg_);
-      if (s == SRC_L1 && touched == 1)
-        eit->single = 1;
-    } else {
-      eit->hb = sm_port_ref::sm_item_halfbeats(sm_port_ref::SmItem::ReadLine, be.data(), config_.line_bytes, 0, 0, cfg_);
-      if (s == SRC_L1 && touched == 1)
-        eit->single = 2;
+    // A read's or a fence's header names sectors, not bytes.
+    if (kind == sm_port_ref::SmItem::ReadLine || kind == sm_port_ref::SmItem::Fence) {
+      for (auto& b : it.blocks)
+        b.byteen = this->sector_mask(b.byteen);
     }
     return it;
   }
@@ -367,16 +354,14 @@ private:
           continue;
         it.src = DSM;
         it.dsm = DsmReqIn.peek();
-        eit.hb = it.dsm.pkt_hb;
-        eit.slots = (it.dsm.pkt_hb + 1) / 2;
+        eit.flits = 1;
         eit.l2 = false;
-        eit.single = 0;
       #endif
       }
-      if (!egress_.req_can_push(eit))
+      if (!egress_.req_can_push())
         continue;
       egress_.req_push(eit);
-      DT(3, this->name() << " push src" << j << " hb=" << eit.hb << " slots=" << eit.slots << " blocks=" << nblk);
+      DT(3, this->name() << " push src" << j << " flits=" << eit.flits << " blocks=" << nblk);
       if (j < nsrc) {
         staged_[j].erase(staged_[j].begin(), staged_[j].begin() + nblk);
       } else {
@@ -392,10 +377,9 @@ private:
     if (!DsmRspIn.empty()) {
       auto& rsp = DsmRspIn.peek();
       sm_port_ref::SmEgressItem eit;
-      eit.hb = rsp.pkt_hb;
-      eit.slots = (eit.hb + 1) / 2;
+      eit.flits = 1;
       eit.l2 = false;
-      if (egress_.rsp_can_push(eit)) {
+      if (egress_.rsp_can_push()) {
         egress_.rsp_push(eit);
         rsp_items_.push_back(rsp);
         DsmRspIn.pop();
@@ -518,12 +502,12 @@ private:
   #ifdef VX_CFG_EXT_DLMEM_ENABLE
     if (!ArrReqIn.empty()) {
       valid[G::DSM_REQ] = true;
-      sectors[G::DSM_REQ] = (ArrReqIn.peek().pkt_hb + 1) / 2;
+      sectors[G::DSM_REQ] = 1;
       ready[G::DSM_REQ] = room(ArrReqOut, 1);
     }
     if (!ArrRspIn.empty()) {
       valid[G::DSM_RSP] = true;
-      sectors[G::DSM_RSP] = (ArrRspIn.peek().pkt_hb + 1) / 2;
+      sectors[G::DSM_RSP] = 1;
       ready[G::DSM_RSP] = room(ArrRspOut, 1);
     }
   #endif
@@ -567,7 +551,6 @@ private:
   uint32_t adapter_blk_ = 0;
   uint32_t adapter_idx_ = 0;
   uint32_t rr_last_ = 0;
-  uint32_t idle_ = 0;
 
   friend class SimObject<SmPort>;
 };

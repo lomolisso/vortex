@@ -712,7 +712,8 @@ public:
 #if VX_CFG_EXT_ZACAS_ENABLED
 // 22) cas-global: per hart, amocas.w (and amocas.d at RV64) on its own line
 //   with a non-zero comparand, equal to memory (hit: the swap lands) and not
-//   (miss: memory unchanged); both return the old value. 23) cas-local: the
+//   (miss: memory unchanged), in both halves of a doubleword; both return the
+//   old value. 23) cas-local: the
 //   same on a local-memory copy of the line.
 class Test_CAS_GLOBAL : public ITestCase {
 public:
@@ -723,7 +724,8 @@ public:
       uint32_t* line = shared + h * CASG_LINE_WORDS;
       per_hart[h] = 0;
       line[CASG_W_HIT]  = CASG_W_SEED(h);
-      line[CASG_W_MISS] = CASG_W_SEED(h);
+      line[CASG_W_MISS] = CASG_W_MISS_MEM;
+      line[CASG_W_ODD]  = CASG_W_ODD_SEED(h);
       put_d(line + CASG_D_HIT,  CASG_D_SEED(h));
       put_d(line + CASG_D_MISS, CASG_D_SEED(h));
     }
@@ -741,8 +743,11 @@ public:
       const uint32_t* line = shared + h * CASG_LINE_WORDS;
       check(h, "amocas.w hit memory",   line[CASG_W_HIT],      CASG_W_NEW(h));
       check(h, "amocas.w hit old",      line[CASG_W_HIT_RET],  CASG_W_SEED(h));
-      check(h, "amocas.w miss memory",  line[CASG_W_MISS],     CASG_W_SEED(h));
-      check(h, "amocas.w miss old",     line[CASG_W_MISS_RET], CASG_W_SEED(h));
+      check(h, "amocas.w miss memory",  line[CASG_W_MISS],     CASG_W_MISS_MEM);
+      check(h, "amocas.w miss old",     line[CASG_W_MISS_RET], CASG_W_MISS_MEM);
+      check(h, "amocas.w odd hit old",  line[CASG_W_ODD_RET],  CASG_W_ODD_SEED(h));
+      check(h, "amoadd.w odd old",      line[CASG_W_ODD_ADD_RET], CASG_W_NEW(h));
+      check(h, "amoadd.w odd memory",   line[CASG_W_ODD],      CASG_W_NEW(h) + CASG_W_ODD_ADD);
 #if VX_CFG_XLEN == 64
       check(h, "amocas.d hit memory",   get_d(line + CASG_D_HIT),      CASG_D_NEW(h));
       check(h, "amocas.d hit old",      get_d(line + CASG_D_HIT_RET),  CASG_D_SEED(h));

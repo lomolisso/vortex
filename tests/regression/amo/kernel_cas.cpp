@@ -6,14 +6,20 @@
 #include "common.h"
 
 #if VX_CFG_EXT_ZACAS_ENABLED
-// Compare-and-swap whose comparand is not zero, hit and miss, at both widths.
+// Compare-and-swap whose comparand is not zero, hit and miss, at both widths
+// and both halves of a doubleword.
 static inline void cas_nonzero(uint32_t* line, uint32_t hid) {
   uint32_t w = CASG_W_SEED(hid);
   asm volatile ("amocas.w %0, %2, (%1)" : "+r"(w) : "r"(&line[CASG_W_HIT]), "r"(CASG_W_NEW(hid)) : "memory");
   line[CASG_W_HIT_RET] = w;
-  w = CASG_W_SEED(hid) + 1;
+  w = CASG_W_MISS_CMP(hid);
   asm volatile ("amocas.w %0, %2, (%1)" : "+r"(w) : "r"(&line[CASG_W_MISS]), "r"(CASG_W_NEW(hid)) : "memory");
   line[CASG_W_MISS_RET] = w;
+  w = CASG_W_ODD_SEED(hid);
+  asm volatile ("amocas.w %0, %2, (%1)" : "+r"(w) : "r"(&line[CASG_W_ODD]), "r"(CASG_W_NEW(hid)) : "memory");
+  line[CASG_W_ODD_RET] = w;
+  asm volatile ("amoadd.w %0, %2, (%1)" : "=r"(w) : "r"(&line[CASG_W_ODD]), "r"(CASG_W_ODD_ADD) : "memory");
+  line[CASG_W_ODD_ADD_RET] = w;
 #if __riscv_xlen == 64
   auto dline = (uint64_t*)line;
   uint64_t d = CASG_D_SEED(hid);

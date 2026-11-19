@@ -248,78 +248,6 @@ module VX_dlmem_egress import VX_gpu_pkg::*, VX_dlmem_pkg::*; #(
         end
     end
 
-`ifdef VX_CFG_H100_SM_ENABLE
-    // SM-to-SM packets: the lanes of one request bound for one destination
-    // line form a packet, whose slot count rides on its first lane's message
-    // (an mbarrier operation is a packet of its own); an async request's extra
-    // bytes ride on its first message.
-    localparam PKT_LINE_LSB = `CLOG2(`VX_CFG_N5_LINE_BYTES) - DLMEM_WA;
-    localparam PKT_SECT_LSB = `CLOG2(`VX_CFG_N5_SLOT_BYTES) - DLMEM_WA;
-    localparam PKT_SECT_W   = `CLOG2(DLMEM_PKT_SECTORS + 1);
-    `STATIC_ASSERT (PKT_SECT_LSB >= 0, ("dlmem egress: a slot narrower than an LSU word"))
-
-    wire [NUM_LANES-1:0] lane_issued = in_mask[cur_blk] & ~cur_mask;
-    wire [NUM_LANES-1:0] lane_same;
-    wire [NUM_LANES-1:0][DLMEM_PKT_SECTORS-1:0] lane_sect;
-    for (genvar l = 0; l < NUM_LANES; ++l) begin : g_pkt_lane
-        wire [LSU_ADDR_WIDTH-1:0] la = in_addr[cur_blk][l];
-        `UNUSED_VAR (la)
-        assign lane_same[l] = in_mask[cur_blk][l]
-                           && (la[DLMEM_LMEM_AW +: DLMEM_CORE_W] == cur_dst)
-                           && (la[DLMEM_LMEM_AW-1:PKT_LINE_LSB] == cur_addr[DLMEM_LMEM_AW-1:PKT_LINE_LSB]);
-        if (DLMEM_PKT_SECTORS > 1) begin : g_sect
-            assign lane_sect[l] = lane_same[l] ? (DLMEM_PKT_SECTORS'(1) << la[PKT_SECT_LSB +: `CLOG2(DLMEM_PKT_SECTORS)]) : '0;
-        end else begin : g_sect1
-            assign lane_sect[l] = lane_same[l];
-        end
-    end
-    reg [DLMEM_PKT_SECTORS-1:0] pkt_sect_mask;
-    always @(*) begin
-        pkt_sect_mask = '0;
-        for (integer l = 0; l < NUM_LANES; ++l) begin
-            pkt_sect_mask = pkt_sect_mask | lane_sect[l];
-        end
-    end
-    wire [PKT_SECT_W-1:0] pkt_sectors;
-    `POP_COUNT(pkt_sectors, pkt_sect_mask);
-
-    wire pkt_first = ~(| (lane_same & lane_issued));
-    wire req_first = (lane_issued == '0);
-`ifdef VX_CFG_EXT_MBAR_ENABLE
-    wire cur_mbar  = cur_amo && ~cur_async
-                  && (cur_attr.amo.amo_op inside {AMO_OP_MBAR_ARRIVE, AMO_OP_MBAR_ARRIVE_TX, AMO_OP_MBAR_EXPECT_TX,
-                                                  AMO_OP_MBAR_COMPLETE_TX, AMO_OP_MBAR_TEST_WAIT, AMO_OP_MBAR_TRY_WAIT});
-    wire [DLMEM_HB_W-1:0] extra_hb = ~(req_first && cur_async) ? '0
-        : DLMEM_HB_W'(2 * ((cur_op == DLMEM_OP_AMO) ? `VX_CFG_N5_REDASYNC_EXTRA_BYTES
-                         : (($countones(cur_byteen) <= 4) ? `VX_CFG_N5_ASYNC_EXTRA_BYTES_B32
-                                                          : `VX_CFG_N5_ASYNC_EXTRA_BYTES_V4)) / `VX_CFG_N5_SLOT_BYTES);
-    wire cur_red_async = cur_async && (cur_op == DLMEM_OP_AMO);
-`else
-    wire cur_mbar = 1'b0;
-    wire [DLMEM_HB_W-1:0] extra_hb = '0;
-    wire cur_red_async = 1'b0;
-`endif
-
-    reg [DLMEM_HB_W-1:0] pkt_hb, rsp_hb;
-    always @(*) begin
-        reg [DLMEM_HB_W-1:0] cost;
-        if (cur_op == DLMEM_OP_ST) begin
-            cost = DLMEM_HB_W'(`MAX(32'(pkt_sectors), `VX_CFG_N5_MIN_SLOTS) * `VX_CFG_SM_HB_DSMEM_SLOT);
-        end else if (cur_op == DLMEM_OP_LD) begin
-            cost = DLMEM_HB_W'(`VX_CFG_SM_HB_DSMEM_LD_LINE);
-        end else begin
-            cost = DLMEM_HB_W'((32'(pkt_sectors) + `VX_CFG_DSMEM_ATOM_EXTRA_SLOTS) * `VX_CFG_SM_HB_DSMEM_SLOT);
-        end
-        if (cur_mbar) begin
-            pkt_hb = DLMEM_HB_W'(`VX_CFG_SM_HB_MBAR);
-        end else begin
-            pkt_hb = pkt_first ? (cost + extra_hb) : '0;
-        end
-        rsp_hb = (pkt_first && ~cur_mbar && ~cur_red_async && (cur_op != DLMEM_OP_ST))
-               ? DLMEM_HB_W'(32'(pkt_sectors) * `VX_CFG_SM_HB_DSMEM_SLOT) : '0;
-    end
-`endif
-
     // Request packet.
 
     dlmem_req_pkt_t req_pkt;
@@ -339,10 +267,6 @@ module VX_dlmem_egress import VX_gpu_pkg::*, VX_dlmem_pkg::*; #(
     `ifdef VX_CFG_EXT_MBAR_ENABLE
         req_pkt.mbar_valid   = cur_async;
         req_pkt.mbar_addr    = cur_addr[DLMEM_ASYNC_MB_LSB +: DLMEM_LMEM_AW];
-    `endif
-    `ifdef VX_CFG_H100_SM_ENABLE
-        req_pkt.pkt_hb       = pkt_hb;
-        req_pkt.rsp_hb       = rsp_hb;
     `endif
         req_pkt.tag          = is_st ? DLMEM_TAG_W'(cur_wid) : DLMEM_TAG_W'(free_idx);
     end

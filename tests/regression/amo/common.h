@@ -99,6 +99,11 @@ constexpr uint32_t lrsc_bank_stations(uint32_t entries) {
 // cas-global: one 64-byte line of the shared buffer per hart. Word and
 // doubleword compare-and-swap with a non-zero comparand, once equal to the
 // memory (hit) and once not (miss); the returned old values land in the line.
+// The word miss sits in the upper half of a doubleword with an all-ones memory
+// word and a negative comparand, so a comparand read from the wrong half of the
+// register (its sign extension) would hit. The odd word at byte 44 takes a hit
+// and then an amoadd.w: its comparand's half-sector partner is the line's last
+// word.
 #define CASG_W_HIT       0
 #define CASG_W_MISS      1
 #define CASG_W_HIT_RET   2
@@ -106,12 +111,19 @@ constexpr uint32_t lrsc_bank_stations(uint32_t entries) {
 #define CASG_D_HIT       4   // words 4-5
 #define CASG_D_MISS      6
 #define CASG_D_HIT_RET   8
-#define CASG_D_MISS_RET  10
+#define CASG_W_ODD_RET   10
+#define CASG_W_ODD       11
+#define CASG_D_MISS_RET  12
+#define CASG_W_ODD_ADD_RET 14
 #define CASG_LINE_WORDS  16
 #define CASG_TEST_GLOBAL 22  // test ids (with Zacas) in kernel_cas.vxbin
 #define CASG_TEST_LOCAL  23
 #define CASG_W_SEED(h)   (0x5a000001u + ((uint32_t)(h) << 4))
 #define CASG_W_NEW(h)    (0xc3000000u | (uint32_t)(h))
+#define CASG_W_MISS_MEM  0xffffffffu
+#define CASG_W_MISS_CMP(h) (0x80000000u | (uint32_t)(h))
+#define CASG_W_ODD_SEED(h) (0x6b000003u + ((uint32_t)(h) << 4))
+#define CASG_W_ODD_ADD   0x00010001u
 #define CASG_D_SEED(h)   (0x1234567800000001ull + ((uint64_t)(h) << 4))
 #define CASG_D_NEW(h)    (0x8765432100000000ull | (uint64_t)(h))
 

@@ -1671,7 +1671,15 @@ private:
       m.addr = lr.addrs.at(lane);
       m.data = lr.data.at(lane);
       m.byteen = lr.byteen.at(lane);
-      m.amo_cmp = lr.amo_cmp.at(lane);
+      // The comparand travels in the other 16-B half of the operand's sector,
+      // at the operand's byte position and width.
+      if (memop_is_amo(m.op) && m.data) {
+        uint32_t off = uint32_t(m.addr % VX_CFG_MEM_BLOCK_SIZE) ^ 16;
+        uint32_t width = (__builtin_popcountll(m.byteen) >= 8) ? 8 : 4;
+        m.data = std::make_shared<mem_block_t>(*m.data);
+        std::memcpy(m.data->data() + off, &lr.amo_cmp.at(lane), width);
+      }
+      m.amo_cmp = 0;
       m.flags = lr.flags;
       m.hart_id = hart;
       m.uuid = lr.uuid;

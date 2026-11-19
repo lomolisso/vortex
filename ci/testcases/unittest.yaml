@@ -395,11 +395,13 @@ tests:
     xlen: [64]
     run: "make -C tests/unittest/l1_sector run CONFIGS='-DVX_CFG_H100_SM_ENABLE -DVX_CFG_NUM_THREADS=32 -DVX_CFG_EXT_A_ENABLE -DVX_CFG_EXT_ZACAS_ENABLE'"
     touches: *e12_l1_touches
-  # The SM port: egress rates and every leave cycle against sm_port_ref.h's
-  # SmEgressRef, the single-sector issue limits, the injection credit loop,
-  # the 5 : 1 ingress gate and the ejection cap, a DSMEM head holding the L2
-  # request behind it; with DLMEM and with a 64-B egress. The twin checks the
-  # same rates (its port also splits items into memory blocks).
+  # The SM port: every leave cycle against sm_port_ref.h's SmEgressRef, each
+  # stream's rate against its structural formula (one 32-B flit per cycle, a
+  # packet's flits by the port's format: write = touched sectors + 1 mask flit
+  # if any is partial, read / atomic / SM-to-SM message = 1), the ingress gate
+  # and the ejection link, back-pressure from the L2 and SM-to-SM sinks; H100
+  # rates printed as H100REF lines. The twin checks the same formulas (its port
+  # also splits items into memory blocks).
   - id: hw-sm-port
     via: script
     xlen: [64]

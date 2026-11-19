@@ -18,15 +18,17 @@
 // One SM's ports to the GPC, cycle for cycle sm_port_ref::SmEgressRef and
 // SmIngressRef.
 //
-// Egress: every request-class item (the L1TEX sources' line requests and the
-// SM's own SM-to-SM packets) enters one in-order FIFO, one item per cycle,
-// round robin over the sources an item can be admitted from (room in half-beats
-// and entries, an issue token for a single-sector request). The SM-to-SM
-// replies this SM serves wait in a response queue. Each cycle the port deals
-// 2 * EGRESS_BYTES / BEAT half-beats to the two heads round robin; a half-beat
-// that starts a slot of an SM-to-SM item also takes an injection credit,
-// returned INJ_RETURN cycles later. A paid head leaves when its sink is ready;
-// a head that cannot leave holds its queue.
+// Egress: every request-class packet (the L1TEX sources' line requests and the
+// SM's own SM-to-SM messages) enters one in-order FIFO, one per cycle round
+// robin over the sources; the SM-to-SM replies this SM serves wait in a
+// response queue. The two heads share one link of EGRESS_BYTES / FLIT flits
+// per cycle, round robin per flit. A packet's header rides in the link's side
+// field with its first flit: a write then sends its touched sectors and, when
+// one is partial, the line's byte mask as one more flit; any other packet is
+// one flit (a read's or a fence's header, an atomic's operand sector, an
+// SM-to-SM message). The deserialiser at the far end rebuilds the request;
+// a packet whose last flit is sent leaves once its sink is ready, and a head
+// that cannot leave holds its queue.
 //
 // Ingress: L2 replies pass their input register, then the ingress gate
 // with the SM-to-SM arrivals (VX_sm_ingress) and return to their source.
@@ -59,35 +61,31 @@ module VX_sm_port import VX_gpu_pkg::*;
 
     output wire             empty
 );
-    localparam BEAT       = `VX_CFG_SM_EGRESS_BEAT;
-    localparam SECTORS    = LINE_SIZE / BEAT;
+    localparam FLIT       = `VX_CFG_SM_EGRESS_BEAT;
+    localparam FLIT_BITS  = FLIT * 8;
+    localparam SECTORS    = LINE_SIZE / FLIT;
     localparam SECT_W     = `CLOG2(SECTORS + 1);
-    localparam UNITS      = 2 * `VX_CFG_SM_EGRESS_BYTES / BEAT;
-    localparam ING_UNITS  = `VX_CFG_SM_INGRESS_BYTES / BEAT;
-    localparam EJECT      = `VX_CFG_SM2SM_EJECT_BYTES / BEAT;
+    localparam SIDX_W     = `LOG2UP(SECTORS);
+    localparam UNITS      = `VX_CFG_SM_EGRESS_BYTES / FLIT;
+    localparam ING_UNITS  = `VX_CFG_SM_INGRESS_BYTES / FLIT;
+    localparam EJECT      = `VX_CFG_SM2SM_EJECT_BYTES / FLIT;
     localparam SRC_W      = `LOG2UP(NUM_SRCS);
     localparam LADDR_W    = `VX_CFG_MEM_ADDR_WIDTH - `CLOG2(LINE_SIZE);
     localparam MEM_TAG_W  = SRC_TAG_WIDTH + SECT_W + SRC_W;
-    localparam L2_HB_MAX  = SECTORS * `MAX(`MAX(`VX_CFG_SM_HB_WRITE_SECTOR, `VX_CFG_SM_HB_WRITE_MASKED), `VX_CFG_SM_HB_TMA_ST_SECTOR)
-                          + `MAX(`VX_CFG_SM_HB_READ_LINE, `VX_CFG_SM_HB_ATOM_LANE);
+    localparam CNT_W      = `CLOG2(SECTORS + 2);
+    // The serialiser's skid: the packet on the link and the next one, so the
+    // link never idles on its own ready loop.
+    localparam REQ_DEPTH  = 2;
+    // A reply leaves its ingress slot when it enters this queue, so no more
+    // than the ingress slots can wait.
 `ifdef VX_CFG_EXT_DLMEM_ENABLE
-    localparam DSM_HB_MAX = (1 << DLMEM_HB_W) - 1;
+    localparam RSP_DEPTH  = DLMEM_INGRESS_SLOTS;
 `else
-    localparam DSM_HB_MAX = 0;
+    localparam RSP_DEPTH  = 1;
 `endif
-    localparam HB_W       = `CLOG2(`MAX(L2_HB_MAX, DSM_HB_MAX) + 1);
-    localparam SLOT_W     = HB_W;
-    localparam REQ_CAP    = 2 * `VX_CFG_SM_REQ_FIFO_BYTES / BEAT;
-    localparam REQ_DEPTH  = 1 << `CLOG2(REQ_CAP);
-    localparam RSP_CAP    = `VX_CFG_SM_RSP_QUEUE_SLOTS;
-    localparam RSP_DEPTH  = 1 << `CLOG2(RSP_CAP);
-    localparam OCC_W      = `CLOG2(`MAX(REQ_CAP, 2 * RSP_CAP) * 2 + 1);
-    localparam CRED_W     = `CLOG2(`VX_CFG_SM2SM_INJ_CREDITS + 1);
-    localparam RET        = `VX_CFG_SM2SM_INJ_RETURN;
-    localparam RET_W      = `CLOG2(UNITS + 1);
-    localparam TOK_W      = 12;
-    localparam TOK_W_CAP  = 1000 + `VX_CFG_SM_SECTOR_ISSUE_W_PERMILLE;
-    localparam TOK_R_CAP  = 1000 + `VX_CFG_SM_SECTOR_ISSUE_R_PERMILLE;
+    // An L2 packet's header: rw, line address, attributes, tag, the sectors it
+    // names, whether a byte-mask flit follows, and an atomic's operand bytes.
+    localparam L2_HDR_W   = 1 + LADDR_W + MEM_ATTR_WIDTH + MEM_TAG_W + SECTORS + 1 + FLIT;
     localparam L2_PAYLOAD = 1 + LADDR_W + LINE_SIZE * 8 + LINE_SIZE + MEM_ATTR_WIDTH + MEM_TAG_W;
 `ifdef VX_CFG_EXT_DLMEM_ENABLE
     localparam DSM_PAYLOAD = DLMEM_CORE_W + DLMEM_REQ_DATAW;
@@ -99,32 +97,30 @@ module VX_sm_port import VX_gpu_pkg::*;
     localparam NUM_RSRCS   = NUM_SRCS;
 `endif
     localparam REQ_PAYLOAD = `MAX(L2_PAYLOAD, DSM_PAYLOAD);
-    localparam REQ_META    = HB_W + SLOT_W + 1;
-    localparam RSP_META    = HB_W + SLOT_W;
+    // An SM-to-SM message fills one flit and its side field.
+    localparam HDR_W       = `MAX(L2_HDR_W, `MAX(DSM_PAYLOAD, RSP_PAYLOAD) - FLIT_BITS);
+    localparam LINK_W      = HDR_W + FLIT_BITS;
 
 `ifndef DBG_TRACE_MEM
     `UNUSED_SPARAM (INSTANCE_ID)
 `endif
 
-    `STATIC_ASSERT (BEAT == `VX_CFG_DCACHE_SECTOR_SIZE, ("sm port: the egress beat must be the L1 sector"))
-    `STATIC_ASSERT (`VX_CFG_SM_EGRESS_BYTES % BEAT == 0 && `VX_CFG_SM_INGRESS_BYTES % BEAT == 0,
-        ("sm port: the egress and ingress must be whole beats"))
-    `STATIC_ASSERT (LINE_SIZE % BEAT == 0, ("sm port: the line must be whole sectors"))
-    `STATIC_ASSERT (`VX_CFG_SM2SM_INJ_CREDITS >= 1 && `VX_CFG_SM2SM_INJ_CREDITS <= RET,
-        ("sm port: injection credits must be 1..return"))
+    `STATIC_ASSERT (FLIT == `VX_CFG_DCACHE_SECTOR_SIZE, ("sm port: the flit must be the L1 sector"))
+    `STATIC_ASSERT (UNITS >= 1 && `VX_CFG_SM_EGRESS_BYTES % FLIT == 0 && `VX_CFG_SM_INGRESS_BYTES % FLIT == 0
+                 && `VX_CFG_SM2SM_EJECT_BYTES % FLIT == 0,
+        ("sm port: the egress, ejection and ingress must be whole flits"))
+    `STATIC_ASSERT (LINE_SIZE % FLIT == 0, ("sm port: the line must be whole sectors"))
+    `STATIC_ASSERT (LINE_SIZE <= FLIT_BITS, ("sm port: a line's byte mask must fit one flit"))
     `STATIC_ASSERT (`VX_CFG_SM2SM_EJECT_BYTES <= `VX_CFG_SM_INGRESS_BYTES, ("sm port: ejection above the ingress"))
     `STATIC_ASSERT (NUM_SRCS >= 1 && NUM_SRCS <= 2, ("sm port: one L1 and at most one TMA source"))
 
     ///////////////////////////////////////////////////////////////////////////
-    // Request-class sources and their costs.
+    // Request-class sources.
 
-    wire [NUM_RSRCS-1:0]                 rs_valid;
-    wire [NUM_RSRCS-1:0][HB_W-1:0]       rs_hb;
-    wire [NUM_RSRCS-1:0][SLOT_W-1:0]     rs_slots;
-    wire [NUM_RSRCS-1:0]                 rs_l2;
-    wire [NUM_RSRCS-1:0][1:0]            rs_single;
+    wire [NUM_RSRCS-1:0]                  rs_valid;
+    wire [NUM_RSRCS-1:0]                  rs_l2;
     wire [NUM_RSRCS-1:0][REQ_PAYLOAD-1:0] rs_payload;
-    wire [NUM_RSRCS-1:0]                 rs_ready;
+    wire [NUM_RSRCS-1:0]                  rs_ready;
 
     for (genvar i = 0; i < NUM_SRCS; ++i) begin : g_src
         wire [LINE_SIZE-1:0] be = src_bus_if[i].req_data.byteen;
@@ -132,57 +128,24 @@ module VX_sm_port import VX_gpu_pkg::*;
         assign attr = mem_bus_attr_t'(src_bus_if[i].req_data.attr);
         `UNUSED_VAR (attr)
 
-        wire [SECTORS-1:0] touched, full;
+        wire [SECTORS-1:0] touched;
         for (genvar s = 0; s < SECTORS; ++s) begin : g_sect
-            assign touched[s] = (| be[s * BEAT +: BEAT]);
-            assign full[s]    = (& be[s * BEAT +: BEAT]);
+            assign touched[s] = (| be[s * FLIT +: FLIT]);
         end
-
-        wire [SECT_W-1:0] n_touched, n_full;
+        wire [SECT_W-1:0] n_touched;
         `POP_COUNT(n_touched, touched);
-        `POP_COUNT(n_full, full);
 
-        wire is_fence = attr.is_fence;
-        wire is_amo   = attr.amo.amo_valid;
-        wire is_rd    = ~src_bus_if[i].req_data.rw && ~is_fence && ~is_amo;
-        wire is_wr    = src_bus_if[i].req_data.rw && ~is_amo;
+        wire is_rd = ~src_bus_if[i].req_data.rw && ~attr.is_fence && ~attr.amo.amo_valid;
 
         // Sectors the reply brings back (0: no reply, or one that carries no fill).
         wire [SECT_W-1:0] rsp_sect = is_rd ? ((n_touched != '0) ? n_touched : SECT_W'(SECTORS))
-                                   : (is_amo ? SECT_W'(1) : '0);
-
-        reg [HB_W-1:0] hb;
-        reg [1:0]      single;
-        always @(*) begin
-            single = 2'd0;
-            if (is_fence) begin
-                hb = HB_W'(`VX_CFG_SM_HB_READ_LINE);
-            end else if (is_amo) begin
-                hb = HB_W'(`VX_CFG_SM_HB_ATOM_LANE);
-            end else if (is_wr) begin
-                if (i == 0) begin
-                    hb = HB_W'(n_full) * HB_W'(`VX_CFG_SM_HB_WRITE_SECTOR)
-                       + HB_W'(n_touched - n_full) * HB_W'(`VX_CFG_SM_HB_WRITE_MASKED);
-                    single = (n_touched == SECT_W'(1)) ? 2'd1 : 2'd0;
-                end else begin
-                    hb = HB_W'(n_touched) * HB_W'(`VX_CFG_SM_HB_TMA_ST_SECTOR);
-                end
-            end else begin
-                hb = HB_W'(`VX_CFG_SM_HB_READ_LINE);
-                if (i == 0) begin
-                    single = (n_touched == SECT_W'(1)) ? 2'd2 : 2'd0;
-                end
-            end
-        end
+                                   : (attr.amo.amo_valid ? SECT_W'(1) : '0);
 
         wire [MEM_TAG_W-1:0] out_tag = {src_bus_if[i].req_data.tag.uuid, rsp_sect, SRC_W'(i),
                                         src_bus_if[i].req_data.tag.value};
 
         assign rs_valid[i]   = src_bus_if[i].req_valid;
-        assign rs_hb[i]      = hb;
-        assign rs_slots[i]   = '0;
         assign rs_l2[i]      = 1'b1;
-        assign rs_single[i]  = single;
         assign rs_payload[i] = REQ_PAYLOAD'({src_bus_if[i].req_data.rw,
                                              src_bus_if[i].req_data.addr,
                                              src_bus_if[i].req_data.data,
@@ -193,34 +156,17 @@ module VX_sm_port import VX_gpu_pkg::*;
     end
 
 `ifdef VX_CFG_EXT_DLMEM_ENABLE
-    dlmem_req_pkt_t dsm_req_pkt;
-    assign dsm_req_pkt = dlmem_req_pkt_t'(dsm_req_in_if.data);
-    `UNUSED_VAR (dsm_req_pkt)
     assign rs_valid[NUM_SRCS]   = dsm_req_in_if.valid;
-    assign rs_hb[NUM_SRCS]      = HB_W'(dsm_req_pkt.pkt_hb);
-    assign rs_slots[NUM_SRCS]   = SLOT_W'((HB_W'(dsm_req_pkt.pkt_hb) + HB_W'(1)) >> 1);
     assign rs_l2[NUM_SRCS]      = 1'b0;
-    assign rs_single[NUM_SRCS]  = 2'd0;
     assign rs_payload[NUM_SRCS] = REQ_PAYLOAD'({dsm_req_in_if.dst, dsm_req_in_if.data});
     assign dsm_req_in_if.ready  = rs_ready[NUM_SRCS];
 `endif
 
     ///////////////////////////////////////////////////////////////////////////
-    // Admission: one push per cycle, round robin over the admissible sources.
+    // Admission: one push per cycle, round robin over the sources.
 
-    reg  [OCC_W-1:0] req_occ_r, rsp_occ_r;
-    reg  [TOK_W-1:0] tok_w_r, tok_r_r;
     wire [`CLOG2(REQ_DEPTH+1)-1:0] req_size;
-    wire [`CLOG2(RSP_DEPTH+1)-1:0] rsp_size;
-
-    wire [NUM_RSRCS-1:0] rs_admit;
-    for (genvar i = 0; i < NUM_RSRCS; ++i) begin : g_admit
-        assign rs_admit[i] = rs_valid[i]
-                          && ((req_occ_r + OCC_W'(rs_hb[i])) <= OCC_W'(REQ_CAP))
-                          && (32'(req_size) < REQ_CAP)
-                          && ~((rs_single[i] == 2'd1) && (tok_w_r < TOK_W'(1000)))
-                          && ~((rs_single[i] == 2'd2) && (tok_r_r < TOK_W'(1000)));
-    end
+    wire req_room = (32'(req_size) < REQ_DEPTH);
 
     reg [`LOG2UP(NUM_RSRCS)-1:0] rr_last_r;
     reg [`LOG2UP(NUM_RSRCS)-1:0] push_idx;
@@ -229,7 +175,7 @@ module VX_sm_port import VX_gpu_pkg::*;
         push_valid = 1'b0;
         push_idx   = '0;
         for (integer k = NUM_RSRCS; k >= 1; --k) begin
-            if (rs_admit[(32'(rr_last_r) + k) % NUM_RSRCS]) begin
+            if (rs_valid[(32'(rr_last_r) + k) % NUM_RSRCS] && req_room) begin
                 push_valid = 1'b1;
                 push_idx   = `LOG2UP(NUM_RSRCS)'((32'(rr_last_r) + k) % NUM_RSRCS);
             end
@@ -240,64 +186,49 @@ module VX_sm_port import VX_gpu_pkg::*;
         assign rs_ready[i] = push_valid && (push_idx == `LOG2UP(NUM_RSRCS)'(i));
     end
 
-    wire [HB_W-1:0]   push_hb     = rs_hb[push_idx];
-    wire [1:0]        push_single = push_valid ? rs_single[push_idx] : 2'd0;
-
     ///////////////////////////////////////////////////////////////////////////
     // Request FIFO and response queue.
 
     wire req_pop, rsp_pop;
     wire req_empty, rsp_empty;
     wire [REQ_PAYLOAD-1:0] req_head;
-    wire [REQ_META-1:0]    req_head_meta;
-    wire [HB_W-1:0]        req_head_hb;
-    wire [SLOT_W-1:0]      req_head_slots;
     wire                   req_head_l2;
 
     VX_fifo_queue #(
-        .DATAW (REQ_META + REQ_PAYLOAD),
+        .DATAW (1 + REQ_PAYLOAD),
         .DEPTH (REQ_DEPTH)
     ) req_fifo (
         .clk      (clk),
         .reset    (reset),
         .push     (push_valid),
         .pop      (req_pop),
-        .data_in  ({rs_hb[push_idx], rs_slots[push_idx], rs_l2[push_idx], rs_payload[push_idx]}),
-        .data_out ({req_head_meta, req_head}),
+        .data_in  ({rs_l2[push_idx], rs_payload[push_idx]}),
+        .data_out ({req_head_l2, req_head}),
         .empty    (req_empty),
         `UNUSED_PIN (alm_empty),
         `UNUSED_PIN (full),
         `UNUSED_PIN (alm_full),
         .size     (req_size)
     );
-    assign {req_head_hb, req_head_slots, req_head_l2} = req_head_meta;
 
     wire                   rsp_push;
-    wire [HB_W-1:0]        rsp_in_hb;
     wire [RSP_PAYLOAD-1:0] rsp_head;
-    wire [HB_W-1:0]        rsp_head_hb;
-    wire [SLOT_W-1:0]      rsp_head_slots;
 
 `ifdef VX_CFG_EXT_DLMEM_ENABLE
-    dlmem_rsp_pkt_t dsm_rsp_pkt;
-    assign dsm_rsp_pkt = dlmem_rsp_pkt_t'(dsm_rsp_in_if.data);
-    `UNUSED_VAR (dsm_rsp_pkt)
-    assign rsp_in_hb = HB_W'(dsm_rsp_pkt.pkt_hb);
-    assign rsp_push = dsm_rsp_in_if.valid
-                   && ((rsp_occ_r + OCC_W'(rsp_in_hb)) <= OCC_W'(2 * RSP_CAP))
-                   && (32'(rsp_size) < RSP_CAP);
+    wire [`CLOG2(RSP_DEPTH+1)-1:0] rsp_size;
+    assign rsp_push = dsm_rsp_in_if.valid && (32'(rsp_size) < RSP_DEPTH);
     assign dsm_rsp_in_if.ready = rsp_push;
 
     VX_fifo_queue #(
-        .DATAW (RSP_META + RSP_PAYLOAD),
+        .DATAW (RSP_PAYLOAD),
         .DEPTH (RSP_DEPTH)
     ) rsp_fifo (
         .clk      (clk),
         .reset    (reset),
         .push     (rsp_push),
         .pop      (rsp_pop),
-        .data_in  ({rsp_in_hb, SLOT_W'((rsp_in_hb + HB_W'(1)) >> 1), dsm_rsp_in_if.dst, dsm_rsp_in_if.data}),
-        .data_out ({rsp_head_hb, rsp_head_slots, rsp_head}),
+        .data_in  ({dsm_rsp_in_if.dst, dsm_rsp_in_if.data}),
+        .data_out (rsp_head),
         .empty    (rsp_empty),
         `UNUSED_PIN (alm_empty),
         `UNUSED_PIN (full),
@@ -305,101 +236,226 @@ module VX_sm_port import VX_gpu_pkg::*;
         .size     (rsp_size)
     );
 `else
-    assign rsp_push       = 1'b0;
-    assign rsp_in_hb      = '0;
-    assign rsp_empty      = 1'b1;
-    assign rsp_head       = '0;
-    assign rsp_head_hb    = '0;
-    assign rsp_head_slots = '0;
-    assign rsp_size       = '0;
-    `UNUSED_PARAM (RSP_META)
-    `UNUSED_VAR (rsp_size)
-    `UNUSED_VAR (rsp_head_slots)
+    assign rsp_push  = 1'b0;
+    assign rsp_empty = 1'b1;
+    assign rsp_head  = '0;
+    `UNUSED_VAR (rsp_push)
+    `UNUSED_PARAM (RSP_DEPTH)
 `endif
 
     ///////////////////////////////////////////////////////////////////////////
-    // Payment: UNITS half-beats per cycle, round robin over the two heads.
+    // Serialiser: the request head's packet as flits.
 
-    reg  [HB_W-1:0]  paid_q_r, paid_p_r;
-    reg              turn_r;   // 0: request FIFO next, 1: response queue next
-    reg  [CRED_W-1:0] credits_r;
-    reg  [RET-1:0][RET_W-1:0] ret_r;
-    reg  [`LOG2UP(RET)-1:0]   ret_pos_r;
+    wire                  h_rw;
+    wire [LADDR_W-1:0]    h_addr;
+    wire [LINE_SIZE*8-1:0] h_data;
+    wire [LINE_SIZE-1:0]  h_be;
+    wire [MEM_ATTR_WIDTH-1:0] h_attr_bits;
+    wire [MEM_TAG_W-1:0]  h_tag;
+    assign {h_rw, h_addr, h_data, h_be, h_attr_bits, h_tag} = req_head[L2_PAYLOAD-1:0];
+    mem_bus_attr_t h_attr;
+    assign h_attr = mem_bus_attr_t'(h_attr_bits);
+    `UNUSED_VAR (h_attr)
 
-    reg  [HB_W-1:0]   paid_q_n, paid_p_n;
-    reg               turn_n;
-    reg  [CRED_W-1:0] credits_n;
-    reg  [RET_W-1:0]  used_n;
+    wire [SECTORS-1:0] h_touched, h_full;
+    for (genvar s = 0; s < SECTORS; ++s) begin : g_hsect
+        assign h_touched[s] = (| h_be[s * FLIT +: FLIT]);
+        assign h_full[s]    = (& h_be[s * FLIT +: FLIT]);
+    end
+    wire [SECT_W-1:0] h_nt;
+    `POP_COUNT(h_nt, h_touched);
+    wire h_amo     = h_attr.amo.amo_valid;
+    wire h_wr      = h_rw && ~h_amo;
+    wire h_partial = h_wr && ((h_touched & ~h_full) != '0);
+
+    reg [SIDX_W-1:0] h_amo_sect;
+    always @(*) begin
+        h_amo_sect = '0;
+        for (integer s = SECTORS - 1; s >= 0; --s) begin
+            if (h_touched[s]) h_amo_sect = SIDX_W'(s);
+        end
+    end
+
+    wire [CNT_W-1:0] req_head_flits = ~req_head_l2 ? CNT_W'(1)
+                                    : (h_wr ? `MAX(CNT_W'(h_nt) + CNT_W'(h_partial), CNT_W'(1)) : CNT_W'(1));
+    wire [L2_HDR_W-1:0] h_hdr = {h_rw, h_addr, h_attr_bits, h_tag, h_touched, h_partial,
+                                 h_be[h_amo_sect * FLIT +: FLIT]};
+
+    // The sector the k-th data flit of a sector set carries.
+    function automatic [SIDX_W-1:0] kth_sector(input [SECTORS-1:0] m, input [CNT_W-1:0] k);
+        reg [CNT_W-1:0] c;
+        kth_sector = '0;
+        c = '0;
+        for (integer s = 0; s < SECTORS; ++s) begin
+            if (m[s]) begin
+                if (c == k) kth_sector = SIDX_W'(s);
+                c = c + CNT_W'(1);
+            end
+        end
+    endfunction
+
+    // Every flit of the head packet: data flits of the touched sectors, then
+    // the byte mask; an atomic's operand sector; an SM-to-SM message whole.
+    wire [SECTORS:0][LINK_W-1:0] req_flit;
+    for (genvar k = 0; k <= SECTORS; ++k) begin : g_flit
+        wire [FLIT_BITS-1:0] d = h_wr ? ((k < 32'(h_nt)) ? h_data[kth_sector(h_touched, CNT_W'(k)) * FLIT_BITS +: FLIT_BITS]
+                                                         : FLIT_BITS'(h_be))
+                               : (h_amo ? h_data[h_amo_sect * FLIT_BITS +: FLIT_BITS] : '0);
+        assign req_flit[k] = req_head_l2 ? {HDR_W'(h_hdr), d} : LINK_W'(req_head[DSM_PAYLOAD-1:0]);
+    end
+
+    reg [CNT_W-1:0] sent_q_r, sent_p_r;
+    reg             turn_r;   // 0: request FIFO next, 1: response queue next
+
+    reg [CNT_W-1:0] sent_q_n, sent_p_n;
+    reg             turn_n;
+    reg [UNITS-1:0] lk_valid;
+    reg [UNITS-1:0] lk_rsp;
+    reg [UNITS-1:0][CNT_W-1:0] lk_idx;
+    reg [UNITS-1:0][LINK_W-1:0] lk_data;
 
     always @(*) begin
-        reg cq, cp, nq, np, g;
-        paid_q_n  = paid_q_r;
-        paid_p_n  = paid_p_r;
-        turn_n    = turn_r;
-        credits_n = credits_r + CRED_W'(ret_r[ret_pos_r]);
-        used_n    = '0;
+        reg cq, cp, g;
+        cq       = 1'b0;
+        cp       = 1'b0;
+        g        = 1'b0;
+        sent_q_n = sent_q_r;
+        sent_p_n = sent_p_r;
+        turn_n   = turn_r;
+        lk_valid = '0;
+        lk_rsp   = '0;
+        lk_idx   = '0;
+        lk_data  = '0;
         for (integer u = 0; u < UNITS; ++u) begin
-            g  = 1'b0;
-            nq = ~paid_q_n[0] && (SLOT_W'(paid_q_n >> 1) < req_head_slots);
-            cq = ~req_empty && (paid_q_n < req_head_hb) && ~(nq && (credits_n == '0));
-        `ifdef VX_CFG_EXT_DLMEM_ENABLE
-            np = ~paid_p_n[0] && (SLOT_W'(paid_p_n >> 1) < rsp_head_slots);
-            cp = ~rsp_empty && (paid_p_n < rsp_head_hb) && ~(np && (credits_n == '0));
-        `else
-            np = 1'b0;
-            cp = 1'b0;
-        `endif
+            cq = ~req_empty && (sent_q_n < req_head_flits);
+            cp = ~rsp_empty && (sent_p_n == '0);
             if (cq || cp) begin
                 g = (cq && cp) ? turn_n : cp;
-                if (g ? np : nq) begin
-                    credits_n = credits_n - CRED_W'(1);
-                    used_n    = used_n + RET_W'(1);
-                end
+                lk_valid[u] = 1'b1;
+                lk_rsp[u]   = g;
                 if (g) begin
-                    paid_p_n = paid_p_n + HB_W'(1);
+                    lk_data[u] = LINK_W'(rsp_head);
+                    sent_p_n   = sent_p_n + CNT_W'(1);
                 end else begin
-                    paid_q_n = paid_q_n + HB_W'(1);
+                    lk_idx[u]  = sent_q_n;
+                    lk_data[u] = req_flit[sent_q_n];
+                    sent_q_n   = sent_q_n + CNT_W'(1);
                 end
                 turn_n = ~g;
             end
         end
     end
 
-    // Sinks: the output register (L2 items) and the network buffers.
+    ///////////////////////////////////////////////////////////////////////////
+    // Deserialiser: the far end of the link rebuilds each packet.
+
+    reg [LINK_W-1:0]      rx_q0_r, rx_p_r;
+    reg [LINE_SIZE*8-1:0] rx_data_r;
+    reg [LINE_SIZE-1:0]   rx_be_r;
+
+    reg [LINK_W-1:0]      rx_q0_n, rx_p_n;
+    reg [LINE_SIZE*8-1:0] rx_data_n;
+    reg [LINE_SIZE-1:0]   rx_be_n;
+
+    wire [L2_HDR_W-1:0] rx_hdr = rx_q0_n[FLIT_BITS +: L2_HDR_W];
+    wire                  rx_rw;
+    wire [LADDR_W-1:0]    rx_addr;
+    wire [MEM_ATTR_WIDTH-1:0] rx_attr_bits;
+    wire [MEM_TAG_W-1:0]  rx_tag;
+    wire [SECTORS-1:0]    rx_smask;
+    wire                  rx_partial;
+    wire [FLIT-1:0]       rx_sbe;
+    assign {rx_rw, rx_addr, rx_attr_bits, rx_tag, rx_smask, rx_partial, rx_sbe} = rx_hdr;
+    mem_bus_attr_t rx_attr;
+    assign rx_attr = mem_bus_attr_t'(rx_attr_bits);
+    `UNUSED_VAR (rx_attr)
+
+    always @(*) begin
+        reg [L2_HDR_W-1:0] hdr;
+        reg [SECTORS-1:0] sm;
+        reg [CNT_W-1:0] nt;
+        reg wr, amo;
+        `IGNORE_UNUSED_BEGIN
+        mem_bus_attr_t at;
+        `IGNORE_UNUSED_END
+        hdr       = '0;
+        sm        = '0;
+        nt        = '0;
+        wr        = 1'b0;
+        amo       = 1'b0;
+        at        = '0;
+        rx_q0_n   = rx_q0_r;
+        rx_p_n    = rx_p_r;
+        rx_data_n = rx_data_r;
+        rx_be_n   = rx_be_r;
+        for (integer u = 0; u < UNITS; ++u) begin
+            if (lk_valid[u] && lk_rsp[u]) begin
+                rx_p_n = lk_data[u];
+            end else if (lk_valid[u]) begin
+                if (lk_idx[u] == '0) begin
+                    rx_q0_n = lk_data[u];
+                end
+                hdr = rx_q0_n[FLIT_BITS +: L2_HDR_W];
+                sm  = hdr[FLIT + 1 +: SECTORS];
+                at  = mem_bus_attr_t'(hdr[MEM_TAG_W + SECTORS + 1 + FLIT +: MEM_ATTR_WIDTH]);
+                amo = at.amo.amo_valid;
+                wr  = hdr[L2_HDR_W-1] && ~amo;
+                nt  = '0;
+                for (integer s = 0; s < SECTORS; ++s) begin
+                    nt = nt + CNT_W'(sm[s]);
+                end
+                if (wr && (lk_idx[u] < nt)) begin
+                    rx_data_n[kth_sector(sm, lk_idx[u]) * FLIT_BITS +: FLIT_BITS] = lk_data[u][FLIT_BITS-1:0];
+                end else if (wr) begin
+                    rx_be_n = lk_data[u][LINE_SIZE-1:0];
+                end else if (amo) begin
+                    rx_data_n[kth_sector(sm, '0) * FLIT_BITS +: FLIT_BITS] = lk_data[u][FLIT_BITS-1:0];
+                end
+            end
+        end
+    end
+
+    wire rx_wr  = rx_rw && ~rx_attr.amo.amo_valid;
+    reg [LINE_SIZE-1:0] rx_byteen;
+    always @(*) begin
+        rx_byteen = '0;
+        for (integer s = 0; s < SECTORS; ++s) begin
+            if (rx_wr && rx_partial) begin
+                rx_byteen[s * FLIT +: FLIT] = rx_be_n[s * FLIT +: FLIT];
+            end else if (rx_attr.amo.amo_valid) begin
+                rx_byteen[s * FLIT +: FLIT] = rx_smask[s] ? rx_sbe : '0;
+            end else begin
+                rx_byteen[s * FLIT +: FLIT] = {FLIT{rx_smask[s]}};
+            end
+        end
+    end
+    wire [L2_PAYLOAD-1:0] rx_l2_req = {rx_rw, rx_addr, rx_data_n, rx_byteen, rx_attr_bits, rx_tag};
+
+    // Sinks: the output register (L2 packets) and the network buffers.
     wire l2_sink_ready, dsm_sink_ready, rsp_sink_ready;
 
-    assign req_pop = ~req_empty && (paid_q_n >= req_head_hb)
+    assign req_pop = ~req_empty && (sent_q_n >= req_head_flits)
                   && (req_head_l2 ? l2_sink_ready : dsm_sink_ready);
-    assign rsp_pop = ~rsp_empty && (paid_p_n >= rsp_head_hb) && rsp_sink_ready;
+    assign rsp_pop = ~rsp_empty && (sent_p_n != '0) && rsp_sink_ready;
 
     always @(posedge clk) begin
         if (reset) begin
-            req_occ_r <= '0;
-            rsp_occ_r <= '0;
-            paid_q_r  <= '0;
-            paid_p_r  <= '0;
+            sent_q_r  <= '0;
+            sent_p_r  <= '0;
             turn_r    <= 1'b0;
-            credits_r <= CRED_W'(`VX_CFG_SM2SM_INJ_CREDITS);
-            ret_r     <= '0;
-            ret_pos_r <= '0;
-            tok_w_r   <= TOK_W'(TOK_W_CAP);
-            tok_r_r   <= TOK_W'(TOK_R_CAP);
             rr_last_r <= '0;
         end else begin
-            req_occ_r <= req_occ_r + (push_valid ? OCC_W'(push_hb) : '0) - (req_pop ? OCC_W'(req_head_hb) : '0);
-            rsp_occ_r <= rsp_occ_r + (rsp_push ? OCC_W'(rsp_in_hb) : '0) - (rsp_pop ? OCC_W'(rsp_head_hb) : '0);
-            paid_q_r  <= req_pop ? '0 : paid_q_n;
-            paid_p_r  <= rsp_pop ? '0 : paid_p_n;
+            sent_q_r  <= req_pop ? '0 : sent_q_n;
+            sent_p_r  <= rsp_pop ? '0 : sent_p_n;
             turn_r    <= turn_n;
-            credits_r <= credits_n;
-            ret_r[ret_pos_r] <= used_n;
-            ret_pos_r <= (32'(ret_pos_r) == (RET - 1)) ? '0 : (ret_pos_r + 1);
-            tok_w_r   <= `MIN(tok_w_r - ((push_single == 2'd1) ? TOK_W'(1000) : '0) + TOK_W'(`VX_CFG_SM_SECTOR_ISSUE_W_PERMILLE), TOK_W'(TOK_W_CAP));
-            tok_r_r   <= `MIN(tok_r_r - ((push_single == 2'd2) ? TOK_W'(1000) : '0) + TOK_W'(`VX_CFG_SM_SECTOR_ISSUE_R_PERMILLE), TOK_W'(TOK_R_CAP));
             if (push_valid) begin
                 rr_last_r <= push_idx;
             end
         end
+        rx_q0_r   <= rx_q0_n;
+        rx_p_r    <= rx_p_n;
+        rx_data_r <= rx_data_n;
+        rx_be_r   <= rx_be_n;
     end
 
     ///////////////////////////////////////////////////////////////////////////
@@ -418,7 +474,7 @@ module VX_sm_port import VX_gpu_pkg::*;
         .reset     (reset),
         .valid_in  (req_pop && req_head_l2),
         .ready_in  (l2_sink_ready),
-        .data_in   (req_head[L2_PAYLOAD-1:0]),
+        .data_in   (rx_l2_req),
         .data_out  (l2_out_data),
         .ready_out (l2_out_ready),
         .valid_out (l2_out_valid)
@@ -443,7 +499,7 @@ module VX_sm_port import VX_gpu_pkg::*;
         .reset     (reset),
         .valid_in  (req_pop && ~req_head_l2),
         .ready_in  (dsm_sink_ready),
-        .data_in   (req_head[DSM_PAYLOAD-1:0]),
+        .data_in   (rx_q0_n[DSM_PAYLOAD-1:0]),
         .data_out  ({dsm_req_out_if.dst, dsm_req_out_if.data}),
         .ready_out (dsm_req_out_if.ready),
         .valid_out (dsm_req_out_if.valid)
@@ -457,7 +513,7 @@ module VX_sm_port import VX_gpu_pkg::*;
         .reset     (reset),
         .valid_in  (rsp_pop),
         .ready_in  (rsp_sink_ready),
-        .data_in   (rsp_head),
+        .data_in   (rx_p_n[RSP_PAYLOAD-1:0]),
         .data_out  ({dsm_rsp_out_if.dst, dsm_rsp_out_if.data}),
         .ready_out (dsm_rsp_out_if.ready),
         .valid_out (dsm_rsp_out_if.valid)
@@ -465,7 +521,7 @@ module VX_sm_port import VX_gpu_pkg::*;
 `else
     assign dsm_sink_ready = 1'b0;
     assign rsp_sink_ready = 1'b0;
-    `UNUSED_VAR (rsp_head)
+    `UNUSED_VAR (rx_p_n)
 `endif
 
     ///////////////////////////////////////////////////////////////////////////
@@ -523,16 +579,10 @@ module VX_sm_port import VX_gpu_pkg::*;
     wire dreq_ready, drsp_ready;
 
 `ifdef VX_CFG_EXT_DLMEM_ENABLE
-    dlmem_req_pkt_t arr_req_pkt;
-    dlmem_rsp_pkt_t arr_rsp_pkt;
-    assign arr_req_pkt = dlmem_req_pkt_t'(arr_req_in_if.data);
-    assign arr_rsp_pkt = dlmem_rsp_pkt_t'(arr_rsp_in_if.data);
-    `UNUSED_VAR (arr_req_pkt)
-    `UNUSED_VAR (arr_rsp_pkt)
     assign dreq_valid = arr_req_in_if.valid;
     assign drsp_valid = arr_rsp_in_if.valid;
-    assign dreq_sect  = SECT_W'((HB_W'(arr_req_pkt.pkt_hb) + HB_W'(1)) >> 1);
-    assign drsp_sect  = SECT_W'((HB_W'(arr_rsp_pkt.pkt_hb) + HB_W'(1)) >> 1);
+    assign dreq_sect  = SECT_W'(1);
+    assign drsp_sect  = SECT_W'(1);
 
     VX_elastic_buffer #(
         .DATAW (DLMEM_CORE_W + DLMEM_REQ_DATAW),
@@ -608,7 +658,7 @@ module VX_sm_port import VX_gpu_pkg::*;
 `ifdef DBG_TRACE_MEM
     always @(posedge clk) begin
         if (~reset && push_valid) begin
-            `TRACE(3, ("%t: %s push: src=%0d, hb=%0d, l2=%0d\n", $time, INSTANCE_ID, push_idx, push_hb, rs_l2[push_idx]))
+            `TRACE(3, ("%t: %s push: src=%0d, l2=%0d\n", $time, INSTANCE_ID, push_idx, rs_l2[push_idx]))
         end
     end
 `endif
