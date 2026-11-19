@@ -134,8 +134,14 @@ module VX_dlmem_xlate import VX_gpu_pkg::*, VX_dlmem_pkg::*; #(
 
     lsu_header_t hdr_r;
     assign hdr_r = req_r.tag[LSU_CLIENT_TAG_WIDTH-1 -: HDR_W];
+`ifdef VX_CFG_H100_SM_ENABLE
+    // The slice appends the SM path's shared/global credit class below the fence flag.
+    wire is_fence_r = req_r.tag[1];
+    wire is_rl_r    = req_r.tag[2];
+`else
     wire is_fence_r = req_r.tag[0];
     wire is_rl_r    = req_r.tag[1];
+`endif
     wire [NW_WIDTH-1:0] my_slot = NW_WIDTH'(hdr_r.cta_id);
     wire [LMEM_AW-1:0] own_base = slot_base[my_slot][LMEM_LOG-1:WA];
 
