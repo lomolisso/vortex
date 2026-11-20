@@ -12,7 +12,7 @@ enum {
   SP_DLOAD  = 3,  // cluster: rank 0's warps ld from rank 1's window
   SP_DATOM  = 4,  // cluster: rank 0's warps amoadd.w into rank 1's window
   SP_MIX    = 5,  // cluster: rank 0's even warps sd into rank 1, odd warps sw to global memory
-  SP_TMA    = 6,  // cluster: warp 0 bulk-loads global lines into its own block, rank 0 alone, then every rank
+  SP_TMA    = 6,  // cluster: warp 0 bulk-loads global lines into its own block, rank 0 alone, rank 1 alone, then both
   SP_FILLWR = 7,  // cluster: rank 0's warps 1.. stream LDS / L1-hit lw / STS (recv = SP_FW_*) beside a fill
                   // source (n = SP_BG_*): rank 0's warp 0 TMA bulk loads, or every warp of rank 1 sd'ing into rank 0
 };
@@ -31,7 +31,7 @@ typedef struct {
   uint32_t extra;      // FILLWR: index in out of the words after the per-warp pairs
   uint64_t pat_addr;   // [SP_LANES] byte offsets, 0xFFFFFFFF = idle lane
   uint64_t gmem_addr;  // global region (span bytes, plus a cold line at span for RW)
-  uint64_t out_addr;   // [blocks][warps][2] start/end; RW: [4]; TMA: [2 phases][blocks][2];
+  uint64_t out_addr;   // [blocks][warps][2] start/end; RW: [4]; TMA: [3 phases][blocks][2];
                        // FILLWR: then [3] sd bytes sent, TMA bytes and cycles between the window's completions
 } kernel_arg_t;
 

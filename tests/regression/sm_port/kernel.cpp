@@ -424,8 +424,8 @@ __kernel void kernel_main(kernel_arg_t* __UNIFORM__ arg) {
     if (wid == 0 && lane == 0)
       vx_mbar_init(reinterpret_cast<uint64_t*>(own), 1);
     __syncthreads();
-    for (uint32_t ph = 0; ph < 2; ++ph) {
-      if (wid == 0 && (ph == 1 || rank == 0))
+    for (uint32_t ph = 0; ph < 3; ++ph) {
+      if (wid == 0 && (ph == 2 || rank == ph))
         tma_run(arg, own, rank, &phase, out + (ph * 2 + rank) * 2);
       vx_cluster_sync();
     }

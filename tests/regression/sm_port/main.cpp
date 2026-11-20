@@ -18,8 +18,8 @@
 //   -m 7 ld      rank 0 ld's rank 1's lines              rank 1's replies within its link; rate reported
 //   -m 8 atom    rank 0 amoadd.w's rank 1's lines        within the link; rate reported
 //   -m 9 mix     rank 0 sd's into rank 1 and to global memory: the sum of their flits within the link
-//   -m 10 tma    each rank's warp 0 bulk-loads L2-resident lines (TMA), rank 0 alone, then
-//                both ranks: each SM's rate equals the one-SM rate +-3 % (one engine per SM)
+//   -m 10 tma    each rank's warp 0 bulk-loads L2-resident lines (TMA), each rank alone, then both:
+//                each SM keeps > 0.75 of its own alone rate (one engine and port per SM; shared would give <= 0.5)
 //   -m 11 fillwr rank 0's warps 1.. stream LDS / L1-hit lw / STS beside fills of the SM's array (warp 0's TMA
 //                bulk loads, or rank 1's sd arrivals); fills share the write port only, ahead of STS:
 //                LDS and L1 hits next to TMA >= 15/16 of the datapath, STS next to TMA = datapath - TMA rate +-5 %,
@@ -565,10 +565,18 @@ static void run_mode(int mode, const SmPortCfg& cfg) {
       size_t i = (ph * 2 + rank) * 2;
       return bytes / (double)(out[i + 1] - out[i]);
     };
-    double alone = rate(0, 0);
-    printf("  rank 0 alone: %.3f B/cycle\n", alone);
-    verdict("both SMs: rank 0's TMA B/cycle", rate(1, 0), alone, 0.03);
-    verdict("both SMs: rank 1's TMA B/cycle", rate(1, 1), alone, 0.03);
+    // A TMA engine or SM port shared by the TPC's two SMs halves each SM's rate when both run (<= 0.5);
+    // one per SM keeps it up to the shared L2/DRAM's contention. 0.75 separates the two structures.
+    // H100 reference: two SMs of one TPC each keep their one-SM port rate (SMPORT_flit_h100.md w_tpc2/w_sm1).
+    for (uint32_t rank = 0; rank < 2; ++rank) {
+      double alone = rate(rank, rank);
+      double ratio = rate(2, rank) / alone;
+      bool ok = ratio > 0.75;
+      printf("  rank %u: alone %.3f B/cycle, beside the other SM %.3f B/cycle, ratio %.3f (> 0.75) %s\n",
+             rank, alone, rate(2, rank), ratio, ok ? "ok" : "MISMATCH");
+      if (!ok) ++errors;
+      printf("H100REF metric=tpc2_ratio_rank%u h100=%.3f vortex=%.3f\n", rank, 31.91 / 31.92, ratio);
+    }
 #endif
     break;
   }
