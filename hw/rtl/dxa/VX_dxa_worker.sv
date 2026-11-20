@@ -41,6 +41,14 @@ module VX_dxa_worker import VX_gpu_pkg::*, VX_dxa_pkg::*; #(
     output wire [NC_WIDTH-1:0]      bg_evt_core,
     output dxa_bg_compl_t           bg_evt,
     input  wire                     bg_evt_ready,
+`ifdef VX_CFG_H100_SM_ENABLE
+`ifdef VX_CFG_H100_FE_ENABLE
+    // Each of this worker's requests its SM's port took.
+    input  wire                     gmem_acc_valid,
+    input  wire                     gmem_acc_amo,
+    input  wire [GMEM_TAG_WIDTH-UUID_WIDTH-1:0] gmem_acc_tag,
+`endif
+`endif
 `endif
     VX_mem_bus_if.master smem_bus_if
 );
@@ -742,6 +750,9 @@ module VX_dxa_worker import VX_gpu_pkg::*, VX_dxa_pkg::*; #(
         .fence_room        (ft_room),
         .fence_tag         (ft_tag),
         .fence_sent        (ft_sent),
+    `ifdef VX_CFG_H100_SM_ENABLE
+        .acc_amo           (gmem_acc_valid && gmem_acc_amo),
+    `endif
     `endif
         .amo_valid         (amo_valid),
         .amo_pkt           (amo_pkt),
@@ -783,6 +794,53 @@ module VX_dxa_worker import VX_gpu_pkg::*, VX_dxa_pkg::*; #(
     wire ft_evt_valid = (|ft_ans) && ~st_evt_valid;
     wire ft_evt_fire  = ft_evt_valid && bg_evt_ready;
 
+`ifdef VX_CFG_H100_SM_ENABLE
+    // The writes are done when the SM port takes the fence (they went ahead
+    // of it on the same in-order path): that queues the event; the answer
+    // only frees the entry, once the event has gone.
+    reg [FT_N-1:0]  ft_got;
+    wire [FT_W-1:0] ft_acc_idx  = FT_W'(gmem_acc_tag);
+    wire            ft_acc_fire = gmem_acc_valid && gmem_acc_tag[FT_VAL_W-1];
+    `UNUSED_VAR (gmem_acc_tag)
+
+    always @(posedge clk) begin
+        if (reset) begin
+            ft_valid <= '0;
+            ft_ans   <= '0;
+            ft_got   <= '0;
+        end else begin
+            if (ft_sent) begin
+                ft_valid[ft_free] <= 1'b1;
+                ft_got[ft_free]   <= 1'b0;
+                ft_bg[ft_free]    <= active_bg;
+                ft_wid[ft_free]   <= active_wid;
+                ft_seq[ft_free]   <= active_bg_seq;
+                ft_core[ft_free]  <= active_core_id;
+            end
+            if (ft_acc_fire && ft_bg[ft_acc_idx]) begin
+                ft_ans[ft_acc_idx] <= 1'b1;
+            end
+            if (ft_rsp_fire) begin
+                if (ft_ans[ft_rsp_idx] && ~(ft_evt_fire && ft_ev == ft_rsp_idx)) begin
+                    ft_got[ft_rsp_idx] <= 1'b1;
+                end else begin
+                    ft_valid[ft_rsp_idx] <= 1'b0;
+                end
+            end
+            if (ft_evt_fire) begin
+                ft_ans[ft_ev] <= 1'b0;
+                if (ft_got[ft_ev]) begin
+                    ft_valid[ft_ev] <= 1'b0;
+                end
+            end
+        end
+    end
+
+    `RUNTIME_ASSERT (~(ft_acc_fire && (~ft_valid[ft_acc_idx] || ft_ans[ft_acc_idx])),
+        ("%t: *** %s DXA store fence taken without its entry: entry=%0d", $time, INSTANCE_ID, ft_acc_idx))
+    `RUNTIME_ASSERT (~(ft_rsp_fire && (~ft_valid[ft_rsp_idx] || ft_got[ft_rsp_idx])),
+        ("%t: *** %s DXA store fence answer without its fence: entry=%0d", $time, INSTANCE_ID, ft_rsp_idx))
+`else
     always @(posedge clk) begin
         if (reset) begin
             ft_valid <= '0;
@@ -811,6 +869,8 @@ module VX_dxa_worker import VX_gpu_pkg::*, VX_dxa_pkg::*; #(
 
     `RUNTIME_ASSERT (~(ft_rsp_fire && (~ft_valid[ft_rsp_idx] || ft_ans[ft_rsp_idx])),
         ("%t: *** %s DXA store fence answer without its fence: entry=%0d", $time, INSTANCE_ID, ft_rsp_idx))
+
+`endif
 
     assign bg_evt_valid    = st_evt_valid || ft_evt_valid;
     assign bg_evt_core     = st_evt_valid ? active_core_id : ft_core[ft_ev];

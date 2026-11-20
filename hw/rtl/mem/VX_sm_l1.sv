@@ -253,6 +253,9 @@ module VX_sm_l1 import VX_gpu_pkg::*; #(
     wire sel_cta   = 1'b0;
 `endif
     wire sel_fence = (sel_a.is_flush || sel_a.is_fence) && ~sel_cta;
+`ifdef VX_CFG_H100_SM_ENABLE
+    wire sel_inv   = sel_a.is_inval;
+`endif
     `UNUSED_VAR (sel_a)
     wire [1:0] sel_kind = sel_fence ? K_FENCE : (sel_a.amo.amo_valid ? K_AMO : (sel_rw ? K_STORE : K_LOAD));
 
@@ -285,6 +288,11 @@ module VX_sm_l1 import VX_gpu_pkg::*; #(
     reg [LANES-1:0]  in_todo;
     reg [L1_SEQ_W-1:0] seq_ctr;
     reg              in_r_cta;
+`ifdef VX_CFG_H100_SM_ENABLE
+    // an invalidate ends after the valid clear and answers here
+    reg              in_r_inv;
+    reg              t2_inv;
+`endif
     reg              in_r_host;
     reg              t2_host;
 
@@ -1165,7 +1173,14 @@ module VX_sm_l1 import VX_gpu_pkg::*; #(
                 emit_push = ~eg_full;
                 t2_done = emit_push && amo_emit_last;
             end
+        `ifdef VX_CFG_H100_SM_ENABLE
+            P_INV: begin
+                inval_start = ~inv_wait;
+                t2_done = t2_inv && inv_wait && ~inval_busy;
+            end
+        `else
             P_INV: inval_start = ~inv_wait;
+        `endif
             P_PUSH: begin
                 fence_push = ~eg_full;
                 t2_done = fence_push;
@@ -1401,6 +1416,10 @@ module VX_sm_l1 import VX_gpu_pkg::*; #(
             in_valid    <= 1'b0;
             in_todo     <= '0;
             in_r_cta    <= 1'b0;
+        `ifdef VX_CFG_H100_SM_ENABLE
+            in_r_inv    <= 1'b0;
+            t2_inv      <= 1'b0;
+        `endif
             in_r_host   <= 1'b0;
             t2_host     <= 1'b0;
             fn_host     <= 1'b0;
@@ -1430,6 +1449,9 @@ module VX_sm_l1 import VX_gpu_pkg::*; #(
                 in_valid       <= 1'b1;
                 in_r.kind      <= sel_cta ? K_LOAD : sel_kind;
                 in_r_cta       <= sel_cta;
+            `ifdef VX_CFG_H100_SM_ENABLE
+                in_r_inv       <= sel_inv;
+            `endif
                 in_r_host      <= hf_sel;
                 in_r.nc        <= sel_a.is_addr_io;
                 in_r.blk       <= arb_idx;
@@ -1456,6 +1478,9 @@ module VX_sm_l1 import VX_gpu_pkg::*; #(
                 t2_last  <= in_last;
                 t2_r     <= in_r;
                 t2_host  <= in_r_host;
+            `ifdef VX_CFG_H100_SM_ENABLE
+                t2_inv   <= in_r_inv;
+            `endif
                 t2_bv    <= iss_v;
                 t2_bl    <= iss_l;
                 t2_res   <= '0;
@@ -1563,6 +1588,12 @@ module VX_sm_l1 import VX_gpu_pkg::*; #(
             if (mem_rsp_fire && rsp_special && ~rsp_amo) begin
                 fn_got <= 1'b1;
             end
+        `ifdef VX_CFG_H100_SM_ENABLE
+            if (t2_valid && t2_done && (t2_phase == P_INV)) begin
+                inv_wait <= 1'b0;
+                fn_got   <= 1'b1;
+            end
+        `endif
             amo_out <= amo_out + AMO_OUT_W'(emit_push) - AMO_OUT_W'(amo_rsp);
 
             // fills

@@ -753,6 +753,14 @@ module VX_socket import VX_gpu_pkg::*, VX_tlb_pkg::*;
     dxa_bg_compl_t [`VX_CFG_SOCKET_SIZE-1:0] per_core_bg_compl;
 `endif
 
+`ifdef VX_CFG_H100_SM_ENABLE
+`ifdef VX_CFG_H100_FE_ENABLE
+    // The engine requests each SM's port took.
+    wire [`VX_CFG_SOCKET_SIZE-1:0] dxa_acc_valid, dxa_acc_amo;
+    wire [`VX_CFG_SOCKET_SIZE-1:0][SOCKET_MEM_TAG_WIDTH-UUID_WIDTH-1:0] dxa_acc_tag;
+`endif
+`endif
+`line 751 "VX_socket.sv" 0
     VX_dxa_core #(
         .INSTANCE_ID    (`SFORMATF(("%s-dxa", INSTANCE_ID))),
         .NUM_REQS       (`VX_CFG_SOCKET_SIZE),
@@ -772,6 +780,14 @@ module VX_socket import VX_gpu_pkg::*, VX_tlb_pkg::*;
         .slot_stride      (per_core_slot_stride),
         .bg_compl_valid   (per_core_bg_compl_valid),
         .bg_compl         (per_core_bg_compl),
+    `ifdef VX_CFG_H100_SM_ENABLE
+    `ifdef VX_CFG_H100_FE_ENABLE
+        .gmem_acc_valid   (dxa_acc_valid),
+        .gmem_acc_amo     (dxa_acc_amo),
+        .gmem_acc_tag     (dxa_acc_tag),
+    `endif
+    `endif
+`line 770 "VX_socket.sv" 0
     `ifdef DXA_TMAP_L2_ENABLE
         .tmap_l2_bus_if   (tmap_l2_bus_if),
     `endif
@@ -1123,6 +1139,17 @@ module VX_socket import VX_gpu_pkg::*, VX_tlb_pkg::*;
     `endif
 
         wire port_empty, adapter_empty;
+    `ifdef VX_CFG_H100_FE_ENABLE
+        wire                          tma_acc_valid, tma_acc_amo;
+        wire [SM_SRC_TAG_W-UUID_WIDTH-1:0] tma_acc_tag;
+    `ifdef VX_CFG_EXT_DXA_ENABLE
+        assign dxa_acc_valid[c] = tma_acc_valid;
+        assign dxa_acc_amo[c]   = tma_acc_amo;
+        assign dxa_acc_tag[c]   = (SOCKET_MEM_TAG_WIDTH-UUID_WIDTH)'(tma_acc_tag);
+    `endif
+        `UNUSED_VAR ({tma_acc_valid, tma_acc_amo, tma_acc_tag})
+    `endif
+`line 1166 "VX_socket.sv" 0
 
         VX_sm_port #(
             .INSTANCE_ID   (`SFORMATF(("%s-smport%0d", INSTANCE_ID, c))),
@@ -1144,6 +1171,12 @@ module VX_socket import VX_gpu_pkg::*, VX_tlb_pkg::*;
             .arr_rsp_in_if  (sm_dlmem_rsp_in_if[c]),
             .arr_rsp_out_if (per_core_dlmem_rsp_in_if[c]),
         `endif
+        `ifdef VX_CFG_H100_FE_ENABLE
+            .tma_acc_valid  (tma_acc_valid),
+            .tma_acc_amo    (tma_acc_amo),
+            .tma_acc_tag    (tma_acc_tag),
+        `endif
+`line 1187 "VX_socket.sv" 0
             .empty          (port_empty)
         );
 

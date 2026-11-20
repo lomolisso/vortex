@@ -85,7 +85,6 @@ module VX_dlmem_xlate import VX_gpu_pkg::*, VX_dlmem_pkg::*; #(
 `endif
     localparam MY_CORE  = CORE_ID % DLMEM_NCC;
     localparam PID_BITS = `CLOG2(`VX_CFG_NUM_THREADS / NUM_LANES);
-    localparam HDR_W    = $bits(lsu_header_t);
     localparam ROW_W    = $bits(dlmem_row_t);
     localparam REQ_W    = $bits(lsu_req_data_t);
 
@@ -105,10 +104,10 @@ module VX_dlmem_xlate import VX_gpu_pkg::*, VX_dlmem_pkg::*; #(
 
     // Row select ahead of the register: the row is the one current when the request enters.
 
-    lsu_header_t in_hdr;
-    assign in_hdr   = in_if.req_data.tag[LSU_CLIENT_TAG_WIDTH-1 -: HDR_W];
-    assign row_slot = NW_WIDTH'(in_hdr.cta_id);
-    `UNUSED_VAR (in_hdr)
+    lsu_client_tag_t in_tag;
+    assign in_tag   = in_if.req_data.tag;
+    assign row_slot = NW_WIDTH'(in_tag.header.cta_id);
+    `UNUSED_VAR (in_tag)
 
     lsu_req_data_t req_r;
     dlmem_row_t    row_r;
@@ -132,16 +131,13 @@ module VX_dlmem_xlate import VX_gpu_pkg::*, VX_dlmem_pkg::*; #(
 
     // Translation after the register drives the scheduler's request queue, which registers it.
 
+    lsu_client_tag_t tag_r;
     lsu_header_t hdr_r;
-    assign hdr_r = req_r.tag[LSU_CLIENT_TAG_WIDTH-1 -: HDR_W];
-`ifdef VX_CFG_H100_SM_ENABLE
-    // The slice appends the SM path's shared/global credit class below the fence flag.
-    wire is_fence_r = req_r.tag[1];
-    wire is_rl_r    = req_r.tag[2];
-`else
-    wire is_fence_r = req_r.tag[0];
-    wire is_rl_r    = req_r.tag[1];
-`endif
+    assign tag_r = req_r.tag;
+    assign hdr_r = tag_r.header;
+    wire is_fence_r = tag_r.flags.fence;
+    wire is_rl_r    = tag_r.flags.rl;
+    `UNUSED_VAR (tag_r)
     wire [NW_WIDTH-1:0] my_slot = NW_WIDTH'(hdr_r.cta_id);
     wire [LMEM_AW-1:0] own_base = slot_base[my_slot][LMEM_LOG-1:WA];
 
@@ -283,7 +279,7 @@ module VX_dlmem_xlate import VX_gpu_pkg::*, VX_dlmem_pkg::*; #(
     // A proxy fence sends nothing on: released by the hold above, it is
     // answered here a cycle later, so it reaches no cache. Its slice holds one
     // fence at a time, so the answer register is free when the next arrives.
-    wire [INST_LSU_BITS-1:0] op_r = req_r.tag[LSU_CLIENT_TAG_WIDTH-1-HDR_W -: INST_LSU_BITS];
+    wire [INST_LSU_BITS-1:0] op_r = tag_r.op_type;
     wire is_pfence_r = is_fence_r && (op_r == INST_LSU_PFENCE);
     reg            pf_rsp_valid_r;
     lsu_rsp_data_t pf_rsp_r;

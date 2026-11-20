@@ -78,9 +78,12 @@ RT_HDRS := $(wildcard $(SW_COMMON_DIR)/*.h) \
 # of CONFIGS alone must rebuild it, as the driver libraries already do.
 CONFIG_FILE := $(OUT_DIR)/stub_rt_config.stamp
 
+# Linked to a PID-suffixed file and renamed into place: tests built in parallel
+# each re-make this library with their own CONFIGS, and a test linking against it
+# while another rewrites it in place reads a truncated file.
 $(OUT_DIR)/$(PROJECT): $(SRCS) $(RT_HDRS) $(CONFIG_FILE)
 	@mkdir -p $(OUT_DIR)
-	$(CXX) $(CXXFLAGS) $(filter-out $(RT_HDRS) $(CONFIG_FILE),$^) $(LDFLAGS) -o $@
+	$(CXX) $(CXXFLAGS) $(filter-out $(RT_HDRS) $(CONFIG_FILE),$^) $(LDFLAGS) -o $@.tmp.$$$$ && mv -f $@.tmp.$$$$ $@
 
 # Rewritten only when the flags changed; PID-suffixed tmp for concurrent makes.
 $(CONFIG_FILE): force

@@ -101,8 +101,9 @@ tests:
     configs: "-DVX_CFG_EXT_DXA_ENABLE -DVX_CFG_H100_ORG_ENABLE -DVX_CFG_NUM_THREADS=16"
     env: {DRIVER: rtlsim, STORE_BYTES: "16384"}
     run: *eng_store
-  # A 16-B bulk store's issue -> wait_group 0, L2-resident and to cold lines (a cold one no
-  # faster); the H100's 108 cycles (14 §5) are printed, not judged.
+  # A 16-B bulk store's issue -> wait_group 0, L2-resident and to cold lines (exactly as fast:
+  # the group is done when the SM port takes its writes); the H100's 108 cycles (14 §5) are
+  # printed, not judged.
   - id: complete-org
     via: script
     driver: simx

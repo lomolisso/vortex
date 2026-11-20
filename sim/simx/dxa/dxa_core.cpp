@@ -241,6 +241,11 @@ public:
       bool     wr_done = false;
       bool     wr_new = false;               // write_done in this cycle
       uint64_t end_at = 0;
+#if defined(VX_CFG_H100_SM_ENABLE) && defined(VX_CFG_H100_FE_ENABLE)
+      uint32_t amo_acc = 0;                  // atomics the SM port took
+      bool     wr_evt = false;               // write_done reported
+#endif
+#line 235
     };
     bool                    store = false;
     StWork                  st;
@@ -466,6 +471,19 @@ public:
         ch.pop();
       }
     }
+#if defined(VX_CFG_H100_SM_ENABLE) && defined(VX_CFG_H100_FE_ENABLE)
+
+    // 1b) The SM ports' acceptances of the engine's requests.
+    for (auto& ch : simobject_->gmem_acc_in) {
+      if (!ch.empty()) {
+      #ifdef DXA_MBAR_ENABLE
+        this->gmem_accepted(ch.peek());
+      #endif
+        ch.pop();
+      }
+    }
+#endif
+#line 262
 
 #ifdef DXA_MBAR_ENABLE
     // The map fetch's line reads take the GMEM port ahead of the workers.
@@ -3311,6 +3329,9 @@ private:
     e.c.write_done = true;
     e.core         = w.req.core->id() % kCoresPerSocket;
     e.uuid         = w.req.uuid;
+#ifdef VX_CFG_H100_SM_ENABLE
+    e.acc          = false;
+#endif
     st.end_at = cycle_ + kStEndDelay;
     DT(3, simobject_->name() << "[" << w.worker_id << "] store fence: line=0x" << std::hex << f.addr
        << std::dec << ", entry=" << idx << " (#" << w.req.uuid << ")");
@@ -3321,10 +3342,43 @@ private:
     __assert(idx < kStFences && st_fences_.at(worker_id).at(idx).valid,
              simobject_->name() << " DXA store fence response without its fence: entry=" << idx);
     auto& e = st_fences_.at(worker_id).at(idx);
+#ifdef VX_CFG_H100_SM_ENABLE
+    // The writes were done when the SM port took the fence; its answer only
+    // frees the entry.
+    __assert(e.acc, simobject_->name() << " DXA store fence answered before its port took it: entry=" << idx);
+#else
     bg_evq_.at(worker_id).push_back({e.c, cycle_ + kBgEvtDelay, e.core});
     DT(3, simobject_->name() << "[" << worker_id << "] bg-compl " << e.c << " (#" << e.uuid << ")");
+#endif
     e.valid = false;
   }
+
+#ifdef VX_CFG_H100_SM_ENABLE
+  // The SM port took one of the engine's requests into its in-order request
+  // FIFO. A bulk store's group is written once its trailing fence is taken
+  // (its writes went ahead of it on the same path); a reduction's once its
+  // last atomic is. Ordering behind them in the port keeps them visible.
+  void gmem_accepted(const MemReq& req) {
+    const uint32_t lg2w = log2ceil(VX_CFG_NUM_DXA_CORES);
+    const uint32_t worker_id = uint32_t(req.tag & ((uint64_t(1) << lg2w) - 1));
+    const uint64_t tag = uint64_t(req.tag) >> lg2w;
+    if (req.flags.fence && tag >= kStFenceTag) {
+      const uint32_t idx = uint32_t(tag - kStFenceTag);
+      __assert(idx < kStFences && st_fences_.at(worker_id).at(idx).valid && !st_fences_.at(worker_id).at(idx).acc,
+               simobject_->name() << " DXA store fence taken without its entry: entry=" << idx);
+      auto& e = st_fences_.at(worker_id).at(idx);
+      e.acc = true;
+      bg_evq_.at(worker_id).push_back({e.c, cycle_ + kBgEvtDelay, e.core});
+      DT(3, simobject_->name() << "[" << worker_id << "] bg-compl " << e.c << " (#" << e.uuid << ")");
+      return;
+    }
+    if (memop_is_amo(req.op)) {
+      auto& st = workers_.at(worker_id).st;
+      __assert(st.amo_acc < st.amo_sent, simobject_->name() << " DXA reduction atomic taken without a request");
+      ++st.amo_acc;
+    }
+  }
+#endif
 
 #endif
 #line 2620
@@ -3381,6 +3435,28 @@ private:
       st.wr_done = true;
       st.wr_new  = true;
     }
+#if defined(VX_CFG_H100_SM_ENABLE) && defined(VX_CFG_H100_FE_ENABLE)
+    // A reduction's writes are reported once the SM port took its last
+    // atomic; the worker still ends with the answers.
+    bool wr_evt = st.wr_new && !st.wr_evt;
+    if (!st.wr_evt && !st.slot_valid && st.amo_sent != 0 && st.amo_acc == st.amo_sent
+        && this->store_drained(w)) {
+      wr_evt = true;
+    }
+    if (wr_evt) {
+      st.wr_evt = true;
+    }
+    if (rd_new || wr_evt) {
+      DxaBgCompl c;
+      c.wid        = w.req.wid;
+      c.seq        = w.req.bg_seq;
+      c.read_done  = rd_new;
+      c.write_done = wr_evt;
+      bg_evq_.at(w.worker_id).push_back({c, cycle_ + kBgEvtDelay, w.req.core->id() % kCoresPerSocket});
+      DT(3, simobject_->name() << "[" << w.worker_id << "] bg-compl " << c << " (#" << w.req.uuid << ")");
+    }
+#else
+#line 2673
     if (rd_new || st.wr_new) {
       DxaBgCompl c;
       c.wid        = w.req.wid;
@@ -3390,6 +3466,8 @@ private:
       bg_evq_.at(w.worker_id).push_back({c, cycle_ + kBgEvtDelay, w.req.core->id() % kCoresPerSocket});
       DT(3, simobject_->name() << "[" << w.worker_id << "] bg-compl " << c << " (#" << w.req.uuid << ")");
     }
+#endif
+#line 2682
     if (st.wr_new) {
       st.end_at = cycle_ + kStEndDelay;
     }
@@ -3730,6 +3808,10 @@ private:
     DxaBgCompl c;
     uint32_t   core = 0;
     uint64_t   uuid = 0;
+#ifdef VX_CFG_H100_SM_ENABLE
+    bool       acc = false;    // the SM port took the fence
+#endif
+#line 3022
   };
   std::vector<std::vector<StFence>> st_fences_ =
       std::vector<std::vector<StFence>>(VX_CFG_NUM_DXA_CORES, std::vector<StFence>(kStFences));
@@ -3879,6 +3961,10 @@ DxaCore::DxaCore(const SimContext& ctx, const char* name, Socket* socket)
   , dxa_req_in(kCoresPerSocket, this)
   , gmem_req_out(kDxaMemPorts, this)
   , gmem_rsp_in(kDxaMemPorts, this)
+#if defined(VX_CFG_H100_SM_ENABLE) && defined(VX_CFG_H100_FE_ENABLE)
+  , gmem_acc_in(kCoresPerSocket, this)
+#endif
+#line 949
   , lmem_req_out(kCoresPerSocket * LMEM_PORTS_PER_CORE, this)
   , compl_release_out(kCoresPerSocket, this)
 #ifdef DXA_MBAR_ENABLE

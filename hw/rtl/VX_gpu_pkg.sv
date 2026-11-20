@@ -333,6 +333,10 @@ package VX_gpu_pkg;
     // is_fence marks an LSU fence's is_flush: the device's shared cache level
     // drains it instead of walking. A host flush carries is_flush alone.
     typedef struct packed {
+    `ifdef VX_CFG_H100_SM_ENABLE
+        // An L1 invalidate: the SM's L1 drains, clears every line and answers; nothing goes below it.
+        logic                        is_inval;
+    `endif
     `ifdef VX_CFG_EXT_DLMEM_ENABLE
         // A CTA-scope fence: the first cache level drains it and does not pass it on.
         logic                        is_fence_cta;   // MEM_ATTR_FENCE_CTA_OFFS = MEM_ATTR_LACC_OFFS + 1
@@ -1833,35 +1837,39 @@ package VX_gpu_pkg;
     localparam CPA_OP_ARRIVE = 2'd3;
 `endif
 
-    // Width of the tag carried over VX_lsu_sched_if: lsu_header + op_type
-    // + per-lane align + packet allocator addr (+ global-load mark, AMO aq, rl in DLMEM builds)
-    // + fence flag (+ shared/global credit class on the H100 SM path); matches VX_lsu_slice's TAG_WIDTH.
+    // The LSU slice's client tag over VX_lsu_sched_if: what a response needs to retire, and the
+    // request flags the DLMEM translation stage reads on the way to the scheduler.
+    typedef struct packed {
+`ifdef VX_CFG_EXT_DLMEM_ENABLE
+        logic gload;
 `ifdef VX_CFG_EXT_MBAR_ENABLE
-    // plus the try_wait and cp.async marks
-    localparam LSU_CLIENT_TAG_WIDTH = $bits(lsu_header_t) + INST_LSU_BITS
-                                    + (`VX_CFG_NUM_LSU_LANES * `CLOG2(LSU_WORD_SIZE))
+        logic tw;
+        logic cpa_copy;
+`endif
+        logic aq;
+        logic rl;
+`endif
+        logic fence;
 `ifdef VX_CFG_H100_SM_ENABLE
-                                    + `LOG2UP(LSU_PEND_POOL) + 1 + 1 + 1 + 2 + 1 + 1;
-`else
-                                    + `LOG2UP(`VX_CFG_LSU_PENDING_SIZE) + 1 + 1 + 1 + 2 + 1;
+        logic shm;
 `endif
-`elsif VX_CFG_EXT_DLMEM_ENABLE
-    localparam LSU_CLIENT_TAG_WIDTH = $bits(lsu_header_t) + INST_LSU_BITS
-                                    + (`VX_CFG_NUM_LSU_LANES * `CLOG2(LSU_WORD_SIZE))
+    } lsu_tag_flags_t;
+
 `ifdef VX_CFG_H100_SM_ENABLE
-                                    + `LOG2UP(LSU_PEND_POOL) + 1 + 2 + 1 + 1;
+    localparam LSU_PKT_ADDR_W = `LOG2UP(LSU_PEND_POOL);
 `else
-                                    + `LOG2UP(`VX_CFG_LSU_PENDING_SIZE) + 1 + 2 + 1;
+    localparam LSU_PKT_ADDR_W = `LOG2UP(`VX_CFG_LSU_PENDING_SIZE);
 `endif
-`else
-    localparam LSU_CLIENT_TAG_WIDTH = $bits(lsu_header_t) + INST_LSU_BITS
-                                    + (`VX_CFG_NUM_LSU_LANES * `CLOG2(LSU_WORD_SIZE))
-`ifdef VX_CFG_H100_SM_ENABLE
-                                    + `LOG2UP(LSU_PEND_POOL) + 1 + 1;
-`else
-                                    + `LOG2UP(`VX_CFG_LSU_PENDING_SIZE) + 1;
-`endif
-`endif
+
+    typedef struct packed {
+        lsu_header_t                                                header;
+        logic [INST_LSU_BITS-1:0]                                   op_type;
+        logic [`VX_CFG_NUM_LSU_LANES-1:0][`CLOG2(LSU_WORD_SIZE)-1:0] align;
+        logic [LSU_PKT_ADDR_W-1:0]                                  pkt;
+        lsu_tag_flags_t                                             flags;
+    } lsu_client_tag_t;
+
+    localparam LSU_CLIENT_TAG_WIDTH = $bits(lsu_client_tag_t);
 
     // Request/response payloads for VX_lsu_sched_if. Valid/ready live on
     // the interface, never in the payload (Vortex elastic-idiom rule).

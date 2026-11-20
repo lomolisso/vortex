@@ -173,6 +173,12 @@ module VX_dxa_core_top import VX_gpu_pkg::*, VX_dxa_pkg::*; #(
         assign gmem_rsp_ready[i]           = gmem_bus_if[i].rsp_ready;
     end
 
+`ifdef VX_CFG_H100_SM_ENABLE
+    // The memory model serves L1-line requests; on the H100 SM path the engine's
+    // GMEM port is DXA_GMEM_LINE_SIZE wide and reports the SM port's acceptances.
+    `STATIC_ASSERT (0, ("the dxa_core bench does not model the H100 SM port"))
+`endif
+
     // -----------------------------------------------------------------------
     // DUT
     // -----------------------------------------------------------------------
@@ -208,6 +214,19 @@ module VX_dxa_core_top import VX_gpu_pkg::*, VX_dxa_pkg::*; #(
     assign bg_compl = bg_compl_w;
 `endif
 
+`ifdef DXA_TMAP_L2_ENABLE
+    VX_tmap_l2_bus_if tmap_l2_bus_if[1]();
+
+    VX_tmap_l2 #(
+        .INSTANCE_ID (`SFORMATF(("%s-tmap-l2", INSTANCE_ID))),
+        .NUM_PORTS   (1)
+    ) tmap_l2 (
+        .clk    (clk),
+        .reset  (reset),
+        .bus_if (tmap_l2_bus_if)
+    );
+`endif
+
     VX_dxa_core #(
         .INSTANCE_ID     (INSTANCE_ID),
         .NUM_REQS        (1),
@@ -227,6 +246,9 @@ module VX_dxa_core_top import VX_gpu_pkg::*, VX_dxa_pkg::*; #(
         .slot_stride       (slot_stride),
         .bg_compl_valid    (bg_compl_valid),
         .bg_compl          (bg_compl_w),
+    `ifdef DXA_TMAP_L2_ENABLE
+        .tmap_l2_bus_if    (tmap_l2_bus_if[0]),
+    `endif
     `endif
         .busy              (busy)
     );

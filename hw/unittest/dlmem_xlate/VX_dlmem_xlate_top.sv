@@ -36,7 +36,6 @@ module VX_dlmem_xlate_top import VX_gpu_pkg::*; #(
     localparam DW         = LSU_WORD_SIZE * 8,
     localparam ATTR_W     = MEM_ATTR_WIDTH,
     localparam TAG_W      = LSU_CLIENT_TAG_WIDTH,
-    localparam HDR_W      = $bits(lsu_header_t),
     localparam PID_W      = `LOG2UP(`VX_CFG_NUM_THREADS / NL),
     localparam RSP_W      = $bits(lsu_rsp_data_t),
     localparam CORE_W     = DLMEM_CORE_W,
@@ -196,24 +195,25 @@ module VX_dlmem_xlate_top import VX_gpu_pkg::*; #(
     VX_lsu_sched_if out_if [NB]();
 
     for (genvar b = 0; b < NB; ++b) begin : g_blocks
-        lsu_header_t hdr;
+        lsu_client_tag_t tag_eff;
         always @(*) begin
-            hdr = in_tag[b][TAG_W-1 -: HDR_W];
-            hdr.wid    = in_wid[b];
-            hdr.cta_id = NCTA_WIDTH'(in_cta[b]);
-            hdr.pid    = in_pid[b];
+            tag_eff = in_tag[b];
+            tag_eff.header.wid    = in_wid[b];
+            tag_eff.header.cta_id = NCTA_WIDTH'(in_cta[b]);
+            tag_eff.header.pid    = in_pid[b];
+            tag_eff.flags.rl      = in_rl[b];
+            tag_eff.flags.fence   = in_fence[b];
+        `ifdef DXA_MBAR_ENABLE
+            // A random op field names the proxy fence, which the stage answers
+            // itself, only when the bench asks for one.
+            if (in_pfence[b]) begin
+                tag_eff.op_type = INST_LSU_PFENCE;
+            end else if (tag_eff.op_type == INST_LSU_PFENCE) begin
+                tag_eff.op_type = INST_LSU_FENCE;
+            end
+        `endif
         end
-    `ifdef DXA_MBAR_ENABLE
-        // A random op field names the proxy fence, which the stage answers
-        // itself, only when the bench asks for one.
-        wire [INST_LSU_BITS-1:0] op_raw = in_tag[b][TAG_W-HDR_W-1 -: INST_LSU_BITS];
-        wire [INST_LSU_BITS-1:0] op_eff = in_pfence[b] ? INST_LSU_PFENCE
-                                        : ((op_raw == INST_LSU_PFENCE) ? INST_LSU_FENCE : op_raw);
-        assign in_tag_eff[b] = {hdr, op_eff, in_tag[b][TAG_W-HDR_W-INST_LSU_BITS-1:2], in_rl[b], in_fence[b]};
-    `else
-        assign in_tag_eff[b] = {hdr, in_tag[b][TAG_W-HDR_W-1:2], in_rl[b], in_fence[b]};
-    `endif
-        `UNUSED_VAR (in_tag[b][1:0])
+        assign in_tag_eff[b] = tag_eff;
 
         assign in_if[b].req_valid       = in_valid[b];
         assign in_if[b].req_data.rw     = in_rw[b];

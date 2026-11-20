@@ -51,11 +51,7 @@ module VX_lsu_slice import VX_gpu_pkg::*; #(
 );
     localparam NUM_LANES    = `VX_CFG_NUM_LSU_LANES;
     localparam PID_BITS     = `CLOG2(`VX_CFG_NUM_THREADS / NUM_LANES);
-`ifdef VX_CFG_H100_SM_ENABLE
-    localparam LSUQ_SIZEW   = `LOG2UP(LSU_PEND_POOL);
-`else
-    localparam LSUQ_SIZEW   = `LOG2UP(`VX_CFG_LSU_PENDING_SIZE);
-`endif
+    localparam LSUQ_SIZEW   = LSU_PKT_ADDR_W;
     localparam REQ_ASHIFT   = `CLOG2(LSU_WORD_SIZE);
     localparam MEM_ASHIFT   = `CLOG2(`VX_CFG_MEM_BLOCK_SIZE);
     localparam MEM_ADDRW    = `VX_CFG_MEM_ADDR_WIDTH - MEM_ASHIFT;
@@ -74,22 +70,6 @@ module VX_lsu_slice import VX_gpu_pkg::*; #(
     `UNUSED_PARAM (CORE_ID)
     `UNUSED_SPARAM (INSTANCE_ID)
 
-`ifdef VX_CFG_EXT_MBAR_ENABLE
-    // tag_width = header + op_type + align + pkt_addr + gload + try_wait + cp.async + aq + rl + fence
-    localparam TAG_WIDTH = $bits(lsu_header_t) + INST_LSU_BITS + (NUM_LANES * REQ_ASHIFT) + LSUQ_SIZEW + 1 + 1 + 1 + 2 + 1;
-`elsif VX_CFG_EXT_DLMEM_ENABLE
-    // tag_width = header + op_type + align + pkt_addr + gload + aq + rl + fence
-    localparam TAG_WIDTH = $bits(lsu_header_t) + INST_LSU_BITS + (NUM_LANES * REQ_ASHIFT) + LSUQ_SIZEW + 1 + 2 + 1;
-`else
-    // tag_width = header + op_type + align + pkt_addr + fence
-    localparam TAG_WIDTH = $bits(lsu_header_t) + INST_LSU_BITS + (NUM_LANES * REQ_ASHIFT) + LSUQ_SIZEW + 1;
-`endif
-`ifdef VX_CFG_H100_SM_ENABLE
-    // plus the credit-class bit appended below the slice's tag
-    `STATIC_ASSERT (TAG_WIDTH + 1 == LSU_CLIENT_TAG_WIDTH, ("LSU client tag width mismatch — pkg/slice out of sync"))
-`else
-    `STATIC_ASSERT (TAG_WIDTH == LSU_CLIENT_TAG_WIDTH, ("LSU client tag width mismatch — pkg/slice out of sync"))
-`endif
 `ifdef VX_CFG_EXT_A_ENABLE
     `STATIC_ASSERT ((CORE_ID >> (HART_ID_BITS - NW_BITS - NT_BITS)) == 0, ("global core id does not fit the hart id core field"))
 `endif
@@ -199,6 +179,10 @@ module VX_lsu_slice import VX_gpu_pkg::*; #(
         assign mem_req_attr_struct[i].is_lacc        = 1'b0;
         assign mem_req_attr_struct[i].is_fence_cta   = req_is_cfence;
     `endif
+    `ifdef VX_CFG_H100_SM_ENABLE
+        // vx_l1_inval: a fence whose is_float field the decoder sets.
+        assign mem_req_attr_struct[i].is_inval = req_is_fence && execute_if.data.op_args.lsu.is_float;
+    `endif
     `ifdef VX_CFG_EXT_OM_ENABLE
         // OM fragment-export aperture.
         //
@@ -283,13 +267,13 @@ module VX_lsu_slice import VX_gpu_pkg::*; #(
     wire [NUM_LANES-1:0][LSU_ADDR_WIDTH-1:0] mem_req_addr;
     wire [NUM_LANES-1:0][LSU_WORD_SIZE-1:0] mem_req_byteen;
     reg  [NUM_LANES-1:0][LSU_WORD_SIZE*8-1:0] mem_req_data;
-    wire [TAG_WIDTH-1:0]            mem_req_tag;
+    lsu_client_tag_t                mem_req_tag;
     wire                            mem_req_ready;
 
     wire                            mem_rsp_valid;
     wire [NUM_LANES-1:0]            mem_rsp_mask;
     wire [NUM_LANES-1:0][LSU_WORD_SIZE*8-1:0] mem_rsp_data;
-    wire [TAG_WIDTH-1:0]            mem_rsp_tag;
+    lsu_client_tag_t                mem_rsp_tag;
     wire                            mem_rsp_sop;
     wire                            mem_rsp_eop;
     wire                            mem_rsp_ready;
@@ -700,8 +684,7 @@ module VX_lsu_slice import VX_gpu_pkg::*; #(
     assign req_rl = 1'b0;
 `endif
 `ifdef VX_CFG_EXT_MBAR_ENABLE
-    // Marks a try_wait, whose retire the waiter table needs; rl and fence keep
-    // the tag bits the DLMEM translation reads.
+    // Marks a try_wait, whose retire the waiter table needs.
     wire req_tw = execute_if.data.op_args.lsu.amo_valid
                && (amo_op_e'(execute_if.data.op_args.lsu.amo_op) == AMO_OP_MBAR_TRY_WAIT);
     // A copy's packet field names its cp.async slot.
@@ -713,38 +696,7 @@ module VX_lsu_slice import VX_gpu_pkg::*; #(
 `else
     wire [LSUQ_SIZEW-1:0] cpa_slot;
 `endif
-    assign mem_req_tag = {
-        execute_if.data.header,
-        execute_if.data.op_type,
-        req_align,
-        req_cpa_copy ? cpa_slot : pkt_waddr,
-        req_gload,
-        req_tw,
-        req_cpa_copy,
-        req_aq,
-        req_rl,
-        req_is_fence
-    };
-`else
-    assign mem_req_tag = {
-        execute_if.data.header,
-        execute_if.data.op_type,
-        req_align,
-        pkt_waddr,
-        req_gload,
-        req_aq,
-        req_rl,
-        req_is_fence
-    };
 `endif
-`else
-    assign mem_req_tag = {
-        execute_if.data.header,
-        execute_if.data.op_type,
-        req_align,
-        pkt_waddr,
-        req_is_fence
-    };
 `endif
 
 `ifdef VX_CFG_H100_SM_ENABLE
@@ -775,6 +727,28 @@ module VX_lsu_slice import VX_gpu_pkg::*; #(
         ("%t: *** %s LSU credit class underflow", $time, INSTANCE_ID))
 
 `endif
+    always @(*) begin
+        mem_req_tag.header      = execute_if.data.header;
+        mem_req_tag.op_type     = execute_if.data.op_type;
+        mem_req_tag.align       = req_align;
+    `ifdef VX_CFG_EXT_MBAR_ENABLE
+        mem_req_tag.pkt         = req_cpa_copy ? cpa_slot : pkt_waddr;
+        mem_req_tag.flags.tw    = req_tw;
+        mem_req_tag.flags.cpa_copy = req_cpa_copy;
+    `else
+        mem_req_tag.pkt         = pkt_waddr;
+    `endif
+    `ifdef VX_CFG_EXT_DLMEM_ENABLE
+        mem_req_tag.flags.gload = req_gload;
+        mem_req_tag.flags.aq    = req_aq;
+        mem_req_tag.flags.rl    = req_rl;
+    `endif
+        mem_req_tag.flags.fence = req_is_fence;
+    `ifdef VX_CFG_H100_SM_ENABLE
+        mem_req_tag.flags.shm   = req_shm;
+    `endif
+    end
+
     // Pack per-lane mem_req signals into the client_if request payload;
     // unpack the response payload into per-lane mem_rsp signals.
 `ifdef VX_CFG_H100_SM_ENABLE
@@ -795,21 +769,19 @@ module VX_lsu_slice import VX_gpu_pkg::*; #(
         assign client_if.req_data.mbar_addr[i] = execute_if.data.rs3_data[i][`VX_CFG_MEM_ADDR_WIDTH-1:REQ_ASHIFT];
     end
 `endif
+    assign client_if.req_data.tag    = mem_req_tag;
 `ifdef VX_CFG_H100_SM_ENABLE
-    assign client_if.req_data.tag    = {mem_req_tag, req_shm};
     assign mem_req_ready             = client_if.req_ready && ~cls_hold;
 `else
-    assign client_if.req_data.tag    = mem_req_tag;
     assign mem_req_ready             = client_if.req_ready;
 `endif
 
     assign mem_rsp_valid             = client_if.rsp_valid;
     assign mem_rsp_mask              = client_if.rsp_data.mask;
     assign mem_rsp_data              = client_if.rsp_data.data;
-`ifdef VX_CFG_H100_SM_ENABLE
-    assign {mem_rsp_tag, rsp_shm}    = client_if.rsp_data.tag;
-`else
     assign mem_rsp_tag               = client_if.rsp_data.tag;
+`ifdef VX_CFG_H100_SM_ENABLE
+    assign rsp_shm                   = mem_rsp_tag.flags.shm;
 `endif
     assign mem_rsp_sop               = client_if.rsp_data.sop;
     assign mem_rsp_eop               = client_if.rsp_data.eop;
@@ -826,30 +798,12 @@ module VX_lsu_slice import VX_gpu_pkg::*; #(
     `UNUSED_VAR (rsp_rl)
 `ifdef VX_CFG_EXT_MBAR_ENABLE
     wire rsp_tw;
-    assign {
-        rsp_hdr,
-        rsp_op_type,
-        rsp_align,
-        pkt_raddr,
-        rsp_gload,
-        rsp_tw,
-        rsp_cpa,
-        rsp_aq,
-        rsp_rl,
-        rsp_is_fence
-    } = mem_rsp_tag;
-`else
-    assign {
-        rsp_hdr,
-        rsp_op_type,
-        rsp_align,
-        pkt_raddr,
-        rsp_gload,
-        rsp_aq,
-        rsp_rl,
-        rsp_is_fence
-    } = mem_rsp_tag;
+    assign rsp_tw  = mem_rsp_tag.flags.tw;
+    assign rsp_cpa = mem_rsp_tag.flags.cpa_copy;
 `endif
+    assign rsp_gload = mem_rsp_tag.flags.gload;
+    assign rsp_aq    = mem_rsp_tag.flags.aq;
+    assign rsp_rl    = mem_rsp_tag.flags.rl;
 
     always @(posedge clk) begin
         if (reset) begin
@@ -893,15 +847,12 @@ module VX_lsu_slice import VX_gpu_pkg::*; #(
         ("%t: %s global load counter overflow, wid=%0d", $time, INSTANCE_ID, execute_if.data.header.wid))
     `RUNTIME_ASSERT (~(mem_rsp_fire && mem_rsp_eop && rsp_gload && (gload[rsp_hdr.wid] == '0)),
         ("%t: %s global load counter underflow, wid=%0d", $time, INSTANCE_ID, rsp_hdr.wid))
-`else
-    assign {
-        rsp_hdr,
-        rsp_op_type,
-        rsp_align,
-        pkt_raddr,
-        rsp_is_fence
-    } = mem_rsp_tag;
 `endif
+    assign rsp_hdr      = mem_rsp_tag.header;
+    assign rsp_op_type  = mem_rsp_tag.op_type;
+    assign rsp_align    = mem_rsp_tag.align;
+    assign pkt_raddr    = mem_rsp_tag.pkt;
+    assign rsp_is_fence = mem_rsp_tag.flags.fence;
 
     // load response formatting
 

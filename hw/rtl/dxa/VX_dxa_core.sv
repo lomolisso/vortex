@@ -35,6 +35,15 @@ module VX_dxa_core import VX_gpu_pkg::*, VX_dxa_pkg::*; #(
     // Bulk-group completion events, per requesting core, never refused.
     output wire [`VX_CFG_SOCKET_SIZE-1:0] bg_compl_valid,
     output dxa_bg_compl_t [`VX_CFG_SOCKET_SIZE-1:0] bg_compl,
+`ifdef VX_CFG_H100_SM_ENABLE
+`ifdef VX_CFG_H100_FE_ENABLE
+    // Per SM, each engine request its port's request FIFO took.
+    input wire [`VX_CFG_SOCKET_SIZE-1:0] gmem_acc_valid,
+    input wire [`VX_CFG_SOCKET_SIZE-1:0] gmem_acc_amo,
+    input wire [`VX_CFG_SOCKET_SIZE-1:0][SOCKET_MEM_TAG_WIDTH-UUID_WIDTH-1:0] gmem_acc_tag,
+`endif
+`endif
+`line 38 "VX_dxa_core.sv" 0
 `ifdef DXA_TMAP_L2_ENABLE
     // The cluster's level-2 tensor-map cache.
     VX_tmap_l2_bus_if.master tmap_l2_bus_if,
@@ -713,6 +722,13 @@ module VX_dxa_core import VX_gpu_pkg::*, VX_dxa_pkg::*; #(
     wire [`VX_CFG_NUM_DXA_CORES-1:0]                 w_evt_valid, w_evt_ready;
     wire [`VX_CFG_NUM_DXA_CORES-1:0][NC_WIDTH-1:0]   w_evt_core;
     dxa_bg_compl_t [`VX_CFG_NUM_DXA_CORES-1:0]       w_evt;
+`ifdef VX_CFG_H100_SM_ENABLE
+`ifdef VX_CFG_H100_FE_ENABLE
+    wire [`VX_CFG_NUM_DXA_CORES-1:0]                 w_acc_valid, w_acc_amo;
+    wire [`VX_CFG_NUM_DXA_CORES-1:0][WORKER_GMEM_TAG_WIDTH-UUID_WIDTH-1:0] w_acc_tag;
+`endif
+`endif
+`line 505 "VX_dxa_core.sv" 0
 `endif
 
     for (genvar i = 0; i < `VX_CFG_NUM_DXA_CORES; ++i) begin : g_workers
@@ -738,6 +754,14 @@ module VX_dxa_core import VX_gpu_pkg::*, VX_dxa_pkg::*; #(
             .bg_evt_core    (w_evt_core[i]),
             .bg_evt         (w_evt[i]),
             .bg_evt_ready   (w_evt_ready[i]),
+        `ifdef VX_CFG_H100_SM_ENABLE
+        `ifdef VX_CFG_H100_FE_ENABLE
+            .gmem_acc_valid (w_acc_valid[i]),
+            .gmem_acc_amo   (w_acc_amo[i]),
+            .gmem_acc_tag   (w_acc_tag[i]),
+        `endif
+        `endif
+`line 530 "VX_dxa_core.sv" 0
         `endif
             .smem_bus_if    (worker_smem_bus_if[i])
         );
@@ -971,6 +995,24 @@ module VX_dxa_core import VX_gpu_pkg::*, VX_dxa_pkg::*; #(
     assign tm_rsp_valid = tm_bus_if.rsp_valid;
     assign tm_rsp_data  = tm_bus_if.rsp_data.data;
     `UNUSED_VAR (tm_bus_if.rsp_data.tag)
+`endif
+`line 715 "VX_dxa_core.sv" 0
+`ifdef VX_CFG_H100_FE_ENABLE
+    // A port's report goes to its SM's worker (one engine per SM); a map
+    // read is the fetch's.
+    `STATIC_ASSERT (`VX_CFG_NUM_DXA_CORES == `VX_CFG_SOCKET_SIZE, ("the H100 SM path has one DXA worker per SM"))
+    for (genvar i = 0; i < `VX_CFG_NUM_DXA_CORES; ++i) begin : g_gmem_acc
+        wire [TM_VAL_W-1:0] acc_v = TM_VAL_W'(gmem_acc_tag[i]);
+    `ifdef DXA_TMAP_L2_ENABLE
+        wire acc_tm = acc_v[TM_VAL_W-1] && (acc_v[TM_VAL_W-2] || ~acc_v[TM_VAL_W-3]);
+    `else
+        wire acc_tm = acc_v[TM_VAL_W-1];
+    `endif
+        assign w_acc_valid[i] = gmem_acc_valid[i] && ~acc_tm;
+        assign w_acc_amo[i]   = gmem_acc_amo[i];
+        assign w_acc_tag[i]   = acc_v[TM_VAL_W-1:GMEM_ARB_SEL_BITS];
+        `UNUSED_VAR (gmem_acc_tag[i])
+    end
 `endif
 `line 715 "VX_dxa_core.sv" 0
 

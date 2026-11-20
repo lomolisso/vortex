@@ -80,6 +80,12 @@ public:
   std::vector<SimChannel<MemReq>>  gmem_req_out;
   std::vector<SimChannel<MemRsp>>  gmem_rsp_in;
   MemArbiter::Ptr                  gmem_arb_;
+#if defined(VX_CFG_H100_SM_ENABLE) && defined(VX_CFG_H100_FE_ENABLE)
+
+  // Per SM, the engine's requests its port's request FIFO took (SmPort::TmaAccOut).
+  std::vector<SimChannel<MemReq>>  gmem_acc_in;
+#endif
+#line 61
 
   // LMEM row width the RTL drains per cycle: one DXA write beat covers the
   // full banked row (DXA_LMEM_WORD_SIZE = LMEM_NUM_BANKS * XLEN/8). The

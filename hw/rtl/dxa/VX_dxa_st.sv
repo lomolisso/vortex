@@ -81,6 +81,9 @@ module VX_dxa_st import VX_gpu_pkg::*, VX_dxa_pkg::*, VX_dlmem_pkg::*; #(
     input  wire                        fence_room,
     input  wire [GMEM_TAG_WIDTH-UUID_WIDTH-1:0] fence_tag,
     output wire                        fence_sent,
+`ifdef VX_CFG_H100_SM_ENABLE
+    input  wire                        acc_amo,     // the SM port took one of the atomics
+`endif
 `endif
 
     // Cluster-reduction packets to the row egress.
@@ -530,6 +533,26 @@ module VX_dxa_st import VX_gpu_pkg::*, VX_dxa_pkg::*, VX_dlmem_pkg::*; #(
                  : all_emitted;
     wire wr_cond = active && wr_ok && ~wr_seen_r;
     wire evt_fire = evt_valid && evt_ready;
+`ifdef VX_CFG_H100_FE_ENABLE
+`ifdef VX_CFG_H100_SM_ENABLE
+    // A reduction's writes are reported once the SM port took its last
+    // atomic; the engine still ends with the answers.
+    reg [CNT_W-1:0] acc_left_r;
+    reg             red_seen_r;
+    wire red_cond = active && is_red_g && all_emitted && (acc_left_r == '0) && ~red_seen_r;
+    always @(posedge clk) begin
+        if (reset || start) begin
+            acc_left_r <= '0;
+            red_seen_r <= 1'b0;
+        end else begin
+            acc_left_r <= acc_left_r + CNT_W'(amo_req_fire) - CNT_W'(acc_amo);
+            if (red_cond) red_seen_r <= 1'b1;
+        end
+    end
+    `RUNTIME_ASSERT (~(acc_amo && (acc_left_r == '0)),
+        ("%t: *** %s DXA reduction atomic taken without a request", $time, INSTANCE_ID))
+`endif
+`endif
 
     always @(posedge clk) begin
         if (reset || start) begin
@@ -543,7 +566,11 @@ module VX_dxa_st import VX_gpu_pkg::*, VX_dxa_pkg::*, VX_dlmem_pkg::*; #(
             if (wr_cond) wr_seen_r <= 1'b1;
             evt_rd_r <= (evt_rd_r && ~evt_fire) || (rd_cond && bg);
 `ifdef VX_CFG_H100_FE_ENABLE
+`ifdef VX_CFG_H100_SM_ENABLE
+            evt_wr_r <= (evt_wr_r && ~evt_fire) || (wr_cond && bg && ~fenced && ~is_red_g) || (red_cond && bg);
+`else
             evt_wr_r <= (evt_wr_r && ~evt_fire) || (wr_cond && bg && ~fenced);
+`endif
 `else
             evt_wr_r <= (evt_wr_r && ~evt_fire) || (wr_cond && bg);
 `endif

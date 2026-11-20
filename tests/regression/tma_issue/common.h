@@ -76,6 +76,7 @@
 #define K_FORMS   0
 #define K_COST    1
 #define K_VISIBLE 2
+#define K_VISIBLE_L1 3
 
 // K_VISIBLE: the issuing thread's loads right after vx_bulk_wait_all() of a
 // bulk store and of a bulk reduce, each VIS_BYTES from LM_AREA.
@@ -84,14 +85,36 @@ static_assert(LM_AREA + VIS_BYTES <= LM_BYTES, "K_VISIBLE sources from LM_AREA")
 static inline uint32_t vis_word(uint32_t i) { return 0x3C000000u ^ (i * 40503u); }
 static inline uint32_t vis_red_init(uint32_t i) { return 0x00100000u + i * 11u; }
 
+// K_VISIBLE_L1 (H100 SM path): the issuing thread loads VL1_BYTES of the
+// visibility buffer into its L1, bulk-stores VL1_WBYTES (vis_word) over their
+// start and reads after vx_bulk_wait_group<0> (the written word, an unwritten
+// line, an unrelated gsrc line: all miss, current values); then the same at
+// VL1_R2 with vx_bulk_wait_group_read<0> (the L1 copy stays stale), a bulk
+// reduce (add vis_word) at VL1_R3 with vx_bulk_wait_group<0> (current sums),
+// then the cost of vx_l1_inval against a fence that goes to the L2.
+#define VL1_BYTES  512
+#define VL1_WBYTES 64
+#define VL1_R2     1024
+#define VL1_R3     2048
+static_assert(VL1_R3 + VL1_BYTES <= 2 * VIS_BYTES, "K_VISIBLE_L1 regions lie in the visibility buffer");
+static inline uint32_t vl1_old(uint32_t i) { return 0x5A000000u ^ (i * 2654435761u >> 8); }
+
 // Per-thread output words.
 #define O_DONE   0
 #define O_ALIVE  1   // a value each thread holds across the issue
 #define O_WAIT   2   // an mbarrier wait gave up
 #define O_T1     3   // K_COST: cycles of COST_N1 copies (issuing lane)
 #define O_T2     4   // K_COST: cycles of COST_N2 copies
-#define O_STALE  6   // K_VISIBLE: stale words seen, store (low half) and reduce (high half)
-#define O_WORDS  8
+#define O_STALE  6   // K_VISIBLE: stale words seen, store (low half) and reduce (high half);
+                     // K_VISIBLE_L1: wrong words after wait_group 0 (low half), stale words kept after .read (high half)
+#define O_TW     8   // K_VISIBLE_L1 cycles: the last written word after wait_group 0
+#define O_TN     9   //   a word of the next, unwritten line
+#define O_TU     10  //   the first word of gsrc (unrelated, resident before)
+#define O_TH     11  //   the same word again
+#define O_TS     12  //   the first written word after wait_group.read 0
+#define O_TINV   13  //   vx_l1_inval
+#define O_TFENCE 14  //   a fence (L1 drain, invalidate, L2 confirmation)
+#define O_WORDS  16
 #define MAX_COST_WARPS 8
 static_assert(4 * MAX_COST_WARPS <= NUM_MBARS, "K_COST uses 4 mbarriers per warp");
 

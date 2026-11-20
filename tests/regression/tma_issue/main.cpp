@@ -97,7 +97,7 @@ std::vector<uint32_t> box_words(uint32_t rank) {
 }
 
 void show_usage() {
-  std::printf("Usage: [-k kernel: 0 forms, 1 cost, 2 visibility] [-l issuing lane] [-s seed] [-w cost warps] [-f cost form]\n");
+  std::printf("Usage: [-k kernel: 0 forms, 1 cost, 2 visibility, 3 L1 visibility] [-l issuing lane] [-s seed] [-w cost warps] [-f cost form]\n");
 }
 
 void parse_args(int argc, char** argv) {
@@ -177,6 +177,10 @@ int main(int argc, char** argv) {
     h_gvis[i] = 0;
     h_gvis[VIS_BYTES / 4 + i] = vis_red_init(i);
   }
+  if (opt_kernel == K_VISIBLE_L1) {
+    for (uint32_t i = 0; i < h_gvis.size(); ++i)
+      h_gvis[i] = vl1_old(i);
+  }
   CHECK(vx_enqueue_write(q, gsrc, 0, h_gsrc.data(), tbytes, 0, nullptr, nullptr));
 
   vx_module_h mod;
@@ -196,7 +200,7 @@ int main(int argc, char** argv) {
     CHECK(vx_enqueue_write(q, gdst, 0, h_gdst.data(), 2 * BULK_BYTES, 0, nullptr, nullptr));
     CHECK(vx_enqueue_write(q, gst, 0, h_zero.data(), tbytes, 0, nullptr, nullptr));
     CHECK(vx_enqueue_write(q, gred, 0, h_gred.data(), tbytes, 0, nullptr, nullptr));
-    if (arg.kernel == K_VISIBLE)
+    if (arg.kernel == K_VISIBLE || arg.kernel == K_VISIBLE_L1)
       CHECK(vx_enqueue_write(q, gvis, 0, h_gvis.data(), 2 * VIS_BYTES, 0, nullptr, nullptr));
     vx_launch_info_t li = {};
     li.struct_size = sizeof(li);
@@ -346,6 +350,51 @@ int main(int argc, char** argv) {
       if (g[VIS_BYTES / 4 + i] != vis_red_init(i) + vis_word(i))
         fail("bulk reduce word " + std::to_string(i));
     }
+  } else if (opt_kernel == K_VISIBLE_L1) {
+#if VX_CFG_H100_SM_ENABLED && VX_CFG_H100_FE_ENABLED
+    std::printf("L1 visibility: issuing lane %u of %lu, %u-byte bulk stores over L1-resident lines\n", lane, nt,
+                VL1_WBYTES);
+    launch(arg, 1, (uint32_t)nt, out, dump);
+    check_threads((uint32_t)nt, (uint32_t)nt);
+    const uint32_t* o = &out[lane * O_WORDS];
+    const uint32_t bad = o[O_STALE] & 0xffffu, kept = o[O_STALE] >> 16;
+    const uint32_t sweep = VX_CFG_L1_TAG_SETS / VX_CFG_L1_TAG_BANKS;
+    std::printf("after wait_group 0: written word %u, unwritten line %u, unrelated line %u, its hit %u cycles\n",
+                o[O_TW], o[O_TN], o[O_TU], o[O_TH]);
+    std::printf("after wait_group.read 0: written word %u cycles; vx_l1_inval %u, fence %u cycles (sweep %u rows)\n",
+                o[O_TS], o[O_TINV], o[O_TFENCE], sweep);
+    std::printf("H100REF metric=l1_hit_cycles h100=36 vortex=%u\n", o[O_TH]);
+    std::printf("H100REF metric=l1_miss_cycles h100=233-472 vortex=%u\n", o[O_TU]);
+    std::printf("H100REF metric=l1_inval_cycles h100=35 vortex=%u\n", o[O_TINV]);
+    if (bad)
+      fail(std::to_string(bad) + " words read wrong after a bulk store's or reduce's wait_group 0 (and the L1 invalidate)");
+    if (kept != VL1_WBYTES / 4)
+      fail("after wait_group.read 0 the L1 kept " + std::to_string(kept) + " of " + std::to_string(VL1_WBYTES / 4)
+           + " stale words (the bulk store must not touch the issuer's L1)");
+    if (o[O_TW] <= o[O_TH] || o[O_TN] <= o[O_TH] || o[O_TU] <= o[O_TH])
+      fail("a line resident before wait_group 0 still hit after it");
+    if (o[O_TS] >= o[O_TU])
+      fail("the stale copy after wait_group.read 0 did not hit");
+    if (o[O_TINV] < sweep)
+      fail("vx_l1_inval took fewer cycles than the valid sweep");
+    if (o[O_TINV] >= o[O_TFENCE])
+      fail("vx_l1_inval took no less than a fence's L2 round trip (it must answer in the L1)");
+    std::vector<uint32_t> g(2 * VIS_BYTES / 4);
+    read_back(g.data(), gvis, 2 * VIS_BYTES);
+    for (uint32_t i = 0; i < g.size(); ++i) {
+      uint32_t want = vl1_old(i);
+      for (uint32_t base : {0u, (uint32_t)VL1_R2 / 4}) {
+        if (i - base < VL1_WBYTES / 4)
+          want = vis_word(i - base);
+      }
+      if (i - VL1_R3 / 4 < VL1_WBYTES / 4)
+        want += vis_word(i - VL1_R3 / 4);
+      if (g[i] != want)
+        fail("visibility buffer word " + std::to_string(i));
+    }
+#else
+    fail("-k3 needs the H100 SM path and the front end (VX_CFG_H100_SM_ENABLE, VX_CFG_H100_FE_ENABLE)");
+#endif
   } else {
     const uint32_t threads = (uint32_t)nt * opt_warps;
     for (uint32_t c = 0; c < C_COUNT; ++c) {

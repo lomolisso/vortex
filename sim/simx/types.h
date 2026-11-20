@@ -446,7 +446,7 @@ enum class LsuType {
 struct IntrLsuArgs {
   uint32_t width : 3;
   uint32_t stride : 4;  // per-uop multiplier: 0 = regular LD/ST; 0..N-1 = packLD uop_idx
-  int32_t  offset;      // immediate addr offset (signed); 0 for packLD uops
+  int32_t  offset;      VX_SM_ONLY(bool l1_inval = false;)  // immediate addr offset (signed); 0 for packLD uops; l1_inval: a FENCE that is vx_l1_inval
 #ifdef VX_CFG_EXT_MBAR_ENABLE
   uint32_t red_op = 0;  // red.async: the op's funct5, cp.async: its funct3, a proxy fence: its rs1 field (its form); a default keeps {w, s, off} initialisers complete
   uint32_t cpa_n  = 0;  // cp.async.wait_group: the groups that may stay pending
@@ -571,7 +571,7 @@ struct MemFlags {
     #endif
       // LSU fence token: the caches above the device's shared level walk on
       // it and the shared level drains; the host cache flush never sets it.
-      uint32_t fence             : 1;   // bit 22
+      uint32_t fence             : 1;   VX_SM_ONLY(uint32_t inval : 1;)  // bit 22; inval (H100 SM path, bit 23, shifts the rest): with fence, vx_l1_inval
 #ifdef VX_CFG_EXT_DLMEM_ENABLE
       // lacc: a local access the DLMEM translation counted, whose bank reports the commit.
       // fence_cta: with fence, a CTA fence; the first cache level drains it, nothing below sees it.

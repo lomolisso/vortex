@@ -383,6 +383,14 @@ inline void vx_fence_cluster() {
 #endif
 }
 
+#ifdef VX_CFG_H100_SM_ENABLE
+// SASS CCTL.IVALL: the SM's L1 waits for its in-flight accesses, clears every
+// line and answers; nothing below the L1 sees it.
+inline void vx_l1_inval() {
+    __asm__ volatile (".insn r %0, 7, 3, x0, x0, x0" :: "i"(RISCV_CUSTOM2) : "memory");
+}
+#endif
+
 
 //
 // cooperative threads extensions

@@ -330,6 +330,13 @@ module VX_afu_wrap import VX_gpu_pkg::*; #(
     // Command Processor
     // ========================================================================
     VX_cp_gpu_if cp_gpu_if ();
+    // The CP moves whole 64-B lines (ring entries, DMA beats); a narrower memory
+    // port gets them through a width converter on each CP master.
+    localparam CP_DATA_WIDTH = 512;
+    VX_mem_axi_if #(.ADDR_W(64), .DATA_W(CP_DATA_WIDTH), .ID_W(`VX_CP_AXI_TID_WIDTH))
+        cp_axi_dev_line ();
+    VX_mem_axi_if #(.ADDR_W(64), .DATA_W(CP_DATA_WIDTH), .ID_W(`VX_CP_AXI_TID_WIDTH))
+        cp_axi_host_line ();
     // CP device-memory master (shares Vortex bank 0 via VX_mm_axi_arb).
     VX_mem_axi_if #(.ADDR_W(64), .DATA_W(C_M_AXI_MEM_DATA_WIDTH), .ID_W(`VX_CP_AXI_TID_WIDTH))
         cp_axi_dev ();
@@ -337,14 +344,40 @@ module VX_afu_wrap import VX_gpu_pkg::*; #(
     VX_mem_axi_if #(.ADDR_W(64), .DATA_W(C_M_AXI_MEM_DATA_WIDTH), .ID_W(`VX_CP_AXI_TID_WIDTH))
         cp_axi_host ();
 
+    VX_mem_axi_downsize #(
+        .ADDR_WIDTH   (64),
+        .S_DATA_WIDTH (CP_DATA_WIDTH),
+        .M_DATA_WIDTH (C_M_AXI_MEM_DATA_WIDTH),
+        .ID_WIDTH     (`VX_CP_AXI_TID_WIDTH)
+    ) cp_dev_downsize (
+        .clk   (clk),
+        .reset (subsys_reset),
+        .s     (cp_axi_dev_line),
+        .m     (cp_axi_dev)
+    );
+
+    VX_mem_axi_downsize #(
+        .ADDR_WIDTH   (64),
+        .S_DATA_WIDTH (CP_DATA_WIDTH),
+        .M_DATA_WIDTH (C_M_AXI_MEM_DATA_WIDTH),
+        .ID_WIDTH     (`VX_CP_AXI_TID_WIDTH)
+    ) cp_host_downsize (
+        .clk   (clk),
+        .reset (subsys_reset),
+        .s     (cp_axi_host_line),
+        .m     (cp_axi_host)
+    );
+
     wire cp_interrupt;
 
-    VX_cp_core cp_core (
+    VX_cp_core #(
+        .DATA_W     (CP_DATA_WIDTH)
+    ) cp_core (
         .clk        (clk),
         .reset      (subsys_reset),
         .axil_s     (cp_axil),
-        .axi_host   (cp_axi_host),
-        .axi_dev    (cp_axi_dev),
+        .axi_host   (cp_axi_host_line),
+        .axi_dev    (cp_axi_dev_line),
         .dbg_host_w_counts ({2'b0, dbg_host_b_count, dbg_host_w_count,
                              dbg_host_aw_count}),
         .dbg_host_r_counts ({12'b0, dbg_host_r_count, dbg_host_ar_count}),

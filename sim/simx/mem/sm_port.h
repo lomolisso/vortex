@@ -84,6 +84,11 @@ public:
   std::vector<SimChannel<MemRsp>> SrcRspOut;
   SimChannel<MemReq> MemReqOut;
   SimChannel<MemRsp> MemRspIn;
+#if defined(VX_CFG_EXT_DXA_ENABLE) && defined(VX_CFG_H100_FE_ENABLE)
+  // Each TMA request the request FIFO takes, as its head block.
+  SimChannel<MemReq> TmaAccOut;
+#endif
+#line 87
 #ifdef VX_CFG_EXT_DLMEM_ENABLE
   SimChannel<DlmemReqPkt> DsmReqIn;    // this SM's SM-to-SM requests
   SimChannel<DlmemReqPkt> DsmReqOut;
@@ -101,6 +106,10 @@ public:
     , SrcRspOut(config.num_srcs, this)
     , MemReqOut(this)
     , MemRspIn(this)
+  #if defined(VX_CFG_EXT_DXA_ENABLE) && defined(VX_CFG_H100_FE_ENABLE)
+    , TmaAccOut(this)
+  #endif
+#line 104
   #ifdef VX_CFG_EXT_DLMEM_ENABLE
     , DsmReqIn(this)
     , DsmReqOut(this)
@@ -364,6 +373,11 @@ private:
       DT(3, this->name() << " push src" << j << " flits=" << eit.flits << " blocks=" << nblk);
       if (j < nsrc) {
         staged_[j].erase(staged_[j].begin(), staged_[j].begin() + nblk);
+    #if defined(VX_CFG_EXT_DXA_ENABLE) && defined(VX_CFG_H100_FE_ENABLE)
+      if (j == SRC_TMA)
+        TmaAccOut.send(it.blocks.front(), 1);
+    #endif
+#line 367
       } else {
       #ifdef VX_CFG_EXT_DLMEM_ENABLE
         DsmReqIn.pop();

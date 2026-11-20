@@ -76,12 +76,26 @@
 
 #if VX_CFG_DRAM_PORT_DATA_SIZE > 8
   typedef VlWide<(VX_CFG_DRAM_PORT_DATA_SIZE/4)> Vl_m_data_t;
+  static uint8_t* vl_bytes(Vl_m_data_t* p) { return reinterpret_cast<uint8_t*>(p->data()); }
 #else
 #if VX_CFG_DRAM_PORT_DATA_SIZE > 4
   typedef QData Vl_m_data_t;
 #else
   typedef IData Vl_m_data_t;
 #endif
+  static uint8_t* vl_bytes(Vl_m_data_t* p) { return reinterpret_cast<uint8_t*>(p); }
+#endif
+
+// The write strobe is one bit per port byte, in Verilator's smallest fitting word.
+static_assert(VX_CFG_DRAM_PORT_DATA_SIZE <= 64, "the AXI write strobe is read as one 64-bit word");
+#if VX_CFG_DRAM_PORT_DATA_SIZE > 32
+  typedef QData Vl_m_strb_t;
+#elif VX_CFG_DRAM_PORT_DATA_SIZE > 16
+  typedef IData Vl_m_strb_t;
+#elif VX_CFG_DRAM_PORT_DATA_SIZE > 8
+  typedef SData Vl_m_strb_t;
+#else
+  typedef CData Vl_m_strb_t;
 #endif
 
 using namespace vortex;
@@ -683,7 +697,7 @@ private:
                  + uint64_t(host_rd_beat_) * VX_CFG_DRAM_PORT_DATA_SIZE;
       // Host memory is plain process memory (the runtime's host_mem_alloc
       // hands the CP a raw pointer as the cp_addr) — dereference it directly.
-      std::memcpy(m_axi_host_.rdata->data(), reinterpret_cast<const void*>(a),
+      std::memcpy(vl_bytes(m_axi_host_.rdata), reinterpret_cast<const void*>(a),
                   VX_CFG_DRAM_PORT_DATA_SIZE);
       *m_axi_host_.rvalid = 1;
       *m_axi_host_.rid    = host_rd_id_;
@@ -702,8 +716,8 @@ private:
     if (host_wr_active_ && *m_axi_host_.wvalid && *m_axi_host_.wready) {
       uint64_t a = host_wr_addr_
                  + uint64_t(host_wr_beat_) * VX_CFG_DRAM_PORT_DATA_SIZE;
-      auto byteen = *m_axi_host_.wstrb;
-      auto data = (const uint8_t*)m_axi_host_.wdata->data();
+      uint64_t byteen = *m_axi_host_.wstrb;
+      auto data = vl_bytes(m_axi_host_.wdata);
       for (int i = 0; i < VX_CFG_DRAM_PORT_DATA_SIZE; ++i) {
         if ((byteen >> i) & 0x1)
           reinterpret_cast<uint8_t*>(a)[i] = data[i];
@@ -750,7 +764,7 @@ private:
           *m_axi_mem_[b].rid    = mem_rsp->tag;
           *m_axi_mem_[b].rresp  = 0;
           *m_axi_mem_[b].rlast  = mem_rsp->last;
-          memcpy(m_axi_mem_[b].rdata->data(), mem_rsp->data.data(), VX_CFG_DRAM_PORT_DATA_SIZE);
+          memcpy(vl_bytes(m_axi_mem_[b].rdata), mem_rsp->data.data(), VX_CFG_DRAM_PORT_DATA_SIZE);
           pending_mem_reqs_[b].erase(mem_rsp_it);
           delete mem_rsp;
         }
@@ -837,7 +851,7 @@ private:
         w_beat_t beat;
         beat.addr   = byte_addr;
         beat.byteen = uint64_t(*m_axi_mem_[b].wstrb);
-        std::memcpy(beat.data.data(), m_axi_mem_[b].wdata->data(),
+        std::memcpy(beat.data.data(), vl_bytes(m_axi_mem_[b].wdata),
                     VX_CFG_DRAM_PORT_DATA_SIZE);
         if (st.aw_req == nullptr) {
           st.aw_req = new mem_req_t();
@@ -1038,7 +1052,7 @@ private:
     CData* wvalid;
     CData* wready;
     Vl_m_data_t* wdata;
-    QData* wstrb;
+    Vl_m_strb_t* wstrb;
     CData* wlast;
     CData* arvalid;
     CData* arready;

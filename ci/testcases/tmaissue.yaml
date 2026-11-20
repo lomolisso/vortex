@@ -40,6 +40,29 @@ tests:
     configs: "-DVX_CFG_EXT_DXA_ENABLE -DVX_CFG_H100_ORG_ENABLE -DVX_CFG_NUM_THREADS=16"
     shape: {warps: 32, l2cache: true}
     args: "-k2 -s7"
+  # On the H100 SM path a bulk store bypasses the issuer's L1: after
+  # vx_bulk_wait_group<0> (the wait, then vx_l1_inval) the written line, an
+  # unwritten line and an unrelated resident line all miss and return the current
+  # values, and so do a bulk reduce's lines; after wait_group.read 0 the stale
+  # copy still hits; vx_l1_inval
+  # answers in the L1 (no less than the valid sweep, less than a fence's L2 round
+  # trip). The H100's hit, miss and CCTL.IVALL cycles are printed (H100REF).
+  - id: visible-l1-org
+    app: tma_issue
+    drivers: [simx, rtlsim]
+    configs: "-DVX_CFG_EXT_DXA_ENABLE -DVX_CFG_H100_ORG_ENABLE -DVX_CFG_NUM_THREADS=16"
+    shape: {warps: 32, l2cache: true}
+    touches: &vl1_touch [hw/rtl/core/VX_decode.sv, hw/rtl/core/VX_lsu_slice.sv, hw/rtl/mem/VX_sm_l1.sv,
+              sim/simx/decode.cpp, sim/simx/lsu_unit.cpp, sim/simx/mem/sm_l1.cpp, sim/simx/types.h,
+              sw/kernel/include/vx_intrinsics.h, sw/kernel/include/vx_dxa.h, tests/regression/tma_issue]
+    args: "-k3 -s7"
+  - id: visible-l1-sm
+    app: tma_issue
+    drivers: [simx, rtlsim]
+    configs: "-DVX_CFG_EXT_DXA_ENABLE -DVX_CFG_H100_FE_ENABLE -DVX_CFG_H100_SM_ENABLE"
+    shape: {threads: 16, l2cache: true}
+    touches: *vl1_touch
+    args: "-k3 -s7"
   # The issue cost is the header's own instructions: no warp of 4 issues faster
   # than one warp alone, and 4 warps issue no fewer copies per cycle; the H100's
   # per-form costs are printed (H100REF).

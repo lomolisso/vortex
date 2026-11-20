@@ -278,6 +278,10 @@ public:
     for (uint32_t i = 0; i < cores_per_socket; ++i) {
       sm_tma_split_->ReqOut.at(i).bind(&sm_ports_.at(i)->SrcReqIn.at(SmPort::SRC_TMA));
       sm_ports_.at(i)->SrcRspOut.at(SmPort::SRC_TMA).bind(&sm_tma_split_->RspIn.at(i));
+    #ifdef VX_CFG_H100_FE_ENABLE
+      sm_ports_.at(i)->TmaAccOut.bind(&dxa_core_->gmem_acc_in.at(i));
+    #endif
+#line 251
     }
   #endif
     {

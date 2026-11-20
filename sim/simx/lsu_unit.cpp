@@ -913,7 +913,7 @@ void LsuUnit::issue_fence(uint32_t b, instr_trace_t* trace) {
 
 	LsuReq lsu_req(VX_CFG_NUM_LSU_LANES);
 	lsu_req.op = MemOp::FLUSH;
-	lsu_req.flags.fence = 1;
+	lsu_req.flags.fence = 1; VX_SM_ONLY(lsu_req.flags.inval = std::get<IntrLsuArgs>(trace->instr_ptr->get_args()).l1_inval;)
 	lsu_req.wid = trace->wid;
 #ifdef VX_CFG_EXT_DLMEM_ENABLE
 	lsu_req.cta_id = trace->cta_id;

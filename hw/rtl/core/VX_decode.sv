@@ -13,6 +13,12 @@
 
 `include "VX_define.vh"
 
+`ifdef VX_CFG_EXT_DLMEM_ENABLE
+`define VX_DECODE_EXT3
+`elsif VX_CFG_H100_SM_ENABLE
+`define VX_DECODE_EXT3
+`endif
+
 module VX_decode import
 `ifdef VX_CFG_EXT_RTU_ENABLE
     VX_rtu_pkg::*,
@@ -483,8 +489,24 @@ module VX_decode import
             `endif
             end
         `endif
-        `ifdef VX_CFG_EXT_DLMEM_ENABLE
+        `ifdef VX_DECODE_EXT3
             INST_EXT3: begin
+            `ifdef VX_CFG_H100_SM_ENABLE
+                if (funct7 == 7'd3 && funct3 == 3'd7) begin
+                    // vx_l1_inval: a fence whose is_float marks it for the L1's invalidate.
+                    ex_type = EX_LSU;
+                    op_type = INST_LSU_FENCE;
+                    op_args.lsu.is_store = 0;
+                    op_args.lsu.is_float = 1;
+                    op_args.lsu.pack     = 0;
+                    op_args.lsu.offset   = 0;
+                `ifdef TCU_META_ENABLE
+                    rd_xregs[XREG_0] = 1'b1;
+                    rd_xregs[XREG_1] = 1'b1;
+                `endif
+                end
+            `endif
+            `ifdef VX_CFG_EXT_DLMEM_ENABLE
                 if (funct7 == 7'd0 && funct3 == 3'd7) begin
                     // vx_fence_cta
                     ex_type = EX_LSU;
@@ -613,6 +635,7 @@ module VX_decode import
                     end
                     endcase
                 end
+            `endif
             `endif
             end
         `endif
@@ -1362,9 +1385,11 @@ module VX_decode import
     `RUNTIME_ASSERT (~(async_fire && async_legal && (funct3 == 3'd4) && rs2[0]),
         ("%t: %s st.async 16-byte data needs an even register pair: wid=%0d PC=0x%0h rs2=x%0d (#%0d)",
             $time, INSTANCE_ID, fetch_if.data.wid, to_fullPC(fetch_if.data.PC), rs2, fetch_if.data.uuid))
+`ifndef VX_CFG_H100_SM_ENABLE
     `RUNTIME_ASSERT (~(fetch_fire && (opcode == INST_EXT3) && (funct7 == 7'd3) && (funct3 == 3'd7)),
         ("%t: %s invalid cp.async encoding: wid=%0d PC=0x%0h instr=0x%h (#%0d)",
             $time, INSTANCE_ID, fetch_if.data.wid, to_fullPC(fetch_if.data.PC), instr, fetch_if.data.uuid))
+`endif
 `endif
 
 `ifdef DXA_MBAR_ENABLE
@@ -1494,3 +1519,7 @@ module VX_decode import
 `endif
 
 endmodule
+
+`ifdef VX_DECODE_EXT3
+`undef VX_DECODE_EXT3
+`endif

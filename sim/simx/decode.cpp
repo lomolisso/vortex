@@ -601,7 +601,7 @@ Instr::Ptr Decoder::decode(uint32_t code, uint64_t uuid) {
   auto rs2 = (code >> shift_rs2) & mask_reg;
   auto rs3 = (code >> shift_rs3) & mask_reg;
 
-  auto instr = std::allocate_shared<Instr>(instr_pool_, uuid, FUType::ALU);
+  auto instr = std::allocate_shared<Instr>(instr_pool_, uuid, FUType::ALU); VX_SM_ONLY(if (op == Opcode::EXT3 && funct7 == 3 && funct3 == 7) { IntrLsuArgs args{0, 0, 0}; args.l1_inval = true; instr->set_fu_type(FUType::LSU); instr->set_op_type(LsuType::FENCE); instr->set_args(args); return instr; })  // vx_l1_inval: EXT3 funct7 3 funct3 7, decoded with or without DLMEM
 
   switch (op) {
   case Opcode::LUI:

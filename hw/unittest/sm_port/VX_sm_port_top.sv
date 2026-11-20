@@ -260,6 +260,11 @@ module VX_sm_port_top import VX_gpu_pkg::*;
         .arr_rsp_in_if  (arr_rsp_in_if),
         .arr_rsp_out_if (arr_rsp_out_if),
     `endif
+    `ifdef VX_CFG_H100_FE_ENABLE
+        `UNUSED_PIN (tma_acc_valid),
+        `UNUSED_PIN (tma_acc_amo),
+        `UNUSED_PIN (tma_acc_tag),
+    `endif
         .empty          (empty)
     );
 

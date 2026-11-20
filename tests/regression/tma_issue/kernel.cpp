@@ -174,6 +174,92 @@ __attribute__((noinline)) uint32_t visible_run(const tma_arg_t* arg, uint8_t* lm
   return stale;
 }
 
+#if VX_CFG_H100_SM_ENABLED && VX_CFG_H100_FE_ENABLED
+// Cycles of one load, from a drained pipeline to its value in a register. Out of
+// line so that one warm-up call leaves every timed window's code in the I-cache.
+__attribute__((noinline)) uint32_t ld_timed(const volatile uint32_t* p, uint32_t* t) {
+  const uint64_t t0 = vx_rdcycle_sync();
+  uint32_t v = *p;
+  __asm__ volatile ("mv %0, %0" : "+r"(v));
+  *t = (uint32_t)(vx_rdcycle_sync() - t0);
+  return v;
+}
+
+// Loads every word of [p, p + n) and returns once all of them are in registers.
+INL void touch(const volatile uint32_t* p, uint32_t n) {
+  uint32_t s = 0;
+  for (uint32_t i = 0; i < n; ++i)
+    s += p[i];
+  __asm__ volatile ("mv %0, %0" : "+r"(s));
+  vx_rdcycle_sync();
+}
+
+// Out of line and called twice, the second call timed with its code warm.
+__attribute__((noinline)) uint32_t inval_timed() {
+  const uint64_t t0 = vx_rdcycle_sync();
+  vx_l1_inval();
+  return (uint32_t)(vx_rdcycle_sync() - t0);
+}
+
+__attribute__((noinline)) uint32_t fence_timed() {
+  const uint64_t t0 = vx_rdcycle_sync();
+  vx_fence();
+  return (uint32_t)(vx_rdcycle_sync() - t0);
+}
+
+__attribute__((noinline)) void visible_l1_run(const tma_arg_t* arg, uint8_t* lm, uint32_t* out) {
+  constexpr uint32_t LW = VX_CFG_DCACHE_LINE_SIZE / 4;
+  static_assert(LW * 4 > VL1_WBYTES && 2 * LW * 4 <= VL1_BYTES, "the written bytes lie in the first line");
+  auto r  = reinterpret_cast<volatile uint32_t*>(arg->vis_addr);
+  auto r2 = r + VL1_R2 / 4;
+  auto u  = reinterpret_cast<const volatile uint32_t*>(arg->gsrc_addr);
+  const void* src = lm + LM_AREA;
+  uint32_t bad = 0, kept = 0, t;
+
+  touch(r, VL1_BYTES / 4);
+  touch(u, VL1_BYTES / 4);
+  ld_timed(&u[0], &t);
+  vx_fence_proxy_async();
+  vx_dxa_bulk_store(const_cast<uint32_t*>(r), src, VL1_WBYTES);
+  vx_bulk_commit_group();
+  vx_bulk_wait_group<0>();
+  bad += ld_timed(&r[VL1_WBYTES / 4 - 1], &t) != vis_word(VL1_WBYTES / 4 - 1);
+  out[O_TW] = t;
+  bad += ld_timed(&r[LW], &t) != vl1_old(LW);
+  out[O_TN] = t;
+  const uint32_t u0 = ld_timed(&u[0], &t);
+  out[O_TU] = t;
+  bad += ld_timed(&u[0], &t) != u0;
+  out[O_TH] = t;
+  for (uint32_t i = 0; i < VL1_BYTES / 4; ++i)
+    bad += r[i] != (i < VL1_WBYTES / 4 ? vis_word(i) : vl1_old(i));
+
+  touch(r2, VL1_BYTES / 4);
+  vx_dxa_bulk_store(const_cast<uint32_t*>(r2), src, VL1_WBYTES);
+  vx_bulk_commit_group();
+  vx_bulk_wait_group_read<0>();
+  kept += ld_timed(&r2[0], &t) == vl1_old(VL1_R2 / 4);
+  out[O_TS] = t;
+  for (uint32_t i = 1; i < VL1_WBYTES / 4; ++i)
+    kept += r2[i] == vl1_old(VL1_R2 / 4 + i);
+  vx_bulk_wait_group<0>();
+
+  auto r3 = r + VL1_R3 / 4;
+  touch(r3, VL1_BYTES / 4);
+  vx_dxa_reduce_global(const_cast<uint32_t*>(r3), src, VL1_WBYTES, DXA_RED_ADD, DXA_RT_U32);
+  vx_bulk_commit_group();
+  vx_bulk_wait_group<0>();
+  for (uint32_t i = 0; i < VL1_BYTES / 4; ++i)
+    bad += r3[i] != vl1_old(VL1_R3 / 4 + i) + (i < VL1_WBYTES / 4 ? vis_word(i) : 0);
+
+  inval_timed();
+  out[O_TINV] = inval_timed();
+  fence_timed();
+  out[O_TFENCE] = fence_timed();
+  out[O_STALE] = bad | kept << 16;
+}
+#endif
+
 } // namespace
 
 __kernel void tma_k(tma_arg_t* __UNIFORM__ arg) {
@@ -193,7 +279,7 @@ __kernel void tma_k(tma_arg_t* __UNIFORM__ arg) {
       v = 0xC0000000u | ((i - LM_SRC / 4) * 7919u);
     else if (i >= (LM_AREA + F_CRED * AREA_BYTES) / 4 && i < (LM_AREA + (F_CRED + 1) * AREA_BYTES) / 4)
       v = (i - (LM_AREA + F_CRED * AREA_BYTES) / 4) * 3u + 1u;
-    if (arg->kernel == K_VISIBLE && i >= LM_AREA / 4 && i < (LM_AREA + VIS_BYTES) / 4)
+    if ((arg->kernel == K_VISIBLE || arg->kernel == K_VISIBLE_L1) && i >= LM_AREA / 4 && i < (LM_AREA + VIS_BYTES) / 4)
       v = vis_word(i - LM_AREA / 4);
     if (i >= (LM_MBAR + 8 * NUM_MBARS) / 4)
       lw[i] = v;
@@ -225,6 +311,11 @@ __kernel void tma_k(tma_arg_t* __UNIFORM__ arg) {
     }
   } else if (arg->kernel == K_VISIBLE) {
     out[O_STALE] = (w == 0 && issues(lane, arg->lane)) ? visible_run(arg, lm) : 0;
+  } else if (arg->kernel == K_VISIBLE_L1) {
+#if VX_CFG_H100_SM_ENABLED && VX_CFG_H100_FE_ENABLED
+    if (w == 0 && issues(lane, arg->lane))
+      visible_l1_run(arg, lm, out);
+#endif
   } else if (w < arg->warps && issues(lane, arg->lane)) {
     auto mb = [&](uint32_t k) { return reinterpret_cast<uint64_t*>(lm + LM_MBAR + 8 * (4 * w + k)); };
     const bool lead = (lane == arg->lane);

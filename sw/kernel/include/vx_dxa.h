@@ -647,6 +647,10 @@ inline void vx_dxa_prefetch_l2(const void* gsrc, uint32_t size) {
 // vx_bulk_wait_group_read<N>() has released the group, and the writes are
 // performed once vx_bulk_wait_group<N>() has; a later generic load of them
 // also needs vx_fence_proxy_async_global(). Groups are tracked per warp.
+// The writes bypass the issuing SM's L1: on the H100 SM path the write-form
+// wait is followed by vx_l1_inval(), as ptxas follows it with CCTL.IVALL, so
+// no stale line of the destination survives it; the .read form invalidates
+// nothing.
 // funct3 = 5: rs1 = wgather(src, a1, a2, a3), rs2 = wgather({ctl, c4}, 0, 0, 0),
 // ctl = kind | op << 3 | type << 7 | slot << 11 (DXA_ST_CTL_* in dxa_meta.h);
 // a1, a2, a3 = gdst, size, 0 (bulk store, global reduction), dst, size, mbar
@@ -842,6 +846,9 @@ inline void vx_bulk_commit_group(void) {
 inline void vx_bulk_wait_all(void) {
   vx_bulk_commit_group();
   __asm__ volatile (".insn r %0, 6, %1, x0, x1, x0" :: "i"(VX_DXA_EXT_OPCODE), "i"(VX_DXA_FUNCT7) : "memory");
+#ifdef VX_CFG_H100_SM_ENABLE
+  vx_l1_inval();
+#endif
 }
 
 // fence.proxy.async.global: vx_fence_proxy_async(), and the warp's earlier
@@ -1330,6 +1337,9 @@ inline void vx_bulk_wait_group() {
   static_assert(N < 32, "wait_group N is 0-31");
   __asm__ volatile (".insn r %0, 6, %1, x0, x1, x%2" :: "i"(VX_DXA_EXT_OPCODE), "i"(VX_DXA_FUNCT7), "i"(N)
                     : "memory");
+#ifdef VX_CFG_H100_SM_ENABLE
+  vx_l1_inval();
+#endif
 }
 
 // cp.async.bulk.wait_group.read N: the same, until the groups' sources have been read.

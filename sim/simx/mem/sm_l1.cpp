@@ -233,6 +233,8 @@ public:
     in_valid_ = false;
     in_todo_ = 0;
     in_cta_ = false;
+    in_inv_ = false;
+    t2_inv_ = false;
     hf_req_ = false;
     hf_sent_ = false;
     hf_done_ = false;
@@ -835,7 +837,10 @@ public:
         emit_push = !eg_full;
         t2_done = emit_push && amo_emit_last;
         break;
-      case P_INV: inval_start = !inv_wait_; break;
+      case P_INV:
+        inval_start = !inv_wait_;
+        t2_done = t2_inv_ && inv_wait_ && !inval_r_;
+        break;
       case P_PUSH:
         fence_push = !eg_full;
         t2_done = fence_push;
@@ -843,6 +848,8 @@ public:
       }
     }
     const bool req_end = t2_valid_ && t2_done && t2_last_;
+    // an invalidate ends after the valid clear and answers here
+    const bool inv_end = t2_valid_ && t2_done && t2_phase_ == P_INV;
 
     bool eg_push = aeg_push;
     EgItem eg_in = aeg;
@@ -1194,6 +1201,7 @@ public:
       t2_first_ = (in_todo_ == in_r_.lead);
       t2_last_ = in_last;
       t2_r_ = in_r_;
+      t2_inv_ = in_inv_;
       t2_bv_ = iss_bv;
       t2_bl_ = iss_l;
       t2_res_ = 0;
@@ -1343,6 +1351,10 @@ public:
         ctx_.at(blk).erase(it);
       this->respond(blk, out);
       so->GlRspIn.pop();
+    }
+    if (inv_end) {
+      inv_wait_ = false;
+      fn_got_ = true;
     }
     if (fn_done && rs_free) fn_valid_ = false;
     if (fn_set) {
@@ -1596,6 +1608,7 @@ private:
     Kind kind = (fence && !cta) ? K_FENCE : (req.is_amo() ? K_AMO : (req.is_write() ? K_STORE : K_LOAD));
     r.kind = cta ? K_LOAD : kind;
     in_cta_ = cta;
+    in_inv_ = fence && req.flags.inval;
     r.nc = (first >= 0) && get_addr_type(req.addrs.at(first)) == AddrType::IO;
     for (uint32_t i = 0; i < LANES; ++i) {
       r.lead_idx[i] = i;
@@ -1741,6 +1754,8 @@ private:
   Req in_r_;
   uint64_t in_todo_ = 0;
   bool in_cta_ = false;
+  bool in_inv_ = false;
+  bool t2_inv_ = false;
   bool hf_req_ = false;
   bool hf_sent_ = false;
   bool hf_done_ = false;

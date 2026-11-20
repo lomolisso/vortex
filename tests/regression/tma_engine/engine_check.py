@@ -16,8 +16,10 @@
 #   reduce: 4 KiB more of bulk reduce takes longer, at no more than the egress width.
 #   read:   wait_group.read 0 returns before wait_group 0 alone does for the same store
 #           (the source read is released before the write's round trip ends).
-#   complete: a 16-B bulk store's issue -> wait_group 0 (printed against the H100's 108 cycles).
-#   cold:   the same to lines nothing touched before: no faster than the L2-resident case.
+#   complete: a 16-B bulk store's issue -> wait_group 0 alone (printed against the H100's 108 cycles)
+#           never returns before issue -> wait_group.read 0 alone.
+#   cold:   the same to lines nothing touched before: exactly as fast as to L2-resident lines,
+#           since a group's writes are done when the SM port takes them, not when memory answers.
 # Usage: engine_check.py <check> ...; env DRIVER (simx, rtlsim), CONFIGS.
 import os
 import re
@@ -181,9 +183,14 @@ def check_read(fails):
 
 
 def check_complete(fails):
-    t_read, after = store_done("-m3 -b16")
-    print("complete: 16-B store issue -> wait_group 0 %d cycles, %d after wait_group.read 0" % (t_read + after, after))
-    ref("bulk_store16_issue_to_wait0_cycles", H100_STORE16_DONE, t_read + after)
+    t_read, after, full = store_times("-m3 -b16")
+    print("complete: 16-B store issue -> wait_group.read 0 %d, wait_group 0 %d after it; issue -> wait_group 0 "
+          "alone %d" % (t_read, after, full))
+    ref("bulk_store16_issue_to_wait0_cycles", H100_STORE16_DONE, full)
+    ref("bulk_done_after_read_cycles", H100_DONE_AFTER_READ, after)
+    if full < t_read:
+        fails.append("complete: wait_group 0 alone returned after %d cycles, wait_group.read 0 alone after %d"
+                     % (full, t_read))
 
 
 def check_cold(fails):
@@ -191,8 +198,9 @@ def check_cold(fails):
     cold = sum(store_done("-m3 -b16 -c"))
     print("cold: 16-B store issue -> wait_group 0, L2-resident %d, cold destination %d" % (warm, cold))
     ref("bulk_store16_cold_minus_warm_cycles", "<=%d" % H100_COLD_SLACK, cold - warm)
-    if cold < warm:
-        fails.append("cold: a cold destination (%d) completed before an L2-resident one (%d)" % (cold, warm))
+    if cold != warm:
+        fails.append("cold: a cold destination took %d cycles, an L2-resident one %d: the group waited for "
+                     "memory" % (cold, warm))
 
 
 def main():

@@ -59,6 +59,13 @@ module VX_sm_port import VX_gpu_pkg::*;
     VX_dlmem_bus_if.master  arr_rsp_out_if,
 `endif
 
+`ifdef VX_CFG_H100_FE_ENABLE
+    // Each request of source 1 (the TMA engine) the request FIFO takes.
+    output wire                                tma_acc_valid,
+    output wire                                tma_acc_amo,
+    output wire [SRC_TAG_WIDTH-UUID_WIDTH-1:0] tma_acc_tag,
+`endif
+
     output wire             empty
 );
     localparam FLIT       = `VX_CFG_SM_EGRESS_BEAT;
@@ -185,6 +192,21 @@ module VX_sm_port import VX_gpu_pkg::*;
     for (genvar i = 0; i < NUM_RSRCS; ++i) begin : g_ready
         assign rs_ready[i] = push_valid && (push_idx == `LOG2UP(NUM_RSRCS)'(i));
     end
+
+`ifdef VX_CFG_H100_FE_ENABLE
+    if (NUM_SRCS > 1) begin : g_tma_acc
+        mem_bus_attr_t acc_attr;
+        assign acc_attr      = mem_bus_attr_t'(src_bus_if[1].req_data.attr);
+        assign tma_acc_valid = rs_valid[1] && rs_ready[1];
+        assign tma_acc_amo   = acc_attr.amo.amo_valid;
+        assign tma_acc_tag   = src_bus_if[1].req_data.tag.value;
+        `UNUSED_VAR (acc_attr)
+    end else begin : g_tma_acc0
+        assign tma_acc_valid = 1'b0;
+        assign tma_acc_amo   = 1'b0;
+        assign tma_acc_tag   = '0;
+    end
+`endif
 
     ///////////////////////////////////////////////////////////////////////////
     // Request FIFO and response queue.
