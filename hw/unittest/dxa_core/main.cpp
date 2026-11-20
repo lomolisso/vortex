@@ -688,6 +688,30 @@ static std::function<void()> g_after_program;
 static std::function<bool(uint64_t)> g_map_gate;   // true: no map line is answered this cycle
 static uint64_t g_dcr_held = 0, g_dcr_taken = 0;   // map responses presented with a slot DCR write
 
+// With the H100 front end a worker pipelines its G->S copies: lines are written
+// as they arrive and copies complete in any order, stores of one bulk group
+// overlap, and a launch (the kernel-argument pointer's KMU writes) also empties
+// the level-2 map cache, which then reads the parameter window at PARAM_WIN.
+#ifdef VX_CFG_H100_FE_ENABLE
+static constexpr bool FE = true;
+static constexpr uint64_t PARAM_WIN = 0x50000000ull;
+static const std::vector<std::pair<uint32_t, uint32_t>> LAUNCH = {
+    {VX_DCR_KMU_STARTUP_ARG0, uint32_t(PARAM_WIN)}, {VX_DCR_KMU_STARTUP_ARG1, uint32_t(PARAM_WIN >> 32)}};
+#else
+static constexpr bool FE = false;
+static constexpr uint64_t PARAM_WIN = 0;
+static const std::vector<std::pair<uint32_t, uint32_t>> LAUNCH = {{VX_DCR_KMU_STATE_BEGIN, 0}};
+#endif
+static bool win_line(uint64_t line) {
+#ifdef VX_CFG_H100_FE_ENABLE
+    uint64_t a = line * VX_CFG_L1_LINE_SIZE;
+    return a + VX_CFG_L1_LINE_SIZE > PARAM_WIN && a < PARAM_WIN + VX_CFG_TMAP_PARAM_BYTES;
+#else
+    (void)line;
+    return false;
+#endif
+}
+
 static dxa_ref::Desc ref_desc(const Xfer& x) {
     dxa_ref::Desc d;
     d.base = x.base; d.rank = x.rank; d.elem = 1u << x.esz; d.layout = 0;
@@ -833,10 +857,14 @@ static bool run_tensor(const char* name, std::vector<Xfer> xs, int ready_pct, in
     std::vector<uint8_t> mem(LMEM_BYTES), ref(LMEM_BYTES);
     for (int i = 0; i < LMEM_BYTES; ++i)
         mem[i] = ref[i] = pattern(i);
-    struct Done { uint32_t slot, gen, mbar, tx; };
+    struct Done { uint32_t slot, gen, mbar, tx; size_t xi; };
     std::vector<Done> dones;
     uint64_t exp_reads = 0;
-    for (auto& x : xs) {
+    // The transfer that writes each byte, -1 none, -2 several; clash: two of them write different values.
+    std::vector<int> owner(LMEM_BYTES, -1);
+    std::vector<bool> clash(LMEM_BYTES, false);
+    for (size_t xi = 0; xi < xs.size(); ++xi) {
+        auto& x = xs[xi];
         if (x.tmop || x.kmu)
             continue;
         if (!x.bload && !x.bytes && !x.rank0) {
@@ -863,7 +891,12 @@ static bool run_tensor(const char* name, std::vector<Xfer> xs, int ready_pct, in
             tx = walk(x, [&](uint32_t off, bool in, uint64_t a) {
                 for (uint32_t b = 0; b < (1u << x.esz); ++b) {
                     uint32_t r = dxa_ref::swizzle(rel0 + off + b, x.swz);
-                    ref[base + r] = in ? gmem_byte(a + b) : dxa_ref::fill_byte(x.cfill, r);
+                    uint8_t v = in ? gmem_byte(a + b) : dxa_ref::fill_byte(x.cfill, r);
+                    int& o = owner[base + r];
+                    if (o != -1 && o != int(xi) && ref[base + r] != v)
+                        clash[base + r] = true;
+                    o = (o == -1 || o == int(xi)) ? int(xi) : -2;
+                    ref[base + r] = v;
                 }
             });
         }
@@ -875,12 +908,23 @@ static bool run_tensor(const char* name, std::vector<Xfer> xs, int ready_pct, in
                     if ((x.mc_mask >> r) & 1) { if (k == 0) break; --k; }
                 slot = r; gen = 8 + r; mbar = (r * MC_STRIDE) / 8 + x.mbar;
             }
-            dones.push_back({slot, gen, mbar, tx});
+            dones.push_back({slot, gen, mbar, tx, xi});
         }
     }
     std::vector<uint32_t> nrcv;   // completions per transfer
     for (auto& x : xs)
         nrcv.push_back((x.prefetch || x.tmop || x.kmu) ? 0 : (x.mc_mask ? __builtin_popcount(x.mc_mask) : 1));
+
+    // With the front end streamed copies run in any order: no byte may get two different values.
+    if (FE && !serial) {
+        for (int i = 0; i < LMEM_BYTES; ++i)
+            if (clash[i]) {
+                printf("%s: streamed transfers write different values to 0x%x\n", name, i);
+                return false;
+            }
+    }
+    std::vector<uint32_t> xdone(xs.size(), 0);   // completions seen per transfer
+    std::vector<bool> matched(dones.size(), false);
 
     for (size_t i = 0; i < xs.size(); ++i)
         if (!xs[i].bload && xs[i].bytes == 0 && !xs[i].use_map && !xs[i].tmop && !xs[i].kmu)
@@ -896,13 +940,23 @@ static bool run_tensor(const char* name, std::vector<Xfer> xs, int ready_pct, in
     bool ok = true, after_last = false;
     size_t cur = 0;            // the transfer whose writes are expected
     uint32_t cur_lasts = 0;
-    bool launch_due = false;
+    size_t launch_due = 0;     // launch DCR writes still to drive in the loop
+    uint64_t launches = 0, win_reads = 0;
+    std::set<uint64_t> win_seen;   // window lines read since the last launch
     auto issue_next = [&]() {
         while (next < xs.size() && xs[next].kmu) {
-            if (xs[next].in_loop)
-                launch_due = true;
-            else
-                dcr_write(VX_DCR_KMU_STATE_BEGIN, 0);
+            ++launches;
+            win_seen.clear();
+            if (xs[next].in_loop) {
+                // The next request follows the launch's last write.
+                launch_due = LAUNCH.size();
+                ++next;
+                dut->dxa_req_valid = 0;
+                return;
+            } else {
+                for (auto& w : LAUNCH)
+                    dcr_write(w.first, w.second);
+            }
             ++next;
         }
         while (next < xs.size()) {
@@ -956,8 +1010,9 @@ static bool run_tensor(const char* name, std::vector<Xfer> xs, int ready_pct, in
         bool dcr = g_dcr_hook && g_dcr_hook(map_rsps, map_rsp, dcr_addr, dcr_data);
         if (launch_due && !dcr) {
             dcr = true;
-            launch_due = false;
-            dcr_addr = VX_DCR_KMU_STATE_BEGIN;
+            dcr_addr = LAUNCH[LAUNCH.size() - launch_due].first;
+            dcr_data = LAUNCH[LAUNCH.size() - launch_due].second;
+            --launch_due;
         }
         if (dcr) {
             dut->dcr_req_valid = 1;
@@ -976,6 +1031,9 @@ static bool run_tensor(const char* name, std::vector<Xfer> xs, int ready_pct, in
             if (tm_line(line, nullptr)) {
                 ++map_reads;
                 last_map_read = cyc;
+            } else if (win_line(line)) {
+                ++win_reads;
+                win_seen.insert(line);
             } else {
                 ++reads;
                 if (first_eng_read == ~0ull)
@@ -1003,6 +1061,11 @@ static bool run_tensor(const char* name, std::vector<Xfer> xs, int ready_pct, in
                 if (port_bit(dut->lmem_req_byteen, b)) {
                     uint32_t w = dut->lmem_req_data[b / 4];
                     mem[addr * WORD_BYTES + b] = uint8_t(w >> (8 * (b % 4)));
+                    int o = owner[addr * WORD_BYTES + b];
+                    if (o >= 0 && nrcv[o] && xdone[o] == nrcv[o]) {
+                        printf("%s: transfer %d writes 0x%x after its completion\n", name, o, addr * WORD_BYTES + b);
+                        ok = false;
+                    }
                 }
             }
             uint64_t attr = dut->lmem_req_attr;
@@ -1012,14 +1075,29 @@ static bool run_tensor(const char* name, std::vector<Xfer> xs, int ready_pct, in
                 ok = false;
             }
             if (last) {
+                auto same = [&](const Done& d) {
+                    return field(attr, A_MODE, 1) && field(attr, A_PAY, PAY_W) == d.mbar
+                        && field(attr, A_TX, LMEM_LOG + 1) == d.tx && field(attr, A_SLOT, NW_W) == d.slot
+                        && field(attr, A_GEN, 4) == d.gen && !field(attr, A_REMOTE, 1);
+                };
+                // In order, or with the front end's pipelined copies the first unmatched equal one.
+                size_t di = lasts;
+                if (FE)
+                    for (di = 0; di < dones.size() && (matched[di] || !same(dones[di])); ++di) {}
                 if (lasts >= dones.size()) {
                     printf("%s: extra completion beat\n", name);
                     ok = false;
+                } else if (di >= dones.size()) {
+                    printf("%s: completion %zu attr: mode=%lu mbar=0x%lx tx=%lu slot=%lu gen=%lu matches no transfer\n",
+                           name, lasts, (unsigned long)field(attr, A_MODE, 1), (unsigned long)field(attr, A_PAY, PAY_W),
+                           (unsigned long)field(attr, A_TX, LMEM_LOG + 1), (unsigned long)field(attr, A_SLOT, NW_W),
+                           (unsigned long)field(attr, A_GEN, 4));
+                    ok = false;
                 } else {
-                    const auto& d = dones[lasts];
-                    if (!field(attr, A_MODE, 1) || field(attr, A_PAY, PAY_W) != d.mbar
-                     || field(attr, A_TX, LMEM_LOG + 1) != d.tx || field(attr, A_SLOT, NW_W) != d.slot
-                     || field(attr, A_GEN, 4) != d.gen || field(attr, A_REMOTE, 1)) {
+                    const auto& d = dones[di];
+                    matched[di] = true;
+                    ++xdone[d.xi];
+                    if (!same(d)) {
                         printf("%s: completion %zu attr: mode=%lu mbar=0x%lx tx=%lu slot=%lu gen=%lu,"
                                " expected mbar=0x%x tx=%u slot=%u gen=%u\n",
                                name, lasts, (unsigned long)field(attr, A_MODE, 1),
@@ -1052,7 +1130,9 @@ static bool run_tensor(const char* name, std::vector<Xfer> xs, int ready_pct, in
                 issue_next();
         }
         bool quiet = (next >= xs.size()) && !launch_due && rsps.empty() && !dut->busy && (lasts == dones.size());
-        if (serial && !dut->dxa_req_valid && next < xs.size() && rsps.empty() && !dut->busy)
+        if (serial && !dut->dxa_req_valid && !launch_due && next < xs.size() && rsps.empty() && !dut->busy)
+            issue_next();
+        else if (!serial && !dut->dxa_req_valid && !launch_due && next < xs.size())
             issue_next();
         idle = quiet ? idle + 1 : 0;
         if (idle > 64)
@@ -1070,6 +1150,15 @@ static bool run_tensor(const char* name, std::vector<Xfer> xs, int ready_pct, in
     if (reads != exp_reads) {
         printf("%s: %lu line reads, expected %lu\n", name, (unsigned long)reads, (unsigned long)exp_reads);
         ok = false;
+    }
+    // The last launch's window is read whole; each launch reads it at most once.
+    if (FE && launches) {
+        uint64_t wl = VX_CFG_TMAP_PARAM_BYTES / CL;
+        if (win_seen.size() != wl || win_reads > launches * wl) {
+            printf("%s: %zu window lines read since the last launch, %lu in all, expected %lu and at most %lu\n", name,
+                   win_seen.size(), (unsigned long)win_reads, (unsigned long)wl, (unsigned long)(launches * wl));
+            ok = false;
+        }
     }
     g_map_reads = map_reads;
     if (g_maps_first && map_reads && first_eng_read <= last_map_read) {
@@ -1237,11 +1326,13 @@ static bool run_tensor_all() {
     // Global-to-local bulk copies, and prefetches of a box and of a range.
     {
         std::vector<Xfer> v;
+        uint32_t dst = q;
         for (uint32_t bytes : {16u, 48u, 208u, 2064u, 4096u}) {
             Xfer x;
             x.name = "bload"; x.bload = true; x.esz = 3; x.bytes = bytes;
             x.base = G + 0x200000 + v.size() * 0x4000 + 16 * v.size();
-            x.smem = q + 16 * (v.size() + 1); x.mbar = 0x50 + v.size();
+            x.smem = dst + 16 * (v.size() + 1); x.mbar = 0x50 + v.size();
+            dst = (x.smem + bytes + 255) & ~255u;
             v.push_back(x);
         }
         ok = run_tensor("bload", v, 70, 16) && ok;
@@ -1332,7 +1423,9 @@ static bool run_tensor_all() {
         Xfer y2 = y; y2.name = "i2c4-nall"; y2.c[3] = 5;
         Xfer y3 = y; y3.name = "i2c4-c0"; y3.c[0] = 6; y3.cpp = 4; y3.c[3] = 0; y3.ppc = 60;
         Xfer y4 = y2; y4.name = "i2c4-pf-nall"; y4.prefetch = true; y4.smem = 0;
-        ok = run_tensor("i2c-stream", {y, y2, y4, y3, y}, 70, 20) && ok;
+        y2.smem = q + 0xc00; y3.smem = q + 0x1000;
+        Xfer y5 = y; y5.smem = q + 0x1400;
+        ok = run_tensor("i2c-stream", {y, y2, y4, y3, y5}, 70, 20) && ok;
     }
     {
         Xfer z;
@@ -1370,8 +1463,9 @@ static constexpr int HART_W   = up1(clog2(VX_CFG_NUM_CLUSTERS * NCC) + clog2(VX_
 static constexpr int AMO_BITS = 1 + AOW + 1 + ZCW + HART_W;
 static constexpr int ATTR_FENCE = 4 + AMO_BITS;
 // The store fields sit above the tensor-load ones: bg_seq, bg, then dxa_st_t up.
+static constexpr int BGSEQ_W    = clog2(VX_CFG_BULK_GROUPS);
 static constexpr int R_BGSEQ    = R_TLOAD + 1;
-static constexpr int R_BG       = R_BGSEQ + 3;
+static constexpr int R_BG       = R_BGSEQ + BGSEQ_W;
 static constexpr int R_ST_HART  = R_BG + 1;
 static constexpr int R_ST_TSIZE = R_ST_HART + HART_W;
 static constexpr int R_ST_W8    = R_ST_TSIZE + 2;
@@ -1432,7 +1526,7 @@ static void load_st(uint32_t slot, const St& s) {
     set_bits(dut->dxa_req_data, R_DCORE, CORE_W, s.dcore);
     bool bg = dxa_ref::is_bulk_group(s.kind);
     set_bits(dut->dxa_req_data, R_BG, 1, bg);
-    set_bits(dut->dxa_req_data, R_BGSEQ, 3, s.seq);
+    set_bits(dut->dxa_req_data, R_BGSEQ, BGSEQ_W, s.seq);
     set_bits(dut->dxa_req_data, R_ST_EN, 1, 1);
     set_bits(dut->dxa_req_data, R_ST_KIND, 3, s.kind);
     if (dxa_ref::is_reduce(s.kind)) {
@@ -1741,15 +1835,43 @@ static bool run_store(const char* name, std::vector<St> ss, int ready_pct, int m
     if (gamos != exp_amo) { printf("%s: %lu atomics, expected %lu\n", name, (unsigned long)gamos, (unsigned long)exp_amo); ok = false; }
     if (pkts != exp_pkt) { printf("%s: %lu packets, expected %lu\n", name, (unsigned long)pkts, (unsigned long)exp_pkt); ok = false; }
     if (lreads != exp_rd) { printf("%s: %lu local-memory reads, expected %lu\n", name, (unsigned long)lreads, (unsigned long)exp_rd); ok = false; }
-    // Completion events: one read_done and one write_done per bulk_group op, in order.
-    {
+    // Completion events: one read_done and one write_done per bulk_group op, in
+    // order; with the front end the ops of one group overlap, so per group no
+    // write_done ahead of its read_done.
+    if (FE) {
+        std::map<uint32_t, int> ops, rd, wr;
+        for (auto& s : ss)
+            if (dxa_ref::is_bulk_group(s.kind))
+                ++ops[(s.wid << BGSEQ_W) | s.seq];
+        for (auto& e : evts) {
+            uint32_t v = e.first, g = v >> 2;
+            if (!ops.count(g)) {
+                printf("%s: event 0x%x of no op\n", name, v);
+                ok = false;
+                continue;
+            }
+            rd[g] += (v >> 1) & 1;
+            wr[g] += v & 1;
+            if (rd[g] > ops[g] || wr[g] > ops[g] || wr[g] > rd[g]) {
+                printf("%s: group seq %u: %d read_done, %d write_done of %d ops\n", name, g & ((1u << BGSEQ_W) - 1),
+                       rd[g], wr[g], ops[g]);
+                ok = false;
+            }
+        }
+        for (auto& o : ops)
+            if (rd[o.first] != o.second || wr[o.first] != o.second) {
+                printf("%s: group seq %u: %d read_done, %d write_done of %d ops\n", name,
+                       o.first & ((1u << BGSEQ_W) - 1), rd[o.first], wr[o.first], o.second);
+                ok = false;
+            }
+    } else {
         size_t k = 0;
         for (auto& s : ss) {
             if (!dxa_ref::is_bulk_group(s.kind)) continue;
             bool rd = false, wr = false;
             while (k < evts.size() && !(rd && wr)) {
                 uint32_t v = evts[k].first;
-                uint32_t wid = v >> 5, seq = (v >> 2) & 7;
+                uint32_t wid = v >> (2 + BGSEQ_W), seq = (v >> 2) & ((1u << BGSEQ_W) - 1);
                 if (wid != s.wid || seq != s.seq) {
                     printf("%s: event wid %u seq %u, expected wid %u seq %u\n", name, wid, seq, s.wid, s.seq);
                     ok = false;
@@ -1766,6 +1888,8 @@ static bool run_store(const char* name, std::vector<St> ss, int ready_pct, int m
             printf("%s: extra event 0x%x\n", name, evts[k].first);
             ok = false;
         }
+    }
+    {
         // The last write_done comes after the last fence or atomic response.
         for (auto it = evts.rbegin(); it != evts.rend(); ++it) {
             if (it->first & 1) {
@@ -1989,7 +2113,13 @@ static constexpr int R_TM_ADDR = R_TM_RT + 1;
 static constexpr int R_TM_OP   = R_TM_ADDR + TM_TAG_W;
 static constexpr int R_TM_EN   = R_TM_OP + 2;
 static constexpr int R_TM_END  = R_TM_EN + 1;
+#ifdef VX_CFG_H100_FE_ENABLE
+static constexpr int TM_ENTRIES = VX_CFG_TMAP_L1_ENTRIES;
+static constexpr bool TM_LRU = VX_CFG_TMAP_L1_REPL == 1;
+#else
 static constexpr int TM_ENTRIES = 8;
+static constexpr bool TM_LRU = false;
+#endif
 static constexpr uint64_t TMAP_BASE = 0x40000000ull;
 
 // The 128-byte map in memory: the slot words, then words 22-23, then junk.
@@ -2058,24 +2188,33 @@ static void load_tm(const Xfer& x) {
     set_bits(dut->dxa_req_data, R_META, 32, 0xC0000000u);   // slot bits 0
 }
 
-// The descriptor cache: 8 entries, the lowest invalid one or a round-robin victim.
+// The descriptor cache: TM_ENTRIES entries, the lowest invalid one or a
+// round-robin (LRU with the front end) victim. With the front end a level-1
+// miss reads memory only when level 2, emptied by a launch, misses too.
 struct TmModel {
     bool v[TM_ENTRIES] = {};
-    uint64_t tag[TM_ENTRIES] = {};
+    uint64_t tag[TM_ENTRIES] = {}, used[TM_ENTRIES] = {};
     int rr = 0;
-    uint64_t misses = 0, hits = 0, lines = 0;
-    bool find(uint64_t a) const {
+    uint64_t misses = 0, hits = 0, lines = 0, now = 0;
+    std::set<uint64_t> l2;
+    int find(uint64_t a) const {
         for (int e = 0; e < TM_ENTRIES; ++e)
-            if (v[e] && tag[e] == a) return true;
-        return false;
+            if (v[e] && tag[e] == a) return e;
+        return -1;
     }
     void launch() {
         for (auto& b : v) b = false;
         rr = 0;
     }
+    void read(uint64_t a) {
+        if (FE && l2.count(a))
+            return;
+        lines += ((a % CL) + 127) / CL + 1;
+    }
     void step(const Xfer& x) {
         if (x.kmu) {
             launch();
+            l2.clear();
             return;
         }
         if (!x.use_map && !x.tmop)
@@ -2083,24 +2222,33 @@ struct TmModel {
         if (x.tmop == 2) {
             for (int e = 0; e < TM_ENTRIES; ++e)
                 if (v[e] && tag[e] == x.map) v[e] = false;
+            l2.erase(x.map);
             return;
         }
-        if (find(x.map)) { ++hits; return; }
+        ++now;
+        int h = find(x.map);
+        if (h >= 0) { ++hits; used[h] = now; return; }
         ++misses;
-        lines += ((x.map % CL) + 127) / CL + 1;
+        read(x.map);
         if (x.kill) {
             // The killed fetch fills nothing; a transfer misses again, a prefetch pops.
             launch();
             if (x.tmop)
                 return;
             ++misses;
-            lines += ((x.map % CL) + 127) / CL + 1;
+            read(x.map);
         }
+        l2.insert(x.map);
         int e = -1;
         for (int i = 0; i < TM_ENTRIES && e < 0; ++i)
             if (!v[i]) e = i;
+        if (e < 0 && TM_LRU) {
+            e = 0;
+            for (int i = 1; i < TM_ENTRIES; ++i)
+                if (used[i] < used[e]) e = i;
+        }
         if (e < 0) { e = rr; rr = (rr + 1) % TM_ENTRIES; }
-        v[e] = true; tag[e] = x.map;
+        v[e] = true; tag[e] = x.map; used[e] = now;
     }
 };
 

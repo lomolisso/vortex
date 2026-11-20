@@ -1273,7 +1273,15 @@ module VX_dxa_core import VX_gpu_pkg::*, VX_dxa_pkg::*; #(
             dxa_busy_r <= dcr_bus_if.req_valid | (|req_bus_valid) | ~(&worker_idle);
     end
 `ifdef DXA_MBAR_ENABLE
+`ifdef DXA_TMAP_L2_ENABLE
+    // A head waiting for level 2 holds a map lookup in flight, as one reading memory does.
+    assign busy = dxa_busy_r | dcr_bus_if.req_valid | (|req_bus_valid) | (fetch_state_r == FETCH_MAP)
+                | (fetch_state_r == FETCH_L2);
+`else
+`line 929 "VX_dxa_core.sv" 0
     assign busy = dxa_busy_r | dcr_bus_if.req_valid | (|req_bus_valid) | (fetch_state_r == FETCH_MAP);
+`endif
+`line 930 "VX_dxa_core.sv" 0
 `else
     assign busy = dxa_busy_r | dcr_bus_if.req_valid | (|req_bus_valid);
 `endif

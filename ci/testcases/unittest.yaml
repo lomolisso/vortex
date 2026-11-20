@@ -211,6 +211,15 @@ tests:
     xlen: [64]
     run: "make -C hw/unittest/dxa_core clean && make -C hw/unittest/dxa_core CONFIGS='-DVX_CFG_EXT_DLMEM_ENABLE -DVX_CFG_EXT_A_ENABLE -DVX_CFG_EXT_MBAR_ENABLE -DVX_CFG_EXT_DXA_ENABLE -DVX_CFG_NUM_CORES=4 -DVX_CFG_NUM_THREADS=32 -DVX_CFG_ISSUE_WIDTH=4 -DVX_CFG_EXT_TCU_ENABLE -DVX_CFG_TCU_WGMMA_ENABLE -DVX_CFG_TCU_H100_ENABLE' && make -C hw/unittest/dxa_core run CONFIGS='-DVX_CFG_EXT_DLMEM_ENABLE -DVX_CFG_EXT_A_ENABLE -DVX_CFG_EXT_MBAR_ENABLE -DVX_CFG_EXT_DXA_ENABLE -DVX_CFG_NUM_CORES=4 -DVX_CFG_NUM_THREADS=32 -DVX_CFG_ISSUE_WIDTH=4 -DVX_CFG_EXT_TCU_ENABLE -DVX_CFG_TCU_WGMMA_ENABLE -DVX_CFG_TCU_H100_ENABLE' && make -C hw/unittest/dxa_core clean"
     touches: *dxa_bulk_bench_touches
+  # The bench with the H100 front end (no SM path): each worker pipelines its
+  # G->S copies, so streamed copies write disjoint bytes and complete in any
+  # order, the stores of one bulk group overlap, and a launch also empties the
+  # level-2 tensor-map cache, which reads the parameter window.
+  - id: hw-dxa-bulk-fe
+    via: script
+    xlen: [64]
+    run: "make -C hw/unittest/dxa_core clean && make -C hw/unittest/dxa_core CONFIGS='-DVX_CFG_EXT_DLMEM_ENABLE -DVX_CFG_EXT_A_ENABLE -DVX_CFG_EXT_MBAR_ENABLE -DVX_CFG_EXT_DXA_ENABLE -DVX_CFG_H100_FE_ENABLE' && make -C hw/unittest/dxa_core run CONFIGS='-DVX_CFG_EXT_DLMEM_ENABLE -DVX_CFG_EXT_A_ENABLE -DVX_CFG_EXT_MBAR_ENABLE -DVX_CFG_EXT_DXA_ENABLE -DVX_CFG_H100_FE_ENABLE' && make -C hw/unittest/dxa_core clean"
+    touches: *dxa_bulk_bench_touches
   - id: hw-fpamo
     via: script
     xlen: [64]

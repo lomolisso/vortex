@@ -1946,9 +1946,9 @@ package VX_gpu_pkg;
     // Warp requests per LSU block the shared-memory port holds before the bank
     // commit: none, it only stalls requests in the buffers that hold them today.
     localparam LMEM_REQ_STAGES        = 0;
-    // The L1 hit hold counts from a global load's request leaving the LSU; the
-    // core's stages outside that interval and the L1's own path come off the
-    // measured latency (same numbers as SimX's cache.h).
+    // The core's register stages before and after a global load's L1 access,
+    // counted from the pipeline; they hold nothing and feed only the test
+    // formulas of the L1 hit latency (same numbers as SimX's cache.h).
     // The operand collectors' routing stage an instruction passes when there is more than one collector.
     localparam OPC_ROUTE_STAGES       = (`VX_CFG_NUM_OPCS > 1) ? 1 : 0;
     localparam L1_CORE_PRE_STAGES     = 7 + OPC_ROUTE_STAGES;
